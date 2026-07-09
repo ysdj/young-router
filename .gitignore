@@ -1,0 +1,23 @@
+config.yaml
+config.yaml.*
+config.disabled-models.yaml*
+.litellm-runtime/
+.litellm-runtime-state
+.env
+*.log
+*.pid
+*.db
+*.sqlite
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+.venv/
+.playwright-cli/
+artifacts/
+docs/thread-watch/
+LiteLLM Menu.app/
+mac_menu/.build/
+.litellm-menu/
+menu.litellm.proxy.runtime.plist
+*audit*.png

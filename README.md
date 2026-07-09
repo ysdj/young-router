@@ -1,0 +1,535 @@
+# LiteLLM Menu
+
+LiteLLM Menu is a native macOS menu bar application that runs and manages a local [LiteLLM](https://github.com/BerriAI/litellm) proxy service. It consolidates multi-provider model routing, deployment fallback, Responses API compatibility, vision bridging, web search bridging, image generation tool adaptation, and Codex configuration into a single app-owned local endpoint.
+
+---
+
+## Features
+
+### Native Menu Bar App
+
+LiteLLM Menu runs as a macOS status bar application written in Swift. The menu app owns the local LiteLLM proxy lifecycle: it starts, stops, restarts, and monitors the proxy process. No Docker container, database, or system Python installation is required. On first launch, the app uses the bundled `uv` package manager to create a private Python runtime under `~/.litellm-menu`, isolated from the system Python.
+
+The menu provides direct access to:
+
+- Service status, start, stop, and restart
+- Model configuration editor (providers, API keys, model routes, deployment order)
+- Runtime settings (timeouts, cooldowns, web search limits, vision bridge, computer facade)
+- Codex configuration (apply local LiteLLM endpoint, restore pre-switch config)
+- WebDAV sync enable/disable and settings
+- Route trace toggle and visual HTML report
+- Service log, config watch log, and recent request log viewers
+- Auto-start at login
+
+### Deployment Fallback and Routing
+
+Model groups contain multiple deployments across providers. Fallback is ordered by configured deployment `order`:
+
+1. **Same-order peer fallback** — if a deployment fails, the proxy first tries another deployment with the same `order` value under a different provider or API key.
+2. **Next-order fallback** — if no same-order peer is available, the proxy advances to the next higher `order`.
+3. **Wrapped-order fallback** — if the failed deployment was the highest order, the proxy wraps to the lowest available order.
+
+Deployment cooldowns temporarily exclude deployments that have repeated failures. Cooldowns are separate from request-local exclusions and do not count request-shape errors, context-window errors, capability errors, or normal rate-limit polling as hard deployment failures.
+
+The routing constraint patch integrates exclusions and cooldowns directly into LiteLLM's `Router._get_all_deployments` and `get_available_deployment`, so all routing paths respect the active constraints.
+
+### Responses API Compatibility
+
+Many upstream providers expose only the Chat Completions API (`/v1/chat/completions`) rather than the Responses API (`/v1/responses`). LiteLLM Menu includes a Responses bridge that transparently converts Responses API requests to Chat Completions format when the selected route does not support the Responses endpoint.
+
+The bridge handles:
+
+- **Tool mapping** — Responses `function`, `custom`, and `tool_search` tool types are converted to Chat Completions function tools. Item IDs and tool call IDs are preserved.
+- **Surface preference** — deployments are preferred by upstream URL surface (`openai/responses` > `openai/chat` > `anthropic`). When a Responses-capable deployment is available, it is selected first.
+- **Preemptive bridging** — if route metadata indicates the deployment only supports Chat Completions, the request is converted before the upstream call rather than waiting for a failure.
+- **Streaming conversion** — Chat Completions stream chunks are converted to Responses stream events (`response.created`, `response.output_item.added`, `response.output_text.delta`, `response.completed`) for clients expecting Responses streaming.
+
+### Image Generation Tool Adaptation
+
+Responses API requests with `tools: [{"type": "image_generation"}]` are routed to deployments that declare `supports_responses_image_generation_tool: true` in their `model_info`. Routing is determined by structured metadata, not by prompt content or provider names.
+
+If a capable deployment returns an empty response or an explicit image-tool-unavailable refusal, the proxy retries the same model group with `tool_choice: {"type": "image_generation"}` forced. Inline image data URLs are bounded to prevent oversized payloads from breaking compatible providers.
+
+Standalone image model routes (`/v1/images/generations`) are handled separately from the Responses image generation tool.
+
+### Vision Bridge
+
+When a request contains image input and the selected route fails with a vision-unsupported error, the vision bridge rewrites the request to replace image content with textual visual context and retries the original route.
+
+The bridge operates in three modes:
+
+- **`auto`** (default) — tries a configured OpenAI-compatible vision endpoint first, then falls back to the bundled local Vision OCR helper.
+- **`api`** — uses only the configured vision endpoint.
+- **`local`** — uses only the bundled `vision_ocr` binary, which leverages macOS Vision framework for OCR text recognition and rectangle detection to produce layout summaries.
+
+The bridge does not switch the user's model group to an unrelated chat route. It removes image parts from the original request, appends the visual context as text, and retries the same route.
+
+### Web Search Bridge
+
+When a Responses API request includes `web_search` tool usage:
+
+1. **Native hosted search** is attempted first when route metadata indicates support or support is unknown on a Responses-capable route.
+2. **External bridge** activates when the route is chat-only, explicitly lacks hosted web search support, or returns an unsupported hosted-tool error.
+
+The external bridge uses DDGS (DuckDuckGo Search) for query execution and optional Jina Reader for page content excerpts. Search parameters — result count, page read count, read character limit, region, backend list, fetch timeout, max rounds, max queries, max open pages — are configurable through runtime settings.
+
+The bridge exposes focused search queries and source URLs to the model. Query planning is model-driven; the bridge does not add request-specific query rewrites.
+
+### Computer Facade
+
+The computer facade adapts hosted `computer-use` tool requests for routes that do not natively support the computer tool. Supported backends:
+
+- `auto` (default), `browser`, `chrome`, `playwright`, `mcp`, `cua`, `mock`
+
+The facade intercepts computer action calls, routes them to the configured backend, and returns observations. Action denylists, max steps, trace logging, and screenshot tracing are configurable through environment variables and runtime settings.
+
+### Codex Optimization
+
+LiteLLM Menu includes targeted optimizations for [Codex](https://github.com/openai/codex) CLI and similar Responses API clients:
+
+- **Codex config integration** — the menu provides a one-click action to configure Codex to use the local LiteLLM endpoint. It writes `model_provider`, `model`, provider `base_url`, `wire_api: responses`, and `OPENAI_API_KEY` to `~/.codex/config.toml` and `~/.codex/auth.json`, with automatic backup of pre-switch files and a restore action.
+- **Compaction controls** — request pre-processing adds compaction-related metadata and headers that Codex expects.
+- **Reasoning effort compatibility** — when an upstream returns an error indicating `xhigh` reasoning effort is unsupported, the proxy retries with a compatible effort level (`high` or `max`) and records the compat retry.
+- **Usage normalization** — the `response.completed` event's `usage` block is normalized to the Codex-expected schema (`input_tokens`, `output_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens`), including conversion from Chat Completions `prompt_tokens`/`completion_tokens` naming.
+- **Browser-compatible headers** — for providers that require standard browser headers, the proxy injects a browser User-Agent and Accept headers on retry.
+- **Internal context stripping** — Codex internal context fragments (environment context, permissions, app context, skill/plugin instructions) are recognized and excluded from trace logging and request summaries.
+
+### WebDAV Config Sync
+
+Optional bidirectional configuration sync via WebDAV. The sync compares local state, remote state, and the last successful baseline to determine whether to push, pull, or merge. Settings (URL, credentials, remote name, sync interval, timeout) are configurable through the menu. Synced config bundles may contain API keys; credentials are stored locally with file permissions set to `0600`.
+
+### Route Trace and Observability
+
+Route trace logging records deployment selection, fallback decisions, surface bridging, vision bridge rewrites, web search bridge activity, image generation fallback, and streaming error recovery. The trace is viewable as an HTML report with per-request cards showing deployment metadata, event timeline, tool call details, and session context.
+
+A recent requests log stores routing and status metadata in JSONL format. Prompt bodies, message content, authorization headers, and API keys are not stored.
+
+### Config Watch and Validation
+
+A launchd-backed config watcher monitors `config.yaml` for changes. On detection, it validates the config, stages the validated config to `.litellm-runtime/config.yaml`, and requires an explicit apply/restart to activate. The watcher does not silently restart the service on every file write. The runtime service always starts from the staged runtime config, not the editable source config.
+
+---
+
+## Installation
+
+### Requirements
+
+- macOS 13.0 or later
+- [uv](https://docs.astral.sh/uv/) package manager (installed automatically via Homebrew, or set `LITELLM_UV_BIN` to a custom path)
+
+### Homebrew (Recommended)
+
+```bash
+brew tap ysdj/litellm-menu
+brew install litellm-menu
+```
+
+After installation:
+
+```bash
+litellm-menu open
+```
+
+This builds the app bundle (if needed) and launches the menu bar app. The app creates its private Python runtime on first launch.
+
+### Manual Build
+
+Clone the repository and build the app bundle:
+
+```bash
+git clone https://github.com/ysdj/litellm-menu.git
+cd litellm-menu
+./mac_menu/build.sh
+```
+
+The built app is placed at `/Applications/LiteLLM Menu.app` by default. To use a custom install path:
+
+```bash
+LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
+```
+
+Launch the app:
+
+```bash
+./app.sh open
+```
+
+### First Launch
+
+1. Open LiteLLM Menu from the menu bar icon (the "LL" status item).
+2. The app bootstraps a private Python runtime using `uv` and starts the local LiteLLM proxy.
+3. Click **Edit Models Config** to configure providers, API keys, models, and deployment order.
+4. Click **Apply Config** (or restart the service) to stage and activate the configuration.
+5. Optionally click **Configure Codex for LiteLLM** to point Codex at the local endpoint.
+
+---
+
+## Configuration
+
+The primary configuration file is `~/.litellm-menu/config.yaml`. A sanitized example is provided as `config.example.yaml`.
+
+### Key Sections
+
+- **`providers`** — named provider groups with `api_base` and `api_keys` (each key has `name`, `value`, and `enabled` flag).
+- **`model_list`** — model group entries with `litellm_params` (model, api_base, api_key, order) and `model_info` (id, provider, route_key, api_key_name, capability flags).
+- **`litellm_settings`** — callbacks registration, `public_model_groups`, `drop_params`.
+- **`router_settings`** — routing strategy, retry policy, max fallbacks, cooldown configuration.
+- **`general_settings`** — master key, UI toggle.
+
+### Capability Flags
+
+Each deployment's `model_info` supports:
+
+- `supports_responses_endpoint` — whether the upstream supports the Responses API.
+- `supports_responses_image_generation_tool` — whether the upstream supports the Responses image generation tool.
+- `upstream_url_surface` — the API surface (`openai/responses`, `openai/chat`, `anthropic`).
+- `supports_responses_web_search` / `supports_web_search` — web search capability.
+
+### Runtime Settings
+
+Adjustable through the menu without editing config files:
+
+| Setting | Environment Variable | Default |
+|---|---|---|
+| Stall timeout | `LITELLM_MENU_STALL_TIMEOUT_SECONDS` | 120 |
+| Request timeout | `LITELLM_MENU_REQUEST_TIMEOUT_SECONDS` | 7200 |
+| Deployment cooldown failures | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
+| Deployment cooldown seconds | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
+| Web search max results | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 8 |
+| Web search read results | `LITELLM_MENU_WEB_SEARCH_READ_RESULTS` | 4 |
+| Web fetch timeout | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 30 |
+| Vision bridge backend | `LITELLM_MENU_VISION_BRIDGE_BACKEND` | auto |
+| Vision bridge model | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
+| Computer facade backend | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
+| Computer facade max steps | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
+| Route recovery interval | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
+
+---
+
+## CLI Usage
+
+The `app.sh` script provides app-level control:
+
+```bash
+./app.sh open      # Launch or focus the menu app (builds if needed)
+./app.sh restart   # Rebuild, stop, and relaunch
+./app.sh close     # Stop service and quit the app
+./app.sh version   # Print app version
+```
+
+The `service.sh` script provides direct service control (also available as `litellm-menu-service` after Homebrew install):
+
+```bash
+litellm-menu-service status
+litellm-menu-service start
+litellm-menu-service stop
+litellm-menu-service restart
+litellm-menu-service tail
+litellm-menu-service route-trace-html
+```
+
+---
+
+## Development
+
+### Running Tests
+
+```bash
+./scripts/test.sh
+```
+
+For targeted tests:
+
+```bash
+./scripts/test.sh test_hooks_routing
+```
+
+### Building the App
+
+After changing Swift sources, Python service code, service scripts, or bundled resources:
+
+```bash
+./mac_menu/build.sh
+```
+
+For installed app behavior verification, the complete path is: build the app, restart the real menu-owned service, then verify on the normal local service.
+
+### Version Management
+
+`VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Formula/litellm-menu.rb` are kept in sync through `scripts/version.py`.
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
+
+---
+
+---
+
+# LiteLLM Menu（中文）
+
+LiteLLM Menu 是一个原生 macOS 菜单栏应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、视觉桥接、网页搜索桥接、图像生成工具适配，以及 Codex 配置整合到一个由应用管理的本地端点中。
+
+---
+
+## 功能特性
+
+### 原生菜单栏应用
+
+LiteLLM Menu 以 Swift 编写，作为 macOS 状态栏应用运行。菜单应用拥有本地 LiteLLM 代理进程的完整生命周期管理：启动、停止、重启和监控。无需 Docker 容器、数据库或系统 Python 安装。首次启动时，应用使用内置的 `uv` 包管理器在 `~/.litellm-menu` 下创建私有 Python 运行时，与系统 Python 隔离。
+
+菜单提供以下功能的直接访问：
+
+- 服务状态、启动、停止和重启
+- 模型配置编辑器（供应商、API 密钥、模型路由、部署顺序）
+- 运行时设置（超时、冷却、网页搜索限制、视觉桥接、computer facade）
+- Codex 配置（应用本地 LiteLLM 端点、恢复切换前配置）
+- WebDAV 同步启用/禁用和设置
+- 路由追踪开关和可视化 HTML 报告
+- 服务日志、配置监听日志和最近请求日志查看器
+- 登录时自启动
+
+### 部署回退与路由
+
+模型组包含跨供应商的多个部署。回退按配置的部署 `order` 排序：
+
+1. **同序对等回退** — 某部署失败时，代理首先尝试同一 `order` 值下不同供应商或 API 密钥的部署。
+2. **下一序回退** — 无同序对等部署可用时，代理前进到下一个更高的 `order`。
+3. **环绕回退** — 失败部署已是最高序时，代理环绕到最低可用序。
+
+部署冷却机制临时排除出现重复失败的部署。冷却与请求本地排除相互独立，且不计入请求格式错误、上下文窗口错误、能力错误或正常限流轮询作为硬性部署失败。
+
+路由约束补丁将排除和冷却直接集成到 LiteLLM 的 `Router._get_all_deployments` 和 `get_available_deployment` 中，使所有路由路径均遵循当前约束。
+
+### Responses API 兼容
+
+许多上游供应商仅提供 Chat Completions API（`/v1/chat/completions`），不提供 Responses API（`/v1/responses`）。LiteLLM Menu 内置 Responses 桥接器，当所选路由不支持 Responses 端点时，将 Responses API 请求透明转换为 Chat Completions 格式。
+
+桥接器处理以下内容：
+
+- **工具映射** — Responses 的 `function`、`custom` 和 `tool_search` 工具类型转换为 Chat Completions 的 function 工具。项 ID 和工具调用 ID 予以保留。
+- **接口偏好** — 部署按上游 URL 接口优先排序（`openai/responses` > `openai/chat` > `anthropic`）。存在支持 Responses 的部署时优先选择。
+- **预emptive 桥接** — 路由元数据表明部署仅支持 Chat Completions 时，在调用上游前即完成转换，无需等待失败。
+- **流式转换** — Chat Completions 流式数据块转换为 Responses 流式事件（`response.created`、`response.output_item.added`、`response.output_text.delta`、`response.completed`），供期望 Responses 流式的客户端使用。
+
+### 图像生成工具适配
+
+包含 `tools: [{"type": "image_generation"}]` 的 Responses API 请求被路由到在 `model_info` 中声明 `supports_responses_image_generation_tool: true` 的部署。路由由结构化元数据决定，而非提示词内容或供应商名称。
+
+当能力部署返回空响应或明确的图像工具不可用拒绝时，代理以强制 `tool_choice: {"type": "image_generation"}` 重试同一模型组。内联图像 data URL 受到大小限制，以防止过大负载破坏兼容供应商。
+
+独立图像模型路由（`/v1/images/generations`）与 Responses 图像生成工具分开处理。
+
+### 视觉桥接
+
+当请求包含图像输入且所选路由返回视觉不支持的错误时，视觉桥接器将请求中的图像内容替换为文本视觉上下文，并重试原始路由。
+
+桥接器有三种模式：
+
+- **`auto`**（默认）— 先尝试已配置的 OpenAI 兼容视觉端点，失败后回退到内置本地 Vision OCR 辅助工具。
+- **`api`** — 仅使用已配置的视觉端点。
+- **`local`** — 仅使用内置 `vision_ocr` 二进制工具，该工具利用 macOS Vision 框架进行 OCR 文本识别和矩形检测，生成布局摘要。
+
+桥接器不会将用户的模型组切换到无关的聊天路由。它移除原始请求中的图像部分，以文本形式附加视觉上下文，并重试同一路由。
+
+### 网页搜索桥接
+
+当 Responses API 请求包含 `web_search` 工具使用时：
+
+1. **原生托管搜索** — 路由元数据表明支持或支持状态未知时，优先在支持 Responses 的路由上尝试原生托管搜索。
+2. **外部桥接** — 路由仅支持聊天、明确不支持托管网页搜索，或返回不支持托管工具错误时激活。
+
+外部桥接使用 DDGS（DuckDuckGo Search）执行查询，使用可选的 Jina Reader 获取页面内容摘要。搜索参数 — 结果数量、页面读取数量、读取字符限制、区域、后端列表、获取超时、最大轮次、最大查询数、最大打开页面数 — 均可通过运行时设置配置。
+
+桥接器向模型暴露聚焦的搜索查询和来源 URL。查询规划由模型驱动；桥接器不添加特定于请求的查询重写。
+
+### Computer Facade
+
+Computer facade 为不支持原生 computer 工具的路由适配托管的 `computer-use` 工具请求。支持的后端：
+
+- `auto`（默认）、`browser`、`chrome`、`playwright`、`mcp`、`cua`、`mock`
+
+Facade 拦截 computer 动作调用，路由到已配置的后端，并返回观察结果。动作拒绝列表、最大步数、追踪日志和截图追踪可通过环境变量和运行时设置配置。
+
+### Codex 优化
+
+LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似 Responses API 客户端的定向优化：
+
+- **Codex 配置集成** — 菜单提供一键操作将 Codex 配置为使用本地 LiteLLM 端点。它将 `model_provider`、`model`、供应商 `base_url`、`wire_api: responses` 和 `OPENAI_API_KEY` 写入 `~/.codex/config.toml` 和 `~/.codex/auth.json`，自动备份切换前文件，并提供恢复操作。
+- **压缩控制** — 请求预处理添加 Codex 所需的压缩相关元数据和头信息。
+- **推理强度兼容** — 上游返回表明 `xhigh` 推理强度不支持的错误时，代理以兼容强度级别（`high` 或 `max`）重试，并记录兼容重试。
+- **用量归一化** — `response.completed` 事件的 `usage` 块被归一化为 Codex 期望的架构（`input_tokens`、`output_tokens`、`input_tokens_details.cached_tokens`、`output_tokens_details.reasoning_tokens`、`total_tokens`），包括从 Chat Completions 的 `prompt_tokens`/`completion_tokens` 命名转换。
+- **浏览器兼容头** — 对需要标准浏览器头的供应商，代理在重试时注入浏览器 User-Agent 和 Accept 头。
+- **内部上下文剥离** — Codex 内部上下文片段（环境上下文、权限、应用上下文、技能/插件指令）被识别并从追踪日志和请求摘要中排除。
+
+### WebDAV 配置同步
+
+通过 WebDAV 进行可选的双向配置同步。同步逻辑比较本地状态、远程状态和上次成功基线，决定推送、拉取还是合并。设置（URL、凭据、远程名称、同步间隔、超时）可通过菜单配置。同步的配置包可能包含 API 密钥；凭据以本地文件存储，文件权限设为 `0600`。
+
+### 路由追踪与可观测性
+
+路由追踪日志记录部署选择、回退决策、接口桥接、视觉桥接重写、网页搜索桥接活动、图像生成回退和流式错误恢复。追踪以 HTML 报告形式查看，包含每个请求的卡片，展示部署元数据、事件时间线、工具调用详情和会话上下文。
+
+最近请求日志以 JSONL 格式存储路由和状态元数据。不存储提示词正文、消息内容、授权头和 API 密钥。
+
+### 配置监听与验证
+
+由 launchd 支持的配置监听器监控 `config.yaml` 的变更。检测到变更后，验证配置，将验证通过的配置暂存到 `.litellm-runtime/config.yaml`，并要求显式的应用/重启操作才能激活。监听器不会在每次文件写入时静默重启服务。运行时服务始终从暂存的运行时配置启动，而非可编辑的源配置。
+
+---
+
+## 安装
+
+### 系统要求
+
+- macOS 13.0 或更高版本
+- [uv](https://docs.astral.sh/uv/) 包管理器（通过 Homebrew 自动安装，或设置 `LITELLM_UV_BIN` 指向自定义路径）
+
+### Homebrew 安装（推荐）
+
+```bash
+brew tap ysdj/litellm-menu
+brew install litellm-menu
+```
+
+安装后：
+
+```bash
+litellm-menu open
+```
+
+此命令构建应用包（如需要）并启动菜单栏应用。应用在首次启动时创建私有 Python 运行时。
+
+### 手动构建
+
+克隆仓库并构建应用包：
+
+```bash
+git clone https://github.com/ysdj/litellm-menu.git
+cd litellm-menu
+./mac_menu/build.sh
+```
+
+构建的应用默认放置于 `/Applications/LiteLLM Menu.app`。使用自定义安装路径：
+
+```bash
+LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
+```
+
+启动应用：
+
+```bash
+./app.sh open
+```
+
+### 首次启动
+
+1. 从菜单栏图标（"LL" 状态项）打开 LiteLLM Menu。
+2. 应用使用 `uv` 引导私有 Python 运行时并启动本地 LiteLLM 代理。
+3. 点击 **Edit Models Config** 配置供应商、API 密钥、模型和部署顺序。
+4. 点击 **Apply Config**（或重启服务）暂存并激活配置。
+5. 可选：点击 **Configure Codex for LiteLLM** 将 Codex 指向本地端点。
+
+---
+
+## 配置
+
+主配置文件为 `~/.litellm-menu/config.yaml`。仓库提供已脱敏的示例文件 `config.example.yaml`。
+
+### 主要配置段
+
+- **`providers`** — 命名供应商组，包含 `api_base` 和 `api_keys`（每个密钥有 `name`、`value` 和 `enabled` 标志）。
+- **`model_list`** — 模型组条目，包含 `litellm_params`（model、api_base、api_key、order）和 `model_info`（id、provider、route_key、api_key_name、能力标志）。
+- **`litellm_settings`** — 回调注册、`public_model_groups`、`drop_params`。
+- **`router_settings`** — 路由策略、重试策略、最大回退数、冷却配置。
+- **`general_settings`** — 主密钥、UI 开关。
+
+### 能力标志
+
+每个部署的 `model_info` 支持：
+
+- `supports_responses_endpoint` — 上游是否支持 Responses API。
+- `supports_responses_image_generation_tool` — 上游是否支持 Responses 图像生成工具。
+- `upstream_url_surface` — API 接口（`openai/responses`、`openai/chat`、`anthropic`）。
+- `supports_responses_web_search` / `supports_web_search` — 网页搜索能力。
+
+### 运行时设置
+
+可通过菜单调整，无需编辑配置文件：
+
+| 设置项 | 环境变量 | 默认值 |
+|---|---|---|
+| 停滞超时 | `LITELLM_MENU_STALL_TIMEOUT_SECONDS` | 120 |
+| 请求超时 | `LITELLM_MENU_REQUEST_TIMEOUT_SECONDS` | 7200 |
+| 部署冷却失败次数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
+| 部署冷却秒数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
+| 网页搜索最大结果数 | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 8 |
+| 网页搜索读取结果数 | `LITELLM_MENU_WEB_SEARCH_READ_RESULTS` | 4 |
+| 网页获取超时 | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 30 |
+| 视觉桥接后端 | `LITELLM_MENU_VISION_BRIDGE_BACKEND` | auto |
+| 视觉桥接模型 | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
+| Computer facade 后端 | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
+| Computer facade 最大步数 | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
+| 路由恢复间隔 | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
+
+---
+
+## 命令行使用
+
+`app.sh` 脚本提供应用级控制：
+
+```bash
+./app.sh open      # 启动或聚焦菜单应用（需要时构建）
+./app.sh restart   # 重新构建、停止并重启
+./app.sh close     # 停止服务并退出应用
+./app.sh version   # 输出应用版本
+```
+
+`service.sh` 脚本提供直接服务控制（Homebrew 安装后也可通过 `litellm-menu-service` 使用）：
+
+```bash
+litellm-menu-service status
+litellm-menu-service start
+litellm-menu-service stop
+litellm-menu-service restart
+litellm-menu-service tail
+litellm-menu-service route-trace-html
+```
+
+---
+
+## 开发
+
+### 运行测试
+
+```bash
+./scripts/test.sh
+```
+
+指定测试：
+
+```bash
+./scripts/test.sh test_hooks_routing
+```
+
+### 构建应用
+
+修改 Swift 源码、Python 服务代码、服务脚本或内置资源后：
+
+```bash
+./mac_menu/build.sh
+```
+
+验证已安装应用行为的完整路径：构建应用、重启实际的菜单所辖服务、然后在正常的本地服务上验证。
+
+### 版本管理
+
+`VERSION`、`BUILD_NUMBER`、`mac_menu/Info.plist` 和 `Formula/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
+
+---
+
+## 许可证
+
+MIT 许可证。详见 [LICENSE](LICENSE)。
