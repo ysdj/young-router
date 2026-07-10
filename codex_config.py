@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 
@@ -34,11 +33,15 @@ def default_config_yaml() -> Path:
 
 CONFIG_YAML = default_config_yaml()
 DEFAULT_PROVIDER = "newapi"
-DEFAULT_WIRE_API = "responses"
-DEFAULT_MODEL = "default-chat"
 LOCAL_HOST = "127.0.0.1"
 DEFAULT_LOCAL_PORT = "4000"
 LOCAL_CONFIG_STATE_FILE = ".litellm-menu-codex-local-config-state.json"
+LOCAL_CONFIG_STATE_SCHEMA_VERSION = 2
+PROVIDER_MANAGED_VALUES = {
+    "base_url": None,
+    "wire_api": "responses",
+    "requires_openai_auth": True,
+}
 
 
 def local_port() -> str:
@@ -158,38 +161,115 @@ def set_table_values(text: str, table: str, values: dict[str, object]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def cleanup_legacy_backups(path: Path, keep: Path) -> None:
-    for pattern in (f"{path.name}.bak-*", f"{path.name}.pre-restore-bak-*"):
-        for backup_path in path.parent.glob(pattern):
-            if backup_path == keep or not backup_path.is_file():
-                continue
-            backup_path.unlink()
+def strip_inline_toml_comment(value: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, char in enumerate(value):
+        if in_double:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_double = False
+            continue
+        if in_single:
+            if char == "'":
+                in_single = False
+            continue
+        if char == '"':
+            in_double = True
+        elif char == "'":
+            in_single = True
+        elif char == "#":
+            return value[:index].rstrip()
+    return value.strip()
 
 
-def backup(path: Path) -> Path | None:
-    backup_path = path.with_name(f"{path.name}.bak")
-    cleanup_legacy_backups(path, backup_path)
-    if not path.exists():
-        return None
-    shutil.copy2(path, backup_path)
-    return backup_path
+def parse_toml_scalar(value: str) -> object:
+    raw = strip_inline_toml_comment(value).strip()
+    if raw.startswith('"'):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"unsupported TOML string: {raw}") from exc
+    if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
+        return raw[1:-1]
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    if re.fullmatch(r"[+-]?\d+", raw):
+        return int(raw)
+    if re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?", raw):
+        return float(raw)
+    raise ValueError(f"unsupported TOML scalar: {raw}")
 
 
-def existing_backup(path: Path) -> Path | None:
-    backup_path = path.with_name(f"{path.name}.bak")
-    cleanup_legacy_backups(path, backup_path)
-    return backup_path if backup_path.is_file() else None
+def key_value_in_range(lines: list[str], start: int, end: int, key: str) -> tuple[bool, object | None]:
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=\s*(.*)$")
+    for index in range(start, end):
+        if lines[index].lstrip().startswith("#"):
+            continue
+        match = pattern.match(lines[index])
+        if match:
+            return True, parse_toml_scalar(match.group(1))
+    return False, None
 
 
-def copy_file_atomic(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f".{target.name}.tmp-{os.getpid()}")
-    try:
-        shutil.copy2(source, tmp)
-        tmp.replace(target)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+def top_level_value(text: str, key: str) -> tuple[bool, object | None]:
+    lines = split_lines(text)
+    return key_value_in_range(lines, 0, first_table_index(lines), key)
+
+
+def table_value(text: str, table: str, key: str) -> tuple[bool, object | None]:
+    lines = split_lines(text)
+    bounds = table_bounds(lines, table)
+    if bounds is None:
+        return False, None
+    start, end = bounds
+    return key_value_in_range(lines, start + 1, end, key)
+
+
+def remove_top_level_key(text: str, key: str) -> str:
+    lines = split_lines(text)
+    limit = first_table_index(lines)
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    lines = [line for index, line in enumerate(lines) if index >= limit or not pattern.match(line)]
+    return "\n".join(lines).rstrip() + "\n" if lines else ""
+
+
+def remove_table_key(text: str, table: str, key: str, *, remove_empty_table: bool = False) -> str:
+    lines = split_lines(text)
+    bounds = table_bounds(lines, table)
+    if bounds is None:
+        return "\n".join(lines).rstrip() + "\n" if lines else ""
+
+    start, end = bounds
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    index = start + 1
+    while index < end:
+        if pattern.match(lines[index]):
+            del lines[index]
+            end -= 1
+            continue
+        index += 1
+
+    if remove_empty_table and all(not line.strip() for line in lines[start + 1 : end]):
+        del lines[start:end]
+    return "\n".join(lines).rstrip() + "\n" if lines else ""
+
+
+def remove_empty_table(text: str, table: str) -> str:
+    lines = split_lines(text)
+    bounds = table_bounds(lines, table)
+    if bounds is None:
+        return "\n".join(lines).rstrip() + "\n" if lines else ""
+    start, end = bounds
+    if all(not line.strip() for line in lines[start + 1 : end]):
+        del lines[start:end]
+    return "\n".join(lines).rstrip() + "\n" if lines else ""
 
 
 def write_atomic(path: Path, text: str, mode: int | None) -> None:
@@ -214,35 +294,16 @@ def load_local_config_state(home: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def local_config_state_active(home: Path, old_config: str) -> bool:
-    state = load_local_config_state(home)
-    if state.get("active") is not True:
-        return False
-    if state.get("target_base_url") != LOCAL_BASE_URL:
-        return False
-    if LOCAL_BASE_URL not in old_config:
-        return False
-    return (home / "config.toml.bak").is_file() or (home / "auth.json.bak").is_file()
+def local_config_state_active(state: dict) -> bool:
+    return (
+        state.get("schema_version") == LOCAL_CONFIG_STATE_SCHEMA_VERSION
+        and state.get("active") is True
+        and isinstance(state.get("config"), dict)
+        and isinstance(state.get("auth"), dict)
+    )
 
 
-def write_local_config_state(
-    home: Path,
-    *,
-    model: str,
-    provider: str,
-    api_base: str,
-    config_backup: Path | None,
-    auth_backup: Path | None,
-) -> None:
-    state = {
-        "schema_version": 1,
-        "active": True,
-        "target_base_url": api_base,
-        "target_model": model,
-        "target_model_provider": provider,
-        "config_backup": str(config_backup) if config_backup else None,
-        "auth_backup": str(auth_backup) if auth_backup else None,
-    }
+def write_local_config_state(home: Path, state: dict) -> None:
     write_atomic(local_config_state_path(home), json.dumps(state, indent=2) + "\n", 0o600)
 
 
@@ -253,7 +314,7 @@ def clear_local_config_state(home: Path) -> None:
         pass
 
 
-def update_auth(path: Path, api_key: str) -> tuple[dict, int | None]:
+def load_auth(path: Path) -> tuple[dict, int]:
     mode = None
     if path.exists():
         mode = path.stat().st_mode & 0o777
@@ -263,15 +324,88 @@ def update_auth(path: Path, api_key: str) -> tuple[dict, int | None]:
             raise ValueError(f"{path} must contain a JSON object")
     else:
         auth = {}
-    auth["OPENAI_API_KEY"] = api_key
     if mode is None:
         mode = 0o600
     return auth, mode
 
 
+def field_snapshot(present: bool, value: object | None) -> dict:
+    snapshot = {"present": present}
+    if present:
+        snapshot["value"] = value
+    return snapshot
+
+
+def capture_initial_state(
+    *,
+    config_path: Path,
+    auth_path: Path,
+    old_config: str,
+    old_auth: dict,
+    provider: str,
+) -> dict:
+    table = f"model_providers.{provider}"
+    top_present, top_value = top_level_value(old_config, "model_provider")
+    provider_fields = {
+        key: field_snapshot(*table_value(old_config, table, key))
+        for key in PROVIDER_MANAGED_VALUES
+    }
+    return {
+        "schema_version": LOCAL_CONFIG_STATE_SCHEMA_VERSION,
+        "active": True,
+        "target_base_url": LOCAL_BASE_URL,
+        "target_model_provider": provider,
+        "config": {
+            "file_present": config_path.exists(),
+            "top_level": {
+                "model_provider": field_snapshot(top_present, top_value),
+            },
+            "providers": {
+                provider: {
+                    "table_present": table_bounds(split_lines(old_config), table) is not None,
+                    "fields": provider_fields,
+                }
+            },
+        },
+        "auth": {
+            "file_present": auth_path.exists(),
+            "OPENAI_API_KEY": field_snapshot(
+                "OPENAI_API_KEY" in old_auth,
+                old_auth.get("OPENAI_API_KEY"),
+            ),
+        },
+    }
+
+
+def ensure_provider_snapshot(state: dict, old_config: str, provider: str) -> None:
+    config_state = state["config"]
+    providers = config_state.setdefault("providers", {})
+    if provider in providers:
+        return
+    table = f"model_providers.{provider}"
+    providers[provider] = {
+        "table_present": table_bounds(split_lines(old_config), table) is not None,
+        "fields": {
+            key: field_snapshot(*table_value(old_config, table, key))
+            for key in PROVIDER_MANAGED_VALUES
+        },
+    }
+
+
+def restore_top_level_field(text: str, key: str, snapshot: dict) -> str:
+    if snapshot.get("present") is True:
+        return set_top_level_key(text, key, snapshot.get("value"))
+    return remove_top_level_key(text, key)
+
+
+def restore_table_field(text: str, table: str, key: str, snapshot: dict) -> str:
+    if snapshot.get("present") is True:
+        return set_table_values(text, table, {key: snapshot.get("value")})
+    return remove_table_key(text, table, key)
+
+
 def update_codex_files(
     *,
-    model: str,
     api_base: str,
     api_key: str,
     summary: str,
@@ -283,46 +417,45 @@ def update_codex_files(
 
     old_config = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     config_mode = (config_path.stat().st_mode & 0o777) if config_path.exists() else 0o600
-    old_auth, auth_mode = update_auth(auth_path, api_key)
+    old_auth, auth_mode = load_auth(auth_path)
+    state = load_local_config_state(home)
+    if not local_config_state_active(state):
+        state = capture_initial_state(
+            config_path=config_path,
+            auth_path=auth_path,
+            old_config=old_config,
+            old_auth=old_auth,
+            provider=provider,
+        )
+    else:
+        ensure_provider_snapshot(state, old_config, provider)
+        state["target_base_url"] = api_base
+        state["target_model_provider"] = provider
 
     new_config = set_top_level_key(old_config, "model_provider", provider)
-    new_config = set_top_level_key(new_config, "model", model)
     new_config = set_table_values(
         new_config,
         f"model_providers.{provider}",
         {
-            "name": provider,
             "base_url": api_base,
-            "wire_api": DEFAULT_WIRE_API,
+            "wire_api": "responses",
             "requires_openai_auth": True,
         },
     )
-    new_auth = json.dumps(old_auth, indent=2, ensure_ascii=False) + "\n"
+    new_auth_object = dict(old_auth)
+    new_auth_object["OPENAI_API_KEY"] = api_key
+    new_auth = json.dumps(new_auth_object, indent=2, ensure_ascii=False) + "\n"
 
-    if local_config_state_active(home, old_config):
-        config_backup = existing_backup(config_path)
-        auth_backup = existing_backup(auth_path)
-    else:
-        config_backup = backup(config_path)
-        auth_backup = backup(auth_path)
+    write_local_config_state(home, state)
     write_atomic(config_path, new_config, config_mode)
     write_atomic(auth_path, new_auth, auth_mode)
-    write_local_config_state(
-        home,
-        model=model,
-        provider=provider,
-        api_base=api_base,
-        config_backup=config_backup,
-        auth_backup=auth_backup,
-    )
 
     print(summary)
-    print(f"model: {model}")
+    print(f"model_provider: {provider}")
     print(f"base_url: {api_base}")
     print(f"config: {config_path}")
     print(f"auth: {auth_path}")
-    print(f"saved pre-switch config file: {config_backup if config_backup else '(new file)'}")
-    print(f"saved pre-switch auth file: {auth_backup if auth_backup else '(new file)'}")
+    print(f"saved pre-switch managed fields: {local_config_state_path(home)}")
     print("Restart Codex to apply.")
 
 
@@ -334,9 +467,7 @@ def apply_local() -> None:
         else None
     )
     api_key = str(master_key or "sk-local-litellm")
-    model = os.environ.get("CODEX_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     update_codex_files(
-        model=model,
         api_base=LOCAL_BASE_URL,
         api_key=api_key,
         summary="Codex config updated to use the local LiteLLM service.",
@@ -346,33 +477,50 @@ def apply_local() -> None:
 def reapply_pre_switch() -> None:
     home = codex_home()
     state = load_local_config_state(home)
-    if state.get("active") is not True or state.get("target_base_url") != LOCAL_BASE_URL:
+    if not local_config_state_active(state):
         raise FileNotFoundError("No active pre-switch Codex config state found. Nothing to reapply.")
 
-    files = [home / "config.toml", home / "auth.json"]
-    restored: list[tuple[Path, Path]] = []
-    missing: list[Path] = []
+    config_path = home / "config.toml"
+    auth_path = home / "auth.json"
+    config_mode = (config_path.stat().st_mode & 0o777) if config_path.exists() else 0o600
+    auth, auth_mode = load_auth(auth_path)
+    config = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
 
-    for path in files:
-        backup_path = path.with_name(f"{path.name}.bak")
-        cleanup_legacy_backups(path, backup_path)
-        if not backup_path.is_file():
-            missing.append(backup_path)
-            continue
-        copy_file_atomic(backup_path, path)
-        restored.append((path, backup_path))
+    config_state = state["config"]
+    top_level = config_state.get("top_level", {})
+    config = restore_top_level_field(config, "model_provider", top_level["model_provider"])
+    for provider, provider_state in config_state.get("providers", {}).items():
+        table = f"model_providers.{provider}"
+        for key, snapshot in provider_state.get("fields", {}).items():
+            config = restore_table_field(config, table, key, snapshot)
+        if provider_state.get("table_present") is not True:
+            config = remove_empty_table(config, table)
 
-    if not restored:
-        missing_text = "\n".join(f"missing saved pre-switch file: {path}" for path in missing)
-        raise FileNotFoundError(f"No saved pre-switch Codex config files found.\n{missing_text}")
+    auth_state = state["auth"]
+    key_state = auth_state["OPENAI_API_KEY"]
+    if key_state.get("present") is True:
+        auth["OPENAI_API_KEY"] = key_state.get("value")
+    else:
+        auth.pop("OPENAI_API_KEY", None)
 
-    print("Codex config reapplied from saved pre-switch files.")
-    for path, backup_path in restored:
-        print(f"reapplied: {path}")
-        print(f"from saved file: {backup_path}")
-    for path in missing:
-        print(f"missing saved pre-switch file: {path}")
+    if config_state.get("file_present") is not True and not config.strip():
+        try:
+            config_path.unlink()
+        except FileNotFoundError:
+            pass
+    else:
+        write_atomic(config_path, config, config_mode)
+    if auth_state.get("file_present") is not True and not auth:
+        try:
+            auth_path.unlink()
+        except FileNotFoundError:
+            pass
+    else:
+        write_atomic(auth_path, json.dumps(auth, indent=2, ensure_ascii=False) + "\n", auth_mode)
     clear_local_config_state(home)
+    print("Codex pre-switch managed fields reapplied.")
+    print(f"config: {config_path}")
+    print(f"auth: {auth_path}")
     print("Restart Codex to apply.")
 
 

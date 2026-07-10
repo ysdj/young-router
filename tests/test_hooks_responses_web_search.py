@@ -211,7 +211,6 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                 "route_key": "provider_chat / openai/vendor-chat / key=default / order=1",
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat"],
-                "supports_responses_endpoint": False,
             },
         )
 

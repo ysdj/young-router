@@ -27,7 +27,8 @@ model_list:
       provider: primary
       route_key: primary / openai/chat-model / key=default / order=1
       api_key_name: default
-      supports_responses_endpoint: true
+      upstream_url_surface: openai/responses
+      supported_upstream_url_surfaces: [openai/responses]
       supports_responses_image_generation_tool: false
 
   - model_name: default-chat
@@ -41,7 +42,8 @@ model_list:
       provider: backup
       route_key: backup / openai/chat-model / key=default / order=2
       api_key_name: default
-      supports_responses_endpoint: true
+      upstream_url_surface: openai/responses
+      supported_upstream_url_surfaces: [openai/responses]
       supports_responses_image_generation_tool: false
 
   - model_name: fast-chat
@@ -55,7 +57,8 @@ model_list:
       provider: backup
       route_key: backup / openai/fast-chat-model / key=default / order=1
       api_key_name: default
-      supports_responses_endpoint: true
+      upstream_url_surface: openai/responses
+      supported_upstream_url_surfaces: [openai/responses]
 
   - model_name: image-chat
     litellm_params:
@@ -68,7 +71,8 @@ model_list:
       provider: image
       route_key: image / openai/chat-model-with-image-tool / key=default / order=1
       api_key_name: default
-      supports_responses_endpoint: true
+      upstream_url_surface: openai/responses
+      supported_upstream_url_surfaces: [openai/responses]
       supports_responses_image_generation_tool: true
 
   - model_name: image-model
@@ -82,6 +86,9 @@ model_list:
       provider: image
       route_key: image / openai/image-generation-model / key=default / order=1
       api_key_name: default
+      mode: image_generation
+      upstream_url_surface: openai/responses
+      supported_upstream_url_surfaces: [openai/responses]
 
   - model_name: image-model
     litellm_params:
@@ -94,6 +101,9 @@ model_list:
       provider: backup
       route_key: backup / openai/image-generation-model-compatible / key=default / order=2
       api_key_name: default
+      mode: image_generation
+      upstream_url_surface: openai/responses
+      supported_upstream_url_surfaces: [openai/responses]
 
 litellm_settings:
   drop_params: true

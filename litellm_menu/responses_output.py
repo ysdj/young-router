@@ -140,6 +140,11 @@ def _responses_custom_tool_names(
             _responses_tools_module._responses_input_tool_search_output_tools(request_input)
         )
     )
+    names.update(
+        _responses_custom_tool_names_from_tools(
+            _responses_tools_module._responses_input_additional_tools(request_input)
+        )
+    )
     return names
 
 
@@ -153,6 +158,11 @@ def _responses_namespace_tool_map(
     namespace_by_name.update(
         _responses_namespace_tool_map_from_tools(
             _responses_tools_module._responses_input_tool_search_output_tools(request_input)
+        )
+    )
+    namespace_by_name.update(
+        _responses_namespace_tool_map_from_tools(
+            _responses_tools_module._responses_input_additional_tools(request_input)
         )
     )
     return namespace_by_name

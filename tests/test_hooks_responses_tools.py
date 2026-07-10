@@ -242,6 +242,60 @@ class HookResponsesToolBridgeTests(HookTestCase):
 
         self.assertIsNone(bridge_kwargs)
 
+    def test_codex_additional_tools_are_lifted_for_responses_function_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "balanced-chat",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "apply_patch",
+                            "description": "Edit files.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Edit the file."},
+            ],
+            "stream": True,
+            "tools": [],
+            "model_info": {
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
+            },
+        }
+
+        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+            request_kwargs
+        )
+
+        self.assertIsNotNone(bridge_kwargs)
+        assert bridge_kwargs is not None
+        self.assertEqual([tool["name"] for tool in bridge_kwargs["tools"]], ["apply_patch"])
+        self.assertTrue(
+            bridge_kwargs["tools"][0][hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY]
+        )
+        self.assertNotIn(
+            "additional_tools",
+            json.dumps(bridge_kwargs["input"], ensure_ascii=False),
+        )
+        metadata = bridge_kwargs["litellm_metadata"]
+        self.assertEqual(
+            metadata["responses_function_tool_bridge_input_sanitized"],
+            {
+                "changed": True,
+                "dropped_tool_search_items": 0,
+                "dropped_additional_tools_items": 1,
+            },
+        )
+
     def test_native_openai_route_does_not_preemptively_bridge_codex_tools(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
@@ -273,7 +327,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
 
         self.assertIsNone(bridge_kwargs)
 
-    async def test_preemptive_chat_bridge_retries_xhigh_only_after_explicit_error(self) -> None:
+    async def test_selected_chat_surface_retries_xhigh_only_after_explicit_error(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
 
@@ -297,6 +351,8 @@ class HookResponsesToolBridgeTests(HookTestCase):
             model="balanced-chat",
             input="试一下computeruse",
             reasoning={"effort": "xhigh"},
+            use_chat_completions_api=True,
+            _litellm_menu_upstream_url_surface="openai/chat",
             tools=[
                 {"type": "tool_search"},
                 {
@@ -334,8 +390,8 @@ class HookResponsesToolBridgeTests(HookTestCase):
             ]
         )
         self.assertEqual(
-            [tool["name"] for tool in calls[1]["tools"]],
-            ["tool_search", "spawn_agent"],
+            [tool.get("type") for tool in calls[1]["tools"]],
+            ["tool_search", "namespace"],
         )
 
     async def test_generic_response_wrapper_does_not_retry_non_responses_404(self) -> None:

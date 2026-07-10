@@ -23,6 +23,7 @@ class ControlConfigSourceTests(unittest.TestCase):
         checkout.mkdir()
         shutil.copy2(CONTROL, checkout / "service.sh")
         shutil.copytree(ROOT / "service", checkout / "service")
+        shutil.copytree(ROOT / "config_editor_core", checkout / "config_editor_core")
         (checkout / "service.sh").chmod(0o755)
         callback_package = checkout / "litellm_menu"
         callback_package.mkdir()
@@ -78,6 +79,8 @@ class ControlConfigSourceTests(unittest.TestCase):
                           model: openai/checkout-model
                         model_info:
                           id: c0dec001
+                          upstream_url_surface: openai/responses
+                          supported_upstream_url_surfaces: [openai/responses]
                     """
                 ).lstrip(),
                 encoding="utf-8",
@@ -102,12 +105,12 @@ class ControlConfigSourceTests(unittest.TestCase):
             runtime = temp / "runtime"
             runtime.mkdir()
             (checkout / "config.yaml").write_text(
-                "model_list: [{model_name: checkout-model, litellm_params: {model: openai/checkout}, model_info: {id: c0dec002}}]\n",
+                "model_list: [{model_name: checkout-model, litellm_params: {model: openai/checkout}, model_info: {id: c0dec002, upstream_url_surface: openai/responses, supported_upstream_url_surfaces: [openai/responses]}}]\n",
                 encoding="utf-8",
             )
             runtime_config_source = runtime / "config.yaml"
             runtime_config_source.write_text(
-                "model_list: [{model_name: runtime-model, litellm_params: {model: openai/runtime}, model_info: {id: c0dec003}}]\n",
+                "model_list: [{model_name: runtime-model, litellm_params: {model: openai/runtime}, model_info: {id: c0dec003, upstream_url_surface: openai/responses, supported_upstream_url_surfaces: [openai/responses]}}]\n",
                 encoding="utf-8",
             )
 
@@ -123,6 +126,55 @@ class ControlConfigSourceTests(unittest.TestCase):
             model_info = staged_data["model_list"][0]["model_info"]
             self.assertEqual(model_info["id"], "c0dec003")
             self.assertFalse((staged.parent / "litellm_menu" / "callbacks.py").exists())
+
+    def test_unchanged_installed_config_is_not_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            checkout = self.make_checkout(temp)
+            home = temp / "home"
+            runtime = temp / "runtime"
+            runtime.mkdir()
+            source = runtime / "config.yaml"
+            source.write_text(
+                "model_list: [{model_name: default-chat, litellm_params: {model: openai/default-chat}, model_info: {id: c0dec004, upstream_url_surface: openai/responses, supported_upstream_url_surfaces: [openai/responses]}}]\n",
+                encoding="utf-8",
+            )
+            environment = {"LITELLM_RUNTIME_ROOT": str(runtime)}
+
+            first = self.run_stage(checkout, home, environment)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            staged = runtime / ".litellm-runtime/config.yaml"
+            first_stat = staged.stat()
+
+            second = self.run_stage(checkout, home, environment)
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("config.yaml unchanged", second.stdout)
+            second_stat = staged.stat()
+            self.assertEqual(first_stat.st_ino, second_stat.st_ino)
+            self.assertEqual(first_stat.st_mtime_ns, second_stat.st_mtime_ns)
+
+    def test_checkout_fast_path_requires_current_root_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            checkout = self.make_checkout(temp)
+            home = temp / "home"
+            source = checkout / "config.yaml"
+            source.write_text(
+                "model_list: [{model_name: default-chat, litellm_params: {model: openai/default-chat}, model_info: {id: c0dec005, upstream_url_surface: openai/responses, supported_upstream_url_surfaces: [openai/responses]}}]\n",
+                encoding="utf-8",
+            )
+
+            first = self.run_stage(checkout, home)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            root_mirror = home / ".litellm-menu/config.yaml"
+            root_mirror.write_text("model_list: []\n", encoding="utf-8")
+
+            second = self.run_stage(checkout, home)
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("Mirrored checkout config", second.stdout)
+            self.assertEqual(root_mirror.read_bytes(), source.read_bytes())
 
     def test_stage_config_does_not_augment_context_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -140,6 +192,8 @@ class ControlConfigSourceTests(unittest.TestCase):
                     model_info:
                       id: 1234abcd
                       provider: example
+                      upstream_url_surface: openai/responses
+                      supported_upstream_url_surfaces: [openai/responses]
                 """
             ).lstrip()
             checkout_config.write_text(source_text, encoding="utf-8")
@@ -153,7 +207,7 @@ class ControlConfigSourceTests(unittest.TestCase):
             runtime_config = home / ".litellm-menu/.litellm-runtime/config.yaml"
             self.assertEqual(runtime_config.read_text(encoding="utf-8"), source_text)
 
-    def test_stage_config_removes_explicit_context_metadata(self) -> None:
+    def test_stage_config_rejects_removed_context_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             checkout = self.make_checkout(temp)
@@ -180,19 +234,9 @@ class ControlConfigSourceTests(unittest.TestCase):
 
             result = self.run_stage(checkout, home)
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn("Applied learned context metadata", result.stdout)
-            self.assertIn("Removed legacy context metadata", result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unsupported max_input_tokens", result.stderr)
             self.assertEqual(checkout_config.read_text(encoding="utf-8"), source_text)
-
-            runtime_config = home / ".litellm-menu/.litellm-runtime/config.yaml"
-            staged = yaml.safe_load(runtime_config.read_text(encoding="utf-8"))
-            model_info = staged["model_list"][0]["model_info"]
-            self.assertEqual(model_info["max_output_tokens"], 32768)
-            self.assertEqual(model_info["max_tokens"], 32768)
-            self.assertNotIn("max_input_tokens", model_info)
-            self.assertNotIn("context_metadata_source", model_info)
-            self.assertNotIn("context_metadata_model_id", model_info)
 
 
 if __name__ == "__main__":

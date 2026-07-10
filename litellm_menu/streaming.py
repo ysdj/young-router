@@ -4,6 +4,7 @@ from . import computer_facade as _computer_facade_module
 from . import image_generation as _image_generation_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
+from . import responses_tools as _responses_tools_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
 from . import state as _state_module
@@ -1519,10 +1520,15 @@ def _apply_streaming_error_fallback_constraints(
 
     peer_entry = _responses_execution_module._ordered_deployment_fallback_entry(router, exception, request_data)
     if peer_entry is not None:
-        if "_target_order" in peer_entry:
-            payload["_target_order"] = peer_entry["_target_order"]
-        if "_excluded_deployment_ids" in peer_entry:
-            payload["_excluded_deployment_ids"] = peer_entry["_excluded_deployment_ids"]
+        for key in (
+            "_target_order",
+            "_excluded_deployment_ids",
+            "_litellm_menu_upstream_url_surface",
+            "_litellm_menu_attempted_upstream_url_surfaces",
+            "_litellm_menu_surface_target_deployment_id",
+        ):
+            if key in peer_entry:
+                payload[key] = peer_entry[key]
         return
 
     def explicit_request_order() -> Optional[int]:
@@ -1594,6 +1600,24 @@ async def _streaming_error_fallback_response(
     if method_name is None:
         return None
 
+    if getattr(exception, "responses_stream_incomplete", False):
+        current_surface = _routing_module._request_current_upstream_surface(
+            request_data
+        ) or _routing_module._deployment_primary_surface(
+            {"model_info": _image_generation_module._request_model_info(request_data)}
+        )
+        if current_surface:
+            attempted_surfaces = _routing_module._request_attempted_upstream_surfaces(
+                request_data
+            )
+            if current_surface not in attempted_surfaces:
+                attempted_surfaces.append(current_surface)
+            _routing_module._set_request_surface_state(
+                request_data,
+                surface=current_surface,
+                attempted_surfaces=attempted_surfaces,
+                deployment_id=_routing_module._deployment_id_from_request(request_data),
+            )
     if (
         _routing_module._is_priority_deployment_failover_error(exception)
         and not _routing_module._should_retry_same_deployment_before_fallback(exception)
@@ -1635,6 +1659,31 @@ async def _streaming_error_fallback_response(
         request_data,
         route_recovery_poll=route_recovery_poll,
     )
+    retry_surface = _routing_module._request_current_upstream_surface(payload)
+    if retry_surface in {
+        "openai/chat",
+        "anthropic",
+    }:
+        from . import responses_surfaces as _responses_surfaces_module
+
+        retry_metadata = (
+            _image_generation_module._request_metadata_dict(
+                payload, "litellm_metadata"
+            )
+            or {}
+        )
+        _responses_surfaces_module._with_responses_chat_bridge_compatible_tools(
+            payload,
+            retry_metadata,
+        )
+        bridge_input, input_stats = (
+            _responses_tools_module._responses_chat_bridge_input(
+                payload.get("input")
+            )
+        )
+        if input_stats.get("changed"):
+            payload["input"] = bridge_input
+        payload["litellm_metadata"] = retry_metadata
     router_method = getattr(llm_router, method_name, None)
     if router_method is None:
         raise RuntimeError(f"LiteLLM router does not support {method_name} streaming fallback")

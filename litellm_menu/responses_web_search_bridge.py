@@ -30,14 +30,12 @@ from .base import (
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
-    _RESPONSES_ENDPOINT_SUPPORT_KEY,
     _WEB_SEARCH_BRIDGE_FUNCTION_NAME,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
     _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
     _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
-    _UPSTREAM_URL_SURFACE_KEY,
     asyncio,
     copy,
     inspect,
@@ -2575,21 +2573,14 @@ def _external_web_search_message_response(
 
 def _external_web_search_chat_only_route(request_kwargs: Optional[dict]) -> bool:
     model_info = _image_generation_module._request_model_info(request_kwargs)
-    surface = model_info.get(_UPSTREAM_URL_SURFACE_KEY)
+    surface = _routing_module._request_current_upstream_surface(request_kwargs)
+    if not surface:
+        supported_surfaces = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+        if isinstance(supported_surfaces, list) and supported_surfaces:
+            surface = supported_surfaces[0]
     if surface in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
         return True
-
-    supported_surfaces = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
-    if isinstance(supported_surfaces, list) and supported_surfaces:
-        normalized = {
-            surface
-            for surface in supported_surfaces
-            if isinstance(surface, str) and surface.strip()
-        }
-        if normalized and normalized.issubset(_UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES):
-            return True
-
-    return model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is False
+    return False
 
 
 def _external_web_search_chat_synthesis_messages(

@@ -15,7 +15,10 @@ from .base import (
     List,
     Optional,
     _CHAT_TOOL_NAME_PATTERN,
+    _ATTEMPTED_UPSTREAM_URL_SURFACES_KEY,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
+    _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE,
+    _CURRENT_UPSTREAM_URL_SURFACE_KEY,
     _CURRENT_SELECTED_DEPLOYMENT,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _DEPLOYMENT_COOLDOWNS,
@@ -31,7 +34,6 @@ from .base import (
     _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_MAX,
     _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_TTL_SECONDS,
     _LITELLM_MODEL_GROUP_FALLBACK_EXHAUSTED_MARKERS,
-    _RESPONSES_ENDPOINT_SUPPORT_KEY,
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
     _RECOVERY_INTERVAL_DEFAULT_SECONDS,
     _RECOVERY_INTERVAL_SECONDS_ENV,
@@ -59,9 +61,12 @@ from .base import (
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
+    _SURFACE_TARGET_DEPLOYMENT_ID_KEY,
+    _UPSTREAM_URL_SURFACE_ANTHROPIC,
+    _UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY,
+    _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-    _UPSTREAM_URL_SURFACE_KEY,
     _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
     _XHIGH_REASONING_EFFORT,
     asyncio,
@@ -309,8 +314,6 @@ def _is_route_recovery_poll_payload(request_kwargs: Optional[dict]) -> bool:
 
 def _is_route_recovery_poll_error(exception: Exception) -> bool:
     if _is_context_size_error(exception):
-        return False
-    if _is_responses_endpoint_failover_error(exception):
         return False
     if _is_upstream_gateway_bad_request_error(exception):
         return False
@@ -811,6 +814,46 @@ def _deployment_cooldown_keys(
     return []
 
 
+def _deployment_cooldown_surface(request_kwargs: Optional[dict]) -> Optional[str]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    return _request_current_upstream_surface(request_kwargs) or None
+
+
+def _deployment_cooldown_request_for_current_surface() -> Optional[dict]:
+    surface = _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.get()
+    if surface:
+        return {_CURRENT_UPSTREAM_URL_SURFACE_KEY: surface}
+    return None
+
+
+def _deployment_cooldown_keys_for_request(
+    *,
+    deployment_id: Optional[str],
+    route_key: Optional[str],
+    request_kwargs: Optional[dict],
+) -> list[str]:
+    keys = _deployment_cooldown_keys(
+        deployment_id=deployment_id,
+        route_key=route_key,
+    )
+    surface = _deployment_cooldown_surface(request_kwargs)
+    if not surface:
+        model_info = _image_generation_module._request_model_info(request_kwargs)
+        raw_surfaces = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+        surfaces = []
+        if isinstance(raw_surfaces, list):
+            for raw_surface in raw_surfaces:
+                normalized = _normalized_deployment_surface(raw_surface)
+                if normalized and normalized not in surfaces:
+                    surfaces.append(normalized)
+        if len(surfaces) == 1:
+            surface = surfaces[0]
+    if surface:
+        return [f"{key}|surface:{surface}" for key in keys]
+    return keys
+
+
 def _deployment_cooldown_key_from_request(request_kwargs: Optional[dict]) -> Optional[str]:
     return _deployment_cooldown_key(
         deployment_id=_deployment_id_from_request(request_kwargs),
@@ -826,9 +869,10 @@ def _deployment_cooldown_key_from_deployment(deployment: Any) -> Optional[str]:
 
 
 def _deployment_cooldown_keys_from_request(request_kwargs: Optional[dict]) -> list[str]:
-    return _deployment_cooldown_keys(
+    return _deployment_cooldown_keys_for_request(
         deployment_id=_deployment_id_from_request(request_kwargs),
         route_key=_deployment_route_key_from_request(request_kwargs),
+        request_kwargs=request_kwargs,
     )
 
 
@@ -836,6 +880,17 @@ def _deployment_cooldown_keys_from_deployment(deployment: Any) -> list[str]:
     return _deployment_cooldown_keys(
         deployment_id=_image_generation_module._deployment_id(deployment),
         route_key=_deployment_route_key_from_deployment(deployment),
+    )
+
+
+def _deployment_cooldown_keys_from_deployment_for_request(
+    deployment: Any,
+    request_kwargs: Optional[dict],
+) -> list[str]:
+    return _deployment_cooldown_keys_for_request(
+        deployment_id=_image_generation_module._deployment_id(deployment),
+        route_key=_deployment_route_key_from_deployment(deployment),
+        request_kwargs=request_kwargs,
     )
 
 def _trace_deployment(value: Any) -> dict[str, Any]:
@@ -863,9 +918,7 @@ def _trace_deployment(value: Any) -> dict[str, Any]:
         "supports_responses_image_generation_tool": model_info.get(
             "supports_responses_image_generation_tool"
         ),
-        "upstream_url_surface": model_info.get(_UPSTREAM_URL_SURFACE_KEY),
         "supported_upstream_url_surfaces": model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY),
-        "supports_responses_endpoint": model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY),
         "supports_responses_image_input": model_info.get(_RESPONSES_IMAGE_INPUT_SUPPORT_KEY),
         "supports_responses_hosted_tools": model_info.get(
             _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY
@@ -889,20 +942,140 @@ def _normalized_deployment_surface(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     text = value.strip().lower()
-    aliases = {
-        "openai_chat": "openai/chat",
-        "openai_chat_completions": "openai/chat",
-        "openai-chat": "openai/chat",
-        "chat": "openai/chat",
-        "chat_completions": "openai/chat",
-        "openai_responses": _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-        "openai-responses": _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-        "responses": _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-        "anthropic_messages": "anthropic",
-        "anthropic/messages": "anthropic",
-        "claude": "anthropic",
-    }
-    return aliases.get(text, text)
+    return text if text in {
+        _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
+        _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
+        _UPSTREAM_URL_SURFACE_ANTHROPIC,
+    } else ""
+
+
+def _normalized_request_surface(value: Any) -> str:
+    surface = _normalized_deployment_surface(value)
+    if surface in {
+        _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
+        _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
+        _UPSTREAM_URL_SURFACE_ANTHROPIC,
+    }:
+        return surface
+    return ""
+
+
+def _request_current_upstream_surface(request_kwargs: Optional[dict]) -> str:
+    if not isinstance(request_kwargs, dict):
+        return ""
+    surface = _normalized_request_surface(
+        request_kwargs.get(_CURRENT_UPSTREAM_URL_SURFACE_KEY)
+    )
+    if surface:
+        return surface
+    for metadata_key in ("litellm_metadata", "metadata"):
+        metadata = _image_generation_module._request_metadata_dict(
+            request_kwargs, metadata_key
+        )
+        if not isinstance(metadata, dict):
+            continue
+        surface = _normalized_request_surface(
+            metadata.get(_CURRENT_UPSTREAM_URL_SURFACE_KEY)
+        )
+        if surface:
+            return surface
+    return ""
+
+
+def _request_attempted_upstream_surfaces(request_kwargs: Optional[dict]) -> list[str]:
+    if not isinstance(request_kwargs, dict):
+        return []
+    raw_values: Any = request_kwargs.get(_ATTEMPTED_UPSTREAM_URL_SURFACES_KEY)
+    if raw_values is None:
+        metadata = _image_generation_module._request_metadata_dict(
+            request_kwargs, "litellm_metadata"
+        ) or {}
+        raw_values = metadata.get(_ATTEMPTED_UPSTREAM_URL_SURFACES_KEY)
+    if not isinstance(raw_values, list):
+        return []
+    surfaces: list[str] = []
+    for value in raw_values:
+        surface = _normalized_request_surface(value)
+        if surface and surface not in surfaces:
+            surfaces.append(surface)
+    return surfaces
+
+
+def _request_surface_deployment_id(request_kwargs: Optional[dict]) -> Optional[str]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    value = request_kwargs.get(_UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY)
+    if not isinstance(value, str) or not value.strip():
+        metadata = _image_generation_module._request_metadata_dict(
+            request_kwargs, "litellm_metadata"
+        ) or {}
+        value = metadata.get(_UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _set_request_surface_state(
+    request_kwargs: dict,
+    *,
+    surface: str,
+    attempted_surfaces: Optional[list[str]] = None,
+    deployment_id: Optional[str] = None,
+    target_deployment_id: Optional[str] = None,
+) -> None:
+    surface = _normalized_request_surface(surface)
+    if not surface:
+        return
+    request_kwargs[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
+    metadata = _image_generation_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    updated_metadata = metadata.copy()
+    updated_metadata[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
+    if isinstance(deployment_id, str) and deployment_id.strip():
+        deployment_id = deployment_id.strip()
+        request_kwargs[_UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY] = deployment_id
+        updated_metadata[_UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY] = deployment_id
+    if attempted_surfaces is not None:
+        normalized_attempts: list[str] = []
+        for value in attempted_surfaces:
+            normalized = _normalized_request_surface(value)
+            if normalized and normalized not in normalized_attempts:
+                normalized_attempts.append(normalized)
+        request_kwargs[_ATTEMPTED_UPSTREAM_URL_SURFACES_KEY] = normalized_attempts
+        updated_metadata[_ATTEMPTED_UPSTREAM_URL_SURFACES_KEY] = normalized_attempts
+    if isinstance(target_deployment_id, str) and target_deployment_id.strip():
+        request_kwargs[_SURFACE_TARGET_DEPLOYMENT_ID_KEY] = target_deployment_id.strip()
+        updated_metadata[_SURFACE_TARGET_DEPLOYMENT_ID_KEY] = target_deployment_id.strip()
+    else:
+        request_kwargs.pop(_SURFACE_TARGET_DEPLOYMENT_ID_KEY, None)
+        updated_metadata.pop(_SURFACE_TARGET_DEPLOYMENT_ID_KEY, None)
+    request_kwargs["litellm_metadata"] = updated_metadata
+
+
+def _clear_request_surface_target(request_kwargs: Optional[dict]) -> None:
+    if not isinstance(request_kwargs, dict):
+        return
+    request_kwargs.pop(_SURFACE_TARGET_DEPLOYMENT_ID_KEY, None)
+    metadata = _image_generation_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    )
+    if isinstance(metadata, dict) and _SURFACE_TARGET_DEPLOYMENT_ID_KEY in metadata:
+        updated_metadata = metadata.copy()
+        updated_metadata.pop(_SURFACE_TARGET_DEPLOYMENT_ID_KEY, None)
+        request_kwargs["litellm_metadata"] = updated_metadata
+
+
+def _request_surface_target_deployment_id(
+    request_kwargs: Optional[dict],
+) -> Optional[str]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    value = request_kwargs.get(_SURFACE_TARGET_DEPLOYMENT_ID_KEY)
+    if not isinstance(value, str) or not value.strip():
+        metadata = _image_generation_module._request_metadata_dict(
+            request_kwargs, "litellm_metadata"
+        ) or {}
+        value = metadata.get(_SURFACE_TARGET_DEPLOYMENT_ID_KEY)
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _deployment_supported_surface_modes(deployment: Any) -> list[str]:
@@ -912,12 +1085,11 @@ def _deployment_supported_surface_modes(deployment: Any) -> list[str]:
     if not isinstance(model_info, dict):
         return []
 
-    raw_modes: list[Any] = [model_info.get(_UPSTREAM_URL_SURFACE_KEY)]
+    raw_modes: list[Any] = []
     supported = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
     if isinstance(supported, list):
         raw_modes.extend(supported)
-    elif isinstance(supported, str):
-        raw_modes.extend(re.split(r"[,;\s]+", supported))
+
 
     modes: list[str] = []
     for raw_mode in raw_modes:
@@ -927,22 +1099,197 @@ def _deployment_supported_surface_modes(deployment: Any) -> list[str]:
     return modes
 
 
+def _deployment_has_surface_configuration(deployment: Any) -> bool:
+    if not isinstance(deployment, dict):
+        return False
+    model_info = deployment.get("model_info")
+    return bool(
+        isinstance(model_info, dict)
+        and isinstance(model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY), list)
+        and model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+    )
+
+
+def _deployment_primary_surface(deployment: Any) -> str:
+    modes = _deployment_supported_surface_modes(deployment)
+    return modes[0] if modes else ""
+
+
+def _active_cooldown_state_for_key(
+    cooldowns: dict[str, Any],
+    cooldown_key: str,
+    now: float,
+) -> Optional[dict[str, Any]]:
+    state = cooldowns.get(cooldown_key)
+    if not isinstance(state, dict):
+        return None
+    cooldown_until = float(state.get("cooldown_until") or 0.0)
+    if cooldown_until > now:
+        return state
+    if cooldown_until > 0:
+        cooldowns.pop(cooldown_key, None)
+    return None
+
+
+def _first_available_deployment_surface(
+    deployment: Any,
+    cooldowns: dict[str, Any],
+    now: float,
+) -> str:
+    base_keys = _deployment_cooldown_keys_from_deployment(deployment)
+    for surface in _deployment_supported_surface_modes(deployment):
+        if not any(
+            _active_cooldown_state_for_key(
+                cooldowns,
+                f"{base_key}|surface:{surface}",
+                now,
+            )
+            is not None
+            for base_key in base_keys
+        ):
+            return surface
+    return ""
+
+
+def _first_available_surface_for_deployment(deployment: Any) -> str:
+    if not _deployment_cooldown_enabled():
+        return _deployment_primary_surface(deployment)
+
+    def select(cooldowns: dict[str, Any], now: float) -> str:
+        return _first_available_deployment_surface(deployment, cooldowns, now)
+
+    result = _deployment_cooldown_update_shared(select)
+    if isinstance(result, tuple) and isinstance(result[0], str):
+        return result[0]
+    with _DEPLOYMENT_COOLDOWN_LOCK:
+        return select(_DEPLOYMENT_COOLDOWNS, time.time())
+
+
+def _request_surface_for_deployment(
+    request_kwargs: Optional[dict],
+    deployment: Any,
+) -> str:
+    deployment_id = _image_generation_module._deployment_id(deployment)
+    state_deployment_id = _request_surface_deployment_id(request_kwargs)
+    target_deployment_id = _request_surface_target_deployment_id(request_kwargs)
+    requested = _request_current_upstream_surface(request_kwargs)
+    supported = _deployment_supported_surface_modes(deployment)
+    if (
+        requested
+        and requested in supported
+        and deployment_id
+        and deployment_id in {state_deployment_id, target_deployment_id}
+    ):
+        return requested
+    if requested and not supported and deployment_id == target_deployment_id:
+        return requested
+    return _first_available_surface_for_deployment(deployment)
+
+
+def _surface_adapter_model(model: Any, surface: str) -> Any:
+    if not isinstance(model, str) or not model.strip():
+        return model
+    upstream = model.strip()
+    for prefix in (
+        "openai/responses/",
+        "anthropic/",
+        "openai/",
+    ):
+        if upstream.startswith(prefix):
+            upstream = upstream[len(prefix):]
+            break
+    if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
+        return f"anthropic/{upstream}"
+    if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+        return f"openai/responses/{upstream}"
+    return f"openai/{upstream}"
+
+
+def _apply_surface_adapter_to_request(
+    request_kwargs: dict,
+    surface: str,
+    upstream_model: Any,
+) -> None:
+    surface = _normalized_request_surface(surface)
+    if not surface:
+        return
+    adapted_model = _surface_adapter_model(upstream_model, surface)
+    request_kwargs["model"] = adapted_model
+    request_kwargs["custom_llm_provider"] = (
+        "anthropic" if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC else "openai"
+    )
+    if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+        request_kwargs.pop("use_chat_completions_api", None)
+    else:
+        request_kwargs["use_chat_completions_api"] = True
+
+    litellm_params = request_kwargs.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        updated_params = litellm_params.copy()
+        updated_params["model"] = adapted_model
+        updated_params["custom_llm_provider"] = request_kwargs[
+            "custom_llm_provider"
+        ]
+        request_kwargs["litellm_params"] = updated_params
+
+
+def _next_upstream_surface_for_failed_deployment(
+    router: Any,
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> Optional[tuple[str, str]]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    failed_id = (
+        _responses_execution_module._failed_deployment_id(exception)
+        or _deployment_id_from_request(request_kwargs)
+    )
+    if not failed_id:
+        return None
+    model_group = _responses_execution_module._request_model_group(request_kwargs)
+    if not model_group:
+        return None
+    try:
+        deployments = _router_configured_deployments(router, model_group)
+    except Exception:
+        return None
+    deployment = next(
+        (
+            candidate
+            for candidate in deployments
+            if _image_generation_module._deployment_id(candidate) == failed_id
+        ),
+        None,
+    )
+    if deployment is None:
+        return None
+    surfaces = _deployment_supported_surface_modes(deployment)
+    current = _request_current_upstream_surface(request_kwargs)
+    attempted = _request_attempted_upstream_surfaces(request_kwargs)
+    if current and current not in attempted:
+        attempted.append(current)
+    for surface in surfaces:
+        if surface in attempted:
+            continue
+        probe_request = {_CURRENT_UPSTREAM_URL_SURFACE_KEY: surface}
+        available, _cooled, _filtered = _with_active_deployment_cooldowns(
+            [deployment],
+            request_kwargs=probe_request,
+        )
+        if available:
+            return surface, failed_id
+    return None
+
+
 def _deployment_prefers_responses_surface(deployment: Any) -> bool:
     if not isinstance(deployment, dict):
         return False
     model_info = deployment.get("model_info")
     if not isinstance(model_info, dict):
         return False
-    primary_mode = _normalized_deployment_surface(model_info.get(_UPSTREAM_URL_SURFACE_KEY))
-    if primary_mode:
-        return (
-            primary_mode == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
-            and model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is not False
-        )
-    if model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is False:
-        return False
-    return _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES in _deployment_supported_surface_modes(
-        deployment
+    return (
+        _deployment_primary_surface(deployment)
+        == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
     )
 
 
@@ -952,11 +1299,9 @@ def _deployment_is_known_chat_bridge_surface(deployment: Any) -> bool:
     model_info = deployment.get("model_info")
     if not isinstance(model_info, dict):
         return False
-    primary_mode = _normalized_deployment_surface(model_info.get(_UPSTREAM_URL_SURFACE_KEY))
+    primary_mode = _deployment_primary_surface(deployment)
     if primary_mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
         return True
-    if model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is False:
-        return not _deployment_prefers_responses_surface(deployment)
     return False
 
 
@@ -1056,10 +1401,17 @@ def _selected_deployment_request_marker(deployment: Any) -> Optional[dict]:
     }
 
 
-def _remember_selected_deployment(deployment: Any) -> None:
+def _remember_selected_deployment(
+    deployment: Any,
+    *,
+    surface: str = "",
+) -> None:
     marker = _selected_deployment_request_marker(deployment)
     if marker is None:
         return
+    surface = _normalized_request_surface(surface)
+    if surface:
+        marker[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
     _CURRENT_SELECTED_DEPLOYMENT.set(marker)
     selected_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
     if isinstance(selected_box, dict):
@@ -1095,6 +1447,9 @@ def _apply_selected_deployment_marker_to_request(
 
     selected_model_info = model_info.copy()
     selected_litellm_params = litellm_params.copy()
+    selected_surface = _normalized_request_surface(
+        marker.get(_CURRENT_UPSTREAM_URL_SURFACE_KEY)
+    )
     if update_top_level:
         request_kwargs["model_info"] = selected_model_info
         if selected_litellm_params:
@@ -1114,6 +1469,14 @@ def _apply_selected_deployment_marker_to_request(
     if isinstance(api_base, str) and api_base.strip():
         updated_metadata["api_base"] = api_base
     request_kwargs["litellm_metadata"] = updated_metadata
+    if selected_surface:
+        _set_request_surface_state(
+            request_kwargs,
+            surface=selected_surface,
+            attempted_surfaces=_request_attempted_upstream_surfaces(request_kwargs),
+            deployment_id=_deployment_id_from_request(request_kwargs),
+            target_deployment_id=_request_surface_target_deployment_id(request_kwargs),
+        )
     return True
 
 
@@ -1134,9 +1497,14 @@ def _remember_selected_deployment_for_request(
     request_kwargs: Optional[dict],
     deployment: Any,
 ) -> None:
+    marker = _selected_deployment_request_marker(deployment)
+    if marker is not None and isinstance(request_kwargs, dict):
+        surface = _request_current_upstream_surface(request_kwargs)
+        if surface:
+            marker[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
     _apply_selected_deployment_marker_to_request(
         request_kwargs,
-        _selected_deployment_request_marker(deployment),
+        marker,
         update_top_level=True,
     )
 
@@ -1877,6 +2245,14 @@ def _mark_exception_for_deployment_failover(
         except Exception:
             pass
     deployment_order = _deployment_order_from_request(request_kwargs)
+    deployment_surface = _request_current_upstream_surface(request_kwargs)
+    if deployment_surface and not getattr(
+        exception, "failed_deployment_surface", None
+    ):
+        try:
+            exception.failed_deployment_surface = deployment_surface  # type: ignore[attr-defined]
+        except Exception:
+            pass
     if (
         deployment_order is not None
         and _request_allows_failed_deployment_order(request_kwargs)
@@ -1886,12 +2262,25 @@ def _mark_exception_for_deployment_failover(
             exception.failed_deployment_order = deployment_order  # type: ignore[attr-defined]
         except Exception:
             pass
-    if (
+    should_sync_exclusions = bool(
         not _is_local_stream_timeout_error(exception)
         and not _exception_indicates_timeout_or_long_wait(exception)
         and not _exception_indicates_network_connectivity_error(exception)
-    ):
-        _sync_failed_deployment_exclusions(request_kwargs, exception, deployment_id=deployment_id)
+    )
+    if not deployment_surface and should_sync_exclusions:
+        _sync_failed_deployment_exclusions(
+            request_kwargs, exception, deployment_id=deployment_id
+        )
+    elif deployment_surface and should_sync_exclusions and isinstance(request_kwargs, dict):
+        existing_exclusions = _image_generation_module._request_excluded_deployment_ids(
+            request_kwargs
+        )
+        if existing_exclusions:
+            _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(existing_exclusions)
+            try:
+                exception.excluded_deployment_ids = sorted(existing_exclusions)  # type: ignore[attr-defined]
+            except Exception:
+                pass
     try:
         exception.num_retries = 0  # type: ignore[attr-defined]
     except Exception:
@@ -1911,12 +2300,12 @@ def _mark_exception_for_deployment_failover(
     _record_deployment_failure_for_cooldown(exception, request_kwargs)
 
 
-def _mark_exception_for_responses_endpoint_failover(
+def _mark_exception_for_upstream_surface_failover(
     exception: Exception,
     request_kwargs: Optional[dict],
 ) -> None:
     try:
-        exception.responses_endpoint_unsupported = True  # type: ignore[attr-defined]
+        exception.upstream_surface_unsupported = True  # type: ignore[attr-defined]
     except Exception:
         pass
     _mark_exception_for_deployment_failover(exception, request_kwargs)
@@ -1940,8 +2329,26 @@ def _sync_failed_deployment_exclusions(
     if isinstance(request_kwargs, dict):
         excluded_ids.update(_image_generation_module._request_excluded_deployment_ids(request_kwargs))
     failed_id = deployment_id or _responses_execution_module._failed_deployment_id(exception)
+    request_model_info = _image_generation_module._request_model_info(request_kwargs)
+    supported_surfaces = []
+    raw_supported_surfaces = request_model_info.get(
+        _SUPPORTED_UPSTREAM_URL_SURFACES_KEY
+    )
+    if isinstance(raw_supported_surfaces, list):
+        for raw_surface in raw_supported_surfaces:
+            surface = _normalized_deployment_surface(raw_surface)
+            if surface and surface not in supported_surfaces:
+                supported_surfaces.append(surface)
+    attempted_surfaces = set(_request_attempted_upstream_surfaces(request_kwargs))
+    surface_retry_pending = bool(
+        failed_id
+        and isinstance(request_kwargs, dict)
+        and _request_current_upstream_surface(request_kwargs)
+        and any(surface not in attempted_surfaces for surface in supported_surfaces)
+    )
     if (
         failed_id
+        and not surface_retry_pending
         and not _is_local_stream_timeout_error(exception)
         and not _should_retry_same_deployment_before_fallback(exception)
     ):
@@ -1963,7 +2370,9 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         return False
     if _is_image_generation_tool_runtime_fallback_error(exception):
         return True
-    if _is_responses_endpoint_failover_error(exception):
+    if _is_upstream_surface_failover_error(exception):
+        return True
+    if getattr(exception, "responses_stream_incomplete", False):
         return True
     if _is_upstream_deployment_failover_error(exception):
         return True
@@ -2061,8 +2470,6 @@ def _should_count_deployment_failure_for_cooldown(
         return False
     if _should_retry_same_deployment_before_fallback(exception):
         return False
-    if _is_responses_endpoint_failover_error(exception):
-        return False
     if _is_upstream_gateway_bad_request_error(exception):
         return False
     if _is_image_parameter_or_capability_bad_request_error(exception):
@@ -2080,6 +2487,8 @@ def _should_count_deployment_failure_for_cooldown(
     if duration_seconds is not None and duration_seconds >= 30.0 and not stream_start_timeout:
         return False
     if stream_start_timeout:
+        return True
+    if _is_upstream_surface_failover_error(exception):
         return True
     status_code = _exception_status_code(exception)
     if status_code is not None and status_code >= 500:
@@ -2102,9 +2511,10 @@ def _record_deployment_failure_for_cooldown(
     route_key = _responses_execution_module._failed_deployment_route_key(exception) or _deployment_route_key_from_request(
         request_kwargs
     )
-    cooldown_keys = _deployment_cooldown_keys(
+    cooldown_keys = _deployment_cooldown_keys_for_request(
         deployment_id=deployment_id,
         route_key=route_key,
+        request_kwargs=request_kwargs,
     )
     if not cooldown_keys:
         return
@@ -2230,6 +2640,8 @@ def _deployment_cooldown_trace_entry(
 
 def _with_active_deployment_cooldowns(
     deployments: List[dict],
+    *,
+    request_kwargs: Optional[dict] = None,
 ) -> tuple[List[dict], list[dict[str, Any]], bool]:
     if not deployments or not _deployment_cooldown_enabled():
         return deployments, [], False
@@ -2237,30 +2649,64 @@ def _with_active_deployment_cooldowns(
     def filter_active(cooldowns: dict[str, Any], now: float) -> tuple[List[dict], list[dict[str, Any]], bool]:
         available: list[dict] = []
         cooled: list[dict[str, Any]] = []
-        expired_keys: list[str] = []
         for deployment in deployments:
-            cooldown_keys = _deployment_cooldown_keys_from_deployment(deployment)
-            active_cooldown: Optional[tuple[str, dict[str, Any]]] = None
-            for cooldown_key in cooldown_keys:
-                state = cooldowns.get(cooldown_key)
-                if not state:
-                    continue
-
-                cooldown_until = float(state.get("cooldown_until") or 0.0)
-                if cooldown_until > now:
-                    active_cooldown = (cooldown_key, state)
-                    break
-
-                if cooldown_until > 0:
-                    expired_keys.append(cooldown_key)
+            requested_surface = _deployment_cooldown_surface(request_kwargs)
+            if requested_surface is not None:
+                cooldown_keys = _deployment_cooldown_keys_from_deployment_for_request(
+                    deployment,
+                    request_kwargs,
+                )
+                active_cooldown = next(
+                    (
+                        (cooldown_key, state)
+                        for cooldown_key in cooldown_keys
+                        if (
+                            state := _active_cooldown_state_for_key(
+                                cooldowns, cooldown_key, now
+                            )
+                        )
+                        is not None
+                    ),
+                    None,
+                )
+            else:
+                active_cooldown = None
+                configured_surfaces = _deployment_supported_surface_modes(
+                    deployment
+                )
+                if configured_surfaces:
+                    available_surface = _first_available_deployment_surface(
+                        deployment, cooldowns, now
+                    )
+                else:
+                    available_surface = ""
+                    for cooldown_key in _deployment_cooldown_keys_from_deployment(
+                        deployment
+                    ):
+                        state = _active_cooldown_state_for_key(
+                            cooldowns, cooldown_key, now
+                        )
+                        if state is not None:
+                            active_cooldown = (cooldown_key, state)
+                            break
+                if configured_surfaces and not available_surface:
+                    base_keys = _deployment_cooldown_keys_from_deployment(deployment)
+                    for surface in configured_surfaces:
+                        for base_key in base_keys:
+                            cooldown_key = f"{base_key}|surface:{surface}"
+                            state = _active_cooldown_state_for_key(
+                                cooldowns, cooldown_key, now
+                            )
+                            if state is not None:
+                                active_cooldown = (cooldown_key, state)
+                                break
+                        if active_cooldown is not None:
+                            break
             if active_cooldown is not None:
                 cooldown_key, state = active_cooldown
                 cooled.append(_deployment_cooldown_trace_entry(deployment, state, now, cooldown_key=cooldown_key))
                 continue
             available.append(deployment)
-
-        for cooldown_key in expired_keys:
-            cooldowns.pop(cooldown_key, None)
 
         if cooled:
             return available, cooled, True
@@ -2643,11 +3089,68 @@ def _raise_sanitized_upstream_route_failure(
     raise sanitized from exception
 
 
-def _is_responses_endpoint_failover_error(exception: Exception) -> bool:
+def _is_upstream_surface_failover_error(exception: Exception) -> bool:
     return bool(
-        getattr(exception, "responses_endpoint_unsupported", False)
+        getattr(exception, "upstream_surface_unsupported", False)
         and _responses_execution_module._failed_deployment_id(exception)
     )
+
+
+def _is_current_upstream_surface_incompatible_error(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    current_surface = _request_current_upstream_surface(request_kwargs)
+    if not current_surface:
+        current_surface = _request_current_upstream_surface(outer_request_kwargs)
+    if not current_surface:
+        return False
+    if _is_terminal_prompt_or_policy_error(exception):
+        return False
+
+    status_code = _exception_status_code(exception)
+    if status_code in {404, 405}:
+        return True
+    if (
+        current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+        and _is_responses_schema_unsupported_error(exception)
+    ):
+        return True
+    if status_code not in {400, 422}:
+        return False
+
+    text = _exception_text(exception)
+    endpoint_markers = (
+        "endpoint not found",
+        "unknown endpoint",
+        "unsupported endpoint",
+        "endpoint is not supported",
+        "method not allowed",
+        "unsupported api protocol",
+        "unsupported protocol",
+    )
+    if any(marker in text for marker in endpoint_markers):
+        return True
+    if current_surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
+        return any(
+            marker in text
+            for marker in (
+                "messages api is not supported",
+                "messages endpoint is not supported",
+                "anthropic messages is not supported",
+            )
+        )
+    if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_CHAT:
+        return any(
+            marker in text
+            for marker in (
+                "chat completions api is not supported",
+                "chat completions endpoint is not supported",
+                "chat/completions is not supported",
+            )
+        )
+    return False
 
 
 def _is_responses_endpoint_not_found_error(

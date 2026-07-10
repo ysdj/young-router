@@ -14,7 +14,9 @@ from .base import (
     List,
     Optional,
     _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY,
+    _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
+    _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID,
     _CURRENT_SELECTED_DEPLOYMENT,
     _GENERIC_HELPER_PATCH_ATTR,
     _ORDER_PEER_FAILOVER_PATCH_ATTR,
@@ -113,8 +115,21 @@ def _install_routing_constraint_patch() -> None:
                     for deployment in constrained
                     if _image_generation_module._deployment_id(deployment) not in excluded_ids
                 ]
+            target_deployment_id = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.get()
+            if target_deployment_id:
+                constrained = [
+                    deployment
+                    for deployment in constrained
+                    if _image_generation_module._deployment_id(deployment)
+                    == target_deployment_id
+                ]
             constrained, _cooldown_deployments, _cooldown_filtered = (
-                _routing_module._with_active_deployment_cooldowns(constrained)
+                _routing_module._with_active_deployment_cooldowns(
+                    constrained,
+                    request_kwargs=(
+                        _routing_module._deployment_cooldown_request_for_current_surface()
+                    ),
+                )
             )
             return constrained
 
@@ -140,11 +155,19 @@ def _install_routing_constraint_patch() -> None:
                 positional_index=4,
             )
             excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
-            token = _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids or None)
+            excluded_token = _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids or None)
+            target_token = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.set(
+                _routing_module._request_surface_target_deployment_id(request_kwargs)
+            )
+            cooldown_token = _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.set(
+                _routing_module._deployment_cooldown_surface(request_kwargs)
+            )
             try:
                 return original_get_available_deployment(self, *args, **kwargs)
             finally:
-                _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(token)
+                _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.reset(cooldown_token)
+                _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.reset(target_token)
+                _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(excluded_token)
 
         setattr(patched_get_available_deployment, _ROUTING_CONSTRAINT_PATCH_ATTR, True)
         setattr(
@@ -177,11 +200,19 @@ def _install_routing_constraint_patch() -> None:
             positional_index=1,
         )
         excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
-        token = _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids or None)
+        excluded_token = _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids or None)
+        target_token = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.set(
+            _routing_module._request_surface_target_deployment_id(request_kwargs)
+        )
+        cooldown_token = _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.set(
+            _routing_module._deployment_cooldown_surface(request_kwargs)
+        )
         try:
             return await original_async_get_available_deployment(self, *args, **kwargs)
         finally:
-            _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(token)
+            _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.reset(cooldown_token)
+            _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.reset(target_token)
+            _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(excluded_token)
 
     setattr(patched_async_get_available_deployment, _ROUTING_CONSTRAINT_PATCH_ATTR, True)
     setattr(
@@ -216,7 +247,41 @@ def _install_selected_deployment_marker_patch() -> None:
             function_name: Optional[str] = None,
         ) -> None:
             _responses_execution_module._remember_request_model_group_before_deployment_update(kwargs)
-            _routing_module._remember_selected_deployment(deployment)
+            surface = _routing_module._request_surface_for_deployment(kwargs, deployment)
+            if not surface:
+                _routing_module._remember_selected_deployment(deployment)
+                force_browser_headers = _image_generation_module._request_forces_browser_compatible_headers(kwargs)
+                result = original_update_kwargs_with_deployment(
+                    self, deployment, kwargs, function_name=function_name
+                )
+                _routing_module._remember_selected_deployment_for_request(kwargs, deployment)
+                if force_browser_headers:
+                    kwargs[_BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY] = True
+                browser_kwargs = _image_generation_module._with_browser_compatible_headers(kwargs)
+                if browser_kwargs is not None:
+                    kwargs.clear()
+                    kwargs.update(browser_kwargs)
+                return result
+            deployment_id = _image_generation_module._deployment_id(deployment)
+            attempted_surfaces = (
+                _routing_module._request_attempted_upstream_surfaces(kwargs)
+                if deployment_id
+                == _routing_module._request_surface_deployment_id(kwargs)
+                else []
+            )
+            if surface not in attempted_surfaces:
+                attempted_surfaces.append(surface)
+            _routing_module._set_request_surface_state(
+                kwargs,
+                surface=surface,
+                attempted_surfaces=attempted_surfaces,
+                deployment_id=deployment_id,
+                target_deployment_id=_routing_module._request_surface_target_deployment_id(kwargs),
+            )
+            _routing_module._remember_selected_deployment(
+                deployment,
+                surface=surface,
+            )
             force_browser_headers = _image_generation_module._request_forces_browser_compatible_headers(kwargs)
             _trace_module._route_trace(
                 "selected_deployment",
@@ -240,6 +305,11 @@ def _install_selected_deployment_marker_patch() -> None:
                 function_name=function_name,
             )
             _routing_module._remember_selected_deployment_for_request(kwargs, deployment)
+            _routing_module._apply_surface_adapter_to_request(
+                kwargs,
+                surface,
+                deployment.get("litellm_params", {}).get("model"),
+            )
             if force_browser_headers:
                 kwargs[_BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY] = True
 
@@ -277,7 +347,15 @@ def _install_selected_deployment_marker_patch() -> None:
             return await original_make_call(self, original_function, *args, **kwargs)
         except Exception as exc:
             marker = _CURRENT_SELECTED_DEPLOYMENT.get()
-            if (
+            if marker is not None and _routing_module._is_current_upstream_surface_incompatible_error(
+                exc,
+                marker,
+            ):
+                _routing_module._mark_exception_for_upstream_surface_failover(
+                    exc,
+                    marker,
+                )
+            elif (
                 marker is not None
                 and _routing_module._is_priority_deployment_failover_error(exc)
                 and not _routing_module._should_retry_with_browser_compatible_headers(exc, marker)

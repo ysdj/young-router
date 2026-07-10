@@ -505,7 +505,121 @@ class HookStreamingTimeoutTests(HookTestCase):
         self.assertEqual(calls[0]["model"], "default-chat")
         self.assertEqual(calls[0]["_target_order"], 1)
         self.assertEqual(calls[0]["_excluded_deployment_ids"], ["order1-a"])
+        self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
+
+    async def test_dual_surface_incomplete_responses_stream_recovers_via_chat(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+        candidate_results = []
+        deployment = {
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "order": 1,
+            },
+            "model_info": {
+                "id": "dual-route",
+                "model_group": "default-chat",
+                "upstream_url_surface": "openai/responses",
+                "supported_upstream_url_surfaces": [
+                    "openai/responses",
+                    "openai/chat",
+                ],
+            },
+        }
+
+        async def original_stream():
+            yield {"type": "response.created", "response": {"id": "resp-original"}}
+
+        async def recovered_stream():
+            yield {"type": "response.output_text.delta", "delta": "chat recovered"}
+            yield {
+                "type": "response.completed",
+                "response": {"id": "resp-chat-recovered"},
+            }
+
+        hook = hooks.LiteLLMMenuHook()
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                candidates = await hook.async_filter_deployments(
+                    "default-chat",
+                    [deployment],
+                    messages=None,
+                    request_kwargs=payload,
+                )
+                candidate_results.append(candidates)
+                return recovered_stream()
+        proxy_server.llm_router = FakeRouter()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec_command",
+                            "description": "Run a command.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Inspect the workspace."},
+            ],
+            "tools": [],
+            "stream": True,
+            "model_info": deployment["model_info"],
+            "litellm_params": deployment["litellm_params"],
+            "_excluded_deployment_ids": ["other-route"],
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(
+            chunks,
+            [
+                {"type": "response.output_text.delta", "delta": "chat recovered"},
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp-chat-recovered"},
+                },
+            ],
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(candidate_results, [[deployment]])
+        self.assertEqual(
+            calls[0]["_litellm_menu_upstream_url_surface"],
+            "openai/chat",
+        )
+        self.assertEqual(calls[0]["_target_order"], 1)
+        self.assertEqual(calls[0]["_excluded_deployment_ids"], ["other-route"])
+        self.assertEqual([tool["name"] for tool in calls[0]["tools"]], ["exec_command"])
+        self.assertNotIn(
+            "additional_tools",
+            json.dumps(calls[0]["input"], ensure_ascii=False),
+        )
+        self.assertIn(
+            "id:dual-route|surface:openai/responses",
+            hooks._DEPLOYMENT_COOLDOWNS,
+        )
+        self.assertNotIn(
+            "id:dual-route|surface:openai/chat",
+            hooks._DEPLOYMENT_COOLDOWNS,
+        )
 
     async def test_responses_empty_completed_stream_enters_route_recovery_without_leaking_empty_terminal(self) -> None:
         hooks, proxy_server = load_hook_module()

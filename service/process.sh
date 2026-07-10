@@ -198,6 +198,7 @@ run_native_process() {
 
   env \
     LITELLM_MASTER_KEY="$MASTER_KEY" \
+    LITELLM_MENU_PROXY_PROCESS=1 \
     LITELLM_RECENT_REQUESTS_LOG="$RECENT_REQUESTS_LOG" \
     LITELLM_MENU_LOG_MAX_BYTES="$LOCAL_LOG_MAX_BYTES" \
     LITELLM_MENU_REQUEST_TIMEOUT_SECONDS="$REQUEST_TIMEOUT_SECONDS" \
@@ -422,6 +423,89 @@ start_service_process() {
   start_native_detached "${1:-}"
 }
 
+clear_transient_routing_state() {
+  local runtime_dir cooldown_path recovery_path python_bin
+  runtime_dir="${RUNTIME_DIR:-}"
+  cooldown_path="${DEPLOYMENT_COOLDOWN_FILE:-}"
+  recovery_path="${ROUTE_RECOVERY_STATE_FILE:-}"
+  if [[ -z "$cooldown_path" && -n "$runtime_dir" ]]; then
+    cooldown_path="$runtime_dir/deployment-cooldowns.json"
+  fi
+  if [[ -z "$recovery_path" && -n "$runtime_dir" ]]; then
+    recovery_path="$runtime_dir/route-recovery-state.json"
+  fi
+  if [[ -z "$cooldown_path" && -z "$recovery_path" ]]; then
+    return 0
+  fi
+
+  python_bin="${PYTHON:-${NATIVE_PYTHON:-}}"
+  if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
+    python_bin="$(command -v python3 2>/dev/null || true)"
+  fi
+  if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
+    echo "Python is required to reset transient routing state." >&2
+    return 1
+  fi
+
+  "$python_bin" - "$cooldown_path" "$recovery_path" <<'PY'
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+import sys
+import tempfile
+
+
+def reset(path: str, payload: dict) -> None:
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    lock_path = f"{path}.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f"{os.path.basename(path)}.reset.",
+            dir=directory or None,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+cooldown_path, recovery_path = sys.argv[1:3]
+reset(cooldown_path, {"schema_version": 1, "cooldowns": {}})
+reset(
+    recovery_path,
+    {
+        "recoveries": {},
+        "updated_at": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+    },
+)
+PY
+}
+
 start_server() {
   local owner_pid
   owner_pid="$(require_menu_app_owner "start")" || return $?
@@ -451,6 +535,7 @@ start_server() {
     print_native_health_failure "Timed out waiting for old native LiteLLM listener to stop."
     exit 1
   fi
+  clear_transient_routing_state || exit 1
   write_state starting
   start_service_process "$owner_pid"
 
@@ -489,6 +574,7 @@ restart_server() {
     print_native_health_failure "Timed out waiting for old native LiteLLM listener to stop."
     exit 1
   fi
+  clear_transient_routing_state || exit 1
   start_service_process "$owner_pid"
 
   if wait_for_managed_health && wait_for_runtime_config; then
@@ -519,6 +605,7 @@ reload_server() {
   fi
 
   if wait_for_managed_health && wait_for_runtime_config; then
+    clear_transient_routing_state || return 1
     write_runtime_reload_fingerprint || true
     clear_state
     echo "LiteLLM gracefully reloaded on http://127.0.0.1:$PORT with runtime routes verified"

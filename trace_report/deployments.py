@@ -96,7 +96,6 @@ def deployment_pill(dep: dict[str, Any], selected_id: str | None = None) -> str:
     caps = [
         bool_badge("vision", dep.get("supports_vision")),
         bool_badge("image tool", dep.get("supports_responses_image_generation_tool")),
-        bool_badge("responses", dep.get("supports_responses_endpoint")),
         bool_badge("resp image", dep.get("supports_responses_image_input")),
         bool_badge("resp tools", dep.get("supports_responses_hosted_tools")),
         bool_badge("web", dep.get("supports_responses_web_search") or dep.get("supports_web_search")),

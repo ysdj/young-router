@@ -462,14 +462,13 @@ extension AppDelegate {
     func readCodexConfigState() -> CodexConfigState {
         let fileManager = FileManager.default
         let configPath = "\(codexHome)/config.toml"
-        let authPath = "\(codexHome)/auth.json"
         let statePath = "\(codexHome)/.litellm-menu-codex-local-config-state.json"
         let configText = try? String(contentsOfFile: configPath, encoding: .utf8)
         let configured = configText.map { codexConfigTextPointsToLiteLLM($0) } ?? false
-        let savedPreSwitchFileExists = fileManager.fileExists(atPath: "\(configPath).bak")
-            || fileManager.fileExists(atPath: "\(authPath).bak")
-        let preSwitchReapplyAvailable = savedPreSwitchFileExists
-            && codexPreSwitchStateIsActive(atPath: statePath, fileManager: fileManager)
+        let preSwitchReapplyAvailable = codexPreSwitchStateIsActive(
+            atPath: statePath,
+            fileManager: fileManager
+        )
         return CodexConfigState(
             configuredForLiteLLM: configured,
             preSwitchReapplyAvailable: preSwitchReapplyAvailable
@@ -480,7 +479,10 @@ extension AppDelegate {
         guard fileManager.fileExists(atPath: statePath),
               let data = fileManager.contents(atPath: statePath),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["schema_version"] as? Int == 2,
               object["active"] as? Bool == true,
+              object["config"] as? [String: Any] != nil,
+              object["auth"] as? [String: Any] != nil,
               normalizedURL(object["target_base_url"] as? String ?? "") == normalizedURL("http://127.0.0.1:\(localServicePort(runtimeRoot: root, environment: ProcessInfo.processInfo.environment))/v1") else {
             return false
         }

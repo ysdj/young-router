@@ -88,7 +88,7 @@ class HookStreamingFailoverTests(HookTestCase):
             "model_info": {
                 "id": "third-party-responses",
                 "upstream_url_surface": "openai/responses",
-                "supported_upstream_url_surfaces": ["openai/chat", "openai/responses"],
+                "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
             },
         }
 
@@ -119,7 +119,7 @@ class HookStreamingFailoverTests(HookTestCase):
                 "id": "third-party-responses",
                 "provider": "third-party",
                 "upstream_url_surface": "openai/responses",
-                "supported_upstream_url_surfaces": ["openai/chat", "openai/responses"],
+                "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
             },
         }
         bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
@@ -164,7 +164,7 @@ class HookStreamingFailoverTests(HookTestCase):
                     "id": "third-party-responses",
                     "provider": "third-party",
                     "upstream_url_surface": "openai/responses",
-                    "supported_upstream_url_surfaces": ["openai/chat", "openai/responses"],
+                    "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
                 },
             )
 

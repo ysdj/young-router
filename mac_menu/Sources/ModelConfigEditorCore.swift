@@ -28,10 +28,16 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     var modelCandidateRequestGeneration = 0
     var modelCandidateFetchInFlight = false
     var modelAvailabilityProbeRuns: [ModelProbeKey: UUID] = [:]
-    var responsesEndpointProbeRuns: [ModelProbeKey: UUID] = [:]
     var selectedModelInfoRequestGeneration = 0
     var selectedModelInfoInFlight = false
     var selectedModelImageGenerationEndpointDisabled = false
+    var displayedUpstreamApiModes = ["openai/responses", "openai/chat", "anthropic"]
+    var upstreamApiProbeSummaries: [String: String] = [:]
+    var upstreamApiProbeDetails: [String: String] = [:]
+    var upstreamApiProbeKey: ModelProbeKey?
+    var upstreamApiModeRows: [String: NSStackView] = [:]
+    var upstreamApiModeRankLabels: [String: NSTextField] = [:]
+    var upstreamApiModeStatusLabels: [String: NSTextField] = [:]
     var runtimeApplyInFlight = false
     var runtimeApplyGeneration = 0
     let runtimeApplyLock = NSLock()
@@ -54,12 +60,14 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     let routeProviderKeyColumnIdentifier = NSUserInterfaceItemIdentifier("routeProviderKey")
     let routeUpstreamColumnIdentifier = NSUserInterfaceItemIdentifier("routeUpstream")
     let routeStatusColumnIdentifier = NSUserInterfaceItemIdentifier("routeStatus")
+    let runtimeMapColumnIdentifier = NSUserInterfaceItemIdentifier("runtimeMap")
     var providerCascadeView: NSView?
     var routesListView: NSView?
     var providerDetailView: NSView?
     var modelDetailView: NSView?
-    var runtimeMapTextView: NSTextView?
+    let runtimeMapTableView = NSTableView()
     var runtimeMapScrollView: NSScrollView?
+    var runtimeMapRows: [RuntimeMapRow] = []
     let adapterOptions = [
         "openai",
         "anthropic",
@@ -76,7 +84,6 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         "ollama",
     ]
     let upstreamApiModes = ["openai/chat", "openai/responses", "anthropic"]
-    let effectiveUpstreamApiModePreference = ["openai/responses", "openai/chat", "anthropic"]
     let defaultUpstreamApiMode = "openai/responses"
     let customAdapterTitle = "Custom"
     let defaultProviderKeyName = "default"
@@ -106,13 +113,40 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         var modelEnabled: Bool
         var missingKey: Bool
         var supportsImageGeneration: Bool
-        var upstreamApiMode: String
+        var isImageGenerationEndpoint: Bool
         var supportedUpstreamApiModes: [String]
-        var supportsResponsesEndpoint: Bool
 
         var enabled: Bool {
             providerEnabled && keyEnabled && modelEnabled && !missingKey
         }
+    }
+
+    struct RuntimeMapSummaryRow {
+        var modelCount: Int
+        var runningCount: Int
+        var offCount: Int
+    }
+
+    struct RuntimeMapModelRow {
+        var publicModel: String
+        var runningCount: Int
+        var offCount: Int
+    }
+
+    struct RuntimeMapOrderRow {
+        var order: Int?
+        var previousOrder: Int?
+        var isFirst: Bool
+        var runningCount: Int
+        var offCount: Int
+    }
+
+    enum RuntimeMapRow {
+        case summary(RuntimeMapSummaryRow)
+        case model(RuntimeMapModelRow)
+        case order(RuntimeMapOrderRow)
+        case deployment(RuntimeDeployment)
+        case empty
     }
 
     struct RouteDeploymentRow {
@@ -209,9 +243,20 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         case inconclusive(String)
     }
 
-    enum UpstreamApiModeProbeOutcome {
-        case detected(String, [String], String)
-        case failed(String)
+    enum UpstreamApiProbeAvailability {
+        case available
+        case unavailable
+        case inconclusive
+    }
+
+    struct UpstreamApiProbeResult {
+        var mode: String
+        var availability: UpstreamApiProbeAvailability
+        var detail: String
+
+        var isAvailable: Bool {
+            availability == .available
+        }
     }
 
     struct LiteLLMModelInfoCapability {
@@ -222,7 +267,6 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         var mode: String
         var upstreamApiMode: String
         var supportsImageGenerationFlag: Bool?
-        var supportsResponsesEndpointFlag: Bool?
         var provider: String
         var key: String
         var matchedBy: String
@@ -287,9 +331,9 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         NSButton(checkboxWithTitle: "Model enabled", target: self, action: #selector(formCheckboxChanged(_:)))
     }()
     lazy var probeModelAvailabilityButton: NSButton = {
-        let button = NSButton(title: "Probe Model", target: self, action: #selector(probeModelAvailability))
+        let button = NSButton(title: "Probe & Recommend", target: self, action: #selector(probeModelAvailability))
         button.bezelStyle = .rounded
-        button.toolTip = "Send a tiny request to this upstream deployment and update Model enabled"
+        button.toolTip = "Probe model availability and all three API protocols, then recommend a minimal ordered selection"
         return button
     }()
     lazy var modelNameField = makeTextField(width: 430)
@@ -337,11 +381,12 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     lazy var supportsAnthropicCheckbox: NSButton = {
         NSButton(checkboxWithTitle: "anthropic", target: self, action: #selector(upstreamApiSupportChanged(_:)))
     }()
-    lazy var probeResponsesEndpointButton: NSButton = {
-        let button = NSButton(title: "Probe URL", target: self, action: #selector(probeResponsesEndpointSupport))
-        button.bezelStyle = .rounded
-        button.toolTip = "Probe which API surfaces this upstream URL exposes"
-        return button
+    lazy var upstreamApiModeStackView: NSStackView = {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        return stack
     }()
     lazy var deleteProviderButton = NSButton(title: "Delete", target: self, action: #selector(deleteProvider))
     lazy var addModelButton = NSButton(title: "Add", target: self, action: #selector(addModel))

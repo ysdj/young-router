@@ -163,7 +163,6 @@ class RouteTraceReportTests(unittest.TestCase):
                     "model": "openai/vendor-chat",
                     "route_key": "provider_chat / openai/vendor-chat / key=default / order=1",
                     "upstream_url_surface": "openai/chat",
-                    "supports_responses_endpoint": False,
                 },
                 "request": {
                     "interface": {
@@ -173,7 +172,6 @@ class RouteTraceReportTests(unittest.TestCase):
                         "stream": True,
                         "upstream_url_surface": "openai/chat",
                         "supported_upstream_url_surfaces": ["openai/chat"],
-                        "supports_responses_endpoint": False,
                     },
                 },
             },
@@ -190,7 +188,6 @@ class RouteTraceReportTests(unittest.TestCase):
                         "stream": True,
                         "upstream_url_surface": "openai/chat",
                         "supported_upstream_url_surfaces": ["openai/chat"],
-                        "supports_responses_endpoint": False,
                     },
                 },
                 "retry_request": {
@@ -201,7 +198,6 @@ class RouteTraceReportTests(unittest.TestCase):
                         "stream": True,
                         "upstream_url_surface": "openai/chat",
                         "supported_upstream_url_surfaces": ["openai/chat"],
-                        "supports_responses_endpoint": False,
                         "use_chat_completions_api": True,
                     },
                 },

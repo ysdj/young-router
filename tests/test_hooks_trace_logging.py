@@ -129,7 +129,6 @@ class HookTraceLoggingTests(HookTestCase):
                 "model_info": {
                     "id": "vendor-chat",
                     "upstream_url_surface": "openai/responses",
-                    "supports_responses_endpoint": True,
                     "supports_responses_web_search": False,
                 },
             }

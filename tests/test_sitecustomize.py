@@ -37,6 +37,7 @@ class SiteCustomizeTests(unittest.TestCase):
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
+        env.pop("LITELLM_MENU_PROXY_PROCESS", None)
         env.update(
             {
                 "LITELLM_TEMPLATE_ROOT": str(template),
@@ -80,6 +81,7 @@ class SiteCustomizeTests(unittest.TestCase):
                     print(get_instance_fn("litellm_menu.callbacks.value", config_file_path="config.yaml"))
                     """
                 ),
+                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -115,6 +117,7 @@ class SiteCustomizeTests(unittest.TestCase):
                         raise SystemExit("expected ImportError")
                     """
                 ),
+                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -167,10 +170,32 @@ class SiteCustomizeTests(unittest.TestCase):
                     )
                     """
                 ),
+                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "1 1000 1001 0 0")
+
+    def test_non_proxy_python_does_not_import_litellm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import sys
+
+                    print(any(name == "litellm" or name.startswith("litellm.") for name in sys.modules))
+                    """
+                ),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "False")
 
     def test_disable_system_proxy_lookup_uses_environment_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -192,5 +192,6 @@ def _install_system_proxy_lookup_patch() -> None:
 
 
 _install_system_proxy_lookup_patch()
-_install_litellm_config_callback_import_patch()
-_install_litellm_openai_image_edit_usage_patch()
+if os.environ.get("LITELLM_MENU_PROXY_PROCESS") == "1":
+    _install_litellm_config_callback_import_patch()
+    _install_litellm_openai_image_edit_usage_patch()

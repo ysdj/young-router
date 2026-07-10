@@ -69,11 +69,24 @@ extension ModelConfigEditorController {
             return
         }
         let modes = selectedSupportedUpstreamApiModes()
+        if modes.isEmpty {
+            sender.state = .on
+            setEditorStatus("At least one upstream protocol is required.", color: .systemOrange)
+            return
+        }
         let active = effectiveUpstreamApiMode(from: modes)
         setUpstreamApiSupportCheckboxes(modes)
         applyAdapterControls(forUpstreamApiMode: active)
         commitEditor()
         markPendingChanges()
+    }
+
+    @objc func moveUpstreamApiModeUp(_ sender: NSButton) {
+        moveSelectedUpstreamApiMode(sender.identifier?.rawValue ?? "", delta: -1)
+    }
+
+    @objc func moveUpstreamApiModeDown(_ sender: NSButton) {
+        moveSelectedUpstreamApiMode(sender.identifier?.rawValue ?? "", delta: 1)
     }
 
     @objc func adapterSelectionChanged(_ sender: NSPopUpButton) {
@@ -148,338 +161,298 @@ extension ModelConfigEditorController {
             let runID = UUID()
             modelAvailabilityProbeRuns[request.probeKey] = runID
             refreshModelAvailabilityProbeControlsEnabled()
-            setEditorStatus("Model probe: checking LiteLLM /model/info for \(request.providerName)/\(request.keyName) \(request.upstreamModel)...")
-
-            fetchLiteLLMModelInfoCapability(lookup: request.modelInfoLookup) { [weak self] result in
-                guard let self = self else { return }
-                guard self.modelAvailabilityProbeRuns[request.probeKey] == runID else { return }
-                guard self.modelProbeRequestStillMatches(request) else {
-                    self.modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
-                    self.refreshModelAvailabilityProbeControlsEnabled()
-                    return
-                }
-                switch result {
-                case .success(let capability):
-                    let detail = capability.map { "LiteLLM /model/info reports \($0.summary)." }
-                        ?? self.missingLiteLLMModelInfoMessage(lookup: request.modelInfoLookup)
-                    if let capability, capability.isImageGenerationEndpointModel {
-                        self.runModelAvailabilityImageGenerationProbe(request: request, runID: runID, preflightDetail: detail)
-                        return
-                    }
-                    self.runModelAvailabilityChatProbe(request: request, runID: runID, preflightDetail: detail)
-                case .failure(let detail):
-                    self.runModelAvailabilityChatProbe(
-                        request: request,
-                        runID: runID,
-                        preflightDetail: "LiteLLM /model/info failed: \(detail.localizedDescription)"
-                    )
-                }
-            }
+            runFullModelProbe(request: request, runID: runID, automatic: false)
         } catch {
             setEditorError("Model probe failed", message: error.localizedDescription)
         }
     }
 
-    func runModelAvailabilityChatProbe(
+    func recommendedUpstreamApiModes(from results: [UpstreamApiProbeResult]) -> [String] {
+        let available = Set(results.filter { $0.isAvailable }.map { $0.mode })
+        return ["openai/responses", "anthropic", "openai/chat"].filter { available.contains($0) }
+    }
+
+    func upstreamApiProbeSummary(
+        _ result: UpstreamApiProbeResult,
+        recommendedOrder: [String]
+    ) -> String {
+        switch result.availability {
+        case .available:
+            guard let index = recommendedOrder.firstIndex(of: result.mode) else {
+                return "Available"
+            }
+            return index == 0
+                ? "Preferred #1 · Available"
+                : "Fallback #\(index + 1) · Available"
+        case .unavailable:
+            return "Unavailable"
+        case .inconclusive:
+            return "Uncertain"
+        }
+    }
+
+    func runFullModelProbe(
         request: ModelAvailabilityProbeRequest,
         runID: UUID,
-        preflightDetail: String
+        automatic: Bool,
+        completion: (() -> Void)? = nil
     ) {
-        setEditorStatus("Model probe: probing /chat/completions for \(request.providerName)/\(request.keyName) \(request.upstreamModel)...")
-
-        do {
-            let body = try modelAvailabilityProbeBody(model: request.upstreamModel)
-            postJSONProbe(
-                urls: request.chatURLs,
-                apiKey: request.apiKey,
-                apiBase: request.apiBase,
-                body: body,
-                timeout: 45
-            ) { [weak self] url, httpResponse, data, error in
-                guard let self = self else { return }
-                guard self.modelAvailabilityProbeRuns[request.probeKey] == runID else { return }
-                guard self.modelProbeRequestStillMatches(request) else {
-                    self.modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
-                    self.refreshModelAvailabilityProbeControlsEnabled()
-                    return
-                }
-                self.modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
-                self.refreshModelAvailabilityProbeControlsEnabled()
-
-                if let error = error {
-                    self.applyModelAvailabilityProbeOutcome(
-                        .unavailable("\(preflightDetail)\n\(url.path) failed: \(error.localizedDescription)"),
-                        request: request
-                    )
-                    return
-                }
-
-                guard let httpResponse else {
-                    self.applyModelAvailabilityProbeOutcome(
-                        .unavailable("\(preflightDetail)\n\(url.path) failed: No HTTP response returned."),
-                        request: request
-                    )
-                    return
-                }
-
-                let outcome = self.parseModelAvailabilityProbeOutcome(statusCode: httpResponse.statusCode, data: data)
-                self.applyModelAvailabilityProbeOutcome(self.outcome(outcome, prefixing: "\(preflightDetail)\nProbe URL: \(url.absoluteString)"), request: request)
+        setEditorStatus("Full probe: checking model info and all API protocols for \(request.upstreamModel)...")
+        fetchLiteLLMModelInfoCapability(lookup: request.modelInfoLookup) { [weak self] result in
+            guard let self else { return }
+            guard self.modelAvailabilityProbeRuns[request.probeKey] == runID else { return }
+            let detail: String
+            let capability: LiteLLMModelInfoCapability?
+            switch result {
+            case .success(let value):
+                capability = value
+                detail = value?.summary ?? self.missingLiteLLMModelInfoMessage(lookup: request.modelInfoLookup)
+            case .failure(let error):
+                capability = nil
+                detail = "LiteLLM /model/info preflight unavailable: \(error.localizedDescription)"
             }
-        } catch {
-            modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
-            refreshModelAvailabilityProbeControlsEnabled()
-            applyModelAvailabilityProbeOutcome(
-                .unavailable("\(preflightDetail)\n/chat/completions request failed: \(error.localizedDescription)"),
-                request: request
-            )
-        }
-    }
-
-    func runModelAvailabilityImageGenerationProbe(
-        request: ModelAvailabilityProbeRequest,
-        runID: UUID,
-        preflightDetail: String
-    ) {
-        setEditorStatus("Model probe: probing /images/generations for \(request.providerName)/\(request.keyName) \(request.upstreamModel)...")
-
-        do {
-            let body = try modelAvailabilityImageGenerationProbeBody(model: request.upstreamModel)
-            postJSONProbe(
-                urls: request.imageGenerationURLs,
-                apiKey: request.apiKey,
-                apiBase: request.apiBase,
-                body: body,
-                timeout: 60
-            ) { [weak self] url, httpResponse, data, error in
-                guard let self = self else { return }
-                guard self.modelAvailabilityProbeRuns[request.probeKey] == runID else { return }
-                guard self.modelProbeRequestStillMatches(request) else {
-                    self.modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
-                    self.refreshModelAvailabilityProbeControlsEnabled()
-                    return
-                }
-                self.modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
-                self.refreshModelAvailabilityProbeControlsEnabled()
-
-                if let error = error {
-                    self.applyModelAvailabilityProbeOutcome(
-                        .unavailable("\(preflightDetail)\n\(url.path) failed: \(error.localizedDescription)"),
-                        request: request
-                    )
-                    return
-                }
-
-                guard let httpResponse else {
-                    self.applyModelAvailabilityProbeOutcome(
-                        .unavailable("\(preflightDetail)\n\(url.path) failed: No HTTP response returned."),
-                        request: request
-                    )
-                    return
-                }
-
-                let outcome = self.parseModelAvailabilityImageGenerationProbeOutcome(statusCode: httpResponse.statusCode, data: data)
-                self.applyModelAvailabilityProbeOutcome(self.outcome(outcome, prefixing: "\(preflightDetail)\nProbe URL: \(url.absoluteString)"), request: request)
-            }
-        } catch {
-            modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
-            refreshModelAvailabilityProbeControlsEnabled()
-            applyModelAvailabilityProbeOutcome(
-                .unavailable("\(preflightDetail)\n/images/generations request failed: \(error.localizedDescription)"),
-                request: request
-            )
-        }
-    }
-
-    func outcome(_ outcome: ModelAvailabilityProbeOutcome, prefixing detail: String) -> ModelAvailabilityProbeOutcome {
-        switch outcome {
-        case .available(let message):
-            return .available("\(detail)\n\(message)")
-        case .unavailable(let message):
-            return .unavailable("\(detail)\n\(message)")
-        case .inconclusive(let message):
-            return .inconclusive("\(detail)\n\(message)")
-        }
-    }
-
-    @objc func probeResponsesEndpointSupport() {
-        beginResponsesEndpointProbe(automatic: false)
-    }
-
-    func beginResponsesEndpointProbe(automatic: Bool) {
-        do {
-            if !automatic {
-                commitEditor()
-            }
-            let request = try currentModelAvailabilityProbeRequest()
-            if responsesEndpointProbeRuns[request.probeKey] != nil {
-                refreshResponsesEndpointProbeControlsEnabled()
+            if capability?.isImageGenerationEndpointModel == true {
+                self.runFullImageModelProbe(
+                    request: request,
+                    runID: runID,
+                    preflightDetail: detail,
+                    completion: completion
+                )
                 return
             }
-            let runID = UUID()
-            responsesEndpointProbeRuns[request.probeKey] = runID
-            refreshResponsesEndpointProbeControlsEnabled()
-            runResponsesEndpointProbe(request: request, runID: runID, automatic: automatic)
-        } catch {
-            if automatic {
-                setEditorStatus(
-                    "Auto URL probe: skipped (\(error.localizedDescription))",
-                    color: .secondaryLabelColor
-                )
-            } else {
-                setEditorError("URL probe failed", message: error.localizedDescription)
-            }
+            self.runFullProtocolProbe(
+                request: request,
+                runID: runID,
+                preflightDetail: detail,
+                automatic: automatic,
+                completion: completion
+            )
         }
     }
 
-    func runResponsesEndpointProbe(
+    func finishFullModelProbe(
+        request: ModelAvailabilityProbeRequest,
+        completion: (() -> Void)? = nil
+    ) {
+        modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
+        refreshModelAvailabilityProbeControlsEnabled()
+        completion?()
+    }
+
+    func runFullProtocolProbe(
         request: ModelAvailabilityProbeRequest,
         runID: UUID,
-        automatic: Bool
+        preflightDetail: String,
+        automatic: Bool,
+        completion: (() -> Void)?
     ) {
-        let prefix = automatic ? "Auto URL probe" : "URL probe"
-        setEditorStatus("\(prefix): probing surfaces exposed by \(request.providerName)/\(request.keyName) \(request.upstreamModel)...")
-
         do {
-            let responsesBody = try responsesEndpointProbeBody(model: request.upstreamModel)
-            let chatBody = try modelAvailabilityProbeBody(model: request.upstreamModel)
-            let anthropicBody = try anthropicMessagesProbeBody(model: request.upstreamModel)
-            var detectedModes: [String] = []
-            var details: [String] = []
-
-            func addDetected(_ mode: String) {
-                if !detectedModes.contains(mode) {
-                    detectedModes.append(mode)
-                }
-            }
+            let probes: [(String, [URL], Data, [String: String])] = [
+                ("openai/responses", request.responsesURLs, try responsesEndpointProbeBody(model: request.upstreamModel), [:]),
+                (
+                    "anthropic",
+                    request.anthropicURLs,
+                    try anthropicMessagesProbeBody(model: request.upstreamModel),
+                    [
+                        "anthropic-version": "2023-06-01",
+                        "x-api-key": request.apiKey,
+                    ]
+                ),
+                ("openai/chat", request.chatURLs, try modelAvailabilityProbeBody(model: request.upstreamModel), [:]),
+            ]
+            var results: [UpstreamApiProbeResult] = []
 
             func finish() {
-                self.responsesEndpointProbeRuns.removeValue(forKey: request.probeKey)
-                self.refreshResponsesEndpointProbeControlsEnabled()
-                if detectedModes.isEmpty {
-                    self.applyResponsesEndpointProbeOutcome(
-                        .failed((details + ["No supported API surface was detected."]).joined(separator: "\n\n")),
-                        request: request,
-                        automatic: automatic
-                    )
-                    return
-                }
-                let active = self.effectiveUpstreamApiMode(from: detectedModes)
-                self.applyResponsesEndpointProbeOutcome(
-                    .detected(active, detectedModes, details.joined(separator: "\n\n")),
-                    request: request,
-                    automatic: automatic
-                )
-            }
-
-            func probeAnthropic() {
-                self.postJSONProbe(
-                    urls: request.anthropicURLs,
-                    apiKey: request.apiKey,
-                    apiBase: request.apiBase,
-                    body: anthropicBody,
-                    timeout: 45,
-                    extraHeaders: ["anthropic-version": "2023-06-01"]
-                ) { [weak self] url, httpResponse, data, error in
-                    guard let self = self else { return }
-                    guard self.responsesEndpointProbeRuns[request.probeKey] == runID else { return }
-                    guard self.modelProbeRequestStillMatches(request) else {
-                        self.responsesEndpointProbeRuns.removeValue(forKey: request.probeKey)
-                        self.refreshResponsesEndpointProbeControlsEnabled()
-                        return
-                    }
-                    if let error {
-                        details.append("anthropic probe URL: \(url.absoluteString)\n\(error.localizedDescription)")
-                        finish()
-                        return
-                    }
-                    guard let httpResponse else {
-                        details.append("anthropic probe URL: \(url.absoluteString)\nNo HTTP response returned.")
-                        finish()
-                        return
-                    }
-                    let detail = self.probeDetail(surface: "anthropic", url: url, statusCode: httpResponse.statusCode, data: data)
-                    details.append(detail)
-                    if self.apiEndpointExists(statusCode: httpResponse.statusCode, data: data) == true {
-                        addDetected("anthropic")
-                    }
-                    finish()
-                }
-            }
-
-            func probeChat() {
-                self.postJSONProbe(
-                    urls: request.chatURLs,
-                    apiKey: request.apiKey,
-                    apiBase: request.apiBase,
-                    body: chatBody,
-                    timeout: 45
-                ) { [weak self] url, httpResponse, data, error in
-                    guard let self = self else { return }
-                    guard self.responsesEndpointProbeRuns[request.probeKey] == runID else { return }
-                    guard self.modelProbeRequestStillMatches(request) else {
-                        self.responsesEndpointProbeRuns.removeValue(forKey: request.probeKey)
-                        self.refreshResponsesEndpointProbeControlsEnabled()
-                        return
-                    }
-                    if let error {
-                        details.append("openai/chat probe URL: \(url.absoluteString)\n\(error.localizedDescription)")
-                        probeAnthropic()
-                        return
-                    }
-                    guard let httpResponse else {
-                        details.append("openai/chat probe URL: \(url.absoluteString)\nNo HTTP response returned.")
-                        probeAnthropic()
-                        return
-                    }
-                    let detail = self.probeDetail(surface: "openai/chat", url: url, statusCode: httpResponse.statusCode, data: data)
-                    details.append(detail)
-                    if self.apiEndpointExists(statusCode: httpResponse.statusCode, data: data) == true {
-                        addDetected("openai/chat")
-                    }
-                    probeAnthropic()
-                }
-            }
-
-            postJSONProbe(
-                urls: request.responsesURLs,
-                apiKey: request.apiKey,
-                apiBase: request.apiBase,
-                body: responsesBody,
-                timeout: 45
-            ) { [weak self] url, httpResponse, data, error in
-                guard let self = self else { return }
-                guard self.responsesEndpointProbeRuns[request.probeKey] == runID else { return }
                 guard self.modelProbeRequestStillMatches(request) else {
-                    self.responsesEndpointProbeRuns.removeValue(forKey: request.probeKey)
-                    self.refreshResponsesEndpointProbeControlsEnabled()
+                    self.finishFullModelProbe(request: request, completion: completion)
                     return
                 }
-                if let error {
-                    details.append("openai/responses probe URL: \(url.absoluteString)\n\(error.localizedDescription)")
-                    probeChat()
+                let recommended = self.recommendedUpstreamApiModes(from: results)
+                self.upstreamApiProbeKey = request.probeKey
+                self.upstreamApiProbeSummaries = Dictionary(uniqueKeysWithValues: results.map {
+                    ($0.mode, self.upstreamApiProbeSummary($0, recommendedOrder: recommended))
+                })
+                self.upstreamApiProbeDetails = Dictionary(uniqueKeysWithValues: results.map {
+                    ($0.mode, $0.detail)
+                })
+                self.refreshUpstreamApiModeRows()
+                guard let primary = recommended.first else {
+                    let detail = ([preflightDetail] + results.map { $0.detail }).joined(separator: "\n\n")
+                    let hasInconclusive = results.contains { $0.availability == .inconclusive }
+                    if !hasInconclusive {
+                        self.runFullImageModelProbe(
+                            request: request,
+                            runID: runID,
+                            preflightDetail: detail,
+                            knownImageModel: false,
+                            completion: completion
+                        )
+                        return
+                    }
+                    self.applyModelAvailabilityProbeOutcome(
+                        .inconclusive(detail),
+                        request: request
+                    )
+                    self.finishFullModelProbe(request: request, completion: completion)
                     return
                 }
-                guard let httpResponse else {
-                    details.append("openai/responses probe URL: \(url.absoluteString)\nNo HTTP response returned.")
-                    probeChat()
-                    return
+                if automatic {
+                    self.applyFullProbeSelection(
+                        [primary],
+                        recommendedOrder: recommended,
+                        request: request,
+                        details: results,
+                        preflightDetail: preflightDetail
+                    )
+                } else {
+                    self.presentFullProbeRecommendation(
+                        recommendedOrder: recommended,
+                        request: request,
+                        details: results,
+                        preflightDetail: preflightDetail
+                    )
                 }
-                let detail = self.probeDetail(surface: "openai/responses", url: url, statusCode: httpResponse.statusCode, data: data)
-                details.append(detail)
-                if self.apiEndpointExists(statusCode: httpResponse.statusCode, data: data) == true {
-                    addDetected("openai/responses")
+                self.finishFullModelProbe(request: request, completion: completion)
+            }
+
+            func run(_ index: Int) {
+                if index >= probes.count { finish(); return }
+                let (mode, urls, body, headers) = probes[index]
+                self.postJSONProbe(
+                    urls: urls, apiKey: request.apiKey, apiBase: request.apiBase,
+                    body: body, timeout: 45, extraHeaders: headers
+                ) { [weak self] url, response, data, error in
+                    guard let self else { return }
+                    guard self.modelAvailabilityProbeRuns[request.probeKey] == runID else { return }
+                    guard self.modelProbeRequestStillMatches(request) else {
+                        self.finishFullModelProbe(request: request, completion: completion)
+                        return
+                    }
+                    let availability = response.map {
+                        self.upstreamApiProbeAvailability(statusCode: $0.statusCode, data: data)
+                    } ?? .inconclusive
+                    let detail: String
+                    if let response {
+                        detail = self.probeDetail(surface: mode, url: url, statusCode: response.statusCode, data: data)
+                    } else {
+                        detail = "\(mode) probe URL: \(url.absoluteString)\n\(error?.localizedDescription ?? "No HTTP response returned.")"
+                    }
+                    results.append(UpstreamApiProbeResult(mode: mode, availability: availability, detail: detail))
+                    run(index + 1)
                 }
-                probeChat()
+            }
+            run(0)
+        } catch {
+            setEditorError("Full probe failed", message: error.localizedDescription)
+            finishFullModelProbe(request: request, completion: completion)
+        }
+    }
+
+    func runFullImageModelProbe(
+        request: ModelAvailabilityProbeRequest,
+        runID: UUID,
+        preflightDetail: String,
+        knownImageModel: Bool = true,
+        completion: (() -> Void)?
+    ) {
+        if knownImageModel {
+            markModelAsImageGenerationEndpoint(request: request)
+        }
+        do {
+            let body = try modelAvailabilityImageGenerationProbeBody(model: request.upstreamModel)
+            postJSONProbe(urls: request.imageGenerationURLs, apiKey: request.apiKey, apiBase: request.apiBase, body: body, timeout: 60) { [weak self] url, response, data, error in
+                guard let self else { return }
+                guard self.modelAvailabilityProbeRuns[request.probeKey] == runID else { return }
+                let detail = error.map { "\(url.absoluteString)\n\($0.localizedDescription)" }
+                    ?? response.map { self.probeDetail(surface: "image generation", url: url, statusCode: $0.statusCode, data: data) }
+                    ?? "\(url.absoluteString)\nNo HTTP response returned."
+                let outcome = response.map { self.parseModelAvailabilityImageGenerationProbeOutcome(statusCode: $0.statusCode, data: data) } ?? .inconclusive(detail)
+                if case .available = outcome {
+                    self.markModelAsImageGenerationEndpoint(request: request)
+                }
+                self.applyModelAvailabilityProbeOutcome(self.probeOutcome(outcome, prefixing: "\(preflightDetail)\n\n\(detail)"), request: request)
+                self.finishFullModelProbe(request: request, completion: completion)
             }
         } catch {
-            responsesEndpointProbeRuns.removeValue(forKey: request.probeKey)
-            refreshResponsesEndpointProbeControlsEnabled()
-            applyResponsesEndpointProbeOutcome(
-                .failed("URL probe request failed: \(error.localizedDescription)"),
-                request: request,
-                automatic: automatic
-            )
+            applyModelAvailabilityProbeOutcome(.inconclusive("\(preflightDetail)\n\n/images/generations probe failed: \(error.localizedDescription)"), request: request)
+            finishFullModelProbe(request: request, completion: completion)
         }
+    }
+
+    func markModelAsImageGenerationEndpoint(request: ModelAvailabilityProbeRequest) {
+        guard modelProbeRequestStillMatches(request) else { return }
+        var model = providers[request.providerIndex].models[request.modelIndex]
+        let originalModel = model
+        model.modelInfoExtra["mode"] = .string("image_generation")
+        model.supportsImageGeneration = false
+        model.supportsImageGenerationPresent = false
+        providers[request.providerIndex].models[request.modelIndex] = model
+        markPendingChangesIfNeeded(model != originalModel, updateStatus: false)
+        if selectedModelProbeKey() == request.probeKey {
+            selectedModelImageGenerationEndpointDisabled = true
+            refreshResponsesEndpointSupportControls()
+        }
+    }
+
+    func probeOutcome(_ outcome: ModelAvailabilityProbeOutcome, prefixing detail: String) -> ModelAvailabilityProbeOutcome {
+        switch outcome {
+        case .available(let message): return .available("\(detail)\n\(message)")
+        case .unavailable(let message): return .unavailable("\(detail)\n\(message)")
+        case .inconclusive(let message): return .inconclusive("\(detail)\n\(message)")
+        }
+    }
+
+    func presentFullProbeRecommendation(
+        recommendedOrder: [String],
+        request: ModelAvailabilityProbeRequest,
+        details: [UpstreamApiProbeResult],
+        preflightDetail: String
+    ) {
+        let alert = NSAlert()
+        alert.messageText = "Probe recommendation"
+        let lines = details.map { result in
+            return "\(self.upstreamApiDisplayName(result.mode)): \(self.upstreamApiProbeSummary(result, recommendedOrder: recommendedOrder))"
+        }
+        alert.informativeText = ([preflightDetail, ""] + lines + ["", "Recommended order: \(recommendedOrder.map(upstreamApiDisplayName).joined(separator: " → "))", "Accept selects only the preferred protocol. Use Customize to choose extra fallbacks and reorder before Apply."]).joined(separator: "\n")
+        alert.addButton(withTitle: "Accept Preferred")
+        alert.addButton(withTitle: "Customize")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            applyFullProbeSelection([recommendedOrder[0]], recommendedOrder: recommendedOrder, request: request, details: details, preflightDetail: preflightDetail)
+        case .alertSecondButtonReturn:
+            applyFullProbeSelection([recommendedOrder[0]], recommendedOrder: recommendedOrder, request: request, details: details, preflightDetail: preflightDetail)
+            setEditorStatus("Probe complete. Adjust checks/order, then Apply.", tooltip: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n"))
+        default:
+            setEditorStatus("Probe results were not applied.")
+        }
+    }
+
+    func applyFullProbeSelection(
+        _ selected: [String],
+        recommendedOrder: [String],
+        request: ModelAvailabilityProbeRequest,
+        details: [UpstreamApiProbeResult],
+        preflightDetail: String
+    ) {
+        guard modelProbeRequestStillMatches(request), let primary = selected.first else { return }
+        var model = providers[request.providerIndex].models[request.modelIndex]
+        model.modelEnabled = true
+        model.enabled = modelEffectivelyEnabled(providerIndex: request.providerIndex, model: model)
+        model.upstreamApiMode = primary
+        model.supportedUpstreamApiModes = selected
+        model.litellmModel = litellmModel(model.litellmModel, settingAdapterFor: primary)
+        providers[request.providerIndex].models[request.modelIndex] = model
+        displayedUpstreamApiModes = recommendedOrder + upstreamApiModes.filter { !recommendedOrder.contains($0) }
+        if selectedModelProbeKey() == request.probeKey {
+            setUpstreamApiSupportCheckboxes(selected)
+            setAdapterControls(from: model.litellmModel)
+            enabledCheckbox.state = .on
+        }
+        markPendingChanges()
+        reloadRouteTable(preserving: (request.providerIndex, request.modelIndex))
+        refreshRuntimeMap()
+        setEditorStatus("Probe complete: using \(upstreamApiDisplayName(primary)); extra fallbacks remain opt-in.", tooltip: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n"))
     }
 
     func setModelCandidateFetchState(_ loading: Bool) {
@@ -557,68 +530,6 @@ extension ModelConfigEditorController {
             modelTableView.reloadData(forRowIndexes: IndexSet(integer: request.modelIndex), columnIndexes: IndexSet(integersIn: 0..<modelTableView.numberOfColumns))
         }
         reloadRouteTable(preserving: (request.providerIndex, request.modelIndex))
-        refreshRuntimeMap()
-    }
-
-    func applyResponsesEndpointProbeOutcome(
-        _ outcome: UpstreamApiModeProbeOutcome,
-        request: ModelAvailabilityProbeRequest,
-        automatic: Bool
-    ) {
-        guard modelProbeRequestStillMatches(request) else {
-            return
-        }
-
-        var model = providers[request.providerIndex].models[request.modelIndex]
-        let originalModel = model
-        let label = "\(request.providerName)/\(request.keyName) \(request.upstreamModel)"
-        let prefix = automatic ? "Auto URL probe" : "URL probe"
-
-        switch outcome {
-        case .detected(let mode, let supportedModes, let detail):
-            let normalizedMode = normalizedUpstreamApiMode(mode)
-            var normalizedSupportedModes: [String] = []
-            for item in supportedModes {
-                let supportedMode = normalizedUpstreamApiMode(item)
-                if !normalizedSupportedModes.contains(supportedMode) {
-                    normalizedSupportedModes.append(supportedMode)
-                }
-            }
-            if !normalizedSupportedModes.contains(normalizedMode) {
-                normalizedSupportedModes.append(normalizedMode)
-            }
-            model.upstreamApiMode = normalizedMode
-            model.upstreamApiModePresent = true
-            model.supportedUpstreamApiModes = normalizedSupportedModes
-            model.supportedUpstreamApiModesPresent = true
-            model.supportsResponsesEndpoint = normalizedSupportedModes.contains("openai/responses")
-            model.supportsResponsesEndpointPresent = false
-            model.litellmModel = litellmModel(model.litellmModel, settingAdapterFor: normalizedMode)
-            providers[request.providerIndex].models[request.modelIndex] = model
-            if selectedProviderIndex == request.providerIndex, selectedModelIndex == request.modelIndex {
-                setUpstreamApiSupportCheckboxes(normalizedSupportedModes)
-                setAdapterControls(from: model.litellmModel)
-            }
-            setEditorStatus("\(prefix): detected \(normalizedSupportedModes.joined(separator: ", ")) for \(label).", tooltip: "Effective: \(normalizedMode)\n\n\(detail)")
-        case .failed(let detail):
-            if automatic {
-                setEditorStatus(
-                    "\(prefix): inconclusive for \(label); URL surface settings were not changed.",
-                    color: .secondaryLabelColor,
-                    tooltip: detail
-                )
-            } else {
-                setEditorError("\(prefix) failed", message: detail)
-            }
-            return
-        }
-
-        markPendingChangesIfNeeded(model != originalModel, updateStatus: false)
-        if selectedProviderIndex == request.providerIndex {
-            modelTableView.reloadData(forRowIndexes: IndexSet(integer: request.modelIndex), columnIndexes: IndexSet(integersIn: 0..<modelTableView.numberOfColumns))
-        }
-        reloadRouteTable(preserving: (request.providerIndex, request.modelIndex))
-        refreshResponsesEndpointSupportControls()
         refreshRuntimeMap()
     }
 
@@ -804,6 +715,7 @@ extension ModelConfigEditorController {
         guard let key else { return }
 
         var addedCount = 0
+        var addedIndexes: [Int] = []
         for upstream in models {
             var model = EditableModel.blank()
             model.enabled = true
@@ -817,12 +729,9 @@ extension ModelConfigEditorController {
             model.supportsImageGeneration = false
             model.supportsImageGenerationPresent = false
             model.upstreamApiMode = defaultUpstreamApiMode
-            model.upstreamApiModePresent = false
             model.supportedUpstreamApiModes = [defaultUpstreamApiMode]
-            model.supportedUpstreamApiModesPresent = false
-            model.supportsResponsesEndpoint = true
-            model.supportsResponsesEndpointPresent = false
             providers[providerIndex].models.append(model)
+            addedIndexes.append(providers[providerIndex].models.count - 1)
             addedCount += 1
         }
 
@@ -833,12 +742,45 @@ extension ModelConfigEditorController {
             let lastIdentity = modelSelectionIdentity(providerIndex: providerIndex, modelIndex: lastIndex)
             reloadRouteTable(preserving: lastIdentity)
             showModel(providerIndex: providerIndex, modelIndex: lastIndex)
-            beginResponsesEndpointProbe(automatic: true)
+            runAutomaticFullProbes(providerIndex: providerIndex, modelIndexes: addedIndexes)
         } else {
             reloadRouteTable()
         }
         refreshRuntimeMap()
         markPendingChangesIfNeeded(addedCount > 0)
-        setEditorStatus("Added \(addedCount) model\(addedCount == 1 ? "" : "s") to \(provider.displayName).")
+        if addedCount == 0 {
+            setEditorStatus("No models added to \(provider.displayName).")
+        }
+    }
+
+    func runAutomaticFullProbes(providerIndex: Int, modelIndexes: [Int]) {
+        let indexes = modelIndexes
+        guard !indexes.isEmpty else { return }
+
+        func run(_ position: Int) {
+            guard position < indexes.count else {
+                refreshModelAvailabilityProbeControlsEnabled()
+                setEditorStatus("Added models: full probes complete.")
+                return
+            }
+            let modelIndex = indexes[position]
+            do {
+                let probeRequest = try modelAvailabilityProbeRequest(providerIndex: providerIndex, modelIndex: modelIndex)
+                let runID = UUID()
+                modelAvailabilityProbeRuns[probeRequest.probeKey] = runID
+                setEditorStatus("Full probe \(position + 1) of \(indexes.count): \(probeRequest.upstreamModel)...")
+                runFullModelProbe(
+                    request: probeRequest,
+                    runID: runID,
+                    automatic: true,
+                    completion: { run(position + 1) }
+                )
+            } catch {
+                setEditorStatus("Added models; automatic full probe skipped for one model: \(error.localizedDescription)")
+                run(position + 1)
+            }
+        }
+        run(0)
+        refreshModelAvailabilityProbeControlsEnabled()
     }
 }

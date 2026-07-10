@@ -76,10 +76,6 @@ class LiteLLMMenuHook(CustomLogger):
             _image_generation_module._with_codex_compaction_controls,
             _image_generation_module._with_responses_native_extra_body,
             _image_generation_module._with_codex_compaction_headers,
-            lambda current_kwargs: _responses_surfaces_module._with_preemptive_responses_chat_bridge_for_call_type(
-                current_kwargs,
-                call_type,
-            ),
             _image_generation_module._with_stream_request_timeout,
             _image_generation_module._with_incoming_user_agent_header,
             _image_generation_module._with_browser_compatible_headers,
@@ -107,15 +103,13 @@ class LiteLLMMenuHook(CustomLogger):
             )
             after_constraints = candidate_deployments
             candidate_deployments, cooldown_deployments, cooldown_filtered = (
-                _routing_module._with_active_deployment_cooldowns(candidate_deployments)
-            )
-            after_cooldown = candidate_deployments
-            candidate_deployments, responses_surface_filtered = (
-                _routing_module._prefer_responses_surface_deployments(
+                _routing_module._with_active_deployment_cooldowns(
                     candidate_deployments,
-                    request_kwargs,
+                    request_kwargs=request_kwargs,
                 )
             )
+            after_cooldown = candidate_deployments
+            responses_surface_filtered = False
             image_generation_filtered = False
             web_search_filtered = False
             web_search_unsupported_bridge = False

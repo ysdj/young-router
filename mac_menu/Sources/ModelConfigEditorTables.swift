@@ -8,6 +8,9 @@ extension ModelConfigEditorController {
         if tableView == routeTableView {
             return routeTableRows().count
         }
+        if tableView == runtimeMapTableView {
+            return runtimeMapRows.count
+        }
         if tableView == providerKeyTableView {
             guard let providerIndex = selectedProviderIndex else { return 0 }
             return providers[providerIndex].apiKeys.count
@@ -17,6 +20,16 @@ extension ModelConfigEditorController {
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        if tableView == runtimeMapTableView {
+            guard runtimeMapRows.indices.contains(row) else { return 28 }
+            switch runtimeMapRows[row] {
+            case .summary: return 30
+            case .model: return 27
+            case .order: return 23
+            case .deployment: return 40
+            case .empty: return 44
+            }
+        }
         if tableView == routeTableView {
             let rows = routeTableRows()
             if row >= 0, row < rows.count {
@@ -39,6 +52,9 @@ extension ModelConfigEditorController {
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !isRenderingSelection else { return }
         guard let tableView = notification.object as? NSTableView else { return }
+        if tableView == runtimeMapTableView {
+            return
+        }
         if tableView == providerTableView {
             renderProviderSelection()
         } else if tableView == providerKeyTableView {
@@ -51,6 +67,9 @@ extension ModelConfigEditorController {
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if tableView == runtimeMapTableView {
+            return runtimeMapCell(at: row)
+        }
         let text: String
         var tooltip: String?
         var enabled = true
@@ -125,6 +144,21 @@ extension ModelConfigEditorController {
             || tableColumn?.identifier == routeStatusColumnIdentifier ? .right : .left
         label.toolTip = tooltip ?? text
         return verticallyCenteredTableCell(label: label)
+    }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        tableView != runtimeMapTableView
+    }
+
+    func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool {
+        guard tableView == runtimeMapTableView,
+              runtimeMapRows.indices.contains(row) else {
+            return false
+        }
+        if case .model = runtimeMapRows[row] {
+            return true
+        }
+        return false
     }
 
     func verticallyCenteredTableCell(label: NSTextField) -> NSTableCellView {
@@ -568,21 +602,7 @@ extension ModelConfigEditorController {
 
     func normalizedUpstreamApiMode(_ value: String) -> String {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let aliases: [String: String] = [
-            "openai_chat": "openai/chat",
-            "openai_chat_completions": "openai/chat",
-            "openai-chat": "openai/chat",
-            "chat": "openai/chat",
-            "chat_completions": "openai/chat",
-            "openai_responses": "openai/responses",
-            "openai-responses": "openai/responses",
-            "responses": "openai/responses",
-            "anthropic_messages": "anthropic",
-            "anthropic/messages": "anthropic",
-            "claude": "anthropic",
-        ]
-        let normalized = aliases[text] ?? text
-        return upstreamApiModes.contains(normalized) ? normalized : defaultUpstreamApiMode
+        return upstreamApiModes.contains(text) ? text : defaultUpstreamApiMode
     }
 
     func normalizedUpstreamApiMode(for model: EditableModel) -> String {

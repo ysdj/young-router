@@ -40,6 +40,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000001"
                   provider: experimental_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
             """
         )
 
@@ -47,6 +49,58 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         self.assertEqual(["renamed"], [key["name"] for key in provider["api_keys"]])
         self.assertEqual("renamed", provider["models"][0]["api_key_name"])
+
+    def test_load_accepts_current_disabled_models_companion_file(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              experimental_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list: []
+            """
+        )
+        disabled_path = path.with_name("config.disabled-models.yaml")
+        disabled_path.write_text(
+            textwrap.dedent(
+                """
+                disabled_model_list:
+                  - model_name: disabled-chat
+                    litellm_params:
+                      model: openai/disabled-chat
+                      api_base: https://example.com/v1
+                      api_key: sk-test
+                    model_info:
+                      id: "0000000d"
+                      provider: experimental_provider
+                      upstream_url_surface: openai/chat
+                      supported_upstream_url_surfaces: [openai/chat]
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+        provider = config_editor.load_config(path)["providers"][0]
+
+        self.assertEqual(1, len(provider["models"]))
+        self.assertFalse(provider["models"][0]["enabled"])
+        self.assertEqual(
+            ["openai/chat"],
+            provider["models"][0]["supported_upstream_url_surfaces"],
+        )
+
+    def test_load_rejects_disabled_models_embedded_in_main_config(self) -> None:
+        path = self.write_config(
+            """
+            model_list: []
+            disabled_model_list: []
+            """
+        )
+
+        with self.assertRaisesRegex(ValueError, "config.disabled-models.yaml"):
+            config_editor.load_config(path)
 
     def test_save_round_trip_preserves_renamed_primary_api_key_label(self) -> None:
         path = self.write_config(
@@ -66,6 +120,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000002"
                   provider: experimental_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
             """
         )
         payload = config_editor.load_config(path)
@@ -78,6 +134,56 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         self.assertEqual(["renamed"], [key["name"] for key in reloaded["api_keys"]])
         self.assertEqual("renamed", reloaded["models"][0]["api_key_name"])
+
+    def test_save_round_trip_keeps_multiple_providers_nested(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              primary:
+                api_base: "https://primary.example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-primary"
+              backup:
+                api_base: "https://backup.example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-backup"
+            model_list:
+              - model_name: default-chat
+                litellm_params:
+                  model: openai/default-chat
+                  api_base: "https://primary.example.test/v1"
+                  api_key: "sk-primary"
+                model_info:
+                  id: "00000021"
+                  provider: primary
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+              - model_name: default-chat
+                litellm_params:
+                  model: openai/default-chat
+                  api_base: "https://backup.example.test/v1"
+                  api_key: "sk-backup"
+                model_info:
+                  id: "00000022"
+                  provider: backup
+                  upstream_url_surface: openai/chat
+                  supported_upstream_url_surfaces: [openai/chat]
+            router_settings: {}
+            """
+        )
+        payload = config_editor.load_config(path)
+
+        result = config_editor.save_config(payload["providers"], path)
+        saved = config_editor._load_yaml(path)
+
+        self.assertEqual(2, result["providers"])
+        self.assertEqual({"primary", "backup"}, set(saved["providers"]))
+        self.assertNotIn("primary", saved)
+        self.assertNotIn("backup", saved)
+        self.assertEqual({}, saved["router_settings"])
+        self.assertEqual(2, len(saved["model_list"]))
 
     def test_save_drops_legacy_supports_vision_model_info(self) -> None:
         path = self.write_config(
@@ -97,6 +203,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000003"
                   provider: provider_alpha
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
             """
         )
         payload = config_editor.load_config(path)
@@ -153,31 +261,29 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000004"
                   provider: provider_alpha
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
             """
         )
         payload = config_editor.load_config(path)
         model = payload["providers"][0]["models"][0]
         model["upstream_url_surface"] = "openai/chat"
-        model["upstream_url_surface_present"] = True
         model["supported_upstream_url_surfaces"] = ["openai/chat", "anthropic"]
-        model["supported_upstream_url_surfaces_present"] = True
 
         config_editor.save_config(payload["providers"], path)
         reloaded_model = config_editor.load_config(path)["providers"][0]["models"][0]
 
         self.assertEqual("openai/chat", reloaded_model["upstream_url_surface"])
-        self.assertTrue(reloaded_model["upstream_url_surface_present"])
         self.assertEqual(
             ["openai/chat", "anthropic"],
             reloaded_model["supported_upstream_url_surfaces"],
         )
-        self.assertTrue(reloaded_model["supported_upstream_url_surfaces_present"])
         self.assertNotIn("upstream_api_mode", reloaded_model["model_info_extra"])
         self.assertNotIn("upstream_url_surface", reloaded_model["model_info_extra"])
         self.assertNotIn("supported_upstream_api_modes", reloaded_model["model_info_extra"])
         self.assertNotIn("supported_upstream_url_surfaces", reloaded_model["model_info_extra"])
 
-    def test_save_removes_legacy_context_metadata(self) -> None:
+    def test_load_rejects_removed_context_metadata(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -200,23 +306,10 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   context_metadata_model_id: openai/vendor-chat
             """
         )
-        payload = config_editor.load_config(path)
-        model = payload["providers"][0]["models"][0]
+        with self.assertRaisesRegex(ValueError, "unsupported max_input_tokens"):
+            config_editor.load_config(path)
 
-        self.assertNotIn("context_window_mode", model)
-        self.assertNotIn("context_window", model)
-        self.assertNotIn("max_input_tokens", model["model_info_extra"])
-        self.assertNotIn("context_metadata_source", model["model_info_extra"])
-        self.assertNotIn("context_metadata_model_id", model["model_info_extra"])
-
-        config_editor.save_config(payload["providers"], path)
-        saved = config_editor._load_yaml(path)["model_list"][0]["model_info"]
-
-        self.assertNotIn("max_input_tokens", saved)
-        self.assertNotIn("context_metadata_source", saved)
-        self.assertNotIn("context_metadata_model_id", saved)
-
-    def test_load_maps_responses_false_to_openai_chat_mode(self) -> None:
+    def test_load_rejects_removed_responses_endpoint_flag(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -238,21 +331,10 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
 
-        model = config_editor.load_config(path)["providers"][0]["models"][0]
+        with self.assertRaisesRegex(ValueError, "unsupported supports_responses_endpoint"):
+            config_editor.load_config(path)
 
-        self.assertEqual("openai/chat", model["upstream_url_surface"])
-        self.assertEqual(["openai/chat"], model["supported_upstream_url_surfaces"])
-        self.assertFalse(model["upstream_url_surface_present"])
-        self.assertFalse(model["supports_responses_endpoint"])
-        self.assertTrue(model["supports_responses_endpoint_present"])
-
-        payload = config_editor.load_config(path)
-        config_editor.save_config(payload["providers"], path)
-        saved = config_editor._load_yaml(path)["model_list"][0]["model_info"]
-        self.assertEqual("openai/chat", saved["upstream_url_surface"])
-        self.assertFalse(saved["supports_responses_endpoint"])
-
-    def test_supported_url_surfaces_override_responses_false(self) -> None:
+    def test_supported_url_surfaces_define_primary_without_legacy_flags(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -274,28 +356,55 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces:
                     - openai/chat
                     - openai/responses
-                  supports_responses_endpoint: false
             """
         )
 
         payload = config_editor.load_config(path)
         model = payload["providers"][0]["models"][0]
 
-        self.assertEqual("openai/responses", model["upstream_url_surface"])
+        self.assertEqual("openai/chat", model["upstream_url_surface"])
         self.assertEqual(
             ["openai/chat", "openai/responses"],
             model["supported_upstream_url_surfaces"],
         )
-        self.assertTrue(model["supports_responses_endpoint"])
 
         config_editor.save_config(payload["providers"], path)
         saved = config_editor._load_yaml(path)["model_list"][0]["model_info"]
-        self.assertEqual("openai/responses", saved["upstream_url_surface"])
+        self.assertEqual("openai/chat", saved["upstream_url_surface"])
         self.assertEqual(
             ["openai/chat", "openai/responses"],
             saved["supported_upstream_url_surfaces"],
         )
         self.assertNotIn("supports_responses_endpoint", saved)
+
+    def test_load_rejects_primary_surface_that_differs_from_ordered_list(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              provider_alpha:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: balanced-chat
+                litellm_params:
+                  model: openai/vendor-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000016"
+                  provider: provider_alpha
+                  upstream_url_surface: openai/chat
+                  supported_upstream_url_surfaces:
+                    - openai/responses
+                    - anthropic
+                    - openai/chat
+            """
+        )
+
+        with self.assertRaisesRegex(ValueError, "must equal the first"):
+            config_editor.load_config(path)
 
     def test_save_generates_random_deployment_token_and_explicit_route_key(self) -> None:
         path = self.write_config(
@@ -327,11 +436,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             "supports_responses_image_generation_tool": False,
             "supports_responses_image_generation_tool_present": False,
             "upstream_url_surface": "openai/responses",
-            "upstream_url_surface_present": False,
             "supported_upstream_url_surfaces": ["openai/responses"],
-            "supported_upstream_url_surfaces_present": False,
-            "supports_responses_endpoint": True,
-            "supports_responses_endpoint_present": False,
             "entry_extra": {},
             "litellm_extra": {},
             "model_info_extra": {},
@@ -368,6 +473,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000007"
                   provider: compat_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
               - model_name: default-chat
                 litellm_params:
                   model: openai/default-chat
@@ -377,6 +484,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000008"
                   provider: compat_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
             """
         )
         payload = config_editor.load_config(path)
@@ -415,6 +524,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000018"
                   provider: openrouter
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
               - model_name: llmwebsearch
                 litellm_params:
                   model: openai/vendor/vendor-chat
@@ -424,6 +535,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000019"
                   provider: openrouter
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
             """
         )
         payload = config_editor.load_config(path)
@@ -471,11 +584,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             "supports_responses_image_generation_tool": False,
             "supports_responses_image_generation_tool_present": False,
             "upstream_url_surface": "openai/responses",
-            "upstream_url_surface_present": False,
             "supported_upstream_url_surfaces": ["openai/responses"],
-            "supported_upstream_url_surfaces_present": False,
-            "supports_responses_endpoint": True,
-            "supports_responses_endpoint_present": False,
             "entry_extra": {},
             "litellm_extra": {},
             "model_info_extra": {},
@@ -511,6 +620,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000009"
                   provider: compat_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
               - model_name: gpt-image-2
                 litellm_params:
                   model: openai/gpt-image-2
@@ -520,6 +631,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "0000000a"
                   provider: compat_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
             """
         )
 
@@ -674,6 +787,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   id: "00000008"
                   provider: compat_provider
                   alias_target: default-chat
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
             """
         )
         payload = config_editor.load_config(path)

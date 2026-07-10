@@ -177,25 +177,19 @@ extension ModelConfigEditorController {
         ])
 
         let runtimeSection = sectionStack(title: "Runtime Map")
-        let runtimeTextView = NSTextView()
-        runtimeTextView.isEditable = false
-        runtimeTextView.isSelectable = true
-        runtimeTextView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        runtimeTextView.textContainerInset = NSSize(width: 6, height: 6)
-        runtimeTextView.isHorizontallyResizable = true
-        runtimeTextView.textContainer?.widthTracksTextView = false
-        runtimeTextView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        configureRuntimeMapTable()
         let runtimeScroll = NSScrollView()
         runtimeScroll.borderType = .bezelBorder
         runtimeScroll.hasVerticalScroller = true
-        runtimeScroll.hasHorizontalScroller = true
+        runtimeScroll.hasHorizontalScroller = false
         runtimeScroll.autohidesScrollers = false
-        runtimeScroll.documentView = runtimeTextView
+        runtimeScroll.usesPredominantAxisScrolling = true
+        runtimeScroll.verticalScrollElasticity = .none
+        runtimeScroll.documentView = runtimeMapTableView
         runtimeScroll.widthAnchor.constraint(equalToConstant: 560).isActive = true
         runtimeScroll.heightAnchor.constraint(equalToConstant: 220).isActive = true
         runtimeSection.stack.addArrangedSubview(runtimeScroll)
         formStack.addArrangedSubview(runtimeSection.view)
-        runtimeMapTextView = runtimeTextView
         runtimeMapScrollView = runtimeScroll
 
         let cancelButton = NSButton(title: "Close", target: self, action: #selector(cancel))
@@ -324,6 +318,26 @@ extension ModelConfigEditorController {
         nameColumn.title = "Key"
         nameColumn.width = 180
         providerKeyTableView.addTableColumn(nameColumn)
+    }
+
+    func configureRuntimeMapTable() {
+        runtimeMapTableView.delegate = self
+        runtimeMapTableView.dataSource = self
+        runtimeMapTableView.headerView = nil
+        runtimeMapTableView.usesAlternatingRowBackgroundColors = false
+        runtimeMapTableView.intercellSpacing = .zero
+        runtimeMapTableView.selectionHighlightStyle = .none
+        runtimeMapTableView.focusRingType = .none
+        runtimeMapTableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        runtimeMapTableView.allowsColumnReordering = false
+        runtimeMapTableView.allowsColumnResizing = false
+        runtimeMapTableView.floatsGroupRows = false
+
+        let column = NSTableColumn(identifier: runtimeMapColumnIdentifier)
+        column.title = "Runtime route"
+        column.resizingMask = .autoresizingMask
+        column.width = 540
+        runtimeMapTableView.addTableColumn(column)
     }
 
     func configureListTable(_ tableView: NSTableView) {
@@ -511,16 +525,8 @@ extension ModelConfigEditorController {
     }
 
     func upstreamApiModeRow() -> NSStackView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
-        row.addArrangedSubview(supportsOpenAIChatCheckbox)
-        row.addArrangedSubview(supportsOpenAIResponsesCheckbox)
-        row.addArrangedSubview(supportsAnthropicCheckbox)
-        row.addArrangedSubview(probeResponsesEndpointButton)
-        row.addArrangedSubview(spacer())
-        return row
+        configureUpstreamApiModeRowsIfNeeded()
+        return upstreamApiModeStackView
     }
 
     func setEditorStatus(_ message: String, color: NSColor = .secondaryLabelColor, tooltip: String? = nil) {

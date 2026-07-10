@@ -19,7 +19,6 @@ from .base import (
     _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
-    _RESPONSES_ENDPOINT_SUPPORT_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
     _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
@@ -30,15 +29,12 @@ from .base import (
     _SUPPORTS_WEB_SEARCH_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
-    _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-    _UPSTREAM_URL_SURFACE_PREFERENCE,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
     inspect,
     litellm,
-    re,
 )
 
 
@@ -47,18 +43,32 @@ def _with_responses_chat_bridge_compatible_tools(
     retry_metadata: dict,
 ) -> None:
     discovered_tools = _responses_tools_module._responses_input_tool_search_output_tools(retry_kwargs.get("input"))
-    if "tools" not in retry_kwargs and not discovered_tools:
+    additional_tools = _responses_tools_module._responses_input_additional_tools(
+        retry_kwargs.get("input")
+    )
+    if "tools" not in retry_kwargs and not discovered_tools and not additional_tools:
         return
 
     tools = retry_kwargs.get("tools")
     if not isinstance(tools, list):
         tools = []
+    if additional_tools:
+        tools = [*tools, *additional_tools]
     sanitized_tools, web_search_options, stats = _responses_tools_module._responses_chat_bridge_sanitize_tools(
         tools,
         input_value=retry_kwargs.get("input"),
     )
     if stats.get("changed"):
         retry_metadata["responses_chat_bridge_tool_sanitized"] = stats
+    if additional_tools:
+        retry_metadata["responses_chat_bridge_additional_tools"] = {
+            "item_count": sum(
+                1
+                for item in retry_kwargs.get("input") or []
+                if isinstance(item, dict) and item.get("type") == "additional_tools"
+            ),
+            "tool_count": len(additional_tools),
+        }
     if stats.get("bridged_web_search_tools"):
         retry_metadata[_WEB_SEARCH_EXTERNAL_BRIDGE_KEY] = True
         retry_kwargs.pop("web_search_options", None)
@@ -94,12 +104,17 @@ def _with_responses_function_tool_bridge_compatible_tools(
     outer_request_kwargs: Optional[dict] = None,
 ) -> None:
     discovered_tools = _responses_tools_module._responses_input_tool_search_output_tools(bridge_kwargs.get("input"))
-    if "tools" not in bridge_kwargs and not discovered_tools:
+    additional_tools = _responses_tools_module._responses_input_additional_tools(
+        bridge_kwargs.get("input")
+    )
+    if "tools" not in bridge_kwargs and not discovered_tools and not additional_tools:
         return
 
     tools = bridge_kwargs.get("tools")
     if not isinstance(tools, list):
         tools = []
+    if additional_tools:
+        tools = [*tools, *additional_tools]
     plan = _responses_tools_module._responses_hosted_tool_plan(
         bridge_kwargs,
         outer_request_kwargs,
@@ -116,6 +131,15 @@ def _with_responses_function_tool_bridge_compatible_tools(
     )
     if stats.get("changed"):
         bridge_metadata["responses_function_tool_bridge_tool_sanitized"] = stats
+    if additional_tools:
+        bridge_metadata["responses_function_tool_bridge_additional_tools"] = {
+            "item_count": sum(
+                1
+                for item in bridge_kwargs.get("input") or []
+                if isinstance(item, dict) and item.get("type") == "additional_tools"
+            ),
+            "tool_count": len(additional_tools),
+        }
     if stats.get("bridged_web_search_tools"):
         bridge_metadata[_WEB_SEARCH_EXTERNAL_BRIDGE_KEY] = True
         bridge_kwargs.pop("web_search_options", None)
@@ -161,12 +185,14 @@ def _responses_chat_bridge_retry_kwargs(
         request_kwargs
     ) or _image_generation_module._request_already_attempted_responses_chat_bridge(outer_request_kwargs):
         return None
-    retry_reason = _responses_chat_bridge_retry_reason(
-        exception,
-        request_kwargs,
-        outer_request_kwargs,
+    if _responses_chat_bridge_retry_reason(
+        exception, request_kwargs, outer_request_kwargs
+    ) is None:
+        return None
+    current_surface = _routing_module._request_current_upstream_surface(
+        request_kwargs
     )
-    if retry_reason is None:
+    if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
         return None
     plan = _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_request_kwargs)
     if (
@@ -184,8 +210,9 @@ def _responses_chat_bridge_retry_kwargs(
     litellm_metadata = _image_generation_module._request_metadata_dict(retry_kwargs, "litellm_metadata") or {}
     retry_metadata = litellm_metadata.copy()
     retry_metadata[_RESPONSES_CHAT_BRIDGE_METADATA_KEY] = True
-    if retry_reason != "responses_endpoint_not_found":
-        retry_metadata[_RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY] = retry_reason
+    retry_metadata[_RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY] = (
+        "responses_schema_unsupported"
+    )
     _responses_execution_module._remember_responses_chat_bridge_model_group(
         retry_metadata,
         request_kwargs,
@@ -202,6 +229,8 @@ def _responses_chat_bridge_retry_kwargs(
         retry_metadata["responses_chat_bridge_input_sanitized"] = input_stats
     retry_kwargs["litellm_metadata"] = retry_metadata
     retry_kwargs["use_chat_completions_api"] = True
+    if current_surface in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
+        retry_kwargs["_litellm_menu_upstream_url_surface"] = current_surface
     return retry_kwargs
 
 
@@ -230,12 +259,14 @@ def _responses_chat_bridge_retry_reason(
 def _request_configured_responses_endpoint_unsupported(request_kwargs: Optional[dict]) -> bool:
     request_kwargs = request_kwargs or {}
     model_info = _image_generation_module._request_model_info(request_kwargs)
-    mode = _normalized_upstream_url_surface(model_info.get(_UPSTREAM_URL_SURFACE_KEY))
-    if mode == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
-        return model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is False
-    if mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
-        return True
-    return model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is False
+    mode = _routing_module._request_current_upstream_surface(request_kwargs)
+    if not mode:
+        modes = _normalized_upstream_url_surfaces(
+            model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+        )
+        if len(modes) == 1:
+            mode = modes[0]
+    return mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES
 
 
 def _request_has_explicit_surface_metadata(request_kwargs: Optional[dict]) -> bool:
@@ -245,9 +276,7 @@ def _request_has_explicit_surface_metadata(request_kwargs: Optional[dict]) -> bo
     return any(
         key in model_info
         for key in (
-            _UPSTREAM_URL_SURFACE_KEY,
             _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
-            _RESPONSES_ENDPOINT_SUPPORT_KEY,
         )
     )
 
@@ -258,18 +287,23 @@ def _current_route_responses_endpoint_unsupported(
 ) -> bool:
     if _request_has_explicit_surface_metadata(request_kwargs):
         return _request_configured_responses_endpoint_unsupported(request_kwargs)
+    if _routing_module._request_current_upstream_surface(request_kwargs):
+        return _request_configured_responses_endpoint_unsupported(request_kwargs)
     return _request_configured_responses_endpoint_unsupported(
         request_kwargs
     ) or _request_configured_responses_endpoint_unsupported(outer_request_kwargs)
 
 
 def _model_info_has_chat_bridge_mode(model_info: dict) -> bool:
-    mode = _normalized_upstream_url_surface(model_info.get(_UPSTREAM_URL_SURFACE_KEY))
+    modes = _normalized_upstream_url_surfaces(
+        model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+    )
+    mode = modes[0] if modes else ""
     if mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
         return True
     if mode == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
         return False
-    return model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is False
+    return False
 
 
 def _request_has_chat_bridge_mode(
@@ -277,6 +311,11 @@ def _request_has_chat_bridge_mode(
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
     for request in (request_kwargs, outer_request_kwargs):
+        current_surface = _routing_module._request_current_upstream_surface(request)
+        if current_surface in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
+            return True
+        if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+            continue
         model_info = _image_generation_module._request_model_info(request)
         if model_info and _model_info_has_chat_bridge_mode(model_info):
             return True
@@ -313,14 +352,18 @@ def _request_uses_responses_endpoint(
     if not isinstance(request_kwargs, dict):
         return False
     model_info = _image_generation_module._request_model_info(request_kwargs)
-    mode = _normalized_upstream_url_surface(model_info.get(_UPSTREAM_URL_SURFACE_KEY))
+    mode = _routing_module._request_current_upstream_surface(request_kwargs)
+    if not mode:
+        modes = _normalized_upstream_url_surfaces(
+            model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+        )
+        if len(modes) == 1:
+            mode = modes[0]
     if mode:
         if mode == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
-            return model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is not False
+            return True
         if mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
             return False
-    if model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY) is False:
-        return False
     return _image_generation_module._request_is_responses_api(request_kwargs)
 
 
@@ -328,6 +371,11 @@ def _request_supports_native_responses_web_search(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
+    if _routing_module._request_current_upstream_surface(request_kwargs):
+        support = _request_native_responses_web_search_support_decision(
+            request_kwargs
+        )
+        return support is True
     for request in (request_kwargs, outer_request_kwargs):
         support = _request_native_responses_web_search_support_decision(request)
         if support is not None:
@@ -368,6 +416,11 @@ def _request_should_try_unknown_native_responses_web_search(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
+    if _routing_module._request_current_upstream_surface(request_kwargs):
+        return (
+            _request_web_search_support_is_unknown(request_kwargs)
+            and _request_uses_responses_endpoint(request_kwargs)
+        )
     for request in (request_kwargs, outer_request_kwargs):
         if _request_web_search_support_is_unknown(
             request
@@ -692,8 +745,19 @@ def _responses_chat_bridge_preemptive_kwargs(
     ):
         return None
     _with_responses_chat_bridge_compatible_tools(bridge_kwargs, bridge_metadata)
+    bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
+        bridge_kwargs.get("input")
+    )
+    if input_stats.get("changed"):
+        bridge_kwargs["input"] = bridge_input
+        bridge_metadata["responses_chat_bridge_input_sanitized"] = input_stats
     bridge_kwargs["litellm_metadata"] = bridge_metadata
     bridge_kwargs["use_chat_completions_api"] = True
+    current_surface = _routing_module._request_current_upstream_surface(
+        request_kwargs
+    )
+    if current_surface in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
+        bridge_kwargs["_litellm_menu_upstream_url_surface"] = current_surface
     return bridge_kwargs
 
 
@@ -782,14 +846,20 @@ def _responses_function_tool_bridge_preemptive_kwargs(
         bridge_metadata,
         outer_for_tool_plan,
     )
+    bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
+        bridge_kwargs.get("input")
+    )
+    if input_stats.get("changed"):
+        bridge_kwargs["input"] = bridge_input
+        bridge_metadata["responses_function_tool_bridge_input_sanitized"] = (
+            input_stats
+        )
     bridge_kwargs["litellm_metadata"] = bridge_metadata
     return bridge_kwargs
 
 
 def _normalized_upstream_url_surfaces(value: Any) -> List[str]:
-    if isinstance(value, str):
-        raw_items = re.split(r"[,;\s]+", value)
-    elif isinstance(value, list):
+    if isinstance(value, list):
         raw_items = value
     else:
         raw_items = []
@@ -802,9 +872,6 @@ def _normalized_upstream_url_surfaces(value: Any) -> List[str]:
 
 
 def _effective_upstream_url_surface(modes: List[str]) -> str:
-    for preferred in _UPSTREAM_URL_SURFACE_PREFERENCE:
-        if preferred in modes:
-            return preferred
     return modes[0] if modes else ""
 
 
@@ -812,20 +879,11 @@ def _normalized_upstream_url_surface(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     text = value.strip().lower()
-    aliases = {
-        "openai_chat": _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-        "openai_chat_completions": _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-        "openai-chat": _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-        "chat": _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-        "chat_completions": _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-        "openai_responses": _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-        "openai-responses": _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-        "responses": _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-        "anthropic_messages": _UPSTREAM_URL_SURFACE_ANTHROPIC,
-        "anthropic/messages": _UPSTREAM_URL_SURFACE_ANTHROPIC,
-        "claude": _UPSTREAM_URL_SURFACE_ANTHROPIC,
-    }
-    return aliases.get(text, text)
+    return text if text in {
+        _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
+        _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
+        _UPSTREAM_URL_SURFACE_ANTHROPIC,
+    } else ""
 
 
 def _with_preemptive_responses_chat_bridge(request_kwargs: dict) -> Optional[dict]:
@@ -855,19 +913,6 @@ def _with_preemptive_responses_chat_bridge(request_kwargs: dict) -> Optional[dic
         ),
     )
     return bridge_kwargs
-
-
-def _with_preemptive_responses_chat_bridge_for_call_type(
-    request_kwargs: dict,
-    call_type: Any,
-) -> Optional[dict]:
-    if _image_generation_module._request_is_responses_api(request_kwargs):
-        return _with_preemptive_responses_chat_bridge(request_kwargs)
-    if not isinstance(call_type, str) or call_type.lower() not in {"responses", "aresponses"}:
-        return None
-    bridge_view = request_kwargs.copy()
-    bridge_view["call_type"] = call_type
-    return _with_preemptive_responses_chat_bridge(bridge_view)
 
 
 def _request_already_attempted_responses_chat_bridge_empty_retry(

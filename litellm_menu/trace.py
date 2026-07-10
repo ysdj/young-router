@@ -19,7 +19,6 @@ from .base import (
     _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
-    _RESPONSES_ENDPOINT_SUPPORT_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
@@ -598,7 +597,6 @@ def _trace_interface_summary(
         "api_base_host": _image_generation_module._api_base_host(api_base),
         "upstream_url_surface": model_info.get(_UPSTREAM_URL_SURFACE_KEY),
         "supported_upstream_url_surfaces": _trace_limited_value(supported_surfaces, limit=120),
-        "supports_responses_endpoint": model_info.get(_RESPONSES_ENDPOINT_SUPPORT_KEY),
         "supports_responses_image_input": model_info.get(_RESPONSES_IMAGE_INPUT_SUPPORT_KEY),
         "supports_responses_hosted_tools": model_info.get(
             _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY

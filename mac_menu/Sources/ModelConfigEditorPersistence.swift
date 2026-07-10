@@ -50,10 +50,18 @@ extension ModelConfigEditorController {
         return try JSONDecoder().decode(ConfigEditorLoadPayload.self, from: output)
     }
 
-    func saveProviders(_ providers: [EditableProvider]) throws -> ConfigEditorSaveResult {
+    func saveProviders(
+        _ providers: [EditableProvider],
+        expectedRevision: JSONValue? = nil
+    ) throws -> ConfigEditorSaveResult {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let input = try encoder.encode(ConfigEditorSavePayload(providers: providers, expectedRevision: loadedConfigRevision))
+        let input = try encoder.encode(
+            ConfigEditorSavePayload(
+                providers: providers,
+                expectedRevision: expectedRevision ?? loadedConfigRevision
+            )
+        )
         let output = try runHelper(arguments: ["save"], input: input)
         return try JSONDecoder().decode(ConfigEditorSaveResult.self, from: output)
     }

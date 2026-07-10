@@ -46,6 +46,9 @@ These instructions apply to the entire `litellm-menu` repository.
 - Do not commit `config.yaml`, `.litellm-runtime/`, `.venv/`, logs, local route traces, WebDAV settings, thread-watch artifacts, or copied runtime directories.
 - Public examples should use `example.test`, `example.com`, `primary`, `backup`, `image`, `default-chat`, `fast-chat`, `image-chat`, and similar neutral placeholders.
 - Before release-oriented changes, run a sensitive-string scan for private provider names, API hosts, local user paths, request/thread ids, and domain-specific fixture text.
+- Before every commit, tag, or push, inspect untracked files and the exact staged diff for API keys or tokens, private provider/model names, private hosts, request/thread ids, local paths, logs, traces, and copied configuration values. Replace every real value with a neutral synthetic fixture before proceeding.
+- Re-run the sensitive-string scan against `git diff --cached` after staging and again against the committed range before pushing. A successful test run does not replace this privacy gate; do not upload while any unexplained match remains.
+- For public remotes, verify author and committer metadata before committing and use the intended public or noreply identity instead of a private email address.
 
 ## Detailed Runbooks
 

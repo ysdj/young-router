@@ -26,7 +26,6 @@ def request_details_html(details: dict[str, Any], tool_calls: dict[str, Any]) ->
     ]
     interface_caps = (
         '<div class="detail-pills">'
-        f'{bool_badge("responses endpoint", interface.get("supports_responses_endpoint"))}'
         f'{bool_badge("responses image", interface.get("supports_responses_image_input"))}'
         f'{bool_badge("hosted tools", interface.get("supports_responses_hosted_tools"))}'
         f'{bool_badge("client tools", interface.get("supports_responses_client_tools"))}'

@@ -166,12 +166,46 @@ extension ModelConfigEditorController {
         guard hasPendingChanges else { return }
         let generation = beginLatestRuntimeApply()
         do {
-            let result = try saveProviders(validatedProvidersForSave())
-            loadedConfigRevision = result.revision
-            setPendingChanges(false)
-            reloadRouteTable()
-            refreshRuntimeMap()
-            applyRuntimeConfigAfterSave(result, generation: generation)
+            let providersToSave = try validatedProvidersForSave()
+            let expectedRevision = loadedConfigRevision
+            setRuntimeApplyInFlight(true)
+            setEditorStatus("Saving config...")
+
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else { return }
+                let result: Result<ConfigEditorSaveResult, Error>
+                do {
+                    result = .success(
+                        try self.saveProviders(
+                            providersToSave,
+                            expectedRevision: expectedRevision
+                        )
+                    )
+                } catch {
+                    result = .failure(error)
+                }
+
+                DispatchQueue.main.async {
+                    guard self.runtimeApplyGeneration == generation else { return }
+                    switch result {
+                    case .success(let saveResult):
+                        self.loadedConfigRevision = saveResult.revision
+                        self.setPendingChanges(false)
+                        self.reloadRouteTable()
+                        self.refreshRuntimeMap()
+                        self.applyRuntimeConfigAfterSave(
+                            saveResult,
+                            generation: generation
+                        )
+                    case .failure(let error):
+                        self.setRuntimeApplyInFlight(false)
+                        self.setEditorError(
+                            "Apply failed",
+                            message: error.localizedDescription
+                        )
+                    }
+                }
+            }
         } catch {
             if runtimeApplyGeneration == generation {
                 setRuntimeApplyInFlight(false)

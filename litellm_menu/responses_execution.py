@@ -826,6 +826,8 @@ def _wrap_generic_function_for_deployment_failover(
                     outer_request_kwargs=outer_request_kwargs,
                 )
             except Exception as exc:
+                if _routing_module._request_current_upstream_surface(kwargs):
+                    raise
                 bridge_kwargs = _responses_surfaces_module._responses_chat_bridge_retry_kwargs(
                     exc,
                     kwargs,
@@ -861,6 +863,8 @@ def _wrap_generic_function_for_deployment_failover(
                     outer_request_kwargs=outer_request_kwargs,
                 )
             except Exception as exc:
+                if _routing_module._request_current_upstream_surface(kwargs):
+                    raise
                 bridge_kwargs = _responses_surfaces_module._responses_chat_bridge_retry_kwargs(
                     exc,
                     kwargs,
@@ -922,6 +926,21 @@ def _wrap_generic_function_for_deployment_failover(
                 original_function,
             )
         except Exception as exc:
+            if _routing_module._is_current_upstream_surface_incompatible_error(
+                exc,
+                kwargs,
+                outer_request_kwargs,
+            ):
+                _routing_module._mark_exception_for_upstream_surface_failover(
+                    exc,
+                    kwargs,
+                )
+                if isinstance(outer_request_kwargs, dict):
+                    _routing_module._sync_failed_deployment_exclusions(
+                        outer_request_kwargs,
+                        exc,
+                    )
+                raise
             facade_response = await _computer_facade_module._responses_computer_facade_retry_response(
                 exc,
                 kwargs,
@@ -970,7 +989,11 @@ def _wrap_generic_function_for_deployment_failover(
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
                 )
-            bridge_kwargs = _responses_surfaces_module._responses_chat_bridge_retry_kwargs(exc, kwargs, outer_request_kwargs)
+            bridge_kwargs = None
+            if not _routing_module._request_current_upstream_surface(kwargs):
+                bridge_kwargs = _responses_surfaces_module._responses_chat_bridge_retry_kwargs(
+                    exc, kwargs, outer_request_kwargs
+                )
             if bridge_kwargs is not None:
                 return await _execute_responses_chat_bridge_call(
                     original_function,
@@ -1031,6 +1054,13 @@ def _failed_deployment_route_key(exception: Exception) -> Optional[str]:
 
 def _failed_deployment_order(exception: Exception) -> Optional[int]:
     return _routing_module._coerce_order(getattr(exception, "failed_deployment_order", None))
+
+
+def _failed_deployment_surface(exception: Exception) -> Optional[str]:
+    surface = _routing_module._normalized_request_surface(
+        getattr(exception, "failed_deployment_surface", None)
+    )
+    return surface or None
 
 
 def _request_model_group(request_kwargs: Optional[dict]) -> Optional[str]:
@@ -1279,6 +1309,60 @@ def _ordered_deployment_fallback_entry(
         return None
 
     excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
+    surface_fallback = (
+        None
+        if _routing_module._should_retry_same_deployment_before_fallback(exception)
+        else _routing_module._next_upstream_surface_for_failed_deployment(
+            router, exception, request_kwargs
+        )
+    )
+    if surface_fallback is not None:
+        next_surface, target_deployment_id = surface_fallback
+        attempted_surfaces = _routing_module._request_attempted_upstream_surfaces(
+            request_kwargs
+        )
+        current_surface = (
+            _failed_deployment_surface(exception)
+            or _routing_module._request_current_upstream_surface(request_kwargs)
+        )
+        if current_surface and current_surface not in attempted_surfaces:
+            attempted_surfaces.append(current_surface)
+        _routing_module._set_request_surface_state(
+            request_kwargs,
+            surface=next_surface,
+            attempted_surfaces=attempted_surfaces,
+            deployment_id=target_deployment_id,
+            target_deployment_id=target_deployment_id,
+        )
+        if failed_order is not None:
+            request_kwargs["_target_order"] = failed_order
+        excluded_ids.discard(target_deployment_id)
+        if excluded_ids:
+            request_kwargs["_excluded_deployment_ids"] = sorted(excluded_ids)
+        else:
+            request_kwargs.pop("_excluded_deployment_ids", None)
+        entry = {
+            "model": model_group,
+            "_target_order": failed_order,
+            "_litellm_menu_upstream_url_surface": next_surface,
+            "_litellm_menu_attempted_upstream_url_surfaces": attempted_surfaces,
+            "_litellm_menu_surface_target_deployment_id": target_deployment_id,
+        }
+        if excluded_ids:
+            entry["_excluded_deployment_ids"] = sorted(excluded_ids)
+        _trace_module._route_trace(
+            "same_deployment_surface_fallback_available",
+            request_id=_routing_module._trace_request_id(request_kwargs),
+            session=_routing_module._trace_session_context(request_kwargs),
+            model_group=model_group,
+            failed_deployment_id=failed_id,
+            failed_surface=current_surface,
+            next_surface=next_surface,
+            target_order=failed_order,
+        )
+        return entry
+
+    _routing_module._clear_request_surface_target(request_kwargs)
     if failed_id is not None:
         excluded_ids.add(failed_id)
 
@@ -1294,7 +1378,10 @@ def _ordered_deployment_fallback_entry(
         return None
 
     cooldown_candidates, cooldown_deployments, cooldown_filtered = (
-        _routing_module._with_active_deployment_cooldowns(list(all_deployments or []))
+        _routing_module._with_active_deployment_cooldowns(
+            list(all_deployments or []),
+            request_kwargs=request_kwargs,
+        )
     )
     if cooldown_deployments:
         _trace_module._route_trace(

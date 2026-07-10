@@ -366,24 +366,51 @@ def _responses_input_tool_search_output_tools(value: Any) -> list[dict]:
     return tools
 
 
+def _responses_input_additional_tools(value: Any) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+
+    tools: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            continue
+        item_tools = item.get("tools")
+        if not isinstance(item_tools, list):
+            continue
+        for tool in item_tools:
+            if isinstance(tool, dict):
+                tools.append(tool)
+    return tools
+
+
 def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
     if not isinstance(value, list):
         return value, {"changed": False, "dropped_tool_search_items": 0}
 
     filtered: list[Any] = []
-    dropped = 0
+    dropped_tool_search = 0
+    dropped_additional_tools = 0
     for item in value:
         if isinstance(item, dict) and item.get("type") in {
             "tool_search_call",
             "tool_search_output",
         }:
-            dropped += 1
+            dropped_tool_search += 1
+            continue
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            dropped_additional_tools += 1
             continue
         filtered.append(copy.deepcopy(item))
 
-    if dropped == 0:
+    if dropped_tool_search == 0 and dropped_additional_tools == 0:
         return value, {"changed": False, "dropped_tool_search_items": 0}
-    return filtered, {"changed": True, "dropped_tool_search_items": dropped}
+    stats = {
+        "changed": True,
+        "dropped_tool_search_items": dropped_tool_search,
+    }
+    if dropped_additional_tools:
+        stats["dropped_additional_tools_items"] = dropped_additional_tools
+    return filtered, stats
 
 
 def _append_unique_string(target: list[str], value: Any) -> None:
@@ -476,6 +503,8 @@ def _responses_hosted_tool_plan(
                 visit_tool(tool)
         for discovered_tool in _responses_input_tool_search_output_tools(request.get("input")):
             visit_tool(discovered_tool)
+        for additional_tool in _responses_input_additional_tools(request.get("input")):
+            visit_tool(additional_tool)
 
     facade_required = hosted_computer
     unsupported_reason: Optional[str] = None

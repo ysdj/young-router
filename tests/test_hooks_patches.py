@@ -4,6 +4,46 @@ from hook_test_utils import *
 
 
 class HookPatchTests(HookTestCase):
+    def test_selected_deployment_marker_applies_each_protocol_adapter(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _update_kwargs_with_deployment(self, deployment, kwargs, function_name=None):
+                kwargs["litellm_params"] = dict(deployment["litellm_params"])
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        deployment = {
+            "litellm_params": {"model": "openai/vendor/model", "order": 1},
+            "model_info": {
+                "id": "three-protocol-route",
+                "supported_upstream_url_surfaces": [
+                    "openai/responses",
+                    "anthropic",
+                    "openai/chat",
+                ],
+            },
+        }
+
+        expected = {
+            "openai/responses": ("openai/responses/vendor/model", "openai", False),
+            "anthropic": ("anthropic/vendor/model", "anthropic", True),
+            "openai/chat": ("openai/vendor/model", "openai", True),
+        }
+        for surface, (model, provider, uses_chat) in expected.items():
+            kwargs = {
+                "model": "default-chat",
+                "_litellm_menu_upstream_url_surface": surface,
+                "_litellm_menu_upstream_url_surface_deployment_id": "three-protocol-route",
+            }
+            Router()._update_kwargs_with_deployment(deployment, kwargs)
+            self.assertEqual(kwargs["model"], model)
+            self.assertEqual(kwargs["litellm_params"]["model"], model)
+            self.assertEqual(kwargs["custom_llm_provider"], provider)
+            self.assertEqual(kwargs.get("use_chat_completions_api") is True, uses_chat)
+
     def test_selected_deployment_update_preserves_original_route_model_group(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
@@ -995,6 +1035,63 @@ class HookPatchTests(HookTestCase):
             [deployment["model_info"]["id"] for deployment in deployments],
             ["order1-b", "order2-c"],
         )
+
+    async def test_routing_constraint_patch_uses_request_surface_for_cooldown(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        router_module = types.ModuleType("litellm.router")
+        deployment = {
+            "litellm_params": {"model": "openai/default-chat"},
+            "model_info": {"id": "dual-route"},
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            def get_available_deployment(self, model, request_kwargs=None):
+                return self._get_all_deployments(model)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+
+        error = RuntimeError("temporary responses failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            error,
+            {
+                "call_type": "aresponses",
+                "model": "default-chat",
+                "_litellm_menu_upstream_url_surface": "openai/responses",
+                "model_info": {
+                    "id": "dual-route",
+                    "supported_upstream_url_surfaces": [
+                        "openai/responses",
+                        "openai/chat",
+                    ],
+                },
+            },
+        )
+
+        responses = Router().get_available_deployment(
+            "default-chat",
+            request_kwargs={
+                "model": "default-chat",
+                "_litellm_menu_upstream_url_surface": "openai/responses",
+            },
+        )
+        chat = Router().get_available_deployment(
+            "default-chat",
+            request_kwargs={
+                "model": "default-chat",
+                "_litellm_menu_upstream_url_surface": "openai/chat",
+            },
+        )
+
+        self.assertEqual(responses, [])
+        self.assertEqual(chat, [deployment])
 
     async def test_order_peer_failover_patch_runs_same_order_before_larger_order(self) -> None:
         hooks, _ = load_hook_module()

@@ -131,11 +131,7 @@ struct EditableModel: Codable, Equatable {
     var supportsImageGeneration: Bool
     var supportsImageGenerationPresent: Bool
     var upstreamApiMode: String
-    var upstreamApiModePresent: Bool
     var supportedUpstreamApiModes: [String]
-    var supportedUpstreamApiModesPresent: Bool
-    var supportsResponsesEndpoint: Bool
-    var supportsResponsesEndpointPresent: Bool
     var entryExtra: [String: JSONValue]
     var litellmExtra: [String: JSONValue]
     var modelInfoExtra: [String: JSONValue]
@@ -159,11 +155,7 @@ struct EditableModel: Codable, Equatable {
         case supportsImageGeneration = "supports_responses_image_generation_tool"
         case supportsImageGenerationPresent = "supports_responses_image_generation_tool_present"
         case upstreamApiMode = "upstream_url_surface"
-        case upstreamApiModePresent = "upstream_url_surface_present"
         case supportedUpstreamApiModes = "supported_upstream_url_surfaces"
-        case supportedUpstreamApiModesPresent = "supported_upstream_url_surfaces_present"
-        case supportsResponsesEndpoint = "supports_responses_endpoint"
-        case supportsResponsesEndpointPresent = "supports_responses_endpoint_present"
         case entryExtra = "entry_extra"
         case litellmExtra = "litellm_extra"
         case modelInfoExtra = "model_info_extra"
@@ -188,11 +180,7 @@ struct EditableModel: Codable, Equatable {
             supportsImageGeneration: false,
             supportsImageGenerationPresent: false,
             upstreamApiMode: "openai/responses",
-            upstreamApiModePresent: false,
             supportedUpstreamApiModes: ["openai/responses"],
-            supportedUpstreamApiModesPresent: false,
-            supportsResponsesEndpoint: true,
-            supportsResponsesEndpointPresent: false,
             entryExtra: [:],
             litellmExtra: [:],
             modelInfoExtra: [:]
@@ -217,11 +205,7 @@ struct EditableModel: Codable, Equatable {
         supportsImageGeneration: Bool,
         supportsImageGenerationPresent: Bool,
         upstreamApiMode: String,
-        upstreamApiModePresent: Bool,
         supportedUpstreamApiModes: [String],
-        supportedUpstreamApiModesPresent: Bool,
-        supportsResponsesEndpoint: Bool,
-        supportsResponsesEndpointPresent: Bool,
         entryExtra: [String: JSONValue],
         litellmExtra: [String: JSONValue],
         modelInfoExtra: [String: JSONValue]
@@ -243,11 +227,7 @@ struct EditableModel: Codable, Equatable {
         self.supportsImageGeneration = supportsImageGeneration
         self.supportsImageGenerationPresent = supportsImageGenerationPresent
         self.upstreamApiMode = upstreamApiMode
-        self.upstreamApiModePresent = upstreamApiModePresent
         self.supportedUpstreamApiModes = supportedUpstreamApiModes
-        self.supportedUpstreamApiModesPresent = supportedUpstreamApiModesPresent
-        self.supportsResponsesEndpoint = supportsResponsesEndpoint
-        self.supportsResponsesEndpointPresent = supportsResponsesEndpointPresent
         self.entryExtra = entryExtra
         self.litellmExtra = litellmExtra
         self.modelInfoExtra = modelInfoExtra
@@ -272,12 +252,8 @@ struct EditableModel: Codable, Equatable {
             supportsVisionPresent: try container.decodeIfPresent(Bool.self, forKey: .supportsVisionPresent) ?? true,
             supportsImageGeneration: try container.decodeIfPresent(Bool.self, forKey: .supportsImageGeneration) ?? false,
             supportsImageGenerationPresent: try container.decodeIfPresent(Bool.self, forKey: .supportsImageGenerationPresent) ?? false,
-            upstreamApiMode: try container.decodeIfPresent(String.self, forKey: .upstreamApiMode) ?? "openai/responses",
-            upstreamApiModePresent: try container.decodeIfPresent(Bool.self, forKey: .upstreamApiModePresent) ?? false,
-            supportedUpstreamApiModes: try container.decodeIfPresent([String].self, forKey: .supportedUpstreamApiModes) ?? ["openai/responses"],
-            supportedUpstreamApiModesPresent: try container.decodeIfPresent(Bool.self, forKey: .supportedUpstreamApiModesPresent) ?? false,
-            supportsResponsesEndpoint: try container.decodeIfPresent(Bool.self, forKey: .supportsResponsesEndpoint) ?? true,
-            supportsResponsesEndpointPresent: try container.decodeIfPresent(Bool.self, forKey: .supportsResponsesEndpointPresent) ?? false,
+            upstreamApiMode: try container.decode(String.self, forKey: .upstreamApiMode),
+            supportedUpstreamApiModes: try container.decode([String].self, forKey: .supportedUpstreamApiModes),
             entryExtra: try container.decodeIfPresent([String: JSONValue].self, forKey: .entryExtra) ?? [:],
             litellmExtra: try container.decodeIfPresent([String: JSONValue].self, forKey: .litellmExtra) ?? [:],
             modelInfoExtra: try container.decodeIfPresent([String: JSONValue].self, forKey: .modelInfoExtra) ?? [:]

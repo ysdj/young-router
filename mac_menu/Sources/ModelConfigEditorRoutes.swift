@@ -17,13 +17,6 @@ extension ModelConfigEditorController {
 
     func normalizedSupportedUpstreamApiModes(for model: EditableModel) -> [String] {
         var modes = normalizedUpstreamApiModes(model.supportedUpstreamApiModes)
-        if modes.isEmpty || !model.supportedUpstreamApiModesPresent {
-            if model.supportsResponsesEndpointPresent && !model.supportsResponsesEndpoint {
-                modes = ["openai/chat"]
-            } else {
-                modes = [normalizedUpstreamApiMode(model.upstreamApiMode)]
-            }
-        }
         if modes.isEmpty {
             modes = [defaultUpstreamApiMode]
         }
@@ -32,11 +25,6 @@ extension ModelConfigEditorController {
 
     func effectiveUpstreamApiMode(from modes: [String], fallback: String = "") -> String {
         let normalizedModes = normalizedUpstreamApiModes(modes)
-        for preferred in effectiveUpstreamApiModePreference {
-            if normalizedModes.contains(preferred) {
-                return preferred
-            }
-        }
         if let first = normalizedModes.first {
             return first
         }
@@ -44,29 +32,128 @@ extension ModelConfigEditorController {
     }
 
     func setUpstreamApiSupportCheckboxes(_ modes: [String]) {
+        displayedUpstreamApiModes = normalizedUpstreamApiModes(modes)
+            + upstreamApiModes.filter { !modes.contains($0) }
         supportsOpenAIChatCheckbox.state = modes.contains("openai/chat") ? .on : .off
         supportsOpenAIResponsesCheckbox.state = modes.contains("openai/responses") ? .on : .off
         supportsAnthropicCheckbox.state = modes.contains("anthropic") ? .on : .off
+        refreshUpstreamApiModeRows()
     }
 
     func selectedSupportedUpstreamApiModes() -> [String] {
-        var modes: [String] = []
-        if supportsOpenAIChatCheckbox.state == .on { modes.append("openai/chat") }
-        if supportsOpenAIResponsesCheckbox.state == .on { modes.append("openai/responses") }
-        if supportsAnthropicCheckbox.state == .on { modes.append("anthropic") }
-        if modes.isEmpty {
-            modes.append(defaultUpstreamApiMode)
-        }
-        return modes
+        let selected = Set([
+            supportsOpenAIChatCheckbox.state == .on ? "openai/chat" : nil,
+            supportsOpenAIResponsesCheckbox.state == .on ? "openai/responses" : nil,
+            supportsAnthropicCheckbox.state == .on ? "anthropic" : nil,
+        ].compactMap { $0 })
+        return displayedUpstreamApiModes.filter { selected.contains($0) }
     }
 
     func refreshResponsesEndpointSupportControls() {
         let hasModel = selectedModelIndex != nil
-        supportsOpenAIChatCheckbox.isEnabled = hasModel
-        supportsOpenAIResponsesCheckbox.isEnabled = hasModel
-        supportsAnthropicCheckbox.isEnabled = hasModel
-        probeResponsesEndpointButton.toolTip = "Probe and check all API surfaces exposed by this upstream URL"
+        let protocolsEnabled = hasModel && !selectedModelImageGenerationEndpointDisabled
+        supportsOpenAIChatCheckbox.isEnabled = protocolsEnabled
+        supportsOpenAIResponsesCheckbox.isEnabled = protocolsEnabled
+        supportsAnthropicCheckbox.isEnabled = protocolsEnabled
+        upstreamApiModeStackView.isHidden = hasModel && selectedModelImageGenerationEndpointDisabled
+        refreshUpstreamApiModeRows()
         refreshResponsesEndpointProbeControlsEnabled()
+    }
+
+    func upstreamApiCheckbox(for mode: String) -> NSButton {
+        switch mode {
+        case "openai/chat": return supportsOpenAIChatCheckbox
+        case "anthropic": return supportsAnthropicCheckbox
+        default: return supportsOpenAIResponsesCheckbox
+        }
+    }
+
+    func upstreamApiDisplayName(_ mode: String) -> String {
+        switch mode {
+        case "openai/chat": return "OpenAI Chat"
+        case "anthropic": return "Anthropic Messages"
+        default: return "OpenAI Responses"
+        }
+    }
+
+    func configureUpstreamApiModeRowsIfNeeded() {
+        guard upstreamApiModeRows.isEmpty else { return }
+        for mode in upstreamApiModes {
+            let row = NSStackView()
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 6
+            let rank = NSTextField(labelWithString: "")
+            rank.alignment = .right
+            rank.widthAnchor.constraint(equalToConstant: 18).isActive = true
+            let checkbox = upstreamApiCheckbox(for: mode)
+            checkbox.title = upstreamApiDisplayName(mode)
+            checkbox.widthAnchor.constraint(equalToConstant: 148).isActive = true
+            let status = NSTextField(labelWithString: "Not probed")
+            status.textColor = .secondaryLabelColor
+            status.lineBreakMode = .byTruncatingTail
+            status.widthAnchor.constraint(equalToConstant: 235).isActive = true
+            let up = NSButton(
+                image: NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "Move protocol up")!,
+                target: self,
+                action: #selector(moveUpstreamApiModeUp(_:))
+            )
+            let down = NSButton(
+                image: NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "Move protocol down")!,
+                target: self,
+                action: #selector(moveUpstreamApiModeDown(_:))
+            )
+            for (button, tooltip) in [(up, "Move protocol earlier"), (down, "Move protocol later")] {
+                button.bezelStyle = .inline
+                button.identifier = NSUserInterfaceItemIdentifier(mode)
+                button.toolTip = tooltip
+                button.widthAnchor.constraint(equalToConstant: 22).isActive = true
+                button.heightAnchor.constraint(equalToConstant: 22).isActive = true
+                row.addArrangedSubview(button)
+            }
+            row.insertArrangedSubview(status, at: 0)
+            row.insertArrangedSubview(checkbox, at: 0)
+            row.insertArrangedSubview(rank, at: 0)
+            upstreamApiModeRows[mode] = row
+            upstreamApiModeRankLabels[mode] = rank
+            upstreamApiModeStatusLabels[mode] = status
+        }
+    }
+
+    func refreshUpstreamApiModeRows() {
+        configureUpstreamApiModeRowsIfNeeded()
+        for view in upstreamApiModeStackView.arrangedSubviews {
+            upstreamApiModeStackView.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let summaries = upstreamApiProbeKey == selectedModelProbeKey()
+            ? upstreamApiProbeSummaries
+            : [:]
+        let details = upstreamApiProbeKey == selectedModelProbeKey()
+            ? upstreamApiProbeDetails
+            : [:]
+        for (index, mode) in displayedUpstreamApiModes.enumerated() {
+            guard let row = upstreamApiModeRows[mode] else { continue }
+            upstreamApiModeRankLabels[mode]?.stringValue = "\(index + 1)"
+            upstreamApiModeStatusLabels[mode]?.stringValue = summaries[mode] ?? "Not probed"
+            upstreamApiModeStatusLabels[mode]?.toolTip = details[mode]
+            upstreamApiModeStackView.addArrangedSubview(row)
+        }
+    }
+
+    func moveSelectedUpstreamApiMode(_ mode: String, delta: Int) {
+        guard let providerIndex = selectedProviderIndex, let modelIndex = selectedModelIndex else { return }
+        guard let index = displayedUpstreamApiModes.firstIndex(of: mode) else { return }
+        let destination = index + delta
+        guard displayedUpstreamApiModes.indices.contains(destination) else { return }
+        displayedUpstreamApiModes.swapAt(index, destination)
+        let modes = selectedSupportedUpstreamApiModes()
+        guard let primary = modes.first else { return }
+        providers[providerIndex].models[modelIndex].supportedUpstreamApiModes = modes
+        providers[providerIndex].models[modelIndex].upstreamApiMode = primary
+        refreshUpstreamApiModeRows()
+        commitEditor()
+        markPendingChanges()
     }
 
     func refreshSelectedModelInfoState(providerIndex: Int, modelIndex: Int) {
@@ -102,6 +189,7 @@ extension ModelConfigEditorController {
                     self.providers[current.provider].models[current.model] = model
                 }
             }
+            self.refreshResponsesEndpointSupportControls()
         }
     }
 
@@ -435,59 +523,7 @@ extension ModelConfigEditorController {
     }
 
     func refreshRuntimeMap() {
-        var lines: [String] = []
-        var runningProviders = 0
-        var stoppedProviders = 0
-        var runningModels = 0
-        var stoppedModels = 0
-
-        for providerIndex in providers.indices {
-            let provider = providers[providerIndex]
-            let providerRuns = provider.enabled && provider.models.contains { modelEffectivelyEnabled(providerIndex: providerIndex, model: $0) }
-            if providerRuns {
-                runningProviders += 1
-            } else {
-                stoppedProviders += 1
-            }
-            lines.append("\(providerRuns ? "RUN" : "OFF") provider \(provider.displayName)\(provider.enabled ? "" : " [disabled]")")
-
-            for key in normalizedProviderKeys(providerIndex) {
-                let keyRuns = provider.enabled && key.enabled && provider.models.contains { $0.apiKeyName == key.name && $0.modelEnabled }
-                lines.append("  \(keyRuns ? "RUN" : "OFF") key \(key.displayName)\(key.enabled ? "" : " [disabled]")")
-                for model in provider.models where model.apiKeyName == key.name {
-                    let modelRuns = modelEffectivelyEnabled(providerIndex: providerIndex, model: model)
-                    if modelRuns {
-                        runningModels += 1
-                    } else {
-                        stoppedModels += 1
-                    }
-                    var reasons: [String] = []
-                    if !provider.enabled { reasons.append("provider disabled") }
-                    if !key.enabled { reasons.append("key disabled") }
-                    if !model.modelEnabled { reasons.append("model disabled") }
-                    let suffix = reasons.isEmpty ? "" : " [" + reasons.joined(separator: ", ") + "]"
-                    lines.append("    \(modelRuns ? "RUN" : "OFF") model \(model.displayName) -> \(modelUpstreamPart(model.litellmModel))\(suffix)")
-                }
-            }
-
-            let unassigned = provider.models.filter { model in
-                !normalizedProviderKeys(providerIndex).contains { $0.name == model.apiKeyName }
-            }
-            for model in unassigned {
-                stoppedModels += 1
-                lines.append("  OFF model \(model.displayName) [missing key: \(model.apiKeyName)]")
-            }
-        }
-
-        let summary = "Running providers: \(runningProviders)  Off providers: \(stoppedProviders)  Running models: \(runningModels)  Off models: \(stoppedModels)"
-        appendHookFallbackMap(to: &lines)
-        runtimeMapTextView?.string = ([summary, ""] + lines).joined(separator: "\n")
-        scrollRuntimeMapToTop()
-    }
-
-    func appendHookFallbackMap(to lines: inout [String]) {
         let deployments = runtimeDeployments()
-        let activeDeployments = deployments.filter { $0.enabled }
         let grouped = Dictionary(grouping: deployments) { $0.publicModel }
         let preferredModelNames = preferredRuntimeModelNames()
         let modelNames = grouped.keys
@@ -500,51 +536,41 @@ extension ModelConfigEditorController {
                 }
                 return left < right
             }
-
-        lines.append("")
-        lines.append("Routing diagram (config.yaml + litellm_menu/callbacks.py)")
-        lines.append("Legend: o1/o2/o3 = config order. [headers] = hook adds browser headers.")
-
-        if modelNames.isEmpty {
-            lines.append("  no model groups")
-            return
-        }
-
+        var rows: [RuntimeMapRow] = [
+            .summary(RuntimeMapSummaryRow(
+                modelCount: modelNames.count,
+                runningCount: deployments.filter { $0.enabled }.count,
+                offCount: deployments.filter { !$0.enabled }.count
+            )),
+        ]
         for modelName in modelNames {
             let group = (grouped[modelName] ?? []).sorted(by: runtimeDeploymentComesBefore)
-            let activeGroup = group.filter { $0.enabled }
-            lines.append("")
-            lines.append("+-- \(modelName)")
-            lines.append("|   config deployments")
-            for deployment in group {
-                lines.append("|   |-- \(formatRuntimeDeploymentDetail(deployment))")
+            rows.append(.model(RuntimeMapModelRow(
+                publicModel: modelName,
+                runningCount: group.filter { $0.enabled }.count,
+                offCount: group.filter { !$0.enabled }.count
+            )))
+            let byOrder = Dictionary(grouping: group) { $0.order }
+            let orders = byOrder.keys.sorted { orderSortValue($0) < orderSortValue($1) }
+            for (index, order) in orders.enumerated() {
+                let orderDeployments = (byOrder[order] ?? []).sorted(by: runtimeDeploymentComesBefore)
+                rows.append(.order(RuntimeMapOrderRow(
+                    order: order,
+                    previousOrder: index > 0 ? orders[index - 1] : nil,
+                    isFirst: index == 0,
+                    runningCount: orderDeployments.filter { $0.enabled }.count,
+                    offCount: orderDeployments.filter { !$0.enabled }.count
+                )))
+                rows.append(contentsOf: orderDeployments.map { .deployment($0) })
             }
-            if activeGroup.isEmpty {
-                lines.append("|")
-                lines.append("|   result: no RUN deployments for this model")
-                continue
-            }
-            lines.append("|")
-            lines.append("|   chat /v1/chat/completions")
-            lines.append("|     request")
-            lines.append("|       -> try config order")
-            for step in orderFlowSteps(activeGroup) {
-                lines.append("|          \(step)")
-            }
-            lines.append("|       => first upstream that succeeds")
-            appendResponsesRoute(to: &lines, deployments: activeGroup, requireImageGeneration: false)
-            appendResponsesRoute(to: &lines, deployments: activeGroup, requireImageGeneration: true)
+        }
+        if modelNames.isEmpty {
+            rows.append(.empty)
         }
 
-        let headerDeployments = activeDeployments.filter { needsBrowserCompatibleHeaders(apiBase: $0.apiBase) }
-        if !headerDeployments.isEmpty {
-            lines.append("")
-            lines.append("Header hook")
-            lines.append("  headers.example calls get browser-like headers before upstream:")
-            for deployment in headerDeployments.sorted(by: runtimeDeploymentComesBefore) {
-                lines.append("  - \(formatRuntimeDeployment(deployment, includeStatus: false, includeOrder: true))")
-            }
-        }
+        runtimeMapRows = rows
+        runtimeMapTableView.reloadData()
+        scrollRuntimeMapToTop()
     }
 
     func preferredRuntimeModelNames() -> [String] {
@@ -571,13 +597,10 @@ extension ModelConfigEditorController {
     }
 
     func scrollRuntimeMapToTop() {
-        guard let textView = runtimeMapTextView else { return }
-        DispatchQueue.main.async { [weak self, weak textView] in
-            guard let textView else { return }
-            textView.scrollToBeginningOfDocument(nil)
-            if let scrollView = self?.runtimeMapScrollView {
-                scrollView.reflectScrolledClipView(scrollView.contentView)
-            }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let scrollView = self.runtimeMapScrollView else { return }
+            scrollView.contentView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
         }
     }
 
@@ -589,40 +612,406 @@ extension ModelConfigEditorController {
         }
     }
 
-    func appendResponsesRoute(to lines: inout [String], deployments: [RuntimeDeployment], requireImageGeneration: Bool) {
-        let title = requireImageGeneration ? "responses + image_generation" : "responses /v1/responses"
-        lines.append("|")
-        lines.append("|   \(title)")
-        lines.append("|     request")
-
-        let candidates = deployments
-        if requireImageGeneration {
-            lines.append("|       -> keep normal RUN list")
-            lines.append("|       -> runtime fallback can force tool_choice=image_generation after an unsupported/empty response")
+    func runtimeMapCell(at row: Int) -> NSView? {
+        guard runtimeMapRows.indices.contains(row) else { return nil }
+        switch runtimeMapRows[row] {
+        case .summary(let summary):
+            return runtimeMapSummaryCell(summary)
+        case .model(let model):
+            return runtimeMapModelCell(model)
+        case .order(let order):
+            return runtimeMapOrderCell(order)
+        case .deployment(let deployment):
+            return runtimeMapDeploymentCell(deployment)
+        case .empty:
+            return runtimeMapEmptyCell()
         }
+    }
 
-        let browserCompatible = candidates.filter { needsBrowserCompatibleHeaders(apiBase: $0.apiBase) }
-        if browserCompatible.isEmpty {
-            lines.append("|       -> no headers.example candidate")
-            lines.append("|       -> fall back to config order")
-            for step in orderFlowSteps(candidates) {
-                lines.append("|          \(step)")
+    func runtimeMapSummaryCell(_ summary: RuntimeMapSummaryRow) -> NSView {
+        let content = NSStackView()
+        content.orientation = .horizontal
+        content.alignment = .centerY
+        content.spacing = 7
+        let modelLabel = runtimeMapLabel(
+            "\(summary.modelCount) \(summary.modelCount == 1 ? "model" : "models")",
+            font: NSFont.systemFont(ofSize: 11, weight: .semibold)
+        )
+        content.addArrangedSubview(modelLabel)
+        content.addArrangedSubview(runtimeMapStatusToken(
+            text: "\(summary.runningCount) RUN",
+            color: .systemGreen
+        ))
+        content.addArrangedSubview(runtimeMapStatusToken(
+            text: "\(summary.offCount) OFF",
+            color: .tertiaryLabelColor
+        ))
+        content.addArrangedSubview(spacer())
+        content.addArrangedSubview(runtimeMapFallbackFlowView())
+        content.toolTip = "Fallback order: try the selected deployment's protocols in order, then another RUN deployment at the same route order, then the next route order. Cooldown is isolated by deployment and protocol."
+        return runtimeMapCellContainer(content, verticalInset: 5)
+    }
+
+    func runtimeMapModelCell(_ model: RuntimeMapModelRow) -> NSView {
+        let content = NSStackView()
+        content.orientation = .horizontal
+        content.alignment = .centerY
+        content.spacing = 7
+        if let icon = runtimeMapSymbolView(
+            name: "rectangle.stack",
+            description: "Model group",
+            color: .secondaryLabelColor
+        ) {
+            content.addArrangedSubview(icon)
+        }
+        let name = runtimeMapLabel(
+            model.publicModel,
+            font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            lineBreakMode: .byTruncatingMiddle
+        )
+        name.toolTip = model.publicModel
+        content.addArrangedSubview(name)
+        content.addArrangedSubview(spacer())
+        content.addArrangedSubview(runtimeMapStatusToken(
+            text: "\(model.runningCount) RUN",
+            color: model.runningCount > 0 ? .systemGreen : .tertiaryLabelColor
+        ))
+        if model.offCount > 0 {
+            content.addArrangedSubview(runtimeMapStatusToken(
+                text: "\(model.offCount) OFF",
+                color: .tertiaryLabelColor
+            ))
+        }
+        content.toolTip = "\(model.publicModel): \(model.runningCount) active and \(model.offCount) disabled deployments."
+        return runtimeMapCellContainer(content, horizontalInset: 7, verticalInset: 4)
+    }
+
+    func runtimeMapOrderCell(_ order: RuntimeMapOrderRow) -> NSView {
+        let content = NSStackView()
+        content.orientation = .horizontal
+        content.alignment = .centerY
+        content.spacing = 6
+        let symbolName = order.isFirst ? "arrow.right" : "arrow.turn.down.right"
+        if let icon = runtimeMapSymbolView(
+            name: symbolName,
+            description: order.isFirst ? "Start order" : "Next order",
+            color: .controlAccentColor
+        ) {
+            content.addArrangedSubview(icon)
+        }
+        let orderLabel = runtimeMapLabel(
+            runtimeMapOrderLabel(order.order),
+            font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+            color: .controlAccentColor
+        )
+        content.addArrangedSubview(orderLabel)
+        let transition: String
+        if order.isFirst {
+            transition = "start"
+        } else {
+            transition = "after \(runtimeMapOrderLabel(order.previousOrder)) exhausted"
+        }
+        var details = [transition, "\(order.runningCount) RUN"]
+        if order.offCount > 0 {
+            details.append("\(order.offCount) OFF")
+        }
+        let detailLabel = runtimeMapLabel(
+            details.joined(separator: "  |  "),
+            font: NSFont.systemFont(ofSize: 10),
+            color: .secondaryLabelColor
+        )
+        content.addArrangedSubview(detailLabel)
+        content.addArrangedSubview(spacer())
+        content.toolTip = "Each RUN deployment exhausts its configured protocol chain before routing tries another RUN deployment at this order. After all peers at this order are exhausted, routing advances to the next order."
+        return runtimeMapCellContainer(content, horizontalInset: 16, verticalInset: 3)
+    }
+
+    func runtimeMapDeploymentCell(_ deployment: RuntimeDeployment) -> NSView {
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 1
+
+        let top = NSStackView()
+        top.orientation = .horizontal
+        top.alignment = .centerY
+        top.spacing = 6
+        let status = runtimeMapStatusToken(
+            text: deployment.enabled ? "RUN" : "OFF",
+            color: deployment.enabled ? .systemGreen : .tertiaryLabelColor
+        )
+        status.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        top.addArrangedSubview(status)
+
+        let provider = runtimeMapLabel(
+            "\(deployment.providerName) / \(deployment.keyName)",
+            font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            color: deployment.enabled ? .labelColor : .secondaryLabelColor,
+            lineBreakMode: .byTruncatingMiddle
+        )
+        provider.widthAnchor.constraint(lessThanOrEqualToConstant: 170).isActive = true
+        provider.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        top.addArrangedSubview(provider)
+        if let arrow = runtimeMapSymbolView(
+            name: "arrow.right",
+            description: "Routes to",
+            color: .tertiaryLabelColor,
+            size: 10
+        ) {
+            top.addArrangedSubview(arrow)
+        }
+        let upstream = deployment.upstreamModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = apiBaseHost(deployment.apiBase)
+        let endpoint = "\(upstream.isEmpty ? "(no upstream model)" : upstream) @ \(host.isEmpty ? "(no host)" : host)"
+        let endpointLabel = runtimeMapLabel(
+            endpoint,
+            font: NSFont.systemFont(ofSize: 10.5),
+            color: deployment.enabled ? .secondaryLabelColor : .tertiaryLabelColor,
+            lineBreakMode: .byTruncatingMiddle
+        )
+        endpointLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        endpointLabel.toolTip = endpoint
+        top.addArrangedSubview(endpointLabel)
+        content.addArrangedSubview(top)
+        top.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+
+        let bottom = NSStackView()
+        bottom.orientation = .horizontal
+        bottom.alignment = .centerY
+        bottom.spacing = 6
+        let indent = NSView()
+        indent.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        bottom.addArrangedSubview(indent)
+        bottom.addArrangedSubview(runtimeMapProtocolChain(deployment))
+        bottom.addArrangedSubview(spacer())
+        if deployment.supportsImageGeneration && !deployment.isImageGenerationEndpoint,
+           let icon = runtimeMapSymbolView(
+               name: "photo",
+               description: "Responses image-generation tool",
+               color: deployment.enabled ? .systemPurple : .tertiaryLabelColor
+           ) {
+            icon.toolTip = "Supports the Responses image-generation tool."
+            bottom.addArrangedSubview(icon)
+        }
+        if needsBrowserCompatibleHeaders(apiBase: deployment.apiBase),
+           let icon = runtimeMapSymbolView(
+               name: "globe",
+               description: "Browser-compatible headers",
+               color: deployment.enabled ? .systemBlue : .tertiaryLabelColor
+           ) {
+            icon.toolTip = "Adds browser-compatible headers for this upstream host."
+            bottom.addArrangedSubview(icon)
+        }
+        content.addArrangedSubview(bottom)
+        bottom.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        content.toolTip = runtimeDeploymentTooltip(deployment)
+        return runtimeMapCellContainer(content, horizontalInset: 8, verticalInset: 3)
+    }
+
+    func runtimeMapEmptyCell() -> NSView {
+        let content = NSStackView()
+        content.orientation = .horizontal
+        content.alignment = .centerY
+        content.spacing = 7
+        if let icon = runtimeMapSymbolView(
+            name: "tray",
+            description: "No deployments",
+            color: .tertiaryLabelColor,
+            size: 14
+        ) {
+            content.addArrangedSubview(icon)
+        }
+        content.addArrangedSubview(runtimeMapLabel(
+            "No configured model deployments",
+            font: NSFont.systemFont(ofSize: 11),
+            color: .secondaryLabelColor
+        ))
+        content.addArrangedSubview(spacer())
+        return runtimeMapCellContainer(content, horizontalInset: 16, verticalInset: 8)
+    }
+
+    func runtimeMapCellContainer(
+        _ content: NSView,
+        horizontalInset: CGFloat = 8,
+        verticalInset: CGFloat
+    ) -> NSTableCellView {
+        let cell = NSTableCellView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: horizontalInset),
+            content.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -horizontalInset),
+            content.topAnchor.constraint(equalTo: cell.topAnchor, constant: verticalInset),
+            content.bottomAnchor.constraint(equalTo: cell.bottomAnchor, constant: -verticalInset),
+        ])
+        return cell
+    }
+
+    func runtimeMapLabel(
+        _ text: String,
+        font: NSFont,
+        color: NSColor = .labelColor,
+        lineBreakMode: NSLineBreakMode = .byTruncatingTail
+    ) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = font
+        label.textColor = color
+        label.usesSingleLineMode = true
+        label.lineBreakMode = lineBreakMode
+        return label
+    }
+
+    func runtimeMapStatusToken(text: String, color: NSColor) -> NSStackView {
+        let token = NSStackView()
+        token.orientation = .horizontal
+        token.alignment = .centerY
+        token.spacing = 4
+        let dot = NSView()
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = color.cgColor
+        dot.layer?.cornerRadius = 3
+        dot.widthAnchor.constraint(equalToConstant: 6).isActive = true
+        dot.heightAnchor.constraint(equalToConstant: 6).isActive = true
+        token.addArrangedSubview(dot)
+        token.addArrangedSubview(runtimeMapLabel(
+            text,
+            font: NSFont.systemFont(ofSize: 9.5, weight: .semibold),
+            color: color
+        ))
+        return token
+    }
+
+    func runtimeMapFallbackFlowView() -> NSStackView {
+        let flow = NSStackView()
+        flow.orientation = .horizontal
+        flow.alignment = .centerY
+        flow.spacing = 4
+        flow.addArrangedSubview(runtimeMapLabel(
+            "Fallback",
+            font: NSFont.systemFont(ofSize: 9.5, weight: .semibold),
+            color: .secondaryLabelColor
+        ))
+        for (index, text) in ["protocol", "peer", "order"].enumerated() {
+            if index > 0, let arrow = runtimeMapSymbolView(
+                name: "chevron.right",
+                description: "then",
+                color: .tertiaryLabelColor,
+                size: 8
+            ) {
+                flow.addArrangedSubview(arrow)
             }
-            return
+            flow.addArrangedSubview(runtimeMapLabel(
+                text,
+                font: NSFont.systemFont(ofSize: 9.5, weight: index == 0 ? .semibold : .regular),
+                color: index == 0 ? .controlAccentColor : .secondaryLabelColor
+            ))
+        }
+        return flow
+    }
+
+    func runtimeMapProtocolChain(_ deployment: RuntimeDeployment) -> NSStackView {
+        let chain = NSStackView()
+        chain.orientation = .horizontal
+        chain.alignment = .centerY
+        chain.spacing = 4
+        if deployment.isImageGenerationEndpoint {
+            if let icon = runtimeMapSymbolView(
+                name: "photo",
+                description: "Images API",
+                color: deployment.enabled ? .controlAccentColor : .tertiaryLabelColor,
+                size: 10
+            ) {
+                chain.addArrangedSubview(icon)
+            }
+            chain.addArrangedSubview(runtimeMapLabel(
+                "Images API",
+                font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                color: deployment.enabled ? .controlAccentColor : .tertiaryLabelColor
+            ))
+            chain.toolTip = "Standalone image-generation endpoint."
+            return chain
         }
 
-        let selected = lowestOrderDeployments(browserCompatible)
-        let selectedIds = Set(selected.map { $0.id })
-        let skipped = candidates.filter { !selectedIds.contains($0.id) }
-        lines.append("|       -> hook keeps headers.example only")
-        for deployment in browserCompatible.sorted(by: runtimeDeploymentComesBefore) {
-            lines.append("|          \(formatRuntimeDeployment(deployment, includeStatus: false, includeOrder: true))")
+        for (index, mode) in deployment.supportedUpstreamApiModes.enumerated() {
+            if index > 0, let arrow = runtimeMapSymbolView(
+                name: "chevron.right",
+                description: "fallback to",
+                color: .tertiaryLabelColor,
+                size: 8
+            ) {
+                chain.addArrangedSubview(arrow)
+            }
+            let activeColor: NSColor = index == 0 ? .controlAccentColor : .secondaryLabelColor
+            let label = runtimeMapLabel(
+                runtimeMapProtocolName(mode),
+                font: NSFont.systemFont(ofSize: 10, weight: index == 0 ? .semibold : .regular),
+                color: deployment.enabled ? activeColor : .tertiaryLabelColor
+            )
+            label.toolTip = runtimeMapProtocolTooltip(mode)
+            chain.addArrangedSubview(label)
         }
-        lines.append("|       -> lowest order wins")
-        lines.append("|       => final pick: \(formatRuntimeDeployments(selected, includeStatus: false))")
-        if !skipped.isEmpty {
-            lines.append("|          skipped: \(formatRuntimeDeployments(skipped, includeStatus: false))")
+        chain.toolTip = "Protocol fallback order. Cooldown is isolated for each deployment and protocol."
+        return chain
+    }
+
+    func runtimeMapSymbolView(
+        name: String,
+        description: String,
+        color: NSColor,
+        size: CGFloat = 11
+    ) -> NSImageView? {
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: description) else {
+            return nil
         }
+        let view = NSImageView(image: image)
+        view.contentTintColor = color
+        view.imageScaling = .scaleProportionallyDown
+        view.widthAnchor.constraint(equalToConstant: size).isActive = true
+        view.heightAnchor.constraint(equalToConstant: size).isActive = true
+        return view
+    }
+
+    func runtimeMapOrderLabel(_ order: Int?) -> String {
+        order.map { "Order \($0)" } ?? "Order -"
+    }
+
+    func runtimeMapProtocolName(_ mode: String) -> String {
+        switch mode {
+        case "anthropic": return "Anthropic"
+        case "openai/chat": return "Chat"
+        default: return "Responses"
+        }
+    }
+
+    func runtimeMapProtocolTooltip(_ mode: String) -> String {
+        switch mode {
+        case "anthropic": return "anthropic via /v1/messages"
+        case "openai/chat": return "openai/chat via /v1/chat/completions"
+        default: return "openai/responses via /v1/responses"
+        }
+    }
+
+    func runtimeDeploymentTooltip(_ deployment: RuntimeDeployment) -> String {
+        let status = deployment.enabled ? "RUN" : "OFF: \(runtimeDeploymentOffReason(deployment))"
+        let upstream = deployment.upstreamModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let host = apiBaseHost(deployment.apiBase)
+        let protocols = deployment.isImageGenerationEndpoint
+            ? "Images API"
+            : deployment.supportedUpstreamApiModes.joined(separator: " -> ")
+        var details = [
+            status,
+            "Provider/key: \(deployment.providerName) / \(deployment.keyName)",
+            "Upstream: \(upstream.isEmpty ? "(none)" : upstream)",
+            "Host: \(host.isEmpty ? "(none)" : host)",
+            "Protocols: \(protocols)",
+        ]
+        if deployment.supportsImageGeneration {
+            details.append("Supports the Responses image-generation tool.")
+        }
+        if needsBrowserCompatibleHeaders(apiBase: deployment.apiBase) {
+            details.append("Browser-compatible headers are added for this host.")
+        }
+        return details.joined(separator: "\n")
     }
 
     func runtimeDeployments() -> [RuntimeDeployment] {
@@ -655,9 +1044,8 @@ extension ModelConfigEditorController {
                     modelEnabled: model.modelEnabled,
                     missingKey: key == nil,
                     supportsImageGeneration: model.supportsImageGeneration,
-                    upstreamApiMode: normalizedUpstreamApiMode(for: model),
-                    supportedUpstreamApiModes: normalizedSupportedUpstreamApiModes(for: model),
-                    supportsResponsesEndpoint: normalizedSupportedUpstreamApiModes(for: model).contains("openai/responses")
+                    isImageGenerationEndpoint: modelIsImageGenerationEndpointModel(model),
+                    supportedUpstreamApiModes: normalizedSupportedUpstreamApiModes(for: model)
                 ))
             }
         }
@@ -687,99 +1075,6 @@ extension ModelConfigEditorController {
             return left.keyName < right.keyName
         }
         return left.upstreamModel < right.upstreamModel
-    }
-
-    func orderFallbackDescription(_ deployments: [RuntimeDeployment]) -> String {
-        let grouped = Dictionary(grouping: deployments) { $0.order }
-        let orders = grouped.keys.sorted { orderSortValue($0) < orderSortValue($1) }
-        return orders.map { order in
-            let orderLabel = order.map { "o\($0)" } ?? "o-"
-            let deploymentsForOrder = (grouped[order] ?? []).sorted(by: runtimeDeploymentComesBefore)
-            return "\(orderLabel) \(formatRuntimeDeployments(deploymentsForOrder, includeStatus: false, includeOrder: false))"
-        }.joined(separator: " -> ")
-    }
-
-    func orderFlowSteps(_ deployments: [RuntimeDeployment]) -> [String] {
-        let grouped = Dictionary(grouping: deployments) { $0.order }
-        let orders = grouped.keys.sorted { orderSortValue($0) < orderSortValue($1) }
-        return orders.enumerated().map { index, order in
-            let prefix = index == 0 ? "start" : "if previous fails"
-            let orderLabel = order.map { "o\($0)" } ?? "o-"
-            let deploymentsForOrder = (grouped[order] ?? []).sorted(by: runtimeDeploymentComesBefore)
-            return "\(prefix) -> \(orderLabel) \(formatRuntimeDeployments(deploymentsForOrder, includeStatus: false, includeOrder: false))"
-        }
-    }
-
-    func lowestOrderDeployments(_ deployments: [RuntimeDeployment]) -> [RuntimeDeployment] {
-        let orders = deployments.compactMap { $0.order }
-        guard let minOrder = orders.min() else {
-            return deployments.sorted(by: runtimeDeploymentComesBefore)
-        }
-        return deployments
-            .filter { $0.order == minOrder }
-            .sorted(by: runtimeDeploymentComesBefore)
-    }
-
-    func formatRuntimeDeployments(_ deployments: [RuntimeDeployment], includeStatus: Bool, includeOrder: Bool = true) -> String {
-        let sorted = deployments.sorted(by: runtimeDeploymentComesBefore)
-        if sorted.isEmpty {
-            return "none"
-        }
-        return sorted.map { formatRuntimeDeployment($0, includeStatus: includeStatus, includeOrder: includeOrder) }.joined(separator: " | ")
-    }
-
-    func formatRuntimeDeployment(_ deployment: RuntimeDeployment, includeStatus: Bool, includeOrder: Bool) -> String {
-        var parts: [String] = []
-        if includeOrder {
-            parts.append(deployment.order.map { "o\($0)" } ?? "o-")
-        }
-        parts.append("\(deployment.providerName)/\(deployment.keyName)")
-        if !deployment.upstreamModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.append(deployment.upstreamModel)
-        }
-
-        var flags: [String] = []
-        if needsBrowserCompatibleHeaders(apiBase: deployment.apiBase) {
-            flags.append("browser-headers")
-        }
-        if deployment.supportsImageGeneration {
-            flags.append("image")
-        }
-        flags.append("use \(deployment.upstreamApiMode)")
-        if deployment.supportedUpstreamApiModes.count > 1 {
-            flags.append("supports \(deployment.supportedUpstreamApiModes.joined(separator: "+"))")
-        }
-        if includeStatus, !deployment.enabled {
-            flags.append("off: \(runtimeDeploymentOffReason(deployment))")
-        }
-        let suffix = flags.isEmpty ? "" : " [" + flags.joined(separator: ", ") + "]"
-        return parts.joined(separator: " ") + suffix
-    }
-
-    func formatRuntimeDeploymentDetail(_ deployment: RuntimeDeployment) -> String {
-        let status = deployment.enabled ? "RUN" : "OFF"
-        let order = deployment.order.map { "o\($0)" } ?? "o-"
-        let upstream = deployment.upstreamModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "(no upstream model)"
-            : deployment.upstreamModel
-        let host = apiBaseHost(deployment.apiBase)
-        let hostText = host.isEmpty ? "(no base URL)" : host
-        var flags: [String] = []
-        if needsBrowserCompatibleHeaders(apiBase: deployment.apiBase) {
-            flags.append("hook adds headers")
-        }
-        if deployment.supportsImageGeneration {
-            flags.append("image-capable")
-        }
-        flags.append("use \(deployment.upstreamApiMode)")
-        if deployment.supportedUpstreamApiModes.count > 1 {
-            flags.append("supports \(deployment.supportedUpstreamApiModes.joined(separator: "+"))")
-        }
-        if !deployment.enabled {
-            flags.append("off: \(runtimeDeploymentOffReason(deployment))")
-        }
-        let suffix = flags.isEmpty ? "" : " [" + flags.joined(separator: ", ") + "]"
-        return "\(status) \(order) \(deployment.providerName)/\(deployment.keyName) -> \(upstream) @ \(hostText)\(suffix)"
     }
 
     func runtimeDeploymentOffReason(_ deployment: RuntimeDeployment) -> String {

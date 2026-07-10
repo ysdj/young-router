@@ -58,7 +58,7 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(filtered, deployments)
 
-    async def test_filter_deployments_prefers_responses_surface_for_codex_tools(self) -> None:
+    async def test_filter_deployments_preserves_user_surface_order_for_codex_tools(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         chat_only = {
@@ -73,7 +73,6 @@ class HookRoutingTests(HookTestCase):
                 "api_key_name": "x-plus",
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat", "anthropic"],
-                "supports_responses_endpoint": False,
             },
         }
         responses = {
@@ -108,7 +107,7 @@ class HookRoutingTests(HookTestCase):
             },
         )
 
-        self.assertEqual(filtered, [responses])
+        self.assertEqual(filtered, deployments)
 
     async def test_filter_deployments_keeps_chat_surface_when_no_responses_candidate(self) -> None:
         hooks, _ = load_hook_module()
@@ -126,7 +125,6 @@ class HookRoutingTests(HookTestCase):
                     "api_key_name": "x-plus",
                     "upstream_url_surface": "openai/chat",
                     "supported_upstream_url_surfaces": ["openai/chat"],
-                    "supports_responses_endpoint": False,
                 },
             }
         ]
@@ -845,6 +843,222 @@ class HookRoutingTests(HookTestCase):
             request_kwargs={},
         )
         self.assertEqual(filtered, [deployments[1]])
+
+    async def test_deployment_cooldown_isolated_between_responses_and_chat_surfaces(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        deployment = {
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "api_base": "https://api.example.test/v1",
+                "order": 1,
+            },
+            "model_info": {
+                "id": "dual-protocol-route",
+                "provider": "primary",
+                "api_key_name": "default",
+                "upstream_url_surface": "openai/responses",
+                "supported_upstream_url_surfaces": [
+                    "openai/responses",
+                    "openai/chat",
+                ],
+            },
+        }
+        error = RuntimeError("temporary responses upstream failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            error,
+            {
+                "call_type": "aresponses",
+                "model": "default-chat",
+                "stream": True,
+                "_litellm_menu_upstream_url_surface": "openai/responses",
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            },
+        )
+
+        responses_filtered = await hook.async_filter_deployments(
+            "default-chat",
+            [deployment],
+            messages=None,
+            request_kwargs={
+                "call_type": "aresponses",
+                "model": "default-chat",
+                "stream": True,
+            },
+        )
+        chat_filtered = await hook.async_filter_deployments(
+            "default-chat",
+            [deployment],
+            messages=None,
+            request_kwargs={
+                "call_type": "aresponses",
+                "model": "default-chat",
+                "stream": True,
+                "_litellm_menu_upstream_url_surface": "openai/chat",
+            },
+        )
+
+        self.assertEqual(responses_filtered, [deployment])
+        self.assertEqual(chat_filtered, [deployment])
+        self.assertEqual(
+            hooks._request_surface_for_deployment({}, deployment),
+            "openai/chat",
+        )
+        self.assertIn(
+            "id:dual-protocol-route|surface:openai/responses",
+            hooks._DEPLOYMENT_COOLDOWNS,
+        )
+        self.assertNotIn(
+            "id:dual-protocol-route|surface:openai/chat",
+            hooks._DEPLOYMENT_COOLDOWNS,
+        )
+
+    def test_surface_adapter_uses_exact_model_for_all_three_protocols(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertEqual(
+            hooks._surface_adapter_model("openai/vendor/model", "openai/responses"),
+            "openai/responses/vendor/model",
+        )
+        self.assertEqual(
+            hooks._surface_adapter_model("openai/responses/vendor/model", "anthropic"),
+            "anthropic/vendor/model",
+        )
+        self.assertEqual(
+            hooks._surface_adapter_model("anthropic/vendor/model", "openai/chat"),
+            "openai/vendor/model",
+        )
+
+    def test_ordered_surface_fallback_exhausts_a_before_same_order_b(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment_a = {
+            "litellm_params": {"model": "openai/vendor-a", "order": 1},
+            "model_info": {
+                "id": "route-a",
+                "supported_upstream_url_surfaces": [
+                    "openai/responses",
+                    "anthropic",
+                    "openai/chat",
+                ],
+            },
+        }
+        deployment_b = {
+            "litellm_params": {"model": "openai/vendor-b", "order": 1},
+            "model_info": {
+                "id": "route-b",
+                "supported_upstream_url_surfaces": ["openai/responses"],
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment_a, deployment_b]
+
+        request = {
+            "model": "default-chat",
+            "_target_order": 1,
+            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_litellm_menu_attempted_upstream_url_surfaces": ["openai/responses"],
+            "_litellm_menu_upstream_url_surface_deployment_id": "route-a",
+            "model_info": deployment_a["model_info"],
+            "litellm_params": deployment_a["litellm_params"],
+        }
+
+        first_error = RuntimeError("responses endpoint not found")
+        first_error.status_code = 404
+        hooks._mark_exception_for_upstream_surface_failover(first_error, request)
+        first = hooks._ordered_deployment_fallback_entry(Router(), first_error, request)
+
+        self.assertEqual(first["_litellm_menu_upstream_url_surface"], "anthropic")
+        self.assertEqual(first["_litellm_menu_surface_target_deployment_id"], "route-a")
+        self.assertNotIn("route-a", first.get("_excluded_deployment_ids", []))
+
+        request.update({key: value for key, value in first.items() if key != "model"})
+        request["_litellm_menu_upstream_url_surface_deployment_id"] = "route-a"
+        second_error = RuntimeError("anthropic messages endpoint not found")
+        second_error.status_code = 404
+        hooks._mark_exception_for_upstream_surface_failover(second_error, request)
+        second = hooks._ordered_deployment_fallback_entry(Router(), second_error, request)
+
+        self.assertEqual(second["_litellm_menu_upstream_url_surface"], "openai/chat")
+        self.assertEqual(second["_litellm_menu_surface_target_deployment_id"], "route-a")
+
+        request.update({key: value for key, value in second.items() if key != "model"})
+        request["_litellm_menu_upstream_url_surface_deployment_id"] = "route-a"
+        third_error = RuntimeError("chat completions endpoint not found")
+        third_error.status_code = 404
+        hooks._mark_exception_for_upstream_surface_failover(third_error, request)
+        third = hooks._ordered_deployment_fallback_entry(Router(), third_error, request)
+
+        self.assertEqual(third["_target_order"], 1)
+        self.assertEqual(third["_excluded_deployment_ids"], ["route-a"])
+        self.assertNotIn("_litellm_menu_upstream_url_surface", third)
+
+    async def test_deployment_is_filtered_only_after_all_three_surfaces_cool_down(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        deployment = {
+            "litellm_params": {"model": "openai/vendor-a", "order": 1},
+            "model_info": {
+                "id": "three-surface-route",
+                "supported_upstream_url_surfaces": [
+                    "openai/responses",
+                    "anthropic",
+                    "openai/chat",
+                ],
+            },
+        }
+
+        for index, surface in enumerate(
+            ["openai/responses", "anthropic", "openai/chat"],
+            start=1,
+        ):
+            error = RuntimeError(f"temporary {surface} failure")
+            error.status_code = 503
+            hooks._mark_exception_for_deployment_failover(
+                error,
+                {
+                    "model": "default-chat",
+                    "_litellm_menu_upstream_url_surface": surface,
+                    "litellm_params": deployment["litellm_params"],
+                    "model_info": deployment["model_info"],
+                },
+            )
+            filtered = await hook.async_filter_deployments(
+                "default-chat",
+                [deployment],
+                messages=None,
+                request_kwargs={},
+            )
+            self.assertEqual(filtered, [deployment] if index < 3 else [])
+
+    def test_current_surface_incompatibility_is_narrowly_classified(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {"_litellm_menu_upstream_url_surface": "openai/responses"}
+        endpoint_error = RuntimeError("endpoint not found")
+        endpoint_error.status_code = 404
+        schema_error = RuntimeError(
+            "Invalid Responses API request: invalid_union; expected string, received array"
+        )
+        schema_error.status_code = 400
+        policy_error = RuntimeError("request violates content policy")
+        policy_error.status_code = 400
+
+        self.assertTrue(
+            hooks._is_current_upstream_surface_incompatible_error(endpoint_error, request)
+        )
+        self.assertTrue(
+            hooks._is_current_upstream_surface_incompatible_error(schema_error, request)
+        )
+        self.assertFalse(
+            hooks._is_current_upstream_surface_incompatible_error(policy_error, request)
+        )
 
     def test_route_key_canonicalizes_api_base_host(self) -> None:
         hooks, _ = load_hook_module()

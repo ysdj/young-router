@@ -226,9 +226,6 @@ def _entry_from_editor(
     params = dict(_as_dict(model.get("litellm_extra")))
     model_info = dict(_as_dict(model.get("model_info_extra")))
     model_info.pop("supports_vision", None)
-    for legacy_key in LEGACY_CONTEXT_METADATA_KEYS:
-        model_info.pop(legacy_key, None)
-
     _set_if_text(entry, "model_name", model_name)
     _set_if_text(params, "model", litellm_model)
     api_base = str(provider.get("api_base", "")).strip()
@@ -284,24 +281,12 @@ def _entry_from_editor(
     )
     if supports_responses_image_tool_present or supports_responses_image_tool:
         model_info["supports_responses_image_generation_tool"] = supports_responses_image_tool
-    upstream_url_surface = _upstream_url_surface(model.get("upstream_url_surface"))
     supported_upstream_url_surfaces = _upstream_url_surfaces(
-        model.get("supported_upstream_url_surfaces"),
-        upstream_url_surface,
+        model.get("supported_upstream_url_surfaces")
     )
-    if (
-        bool(model.get("upstream_url_surface_present", False))
-        or upstream_url_surface != DEFAULT_UPSTREAM_URL_SURFACE
-    ):
-        model_info[UPSTREAM_URL_SURFACE_KEY] = upstream_url_surface
-    if (
-        bool(model.get("supported_upstream_url_surfaces_present", False))
-        or supported_upstream_url_surfaces != [DEFAULT_UPSTREAM_URL_SURFACE]
-    ):
-        model_info[SUPPORTED_UPSTREAM_URL_SURFACES_KEY] = supported_upstream_url_surfaces
-    supports_responses_endpoint = "openai/responses" in supported_upstream_url_surfaces
-    if not supports_responses_endpoint:
-        model_info["supports_responses_endpoint"] = False
+    upstream_url_surface = supported_upstream_url_surfaces[0]
+    model_info[UPSTREAM_URL_SURFACE_KEY] = upstream_url_surface
+    model_info[SUPPORTED_UPSTREAM_URL_SURFACES_KEY] = supported_upstream_url_surfaces
 
     if params:
         entry["litellm_params"] = params
@@ -381,12 +366,21 @@ def _dump_section(key: str, value: Any) -> str:
 
 
 def _find_top_level_section(text: str, key: str) -> tuple[int, int] | None:
-    match = re.search(rf"^{re.escape(key)}:\s*(?:#.*)?\n?", text, flags=re.MULTILINE)
-    if not match:
+    document = yaml.compose(text)
+    if not isinstance(document, yaml.nodes.MappingNode):
         return None
-    next_match = re.search(r"^[A-Za-z0-9_.-]+:\s*(?:#.*)?$", text[match.end() :], flags=re.MULTILINE)
-    end = match.end() + next_match.start() if next_match else len(text)
-    return match.start(), end
+
+    entries = document.value
+    for index, (key_node, _value_node) in enumerate(entries):
+        if not isinstance(key_node, yaml.nodes.ScalarNode) or key_node.value != key:
+            continue
+        end = (
+            entries[index + 1][0].start_mark.index
+            if index + 1 < len(entries)
+            else len(text)
+        )
+        return key_node.start_mark.index, end
+    return None
 
 
 def _replace_top_level_section(text: str, key: str, block: str) -> str:
@@ -400,36 +394,6 @@ def _replace_top_level_section(text: str, key: str, block: str) -> str:
     prefix = f"{before}\n\n" if before else ""
     suffix = f"\n{after}" if after else ""
     return f"{prefix}{block.rstrip()}\n{suffix}"
-
-
-def _find_litellm_settings_section(text: str) -> tuple[int, int] | None:
-    return _find_top_level_section(text, "litellm_settings")
-
-
-def _public_model_groups_block(groups: list[str]) -> str:
-    dumped = _dump_section("public_model_groups", groups).rstrip().splitlines()
-    return "\n".join(f"  {line}" for line in dumped) + "\n"
-
-
-def _replace_public_model_groups(text: str, groups: list[str]) -> str:
-    settings = _find_litellm_settings_section(text)
-    if settings is None:
-        block = "litellm_settings:\n" + _public_model_groups_block(groups)
-        suffix = "" if text.endswith("\n") else "\n"
-        return f"{text}{suffix}\n{block}\n"
-
-    start, end = settings
-    section = text[start:end].rstrip()
-    rest = text[end:]
-    match = re.search(r"^  public_model_groups:\s*(?:#.*)?\n?", section, flags=re.MULTILINE)
-    block = _public_model_groups_block(groups).rstrip()
-    if match:
-        next_match = re.search(r"^  [A-Za-z0-9_.-]+:\s*(?:#.*)?$", section[match.end() :], flags=re.MULTILINE)
-        group_end = match.end() + next_match.start() if next_match else len(section)
-        section = f"{section[:match.start()].rstrip()}\n{block}\n{section[group_end:].lstrip(chr(10))}".rstrip()
-    else:
-        section = f"{section.rstrip()}\n{block}"
-    return f"{text[:start]}{section}\n{rest.lstrip(chr(10))}"
 
 
 def _unique_model_groups(active_entries: list[dict[str, Any]], existing_groups: list[Any] | None = None) -> list[str]:

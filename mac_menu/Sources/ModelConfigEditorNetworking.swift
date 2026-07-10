@@ -219,7 +219,6 @@ extension ModelConfigEditorController {
         let mode = jsonString(modelInfo["mode"]).lowercased()
         let upstreamApiMode = jsonString(modelInfo["upstream_url_surface"])
         let supportsFlag = jsonBool(modelInfo["supports_responses_image_generation_tool"])
-        let supportsResponsesEndpointFlag = jsonBool(modelInfo["supports_responses_endpoint"])
         let provider = jsonString(modelInfo["provider"])
         let key = jsonString(modelInfo["key"])
 
@@ -261,7 +260,6 @@ extension ModelConfigEditorController {
                 mode: mode,
                 upstreamApiMode: upstreamApiMode,
                 supportsImageGenerationFlag: supportsFlag,
-                supportsResponsesEndpointFlag: supportsResponsesEndpointFlag,
                 provider: provider,
                 key: key,
                 matchedBy: matchedBy
@@ -386,14 +384,14 @@ extension ModelConfigEditorController {
 
     func refreshModelAvailabilityProbeControlsEnabled() {
         let inFlight = selectedModelProbeKey().map { modelAvailabilityProbeRuns[$0] != nil } ?? false
-        probeModelAvailabilityButton.title = inFlight ? "Probing..." : "Probe Model"
+        probeModelAvailabilityButton.title = inFlight
+            ? "Probing..."
+            : (selectedModelImageGenerationEndpointDisabled ? "Probe Image Endpoint" : "Probe & Recommend")
         probeModelAvailabilityButton.isEnabled = selectedModelIndex != nil && !inFlight
     }
 
     func refreshResponsesEndpointProbeControlsEnabled() {
-        let inFlight = selectedModelProbeKey().map { responsesEndpointProbeRuns[$0] != nil } ?? false
-        probeResponsesEndpointButton.title = inFlight ? "Probing..." : "Probe URL"
-        probeResponsesEndpointButton.isEnabled = selectedModelIndex != nil && !inFlight
+        refreshUpstreamApiModeRows()
     }
 
     func selectedModelProbeKey() -> ModelProbeKey? {
@@ -480,9 +478,11 @@ extension ModelConfigEditorController {
         )
     }
 
-    func currentModelAvailabilityProbeRequest() throws -> ModelAvailabilityProbeRequest {
-        guard let providerIndex = selectedProviderIndex,
-              let modelIndex = selectedModelIndex else {
+    func modelAvailabilityProbeRequest(providerIndex: Int, modelIndex: Int) throws -> ModelAvailabilityProbeRequest {
+        guard providerIndex >= 0,
+              providerIndex < providers.count,
+              modelIndex >= 0,
+              modelIndex < providers[providerIndex].models.count else {
             throw ConfigEditorError(message: "Select a model deployment before probing availability.")
         }
         let provider = providers[providerIndex]
@@ -543,6 +543,14 @@ extension ModelConfigEditorController {
             deploymentToken: model.deploymentToken.trimmingCharacters(in: .whitespacesAndNewlines),
             supportsImageGeneration: model.supportsImageGeneration
         )
+    }
+
+    func currentModelAvailabilityProbeRequest() throws -> ModelAvailabilityProbeRequest {
+        guard let providerIndex = selectedProviderIndex,
+              let modelIndex = selectedModelIndex else {
+            throw ConfigEditorError(message: "Select a model deployment before probing availability.")
+        }
+        return try modelAvailabilityProbeRequest(providerIndex: providerIndex, modelIndex: modelIndex)
     }
 
     func endpointURLCandidates(baseURL: String, endpoint: String) -> [URL] {
@@ -619,25 +627,42 @@ extension ModelConfigEditorController {
         if (200...299).contains(statusCode) {
             return .available(snippet.isEmpty ? "/images/generations returned HTTP \(statusCode)." : "/images/generations returned HTTP \(statusCode).\n\(snippet)")
         }
+        let lower = snippet.lowercased()
+        if statusCode == 404 || statusCode == 405
+            || lower.contains("model not found")
+            || lower.contains("unknown model")
+            || lower.contains("unsupported model")
+            || lower.contains("not implemented") {
+            return .unavailable(snippet.isEmpty ? "HTTP \(statusCode)" : "HTTP \(statusCode)\n\(snippet)")
+        }
         if imageGenerationProbeParameterError(statusCode: statusCode, snippet: snippet) {
             let detail = snippet.isEmpty ? "HTTP \(statusCode)" : "HTTP \(statusCode)\n\(snippet)"
             return .inconclusive("The image probe request was rejected as invalid, so model availability was not changed.\n\(detail)")
         }
-        return .unavailable(snippet.isEmpty ? "HTTP \(statusCode)" : "HTTP \(statusCode)\n\(snippet)")
+        return .inconclusive(snippet.isEmpty ? "HTTP \(statusCode)" : "HTTP \(statusCode)\n\(snippet)")
     }
 
-    func apiEndpointExists(statusCode: Int, data: Data?) -> Bool? {
+    func upstreamApiProbeAvailability(statusCode: Int, data: Data?) -> UpstreamApiProbeAvailability {
         let snippet = responseSnippet(data)
         if (200...299).contains(statusCode) {
-            return true
+            return .available
         }
         if statusCode == 404 || statusCode == 405 {
-            return false
+            return .unavailable
         }
+        let lower = snippet.lowercased()
         if statusCode == 400 || statusCode == 422 {
-            return !snippet.lowercased().contains("not found")
+            if lower.contains("not found")
+                || lower.contains("unsupported endpoint")
+                || lower.contains("unsupported protocol")
+                || lower.contains("not implemented")
+                || lower.contains("unknown model")
+                || lower.contains("unsupported model") {
+                return .unavailable
+            }
+            return .inconclusive
         }
-        return nil
+        return .inconclusive
     }
 
     func probeDetail(surface: String, url: URL, statusCode: Int, data: Data?) -> String {

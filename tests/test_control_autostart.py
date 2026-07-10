@@ -170,6 +170,8 @@ class ControlAutoStartTests(unittest.TestCase):
                         model_info:
                           id: a1b2c3d4
                           provider: example
+                          upstream_url_surface: openai/responses
+                          supported_upstream_url_surfaces: [openai/responses]
                           route_key: example / openai/default-chat / order=1
                     """
                 ).lstrip(),
@@ -336,6 +338,177 @@ class ControlAutoStartTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertEqual(argument_file.read_text(encoding="utf-8").strip(), "5")
 
+    def test_restart_clears_transient_routing_state_after_port_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            cooldown_file = temp / "deployment-cooldowns.json"
+            cooldown_lock = temp / "deployment-cooldowns.json.lock"
+            recovery_file = temp / "route-recovery-state.json"
+            recovery_lock = temp / "route-recovery-state.json.lock"
+            cooldown_file.write_text(
+                json.dumps(
+                    {
+                        "cooldowns": {
+                            "id:route-a|surface:responses": {
+                                "failures": 2,
+                                "cooldown_until": 9999999999,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cooldown_lock.write_text("", encoding="utf-8")
+            recovery_file.write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "request:old": {
+                                "status": "polling",
+                                "attempt": 12,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            recovery_lock.write_text("", encoding="utf-8")
+            observed_file = temp / "observed-cooldown-state"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                source {ROOT / 'service/process.sh'}
+                require_menu_app_owner() {{ printf '4242\n'; }}
+                ensure_native_environment() {{ :; }}
+                sync_runtime_config() {{ :; }}
+                write_state() {{ :; }}
+                bootout_launch_agent() {{ :; }}
+                request_native_processes_to_stop() {{ :; }}
+                wait_for_native_port_released() {{ :; }}
+                start_service_process() {{
+                  if grep -q '"cooldowns": {{}}' {cooldown_file} \
+                    && grep -q '"recoveries": {{}}' {recovery_file}; then
+                    printf 'cleared\n' > {observed_file}
+                  fi
+                }}
+                wait_for_managed_health() {{ :; }}
+                wait_for_runtime_config() {{ :; }}
+                write_runtime_reload_fingerprint() {{ :; }}
+                clear_state() {{ :; }}
+                RUNTIME_DIR={temp}
+                DEPLOYMENT_COOLDOWN_FILE={cooldown_file}
+                ROUTE_RECOVERY_STATE_FILE={recovery_file}
+                PYTHON={sys.executable}
+                PORT=49232
+                NATIVE_WORKERS=1
+                restart_server >/dev/null
+                """
+            ).lstrip()
+
+            result = subprocess.run(
+                ["/bin/bash", "-c", script],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(observed_file.read_text(encoding="utf-8"), "cleared\n")
+            self.assertEqual(
+                json.loads(cooldown_file.read_text(encoding="utf-8"))["cooldowns"],
+                {},
+            )
+            self.assertEqual(
+                json.loads(recovery_file.read_text(encoding="utf-8"))["recoveries"],
+                {},
+            )
+            self.assertTrue(cooldown_lock.exists())
+            self.assertTrue(recovery_lock.exists())
+
+    def test_reload_clears_transient_routing_state_after_routes_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            cooldown_file = temp / "deployment-cooldowns.json"
+            recovery_file = temp / "route-recovery-state.json"
+            cooldown_file.write_text(
+                json.dumps({"cooldowns": {"id:old|surface:chat": {"failures": 2}}}),
+                encoding="utf-8",
+            )
+            recovery_file.write_text(
+                json.dumps({"recoveries": {"request:old": {"status": "polling"}}}),
+                encoding="utf-8",
+            )
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                source {ROOT / 'service/process.sh'}
+                require_menu_app_owner() {{ :; }}
+                ensure_python_tools() {{ :; }}
+                native_master_pid() {{ printf '4242\n'; }}
+                kill() {{ :; }}
+                write_state() {{ :; }}
+                wait_for_managed_health() {{ :; }}
+                wait_for_runtime_config() {{ :; }}
+                write_runtime_reload_fingerprint() {{ :; }}
+                clear_state() {{ :; }}
+                DEPLOYMENT_COOLDOWN_FILE={cooldown_file}
+                ROUTE_RECOVERY_STATE_FILE={recovery_file}
+                PYTHON={sys.executable}
+                PORT=49232
+                NATIVE_WORKERS=1
+                reload_server >/dev/null
+                """
+            ).lstrip()
+
+            result = subprocess.run(
+                ["/bin/bash", "-c", script],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(
+                json.loads(cooldown_file.read_text(encoding="utf-8"))["cooldowns"],
+                {},
+            )
+            self.assertEqual(
+                json.loads(recovery_file.read_text(encoding="utf-8"))["recoveries"],
+                {},
+            )
+
+    def test_apply_config_prefers_graceful_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            calls = temp / "calls"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                source {ROOT / 'service/process.sh'}
+                ensure_python_tools() {{ :; }}
+                sync_runtime_config() {{ :; }}
+                health_ok() {{ :; }}
+                require_menu_app_owner() {{ :; }}
+                runtime_reload_fingerprint_changed() {{ return 1; }}
+                reload_server() {{ printf 'reload\n' >> {calls}; }}
+                restart_server() {{ printf 'restart\n' >> {calls}; }}
+                apply_config
+                """
+            ).lstrip()
+
+            result = subprocess.run(
+                ["/bin/bash", "-c", script],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["reload"])
+
     def test_run_native_process_passes_worker_recycle_argument(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -345,6 +518,7 @@ class ControlAutoStartTests(unittest.TestCase):
             callback_source = callback_dir / "callbacks.py"
             log_file = temp / "menu-server.log"
             args_file = temp / "litellm-args.txt"
+            proxy_flag_file = temp / "proxy-process-flag.txt"
             fake_litellm = temp / "litellm"
             runtime_dir.mkdir()
             callback_dir.mkdir()
@@ -352,7 +526,8 @@ class ControlAutoStartTests(unittest.TestCase):
             runtime_config.write_text("model_list: []\n", encoding="utf-8")
             callback_source.write_text("# test callback\n", encoding="utf-8")
             fake_litellm.write_text(
-                f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(args_file))}\n",
+                f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(args_file))}\n"
+                f"printf '%s\\n' \"${{LITELLM_MENU_PROXY_PROCESS:-}}\" > {shlex.quote(str(proxy_flag_file))}\n",
                 encoding="utf-8",
             )
             fake_litellm.chmod(fake_litellm.stat().st_mode | stat.S_IXUSR)
@@ -420,6 +595,7 @@ class ControlAutoStartTests(unittest.TestCase):
             self.assertIn("--max_requests_before_restart", args)
             index = args.index("--max_requests_before_restart")
             self.assertEqual(args[index + 1], "37")
+            self.assertEqual(proxy_flag_file.read_text(encoding="utf-8").strip(), "1")
 
     def test_port_release_wait_forces_after_configured_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

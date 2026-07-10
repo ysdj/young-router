@@ -141,35 +141,16 @@ def _model_to_editor(
             "provider",
             MENU_ROUTE_KEY,
             MENU_API_KEY_NAME_KEY,
-            *LEGACY_CONTEXT_METADATA_KEYS,
             "supports_responses_image_generation_tool",
-            "supports_responses_endpoint",
             UPSTREAM_URL_SURFACE_KEY,
             SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
             MENU_MODEL_ENABLED_KEY,
         }
     }
-    supports_responses_endpoint = _bool_value(
-        model_info.get("supports_responses_endpoint"),
-        True,
-    )
-    upstream_url_surface = _upstream_url_surface(
-        model_info.get(UPSTREAM_URL_SURFACE_KEY),
-        supports_responses_endpoint=supports_responses_endpoint,
-    )
-    upstream_surface_present = UPSTREAM_URL_SURFACE_KEY in model_info
-    supported_surfaces_present = SUPPORTED_UPSTREAM_URL_SURFACES_KEY in model_info
     supported_upstream_url_surfaces = _upstream_url_surfaces(
-        model_info.get(SUPPORTED_UPSTREAM_URL_SURFACES_KEY),
-        upstream_url_surface,
-        include_fallback=not supported_surfaces_present,
+        model_info.get(SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
     )
-    if supported_surfaces_present:
-        supports_responses_endpoint = "openai/responses" in supported_upstream_url_surfaces
-        upstream_url_surface = _effective_upstream_url_surface(
-            supported_upstream_url_surfaces,
-            upstream_url_surface,
-        )
+    upstream_url_surface = supported_upstream_url_surfaces[0]
     entry_extra = {
         key: _jsonable(value)
         for key, value in entry.items()
@@ -200,11 +181,7 @@ def _model_to_editor(
         "supports_responses_image_generation_tool": supports_responses_image_tool,
         "supports_responses_image_generation_tool_present": supports_responses_image_tool_present,
         "upstream_url_surface": upstream_url_surface,
-        "upstream_url_surface_present": upstream_surface_present,
         "supported_upstream_url_surfaces": supported_upstream_url_surfaces,
-        "supported_upstream_url_surfaces_present": supported_surfaces_present,
-        "supports_responses_endpoint": supports_responses_endpoint,
-        "supports_responses_endpoint_present": "supports_responses_endpoint" in model_info,
         "entry_extra": entry_extra,
         "litellm_extra": litellm_extra,
         "model_info_extra": model_info_extra,

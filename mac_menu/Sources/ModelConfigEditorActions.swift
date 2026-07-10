@@ -173,26 +173,8 @@ extension ModelConfigEditorController {
         providers[providerIndex].models[modelIndex].sslVerify = ""
         providers[providerIndex].models[modelIndex].sslVerifyPresent = false
         let supportedApiModes = selectedSupportedUpstreamApiModes()
-        let originalSupportedApiModes = normalizedSupportedUpstreamApiModes(for: originalModel)
-        let apiModesChanged = Set(normalizedUpstreamApiModes(supportedApiModes)) != Set(originalSupportedApiModes)
-        if apiModesChanged {
-            providers[providerIndex].models[modelIndex].upstreamApiMode = effectiveUpstreamApiMode(
-                from: supportedApiModes,
-                fallback: originalModel.upstreamApiMode
-            )
-            providers[providerIndex].models[modelIndex].upstreamApiModePresent = true
-            providers[providerIndex].models[modelIndex].supportedUpstreamApiModes = supportedApiModes
-            providers[providerIndex].models[modelIndex].supportedUpstreamApiModesPresent = true
-            providers[providerIndex].models[modelIndex].supportsResponsesEndpoint = supportedApiModes.contains("openai/responses")
-            providers[providerIndex].models[modelIndex].supportsResponsesEndpointPresent = false
-        } else {
-            providers[providerIndex].models[modelIndex].upstreamApiMode = originalModel.upstreamApiMode
-            providers[providerIndex].models[modelIndex].upstreamApiModePresent = originalModel.upstreamApiModePresent
-            providers[providerIndex].models[modelIndex].supportedUpstreamApiModes = originalModel.supportedUpstreamApiModes
-            providers[providerIndex].models[modelIndex].supportedUpstreamApiModesPresent = originalModel.supportedUpstreamApiModesPresent
-            providers[providerIndex].models[modelIndex].supportsResponsesEndpoint = originalModel.supportsResponsesEndpoint
-            providers[providerIndex].models[modelIndex].supportsResponsesEndpointPresent = originalModel.supportsResponsesEndpointPresent
-        }
+        providers[providerIndex].models[modelIndex].upstreamApiMode = supportedApiModes[0]
+        providers[providerIndex].models[modelIndex].supportedUpstreamApiModes = supportedApiModes
         markPendingChangesIfNeeded(providers[providerIndex].models[modelIndex] != originalModel)
         if selectedProviderIndex == providerIndex {
             modelTableView.reloadData(forRowIndexes: IndexSet(integer: modelIndex), columnIndexes: IndexSet(integersIn: 0..<modelTableView.numberOfColumns))

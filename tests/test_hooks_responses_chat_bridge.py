@@ -17,7 +17,6 @@ class HookResponsesChatBridgeTests(HookTestCase):
                     "id": "chat-only",
                     "upstream_url_surface": "openai/chat",
                     "supported_upstream_url_surfaces": ["openai/chat"],
-                    "supports_responses_endpoint": False,
                 },
             }
         )
@@ -42,7 +41,6 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "provider": "backup_provider",
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat", "anthropic"],
-                "supports_responses_endpoint": False,
             },
         }
         selected_responses = {
@@ -56,6 +54,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "upstream_url_surface": "openai/responses",
                 "supported_upstream_url_surfaces": ["openai/responses"],
             },
+            "_litellm_menu_upstream_url_surface": "openai/responses",
         }
 
         self.assertIsNone(
@@ -130,8 +129,8 @@ class HookResponsesChatBridgeTests(HookTestCase):
                     "id": "chatroute",
                     "provider": "provider_chat",
                     "route_key": "provider_chat / openai/vendor-chat / key=default",
-                    "upstream_url_surface": "openai/responses",
-                    "supported_upstream_url_surfaces": ["openai/chat", "openai/responses"],
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
                 },
             )
 
@@ -648,7 +647,6 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "model_group": "chat-only-gemini",
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat"],
-                "supports_responses_endpoint": False,
             },
         )
 
@@ -667,6 +665,106 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertEqual(chunks[-1]["response"]["output_text"], "hello")
         self.assertEqual(chunks[-1]["response"]["usage"]["input_tokens"], 4)
         self.assertEqual(chunks[-1]["response"]["usage"]["output_tokens"], 2)
+
+    async def test_chat_only_bridge_preserves_codex_additional_tools_and_tool_call(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {
+                "id": "resp_tool_call",
+                "status": "completed",
+                "output_text": "我先检查一下。",
+                "output": [
+                    {
+                        "id": "msg_intro",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "我先检查一下。",
+                                "annotations": [],
+                            }
+                        ],
+                    },
+                    {
+                        "id": "call_exec",
+                        "call_id": "call_exec",
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": '{"input":"pwd"}',
+                        "status": "completed",
+                    },
+                ],
+            }
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="chat-only-model",
+            input=[
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec_command",
+                            "description": "Run a local command.",
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Inspect the workspace."},
+            ],
+            stream=True,
+            model_info={
+                "id": "chat-only-route",
+                "model_group": "chat-only-model",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["use_chat_completions_api"])
+        self.assertTrue(calls[0]["stream"])
+        self.assertEqual(
+            calls[0]["tools"][0]["name"],
+            "exec_command",
+        )
+        self.assertTrue(
+            calls[0]["tools"][0][hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY]
+        )
+        self.assertNotIn(
+            "additional_tools",
+            json.dumps(calls[0]["input"], ensure_ascii=False),
+        )
+        self.assertEqual(
+            calls[0]["litellm_metadata"]["responses_chat_bridge_input_sanitized"],
+            {
+                "changed": True,
+                "dropped_tool_search_items": 0,
+                "dropped_additional_tools_items": 1,
+            },
+        )
+
+        dumped = hooks._normalize_response_tool_search_output(
+            hooks._jsonable(response),
+            custom_tool_names={"exec_command"},
+        )
+        self.assertEqual(dumped["output_text"], "我先检查一下。")
+        tool_call = next(
+            item
+            for item in dumped["output"]
+            if item.get("type") == "custom_tool_call"
+        )
+        self.assertEqual(tool_call["name"], "exec_command")
+        self.assertEqual(tool_call["input"], "pwd")
 
     async def test_direct_chat_bridge_stream_error_after_text_yields_failed_event(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -696,7 +794,6 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "model_group": "chat-only-gemini",
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat"],
-                "supports_responses_endpoint": False,
             },
         )
 

@@ -94,7 +94,6 @@ _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY = (
     "_browser_compatible_headers_retry"
 )
 _RESPONSES_IMAGE_INPUT_SUPPORT_KEY = "supports_responses_image_input"
-_RESPONSES_ENDPOINT_SUPPORT_KEY = "supports_responses_endpoint"
 _UPSTREAM_URL_SURFACE_KEY = "upstream_url_surface"
 _SUPPORTED_UPSTREAM_URL_SURFACES_KEY = "supported_upstream_url_surfaces"
 _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES = "openai/responses"
@@ -104,11 +103,17 @@ _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES = {
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
 }
-_UPSTREAM_URL_SURFACE_PREFERENCE = (
+_UPSTREAM_URL_SURFACES = {
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
+}
+_CURRENT_UPSTREAM_URL_SURFACE_KEY = "_litellm_menu_upstream_url_surface"
+_ATTEMPTED_UPSTREAM_URL_SURFACES_KEY = "_litellm_menu_attempted_upstream_url_surfaces"
+_UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY = (
+    "_litellm_menu_upstream_url_surface_deployment_id"
 )
+_SURFACE_TARGET_DEPLOYMENT_ID_KEY = "_litellm_menu_surface_target_deployment_id"
 _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY = (
     "responses_chat_bridge_preemptive"
 )
@@ -309,6 +314,14 @@ _CURRENT_SELECTED_DEPLOYMENT_BOX = contextvars.ContextVar(
 )
 _CURRENT_EXCLUDED_DEPLOYMENT_IDS = contextvars.ContextVar(
     "current_excluded_deployment_ids",
+    default=None,
+)
+_CURRENT_SURFACE_TARGET_DEPLOYMENT_ID = contextvars.ContextVar(
+    "current_surface_target_deployment_id",
+    default=None,
+)
+_CURRENT_DEPLOYMENT_COOLDOWN_SURFACE = contextvars.ContextVar(
+    "current_deployment_cooldown_surface",
     default=None,
 )
 _OMIT_RESPONSE_VALUE = object()
