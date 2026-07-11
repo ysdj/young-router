@@ -137,6 +137,402 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertEqual(len(calls), 1)
         self.assertNotIn("use_chat_completions_api", calls[0])
 
+    async def test_unknown_client_tools_retry_with_function_bridge_after_native_error(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        class UnsupportedClientTool(Exception):
+            status_code = 400
+
+        error = UnsupportedClientTool(
+            "Invalid tool type 'namespace': supported values are function."
+        )
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise error
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="balanced-chat",
+            input="use a browser",
+            stream=True,
+            tools=[
+                {"type": "custom", "name": "apply_patch"},
+                {
+                    "type": "namespace",
+                    "name": "browser",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "open_page",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                },
+            ],
+            model_info={
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            [tool["type"] for tool in calls[0]["tools"]],
+            ["custom", "namespace"],
+        )
+        self.assertNotIn(
+            hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
+            calls[0].get("litellm_metadata", {}),
+        )
+        self.assertEqual(
+            [tool["name"] for tool in calls[1]["tools"]],
+            ["apply_patch", "open_page"],
+        )
+        self.assertFalse(calls[1]["parallel_tool_calls"])
+        metadata = calls[1]["litellm_metadata"]
+        self.assertTrue(metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY])
+        self.assertEqual(
+            metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY],
+            "native_client_tools_unsupported",
+        )
+        self.assertTrue(
+            metadata["responses_function_tool_bridge_native_error_fallback"]
+        )
+        self.assertNotIn(
+            hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
+            metadata,
+        )
+
+    async def test_unknown_route_lifts_leading_additional_tools_for_native_attempt(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        original_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Edit files.",
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "browser",
+                        "description": "Browser tools.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "open_page",
+                                "parameters": {"type": "object"},
+                            }
+                        ],
+                    },
+                ],
+            },
+            {"role": "user", "content": "Use a tool."},
+        ]
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="balanced-chat",
+            input=original_input,
+            stream=True,
+            tools=[{"type": "image_generation"}],
+            model_info={
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [tool["type"] for tool in calls[0]["tools"]],
+            ["image_generation", "custom", "namespace"],
+        )
+        self.assertEqual(calls[0]["input"], original_input[1:])
+        self.assertEqual(calls[0]["extra_body"]["tools"], calls[0]["tools"])
+        self.assertEqual(original_input[0]["type"], "additional_tools")
+        metadata = calls[0]["litellm_metadata"]
+        self.assertEqual(
+            metadata[
+                hooks._RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY
+            ],
+            {
+                "tool_count": 3,
+                "lifted_additional_tools_items": 1,
+                "lifted_tool_count": 2,
+            },
+        )
+        self.assertNotIn(
+            hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
+            metadata,
+        )
+
+    async def test_unknown_route_preserves_controls_while_lifting_only_additional_tools(
+        self,
+    ) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        original_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Edit files.",
+                    }
+                ],
+            },
+            {"role": "user", "content": "Use apply_patch exactly once."},
+        ]
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="balanced-chat",
+            input=original_input,
+            tools=[],
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            parallel_tool_calls=False,
+            model_info={
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"], original_input[1:])
+        self.assertEqual(calls[0]["tools"], [original_input[0]["tools"][0]])
+        self.assertEqual(calls[0]["extra_body"]["tools"], calls[0]["tools"])
+        self.assertEqual(
+            calls[0]["tool_choice"],
+            {"type": "custom", "name": "apply_patch"},
+        )
+        self.assertFalse(calls[0]["parallel_tool_calls"])
+        self.assertEqual(original_input[0]["type"], "additional_tools")
+
+    async def test_lifted_native_tools_retry_with_sanitized_function_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        class UnsupportedClientTool(Exception):
+            status_code = 400
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise UnsupportedClientTool(
+                    "Invalid tool type 'namespace': supported values are function."
+                )
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="balanced-chat",
+            input=[
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {"type": "custom", "name": "apply_patch"},
+                        {
+                            "type": "namespace",
+                            "name": "browser",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "open_page",
+                                    "parameters": {"type": "object"},
+                                }
+                            ],
+                        },
+                    ],
+                },
+                {"role": "user", "content": "Use a tool."},
+            ],
+            stream=True,
+            tools=[],
+            model_info={
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            [tool["type"] for tool in calls[0]["tools"]],
+            ["custom", "namespace"],
+        )
+        self.assertEqual(
+            [tool["type"] for tool in calls[1]["tools"]],
+            ["function", "function"],
+        )
+        self.assertEqual(calls[1]["extra_body"]["tools"], calls[1]["tools"])
+        self.assertFalse(calls[1]["parallel_tool_calls"])
+        self.assertEqual(
+            calls[1]["litellm_metadata"][
+                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY
+            ],
+            "native_client_tools_unsupported",
+        )
+
+    async def test_unknown_client_tools_preserve_explicit_parallel_on_native_error(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        class UnsupportedClientTool(Exception):
+            status_code = 422
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise UnsupportedClientTool(
+                    "Unsupported tool type: custom tool."
+                )
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="balanced-chat",
+            input="edit",
+            tools=[{"type": "custom", "name": "apply_patch"}],
+            parallel_tool_calls=True,
+            model_info={
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[1]["parallel_tool_calls"])
+
+    async def test_client_tool_schema_union_error_uses_function_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        class InvalidClientToolSchema(Exception):
+            status_code = 400
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise InvalidClientToolSchema(
+                    "Invalid Responses API request: invalid_union at tools.0.type "
+                    "for namespace."
+                )
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="balanced-chat",
+            input="use tools",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "browser",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "open_page",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                }
+            ],
+            model_info={
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["tools"][0]["type"], "function")
+
+    async def test_client_tool_auth_and_generic_errors_do_not_function_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+
+        class NativeError(Exception):
+            status_code = 400
+
+        for error in (
+            NativeError("Authentication failed for namespace tool request"),
+            NativeError("Invalid request: malformed input"),
+            ConnectionError("Connection refused while sending namespace tool"),
+        ):
+            calls = []
+
+            async def original_generic_function(**kwargs):
+                calls.append(kwargs)
+                raise error
+
+            request_kwargs = {"original_generic_function": original_generic_function}
+            hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+            with self.assertRaises(type(error)):
+                await request_kwargs["original_generic_function"](
+                    call_type="aresponses",
+                    model="balanced-chat",
+                    input="use tools",
+                    tools=[
+                        {
+                            "type": "namespace",
+                            "name": "browser",
+                            "tools": [],
+                        }
+                    ],
+                    model_info={
+                        "id": "third-party-responses",
+                        "provider": "third-party",
+                        "upstream_url_surface": "openai/responses",
+                    },
+                )
+
+            self.assertEqual(len(calls), 1)
+
     async def test_function_tool_bridge_schema_error_retries_with_chat_bridge(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
@@ -215,6 +611,8 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "id": "provider_beta-generic-chat",
                 "provider": "provider_beta",
                 "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
                 "supported_upstream_url_surfaces": ["openai/responses"],
             },
         )
@@ -535,6 +933,8 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "id": "provider_beta-generic-chat",
                 "provider": "provider_beta",
                 "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
             },
         )
 

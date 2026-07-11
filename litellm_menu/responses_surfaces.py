@@ -19,8 +19,10 @@ from .base import (
     _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
+    _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
+    _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY,
     _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
     _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY,
     _SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY,
@@ -33,9 +35,22 @@ from .base import (
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
+    copy,
     inspect,
     litellm,
 )
+
+
+def _sync_bridge_extra_body_tools(request_kwargs: dict, tools: list[dict]) -> None:
+    existing_extra_body = request_kwargs.get("extra_body")
+    if not isinstance(existing_extra_body, dict) or "tools" not in existing_extra_body:
+        return
+    updated_extra_body = existing_extra_body.copy()
+    if tools:
+        updated_extra_body["tools"] = copy.deepcopy(tools)
+    else:
+        updated_extra_body.pop("tools", None)
+    request_kwargs["extra_body"] = updated_extra_body
 
 
 def _with_responses_chat_bridge_compatible_tools(
@@ -81,6 +96,7 @@ def _with_responses_chat_bridge_compatible_tools(
         retry_kwargs["web_search_options"] = web_search_options
     if sanitized_tools:
         retry_kwargs["tools"] = sanitized_tools
+        _sync_bridge_extra_body_tools(retry_kwargs, sanitized_tools)
         kept_tool_names = {
             tool["name"]
             for tool in sanitized_tools
@@ -96,6 +112,7 @@ def _with_responses_chat_bridge_compatible_tools(
     retry_kwargs.pop("tools", None)
     retry_kwargs.pop("tool_choice", None)
     retry_kwargs.pop("parallel_tool_calls", None)
+    _sync_bridge_extra_body_tools(retry_kwargs, [])
 
 
 def _with_responses_function_tool_bridge_compatible_tools(
@@ -149,6 +166,18 @@ def _with_responses_function_tool_bridge_compatible_tools(
         bridge_kwargs["web_search_options"] = web_search_options
     if sanitized_tools:
         bridge_kwargs["tools"] = sanitized_tools
+        _sync_bridge_extra_body_tools(bridge_kwargs, sanitized_tools)
+        if (
+            not isinstance(bridge_kwargs.get("parallel_tool_calls"), bool)
+            and (
+                stats.get("bridged_namespace_tools")
+                or stats.get("bridged_custom_tools")
+            )
+        ):
+            bridge_kwargs["parallel_tool_calls"] = False
+            bridge_metadata[
+                "responses_function_tool_bridge_parallel_tool_calls_defaulted"
+            ] = False
         kept_tool_names = {
             tool["name"]
             for tool in sanitized_tools
@@ -172,6 +201,7 @@ def _with_responses_function_tool_bridge_compatible_tools(
     bridge_kwargs.pop("tools", None)
     bridge_kwargs.pop("tool_choice", None)
     bridge_kwargs.pop("parallel_tool_calls", None)
+    _sync_bridge_extra_body_tools(bridge_kwargs, [])
 
 
 def _responses_chat_bridge_retry_kwargs(
@@ -453,17 +483,33 @@ def _request_should_bridge_responses_web_search(
     return True
 
 
-def _request_supports_native_responses_client_tools(
+def _request_should_try_native_responses_client_tools(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
+    return (
+        _request_responses_client_tool_support(
+            request_kwargs,
+            outer_request_kwargs,
+        )
+        is not False
+    )
+
+
+def _request_responses_client_tool_support(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> Optional[bool]:
     for request in (request_kwargs, outer_request_kwargs):
         model_info = _image_generation_module._request_model_info(request)
-        if model_info.get(_SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY) is True:
-            return True
+        configured_support = model_info.get(
+            _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY
+        )
+        if isinstance(configured_support, bool):
+            return configured_support
         if _request_is_direct_openai_route(request):
             return True
-    return False
+    return None
 
 
 def _request_supports_responses_function_tools(
@@ -472,8 +518,11 @@ def _request_supports_responses_function_tools(
 ) -> bool:
     for request in (request_kwargs, outer_request_kwargs):
         model_info = _image_generation_module._request_model_info(request)
-        if model_info.get(_SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY) is True:
-            return True
+        configured_support = model_info.get(
+            _SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY
+        )
+        if isinstance(configured_support, bool):
+            return configured_support
         if _request_uses_responses_endpoint(request):
             return True
     return False
@@ -530,6 +579,111 @@ def _request_has_responses_function_tool_bridge_attempt(
             if metadata.get(_RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY) is True:
                 return True
     return False
+
+
+def _with_responses_native_client_tool_passthrough(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> Optional[dict]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    if not _image_generation_module._request_is_responses_api(request_kwargs):
+        return None
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return None
+    if _image_generation_module._request_is_codex_compaction(request_kwargs):
+        return None
+    if not _request_uses_responses_endpoint(request_kwargs):
+        return None
+    if _request_has_responses_function_tool_bridge_attempt(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+
+    support = _request_responses_client_tool_support(
+        request_kwargs,
+        outer_request_kwargs,
+    )
+    if support is False or _request_is_direct_openai_route(request_kwargs):
+        return None
+
+    input_value = request_kwargs.get("input")
+    lifted_items = 0
+    lifted_tools: list[dict] = []
+    if support is None and isinstance(input_value, list):
+        for item in input_value:
+            if not isinstance(item, dict) or item.get("type") != "additional_tools":
+                break
+            item_tools = item.get("tools")
+            if not isinstance(item_tools, list):
+                break
+            lifted_items += 1
+            lifted_tools.extend(
+                copy.deepcopy(tool)
+                for tool in item_tools
+                if isinstance(tool, dict)
+            )
+        if lifted_items >= len(input_value):
+            lifted_items = 0
+            lifted_tools = []
+
+    request_tools = request_kwargs.get("tools")
+    merged_tools = copy.deepcopy(request_tools) if isinstance(request_tools, list) else []
+    for tool in lifted_tools:
+        if tool not in merged_tools:
+            merged_tools.append(tool)
+
+    has_client_tool = bool(lifted_tools) or any(
+        isinstance(tool, dict)
+        and tool.get("type") in {"namespace", "custom", "tool_search"}
+        for tool in merged_tools
+    )
+    if not has_client_tool or not merged_tools:
+        return None
+
+    modified_kwargs = request_kwargs.copy()
+    if lifted_items:
+        modified_kwargs["input"] = input_value[lifted_items:]
+        modified_kwargs["tools"] = merged_tools
+
+    existing_extra_body = request_kwargs.get("extra_body")
+    extra_body = (
+        existing_extra_body.copy()
+        if isinstance(existing_extra_body, dict)
+        else {}
+    )
+    if extra_body.get("tools") != merged_tools:
+        extra_body["tools"] = copy.deepcopy(merged_tools)
+    modified_kwargs["extra_body"] = extra_body
+
+    litellm_metadata = (
+        _image_generation_module._request_metadata_dict(
+            request_kwargs,
+            "litellm_metadata",
+        )
+        or {}
+    )
+    passthrough_metadata = {
+        "tool_count": len(merged_tools),
+        "lifted_additional_tools_items": lifted_items,
+        "lifted_tool_count": len(lifted_tools),
+    }
+    if (
+        extra_body == existing_extra_body
+        and not lifted_items
+        and litellm_metadata.get(
+            _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY
+        )
+        == passthrough_metadata
+    ):
+        return None
+    updated_metadata = litellm_metadata.copy()
+    updated_metadata[
+        _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY
+    ] = passthrough_metadata
+    modified_kwargs["litellm_metadata"] = updated_metadata
+    return modified_kwargs
 
 
 def _responses_external_web_search_bridge_kwargs(
@@ -789,7 +943,7 @@ def _responses_function_tool_bridge_preemptive_reason(
         outer_for_tool_reason,
     ):
         return None
-    if _request_supports_native_responses_client_tools(
+    if _request_should_try_native_responses_client_tools(
         request_kwargs,
         outer_for_tool_reason,
     ):
@@ -854,6 +1008,198 @@ def _responses_function_tool_bridge_preemptive_kwargs(
         bridge_metadata["responses_function_tool_bridge_input_sanitized"] = (
             input_stats
         )
+    bridge_kwargs["litellm_metadata"] = bridge_metadata
+    return bridge_kwargs
+
+
+def _request_has_responses_client_tools_requiring_bridge(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    for request in (request_kwargs, outer_request_kwargs):
+        if not isinstance(request, dict):
+            continue
+        tools = request.get("tools")
+        candidates = list(tools) if isinstance(tools, list) else []
+        candidates.extend(
+            _responses_tools_module._responses_input_tool_search_output_tools(
+                request.get("input")
+            )
+        )
+        candidates.extend(
+            _responses_tools_module._responses_input_additional_tools(
+                request.get("input")
+            )
+        )
+        if any(
+            isinstance(tool, dict)
+            and tool.get("type") in {"namespace", "custom", "tool_search"}
+            for tool in candidates
+        ):
+            return True
+    return False
+
+
+def _native_responses_client_tools_unsupported_error(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    if _routing_module._exception_status_code(exception) not in {400, 422}:
+        return False
+    if _routing_module._is_terminal_prompt_or_policy_error(exception):
+        return False
+    if not _request_has_responses_client_tools_requiring_bridge(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return False
+
+    text = _routing_module._exception_text(exception)
+    if not text:
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "authentication",
+            "api key",
+            "unauthorized",
+            "permission denied",
+            "insufficient_quota",
+            "insufficient quota",
+            "quota exceeded",
+            "rate limit",
+            "too many requests",
+            "billing",
+            "connection error",
+            "connection refused",
+            "network error",
+            "timed out",
+            "timeout",
+        )
+    ):
+        return False
+
+    has_client_tool_marker = any(
+        marker in text
+        for marker in (
+            "namespace",
+            "tool_search",
+            "tool search",
+            "additional_tools",
+            "additional tools",
+            "custom tool",
+            '"custom"',
+            "'custom'",
+            "`custom`",
+            "type=custom",
+            "type: custom",
+        )
+    )
+    if not has_client_tool_marker:
+        return False
+
+    return any(
+        marker in text
+        for marker in (
+            "unsupported tool",
+            "unsupported tool type",
+            "tool type is unsupported",
+            "tool type is not supported",
+            "tool type not supported",
+            "tool is not supported",
+            "tools are not supported",
+            "does not support tool",
+            "doesn't support tool",
+            "unknown tool",
+            "unrecognized tool",
+            "invalid tool",
+            "invalid tool type",
+            "invalid_union",
+            "invalid_type",
+            "invalid value",
+            "invalid_value",
+            "literal_error",
+            "expected one of",
+            "must be one of",
+            "should be one of",
+            "supported values",
+            "allowed values",
+            "extra_forbidden",
+            "extra inputs are not permitted",
+        )
+    )
+
+
+def _responses_function_tool_bridge_retry_kwargs(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> Optional[dict]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    if not _image_generation_module._request_is_responses_api(request_kwargs):
+        return None
+    if _image_generation_module._request_is_codex_compaction(request_kwargs):
+        return None
+    if _request_has_responses_function_tool_bridge_attempt(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+    if not _request_supports_responses_function_tools(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+    if not _native_responses_client_tools_unsupported_error(
+        exception,
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+    if _computer_facade_module._request_hosted_browser_computer_blocks_chat_bridge(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+
+    bridge_kwargs = request_kwargs.copy()
+    litellm_metadata = (
+        _image_generation_module._request_metadata_dict(
+            bridge_kwargs,
+            "litellm_metadata",
+        )
+        or {}
+    )
+    bridge_metadata = litellm_metadata.copy()
+    bridge_metadata[_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY] = True
+    bridge_metadata[_RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY] = (
+        "native_client_tools_unsupported"
+    )
+    bridge_metadata[
+        "responses_function_tool_bridge_native_error_fallback"
+    ] = True
+    _responses_execution_module._remember_responses_chat_bridge_model_group(
+        bridge_metadata,
+        request_kwargs,
+        outer_request_kwargs,
+    )
+    _with_responses_function_tool_bridge_compatible_tools(
+        bridge_kwargs,
+        bridge_metadata,
+        outer_request_kwargs,
+    )
+    bridge_input, input_stats = (
+        _responses_tools_module._responses_chat_bridge_input(
+            bridge_kwargs.get("input")
+        )
+    )
+    if input_stats.get("changed"):
+        bridge_kwargs["input"] = bridge_input
+        bridge_metadata[
+            "responses_function_tool_bridge_input_sanitized"
+        ] = input_stats
     bridge_kwargs["litellm_metadata"] = bridge_metadata
     return bridge_kwargs
 

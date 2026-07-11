@@ -972,7 +972,10 @@ def _with_empty_tool_controls_removed(request_kwargs: dict) -> Optional[dict]:
         return None
 
     tools = request_kwargs.get("tools")
-    if isinstance(tools, list) and tools:
+    if (
+        (isinstance(tools, list) and tools)
+        or _request_has_leading_responses_additional_tools(request_kwargs)
+    ):
         return None
 
     modified_kwargs = request_kwargs.copy()
@@ -985,6 +988,31 @@ def _with_empty_tool_controls_removed(request_kwargs: dict) -> Optional[dict]:
             modified_kwargs.pop(key, None)
             changed = True
     return modified_kwargs if changed else None
+
+
+def _request_has_leading_responses_additional_tools(
+    request_kwargs: Optional[dict],
+) -> bool:
+    """Keep Responses tool controls until leading Codex tools are promoted.
+
+    Codex may carry its client tools in one or more leading
+    ``input: [{"type": "additional_tools", ...}]`` items while the
+    top-level ``tools`` array is empty.  Those tools are promoted later by the
+    Responses compatibility layer.  Treating the top-level array as empty
+    before that promotion drops a valid custom ``tool_choice`` and its
+    ``parallel_tool_calls`` setting.
+    """
+    if not isinstance(request_kwargs, dict):
+        return False
+    input_value = request_kwargs.get("input")
+    if not isinstance(input_value, list):
+        return False
+    for item in input_value:
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            break
+        if isinstance(item.get("tools"), list) and item["tools"]:
+            return True
+    return False
 
 
 def _positive_int_value(value: Any) -> Optional[int]:

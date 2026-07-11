@@ -88,6 +88,8 @@ class HookStreamingFailoverTests(HookTestCase):
             "model_info": {
                 "id": "third-party-responses",
                 "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
                 "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
             },
         }
@@ -119,6 +121,8 @@ class HookStreamingFailoverTests(HookTestCase):
                 "id": "third-party-responses",
                 "provider": "third-party",
                 "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
                 "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
             },
         }
@@ -164,6 +168,8 @@ class HookStreamingFailoverTests(HookTestCase):
                     "id": "third-party-responses",
                     "provider": "third-party",
                     "upstream_url_surface": "openai/responses",
+                    "supports_responses_client_tools": False,
+                    "supports_responses_function_tools": True,
                     "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
                 },
             )

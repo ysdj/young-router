@@ -226,6 +226,8 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 "provider": "provider_beta",
                 "route_key": "provider_beta / openai/vendor-chat / key=default",
                 "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
                 "supports_responses_web_search": False,
                 "supported_upstream_url_surfaces": [
                     "openai/chat",
@@ -267,8 +269,14 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertIsNotNone(responses_bridge_kwargs)
         assert responses_bridge_kwargs is not None
         self.assertNotIn("use_chat_completions_api", responses_bridge_kwargs)
+        self.assertFalse(responses_bridge_kwargs["parallel_tool_calls"])
         metadata = responses_bridge_kwargs["litellm_metadata"]
         self.assertTrue(metadata[hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY])
+        self.assertFalse(
+            metadata[
+                "responses_function_tool_bridge_parallel_tool_calls_defaulted"
+            ]
+        )
         self.assertEqual(
             metadata["responses_function_tool_bridge_preemptive_reason"],
             "client_tools_need_responses_function_bridge",
@@ -298,6 +306,103 @@ class HookResponsesToolBridgeTests(HookTestCase):
             include_client_tool_unsupported=True,
         )
         self.assertIsNone(preemptive_chat_kwargs)
+
+    def test_responses_function_tool_bridge_preserves_explicit_parallel_tool_calls(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": "use tools",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "browser",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "open_page",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                }
+            ],
+            "parallel_tool_calls": True,
+            "model_info": {
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
+            },
+        }
+
+        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+            request_kwargs
+        )
+
+        self.assertIsNotNone(bridge_kwargs)
+        assert bridge_kwargs is not None
+        self.assertTrue(bridge_kwargs["parallel_tool_calls"])
+        self.assertNotIn(
+            "responses_function_tool_bridge_parallel_tool_calls_defaulted",
+            bridge_kwargs["litellm_metadata"],
+        )
+
+    def test_unknown_client_tool_support_does_not_preemptively_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": "use tools",
+            "tools": [
+                {"type": "custom", "name": "apply_patch"},
+                {"type": "tool_search"},
+                {
+                    "type": "namespace",
+                    "name": "browser",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "open_page",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                },
+            ],
+            "model_info": {
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        }
+
+        self.assertIsNone(
+            hooks._responses_function_tool_bridge_preemptive_kwargs(
+                request_kwargs
+            )
+        )
+
+    def test_explicit_function_tool_unsupported_disables_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": "use tools",
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+            "model_info": {
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": False,
+            },
+        }
+
+        self.assertIsNone(
+            hooks._responses_function_tool_bridge_preemptive_kwargs(
+                request_kwargs
+            )
+        )
 
     def test_explicit_client_tool_support_does_not_preemptively_chat_bridge(self) -> None:
         hooks, _ = load_hook_module()

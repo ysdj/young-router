@@ -86,6 +86,14 @@ class LiteLLMMenuHook(CustomLogger):
                 continue
             modified_kwargs = updated_kwargs
             changed = True
+        native_client_tool_kwargs = (
+            _responses_surfaces_module._with_responses_native_client_tool_passthrough(
+                modified_kwargs
+            )
+        )
+        if native_client_tool_kwargs is not None:
+            modified_kwargs = native_client_tool_kwargs
+            changed = True
         return modified_kwargs if changed else None
 
     async def async_filter_deployments(

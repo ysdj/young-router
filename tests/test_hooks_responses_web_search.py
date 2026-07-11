@@ -298,6 +298,8 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                 "provider": "provider_beta",
                 "route_key": "provider_beta / openai/balanced-chat / key=default",
                 "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
             },
         )
 
@@ -390,6 +392,8 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                 "provider": "provider_beta",
                 "route_key": "provider_beta / openai/vendor-chat / key=default",
                 "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
                 "supports_responses_web_search": True,
             },
         )

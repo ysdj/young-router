@@ -168,6 +168,12 @@ _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY = (
 _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY = (
     "responses_function_tool_bridge_preemptive"
 )
+_RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY = (
+    "responses_function_tool_bridge_fallback_reason"
+)
+_RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY = (
+    "responses_native_client_tool_passthrough"
+)
 _TOOL_SEARCH_BRIDGE_FUNCTION_NAME = "tool_search"
 _WEB_SEARCH_BRIDGE_FUNCTION_NAME = "_litellm_web_search"
 _RESPONSES_BRIDGE_NAMESPACE_KEY = "x-litellm-menu-responses-namespace"

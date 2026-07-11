@@ -16,6 +16,7 @@ from .base import (
     _GENERIC_HELPER_PATCH_ATTR,
     _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
+    _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
     inspect,
@@ -719,6 +720,9 @@ async def _execute_responses_function_tool_bridge_call(
         preemptive_reason=bridge_metadata.get(
             "responses_function_tool_bridge_preemptive_reason"
         ),
+        fallback_reason=bridge_metadata.get(
+            _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY
+        ),
     )
 
     async def execute_once(active_bridge_kwargs: dict) -> Any:
@@ -789,6 +793,9 @@ async def _execute_responses_function_tool_bridge_call(
             preemptive_reason=bridge_metadata.get(
                 "responses_function_tool_bridge_preemptive_reason"
             ),
+            fallback_reason=bridge_metadata.get(
+                _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY
+            ),
         )
         if exc is original_exc:
             raise
@@ -811,6 +818,14 @@ def _wrap_generic_function_for_deployment_failover(
             updated_kwargs = update_request(kwargs)
             if updated_kwargs is not None:
                 kwargs = updated_kwargs
+        native_client_tool_kwargs = (
+            _responses_surfaces_module._with_responses_native_client_tool_passthrough(
+                kwargs,
+                outer_request_kwargs,
+            )
+        )
+        if native_client_tool_kwargs is not None:
+            kwargs = native_client_tool_kwargs
         responses_function_bridge_kwargs = (
             _responses_surfaces_module._responses_function_tool_bridge_preemptive_kwargs(
                 kwargs,
@@ -926,6 +941,20 @@ def _wrap_generic_function_for_deployment_failover(
                 original_function,
             )
         except Exception as exc:
+            responses_function_bridge_retry_kwargs = (
+                _responses_surfaces_module._responses_function_tool_bridge_retry_kwargs(
+                    exc,
+                    kwargs,
+                    outer_request_kwargs,
+                )
+            )
+            if responses_function_bridge_retry_kwargs is not None:
+                return await _execute_responses_function_tool_bridge_call(
+                    original_function,
+                    responses_function_bridge_retry_kwargs,
+                    original_request_kwargs=kwargs,
+                    outer_request_kwargs=outer_request_kwargs,
+                )
             if _routing_module._is_current_upstream_surface_incompatible_error(
                 exc,
                 kwargs,
