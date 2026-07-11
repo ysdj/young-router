@@ -3,13 +3,13 @@ import Cocoa
 extension ModelConfigEditorController {
     func buildWindow() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1220, height: 700),
+            contentRect: NSRect(x: 0, y: 0, width: 1160, height: 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Edit LiteLLM Providers & Models"
-        window.minSize = NSSize(width: 1220, height: 700)
+        window.minSize = NSSize(width: 1160, height: 700)
         window.animationBehavior = .none
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -130,14 +130,16 @@ extension ModelConfigEditorController {
 
         let formStack = NSStackView()
         formStack.orientation = .vertical
-        formStack.spacing = 12
+        formStack.spacing = 8
         formStack.alignment = .leading
-        formStack.widthAnchor.constraint(equalToConstant: 560).isActive = true
+        formStack.widthAnchor.constraint(equalToConstant: 500).isActive = true
         mainStack.addArrangedSubview(formStack)
 
         let detailPane = NSView()
-        detailPane.widthAnchor.constraint(equalToConstant: 560).isActive = true
-        detailPane.heightAnchor.constraint(equalToConstant: 312).isActive = true
+        detailPane.widthAnchor.constraint(equalToConstant: 500).isActive = true
+        let detailHeight = detailPane.heightAnchor.constraint(equalToConstant: 312)
+        detailHeight.isActive = true
+        detailPaneHeightConstraint = detailHeight
         formStack.addArrangedSubview(detailPane)
 
         let providerSection = sectionStack(title: "Selected Provider")
@@ -153,12 +155,12 @@ extension ModelConfigEditorController {
 
         let modelSection = sectionStack(title: "Selected Model Deployment")
         let modelSectionStack = modelSection.stack
+        modelSectionStack.spacing = 6
         modelSectionStack.addArrangedSubview(modelEnabledRow())
-        modelSectionStack.addArrangedSubview(formRow("Public model", modelNameField))
-        modelSectionStack.addArrangedSubview(formRow("Provider API key", modelApiKeyPopupButton))
-        modelSectionStack.addArrangedSubview(formRow("LiteLLM adapter", adapterControlRow()))
-        modelSectionStack.addArrangedSubview(formRow("Upstream model", upstreamModelField))
-        modelSectionStack.addArrangedSubview(formRow("Route order", orderField))
+        modelSectionStack.addArrangedSubview(compactModelFormRow("Public model", modelNameField, width: 300))
+        modelSectionStack.addArrangedSubview(compactModelFormRow("API key", modelApiKeyPopupButton, width: 180))
+        modelSectionStack.addArrangedSubview(compactModelFormRow("Upstream", upstreamModelField, width: 300))
+        modelSectionStack.addArrangedSubview(compactModelFormRow("Order", orderField, width: 80))
         modelSectionStack.addArrangedSubview(upstreamApiModeRow())
         modelSection.view.translatesAutoresizingMaskIntoConstraints = false
         detailPane.addSubview(modelSection.view)
@@ -176,7 +178,7 @@ extension ModelConfigEditorController {
             modelSection.view.bottomAnchor.constraint(lessThanOrEqualTo: detailPane.bottomAnchor),
         ])
 
-        let runtimeSection = sectionStack(title: "Runtime Map")
+        let runtimeSection = sectionStack(title: "Runtime Map", titleWeight: .regular)
         configureRuntimeMapTable()
         let runtimeScroll = NSScrollView()
         runtimeScroll.borderType = .bezelBorder
@@ -186,8 +188,10 @@ extension ModelConfigEditorController {
         runtimeScroll.usesPredominantAxisScrolling = true
         runtimeScroll.verticalScrollElasticity = .none
         runtimeScroll.documentView = runtimeMapTableView
-        runtimeScroll.widthAnchor.constraint(equalToConstant: 560).isActive = true
-        runtimeScroll.heightAnchor.constraint(equalToConstant: 220).isActive = true
+        runtimeScroll.widthAnchor.constraint(equalToConstant: 500).isActive = true
+        let runtimeHeight = runtimeScroll.heightAnchor.constraint(equalToConstant: 220)
+        runtimeHeight.isActive = true
+        runtimeMapHeightConstraint = runtimeHeight
         runtimeSection.stack.addArrangedSubview(runtimeScroll)
         formStack.addArrangedSubview(runtimeSection.view)
         runtimeMapScrollView = runtimeScroll
@@ -336,7 +340,7 @@ extension ModelConfigEditorController {
         let column = NSTableColumn(identifier: runtimeMapColumnIdentifier)
         column.title = "Runtime route"
         column.resizingMask = .autoresizingMask
-        column.width = 540
+        column.width = 480
         runtimeMapTableView.addTableColumn(column)
     }
 
@@ -385,7 +389,11 @@ extension ModelConfigEditorController {
         return (stack, stack)
     }
 
-    func sectionStack(title: String, width: CGFloat = 560) -> (view: NSStackView, stack: NSStackView) {
+    func sectionStack(
+        title: String,
+        width: CGFloat = 500,
+        titleWeight: NSFont.Weight = .semibold
+    ) -> (view: NSStackView, stack: NSStackView) {
         let container = NSStackView()
         container.orientation = .vertical
         container.alignment = .leading
@@ -394,7 +402,7 @@ extension ModelConfigEditorController {
         container.widthAnchor.constraint(equalToConstant: width).isActive = true
 
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: titleWeight)
         titleLabel.textColor = .secondaryLabelColor
         container.addArrangedSubview(titleLabel)
 
@@ -413,14 +421,24 @@ extension ModelConfigEditorController {
     }
 
     func makeTextField(width: CGFloat = 430) -> NSTextField {
+        let field = makeFlexibleTextField()
+        field.widthAnchor.constraint(equalToConstant: width).isActive = true
+        return field
+    }
+
+    func makeFlexibleTextField() -> NSTextField {
         let field = NSTextField()
         field.delegate = self
         field.target = self
         field.action = #selector(textFieldAction(_:))
         field.usesSingleLineMode = true
         field.lineBreakMode = .byTruncatingMiddle
-        field.widthAnchor.constraint(equalToConstant: width).isActive = true
         return field
+    }
+
+    func setDetailLayout(modelIsSelected: Bool) {
+        detailPaneHeightConstraint?.constant = modelIsSelected ? 286 : 312
+        runtimeMapHeightConstraint?.constant = modelIsSelected ? 246 : 220
     }
 
     func makeTokenField(width: CGFloat = 430) -> NSTextField {
@@ -471,7 +489,6 @@ extension ModelConfigEditorController {
         keyFields.orientation = .vertical
         keyFields.alignment = .leading
         keyFields.spacing = 8
-        keyFields.addArrangedSubview(providerKeyEnabledCheckbox)
         keyFields.addArrangedSubview(compactFormRow("Label", providerKeyNameField))
         keyFields.addArrangedSubview(compactFormRow("Token", providerApiKeyField))
         keyRow.addArrangedSubview(keyFields)
@@ -503,16 +520,6 @@ extension ModelConfigEditorController {
         return row
     }
 
-    func adapterControlRow() -> NSStackView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .firstBaseline
-        row.spacing = 8
-        row.addArrangedSubview(adapterPopupButton)
-        row.addArrangedSubview(customAdapterField)
-        return row
-    }
-
     func modelEnabledRow() -> NSStackView {
         let row = NSStackView()
         row.orientation = .horizontal
@@ -521,12 +528,45 @@ extension ModelConfigEditorController {
         row.addArrangedSubview(enabledCheckbox)
         row.addArrangedSubview(probeModelAvailabilityButton)
         row.addArrangedSubview(spacer())
+        row.heightAnchor.constraint(equalToConstant: 24).isActive = true
         return row
+    }
+
+    func compactModelFormRow(_ title: String, _ control: NSView, width: CGFloat) -> NSStackView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .firstBaseline
+        row.spacing = 8
+        row.addArrangedSubview(modelFormLabel(title))
+        control.widthAnchor.constraint(equalToConstant: width).isActive = true
+        row.addArrangedSubview(control)
+        row.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        return row
+    }
+
+    func modelFormLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.alignment = .right
+        label.lineBreakMode = .byClipping
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        label.widthAnchor.constraint(equalToConstant: modelFormLabelWidth).isActive = true
+        return label
     }
 
     func upstreamApiModeRow() -> NSStackView {
         configureUpstreamApiModeRowsIfNeeded()
-        return upstreamApiModeStackView
+        let group = NSStackView()
+        group.orientation = .vertical
+        group.alignment = .leading
+        group.spacing = 4
+
+        let title = NSTextField(labelWithString: "Upstream API order")
+        title.textColor = .secondaryLabelColor
+        title.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        title.toolTip = "Fallback order used from LiteLLM to the upstream endpoint. This does not change the client-facing API."
+        group.addArrangedSubview(title)
+        group.addArrangedSubview(upstreamApiModeStackView)
+        return group
     }
 
     func setEditorStatus(_ message: String, color: NSColor = .secondaryLabelColor, tooltip: String? = nil) {

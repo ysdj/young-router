@@ -23,6 +23,11 @@ if [[ -z "$UV_BIN" || ! -x "$UV_BIN" ]]; then
   exit 1
 fi
 
+if [[ ! -s "$ROOT/LITELLM_VERSION" ]]; then
+  echo "Missing or empty LiteLLM version lock: $ROOT/LITELLM_VERSION" >&2
+  exit 1
+fi
+
 if [[ ! -f "$ICON" || "$ICON_GENERATOR" -nt "$ICON" ]]; then
   /usr/bin/swift "$ICON_GENERATOR" "$ICON"
 fi
@@ -52,6 +57,7 @@ for file in \
   config.example.yaml \
   VERSION \
   BUILD_NUMBER \
+  LITELLM_VERSION \
   scripts/smoke_websearch.py \
   scripts/smoke_responses_tool_bridge_compare.py
 do

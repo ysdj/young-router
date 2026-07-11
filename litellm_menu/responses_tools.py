@@ -119,6 +119,13 @@ def _responses_bridge_tool_description(tool: dict, namespace: Optional[str] = No
             "Use this local shell tool to inspect repository files, list paths, "
             "search text, and run project commands."
         )
+    elif tool_name == "exec" and tool.get("type") == "custom":
+        notes.append(
+            "The raw input to this tool must be executable JavaScript for the "
+            "code-mode runtime. Never pass a bare *** Begin Patch block as the "
+            "tool input. Apply patches from JavaScript with "
+            "text(await tools.apply_patch(patchText))."
+        )
     elif tool_name == "write_stdin":
         notes.append("Use this only to continue a running exec_command session.")
     elif tool_name == "apply_patch":

@@ -118,7 +118,7 @@ extension ModelConfigEditorController {
             let keyIndex = target.key
             let oldName = providers[providerIndex].apiKeys[keyIndex].name
             let newName = providerKeyNameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            providers[providerIndex].apiKeys[keyIndex].enabled = providerKeyEnabledCheckbox.state == .on
+            providers[providerIndex].apiKeys[keyIndex].enabled = true
             providers[providerIndex].apiKeys[keyIndex].name = newName
             providers[providerIndex].apiKeys[keyIndex].value = providerApiKeyField.stringValue
             if oldName != newName {
@@ -166,15 +166,19 @@ extension ModelConfigEditorController {
         if let key = normalizedProviderKeys(providerIndex).first(where: { $0.name == providers[providerIndex].models[modelIndex].apiKeyName }) {
             providers[providerIndex].models[modelIndex].apiKey = key.value
         }
-        providers[providerIndex].models[modelIndex].litellmModel = composedLiteLLMModel()
+        let supportedApiModes = selectedSupportedUpstreamApiModes()
+        providers[providerIndex].models[modelIndex].litellmModel = composedLiteLLMModel(
+            upstreamModel: upstreamModelField.stringValue,
+            upstreamApiMode: supportedApiModes[0]
+        )
         let order = orderField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         providers[providerIndex].models[modelIndex].order = order.isEmpty ? "1" : order
         orderField.stringValue = providers[providerIndex].models[modelIndex].order
         providers[providerIndex].models[modelIndex].sslVerify = ""
         providers[providerIndex].models[modelIndex].sslVerifyPresent = false
-        let supportedApiModes = selectedSupportedUpstreamApiModes()
         providers[providerIndex].models[modelIndex].upstreamApiMode = supportedApiModes[0]
         providers[providerIndex].models[modelIndex].supportedUpstreamApiModes = supportedApiModes
+        persistDisplayedUpstreamApiModeOrder(providerIndex: providerIndex, modelIndex: modelIndex)
         markPendingChangesIfNeeded(providers[providerIndex].models[modelIndex] != originalModel)
         if selectedProviderIndex == providerIndex {
             modelTableView.reloadData(forRowIndexes: IndexSet(integer: modelIndex), columnIndexes: IndexSet(integersIn: 0..<modelTableView.numberOfColumns))
@@ -184,46 +188,22 @@ extension ModelConfigEditorController {
         refreshRuntimeMap()
     }
 
-    var selectedAdapterIsCustom: Bool {
-        adapterPopupButton.titleOfSelectedItem == customAdapterTitle
-    }
-
-    func splitLiteLLMModel(_ value: String) -> (String, String) {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let slashIndex = trimmed.firstIndex(of: "/") else {
-            return ("", trimmed)
-        }
-        let adapter = String(trimmed[..<slashIndex])
-        let upstreamStart = trimmed.index(after: slashIndex)
-        return (adapter, String(trimmed[upstreamStart...]))
-    }
-
     func modelUpstreamPart(_ value: String) -> String {
-        splitLiteLLMModel(value).1
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let legacyResponsesPrefix = "openai/responses/"
+        if trimmed.hasPrefix(legacyResponsesPrefix) {
+            return String(trimmed.dropFirst(legacyResponsesPrefix.count))
+        }
+        guard let slashIndex = trimmed.firstIndex(of: "/") else {
+            return trimmed
+        }
+        let upstreamStart = trimmed.index(after: slashIndex)
+        return String(trimmed[upstreamStart...])
     }
 
-    func setAdapterControls(from value: String) {
-        let split = splitLiteLLMModel(value)
-        if adapterOptions.contains(split.0) {
-            adapterPopupButton.selectItem(withTitle: split.0)
-            customAdapterField.stringValue = ""
-            customAdapterField.isHidden = true
-            customAdapterField.isEnabled = false
-        } else {
-            adapterPopupButton.selectItem(withTitle: customAdapterTitle)
-            customAdapterField.stringValue = split.0
-            customAdapterField.isHidden = false
-            customAdapterField.isEnabled = enabledCheckbox.isEnabled
-        }
-    }
-
-    func composedLiteLLMModel() -> String {
-        let upstream = upstreamModelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let adapter = (selectedAdapterIsCustom ? customAdapterField.stringValue : (adapterPopupButton.titleOfSelectedItem ?? ""))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if adapter.isEmpty {
-            return upstream
-        }
+    func composedLiteLLMModel(upstreamModel: String, upstreamApiMode: String) -> String {
+        let upstream = upstreamModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let adapter = adapterName(forUpstreamApiMode: upstreamApiMode)
         if upstream.isEmpty {
             return "\(adapter)/"
         }
@@ -232,23 +212,6 @@ extension ModelConfigEditorController {
 
     func adapterName(forUpstreamApiMode mode: String) -> String {
         normalizedUpstreamApiMode(mode) == "anthropic" ? "anthropic" : "openai"
-    }
-
-    func litellmModel(_ value: String, settingAdapterFor mode: String) -> String {
-        let upstream = modelUpstreamPart(value).trimmingCharacters(in: .whitespacesAndNewlines)
-        let adapter = adapterName(forUpstreamApiMode: mode)
-        if upstream.isEmpty {
-            return "\(adapter)/"
-        }
-        return "\(adapter)/\(upstream)"
-    }
-
-    func applyAdapterControls(forUpstreamApiMode mode: String) {
-        let adapter = adapterName(forUpstreamApiMode: mode)
-        adapterPopupButton.selectItem(withTitle: adapter)
-        customAdapterField.stringValue = ""
-        customAdapterField.isHidden = true
-        customAdapterField.isEnabled = false
     }
 
     func validatedProvidersForSave() throws -> [EditableProvider] {
@@ -310,11 +273,8 @@ extension ModelConfigEditorController {
                     effectiveProviders[providerIndex].models[modelIndex].apiKeyName = firstKeyName
                     effectiveProviders[providerIndex].models[modelIndex].apiKey = effectiveProviders[providerIndex].apiKeys.first?.value ?? ""
                 }
-                let keyName = effectiveProviders[providerIndex].models[modelIndex].apiKeyName
-                let keyEnabled = effectiveProviders[providerIndex].apiKeys.first { $0.name == keyName }?.enabled ?? true
                 effectiveProviders[providerIndex].models[modelIndex].enabled =
                     effectiveProviders[providerIndex].enabled
-                    && keyEnabled
                     && effectiveProviders[providerIndex].models[modelIndex].modelEnabled
             }
         }

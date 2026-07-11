@@ -863,7 +863,7 @@ class HookStreamingToolEventTests(HookTestCase):
                             "output_index": 1,
                             "item": {
                                 "type": "function_call",
-                                "id": "call_patch",
+                                "id": "fc_patch",
                                 "call_id": "call_patch",
                                 "name": "apply_patch",
                                 "arguments": "",
@@ -872,19 +872,19 @@ class HookStreamingToolEventTests(HookTestCase):
                         },
                         {
                             "type": "response.function_call_arguments.delta",
-                            "item_id": "call_patch",
+                            "item_id": "fc_patch",
                             "output_index": 1,
                             "delta": '{"input":"*** Begin',
                         },
                         {
                             "type": "response.function_call_arguments.delta",
-                            "item_id": "call_patch",
+                            "item_id": "fc_patch",
                             "output_index": 1,
                             "delta": ' Patch\\n*** End Patch"}',
                         },
                         {
                             "type": "response.function_call_arguments.done",
-                            "item_id": "call_patch",
+                            "item_id": "fc_patch",
                             "output_index": 1,
                             "arguments": '{"input":"*** Begin Patch\\n*** End Patch"}',
                         },
@@ -924,13 +924,119 @@ class HookStreamingToolEventTests(HookTestCase):
 
         self.assertEqual(events[0]["type"], "response.output_item.added")
         self.assertEqual(events[0]["item"]["type"], "custom_tool_call")
+        self.assertEqual(events[0]["item"]["id"], "ctc_patch")
         self.assertEqual(events[1]["type"], "response.custom_tool_call_input.delta")
+        self.assertEqual(events[1]["item_id"], "ctc_patch")
         self.assertEqual(events[1]["delta"], "*** Begin")
         self.assertEqual(events[2]["type"], "response.custom_tool_call_input.delta")
         self.assertEqual(events[2]["delta"], " Patch\n*** End Patch")
         self.assertEqual(events[3]["type"], "response.custom_tool_call_input.done")
         self.assertEqual(events[3]["input"], "*** Begin Patch\n*** End Patch")
         self.assertNotIn("arguments", events[3])
+
+    def test_responses_tool_bridge_preserves_streaming_bare_exec_patch_protocol(self) -> None:
+        hooks, _ = load_hook_module()
+        tracker = hooks._CustomToolInputDeltaTracker()
+        patch = "*** Begin Patch\n*** Update File: example.txt\n*** End Patch"
+        added = {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_exec",
+                "call_id": "call_exec",
+                "name": "exec",
+                "arguments": "",
+                "status": "in_progress",
+            },
+        }
+        done = {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_exec",
+            "arguments": json.dumps({"input": patch}),
+        }
+        delta = {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_exec",
+            "delta": json.dumps({"input": patch})[:-1],
+        }
+        custom_tool_item_ids: set[str] = set()
+
+        normalized_added = hooks._normalize_response_stream_tool_bridge_chunk(
+            added,
+            {},
+            {"exec"},
+            custom_tool_item_ids,
+            tracker,
+        )
+        normalized_delta = hooks._normalize_response_stream_tool_bridge_chunk(
+            delta,
+            {},
+            {"exec"},
+            custom_tool_item_ids,
+            tracker,
+        )
+        normalized_done = hooks._normalize_response_stream_tool_bridge_chunk(
+            done,
+            {},
+            {"exec"},
+            custom_tool_item_ids,
+            tracker,
+        )
+
+        self.assertEqual(normalized_added["item"]["type"], "custom_tool_call")
+        self.assertEqual(normalized_delta["type"], "response.custom_tool_call_input.delta")
+        self.assertEqual(normalized_delta["delta"], patch)
+        self.assertEqual(normalized_done["type"], "response.custom_tool_call_input.done")
+        self.assertEqual(normalized_done["input"], patch)
+
+    def test_responses_tool_bridge_preserves_streaming_exec_javascript(self) -> None:
+        hooks, _ = load_hook_module()
+        tracker = hooks._CustomToolInputDeltaTracker()
+        javascript = 'text(await tools.exec_command({"cmd":"pwd"}));'
+        custom_tool_item_ids: set[str] = set()
+
+        hooks._normalize_response_stream_tool_bridge_chunk(
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_exec_js",
+                    "call_id": "call_exec_js",
+                    "name": "exec",
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            },
+            {},
+            {"exec"},
+            custom_tool_item_ids,
+            tracker,
+        )
+        normalized_delta = hooks._normalize_response_stream_tool_bridge_chunk(
+            {
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_exec_js",
+                "delta": json.dumps({"input": javascript})[:-1],
+            },
+            {},
+            {"exec"},
+            custom_tool_item_ids,
+            tracker,
+        )
+        normalized_done = hooks._normalize_response_stream_tool_bridge_chunk(
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_exec_js",
+                "arguments": json.dumps({"input": javascript}),
+            },
+            {},
+            {"exec"},
+            custom_tool_item_ids,
+            tracker,
+        )
+
+        self.assertEqual(normalized_delta["delta"], javascript)
+        self.assertEqual(normalized_done["input"], javascript)
 
     async def test_guarded_responses_stream_restores_custom_tool_input_events(self) -> None:
         hooks, _ = load_hook_module()
@@ -945,7 +1051,7 @@ class HookStreamingToolEventTests(HookTestCase):
                 "output_index": 1,
                 "item": {
                     "type": "function_call",
-                    "id": "call_patch",
+                    "id": "fc_patch",
                     "call_id": "call_patch",
                     "name": "apply_patch",
                     "arguments": "",
@@ -954,19 +1060,19 @@ class HookStreamingToolEventTests(HookTestCase):
             }
             yield {
                 "type": "response.function_call_arguments.delta",
-                "item_id": "call_patch",
+                "item_id": "fc_patch",
                 "output_index": 1,
                 "delta": '{"input":"*** Begin',
             }
             yield {
                 "type": "response.function_call_arguments.delta",
-                "item_id": "call_patch",
+                "item_id": "fc_patch",
                 "output_index": 1,
                 "delta": ' Patch"}',
             }
             yield {
                 "type": "response.function_call_arguments.done",
-                "item_id": "call_patch",
+                "item_id": "fc_patch",
                 "output_index": 1,
                 "arguments": '{"input":"*** Begin Patch"}',
             }
@@ -975,7 +1081,7 @@ class HookStreamingToolEventTests(HookTestCase):
                 "output_index": 1,
                 "item": {
                     "type": "function_call",
-                    "id": "call_patch",
+                    "id": "fc_patch",
                     "call_id": "call_patch",
                     "name": "apply_patch",
                     "arguments": '{"input":"*** Begin Patch"}',
@@ -990,7 +1096,7 @@ class HookStreamingToolEventTests(HookTestCase):
                     "output": [
                         {
                             "type": "function_call",
-                            "id": "call_patch",
+                            "id": "fc_patch",
                             "call_id": "call_patch",
                             "name": "apply_patch",
                             "arguments": '{"input":"*** Begin Patch"}',
@@ -1025,7 +1131,9 @@ class HookStreamingToolEventTests(HookTestCase):
 
         self.assertEqual(events[1]["type"], "response.output_item.added")
         self.assertEqual(events[1]["item"]["type"], "custom_tool_call")
+        self.assertEqual(events[1]["item"]["id"], "ctc_patch")
         self.assertEqual(events[2]["type"], "response.custom_tool_call_input.delta")
+        self.assertEqual(events[2]["item_id"], "ctc_patch")
         self.assertEqual(events[2]["delta"], "*** Begin")
         self.assertEqual(events[3]["type"], "response.custom_tool_call_input.delta")
         self.assertEqual(events[3]["delta"], " Patch")
@@ -1033,7 +1141,9 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertEqual(events[4]["input"], "*** Begin Patch")
         self.assertEqual(events[5]["type"], "response.output_item.done")
         self.assertEqual(events[5]["item"]["type"], "custom_tool_call")
+        self.assertEqual(events[5]["item"]["id"], "ctc_patch")
         self.assertEqual(events[-1]["response"]["output"][0]["type"], "custom_tool_call")
+        self.assertEqual(events[-1]["response"]["output"][0]["id"], "ctc_patch")
 
     def test_completed_stream_output_does_not_duplicate_custom_tool_call_events(self) -> None:
         hooks, _ = load_hook_module()

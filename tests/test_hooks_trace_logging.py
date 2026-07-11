@@ -282,6 +282,7 @@ class HookTraceLoggingTests(HookTestCase):
             kwargs = {
                 "call_type": "aresponses",
                 "model": "default-chat",
+                "completion_start_time": start + timedelta(milliseconds=123),
                 "messages": [{"role": "user", "content": "SECRET_PROMPT_BODY"}],
                 "api_key": "sk-test-secret",
                 "extra_headers": {"Authorization": "Bearer SECRET_AUTH_VALUE"},
@@ -310,6 +311,15 @@ class HookTraceLoggingTests(HookTestCase):
             record = json.loads(raw)
             self.assertEqual(record["status"], "success")
             self.assertEqual(record["duration_ms"], 321)
+            self.assertEqual(record["time_to_first_token_ms"], 123)
+            self.assertEqual(
+                record["time_to_first_token_source"],
+                "litellm_completion_start_time",
+            )
+            self.assertEqual(
+                record["first_stream_output_at"],
+                "2026-06-09T12:00:00.123000Z",
+            )
             self.assertEqual(record["model_group"], "default-chat")
             self.assertEqual(record["deployment_id"], "deployment-1")
             self.assertEqual(record["deployment_token"], "deployment-1")
@@ -364,6 +374,113 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertNotIn("SECRET_ERROR_BODY", raw)
             self.assertNotIn("SECRET_STANDARD_ERROR", raw)
             self.assertNotIn("SECRET_PROMPT_BODY", raw)
+
+    def test_ttft_omits_litellm_end_time_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        end = start + timedelta(milliseconds=321)
+
+        self.assertIsNone(
+            hooks._time_to_first_token_ms(
+                {"completion_start_time": end},
+                start,
+                end,
+            )
+        )
+
+    def test_ttft_prefers_directly_observed_stream_output(self) -> None:
+        hooks, _ = load_hook_module()
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        first_output = start + timedelta(milliseconds=87)
+        end = start + timedelta(milliseconds=321)
+        request_kwargs = {
+            "completion_start_time": end,
+            hooks._FIRST_STREAM_OUTPUT_TIME_KEY: first_output,
+        }
+
+        self.assertEqual(
+            hooks._time_to_first_token_ms(request_kwargs, start, end),
+            87,
+        )
+        self.assertEqual(
+            hooks._completion_start_time(request_kwargs, end)[1],
+            "stream_output_observed",
+        )
+
+    def test_ttft_correlates_observed_stream_output_by_request_id(self) -> None:
+        hooks, _ = load_hook_module()
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        first_output = start + timedelta(milliseconds=64)
+        stream_request = {
+            "litellm_call_id": "ttft-correlation-test",
+            hooks._FIRST_STREAM_OUTPUT_TIME_KEY: first_output,
+        }
+        callback_kwargs = {
+            "litellm_call_id": "ttft-correlation-test",
+            "completion_start_time": start + timedelta(milliseconds=321),
+        }
+
+        hooks._record_first_stream_output_time(stream_request)
+
+        self.assertEqual(
+            hooks._time_to_first_token_ms(
+                callback_kwargs,
+                start,
+                start + timedelta(milliseconds=321),
+            ),
+            64,
+        )
+
+    def test_ttft_uses_proxy_observed_request_start(self) -> None:
+        hooks, _ = load_hook_module()
+        started = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        first_output = started + timedelta(milliseconds=91)
+        stream_request = {
+            "litellm_call_id": "ttft-request-start-test",
+            hooks._REQUEST_STARTED_TIME_KEY: started,
+            hooks._FIRST_STREAM_OUTPUT_TIME_KEY: first_output,
+        }
+        callback_kwargs = {
+            "litellm_call_id": "ttft-request-start-test",
+            "completion_start_time": first_output,
+        }
+
+        hooks._record_request_started_time(stream_request)
+        hooks._record_first_stream_output_time(stream_request)
+
+        self.assertEqual(
+            hooks._time_to_first_token_ms(
+                callback_kwargs,
+                first_output,
+                first_output + timedelta(milliseconds=200),
+            ),
+            91,
+        )
+
+    def test_request_start_correlation_keeps_earliest_pre_call(self) -> None:
+        hooks, _ = load_hook_module()
+        first = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        later = first + timedelta(seconds=5)
+
+        hooks._record_request_started_time(
+            {
+                "litellm_call_id": "ttft-earliest-start-test",
+                hooks._REQUEST_STARTED_TIME_KEY: first,
+            }
+        )
+        hooks._record_request_started_time(
+            {
+                "litellm_call_id": "ttft-earliest-start-test",
+                hooks._REQUEST_STARTED_TIME_KEY: later,
+            }
+        )
+
+        self.assertEqual(
+            hooks._request_started_time(
+                {"litellm_call_id": "ttft-earliest-start-test"}
+            ),
+            first,
+        )
 
     def test_recent_request_rotation_keeps_bounded_current_and_backup_tail(self) -> None:
         hooks, _ = load_hook_module()

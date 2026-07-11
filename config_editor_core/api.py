@@ -47,10 +47,8 @@ def save_config(
         for model in _as_list(provider.get("models")):
             model_index += 1
             model_dict = _as_dict(model)
-            key_name = str(model_dict.get("api_key_name", "")).strip()
-            key_enabled = _key_enabled(provider, key_name)
             model_enabled = _bool_value(model_dict.get("model_enabled"), _bool_value(model_dict.get("enabled"), True))
-            effective_enabled = provider_enabled and key_enabled and model_enabled
+            effective_enabled = provider_enabled and model_enabled
             enabled, entry = _entry_from_editor(
                 model_dict,
                 provider,

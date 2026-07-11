@@ -1,0 +1,17 @@
+name: LiteLLM version policy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  latest-development-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require latest stable LiteLLM during development
+        run: ./scripts/update-litellm.sh --check

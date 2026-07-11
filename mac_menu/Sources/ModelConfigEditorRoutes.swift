@@ -32,12 +32,41 @@ extension ModelConfigEditorController {
     }
 
     func setUpstreamApiSupportCheckboxes(_ modes: [String]) {
-        displayedUpstreamApiModes = normalizedUpstreamApiModes(modes)
-            + upstreamApiModes.filter { !modes.contains($0) }
         supportsOpenAIChatCheckbox.state = modes.contains("openai/chat") ? .on : .off
         supportsOpenAIResponsesCheckbox.state = modes.contains("openai/responses") ? .on : .off
         supportsAnthropicCheckbox.state = modes.contains("anthropic") ? .on : .off
         refreshUpstreamApiModeRows()
+    }
+
+    func loadUpstreamApiModeOrder(_ modes: [String]) {
+        let normalized = normalizedUpstreamApiModes(modes)
+        displayedUpstreamApiModes = normalized
+            + upstreamApiModes.filter { !normalized.contains($0) }
+        setUpstreamApiSupportCheckboxes(normalized)
+    }
+
+    func loadUpstreamApiModeOrder(for model: EditableModel) {
+        let enabled = normalizedSupportedUpstreamApiModes(for: model)
+        let persisted: [String]
+        if case .array(let rawOrder)? = model.modelInfoExtra[upstreamApiModeOrderMetadataKey] {
+            persisted = rawOrder.compactMap { value in
+                guard case .string(let mode) = value else { return nil }
+                return mode
+            }
+        } else {
+            persisted = []
+        }
+        let normalizedOrder = normalizedUpstreamApiModes(persisted)
+        displayedUpstreamApiModes = normalizedOrder
+            + enabled.filter { !normalizedOrder.contains($0) }
+            + upstreamApiModes.filter { !normalizedOrder.contains($0) && !enabled.contains($0) }
+        setUpstreamApiSupportCheckboxes(enabled)
+    }
+
+    func persistDisplayedUpstreamApiModeOrder(providerIndex: Int, modelIndex: Int) {
+        providers[providerIndex].models[modelIndex].modelInfoExtra[upstreamApiModeOrderMetadataKey] = .array(
+            displayedUpstreamApiModes.map { .string($0) }
+        )
     }
 
     func selectedSupportedUpstreamApiModes() -> [String] {
@@ -70,9 +99,9 @@ extension ModelConfigEditorController {
 
     func upstreamApiDisplayName(_ mode: String) -> String {
         switch mode {
-        case "openai/chat": return "OpenAI Chat"
-        case "anthropic": return "Anthropic Messages"
-        default: return "OpenAI Responses"
+        case "openai/chat": return "Chat"
+        case "anthropic": return "Anthropic"
+        default: return "Responses"
         }
     }
 
@@ -82,17 +111,16 @@ extension ModelConfigEditorController {
             let row = NSStackView()
             row.orientation = .horizontal
             row.alignment = .centerY
-            row.spacing = 6
+            row.spacing = 8
+            row.heightAnchor.constraint(equalToConstant: 24).isActive = true
             let rank = NSTextField(labelWithString: "")
             rank.alignment = .right
-            rank.widthAnchor.constraint(equalToConstant: 18).isActive = true
+            rank.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            rank.textColor = .secondaryLabelColor
+            rank.widthAnchor.constraint(equalToConstant: 20).isActive = true
             let checkbox = upstreamApiCheckbox(for: mode)
             checkbox.title = upstreamApiDisplayName(mode)
-            checkbox.widthAnchor.constraint(equalToConstant: 148).isActive = true
-            let status = NSTextField(labelWithString: "Not probed")
-            status.textColor = .secondaryLabelColor
-            status.lineBreakMode = .byTruncatingTail
-            status.widthAnchor.constraint(equalToConstant: 235).isActive = true
+            checkbox.widthAnchor.constraint(equalToConstant: 112).isActive = true
             let up = NSButton(
                 image: NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "Move protocol up")!,
                 target: self,
@@ -107,16 +135,17 @@ extension ModelConfigEditorController {
                 button.bezelStyle = .inline
                 button.identifier = NSUserInterfaceItemIdentifier(mode)
                 button.toolTip = tooltip
-                button.widthAnchor.constraint(equalToConstant: 22).isActive = true
-                button.heightAnchor.constraint(equalToConstant: 22).isActive = true
+                button.widthAnchor.constraint(equalToConstant: 24).isActive = true
+                button.heightAnchor.constraint(equalToConstant: 24).isActive = true
                 row.addArrangedSubview(button)
             }
-            row.insertArrangedSubview(status, at: 0)
             row.insertArrangedSubview(checkbox, at: 0)
             row.insertArrangedSubview(rank, at: 0)
             upstreamApiModeRows[mode] = row
+            row.toolTip = "Upstream API priority. Check to enable; move to change the LiteLLM-to-provider fallback order."
             upstreamApiModeRankLabels[mode] = rank
-            upstreamApiModeStatusLabels[mode] = status
+            upstreamApiModeMoveUpButtons[mode] = up
+            upstreamApiModeMoveDownButtons[mode] = down
         }
     }
 
@@ -126,17 +155,12 @@ extension ModelConfigEditorController {
             upstreamApiModeStackView.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
-        let summaries = upstreamApiProbeKey == selectedModelProbeKey()
-            ? upstreamApiProbeSummaries
-            : [:]
-        let details = upstreamApiProbeKey == selectedModelProbeKey()
-            ? upstreamApiProbeDetails
-            : [:]
         for (index, mode) in displayedUpstreamApiModes.enumerated() {
             guard let row = upstreamApiModeRows[mode] else { continue }
             upstreamApiModeRankLabels[mode]?.stringValue = "\(index + 1)"
-            upstreamApiModeStatusLabels[mode]?.stringValue = summaries[mode] ?? "Not probed"
-            upstreamApiModeStatusLabels[mode]?.toolTip = details[mode]
+            let canReorder = selectedModelIndex != nil && !selectedModelImageGenerationEndpointDisabled
+            upstreamApiModeMoveUpButtons[mode]?.isEnabled = canReorder && index > 0
+            upstreamApiModeMoveDownButtons[mode]?.isEnabled = canReorder && index < displayedUpstreamApiModes.count - 1
             upstreamApiModeStackView.addArrangedSubview(row)
         }
     }
@@ -151,6 +175,7 @@ extension ModelConfigEditorController {
         guard let primary = modes.first else { return }
         providers[providerIndex].models[modelIndex].supportedUpstreamApiModes = modes
         providers[providerIndex].models[modelIndex].upstreamApiMode = primary
+        persistDisplayedUpstreamApiModeOrder(providerIndex: providerIndex, modelIndex: modelIndex)
         refreshUpstreamApiModeRows()
         commitEditor()
         markPendingChanges()
@@ -213,14 +238,8 @@ extension ModelConfigEditorController {
         }
     }
 
-    func providerKeyEnabled(providerIndex: Int, keyName: String) -> Bool {
-        let trimmed = keyName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalizedProviderKeys(providerIndex).first { $0.name == trimmed }?.enabled ?? true
-    }
-
     func modelEffectivelyEnabled(providerIndex: Int, model: EditableModel) -> Bool {
         providers[providerIndex].enabled
-            && providerKeyEnabled(providerIndex: providerIndex, keyName: model.apiKeyName)
             && model.modelEnabled
     }
 
@@ -365,7 +384,6 @@ extension ModelConfigEditorController {
         var reasons: [String] = []
         if !provider.enabled { reasons.append("provider disabled") }
         if key == nil { reasons.append("missing key") }
-        if let key, !key.enabled { reasons.append("key disabled") }
         if !model.modelEnabled { reasons.append("model disabled") }
         return reasons.isEmpty ? "unknown" : reasons.joined(separator: ", ")
     }
@@ -508,15 +526,12 @@ extension ModelConfigEditorController {
     }
 
     func modelRouteTooltip(_ model: EditableModel) -> String {
-        let split = splitLiteLLMModel(model.litellmModel)
-        let adapter = split.0.trimmingCharacters(in: .whitespacesAndNewlines)
-        let upstream = split.1.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upstream = modelUpstreamPart(model.litellmModel).trimmingCharacters(in: .whitespacesAndNewlines)
         let order = model.order.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = model.apiKeyName.trimmingCharacters(in: .whitespacesAndNewlines)
         return [
             "Public model: \(model.displayName)",
             "Upstream: \(upstream.isEmpty ? "(blank)" : upstream)",
-            "Adapter: \(adapter.isEmpty ? "(none)" : adapter)",
             "Key: \(key.isEmpty ? "(no key)" : key)",
             "Order: \(order.isEmpty ? "(none)" : order)",
         ].joined(separator: "\n")
@@ -635,16 +650,17 @@ extension ModelConfigEditorController {
         content.spacing = 7
         let modelLabel = runtimeMapLabel(
             "\(summary.modelCount) \(summary.modelCount == 1 ? "model" : "models")",
-            font: NSFont.systemFont(ofSize: 11, weight: .semibold)
+            font: NSFont.systemFont(ofSize: 11, weight: .regular)
         )
         content.addArrangedSubview(modelLabel)
         content.addArrangedSubview(runtimeMapStatusToken(
             text: "\(summary.runningCount) RUN",
-            color: .systemGreen
+            indicatorColor: .systemGreen
         ))
         content.addArrangedSubview(runtimeMapStatusToken(
             text: "\(summary.offCount) OFF",
-            color: .tertiaryLabelColor
+            indicatorColor: .tertiaryLabelColor,
+            textColor: .tertiaryLabelColor
         ))
         content.addArrangedSubview(spacer())
         content.addArrangedSubview(runtimeMapFallbackFlowView())
@@ -666,7 +682,7 @@ extension ModelConfigEditorController {
         }
         let name = runtimeMapLabel(
             model.publicModel,
-            font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            font: NSFont.systemFont(ofSize: 12, weight: .regular),
             lineBreakMode: .byTruncatingMiddle
         )
         name.toolTip = model.publicModel
@@ -674,12 +690,14 @@ extension ModelConfigEditorController {
         content.addArrangedSubview(spacer())
         content.addArrangedSubview(runtimeMapStatusToken(
             text: "\(model.runningCount) RUN",
-            color: model.runningCount > 0 ? .systemGreen : .tertiaryLabelColor
+            indicatorColor: model.runningCount > 0 ? .systemGreen : .tertiaryLabelColor,
+            textColor: model.runningCount > 0 ? .secondaryLabelColor : .tertiaryLabelColor
         ))
         if model.offCount > 0 {
             content.addArrangedSubview(runtimeMapStatusToken(
                 text: "\(model.offCount) OFF",
-                color: .tertiaryLabelColor
+                indicatorColor: .tertiaryLabelColor,
+                textColor: .tertiaryLabelColor
             ))
         }
         content.toolTip = "\(model.publicModel): \(model.runningCount) active and \(model.offCount) disabled deployments."
@@ -695,14 +713,14 @@ extension ModelConfigEditorController {
         if let icon = runtimeMapSymbolView(
             name: symbolName,
             description: order.isFirst ? "Start order" : "Next order",
-            color: .controlAccentColor
+            color: .secondaryLabelColor
         ) {
             content.addArrangedSubview(icon)
         }
         let orderLabel = runtimeMapLabel(
             runtimeMapOrderLabel(order.order),
-            font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
-            color: .controlAccentColor
+            font: NSFont.systemFont(ofSize: 10.5, weight: .regular),
+            color: .labelColor
         )
         content.addArrangedSubview(orderLabel)
         let transition: String
@@ -728,37 +746,33 @@ extension ModelConfigEditorController {
 
     func runtimeMapDeploymentCell(_ deployment: RuntimeDeployment) -> NSView {
         let content = NSStackView()
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 1
-
-        let top = NSStackView()
-        top.orientation = .horizontal
-        top.alignment = .centerY
-        top.spacing = 6
+        content.orientation = .horizontal
+        content.alignment = .centerY
+        content.spacing = 6
         let status = runtimeMapStatusToken(
             text: deployment.enabled ? "RUN" : "OFF",
-            color: deployment.enabled ? .systemGreen : .tertiaryLabelColor
+            indicatorColor: deployment.enabled ? .systemGreen : .tertiaryLabelColor,
+            textColor: deployment.enabled ? .secondaryLabelColor : .tertiaryLabelColor
         )
         status.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        top.addArrangedSubview(status)
+        content.addArrangedSubview(status)
 
         let provider = runtimeMapLabel(
             "\(deployment.providerName) / \(deployment.keyName)",
-            font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            font: NSFont.systemFont(ofSize: 11, weight: .regular),
             color: deployment.enabled ? .labelColor : .secondaryLabelColor,
             lineBreakMode: .byTruncatingMiddle
         )
         provider.widthAnchor.constraint(lessThanOrEqualToConstant: 170).isActive = true
         provider.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
-        top.addArrangedSubview(provider)
+        content.addArrangedSubview(provider)
         if let arrow = runtimeMapSymbolView(
             name: "arrow.right",
             description: "Routes to",
             color: .tertiaryLabelColor,
             size: 10
         ) {
-            top.addArrangedSubview(arrow)
+            content.addArrangedSubview(arrow)
         }
         let upstream = deployment.upstreamModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let host = apiBaseHost(deployment.apiBase)
@@ -771,41 +785,31 @@ extension ModelConfigEditorController {
         )
         endpointLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         endpointLabel.toolTip = endpoint
-        top.addArrangedSubview(endpointLabel)
-        content.addArrangedSubview(top)
-        top.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-
-        let bottom = NSStackView()
-        bottom.orientation = .horizontal
-        bottom.alignment = .centerY
-        bottom.spacing = 6
-        let indent = NSView()
-        indent.widthAnchor.constraint(equalToConstant: 46).isActive = true
-        bottom.addArrangedSubview(indent)
-        bottom.addArrangedSubview(runtimeMapProtocolChain(deployment))
-        bottom.addArrangedSubview(spacer())
+        content.addArrangedSubview(endpointLabel)
+        let protocolChain = runtimeMapProtocolChain(deployment)
+        protocolChain.setContentCompressionResistancePriority(.required, for: .horizontal)
+        content.addArrangedSubview(protocolChain)
+        content.addArrangedSubview(spacer())
         if deployment.supportsImageGeneration && !deployment.isImageGenerationEndpoint,
            let icon = runtimeMapSymbolView(
                name: "photo",
                description: "Responses image-generation tool",
-               color: deployment.enabled ? .systemPurple : .tertiaryLabelColor
+               color: deployment.enabled ? .secondaryLabelColor : .tertiaryLabelColor
            ) {
             icon.toolTip = "Supports the Responses image-generation tool."
-            bottom.addArrangedSubview(icon)
+            content.addArrangedSubview(icon)
         }
         if needsBrowserCompatibleHeaders(apiBase: deployment.apiBase),
            let icon = runtimeMapSymbolView(
                name: "globe",
                description: "Browser-compatible headers",
-               color: deployment.enabled ? .systemBlue : .tertiaryLabelColor
+               color: deployment.enabled ? .secondaryLabelColor : .tertiaryLabelColor
            ) {
             icon.toolTip = "Adds browser-compatible headers for this upstream host."
-            bottom.addArrangedSubview(icon)
+            content.addArrangedSubview(icon)
         }
-        content.addArrangedSubview(bottom)
-        bottom.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         content.toolTip = runtimeDeploymentTooltip(deployment)
-        return runtimeMapCellContainer(content, horizontalInset: 8, verticalInset: 3)
+        return runtimeMapCellContainer(content, horizontalInset: 8, verticalInset: 4)
     }
 
     func runtimeMapEmptyCell() -> NSView {
@@ -861,22 +865,26 @@ extension ModelConfigEditorController {
         return label
     }
 
-    func runtimeMapStatusToken(text: String, color: NSColor) -> NSStackView {
+    func runtimeMapStatusToken(
+        text: String,
+        indicatorColor: NSColor,
+        textColor: NSColor = .secondaryLabelColor
+    ) -> NSStackView {
         let token = NSStackView()
         token.orientation = .horizontal
         token.alignment = .centerY
         token.spacing = 4
         let dot = NSView()
         dot.wantsLayer = true
-        dot.layer?.backgroundColor = color.cgColor
+        dot.layer?.backgroundColor = indicatorColor.cgColor
         dot.layer?.cornerRadius = 3
         dot.widthAnchor.constraint(equalToConstant: 6).isActive = true
         dot.heightAnchor.constraint(equalToConstant: 6).isActive = true
         token.addArrangedSubview(dot)
         token.addArrangedSubview(runtimeMapLabel(
             text,
-            font: NSFont.systemFont(ofSize: 9.5, weight: .semibold),
-            color: color
+            font: NSFont.systemFont(ofSize: 9.5, weight: .regular),
+            color: textColor
         ))
         return token
     }
@@ -888,7 +896,7 @@ extension ModelConfigEditorController {
         flow.spacing = 4
         flow.addArrangedSubview(runtimeMapLabel(
             "Fallback",
-            font: NSFont.systemFont(ofSize: 9.5, weight: .semibold),
+            font: NSFont.systemFont(ofSize: 9.5, weight: .regular),
             color: .secondaryLabelColor
         ))
         for (index, text) in ["protocol", "peer", "order"].enumerated() {
@@ -902,8 +910,8 @@ extension ModelConfigEditorController {
             }
             flow.addArrangedSubview(runtimeMapLabel(
                 text,
-                font: NSFont.systemFont(ofSize: 9.5, weight: index == 0 ? .semibold : .regular),
-                color: index == 0 ? .controlAccentColor : .secondaryLabelColor
+                font: NSFont.systemFont(ofSize: 9.5, weight: .regular),
+                color: .secondaryLabelColor
             ))
         }
         return flow
@@ -918,15 +926,15 @@ extension ModelConfigEditorController {
             if let icon = runtimeMapSymbolView(
                 name: "photo",
                 description: "Images API",
-                color: deployment.enabled ? .controlAccentColor : .tertiaryLabelColor,
+                color: deployment.enabled ? .secondaryLabelColor : .tertiaryLabelColor,
                 size: 10
             ) {
                 chain.addArrangedSubview(icon)
             }
             chain.addArrangedSubview(runtimeMapLabel(
                 "Images API",
-                font: NSFont.systemFont(ofSize: 10, weight: .semibold),
-                color: deployment.enabled ? .controlAccentColor : .tertiaryLabelColor
+                font: NSFont.systemFont(ofSize: 10, weight: .regular),
+                color: deployment.enabled ? .labelColor : .tertiaryLabelColor
             ))
             chain.toolTip = "Standalone image-generation endpoint."
             return chain
@@ -941,10 +949,10 @@ extension ModelConfigEditorController {
             ) {
                 chain.addArrangedSubview(arrow)
             }
-            let activeColor: NSColor = index == 0 ? .controlAccentColor : .secondaryLabelColor
+            let activeColor: NSColor = index == 0 ? .labelColor : .secondaryLabelColor
             let label = runtimeMapLabel(
                 runtimeMapProtocolName(mode),
-                font: NSFont.systemFont(ofSize: 10, weight: index == 0 ? .semibold : .regular),
+                font: NSFont.systemFont(ofSize: 10, weight: .regular),
                 color: deployment.enabled ? activeColor : .tertiaryLabelColor
             )
             label.toolTip = runtimeMapProtocolTooltip(mode)
@@ -1040,12 +1048,14 @@ extension ModelConfigEditorController {
                     apiBase: apiBase.trimmingCharacters(in: .whitespacesAndNewlines),
                     order: parseOrder(model.order),
                     providerEnabled: provider.enabled,
-                    keyEnabled: key?.enabled ?? false,
                     modelEnabled: model.modelEnabled,
                     missingKey: key == nil,
                     supportsImageGeneration: model.supportsImageGeneration,
                     isImageGenerationEndpoint: modelIsImageGenerationEndpointModel(model),
-                    supportedUpstreamApiModes: normalizedSupportedUpstreamApiModes(for: model)
+                    supportedUpstreamApiModes: modelEditorTarget == modelSelectionIdentity(
+                        providerIndex: providerIndex,
+                        modelIndex: modelIndex
+                    ) ? selectedSupportedUpstreamApiModes() : normalizedSupportedUpstreamApiModes(for: model)
                 ))
             }
         }
@@ -1081,7 +1091,6 @@ extension ModelConfigEditorController {
         var reasons: [String] = []
         if !deployment.providerEnabled { reasons.append("provider") }
         if deployment.missingKey { reasons.append("missing key") }
-        if !deployment.keyEnabled && !deployment.missingKey { reasons.append("key") }
         if !deployment.modelEnabled { reasons.append("model") }
         return reasons.isEmpty ? "unknown" : reasons.joined(separator: "+")
     }

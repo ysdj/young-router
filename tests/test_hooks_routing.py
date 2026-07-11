@@ -922,7 +922,7 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(
             hooks._surface_adapter_model("openai/vendor/model", "openai/responses"),
-            "openai/responses/vendor/model",
+            "openai/vendor/model",
         )
         self.assertEqual(
             hooks._surface_adapter_model("openai/responses/vendor/model", "anthropic"),

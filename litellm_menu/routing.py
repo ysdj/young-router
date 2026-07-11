@@ -76,8 +76,108 @@ from .base import (
     os,
     re,
     time,
+    threading,
     timezone,
 )
+
+
+_FIRST_STREAM_OUTPUT_TIME_KEY = "_litellm_menu_first_stream_output_time"
+_REQUEST_STARTED_TIME_KEY = "_litellm_menu_request_started_time"
+_FIRST_STREAM_OUTPUT_TIMES: dict[str, tuple[float, datetime]] = {}
+_REQUEST_STARTED_TIMES: dict[str, tuple[float, datetime]] = {}
+_FIRST_STREAM_OUTPUT_TIMES_LOCK = threading.Lock()
+_FIRST_STREAM_OUTPUT_TIMES_MAX = 4096
+_FIRST_STREAM_OUTPUT_TIMES_TTL_SECONDS = 600.0
+
+
+def _remember_request_time(
+    store: dict[str, tuple[float, datetime]],
+    request_id: str,
+    observed_at: datetime,
+    *,
+    replace: bool = True,
+) -> None:
+    now = time.monotonic()
+    with _FIRST_STREAM_OUTPUT_TIMES_LOCK:
+        stale_before = now - _FIRST_STREAM_OUTPUT_TIMES_TTL_SECONDS
+        for key, (recorded_at, _) in list(store.items()):
+            if recorded_at < stale_before:
+                store.pop(key, None)
+        if len(store) >= _FIRST_STREAM_OUTPUT_TIMES_MAX:
+            oldest = min(store, key=lambda key: store[key][0])
+            store.pop(oldest, None)
+        if not replace and request_id in store:
+            return
+        store[request_id] = (now, observed_at)
+
+
+def _record_request_started_time(request_kwargs: Optional[dict]) -> None:
+    if not isinstance(request_kwargs, dict):
+        return
+    if not isinstance(request_kwargs.get(_REQUEST_STARTED_TIME_KEY), datetime):
+        request_kwargs[_REQUEST_STARTED_TIME_KEY] = datetime.now(timezone.utc)
+    request_id = _trace_request_id(request_kwargs)
+    started_at = request_kwargs.get(_REQUEST_STARTED_TIME_KEY)
+    if request_id and isinstance(started_at, datetime):
+        _remember_request_time(
+            _REQUEST_STARTED_TIMES,
+            request_id,
+            started_at,
+            replace=False,
+        )
+
+
+def _record_first_stream_output_time(request_kwargs: Optional[dict]) -> None:
+    if not isinstance(request_kwargs, dict):
+        return
+    observed_at = request_kwargs.get(_FIRST_STREAM_OUTPUT_TIME_KEY)
+    if not isinstance(observed_at, datetime):
+        return
+    request_id = _trace_request_id(request_kwargs)
+    if not request_id:
+        return
+    _remember_request_time(_FIRST_STREAM_OUTPUT_TIMES, request_id, observed_at)
+
+
+def _correlated_request_time(
+    request_kwargs: Optional[dict],
+    key: str,
+    store: dict[str, tuple[float, datetime]],
+) -> Optional[datetime]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    direct = request_kwargs.get(key)
+    if isinstance(direct, datetime):
+        return direct
+    request_id = _trace_request_id(request_kwargs)
+    if not request_id:
+        return None
+    now = time.monotonic()
+    with _FIRST_STREAM_OUTPUT_TIMES_LOCK:
+        recorded = store.get(request_id)
+        if recorded is None:
+            return None
+        recorded_at, observed_at = recorded
+        if now - recorded_at > _FIRST_STREAM_OUTPUT_TIMES_TTL_SECONDS:
+            store.pop(request_id, None)
+            return None
+        return observed_at
+
+
+def _first_stream_output_time(request_kwargs: Optional[dict]) -> Optional[datetime]:
+    return _correlated_request_time(
+        request_kwargs,
+        _FIRST_STREAM_OUTPUT_TIME_KEY,
+        _FIRST_STREAM_OUTPUT_TIMES,
+    )
+
+
+def _request_started_time(request_kwargs: Optional[dict]) -> Optional[datetime]:
+    return _correlated_request_time(
+        request_kwargs,
+        _REQUEST_STARTED_TIME_KEY,
+        _REQUEST_STARTED_TIMES,
+    )
 
 
 
@@ -96,6 +196,76 @@ def _duration_ms(start_time: Any, end_time: Any) -> Optional[int]:
         except Exception:
             return None
     return None
+
+
+def _completion_start_time(
+    request_kwargs: Optional[dict],
+    end_time: Any = None,
+) -> tuple[Optional[datetime], Optional[str]]:
+    if not isinstance(request_kwargs, dict):
+        return None, None
+    raw_completion_start_time = _first_stream_output_time(request_kwargs)
+    source = "stream_output_observed"
+    if raw_completion_start_time is None:
+        raw_completion_start_time = request_kwargs.get("completion_start_time")
+        source = "litellm_completion_start_time"
+    if raw_completion_start_time is None:
+        standard = _as_dict(request_kwargs.get("standard_logging_object"))
+        raw_completion_start_time = _first_not_none(
+            standard.get("completionStartTime"),
+            standard.get("completion_start_time"),
+        )
+        source = "litellm_standard_logging"
+    completion_start_time = raw_completion_start_time
+    if isinstance(completion_start_time, (int, float)):
+        try:
+            completion_start_time = datetime.fromtimestamp(
+                float(completion_start_time),
+                tz=timezone.utc,
+            )
+        except (OverflowError, OSError, ValueError):
+            return None, None
+    elif isinstance(completion_start_time, str):
+        try:
+            completion_start_time = datetime.fromisoformat(
+                completion_start_time.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None, None
+    if not isinstance(completion_start_time, datetime):
+        return None, None
+    if completion_start_time.tzinfo is None:
+        completion_start_time = completion_start_time.replace(tzinfo=timezone.utc)
+    normalized_end_time = end_time
+    if isinstance(normalized_end_time, datetime):
+        if normalized_end_time.tzinfo is None:
+            normalized_end_time = normalized_end_time.replace(tzinfo=timezone.utc)
+        if source != "stream_output_observed" and completion_start_time == normalized_end_time:
+            # LiteLLM fills a missing completion_start_time with end_time. Keep
+            # that distinguishable from an actually observed first token.
+            return None, None
+    return completion_start_time, source
+
+
+def _time_to_first_token_ms(
+    request_kwargs: Optional[dict],
+    start_time: Any,
+    end_time: Any = None,
+) -> Optional[int]:
+    completion_start_time, source = _completion_start_time(request_kwargs, end_time)
+    if source is None or completion_start_time is None:
+        return None
+    observed_request_start = _request_started_time(request_kwargs)
+    if observed_request_start is not None:
+        start_time = observed_request_start
+    if not isinstance(start_time, datetime):
+        return None
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=timezone.utc)
+    try:
+        return max(0, int((completion_start_time - start_time).total_seconds() * 1000))
+    except Exception:
+        return None
 
 
 def _stall_timeout_seconds() -> float:
@@ -314,6 +484,8 @@ def _is_route_recovery_poll_payload(request_kwargs: Optional[dict]) -> bool:
 
 def _is_route_recovery_poll_error(exception: Exception) -> bool:
     if _is_context_size_error(exception):
+        return False
+    if _is_upstream_model_not_found_error(exception):
         return False
     if _is_upstream_gateway_bad_request_error(exception):
         return False
@@ -683,6 +855,18 @@ def _request_log_record(
         "ts": _event_time(end_time) or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "status": status,
         "duration_ms": _duration_ms(start_time, end_time),
+        "time_to_first_token_ms": _time_to_first_token_ms(
+            request_kwargs,
+            start_time,
+            end_time,
+        ),
+        "time_to_first_token_source": _completion_start_time(
+            request_kwargs,
+            end_time,
+        )[1],
+        "first_stream_output_at": _event_time(
+            _completion_start_time(request_kwargs, end_time)[0]
+        ),
         "call_type": _state_module._safe_log_text(request_kwargs.get("call_type"), limit=80),
         "model_group": _state_module._safe_log_text(_responses_execution_module._request_model_group(request_kwargs), limit=160),
         "deployment_id": _state_module._safe_log_text(_deployment_id_from_request(request_kwargs), limit=180),
@@ -1200,8 +1384,6 @@ def _surface_adapter_model(model: Any, surface: str) -> Any:
             break
     if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
         return f"anthropic/{upstream}"
-    if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
-        return f"openai/responses/{upstream}"
     return f"openai/{upstream}"
 
 
@@ -3151,6 +3333,22 @@ def _is_current_upstream_surface_incompatible_error(
             )
         )
     return False
+
+
+def _is_upstream_model_not_found_error(exception: Exception) -> bool:
+    if _exception_status_code(exception) != 404:
+        return False
+    text = _exception_text(exception)
+    if not text:
+        return False
+    if "model_not_found" in text:
+        return True
+    return bool(
+        re.search(
+            r"\bmodel\b[^\n]{0,200}\b(?:not found|does not exist|not supported|unsupported|unknown)\b",
+            text,
+        )
+    )
 
 
 def _is_responses_endpoint_not_found_error(

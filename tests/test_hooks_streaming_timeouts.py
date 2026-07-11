@@ -4,6 +4,25 @@ from hook_test_utils import *
 
 
 class HookStreamingTimeoutTests(HookTestCase):
+    async def test_stream_records_first_meaningful_delta_time(self) -> None:
+        hooks, _ = load_hook_module()
+        request_data = {"model": "default-chat"}
+
+        async def upstream():
+            yield {"type": "response.created", "response": {"status": "in_progress"}}
+            yield {"type": "response.reasoning_summary_text.delta", "delta": "working"}
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_with_idle_timeout(upstream(), request_data)
+        ]
+
+        self.assertEqual(len(chunks), 2)
+        self.assertIsInstance(
+            request_data.get(hooks._FIRST_STREAM_OUTPUT_TIME_KEY),
+            datetime,
+        )
+
     async def test_streaming_idle_before_first_chunk_replays_via_router_and_logs_stuck(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []

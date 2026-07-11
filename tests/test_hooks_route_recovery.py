@@ -119,6 +119,73 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertFalse(hooks._is_route_recovery_poll_error(exc))
         self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
 
+    def test_route_recovery_does_not_poll_on_upstream_model_not_found(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class ModelNotFoundError(Exception):
+            status_code = 404
+
+        exc = ModelNotFoundError(
+            'OpenAIException - {"error":{"message":"Model \\"responses/example-chat\\" '
+            'is not supported by any configured account in this group",'
+            '"type":"model_not_found"}}'
+        )
+        exc.failed_deployment_id = "example-route"
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "example-route", "order": 1},
+        }
+
+        self.assertTrue(hooks._is_upstream_model_not_found_error(exc))
+        self.assertFalse(hooks._is_route_recovery_poll_error(exc))
+        self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
+
+    async def test_route_recovery_stops_when_attempt_hits_upstream_model_not_found(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class ServiceUnavailableError(Exception):
+            status_code = 503
+
+        class ModelNotFoundError(Exception):
+            status_code = 404
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                exc = ModelNotFoundError(
+                    'OpenAIException - {"error":{"message":"Model \\"responses/example-chat\\" '
+                    'is not supported by any configured account in this group",'
+                    '"type":"model_not_found"}}'
+                )
+                exc.failed_deployment_id = "example-route"
+                exc.upstream_surface_unsupported = True
+                raise exc
+
+        proxy_server.llm_router = FakeRouter()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "example-route", "order": 1},
+        }
+        first_exception = ServiceUnavailableError("upstream temporarily unavailable")
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                first_exception,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        assert_upstream_route_failed_terminal(self, chunks)
+
     async def test_route_recovery_poll_propagates_context_size_error_without_retrying(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []

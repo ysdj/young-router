@@ -28,7 +28,7 @@ class HookPatchTests(HookTestCase):
         }
 
         expected = {
-            "openai/responses": ("openai/responses/vendor/model", "openai", False),
+            "openai/responses": ("openai/vendor/model", "openai", False),
             "anthropic": ("anthropic/vendor/model", "anthropic", True),
             "openai/chat": ("openai/vendor/model", "openai", True),
         }
@@ -145,6 +145,56 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(error.failed_deployment_id, "picked-deployment")
         self.assertIsNone(getattr(error, "failed_deployment_order", None))
         self.assertEqual(error.num_retries, 0)
+
+    async def test_generic_helper_repairs_custom_tool_item_ids_before_routing(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+        original_input = [
+            {
+                "type": "custom_tool_call",
+                "id": "fc_exec",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": "pwd",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_exec",
+                "call_id": "call_exec",
+                "output": "done",
+            },
+        ]
+
+        async def original_generic_function(**kwargs):
+            return kwargs
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            call_type="aresponses",
+            input=original_input,
+        )
+
+        self.assertEqual(response["input"][0]["id"], "ctc_exec")
+        self.assertEqual(response["input"][1]["id"], "ctco_exec")
+        self.assertEqual(original_input[0]["id"], "fc_exec")
+        self.assertEqual(
+            response["litellm_metadata"]["responses_custom_tool_item_ids_normalized"],
+            {"changed": True, "normalized_item_ids": 1},
+        )
 
     async def test_generic_helper_patch_retries_image_unsupported_with_vision_bridge(self) -> None:
         hooks, _ = load_hook_module()
@@ -1178,6 +1228,76 @@ class HookPatchTests(HookTestCase):
                 ]
             ],
         )
+
+    async def test_order_peer_failover_patch_accepts_and_forwards_fallback_errors_flag(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        router_utils_module = types.ModuleType("litellm.router_utils")
+        fallback_handlers_module = types.ModuleType(
+            "litellm.router_utils.fallback_event_handlers"
+        )
+        seen = {}
+
+        async def run_async_fallback(*args, **kwargs):
+            seen["include_fallback_errors"] = kwargs.get("include_fallback_errors")
+            return "peer-response"
+
+        fallback_handlers_module.run_async_fallback = run_async_fallback
+
+        class Router:
+            max_fallbacks = 8
+
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"order": 1},
+                        "model_info": {"id": "order1-a"},
+                    },
+                    {
+                        "litellm_params": {"order": 1},
+                        "model_info": {"id": "order1-b"},
+                    },
+                ]
+
+            async def async_function_with_fallbacks_common_utils(
+                self,
+                e,
+                disable_fallbacks,
+                fallbacks,
+                context_window_fallbacks,
+                content_policy_fallbacks,
+                model_group,
+                args,
+                kwargs,
+                include_fallback_errors=False,
+            ):
+                return "original-response"
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        sys.modules["litellm.router_utils"] = router_utils_module
+        sys.modules["litellm.router_utils.fallback_event_handlers"] = fallback_handlers_module
+        hooks._install_order_peer_failover_patch()
+
+        error = RuntimeError("upstream 503")
+        error.status_code = 503
+        error.failed_deployment_id = "order1-a"
+        error.failed_deployment_order = 1
+
+        response = await Router().async_function_with_fallbacks_common_utils(
+            error,
+            False,
+            None,
+            None,
+            None,
+            "runtime-model-alias",
+            (),
+            {"model": "runtime-model-alias", "original_function": object()},
+            include_fallback_errors=True,
+        )
+
+        self.assertEqual(response, "peer-response")
+        self.assertTrue(seen["include_fallback_errors"])
 
     async def test_order_peer_failover_patch_marks_plain_selected_deployment_error(self) -> None:
         hooks, _ = load_hook_module()

@@ -4,6 +4,38 @@ from hook_test_utils import *
 
 
 class HookResponsesToolBridgeTests(HookTestCase):
+    def test_responses_input_repairs_custom_tool_item_id_prefixes(self) -> None:
+        hooks, _ = load_hook_module()
+        request_input = [
+            {
+                "type": "custom_tool_call",
+                "id": "fc_exec",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": "pwd",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "fco_exec",
+                "call_id": "call_exec",
+                "output": "done",
+            },
+            {"type": "function_call", "id": "fc_function", "call_id": "call_function"},
+        ]
+
+        normalized, stats = hooks._normalize_responses_custom_tool_input_item_ids(
+            request_input
+        )
+
+        self.assertEqual(normalized[0]["id"], "ctc_exec")
+        self.assertEqual(normalized[1]["id"], "ctco_exec")
+        self.assertEqual(normalized[2]["id"], "fc_function")
+        self.assertEqual(request_input[0]["id"], "fc_exec")
+        self.assertEqual(
+            stats,
+            {"changed": True, "normalized_item_ids": 2},
+        )
+
     def test_external_web_search_bridge_tool_exposes_url_read_without_pseudo_actions(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -42,14 +74,65 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 "description": "Apply a patch.",
             }
         )
+        code_exec_tool = hooks._responses_bridge_custom_tool(
+            {
+                "type": "custom",
+                "name": "exec",
+                "description": "Run code.",
+            }
+        )
 
         self.assertIsNotNone(exec_tool)
         self.assertIsNotNone(patch_tool)
+        self.assertIsNotNone(code_exec_tool)
         assert exec_tool is not None
         assert patch_tool is not None
+        assert code_exec_tool is not None
         self.assertIn("inspect repository files", exec_tool["description"])
         self.assertIn("run project commands", exec_tool["description"])
         self.assertIn("Use this for file edits", patch_tool["description"])
+        self.assertIn("executable JavaScript", code_exec_tool["description"])
+        self.assertIn("Never pass a bare *** Begin Patch", code_exec_tool["description"])
+        self.assertIn("tools.apply_patch", code_exec_tool["description"])
+
+    def test_responses_tool_bridge_repairs_complete_bare_exec_patch(self) -> None:
+        hooks, _ = load_hook_module()
+        patch = """*** Begin Patch
+*** Update File: example.txt
+@@
+-before
++after
+*** End Patch"""
+
+        restored = hooks._restore_response_custom_tool_call(
+            {
+                "type": "function_call",
+                "id": "fc_exec",
+                "call_id": "call_exec",
+                "name": "exec",
+                "arguments": json.dumps({"input": patch}),
+                "status": "completed",
+            },
+            {"exec"},
+        )
+
+        self.assertEqual(restored["type"], "custom_tool_call")
+        self.assertEqual(restored["id"], "ctc_exec")
+        self.assertEqual(
+            restored["input"],
+            f"text(await tools.apply_patch({json.dumps(patch, ensure_ascii=False)}));",
+        )
+
+    def test_exec_patch_repair_leaves_javascript_and_partial_patch_unchanged(self) -> None:
+        hooks, _ = load_hook_module()
+        javascript = 'text(await tools.exec_command({"cmd":"pwd"}));'
+        partial_patch = "*** Begin Patch\n*** Update File: example.txt"
+
+        self.assertEqual(hooks._normalize_exec_custom_tool_input(javascript), javascript)
+        self.assertEqual(
+            hooks._normalize_exec_custom_tool_input(partial_patch),
+            partial_patch,
+        )
 
     def test_trace_tool_summary_expands_namespace_children(self) -> None:
         hooks, _ = load_hook_module()

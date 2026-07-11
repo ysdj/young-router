@@ -346,8 +346,7 @@ extension ModelConfigEditorController {
     }
 
     func modelCandidateKeyTitle(_ key: EditableProviderKey) -> String {
-        let disabledSuffix = key.enabled ? "" : " [off]"
-        return "\(key.displayName) / \(tokenPreview(key.value))\(disabledSuffix)"
+        return "\(key.displayName) / \(tokenPreview(key.value))"
     }
 
     func selectedModelCandidateKeyName() -> String {
@@ -386,7 +385,7 @@ extension ModelConfigEditorController {
         let inFlight = selectedModelProbeKey().map { modelAvailabilityProbeRuns[$0] != nil } ?? false
         probeModelAvailabilityButton.title = inFlight
             ? "Probing..."
-            : (selectedModelImageGenerationEndpointDisabled ? "Probe Image Endpoint" : "Probe & Recommend")
+            : (selectedModelImageGenerationEndpointDisabled ? "Probe Image Endpoint" : "Probe")
         probeModelAvailabilityButton.isEnabled = selectedModelIndex != nil && !inFlight
     }
 
@@ -456,9 +455,6 @@ extension ModelConfigEditorController {
         if let key, apiKey?.isEmpty != false {
             throw ConfigEditorError(message: "Provider key \(key.displayName) has no token.")
         }
-        let adapter = selectedModelIndex.map {
-            splitLiteLLMModel(providers[providerIndex].models[$0].litellmModel).0
-        } ?? "openai"
         let urls = endpointURLCandidates(
             baseURL: baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
             endpoint: "models"
@@ -472,7 +468,6 @@ extension ModelConfigEditorController {
             keyEditorID: key?.editorID,
             keyName: key?.name ?? emptyModelCandidateKeyName,
             keyDisplayName: key.map { modelCandidateKeyTitle($0) } ?? emptyModelCandidateKeyTitle,
-            adapter: adapter.isEmpty ? "openai" : adapter,
             urls: urls,
             apiKey: apiKey
         )

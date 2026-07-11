@@ -22,7 +22,7 @@ extension ModelConfigEditorController {
         let currentModelIndex = selectedModelIndex ?? modelEditorTarget?.model
         let currentProviderKeyIndex = selectedProviderKeyIndex ?? providerKeyEditorTarget?.key
         let isModelCheckbox = sender === enabledCheckbox
-        if sender === providerEnabledCheckbox || sender === providerKeyEnabledCheckbox {
+        if sender === providerEnabledCheckbox {
             providerEditorDirty = true
         }
         commitEditor()
@@ -74,9 +74,7 @@ extension ModelConfigEditorController {
             setEditorStatus("At least one upstream protocol is required.", color: .systemOrange)
             return
         }
-        let active = effectiveUpstreamApiMode(from: modes)
         setUpstreamApiSupportCheckboxes(modes)
-        applyAdapterControls(forUpstreamApiMode: active)
         commitEditor()
         markPendingChanges()
     }
@@ -87,13 +85,6 @@ extension ModelConfigEditorController {
 
     @objc func moveUpstreamApiModeDown(_ sender: NSButton) {
         moveSelectedUpstreamApiMode(sender.identifier?.rawValue ?? "", delta: 1)
-    }
-
-    @objc func adapterSelectionChanged(_ sender: NSPopUpButton) {
-        customAdapterField.isHidden = !selectedAdapterIsCustom
-        customAdapterField.isEnabled = selectedAdapterIsCustom && selectedModelIndex != nil
-        commitEditor()
-        markPendingChanges()
     }
 
     @objc func fetchModelCandidates() {
@@ -169,21 +160,13 @@ extension ModelConfigEditorController {
 
     func recommendedUpstreamApiModes(from results: [UpstreamApiProbeResult]) -> [String] {
         let available = Set(results.filter { $0.isAvailable }.map { $0.mode })
-        return ["openai/responses", "anthropic", "openai/chat"].filter { available.contains($0) }
+        return upstreamApiModes.filter { available.contains($0) }
     }
 
-    func upstreamApiProbeSummary(
-        _ result: UpstreamApiProbeResult,
-        recommendedOrder: [String]
-    ) -> String {
+    func upstreamApiProbeSummary(_ result: UpstreamApiProbeResult) -> String {
         switch result.availability {
         case .available:
-            guard let index = recommendedOrder.firstIndex(of: result.mode) else {
-                return "Available"
-            }
-            return index == 0
-                ? "Preferred #1 · Available"
-                : "Fallback #\(index + 1) · Available"
+            return "Available"
         case .unavailable:
             return "Unavailable"
         case .inconclusive:
@@ -249,6 +232,7 @@ extension ModelConfigEditorController {
         do {
             let probes: [(String, [URL], Data, [String: String])] = [
                 ("openai/responses", request.responsesURLs, try responsesEndpointProbeBody(model: request.upstreamModel), [:]),
+                ("openai/chat", request.chatURLs, try modelAvailabilityProbeBody(model: request.upstreamModel), [:]),
                 (
                     "anthropic",
                     request.anthropicURLs,
@@ -258,7 +242,6 @@ extension ModelConfigEditorController {
                         "x-api-key": request.apiKey,
                     ]
                 ),
-                ("openai/chat", request.chatURLs, try modelAvailabilityProbeBody(model: request.upstreamModel), [:]),
             ]
             var results: [UpstreamApiProbeResult] = []
 
@@ -268,14 +251,6 @@ extension ModelConfigEditorController {
                     return
                 }
                 let recommended = self.recommendedUpstreamApiModes(from: results)
-                self.upstreamApiProbeKey = request.probeKey
-                self.upstreamApiProbeSummaries = Dictionary(uniqueKeysWithValues: results.map {
-                    ($0.mode, self.upstreamApiProbeSummary($0, recommendedOrder: recommended))
-                })
-                self.upstreamApiProbeDetails = Dictionary(uniqueKeysWithValues: results.map {
-                    ($0.mode, $0.detail)
-                })
-                self.refreshUpstreamApiModeRows()
                 guard let primary = recommended.first else {
                     let detail = ([preflightDetail] + results.map { $0.detail }).joined(separator: "\n\n")
                     let hasInconclusive = results.contains { $0.availability == .inconclusive }
@@ -305,12 +280,21 @@ extension ModelConfigEditorController {
                         preflightDetail: preflightDetail
                     )
                 } else {
-                    self.presentFullProbeRecommendation(
-                        recommendedOrder: recommended,
-                        request: request,
-                        details: results,
-                        preflightDetail: preflightDetail
-                    )
+                    let completeRecommendation = recommended
+                        + self.displayedUpstreamApiModes.filter { !recommended.contains($0) }
+                    if completeRecommendation == self.displayedUpstreamApiModes {
+                        self.setEditorStatus(
+                            "Probe complete. Protocol order is already recommended; enabled protocols unchanged.",
+                            tooltip: ([preflightDetail] + results.map { $0.detail }).joined(separator: "\n\n")
+                        )
+                    } else {
+                        self.presentFullProbeRecommendation(
+                            recommendedOrder: recommended,
+                            request: request,
+                            details: results,
+                            preflightDetail: preflightDetail
+                        )
+                    }
                 }
                 self.finishFullModelProbe(request: request, completion: completion)
             }
@@ -411,21 +395,61 @@ extension ModelConfigEditorController {
         let alert = NSAlert()
         alert.messageText = "Probe recommendation"
         let lines = details.map { result in
-            return "\(self.upstreamApiDisplayName(result.mode)): \(self.upstreamApiProbeSummary(result, recommendedOrder: recommendedOrder))"
+            return "\(self.upstreamApiDisplayName(result.mode)): \(self.upstreamApiProbeSummary(result))"
         }
-        alert.informativeText = ([preflightDetail, ""] + lines + ["", "Recommended order: \(recommendedOrder.map(upstreamApiDisplayName).joined(separator: " → "))", "Accept selects only the preferred protocol. Use Customize to choose extra fallbacks and reorder before Apply."]).joined(separator: "\n")
-        alert.addButton(withTitle: "Accept Preferred")
-        alert.addButton(withTitle: "Customize")
-        alert.addButton(withTitle: "Cancel")
+        alert.informativeText = ([preflightDetail, ""] + lines + ["", "Recommended order: \(recommendedOrder.map(upstreamApiDisplayName).joined(separator: " → "))", "Applying changes only the numbered priority; enabled protocols remain unchanged."]).joined(separator: "\n")
+        alert.addButton(withTitle: "Apply Recommended Order")
+        alert.addButton(withTitle: "Keep Current Order")
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            applyFullProbeSelection([recommendedOrder[0]], recommendedOrder: recommendedOrder, request: request, details: details, preflightDetail: preflightDetail)
-        case .alertSecondButtonReturn:
-            applyFullProbeSelection([recommendedOrder[0]], recommendedOrder: recommendedOrder, request: request, details: details, preflightDetail: preflightDetail)
-            setEditorStatus("Probe complete. Adjust checks/order, then Apply.", tooltip: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n"))
+            applyRecommendedProtocolOrder(
+                recommendedOrder,
+                request: request,
+                details: details,
+                preflightDetail: preflightDetail
+            )
         default:
-            setEditorStatus("Probe results were not applied.")
+            setEditorStatus(
+                "Probe complete. Current protocol order kept.",
+                tooltip: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n")
+            )
         }
+    }
+
+    func applyRecommendedProtocolOrder(
+        _ recommendedOrder: [String],
+        request: ModelAvailabilityProbeRequest,
+        details: [UpstreamApiProbeResult],
+        preflightDetail: String
+    ) {
+        guard modelProbeRequestStillMatches(request) else { return }
+        let completeOrder = recommendedOrder
+            + displayedUpstreamApiModes.filter { !recommendedOrder.contains($0) }
+        let enabled = Set(selectedSupportedUpstreamApiModes())
+        let selected = completeOrder.filter { enabled.contains($0) }
+        guard let primary = selected.first else { return }
+
+        displayedUpstreamApiModes = completeOrder
+        var model = providers[request.providerIndex].models[request.modelIndex]
+        model.upstreamApiMode = primary
+        model.supportedUpstreamApiModes = selected
+        model.litellmModel = composedLiteLLMModel(
+            upstreamModel: modelUpstreamPart(model.litellmModel),
+            upstreamApiMode: primary
+        )
+        providers[request.providerIndex].models[request.modelIndex] = model
+        persistDisplayedUpstreamApiModeOrder(
+            providerIndex: request.providerIndex,
+            modelIndex: request.modelIndex
+        )
+        refreshUpstreamApiModeRows()
+        markPendingChanges()
+        reloadRouteTable(preserving: (request.providerIndex, request.modelIndex))
+        refreshRuntimeMap()
+        setEditorStatus(
+            "Probe complete. Recommended protocol order applied; enabled protocols unchanged.",
+            tooltip: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n")
+        )
     }
 
     func applyFullProbeSelection(
@@ -441,12 +465,18 @@ extension ModelConfigEditorController {
         model.enabled = modelEffectivelyEnabled(providerIndex: request.providerIndex, model: model)
         model.upstreamApiMode = primary
         model.supportedUpstreamApiModes = selected
-        model.litellmModel = litellmModel(model.litellmModel, settingAdapterFor: primary)
+        model.litellmModel = composedLiteLLMModel(
+            upstreamModel: modelUpstreamPart(model.litellmModel),
+            upstreamApiMode: primary
+        )
         providers[request.providerIndex].models[request.modelIndex] = model
         displayedUpstreamApiModes = recommendedOrder + upstreamApiModes.filter { !recommendedOrder.contains($0) }
+        persistDisplayedUpstreamApiModeOrder(
+            providerIndex: request.providerIndex,
+            modelIndex: request.modelIndex
+        )
         if selectedModelProbeKey() == request.probeKey {
             setUpstreamApiSupportCheckboxes(selected)
-            setAdapterControls(from: model.litellmModel)
             enabledCheckbox.state = .on
         }
         markPendingChanges()
@@ -721,7 +751,10 @@ extension ModelConfigEditorController {
             model.enabled = true
             model.modelEnabled = true
             model.modelName = upstream
-            model.litellmModel = request.adapter.isEmpty ? upstream : "\(request.adapter)/\(upstream)"
+            model.litellmModel = composedLiteLLMModel(
+                upstreamModel: upstream,
+                upstreamApiMode: defaultUpstreamApiMode
+            )
             model.apiKeyName = key.name
             model.apiKey = key.value
             model.order = "1"

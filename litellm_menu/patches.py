@@ -395,6 +395,7 @@ def _install_order_peer_failover_patch() -> None:
         model_group: Optional[str],
         args: tuple,
         kwargs: dict,
+        include_fallback_errors: bool = False,
     ) -> Any:
         if _routing_module._is_terminal_prompt_or_policy_error(e):
             _trace_module._route_trace(
@@ -424,6 +425,8 @@ def _install_order_peer_failover_patch() -> None:
                 }
                 peer_kwargs.setdefault("max_fallbacks", getattr(self, "max_fallbacks", 0))
                 peer_kwargs.setdefault("fallback_depth", 0)
+                if include_fallback_errors:
+                    peer_kwargs["include_fallback_errors"] = True
                 peer_kwargs.update(
                     {
                         "fallback_model_group": [browser_retry_entry],
@@ -458,6 +461,8 @@ def _install_order_peer_failover_patch() -> None:
                 }
                 peer_kwargs.setdefault("max_fallbacks", getattr(self, "max_fallbacks", 0))
                 peer_kwargs.setdefault("fallback_depth", 0)
+                if include_fallback_errors:
+                    peer_kwargs["include_fallback_errors"] = True
                 peer_kwargs.update(
                     {
                         "fallback_model_group": [peer_entry],
@@ -509,7 +514,7 @@ def _install_order_peer_failover_patch() -> None:
             request=_trace_module._trace_request_summary(kwargs),
             exception=_routing_module._trace_exception(e),
         )
-        return await original_common_utils(
+        original_args = (
             self,
             e,
             disable_fallbacks,
@@ -520,6 +525,12 @@ def _install_order_peer_failover_patch() -> None:
             args,
             kwargs,
         )
+        if include_fallback_errors:
+            return await original_common_utils(
+                *original_args,
+                include_fallback_errors=True,
+            )
+        return await original_common_utils(*original_args)
 
     setattr(patched_common_utils, _ORDER_PEER_FAILOVER_PATCH_ATTR, True)
     setattr(patched_common_utils, "_original_common_utils", original_common_utils)
@@ -542,6 +553,18 @@ def _install_generic_deployment_failover_patch() -> None:
         original_generic_function: Any,
         **kwargs: Any,
     ) -> Any:
+        normalized_input, normalized_input_stats = (
+            _responses_output_module._normalize_responses_custom_tool_input_item_ids(
+                kwargs.get("input")
+            )
+        )
+        if normalized_input_stats.get("changed"):
+            kwargs = kwargs.copy()
+            kwargs["input"] = normalized_input
+            metadata = kwargs.get("litellm_metadata")
+            metadata = metadata.copy() if isinstance(metadata, dict) else {}
+            metadata["responses_custom_tool_item_ids_normalized"] = normalized_input_stats
+            kwargs["litellm_metadata"] = metadata
         for update_request in (
             _image_generation_module._with_empty_tool_controls_removed,
             _image_generation_module._with_codex_compaction_controls,

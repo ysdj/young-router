@@ -1276,12 +1276,32 @@ async def _stream_with_idle_timeout(
             ) from None
         saw_chunk = True
         chunk_count += 1
+        if (
+            _routing_module._FIRST_STREAM_OUTPUT_TIME_KEY not in request_data
+            and _stream_chunk_has_meaningful_delta(chunk)
+        ):
+            request_data[_routing_module._FIRST_STREAM_OUTPUT_TIME_KEY] = datetime.now(
+                timezone.utc
+            )
+            _routing_module._record_first_stream_output_time(request_data)
         if not visible_output_seen:
             visible_output_seen = _stream_chunk_has_visible_output(chunk) or (
                 _request_is_responses_stream(request_data)
                 and _responses_completed_chunk_has_usable_output(chunk)
             )
         yield chunk
+
+
+def _stream_chunk_has_meaningful_delta(chunk: Any) -> bool:
+    dumped = _stream_chunk_dump(chunk)
+    chunk_type = _stream_chunk_type(dumped)
+    if isinstance(chunk_type, str) and chunk_type.endswith(".delta"):
+        delta = dumped.get("delta") if isinstance(dumped, dict) else None
+        if isinstance(delta, str) and delta:
+            return True
+        if delta not in (None, "", [], {}):
+            return True
+    return _stream_chunk_has_visible_output(chunk)
 
 
 async def _stream_with_selected_deployment_box(
@@ -2141,6 +2161,8 @@ async def _stream_route_recovery_poll_attempt(
 
 
 def _route_recovery_poll_keep_going(exception: Exception) -> bool:
+    if _routing_module._is_upstream_model_not_found_error(exception):
+        return False
     return bool(
         _routing_module._is_route_recovery_poll_error(exception)
         or _external_web_search_exception_has_recovery_request(exception)

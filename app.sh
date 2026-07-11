@@ -27,6 +27,7 @@ RESOURCE_FILES=(
   config.example.yaml
   VERSION
   BUILD_NUMBER
+  LITELLM_VERSION
   scripts/smoke_websearch.py
   scripts/smoke_responses_tool_bridge_compare.py
 )

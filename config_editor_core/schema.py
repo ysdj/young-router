@@ -163,12 +163,12 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
         if "api_key" in provider:
             raise ValueError(
                 f"{path.name} provider {provider_name} uses unsupported scalar api_key; "
-                "use api_keys: [{name, value, enabled}]"
+                "use api_keys: [{name, value}]"
             )
         if "disabled_api_keys" in provider:
             raise ValueError(
                 f"{path.name} provider {provider_name} uses unsupported disabled_api_keys; "
-                "put enabled: false on the matching api_keys entry"
+                "remove unused API keys instead"
             )
         raw_keys = provider.get("api_keys")
         if raw_keys is None:

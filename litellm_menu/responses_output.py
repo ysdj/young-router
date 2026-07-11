@@ -58,6 +58,49 @@ def _response_item_set(item: Any, key: str, value: Any) -> None:
             pass
 
 
+def _responses_custom_tool_item_id(value: Any, *, output: bool = False) -> Any:
+    if not isinstance(value, str) or not value:
+        return value
+    expected_prefix = "ctco_" if output else "ctc_"
+    if value.startswith(expected_prefix):
+        return value
+    replaced_prefix = "fco_" if output else "fc_"
+    suffix = value[len(replaced_prefix) :] if value.startswith(replaced_prefix) else value
+    return f"{expected_prefix}{suffix}"
+
+
+def _normalize_responses_custom_tool_input_item_ids(
+    value: Any,
+) -> tuple[Any, dict[str, Any]]:
+    if not isinstance(value, list):
+        return value, {"changed": False, "normalized_item_ids": 0}
+
+    normalized = copy.deepcopy(value)
+    normalized_item_ids = 0
+    for item in normalized:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type not in {"custom_tool_call", "custom_tool_call_output"}:
+            continue
+        item_id = item.get("id")
+        expected_id = _responses_custom_tool_item_id(
+            item_id,
+            output=item_type == "custom_tool_call_output",
+        )
+        if expected_id == item_id:
+            continue
+        item["id"] = expected_id
+        normalized_item_ids += 1
+
+    if normalized_item_ids == 0:
+        return value, {"changed": False, "normalized_item_ids": 0}
+    return normalized, {
+        "changed": True,
+        "normalized_item_ids": normalized_item_ids,
+    }
+
+
 def _responses_namespace_tool_map_from_tools(value: Any) -> dict[str, str]:
     namespace_by_name: dict[str, str] = {}
 
@@ -188,6 +231,8 @@ def _restore_response_function_call_namespace(
 def _restore_response_custom_tool_call(
     item: Any,
     custom_tool_names: Optional[set[str]],
+    *,
+    normalize_exec_input: bool = True,
 ) -> Any:
     if not custom_tool_names:
         return item
@@ -202,12 +247,28 @@ def _restore_response_custom_tool_call(
         return item
     converted = copy.deepcopy(converted)
     converted["type"] = "custom_tool_call"
+    if "id" in converted:
+        converted["id"] = _responses_custom_tool_item_id(converted.get("id"))
     arguments = converted.pop("arguments", None)
     if "input" not in converted:
         converted["input"] = _custom_tool_input_from_chat_arguments(arguments)
+    if normalize_exec_input and name == "exec":
+        converted["input"] = _normalize_exec_custom_tool_input(converted.get("input"))
     if converted.get("status") is None:
         converted["status"] = "completed"
     return converted
+
+
+def _normalize_exec_custom_tool_input(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    patch = value.strip()
+    if not (
+        patch.startswith("*** Begin Patch")
+        and patch.endswith("*** End Patch")
+    ):
+        return value
+    return f"text(await tools.apply_patch({json.dumps(patch, ensure_ascii=False)}));"
 
 
 def _custom_tool_input_from_chat_arguments(arguments: Any) -> str:
@@ -356,11 +417,16 @@ def _normalize_custom_tool_input_event(
         "response.function_call_arguments.done",
     }:
         return event
-    item_id = _stream_function_arguments_event_item_id(event)
+    raw_item_id = _stream_function_arguments_event_item_id(event)
+    item_id = _responses_custom_tool_item_id(raw_item_id)
     if item_id not in custom_tool_item_ids:
         return event
 
     converted = copy.deepcopy(event)
+    if raw_item_id != item_id:
+        for key in ("item_id", "id"):
+            if _responses_web_search_bridge_module._response_item_get(converted, key) == raw_item_id:
+                _response_event_set(converted, key, item_id)
     if event_type.endswith(".delta"):
         delta = _responses_web_search_bridge_module._response_item_get(event, "delta")
         if not isinstance(delta, str) or not item_id:
@@ -393,13 +459,19 @@ def _normalize_response_tool_search_output(
     response: Any,
     namespace_by_name: Optional[dict[str, str]] = None,
     custom_tool_names: Optional[set[str]] = None,
+    *,
+    normalize_exec_input: bool = True,
 ) -> Any:
     output = _responses_web_search_bridge_module._response_item_get(response, "output")
     if not isinstance(output, list):
         return response
     for index, item in enumerate(output):
         converted = _responses_tool_search_call_from_function_call(item)
-        converted = _restore_response_custom_tool_call(converted, custom_tool_names)
+        converted = _restore_response_custom_tool_call(
+            converted,
+            custom_tool_names,
+            normalize_exec_input=normalize_exec_input,
+        )
         output[index] = _restore_response_function_call_namespace(
             converted,
             namespace_by_name,
@@ -461,10 +533,16 @@ def _normalize_tool_search_output_item_event(
     event: Any,
     namespace_by_name: Optional[dict[str, str]] = None,
     custom_tool_names: Optional[set[str]] = None,
+    *,
+    normalize_exec_input: bool = True,
 ) -> Any:
     item = _responses_web_search_bridge_module._response_item_get(event, "item")
     converted = _responses_tool_search_call_from_function_call(item)
-    converted = _restore_response_custom_tool_call(converted, custom_tool_names)
+    converted = _restore_response_custom_tool_call(
+        converted,
+        custom_tool_names,
+        normalize_exec_input=normalize_exec_input,
+    )
     converted = _restore_response_function_call_namespace(
         converted,
         namespace_by_name,
@@ -503,6 +581,7 @@ def _normalize_response_stream_tool_bridge_chunk(
             chunk,
             namespace_by_name,
             custom_tool_names,
+            normalize_exec_input=False,
         )
         item = _responses_web_search_bridge_module._response_item_get(normalized, "item")
         if (
@@ -533,6 +612,7 @@ def _normalize_response_stream_tool_bridge_chunk(
         response,
         namespace_by_name,
         custom_tool_names,
+        normalize_exec_input=False,
     )
     return chunk
 

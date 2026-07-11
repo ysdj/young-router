@@ -231,13 +231,33 @@ EOF
   fi
 }
 
+locked_litellm_version() {
+  local version
+  if [[ ! -f "$LITELLM_VERSION_FILE" ]]; then
+    echo "Missing LiteLLM version lock: $LITELLM_VERSION_FILE" >&2
+    return 1
+  fi
+  version="$(tr -d '[:space:]' < "$LITELLM_VERSION_FILE")"
+  if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.!+_-]*$ ]]; then
+    echo "Invalid LiteLLM version lock in $LITELLM_VERSION_FILE: $version" >&2
+    return 1
+  fi
+  printf '%s\n' "$version"
+}
+
 native_deps_ready() {
+  local locked_version
+  locked_version="$(locked_litellm_version)" || return 1
   [[ -x "$LITELLM_BIN" ]] || return 1
-  "$NATIVE_PYTHON" - <<'PY' >/dev/null 2>&1
+  LITELLM_LOCKED_VERSION="$locked_version" "$NATIVE_PYTHON" - <<'PY' >/dev/null 2>&1
 from importlib import metadata
+import os
 
 for package in ("gunicorn", "litellm", "Pillow", "PyYAML", "ddgs"):
     metadata.version(package)
+
+if metadata.version("litellm") != os.environ["LITELLM_LOCKED_VERSION"]:
+    raise SystemExit(1)
 PY
 }
 
@@ -258,7 +278,10 @@ ensure_helper_python() {
 }
 
 ensure_native_environment() {
+  local locked_litellm_version_value litellm_requirement
   ensure_runtime_layout
+  locked_litellm_version_value="$(locked_litellm_version)" || return 1
+  litellm_requirement="litellm[proxy]==$locked_litellm_version_value"
 
   if [[ ! -x "$NATIVE_PYTHON" ]]; then
     create_native_venv
@@ -269,11 +292,11 @@ ensure_native_environment() {
     if [[ -x "$BUNDLED_UV" ]]; then
       UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" \
         "$BUNDLED_UV" pip install --python "$NATIVE_PYTHON" \
-          'litellm[proxy]' Pillow gunicorn PyYAML ddgs
+          "$litellm_requirement" Pillow gunicorn PyYAML ddgs
     else
       "$NATIVE_PYTHON" -m ensurepip --upgrade >/dev/null 2>&1 || true
       "$NATIVE_PYTHON" -m pip install --upgrade pip
-      "$NATIVE_PYTHON" -m pip install --upgrade 'litellm[proxy]' Pillow gunicorn PyYAML ddgs
+      "$NATIVE_PYTHON" -m pip install --upgrade "$litellm_requirement" Pillow gunicorn PyYAML ddgs
     fi
   fi
 

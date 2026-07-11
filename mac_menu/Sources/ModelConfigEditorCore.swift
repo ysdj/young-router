@@ -32,12 +32,10 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     var selectedModelInfoInFlight = false
     var selectedModelImageGenerationEndpointDisabled = false
     var displayedUpstreamApiModes = ["openai/responses", "openai/chat", "anthropic"]
-    var upstreamApiProbeSummaries: [String: String] = [:]
-    var upstreamApiProbeDetails: [String: String] = [:]
-    var upstreamApiProbeKey: ModelProbeKey?
     var upstreamApiModeRows: [String: NSStackView] = [:]
     var upstreamApiModeRankLabels: [String: NSTextField] = [:]
-    var upstreamApiModeStatusLabels: [String: NSTextField] = [:]
+    var upstreamApiModeMoveUpButtons: [String: NSButton] = [:]
+    var upstreamApiModeMoveDownButtons: [String: NSButton] = [:]
     var runtimeApplyInFlight = false
     var runtimeApplyGeneration = 0
     let runtimeApplyLock = NSLock()
@@ -65,27 +63,15 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     var routesListView: NSView?
     var providerDetailView: NSView?
     var modelDetailView: NSView?
+    var detailPaneHeightConstraint: NSLayoutConstraint?
+    var runtimeMapHeightConstraint: NSLayoutConstraint?
     let runtimeMapTableView = NSTableView()
     var runtimeMapScrollView: NSScrollView?
     var runtimeMapRows: [RuntimeMapRow] = []
-    let adapterOptions = [
-        "openai",
-        "anthropic",
-        "gemini",
-        "azure",
-        "bedrock",
-        "vertex_ai",
-        "openrouter",
-        "deepseek",
-        "xai",
-        "groq",
-        "mistral",
-        "cohere",
-        "ollama",
-    ]
-    let upstreamApiModes = ["openai/chat", "openai/responses", "anthropic"]
+    let upstreamApiModes = ["openai/responses", "openai/chat", "anthropic"]
     let defaultUpstreamApiMode = "openai/responses"
-    let customAdapterTitle = "Custom"
+    let modelFormLabelWidth: CGFloat = 96
+    let upstreamApiModeOrderMetadataKey = "x-litellm-menu-upstream-url-surface-order"
     let defaultProviderKeyName = "default"
     let emptyModelCandidateKeyName = ""
     let emptyModelCandidateKeyTitle = "(empty)"
@@ -109,7 +95,6 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         var apiBase: String
         var order: Int?
         var providerEnabled: Bool
-        var keyEnabled: Bool
         var modelEnabled: Bool
         var missingKey: Bool
         var supportsImageGeneration: Bool
@@ -117,7 +102,7 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         var supportedUpstreamApiModes: [String]
 
         var enabled: Bool {
-            providerEnabled && keyEnabled && modelEnabled && !missingKey
+            providerEnabled && modelEnabled && !missingKey
         }
     }
 
@@ -232,7 +217,6 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         var keyEditorID: UUID?
         var keyName: String
         var keyDisplayName: String
-        var adapter: String
         var urls: [URL]
         var apiKey: String?
     }
@@ -317,45 +301,28 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     lazy var providerEnabledCheckbox: NSButton = {
         NSButton(checkboxWithTitle: "Provider enabled", target: self, action: #selector(formCheckboxChanged(_:)))
     }()
-    lazy var providerNameField = makeTextField(width: 430)
-    lazy var providerApiBaseField = makeTextField(width: 430)
+    lazy var providerNameField = makeTextField(width: 360)
+    lazy var providerApiBaseField = makeTextField(width: 360)
     let providerKeyTableView = NSTableView()
-    lazy var providerKeyEnabledCheckbox: NSButton = {
-        NSButton(checkboxWithTitle: "API key enabled", target: self, action: #selector(formCheckboxChanged(_:)))
-    }()
-    lazy var providerKeyNameField = makeTextField(width: 250)
-    lazy var providerApiKeyField = makeTokenField(width: 250)
+    lazy var providerKeyNameField = makeTextField(width: 220)
+    lazy var providerApiKeyField = makeTokenField(width: 220)
     lazy var addProviderKeyButton = NSButton(title: "Add Key", target: self, action: #selector(addProviderKey))
     lazy var deleteProviderKeyButton = NSButton(title: "Delete Key", target: self, action: #selector(deleteProviderKey))
     lazy var enabledCheckbox: NSButton = {
         NSButton(checkboxWithTitle: "Model enabled", target: self, action: #selector(formCheckboxChanged(_:)))
     }()
     lazy var probeModelAvailabilityButton: NSButton = {
-        let button = NSButton(title: "Probe & Recommend", target: self, action: #selector(probeModelAvailability))
+        let button = NSButton(title: "Probe", target: self, action: #selector(probeModelAvailability))
         button.bezelStyle = .rounded
-        button.toolTip = "Probe model availability and all three API protocols, then recommend a minimal ordered selection"
+        button.toolTip = "Check all three API protocols and recommend an order when needed"
         return button
     }()
-    lazy var modelNameField = makeTextField(width: 430)
+    lazy var modelNameField = makeFlexibleTextField()
     lazy var modelApiKeyPopupButton: NSPopUpButton = {
         let popup = NSPopUpButton()
         popup.target = self
         popup.action = #selector(modelApiKeySelectionChanged(_:))
-        popup.widthAnchor.constraint(equalToConstant: 240).isActive = true
         return popup
-    }()
-    lazy var adapterPopupButton: NSPopUpButton = {
-        let popup = NSPopUpButton()
-        popup.addItems(withTitles: adapterOptions + [customAdapterTitle])
-        popup.target = self
-        popup.action = #selector(adapterSelectionChanged(_:))
-        popup.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        return popup
-    }()
-    lazy var customAdapterField: NSTextField = {
-        let field = makeTextField(width: 240)
-        field.isHidden = true
-        return field
     }()
     lazy var fetchModelsButton: NSButton = {
         let button = NSButton(title: "Fetch /v1/models", target: self, action: #selector(fetchModelCandidates))
@@ -370,8 +337,8 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         popup.toolTip = "API key used only for Fetch /v1/models"
         return popup
     }()
-    lazy var upstreamModelField = makeTextField(width: 430)
-    lazy var orderField = makeTextField(width: 160)
+    lazy var upstreamModelField = makeFlexibleTextField()
+    lazy var orderField = makeFlexibleTextField()
     lazy var supportsOpenAIChatCheckbox: NSButton = {
         NSButton(checkboxWithTitle: "openai/chat", target: self, action: #selector(upstreamApiSupportChanged(_:)))
     }()
@@ -385,7 +352,7 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 4
+        stack.spacing = 6
         return stack
     }()
     lazy var deleteProviderButton = NSButton(title: "Delete", target: self, action: #selector(deleteProvider))

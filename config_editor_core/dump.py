@@ -138,7 +138,7 @@ def _normalized_api_keys(provider: dict[str, Any]) -> list[dict[str, Any]]:
         keys.append({
             "name": key_name,
             "value": key_value,
-            "enabled": _bool_value(item_dict.get("enabled"), True),
+            "enabled": True,
         })
         seen_names.add(key_name)
 
@@ -190,12 +190,7 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
             lines.append("    api_keys:")
             for item in keys:
                 lines.append(f"      - name: {_plain_scalar(item['name'])}")
-                if not _bool_value(item.get("enabled"), True):
-                    lines.append("        enabled: false")
-                if _bool_value(item.get("enabled"), True):
-                    lines.append(f"        value: {_anchor_scalar(item['value'], _provider_key_anchor(name, item['name']))}")
-                else:
-                    lines.append(f"        value: {_anchor_scalar(item['value'], _provider_key_anchor(name, item['name']))}")
+                lines.append(f"        value: {_anchor_scalar(item['value'], _provider_key_anchor(name, item['name']))}")
         for key, value in _as_dict(provider.get("extra")).items():
             lines.append(f"    {key}: {_plain_scalar(value)}")
     return "\n".join(lines).rstrip() + "\n"

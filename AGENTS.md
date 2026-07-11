@@ -31,6 +31,13 @@ These instructions apply to the entire `litellm-menu` repository.
 
 - Keep `VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Formula/litellm-menu.rb` version handling in sync through `scripts/version.py` when version changes are requested.
 
+## Native UI Screenshots
+
+- Computer Use can inspect LiteLLM Menu when a normal editor or settings `NSWindow` is open. A menu-bar-only process exposes only `NSStatusItem` / `NSMenu`; `get_app_state` may time out in that state even when the app is healthy. Retry once by bundle id (`menu.litellm.menu`), then open the target window before treating the timeout as an app defect. Do not add a persistent or hidden window solely to satisfy screenshot tooling.
+- Never use a real configuration window for public screenshots. Run an isolated, ad-hoc-signed preview `.app` with a synthetic `config.yaml` containing only reserved example hosts, neutral provider/model names, and replace-me keys.
+- For a Computer Use capture, open the target normal window, address the app by name or full `.app` path, call `get_app_state`, and copy the returned single-window `screenshot.url`. A temporary preview should have a stable unique bundle id and be launched as a signed `.app`; an unregistered raw executable is not a reliable target.
+- Capture only the intended window. `/usr/sbin/screencapture -x -l <window-number> <output.png>` is an acceptable fallback when the capturing process already has Screen Recording permission, but an ad-hoc preview app may not. Do not capture the desktop, menu bar, other apps, logs, or real credentials. For multi-state documentation images, capture each window state separately and compose those sanitized window images afterward.
+
 ## Architecture Rules
 
 - LiteLLM Menu is app-first and native on macOS. The menu app owns the local service lifecycle.

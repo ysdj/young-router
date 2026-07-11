@@ -67,6 +67,7 @@ class LiteLLMMenuHook(CustomLogger):
         kwargs: Dict[str, Any],
         call_type: Any,
     ) -> Optional[dict]:
+        _routing_module._record_request_started_time(kwargs)
         modified_kwargs = kwargs
         changed = False
         for update_request in (

@@ -230,6 +230,10 @@ class ControlAutoStartTests(unittest.TestCase):
                 encoding="utf-8",
             )
             service_script.chmod(service_script.stat().st_mode | stat.S_IXUSR)
+            (service_script.parent / "LITELLM_VERSION").write_text(
+                (ROOT / "LITELLM_VERSION").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
             callback_package = service_script.parent / "litellm_menu"
             callback_package.mkdir()
             (callback_package / "__init__.py").write_text("# test callback package\n", encoding="utf-8")

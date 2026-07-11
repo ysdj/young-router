@@ -26,7 +26,7 @@ extension ModelConfigEditorController {
             case .summary: return 30
             case .model: return 27
             case .order: return 23
-            case .deployment: return 40
+            case .deployment: return 28
             case .empty: return 44
             }
         }
@@ -129,9 +129,7 @@ extension ModelConfigEditorController {
             guard let providerIndex = selectedProviderIndex,
                   row >= 0,
                   row < providers[providerIndex].apiKeys.count else { return nil }
-            let key = providers[providerIndex].apiKeys[row]
-            text = key.displayName
-            enabled = key.enabled
+            text = providers[providerIndex].apiKeys[row].displayName
         }
         let label = NSTextField(labelWithString: text)
         label.lineBreakMode = .byTruncatingMiddle
@@ -381,6 +379,7 @@ extension ModelConfigEditorController {
     }
 
     func renderProviderSelection() {
+        setDetailLayout(modelIsSelected: false)
         isRenderingSelection = true
         defer { isRenderingSelection = false }
         detailMode = .provider
@@ -436,11 +435,11 @@ extension ModelConfigEditorController {
     }
 
     func renderProviderKeySelection() {
+        setDetailLayout(modelIsSelected: false)
         detailMode = .provider
         modelEditorTarget = nil
         let hasKey = selectedProviderKeyIndex != nil
         deleteProviderKeyButton.isEnabled = hasKey && (selectedProviderIndex.map { providers[$0].apiKeys.count > 1 } ?? false)
-        providerKeyEnabledCheckbox.isEnabled = hasKey
         providerKeyNameField.isEnabled = hasKey
         providerApiKeyField.isEnabled = hasKey
 
@@ -448,7 +447,6 @@ extension ModelConfigEditorController {
               let keyIndex = selectedProviderKeyIndex else {
             providerKeyEditorTarget = nil
             providerEditorDirty = false
-            providerKeyEnabledCheckbox.state = .off
             providerKeyNameField.stringValue = ""
             providerApiKeyField.stringValue = ""
             return
@@ -462,7 +460,7 @@ extension ModelConfigEditorController {
             keyIndex,
             providers[providerIndex].apiKeys[keyIndex].editorID
         )
-        providerKeyEnabledCheckbox.state = providers[providerIndex].apiKeys[keyIndex].enabled ? .on : .off
+        providers[providerIndex].apiKeys[keyIndex].enabled = true
         providerKeyNameField.stringValue = providers[providerIndex].apiKeys[keyIndex].name
         providerApiKeyField.stringValue = providers[providerIndex].apiKeys[keyIndex].value
         providerEditorDirty = false
@@ -470,6 +468,7 @@ extension ModelConfigEditorController {
     }
 
     func renderModelSelection() {
+        setDetailLayout(modelIsSelected: selectedModelIndex != nil)
         isRenderingSelection = true
         defer { isRenderingSelection = false }
         detailMode = .model
@@ -499,11 +498,10 @@ extension ModelConfigEditorController {
         enabledCheckbox.state = model.modelEnabled ? .on : .off
         modelNameField.stringValue = model.modelName
         refreshModelApiKeyPopup(providerIndex: providerIndex, selected: model.apiKeyName)
-        setAdapterControls(from: model.litellmModel)
         upstreamModelField.stringValue = modelUpstreamPart(model.litellmModel)
         let order = model.order.trimmingCharacters(in: .whitespacesAndNewlines)
         orderField.stringValue = order.isEmpty ? "1" : order
-        setUpstreamApiSupportCheckboxes(normalizedSupportedUpstreamApiModes(for: model))
+        loadUpstreamApiModeOrder(for: model)
         selectedModelImageGenerationEndpointDisabled = modelIsImageGenerationEndpointModel(model)
         refreshResponsesEndpointSupportControls()
         if viewMode == .routes {
@@ -526,12 +524,9 @@ extension ModelConfigEditorController {
         for field in modelFields {
             field.stringValue = ""
         }
-        adapterPopupButton.selectItem(withTitle: "openai")
         modelApiKeyPopupButton.removeAllItems()
         modelApiKeyPopupButton.isEnabled = false
-        customAdapterField.isEnabled = false
-        customAdapterField.isHidden = true
-        setUpstreamApiSupportCheckboxes([defaultUpstreamApiMode])
+        loadUpstreamApiModeOrder([defaultUpstreamApiMode])
         refreshResponsesEndpointSupportControls()
         refreshRouteControlsEnabled()
         refreshModelCandidateControlsEnabled()
@@ -544,7 +539,7 @@ extension ModelConfigEditorController {
     }
 
     var modelFields: [NSTextField] {
-        [modelNameField, customAdapterField, upstreamModelField, orderField]
+        [modelNameField, upstreamModelField, orderField]
     }
 
     func isProviderField(_ field: NSTextField) -> Bool {
@@ -562,21 +557,17 @@ extension ModelConfigEditorController {
         for field in providerFields {
             field.isEnabled = enabled
         }
-        providerKeyEnabledCheckbox.isEnabled = enabled && selectedProviderKeyIndex != nil
     }
 
     func setModelFormEnabled(_ enabled: Bool) {
         enabledCheckbox.isEnabled = enabled
         modelApiKeyPopupButton.isEnabled = enabled
-        adapterPopupButton.isEnabled = enabled
         supportsOpenAIChatCheckbox.isEnabled = enabled
         supportsOpenAIResponsesCheckbox.isEnabled = enabled
         supportsAnthropicCheckbox.isEnabled = enabled
         for field in modelFields {
             field.isEnabled = enabled
         }
-        customAdapterField.isHidden = !selectedAdapterIsCustom
-        customAdapterField.isEnabled = enabled && selectedAdapterIsCustom
         refreshModelCandidateControlsEnabled()
         refreshModelAvailabilityProbeControlsEnabled()
         refreshResponsesEndpointSupportControls()

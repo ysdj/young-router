@@ -34,7 +34,7 @@ def _provider_api_keys_from_raw(provider: dict[str, Any]) -> list[dict[str, Any]
         keys.append({
             "name": key_name,
             "value": key_value,
-            "enabled": _bool_value(item_dict.get("enabled"), True),
+            "enabled": True,
         })
         seen_names.add(key_name)
         seen_values.add(key_value)
@@ -220,23 +220,13 @@ def _append_model_to_provider(
     provider_index[provider]["models"].append(model)
 
 
-def _key_enabled(provider: dict[str, Any], key_name: str) -> bool:
-    for item in _as_list(provider.get("api_keys")):
-        item_dict = _as_dict(item)
-        if _string_value(item_dict.get("name")).strip() == key_name:
-            return _bool_value(item_dict.get("enabled"), True)
-    return True
-
-
 def _refresh_effective_model_enabled(providers: list[dict[str, Any]]) -> None:
     for provider in providers:
         provider_enabled = _bool_value(provider.get("enabled"), True)
         for model in _as_list(provider.get("models")):
             model_dict = _as_dict(model)
-            key_name = _string_value(model_dict.get("api_key_name")).strip()
             model_dict["enabled"] = (
                 provider_enabled
-                and _key_enabled(provider, key_name)
                 and _bool_value(model_dict.get("model_enabled"), _bool_value(model_dict.get("enabled"), True))
             )
 
@@ -258,7 +248,7 @@ def load_config(path: pathlib.Path = CONFIG_YAML) -> dict[str, Any]:
             {
                 "name": _string_value(_as_dict(item).get("name")).strip(),
                 "value": _string_value(_as_dict(item).get("value")),
-                "enabled": _bool_value(_as_dict(item).get("enabled"), True),
+                "enabled": True,
             }
             for item in _as_list(provider.get("api_keys"))
             if _string_value(_as_dict(item).get("value"))
