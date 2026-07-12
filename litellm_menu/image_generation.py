@@ -35,12 +35,14 @@ from .base import (
     _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
+    _RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
     _STREAM_ERROR_FALLBACK_METADATA_KEY,
     _STREAM_FALLBACK_METADATA_KEY,
     _UPSTREAM_METADATA_FORWARD_FLAGS,
+    _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
     _WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY,
@@ -52,6 +54,7 @@ from .base import (
     copy,
     inspect,
     io,
+    json,
     os,
     re,
     urlparse,
@@ -259,6 +262,12 @@ _CODEX_COMPACTION_UPSTREAM_HEADER_NAMES = (
 
 _CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS = 200_000
 _CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS = 2_000
+_CODEX_COMPACTION_HISTORY_TEXT_CHARS = 500_000
+_CODEX_COMPACTION_MESSAGE_ITEM_CHARS = 32_000
+_CODEX_COMPACTION_TOOL_CALL_ITEM_CHARS = 8_000
+_CODEX_COMPACTION_MIN_HISTORY_ITEM_CHARS = 128
+_CODEX_COMPACTION_DEVELOPER_MESSAGE_CHARS = 16_000
+_RESPONSES_CONTEXT_TRUNCATION_FALLBACK_HISTORY_TEXT_CHARS = 400_000
 
 
 def _request_has_responses_shape(request_kwargs: Optional[dict]) -> bool:
@@ -679,6 +688,20 @@ def _request_excluded_deployment_ids(request_kwargs: Optional[dict]) -> set[str]
     return {item for item in excluded if isinstance(item, str)}
 
 
+def _request_verified_fallback_deployment_ids(
+    request_kwargs: Optional[dict],
+) -> set[str]:
+    request_kwargs = request_kwargs or {}
+    deployment_ids = request_kwargs.get(_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY)
+    if not isinstance(deployment_ids, list):
+        return set()
+    return {
+        deployment_id
+        for deployment_id in deployment_ids
+        if isinstance(deployment_id, str) and deployment_id.strip()
+    }
+
+
 def _with_retry_target_constraints(
     deployments: List[dict],
     request_kwargs: Optional[dict],
@@ -698,6 +721,14 @@ def _with_retry_target_constraints(
             deployment
             for deployment in constrained
             if _deployment_id(deployment) not in excluded_ids
+        ]
+
+    verified_ids = _request_verified_fallback_deployment_ids(request_kwargs)
+    if verified_ids:
+        constrained = [
+            deployment
+            for deployment in constrained
+            if _deployment_id(deployment) in verified_ids
         ]
 
     return constrained
@@ -1025,8 +1056,109 @@ def _positive_int_value(value: Any) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _codex_turn_metadata_is_compaction(value: Any) -> bool:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(value, dict):
+        return False
+    request_kind = value.get("request_kind")
+    return (
+        isinstance(request_kind, str)
+        and request_kind.strip().lower() == "compaction"
+    )
+
+
+def _codex_turn_metadata_has_request_kind(value: Any) -> bool:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(value, dict):
+        return False
+    request_kind = value.get("request_kind")
+    return isinstance(request_kind, str) and bool(request_kind.strip())
+
+
+def _codex_turn_metadata_values(
+    request_kwargs: Optional[dict],
+) -> List[Any]:
+    if not isinstance(request_kwargs, dict):
+        return []
+
+    metadata_sources: List[Any] = [request_kwargs]
+    for key in (
+        "client_metadata",
+        "litellm_metadata",
+        "metadata",
+        "extra_body",
+        "litellm_params",
+    ):
+        value = request_kwargs.get(key)
+        if isinstance(value, dict):
+            metadata_sources.append(value)
+            nested_client_metadata = value.get("client_metadata")
+            if isinstance(nested_client_metadata, dict):
+                metadata_sources.append(nested_client_metadata)
+            nested_metadata = value.get("metadata")
+            if isinstance(nested_metadata, dict):
+                metadata_sources.append(nested_metadata)
+
+    values: List[Any] = list(metadata_sources)
+    for metadata in metadata_sources:
+        if not isinstance(metadata, dict):
+            continue
+        for key in ("x-codex-turn-metadata", "X-Codex-Turn-Metadata"):
+            if key in metadata:
+                values.append(metadata.get(key))
+    for headers in _incoming_request_headers(request_kwargs):
+        value = _header_value(headers, "X-Codex-Turn-Metadata")
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _request_has_structured_codex_compaction(
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+
+    input_items = request_kwargs.get("input")
+    if isinstance(input_items, list) and any(
+        isinstance(item, dict) and item.get("type") == "compaction_trigger"
+        for item in input_items
+    ):
+        return True
+
+    return any(
+        _codex_turn_metadata_is_compaction(value)
+        for value in _codex_turn_metadata_values(request_kwargs)
+    )
+
+
+def _request_has_explicit_codex_turn_kind(
+    request_kwargs: Optional[dict],
+) -> bool:
+    return any(
+        _codex_turn_metadata_has_request_kind(value)
+        for value in _codex_turn_metadata_values(request_kwargs)
+    )
+
+
 def _request_is_codex_compaction(request_kwargs: Optional[dict]) -> bool:
     if not isinstance(request_kwargs, dict):
+        return False
+    if not _request_has_responses_shape(request_kwargs):
+        return False
+    if _request_has_structured_codex_compaction(request_kwargs):
+        return True
+    if _request_has_explicit_codex_turn_kind(request_kwargs):
+        return False
+    if not _request_has_codex_client_evidence(request_kwargs):
         return False
     preview = _trace_module._trace_request_preview(request_kwargs)
     latest_user = str(preview.get("latest_user") or "").strip().lower()
@@ -1085,6 +1217,129 @@ def _with_codex_compaction_controls(request_kwargs: dict) -> Optional[dict]:
     return modified_kwargs if changed else None
 
 
+def _request_already_attempted_responses_context_truncation_fallback(
+    request_kwargs: Optional[dict],
+) -> bool:
+    for metadata_key in ("litellm_metadata", "metadata"):
+        metadata = _request_metadata_dict(request_kwargs, metadata_key)
+        if (
+            metadata is not None
+            and metadata.get(
+                _RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY
+            )
+            is True
+        ):
+            return True
+    return False
+
+
+def _explicit_responses_truncation(
+    request_kwargs: Optional[dict],
+) -> Any:
+    if not isinstance(request_kwargs, dict):
+        return None
+    if request_kwargs.get("truncation") is not None:
+        return request_kwargs.get("truncation")
+    for container_key in ("extra_body", "litellm_params"):
+        container = request_kwargs.get(container_key)
+        if isinstance(container, dict) and container.get("truncation") is not None:
+            return container.get("truncation")
+    return None
+
+
+def _request_disables_responses_truncation_fallback(
+    request_kwargs: Optional[dict],
+) -> bool:
+    explicit_truncation = _explicit_responses_truncation(request_kwargs)
+    if explicit_truncation is None:
+        return False
+    return str(explicit_truncation).strip().lower() != "auto"
+
+
+def _responses_context_truncation_fallback_kwargs(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> Optional[dict]:
+    """Retry one native Responses turn with the API's own truncation strategy.
+
+    This is deliberately separate from Codex remote compaction.  A structured
+    compaction request must be made valid before its first upstream call; an
+    ordinary turn may use the Responses API's documented ``truncation=auto``
+    compatibility fallback after the upstream establishes that the input is
+    too large.  The caller invokes the selected deployment function directly,
+    so this helper never asks the Router to choose another deployment.
+    """
+    if not isinstance(request_kwargs, dict):
+        return None
+    if not _request_has_responses_shape(request_kwargs):
+        return None
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return None
+    if _request_is_codex_compaction(request_kwargs):
+        return None
+    if _request_disables_responses_truncation_fallback(request_kwargs):
+        return None
+    if _request_already_attempted_responses_context_truncation_fallback(
+        request_kwargs
+    ):
+        return None
+    if not _routing_module._is_context_size_error(exception):
+        return None
+
+    retry_kwargs = request_kwargs.copy()
+    retry_kwargs["truncation"] = "auto"
+    emulated_truncation = _with_responses_context_auto_truncation_emulated(
+        exception,
+        retry_kwargs,
+    )
+    truncation_stats = None
+    if emulated_truncation is not None:
+        retry_kwargs, truncation_stats = emulated_truncation
+    litellm_metadata = (
+        _request_metadata_dict(retry_kwargs, "litellm_metadata") or {}
+    )
+    retry_metadata = litellm_metadata.copy()
+    retry_metadata[_RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY] = True
+    retry_kwargs["litellm_metadata"] = retry_metadata
+    _trace_module._route_trace(
+        "responses_context_truncation_fallback_start",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(
+            request_kwargs
+        ),
+        deployment_id=_routing_module._deployment_id_from_request(
+            request_kwargs
+        ),
+        route_key=_routing_module._deployment_route_key_from_request(
+            request_kwargs
+        ),
+        request=_trace_module._trace_request_summary(request_kwargs),
+        retry_request=_trace_module._trace_request_summary(retry_kwargs),
+        emulated_auto_truncation=truncation_stats,
+        exception=_routing_module._trace_exception(exception),
+    )
+    return retry_kwargs
+
+
+def _request_can_attempt_responses_context_truncation_fallback(
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    if not _request_has_responses_shape(request_kwargs):
+        return False
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return False
+    if _request_is_codex_compaction(request_kwargs):
+        return False
+    if _request_disables_responses_truncation_fallback(request_kwargs):
+        return False
+    return not _request_already_attempted_responses_context_truncation_fallback(
+        request_kwargs
+    )
+
+
 def _request_has_codex_client_evidence(request_kwargs: Optional[dict]) -> bool:
     if not isinstance(request_kwargs, dict):
         return False
@@ -1122,13 +1377,18 @@ def _request_has_codex_client_evidence(request_kwargs: Optional[dict]) -> bool:
     return False
 
 
-def _compact_tool_output_text(text: str, *, max_chars: int) -> str:
+def _compact_history_text(
+    text: str,
+    *,
+    max_chars: int,
+    label: str,
+) -> str:
     if len(text) <= max_chars:
         return text
     marker = (
-        "\n\n[LiteLLM Menu compacted historical function_call_output: "
+        f"\n\n[LiteLLM Menu compacted historical {label}: "
         f"original_chars={len(text)}, kept_chars={max_chars}. "
-        "Middle omitted before upstream to keep Codex history within context.]\n\n"
+        "Middle omitted before the compaction request to keep its input within context.]\n\n"
     )
     if len(marker) >= max_chars:
         return marker[:max_chars]
@@ -1138,72 +1398,527 @@ def _compact_tool_output_text(text: str, *, max_chars: int) -> str:
     return text[:head_chars] + marker + text[-tail_chars:]
 
 
-def _with_codex_large_tool_outputs_compacted(request_kwargs: dict) -> Optional[dict]:
+_CODEX_TOOL_OUTPUT_ITEM_TYPES = {
+    "function_call_output",
+    "custom_tool_call_output",
+    "computer_call_output",
+}
+
+_CODEX_COMPACTION_STRUCTURAL_STRING_KEYS = {
+    "call_id",
+    "id",
+    "item_id",
+    "name",
+    "role",
+    "status",
+    "type",
+}
+
+
+_RESPONSES_CONTEXT_FALLBACK_TOOL_CALL_ITEM_TYPES = {
+    "computer_call",
+    "custom_tool_call",
+    "function_call",
+}
+
+
+def _responses_context_fallback_item_call_id(item: Any) -> Optional[str]:
+    if not isinstance(item, dict):
+        return None
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id.strip():
+        return call_id.strip()
+    return None
+
+
+def _responses_context_fallback_protected_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") == "additional_tools":
+        return True
+    role = str(item.get("role") or "").strip().lower()
+    return role in {"developer", "system"}
+
+
+def _responses_context_fallback_units(
+    input_items: List[Any],
+) -> List[List[int]]:
+    """Group matching tool calls and outputs so truncation cannot orphan one."""
+    call_indices: dict[str, List[int]] = {}
+    output_indices: dict[str, List[int]] = {}
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        call_id = _responses_context_fallback_item_call_id(item)
+        if call_id is None:
+            continue
+        item_type = item.get("type")
+        if item_type in _RESPONSES_CONTEXT_FALLBACK_TOOL_CALL_ITEM_TYPES:
+            call_indices.setdefault(call_id, []).append(index)
+        elif item_type in _CODEX_TOOL_OUTPUT_ITEM_TYPES:
+            output_indices.setdefault(call_id, []).append(index)
+
+    grouped_indices: dict[int, List[int]] = {}
+    consumed: set[int] = set()
+    for call_id, calls in call_indices.items():
+        matching_outputs = output_indices.get(call_id, [])
+        if not matching_outputs:
+            continue
+        group = sorted(set(calls + matching_outputs))
+        leader = group[0]
+        grouped_indices[leader] = group
+        consumed.update(group)
+
+    units: List[List[int]] = []
+    for index in range(len(input_items)):
+        if index in grouped_indices:
+            units.append(grouped_indices[index])
+            continue
+        if index in consumed:
+            continue
+        units.append([index])
+    return units
+
+
+def _responses_context_error_text_budget(
+    exception: Exception,
+    *,
+    original_text_chars: int,
+) -> int:
+    """Choose a conservative retry budget, using upstream token counts when present."""
+    default_budget = min(
+        original_text_chars,
+        _RESPONSES_CONTEXT_TRUNCATION_FALLBACK_HISTORY_TEXT_CHARS,
+    )
+    text = _routing_module._exception_text(exception)
+    maximum_match = re.search(
+        r"max(?:imum)?\s+context(?:\s+(?:length|window))?"
+        r"(?:\s+is|\s+of|\s*:)?\s*([\d,]+)\s*tokens?",
+        text,
+    )
+    input_match = re.search(
+        r"(?:input\s+(?:contains|has)|prompt\s+(?:contains|has)|requested)"
+        r"[^\d]{0,48}([\d,]+)\s*tokens?",
+        text,
+    )
+    if maximum_match is None or input_match is None:
+        return default_budget
+    try:
+        maximum_tokens = int(maximum_match.group(1).replace(",", ""))
+        input_tokens = int(input_match.group(1).replace(",", ""))
+    except (TypeError, ValueError):
+        return default_budget
+    if maximum_tokens <= 0 or input_tokens <= 0:
+        return default_budget
+    scaled_budget = int(
+        original_text_chars * min(1.0, maximum_tokens / input_tokens) * 0.85
+    )
+    return max(16_000, min(original_text_chars, scaled_budget))
+
+
+def _with_responses_context_auto_truncation_emulated(
+    exception: Exception,
+    request_kwargs: dict,
+) -> Optional[tuple[dict, dict[str, Any]]]:
+    """Emulate Responses ``truncation=auto`` for compatible upstreams.
+
+    Some OpenAI-compatible endpoints accept the parameter but do not implement
+    its required oldest-first item eviction.  This helper runs only after that
+    endpoint has returned a context-window error.  It preserves protected
+    instructions and a newest contiguous history suffix, and never separates a
+    matching tool call from its output.
+    """
+    input_items = request_kwargs.get("input")
+    if not isinstance(input_items, list) or len(input_items) < 2:
+        return None
+
+    original_text_chars = _compaction_text_length(input_items)
+    text_budget = _responses_context_error_text_budget(
+        exception,
+        original_text_chars=original_text_chars,
+    )
+    if original_text_chars <= text_budget:
+        return None
+
+    units = _responses_context_fallback_units(input_items)
+    protected_units = {
+        unit_index
+        for unit_index, unit in enumerate(units)
+        if any(
+            _responses_context_fallback_protected_item(input_items[index])
+            for index in unit
+        )
+    }
+    newest_unit = next(
+        (
+            unit_index
+            for unit_index, unit in enumerate(units)
+            if len(input_items) - 1 in unit
+        ),
+        len(units) - 1,
+    )
+    selected_units = set(protected_units)
+    selected_units.add(newest_unit)
+    kept_text_chars = sum(
+        _compaction_text_length(input_items[index])
+        for unit_index in selected_units
+        for index in units[unit_index]
+    )
+
+    for unit_index in reversed(range(len(units))):
+        if unit_index in selected_units:
+            continue
+        unit = units[unit_index]
+        unit_text_chars = sum(
+            _compaction_text_length(input_items[index]) for index in unit
+        )
+        if kept_text_chars + unit_text_chars > text_budget:
+            break
+        selected_units.add(unit_index)
+        kept_text_chars += unit_text_chars
+
+    kept_indices = {
+        index
+        for unit_index in selected_units
+        for index in units[unit_index]
+    }
+    if len(kept_indices) == len(input_items):
+        return None
+
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = [
+        item for index, item in enumerate(input_items) if index in kept_indices
+    ]
+    stats = {
+        "strategy": "protected-plus-newest-contiguous-suffix",
+        "original_items": len(input_items),
+        "kept_items": len(modified_kwargs["input"]),
+        "dropped_items": len(input_items) - len(modified_kwargs["input"]),
+        "original_text_chars": original_text_chars,
+        "kept_text_chars": _compaction_text_length(modified_kwargs["input"]),
+        "text_budget": text_budget,
+        "protected_items": sum(
+            len(units[unit_index]) for unit_index in protected_units
+        ),
+    }
+    return modified_kwargs, stats
+
+
+def _compaction_text_length(value: Any, *, depth: int = 0) -> int:
+    if depth > 16:
+        return 0
+    if isinstance(value, str):
+        if value.startswith("data:image/"):
+            return 0
+        return len(value)
+    if isinstance(value, list):
+        return sum(
+            _compaction_text_length(item, depth=depth + 1)
+            for item in value
+        )
+    if isinstance(value, dict):
+        if value.get("type") in {"input_image", "image_url"}:
+            return 0
+        return sum(
+            _compaction_text_length(item, depth=depth + 1)
+            for key, item in value.items()
+            if key not in _CODEX_COMPACTION_STRUCTURAL_STRING_KEYS
+        )
+    return 0
+
+
+def _tool_output_text_length(value: Any, *, depth: int = 0) -> int:
+    return _compaction_text_length(value, depth=depth)
+
+
+def _tool_output_string_allocations(lengths: List[int], max_chars: int) -> List[int]:
+    if not lengths:
+        return []
+    total = sum(lengths)
+    if total <= max_chars:
+        return list(lengths)
+
+    allocations = [0] * len(lengths)
+    remaining_budget = max(0, max_chars)
+    remaining = sorted(range(len(lengths)), key=lambda index: lengths[index])
+    while remaining:
+        even_share, remainder = divmod(remaining_budget, len(remaining))
+        smallest = remaining[0]
+        if lengths[smallest] <= even_share:
+            allocations[smallest] = lengths[smallest]
+            remaining_budget -= lengths[smallest]
+            remaining.pop(0)
+            continue
+        for position, index in enumerate(remaining):
+            allocations[index] = even_share + (1 if position < remainder else 0)
+        break
+    return allocations
+
+
+def _compact_history_value(
+    value: Any,
+    *,
+    max_chars: int,
+    label: str,
+) -> Any:
+    lengths: List[int] = []
+
+    def collect(item: Any, depth: int = 0) -> None:
+        if depth > 16:
+            return
+        if isinstance(item, str):
+            if not item.startswith("data:image/"):
+                lengths.append(len(item))
+            return
+        if isinstance(item, list):
+            for nested in item:
+                collect(nested, depth + 1)
+            return
+        if isinstance(item, dict):
+            if item.get("type") in {"input_image", "image_url"}:
+                return
+            for key, nested in item.items():
+                if key not in _CODEX_COMPACTION_STRUCTURAL_STRING_KEYS:
+                    collect(nested, depth + 1)
+
+    collect(value)
+    allocations = iter(_tool_output_string_allocations(lengths, max_chars))
+
+    def compact(item: Any, depth: int = 0) -> Any:
+        if depth > 16:
+            return copy.deepcopy(item)
+        if isinstance(item, str):
+            if item.startswith("data:image/"):
+                return item
+            allocation = next(allocations, len(item))
+            return _compact_history_text(
+                item,
+                max_chars=allocation,
+                label=label,
+            )
+        if isinstance(item, list):
+            return [compact(nested, depth + 1) for nested in item]
+        if isinstance(item, dict):
+            if item.get("type") in {"input_image", "image_url"}:
+                return copy.deepcopy(item)
+            return {
+                key: (
+                    copy.deepcopy(nested)
+                    if key in _CODEX_COMPACTION_STRUCTURAL_STRING_KEYS
+                    else compact(nested, depth + 1)
+                )
+                for key, nested in item.items()
+            }
+        return copy.deepcopy(item)
+
+    return compact(value)
+
+
+def _recent_weighted_allocations(
+    maximums: List[int],
+    *,
+    total_budget: int,
+    minimums: Optional[List[int]] = None,
+    protected_indices: Optional[List[int]] = None,
+) -> List[int]:
+    allocations = [0] * len(maximums)
+    remaining = max(0, total_budget)
+    minimums = minimums or [0] * len(maximums)
+
+    for index in protected_indices or []:
+        amount = min(maximums[index], minimums[index], remaining)
+        allocations[index] += amount
+        remaining -= amount
+
+    for index in reversed(range(len(maximums))):
+        amount = min(
+            maximums[index] - allocations[index],
+            max(0, minimums[index] - allocations[index]),
+            remaining,
+        )
+        allocations[index] += amount
+        remaining -= amount
+
+    for index in reversed(range(len(maximums))):
+        amount = min(maximums[index] - allocations[index], remaining)
+        allocations[index] += amount
+        remaining -= amount
+        if remaining <= 0:
+            break
+    return allocations
+
+
+def _compaction_history_fields(
+    input_items: List[Any],
+) -> List[tuple[int, str, str, int, int, int, bool]]:
+    fields: List[tuple[int, str, str, int, int, int, bool]] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        role = str(item.get("role") or "").strip().lower()
+        if item_type in _CODEX_TOOL_OUTPUT_ITEM_TYPES:
+            key = "output"
+            label = "tool output"
+            maximum = _compaction_text_length(item.get(key))
+            minimum = min(maximum, _CODEX_COMPACTION_MIN_HISTORY_ITEM_CHARS)
+            protected = False
+        elif item_type in {"function_call", "custom_tool_call", "computer_call"}:
+            key = "input" if "input" in item else "arguments"
+            label = "tool call input"
+            length = _compaction_text_length(item.get(key))
+            maximum = min(length, _CODEX_COMPACTION_TOOL_CALL_ITEM_CHARS)
+            minimum = min(maximum, _CODEX_COMPACTION_MIN_HISTORY_ITEM_CHARS)
+            protected = False
+        elif item_type == "message" or role in {
+            "assistant",
+            "developer",
+            "system",
+            "user",
+        }:
+            key = "content"
+            label = "message text"
+            length = _compaction_text_length(item.get(key))
+            maximum = min(length, _CODEX_COMPACTION_MESSAGE_ITEM_CHARS)
+            protected = role in {"developer", "system"}
+            minimum = min(
+                maximum,
+                _CODEX_COMPACTION_DEVELOPER_MESSAGE_CHARS
+                if protected
+                else _CODEX_COMPACTION_MIN_HISTORY_ITEM_CHARS,
+            )
+        else:
+            continue
+        length = _compaction_text_length(item.get(key))
+        if length:
+            fields.append(
+                (index, key, label, length, maximum, minimum, protected)
+            )
+    return fields
+
+
+def _with_codex_compaction_input_bounded(
+    request_kwargs: dict,
+) -> Optional[dict]:
     if request_kwargs.get("use_chat_completions_api") is True:
         return None
     if not _request_has_responses_shape(request_kwargs):
         return None
-    if not _request_has_codex_client_evidence(request_kwargs):
+    if not _request_is_codex_compaction(request_kwargs):
         return None
 
     input_items = request_kwargs.get("input")
     if not isinstance(input_items, list):
         return None
 
-    output_lengths: List[int] = []
-    for item in input_items:
-        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+    original_fields = _compaction_history_fields(input_items)
+    original_history_text_chars = sum(field[3] for field in original_fields)
+    updated_items = list(input_items)
+    output_entries: List[tuple[int, int]] = []
+    for index, item in enumerate(input_items):
+        if (
+            not isinstance(item, dict)
+            or item.get("type") not in _CODEX_TOOL_OUTPUT_ITEM_TYPES
+        ):
             continue
         output = item.get("output")
-        if isinstance(output, str):
-            output_lengths.append(len(output))
+        output_length = _tool_output_text_length(output)
+        if output_length:
+            output_entries.append((index, output_length))
 
-    total_output_chars = sum(output_lengths)
-    if total_output_chars <= _CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS:
-        return None
-
-    updated_items: List[Any] = []
+    total_output_chars = sum(length for _index, length in output_entries)
     truncated_count = 0
-    kept_output_chars = 0
-    for item in input_items:
-        if not isinstance(item, dict) or item.get("type") != "function_call_output":
-            updated_items.append(item)
-            continue
-        output = item.get("output")
-        if not isinstance(output, str) or len(output) <= _CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS:
-            updated_items.append(item)
-            if isinstance(output, str):
-                kept_output_chars += len(output)
-            continue
-        compacted_output = _compact_tool_output_text(
-            output,
-            max_chars=_CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS,
+    if total_output_chars > _CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS:
+        output_maximums = [
+            min(length, _CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS)
+            for _index, length in output_entries
+        ]
+        output_minimums = [
+            min(maximum, _CODEX_COMPACTION_MIN_HISTORY_ITEM_CHARS)
+            for maximum in output_maximums
+        ]
+        output_allocations = _recent_weighted_allocations(
+            output_maximums,
+            total_budget=_CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS,
+            minimums=output_minimums,
         )
-        updated_item = item.copy()
-        updated_item["output"] = compacted_output
-        updated_items.append(updated_item)
-        truncated_count += 1
-        kept_output_chars += len(compacted_output)
+        for (item_index, output_length), allocation in zip(
+            output_entries,
+            output_allocations,
+        ):
+            if output_length <= allocation:
+                continue
+            item = updated_items[item_index]
+            assert isinstance(item, dict)
+            updated_item = item.copy()
+            updated_item["output"] = _compact_history_value(
+                item.get("output"),
+                max_chars=allocation,
+                label="tool output",
+            )
+            updated_items[item_index] = updated_item
+            truncated_count += 1
+
+    fields = _compaction_history_fields(updated_items)
+    history_text_chars_after_output_bound = sum(field[3] for field in fields)
+    if history_text_chars_after_output_bound > _CODEX_COMPACTION_HISTORY_TEXT_CHARS:
+        maximums = [field[4] for field in fields]
+        minimums = [field[5] for field in fields]
+        protected_indices = [
+            index for index, field in enumerate(fields) if field[6]
+        ]
+        allocations = _recent_weighted_allocations(
+            maximums,
+            total_budget=_CODEX_COMPACTION_HISTORY_TEXT_CHARS,
+            minimums=minimums,
+            protected_indices=protected_indices,
+        )
+        for field, allocation in zip(fields, allocations):
+            item_index, key, label, length, _maximum, _minimum, _protected = field
+            if length <= allocation:
+                continue
+            item = updated_items[item_index]
+            assert isinstance(item, dict)
+            updated_item = item.copy()
+            updated_item[key] = _compact_history_value(
+                item.get(key),
+                max_chars=allocation,
+                label=label,
+            )
+            updated_items[item_index] = updated_item
+            truncated_count += 1
 
     if truncated_count == 0:
         return None
 
     modified_kwargs = request_kwargs.copy()
     modified_kwargs["input"] = updated_items
+    bounded_fields = _compaction_history_fields(updated_items)
+    bounded_history_chars = sum(field[3] for field in bounded_fields)
+    kept_output_chars = sum(
+        _tool_output_text_length(item.get("output"))
+        for item in updated_items
+        if isinstance(item, dict)
+        and item.get("type") in _CODEX_TOOL_OUTPUT_ITEM_TYPES
+    )
     _trace_module._route_trace(
-        "codex_large_tool_outputs_compacted",
+        "codex_compaction_input_bounded",
         request_id=_routing_module._trace_request_id(request_kwargs),
         session=_routing_module._trace_session_context(request_kwargs),
         model_group=_responses_execution_module._request_model_group(request_kwargs),
         deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
         route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
         input_items=len(input_items),
-        function_call_outputs=len(output_lengths),
-        truncated_function_call_outputs=truncated_count,
+        tool_call_outputs=len(output_entries),
+        truncated_history_fields=truncated_count,
         original_output_chars=total_output_chars,
         compacted_output_chars=kept_output_chars,
+        original_history_text_chars=original_history_text_chars,
+        history_text_chars_after_output_bound=history_text_chars_after_output_bound,
+        bounded_history_text_chars=bounded_history_chars,
         per_item_limit=_CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS,
-        total_threshold=_CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS,
+        tool_output_total_limit=_CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS,
+        history_text_total_limit=_CODEX_COMPACTION_HISTORY_TEXT_CHARS,
     )
     return modified_kwargs
 

@@ -75,6 +75,7 @@ class LiteLLMMenuHook(CustomLogger):
             _image_generation_module._with_internal_litellm_metadata,
             _image_generation_module._with_empty_tool_controls_removed,
             _image_generation_module._with_codex_compaction_controls,
+            _image_generation_module._with_codex_compaction_input_bounded,
             _image_generation_module._with_responses_native_extra_body,
             _image_generation_module._with_codex_compaction_headers,
             _image_generation_module._with_stream_request_timeout,
@@ -188,7 +189,10 @@ class LiteLLMMenuHook(CustomLogger):
         if request_data.get("stream") is not True:
             _routing_module._record_deployment_success_for_cooldown(request_data)
         response = _image_generation_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
-        response = _responses_web_search_bridge_module._sanitize_response_stream_payload(response)
+        response = _responses_web_search_bridge_module._sanitize_response_stream_payload(
+            response,
+            request_data,
+        )
         if _tools_module._request_is_unmarked_internal_web_search_bridge_post_call(request_data):
             return response
         if (
@@ -249,9 +253,20 @@ class LiteLLMMenuHook(CustomLogger):
         request_data: dict,
     ) -> AsyncIterator[Any]:
         def deliver_chunk(chunk: Any) -> Any:
-            return _streaming_module._responses_stream_chunk_for_delivery(chunk)
+            return _streaming_module._responses_stream_chunk_for_delivery(
+                chunk,
+                request_data,
+            )
 
         response = _image_generation_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
+        if (
+            _tools_module._request_has_web_search_tool(request_data)
+            and _image_generation_module._response_is_async_iterable(response)
+        ):
+            response = _responses_web_search_bridge_module._adapt_provider_hidden_web_search_stream(
+                response,
+                request_data,
+            )
         if (
             not _tools_module._request_has_image_generation_tool(request_data)
             or _image_generation_module._request_forces_image_generation_tool(request_data)

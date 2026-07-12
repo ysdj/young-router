@@ -1491,6 +1491,7 @@ class HookRoutingTests(HookTestCase):
                 "model": "default-chat",
                 "_target_order": 3,
                 "_excluded_deployment_ids": ["plus-a"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["pro-a"],
             },
         )
 

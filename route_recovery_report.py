@@ -41,12 +41,25 @@ RECOVERY_CSS = r"""
 .flag-cooldown { color: var(--amber); border-color: #e5c17b; background: #fff7e8; }
 .flag-current { color: var(--blue); border-color: #b9d2f0; background: #eef6ff; }
 .raw-record pre { margin: 0; }
+.countdown-badge {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.request-card.countdown-expired .countdown-badge {
+  color: #9a3412;
+}
+[data-countdown-until] {
+  font-variant-numeric: tabular-nums;
+}
 """
 
 RECOVERY_JS = r"""
 const cards = Array.from(document.querySelectorAll('.request-card'));
 const search = document.getElementById('search');
 const buttons = Array.from(document.querySelectorAll('button[data-filter]'));
+const countdownNodes = Array.from(document.querySelectorAll('[data-countdown-until]'));
+const generatedAt = Number(document.body.dataset.generatedAt || Date.now() / 1000);
+const clockSkewMs = Date.now() - (generatedAt * 1000);
 let activeFilter = 'all';
 
 function applyFilters() {
@@ -61,6 +74,40 @@ function applyFilters() {
   }
 }
 
+function durationLabel(seconds) {
+  const value = Math.max(0, Number(seconds) || 0);
+  if (value < 1) return `${Math.floor(value * 1000)} ms`;
+  if (value < 60) return `${value.toFixed(1)} s`;
+  const minutes = Math.floor(value / 60);
+  const remainder = Math.floor(value % 60);
+  if (minutes < 60) return `${minutes}m ${remainder}s`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return `${hours}h ${mins}m`;
+}
+
+function nowEpoch() {
+  return (Date.now() - clockSkewMs) / 1000;
+}
+
+function tickCountdowns() {
+  const now = nowEpoch();
+  for (const node of countdownNodes) {
+    const until = Number(node.dataset.countdownUntil || 0);
+    if (!Number.isFinite(until) || until <= 0) continue;
+    const remaining = Math.max(0, until - now);
+    const label = remaining > 0 ? durationLabel(remaining) : 'expired';
+    node.textContent = label;
+    const card = node.closest('.request-card');
+    if (card) {
+      card.dataset.remainingSeconds = remaining.toFixed(3);
+      if (remaining <= 0) {
+        card.classList.add('countdown-expired');
+      }
+    }
+  }
+}
+
 search.addEventListener('input', applyFilters);
 for (const button of buttons) {
   button.addEventListener('click', () => {
@@ -71,6 +118,10 @@ for (const button of buttons) {
 }
 document.getElementById('expand').addEventListener('click', () => cards.forEach(card => card.open = true));
 document.getElementById('collapse').addEventListener('click', () => cards.forEach(card => card.open = false));
+tickCountdowns();
+if (countdownNodes.length) {
+  setInterval(tickCountdowns, 250);
+}
 """
 
 
@@ -108,6 +159,43 @@ def duration_label(seconds: Any) -> str:
         return f"{int(minutes)}m {int(remainder)}s"
     hours, minutes = divmod(minutes, 60)
     return f"{int(hours)}h {int(minutes)}m"
+
+
+def countdown_attr(until: Any) -> str:
+    parsed = number(until)
+    if parsed is None or parsed <= 0:
+        return ""
+    return f' data-countdown-until="{esc(f"{parsed:.3f}")}"'
+
+
+def countdown_text(record: dict[str, Any], *, fallback: str = "-") -> str:
+    remaining = number(record.get("remaining_poll_seconds"))
+    if remaining is None:
+        remaining = number(record.get("remaining_seconds"))
+    if remaining is None:
+        return fallback
+    return duration_label(remaining)
+
+
+def countdown_detail_row(label: str, record: dict[str, Any]) -> str:
+    value = countdown_text(record)
+    until = number(record.get("cooldown_until"))
+    attrs = countdown_attr(until) if until is not None and until > 0 else ""
+    return (
+        '<div class="detail-row">'
+        f'<span class="detail-key">{esc(label)}</span>'
+        f'<span class="detail-value countdown-badge"{attrs}>{esc(value)}</span>'
+        '</div>'
+    )
+
+
+def cooldown_ends_at_row(record: dict[str, Any]) -> str:
+    if record.get("source") != "cooldown":
+        return ""
+    ends_at = iso_from_epoch(record.get("cooldown_until"))
+    if not ends_at:
+        return ""
+    return detail_row("ends at", ends_at)
 
 
 def load_json(path: str) -> dict[str, Any]:
@@ -254,6 +342,7 @@ def cooldown_thread_record(row: dict[str, Any]) -> dict[str, Any]:
         "deployment_order": row.get("deployment_order"),
         "attempt": row.get("failures"),
         "remaining_poll_seconds": row.get("remaining_seconds"),
+        "cooldown_until": row.get("cooldown_until"),
         "updated_at": iso_from_epoch(row.get("cooldown_until")) or row.get("updated_at"),
         "stuck": {"reason": "deployment_cooldown"},
         "exception": {"type": "deployment_cooldown", "reason": row.get("cooldown_key")},
@@ -298,7 +387,8 @@ def thread_detail_panels(record: dict[str, Any]) -> str:
         f'{detail_row("status", record.get("status"))}'
         f'{detail_row("attempt", record.get("attempt"))}'
         f'{detail_row("elapsed", duration_label(record.get("elapsed_seconds")))}'
-        f'{detail_row("remaining", duration_label(record.get("remaining_poll_seconds")))}'
+        f'{countdown_detail_row("remaining", record)}'
+        f'{cooldown_ends_at_row(record)}'
         f'{detail_row("max poll", duration_label(record.get("max_poll_seconds")))}'
         f'{detail_row("poll interval", duration_label(record.get("poll_interval_seconds")))}'
         f'{detail_row("target order", record.get("target_order"))}'
@@ -365,15 +455,39 @@ def thread_card(record: dict[str, Any]) -> str:
     for key in ("provider", "upstream_model", "api_base_host", "route_key"):
         if record.get(key):
             meta.append(f"{key}={record.get(key)}")
+    cooldown_until = number(record.get("cooldown_until"))
+    countdown_attrs = countdown_attr(cooldown_until)
+    remaining_label = countdown_text(record, fallback="")
+    if source == "cooldown" and remaining_label:
+        duration_html = (
+            f'<span class="duration-badge countdown-badge"{countdown_attrs}>'
+            f'{esc(remaining_label)}</span>'
+        )
+    else:
+        duration_html = (
+            f'<span class="duration-badge">{esc(duration_label(record.get("elapsed_seconds")))}</span>'
+        )
+    card_attrs = (
+        f'data-search="{esc(search_text)}" '
+        f'data-source="{esc(source)}" data-status="{esc(status)}" '
+        f'data-fallback="false" data-image="false"'
+    )
+    if source == "cooldown" and cooldown_until is not None and cooldown_until > 0:
+        remaining_value = number(record.get("remaining_poll_seconds")) or 0.0
+        until_text = f"{cooldown_until:.3f}"
+        remaining_text = f"{remaining_value:.3f}"
+        card_attrs += (
+            f' data-countdown-until="{esc(until_text)}" '
+            f'data-remaining-seconds="{esc(remaining_text)}"'
+        )
     return (
-        f'<details class="request-card" data-search="{esc(search_text)}" '
-        f'data-source="{esc(source)}" data-status="{esc(status)}" data-fallback="false" data-image="false">'
+        f'<details class="request-card" {card_attrs}>'
         '<summary>'
         '<div class="summary-top">'
         '<div class="summary-left">'
         f'<span class="request-id">{esc(request_id)}</span>'
         f'<span class="time-badge">{esc(record_time_label(record))}</span>'
-        f'<span class="duration-badge">{esc(duration_label(record.get("elapsed_seconds")))}</span>'
+        f'{duration_html}'
         f'<span class="model">{esc(model)}</span>'
         f'{session_html(session)}'
         '</div>'
@@ -444,10 +558,10 @@ def render(*, recovery_state_path: str, cooldown_state_path: str, recent_request
 {RECOVERY_CSS}
 </style>
 </head>
-<body>
+<body data-generated-at="{esc(f'{now_epoch:.3f}')}">
 <header>
   <h1>LiteLLM Recovery</h1>
-  <div class="sub">Generated {esc(now_label)}. Current recovering/cooldown entries use the same card layout as Route Trace.</div>
+  <div class="sub">Generated {esc(now_label)}. Cooldown remaining times tick down live in this page; refresh for recovery status changes.</div>
   <div class="toolbar">
     <input id="search" type="search" placeholder="Search thread id, request id, model, provider, route, exception">
     <button data-filter="all" class="active">All</button>

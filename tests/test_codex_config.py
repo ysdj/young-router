@@ -97,7 +97,7 @@ class CodexConfigTests(unittest.TestCase):
             self.assertIn('base_url = "http://127.0.0.1:4000/v1"', config)
             self.assertIn('wire_api = "responses"', config)
             self.assertIn("requires_openai_auth = true", config)
-            self.assertIn('name = "User display name"', config)
+            self.assertIn('name = "OpenAI"', config)
             self.assertIn("request_max_retries = 7", config)
             self.assertIn("[mcp_servers.example]", config)
             self.assertEqual(auth["OPENAI_API_KEY"], "sk-test-runtime")
@@ -106,7 +106,7 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual(list(codex_home.glob("*.bak*")), [])
 
             state = json.loads((codex_home / STATE_FILE).read_text(encoding="utf-8"))
-            self.assertEqual(state["schema_version"], 2)
+            self.assertEqual(state["schema_version"], 3)
             self.assertEqual(state["config"]["top_level"]["model_provider"]["value"], "remote")
             self.assertEqual(
                 state["config"]["providers"]["newapi"]["fields"]["base_url"]["value"],

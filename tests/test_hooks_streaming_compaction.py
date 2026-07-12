@@ -768,7 +768,7 @@ class HookStreamingCompactionTests(HookTestCase):
                 raise UpstreamError(f"upstream 500 from {selected_id}")
 
         proxy_server.llm_router = FakeRouter()
-        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.02")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.1")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
         request_data = {
             "model": "default-chat",

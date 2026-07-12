@@ -146,7 +146,18 @@ def _litellm_web_search_query_from_call(call: dict[str, Any]) -> Optional[str]:
 def _external_web_search_clean_url(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
-    url = value.strip().rstrip(").,;]")
+    url = value.strip().rstrip(".,;:]}")
+    # Provider text may append a Markdown citation immediately after the URL,
+    # with or without a sentence-ending period before the marker, e.g.
+    # ``https://example.test/page[[1]](https://example.test/page)``.
+    # Keep only the actual URL so source lists never expose citation markup.
+    citation_marker = re.search(r"\[\[\d+\]\]\(https?://", url)
+    if citation_marker:
+        url = url[: citation_marker.start()].rstrip(".,;:]}")
+    # Preserve balanced parentheses in real URL paths, but remove a bare
+    # closing parenthesis that came from surrounding Markdown punctuation.
+    while url.endswith(")") and url.count(")") > url.count("("):
+        url = url[:-1].rstrip(".,;:]}")
     if not url.startswith(("http://", "https://")):
         return None
     return url
@@ -523,6 +534,9 @@ _PROVIDER_HOSTED_WEB_SEARCH_ITEM_TYPES = {
     "openrouter_web_search",
 }
 
+_PROVIDER_HIDDEN_WEB_SEARCH_REASONING_ID_PREFIX = "tco_"
+_PROVIDER_HIDDEN_WEB_SEARCH_DISPLAY_QUERY = "Web search"
+
 _RAW_TOOL_CALL_START = "<tool_call"
 _RAW_TOOL_CALL_END = "</tool_call>"
 _RAW_TOOL_CALL_BLOCK_RE = re.compile(r"(?is)<tool_call\b[^>]*>.*?</tool_call>")
@@ -614,6 +628,324 @@ def _is_provider_hosted_web_search_item(item: Any) -> bool:
     if not isinstance(item, dict):
         return False
     return _provider_hosted_web_search_type(item.get("type")) is not None
+
+
+def _provider_hidden_web_search_reasoning_item(item: Any) -> bool:
+    if not isinstance(item, dict) or item.get("type") != "reasoning":
+        return False
+    item_id = item.get("id")
+    return (
+        isinstance(item_id, str)
+        and item_id.startswith(_PROVIDER_HIDDEN_WEB_SEARCH_REASONING_ID_PREFIX)
+    )
+
+
+def _provider_hidden_web_search_primary_reasoning_item(item: Any) -> bool:
+    if not _provider_hidden_web_search_reasoning_item(item):
+        return False
+    item_id = str(item.get("id") or "")
+    index_match = re.search(r"-(\d+)$", item_id)
+    return index_match is None or index_match.group(1) == "0"
+
+
+def _is_provider_hidden_web_search_call_item(item: Any) -> bool:
+    if not isinstance(item, dict) or item.get("type") != "web_search_call":
+        return False
+    item_id = item.get("id")
+    return isinstance(item_id, str) and item_id.startswith(
+        f"ws_{_PROVIDER_HIDDEN_WEB_SEARCH_REASONING_ID_PREFIX}"
+    )
+
+
+def _provider_hidden_web_search_query(request_kwargs: Optional[dict]) -> str:
+    # The provider's encrypted ``tco_*`` item proves that native search ran,
+    # but does not reveal its internal query planning.  Do not present the
+    # user's whole prompt (or a guessed rewrite) as if it were the real query.
+    return _PROVIDER_HIDDEN_WEB_SEARCH_DISPLAY_QUERY
+
+
+def _provider_hidden_web_search_call_item(
+    item: Any,
+    request_kwargs: Optional[dict],
+    source_urls: Optional[list[str]] = None,
+    *,
+    status: str = "completed",
+) -> Optional[dict[str, Any]]:
+    if (
+        not _tools_module._request_has_web_search_tool(request_kwargs)
+        or not _provider_hidden_web_search_primary_reasoning_item(item)
+    ):
+        return None
+    item_id = item.get("id")
+    search_item = _external_web_search_call_item_for_action(
+        {
+            "type": "search",
+            "query": _provider_hidden_web_search_query(request_kwargs),
+        },
+        source_urls,
+    )
+    if search_item is None:
+        return None
+    search_item["id"] = f"ws_{item_id}"
+    search_item["status"] = status
+    return search_item
+
+
+class _ProviderHiddenWebSearchStreamAdapter:
+    """Expose provider-private ``tco_*`` search reasoning as Responses events.
+
+    Some OpenAI-compatible providers execute web search but encode the call as a
+    private reasoning item instead of emitting ``web_search_call`` events.  Keep
+    the conversion deliberately narrow: it is enabled only when the client sent
+    a native ``web_search`` tool and only recognizes the provider's stable
+    ``tco_`` item id prefix.  Private reasoning text is never forwarded.
+    """
+
+    def __init__(self, request_kwargs: Optional[dict]) -> None:
+        self.request_kwargs = request_kwargs or {}
+        self.enabled = _tools_module._request_has_web_search_tool(self.request_kwargs)
+        self._seen_reasoning_ids: set[str] = set()
+        self._search_items: dict[str, dict[str, Any]] = {}
+        self._output_indexes: dict[str, int] = {}
+        self._source_urls: list[str] = []
+        self._next_output_index = 0
+        self._sequence_number = 0
+        self._completed_item_ids: set[str] = set()
+
+    @property
+    def active(self) -> bool:
+        return bool(self._search_items)
+
+    def _encode(self, event: dict[str, Any]) -> Any:
+        return _streaming_module._json_stream_event(event)
+
+    def _remember_urls(self, value: Any) -> None:
+        for url in _provider_hosted_web_search_source_urls(value):
+            if url not in self._source_urls:
+                self._source_urls.append(url)
+
+    def _observe_sequence_number(self, value: Any) -> None:
+        if isinstance(value, int) and value > self._sequence_number:
+            self._sequence_number = value
+
+    def _next_sequence_number(self) -> int:
+        self._sequence_number += 1
+        return self._sequence_number
+
+    def _item_events(self, item_id: str, output_index: int) -> list[Any]:
+        item = self._search_items[item_id]
+        action = copy.deepcopy(item.get("action", {}))
+        added = copy.deepcopy(item)
+        added["status"] = "in_progress"
+        events: list[Any] = [
+            self._encode(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": added,
+                }
+            )
+        ]
+        for event_type in (
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+        ):
+            events.append(
+                self._encode(
+                    {
+                        "type": event_type,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "sequence_number": self._next_sequence_number(),
+                        "action": copy.deepcopy(action),
+                    }
+                )
+            )
+        return events
+
+    def _start_for_item(self, item: Any, output_index: Any = None) -> list[Any]:
+        if not self.enabled or not _provider_hidden_web_search_primary_reasoning_item(item):
+            return []
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(item_id, str) or not item_id or item_id in self._seen_reasoning_ids:
+            return []
+        self._seen_reasoning_ids.add(item_id)
+        if not isinstance(output_index, int) or output_index < 0:
+            output_index = self._next_output_index
+        self._next_output_index = max(self._next_output_index, output_index + 1)
+        search_item = _provider_hidden_web_search_call_item(
+            item,
+            self.request_kwargs,
+            self._source_urls,
+            status="in_progress",
+        )
+        if search_item is None:
+            return []
+        search_item_id = str(search_item["id"])
+        self._search_items[search_item_id] = search_item
+        self._output_indexes[search_item_id] = output_index
+        return self._item_events(search_item_id, output_index)
+
+    def _completed_events(self) -> list[Any]:
+        events: list[Any] = []
+        for item_id, item in self._search_items.items():
+            if item_id in self._completed_item_ids:
+                continue
+            output_index = self._output_indexes[item_id]
+            completed = copy.deepcopy(item)
+            completed["status"] = "completed"
+            _external_web_search_apply_source_urls(completed["action"], self._source_urls)
+            events.append(
+                self._encode(
+                    {
+                        "type": "response.web_search_call.completed",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "sequence_number": self._next_sequence_number(),
+                        "action": copy.deepcopy(completed.get("action", {})),
+                    }
+                )
+            )
+            events.append(
+                self._encode(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": completed,
+                    }
+                )
+            )
+            self._search_items[item_id] = completed
+            self._completed_item_ids.add(item_id)
+        return events
+
+    def _completion_response(self, response: Any) -> Any:
+        payload = _streaming_module._jsonable(response)
+        if not isinstance(payload, dict):
+            return response
+        payload = _sanitize_response_web_search_call_items(
+            payload,
+            self.request_kwargs,
+        )
+        return payload
+
+    def consume(self, chunk: Any) -> list[Any]:
+        if not self.enabled:
+            return [chunk]
+        dumped = _streaming_module._stream_chunk_dump(chunk)
+        if not isinstance(dumped, dict) or not dumped:
+            return [chunk]
+        self._observe_sequence_number(dumped.get("sequence_number"))
+        self._remember_urls(dumped)
+        chunk_type = _streaming_module._stream_chunk_type(dumped)
+        events: list[Any] = []
+        if chunk_type in {
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.reasoning_item.added",
+            "response.reasoning_item.done",
+        }:
+            item = dumped.get("item")
+            if _provider_hidden_web_search_reasoning_item(item):
+                events.extend(self._start_for_item(item, dumped.get("output_index")))
+                if chunk_type == "response.output_item.done" and not self._search_items:
+                    return events
+                return events
+        if chunk_type.startswith("response.reasoning"):
+            # Reasoning deltas/items are provider-private; only the stable item
+            # id on an output-item event can identify a search call.
+            return events
+        if chunk_type == "response.output_text.annotation.added" and self.active:
+            events.extend(self._completed_events())
+        if chunk_type == "response.completed":
+            # Responses Lite/provider adapters sometimes omit the individual
+            # output-item events and expose the private reasoning item only in
+            # the terminal response.  Synthesize the same lifecycle in that
+            # case so clients do not see a completed search with no progress.
+            completed_response = dumped.get("response")
+            completed_output = (
+                completed_response.get("output")
+                if isinstance(completed_response, dict)
+                else None
+            )
+            if isinstance(completed_output, list):
+                for output_index, item in enumerate(completed_output):
+                    events.extend(self._start_for_item(item, output_index))
+            events.extend(self._completed_events())
+            clean = copy.deepcopy(dumped)
+            clean["response"] = self._completion_response(dumped.get("response"))
+            events.append(_streaming_module._json_stream_event(clean))
+            return events
+        events.append(chunk)
+        return events
+
+    def finalize(self) -> list[Any]:
+        return self._completed_events()
+
+
+class _ProviderHiddenWebSearchStream:
+    """Async-iterator wrapper that also propagates early close to the source.
+
+    The Responses delivery layer deliberately closes an upstream iterator as
+    soon as it sees ``response.completed``.  A plain async-generator wrapper
+    would swallow that close (and yielding from its ``finally`` block is not
+    legal while ``aclose`` is running), so keep the adapter as an explicit
+    iterator with a real ``aclose`` implementation.
+    """
+
+    def __init__(self, response: Any, request_kwargs: Optional[dict]) -> None:
+        self._response = response
+        self._iterator: Any = None
+        self._adapter = _ProviderHiddenWebSearchStreamAdapter(request_kwargs)
+        self._pending: list[Any] = []
+        self._finished = False
+        self._closed = False
+
+    def __aiter__(self) -> "_ProviderHiddenWebSearchStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._pending:
+            return self._pending.pop(0)
+        if self._closed or self._finished:
+            raise StopAsyncIteration
+        if self._iterator is None:
+            self._iterator = self._response.__aiter__()
+        while True:
+            try:
+                chunk = await self._iterator.__anext__()
+            except StopAsyncIteration:
+                self._finished = True
+                self._pending.extend(self._adapter.finalize())
+                if self._pending:
+                    return self._pending.pop(0)
+                raise
+            self._pending.extend(self._adapter.consume(chunk))
+            if self._pending:
+                return self._pending.pop(0)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        iterator = self._iterator or self._response
+        close = getattr(iterator, "aclose", None)
+        if not callable(close):
+            return
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            return
+
+
+def _adapt_provider_hidden_web_search_stream(
+    response: Any,
+    request_kwargs: Optional[dict],
+) -> Any:
+    """Return a provider stream with private search reasoning translated."""
+    return _ProviderHiddenWebSearchStream(response, request_kwargs)
 
 
 def _provider_hosted_web_search_query_strings(item: Any) -> list[str]:
@@ -736,7 +1068,10 @@ def _provider_hosted_web_search_call_item(
     )
 
 
-def _sanitize_response_web_search_call_items(response: Any) -> Any:
+def _sanitize_response_web_search_call_items(
+    response: Any,
+    request_kwargs: Optional[dict] = None,
+) -> Any:
     payload = _streaming_module._jsonable(response)
     if not isinstance(payload, dict):
         return response
@@ -746,6 +1081,7 @@ def _sanitize_response_web_search_call_items(response: Any) -> Any:
     response_source_urls = _provider_hosted_web_search_source_urls(payload)
     clean_output: list[Any] = []
     changed = False
+    hidden_items: list[dict[str, Any]] = []
     for item in output:
         if isinstance(item, dict) and item.get("type") == "web_search_call":
             clean_item = _sanitize_web_search_call_item(item)
@@ -762,7 +1098,23 @@ def _sanitize_response_web_search_call_items(response: Any) -> Any:
                 clean_output.append(clean_item)
                 changed = True
                 continue
+        if (
+            isinstance(request_kwargs, dict)
+            and _tools_module._request_has_web_search_tool(request_kwargs)
+            and _provider_hidden_web_search_primary_reasoning_item(item)
+        ):
+            hidden_item = _provider_hidden_web_search_call_item(
+                item,
+                request_kwargs,
+                response_source_urls,
+            )
+            if hidden_item is not None:
+                hidden_items.append(hidden_item)
+                changed = True
+                continue
         clean_output.append(item)
+    if hidden_items:
+        clean_output = hidden_items + clean_output
     if changed:
         payload["output"] = clean_output
         return payload
@@ -979,10 +1331,13 @@ def _sanitize_response_reasoning_items(response: Any) -> Any:
     return response
 
 
-def _sanitize_response_stream_payload(response: Any) -> Any:
+def _sanitize_response_stream_payload(
+    response: Any,
+    request_kwargs: Optional[dict] = None,
+) -> Any:
     return _sanitize_response_reasoning_items(
         _sanitize_response_raw_tool_call_text(
-            _sanitize_response_web_search_call_items(response)
+            _sanitize_response_web_search_call_items(response, request_kwargs)
         )
     )
 

@@ -19,6 +19,7 @@ from .base import (
     _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
+    _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     inspect,
     time,
     _normalize_response_completed_event_usage,
@@ -525,6 +526,160 @@ async def _postprocess_generic_bridge_response(
     )
 
 
+async def _execute_responses_context_truncation_fallback(
+    original_function: Any,
+    exception: Exception,
+    request_kwargs: dict,
+    *,
+    outer_request_kwargs: Optional[dict] = None,
+) -> Optional[tuple[Any, dict]]:
+    """Replay the selected native Responses call once with truncation=auto."""
+    retry_kwargs = (
+        _image_generation_module._responses_context_truncation_fallback_kwargs(
+            exception,
+            request_kwargs,
+        )
+    )
+    if retry_kwargs is None:
+        return None
+    try:
+        response = original_function(**retry_kwargs)
+        response = await _image_generation_module._await_streaming_fallback_candidate_response(
+            response,
+            retry_kwargs,
+            outer_request_kwargs,
+        )
+        response = await _postprocess_generic_bridge_response(
+            response,
+            retry_kwargs,
+            original_function,
+        )
+    except Exception as retry_exception:
+        _trace_module._route_trace(
+            "responses_context_truncation_fallback_error",
+            request_id=_routing_module._trace_request_id(request_kwargs),
+            session=_routing_module._trace_session_context(request_kwargs),
+            model_group=_request_model_group(request_kwargs),
+            deployment_id=_routing_module._deployment_id_from_request(
+                request_kwargs
+            ),
+            route_key=_routing_module._deployment_route_key_from_request(
+                request_kwargs
+            ),
+            request=_trace_module._trace_request_summary(request_kwargs),
+            retry_request=_trace_module._trace_request_summary(retry_kwargs),
+            original_exception=_routing_module._trace_exception(exception),
+            exception=_routing_module._trace_exception(retry_exception),
+        )
+        raise retry_exception
+    return response, retry_kwargs
+
+
+def _with_responses_context_truncation_fallback_stream(
+    response: Any,
+    request_kwargs: dict,
+    original_function: Any,
+    *,
+    outer_request_kwargs: Optional[dict] = None,
+) -> Any:
+    """Hold pre-answer events so a context error can retry the same call."""
+    if request_kwargs.get("stream") is not True:
+        return response
+    if not _image_generation_module._response_is_async_iterable(response):
+        return response
+    if not _image_generation_module._request_can_attempt_responses_context_truncation_fallback(
+        request_kwargs
+    ):
+        return response
+
+    async def guarded_stream() -> Any:
+        buffered: list[Any] = []
+        fallback_attempted = False
+        delivery_started = False
+
+        async def yield_retry(exception: Exception) -> Any:
+            nonlocal fallback_attempted
+            if fallback_attempted:
+                raise exception
+            fallback_attempted = True
+            await _streaming_module._close_async_iterator_safely(response)
+            fallback = await _execute_responses_context_truncation_fallback(
+                original_function,
+                exception,
+                request_kwargs,
+                outer_request_kwargs=outer_request_kwargs,
+            )
+            if fallback is None:
+                raise exception
+            fallback_response, _fallback_kwargs = fallback
+            if _image_generation_module._response_is_async_iterable(
+                fallback_response
+            ):
+                async for fallback_chunk in fallback_response:
+                    yield fallback_chunk
+            else:
+                yield fallback_response
+
+        try:
+            async for chunk in response:
+                chunk_exception = _streaming_module._stream_chunk_error_exception(
+                    chunk
+                )
+                if (
+                    chunk_exception is not None
+                    and _routing_module._is_context_size_error(chunk_exception)
+                ):
+                    async for retry_chunk in yield_retry(chunk_exception):
+                        yield retry_chunk
+                    return
+
+                buffered.append(chunk)
+                if _streaming_module._responses_stream_chunk_is_incomplete_terminal(
+                    chunk
+                ):
+                    terminal_exception = (
+                        _streaming_module._responses_incomplete_stream_exception(
+                            "terminal response event before response.completed",
+                            buffer=buffered,
+                            request_data=request_kwargs,
+                        )
+                    )
+                    if _routing_module._is_context_size_error(
+                        terminal_exception
+                    ):
+                        async for retry_chunk in yield_retry(terminal_exception):
+                            yield retry_chunk
+                        return
+
+                if (
+                    _streaming_module._stream_chunk_has_visible_output(chunk)
+                    or _streaming_module._responses_stream_chunk_is_completed(chunk)
+                    or len(buffered) >= 20
+                ):
+                    delivery_started = True
+                    for buffered_chunk in buffered:
+                        yield buffered_chunk
+                    buffered.clear()
+                    async for remaining_chunk in response:
+                        yield remaining_chunk
+                    return
+        except Exception as exception:
+            if (
+                not fallback_attempted
+                and not delivery_started
+                and _routing_module._is_context_size_error(exception)
+            ):
+                async for retry_chunk in yield_retry(exception):
+                    yield retry_chunk
+                return
+            raise
+
+        for buffered_chunk in buffered:
+            yield buffered_chunk
+
+    return guarded_stream()
+
+
 def _responses_router_function() -> Optional[Any]:
     try:
         from litellm.proxy.proxy_server import llm_router
@@ -812,6 +967,7 @@ def _wrap_generic_function_for_deployment_failover(
         for update_request in (
             _image_generation_module._with_empty_tool_controls_removed,
             _image_generation_module._with_codex_compaction_controls,
+            _image_generation_module._with_codex_compaction_input_bounded,
             _image_generation_module._with_responses_native_extra_body,
             _image_generation_module._with_codex_compaction_headers,
         ):
@@ -935,12 +1091,29 @@ def _wrap_generic_function_for_deployment_failover(
                 kwargs,
                 outer_request_kwargs,
             )
-            return await _postprocess_generic_bridge_response(
+            response = await _postprocess_generic_bridge_response(
                 response,
                 kwargs,
                 original_function,
             )
+            return _with_responses_context_truncation_fallback_stream(
+                response,
+                kwargs,
+                original_function,
+                outer_request_kwargs=outer_request_kwargs,
+            )
         except Exception as exc:
+            context_truncation_fallback = (
+                await _execute_responses_context_truncation_fallback(
+                    original_function,
+                    exc,
+                    kwargs,
+                    outer_request_kwargs=outer_request_kwargs,
+                )
+            )
+            if context_truncation_fallback is not None:
+                response, _retry_kwargs = context_truncation_fallback
+                return response
             responses_function_bridge_retry_kwargs = (
                 _responses_surfaces_module._responses_function_tool_bridge_retry_kwargs(
                     exc,
@@ -1338,6 +1511,9 @@ def _ordered_deployment_fallback_entry(
         return None
 
     excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
+    no_deployments_available = _routing_module._is_no_deployments_available_error(
+        exception
+    )
     surface_fallback = (
         None
         if _routing_module._should_retry_same_deployment_before_fallback(exception)
@@ -1392,6 +1568,14 @@ def _ordered_deployment_fallback_entry(
         return entry
 
     _routing_module._clear_request_surface_target(request_kwargs)
+    if (
+        failed_id is None
+        and no_deployments_available
+        and excluded_ids
+        and _routing_module._request_surface_deployment_id(request_kwargs)
+        in excluded_ids
+    ):
+        failed_id = next(iter(sorted(excluded_ids)))
     if failed_id is not None:
         excluded_ids.add(failed_id)
 
@@ -1438,6 +1622,14 @@ def _ordered_deployment_fallback_entry(
         else []
     )
     if peer_deployments:
+        peer_deployment_ids = [
+            deployment_id
+            for deployment_id in (
+                _image_generation_module._deployment_id(deployment)
+                for deployment in peer_deployments
+            )
+            if deployment_id
+        ]
         _trace_module._route_trace(
             "same_order_peer_fallback_available",
             request_id=_routing_module._trace_request_id(request_kwargs),
@@ -1454,6 +1646,7 @@ def _ordered_deployment_fallback_entry(
             "model": model_group,
             "_target_order": failed_order,
             "_excluded_deployment_ids": sorted(excluded_ids),
+            _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: peer_deployment_ids,
         }
 
     available_orders = sorted(
@@ -1495,6 +1688,14 @@ def _ordered_deployment_fallback_entry(
         for deployment in available_deployments
         if _image_generation_module._deployment_order(deployment) == next_order
     ]
+    next_deployment_ids = [
+        deployment_id
+        for deployment_id in (
+            _image_generation_module._deployment_id(deployment)
+            for deployment in next_deployments
+        )
+        if deployment_id
+    ]
     _trace_module._route_trace(
         "next_order_fallback_available",
         request_id=_routing_module._trace_request_id(request_kwargs),
@@ -1513,4 +1714,5 @@ def _ordered_deployment_fallback_entry(
         "model": model_group,
         "_target_order": next_order,
         "_excluded_deployment_ids": sorted(excluded_ids),
+        _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: next_deployment_ids,
     }

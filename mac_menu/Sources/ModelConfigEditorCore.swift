@@ -361,7 +361,6 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     lazy var deleteModelButton = NSButton(title: "Delete", target: self, action: #selector(deleteModel))
     lazy var routeMoveUpButton = NSButton(title: "Move Up", target: self, action: #selector(moveRouteUp))
     lazy var routeMoveDownButton = NSButton(title: "Move Down", target: self, action: #selector(moveRouteDown))
-    lazy var routeNormalizeButton = NSButton(title: "Normalize Order", target: self, action: #selector(normalizeRouteOrder))
     lazy var applyStatusLabel: NSTextField = {
         let label = NSTextField(labelWithString: "")
         label.textColor = .secondaryLabelColor

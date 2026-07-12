@@ -212,6 +212,66 @@ class HookResponsesChatBridgeTests(HookTestCase):
             metadata,
         )
 
+    async def test_no_compatible_native_tool_endpoint_uses_function_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        class UnsupportedClientTool(Exception):
+            status_code = 400
+
+        error = UnsupportedClientTool(
+            "OpenAIException - "
+            '{"error":{"message":"No endpoints found that support the native '
+            '`namespace` tool type.","code":400}}. '
+            "Received Model Group=default-chat "
+            "Available Model Group Fallbacks=None"
+        )
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise error
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="default-chat",
+            input="use a local tool",
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "local_tools",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read_item",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                }
+            ],
+            model_info={
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["tools"][0]["type"], "namespace")
+        self.assertEqual(calls[1]["tools"][0]["type"], "function")
+        self.assertEqual(calls[1]["tools"][0]["name"], "read_item")
+        self.assertEqual(
+            calls[1]["litellm_metadata"][
+                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY
+            ],
+            "native_client_tools_unsupported",
+        )
+
     async def test_unknown_route_lifts_leading_additional_tools_for_native_attempt(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
@@ -1232,7 +1292,11 @@ class HookResponsesChatBridgeTests(HookTestCase):
                         "Target at most 2048 tokens. Preserve only unresolved work."
                     ),
                 },
+                {"type": "compaction_trigger"},
             ],
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
             "stream": True,
             "reasoning": {"effort": "medium"},
             "tools": [],
@@ -1274,7 +1338,11 @@ class HookResponsesChatBridgeTests(HookTestCase):
                         "Target at most 1024 tokens. Preserve only unresolved work."
                     ),
                 },
+                {"type": "compaction_trigger"},
             ],
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
             "stream": True,
             "reasoning": {"effort": "medium"},
             "use_chat_completions_api": True,
@@ -1330,7 +1398,11 @@ class HookResponsesChatBridgeTests(HookTestCase):
                         "Target at most 1024 tokens. Preserve only unresolved work."
                     ),
                 },
+                {"type": "compaction_trigger"},
             ],
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
             reasoning={"effort": "medium"},
             stream=True,
         )
@@ -1389,7 +1461,11 @@ class HookResponsesChatBridgeTests(HookTestCase):
                         "Create a handoff summary for another LLM that will resume the task."
                     ),
                 },
+                {"type": "compaction_trigger"},
             ],
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
             reasoning={"effort": "xhigh"},
             tools=[],
             tool_choice="auto",

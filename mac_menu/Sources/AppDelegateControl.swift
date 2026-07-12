@@ -479,7 +479,7 @@ extension AppDelegate {
         guard fileManager.fileExists(atPath: statePath),
               let data = fileManager.contents(atPath: statePath),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["schema_version"] as? Int == 2,
+              object["schema_version"] as? Int == 3,
               object["active"] as? Bool == true,
               object["config"] as? [String: Any] != nil,
               object["auth"] as? [String: Any] != nil,

@@ -4,6 +4,321 @@ from hook_test_utils import *
 
 
 class HookResponsesWebSearchBridgeTests(HookTestCase):
+    def test_provider_citation_suffix_is_removed_from_source_url(self) -> None:
+        hooks, _ = load_hook_module()
+        self.assertEqual(
+            hooks._external_web_search_clean_url(
+                "https://example.test/page[[1]](https://example.test/page)"
+            ),
+            "https://example.test/page",
+        )
+        self.assertEqual(
+            hooks._external_web_search_clean_url(
+                "https://example.test/page.[[1]](https://example.test/page)"
+            ),
+            "https://example.test/page",
+        )
+        self.assertEqual(
+            hooks._external_web_search_clean_url(
+                "https://example.test/wiki/(topic)"
+            ),
+            "https://example.test/wiki/(topic)",
+        )
+        self.assertEqual(
+            hooks._external_web_search_clean_url("https://example.test/page)"),
+            "https://example.test/page",
+        )
+
+    def test_synthetic_provider_hidden_search_is_exposed_as_standard_lifecycle(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "model": "synthetic-search-model",
+            "input": "Find the synthetic source.",
+            "tools": [{"type": "web_search"}],
+            "stream": True,
+        }
+        response = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_synthetic",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "tco_synthetic-0",
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "private"}],
+                    },
+                    {
+                        "id": "msg_synthetic",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Answer with a source.",
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://example.test/source",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+
+        adapter = hooks._adapt_provider_hidden_web_search_stream
+
+        async def upstream():
+            yield response
+
+        async def collect():
+            return [hooks._jsonable(chunk) async for chunk in adapter(upstream(), request)]
+
+        chunks = asyncio.run(collect())
+        types = [chunk.get("type") for chunk in chunks]
+        self.assertEqual(types[:4], [
+            "response.output_item.added",
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+            "response.web_search_call.completed",
+        ])
+        self.assertIn("response.output_item.done", types)
+        self.assertEqual(types[-1], "response.completed")
+        completed = chunks[-1]["response"]["output"]
+        self.assertFalse(any(item.get("id") == "tco_synthetic-0" for item in completed))
+        search_items = [item for item in completed if item.get("type") == "web_search_call"]
+        self.assertEqual(len(search_items), 1)
+        self.assertEqual(search_items[0]["action"]["query"], "Web search")
+        self.assertNotIn(request["input"], json.dumps(chunks))
+        self.assertEqual(
+            search_items[0]["action"]["sources"][0]["url"],
+            "https://example.test/source",
+        )
+
+    def test_synthetic_hidden_search_only_primary_item_is_converted(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {"tools": [{"type": "web_search"}], "input": "synthetic query"}
+        response = {
+            "output": [
+                {"id": "tco_synthetic-0", "type": "reasoning"},
+                {"id": "tco_synthetic-1", "type": "reasoning"},
+            ]
+        }
+        sanitized = hooks._sanitize_response_stream_payload(response, request)
+        self.assertEqual(
+            [item.get("type") for item in sanitized["output"]],
+            ["web_search_call"],
+        )
+        self.assertEqual(sanitized["output"][0]["action"]["query"], "Web search")
+        self.assertNotIn(request["input"], json.dumps(sanitized))
+
+    def test_regular_reasoning_and_missing_tool_are_not_hidden_search(self) -> None:
+        hooks, _ = load_hook_module()
+        regular = {"output": [{"id": "rs_synthetic", "type": "reasoning"}]}
+        regular_sanitized = hooks._sanitize_response_stream_payload(
+            regular,
+            {"input": "x"},
+        )
+        self.assertFalse(
+            any(item.get("type") == "web_search_call" for item in regular_sanitized["output"])
+        )
+        hidden = {"output": [{"id": "tco_synthetic-0", "type": "reasoning"}]}
+        hidden_sanitized = hooks._sanitize_response_stream_payload(
+            hidden,
+            {"input": "x"},
+        )
+        self.assertFalse(
+            any(item.get("type") == "web_search_call" for item in hidden_sanitized["output"])
+        )
+
+    async def test_hidden_provider_search_sequence_numbers_follow_upstream_stream(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def upstream():
+            yield {
+                "type": "response.created",
+                "sequence_number": 40,
+                "response": {"id": "resp_seq", "object": "response", "status": "in_progress", "output": []},
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "tco_seq-0", "type": "reasoning"},
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "output_index": 9,
+                "item_id": "msg_seq",
+                "sequence_number": 77,
+                "delta": "stub",
+            }
+            yield {
+                "type": "response.output_text.annotation.added",
+                "output_index": 9,
+                "item_id": "msg_seq",
+                "sequence_number": 78,
+                "annotation": {
+                    "type": "url_citation",
+                    "url": "https://example.test/source",
+                },
+            }
+            yield {
+                "type": "response.completed",
+                "sequence_number": 79,
+                "response": {
+                    "id": "resp_seq",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {"id": "tco_seq-0", "type": "reasoning"},
+                        {
+                            "id": "msg_seq",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Native answer.",
+                                    "annotations": [
+                                        {
+                                            "type": "url_citation",
+                                            "url": "https://example.test/source",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                },
+            }
+
+        hook = hooks.LiteLLMMenuHook()
+        chunks = [
+            hooks._jsonable(chunk)
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=upstream(),
+                request_data={
+                    "call_type": "aresponses",
+                    "model": "synthetic-native-search-model",
+                    "input": "Use provider-native search.",
+                    "stream": True,
+                    "tools": [{"type": "web_search"}],
+                },
+            )
+        ]
+        web_events = [
+            chunk for chunk in chunks
+            if isinstance(chunk, dict)
+            and chunk.get("type") in {
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+                "response.web_search_call.completed",
+            }
+        ]
+        self.assertEqual(
+            [chunk["type"] for chunk in web_events],
+            [
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+                "response.web_search_call.completed",
+            ],
+        )
+        self.assertGreaterEqual(web_events[0]["sequence_number"], 41)
+        self.assertEqual(
+            web_events[1]["sequence_number"],
+            web_events[0]["sequence_number"] + 1,
+        )
+        self.assertGreater(
+            web_events[2]["sequence_number"],
+            78,
+        )
+
+    async def test_hidden_provider_search_with_answer_never_runs_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        original_run_action = hooks._external_web_search_run_action
+
+        async def forbidden_local_search(*_args, **_kwargs):
+            raise AssertionError("native provider search must not run the local bridge")
+
+        hooks._external_web_search_run_action = forbidden_local_search
+        self.addCleanup(setattr, hooks, "_external_web_search_run_action", original_run_action)
+
+        async def upstream():
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "tco_synthetic-0", "type": "reasoning"},
+            }
+            yield {
+                "type": "response.output_text.annotation.added",
+                "annotation": {
+                    "type": "url_citation",
+                    "url": "https://example.test/source",
+                },
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_native_synthetic",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {"id": "tco_synthetic-0", "type": "reasoning"},
+                        {
+                            "id": "msg_native_synthetic",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Native answer.",
+                                    "annotations": [
+                                        {
+                                            "type": "url_citation",
+                                            "url": "https://example.test/source",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                },
+            }
+
+        hook = hooks.LiteLLMMenuHook()
+        chunks = [
+            hooks._jsonable(chunk)
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=upstream(),
+                request_data={
+                    "call_type": "aresponses",
+                    "model": "synthetic-native-search-model",
+                    "input": "Use provider-native search.",
+                    "stream": True,
+                    "tools": [{"type": "web_search"}],
+                    "model_info": {"supports_responses_web_search": True},
+                },
+            )
+        ]
+        self.assertEqual(
+            [chunk.get("type") for chunk in chunks].count(
+                "response.web_search_call.completed"
+            ),
+            1,
+        )
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertIn("Native answer.", json.dumps(chunks))
+
     def test_sanitize_response_maps_openrouter_hosted_search_output_item(self) -> None:
         hooks, _ = load_hook_module()
 

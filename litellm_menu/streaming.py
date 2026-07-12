@@ -47,6 +47,9 @@ from .base import (
 
 
 _ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY = "_route_recovery_forced_target_order"
+_CODEX_USAGE_REQUEST_OVERHEAD_BYTES = 32_768
+_CODEX_USAGE_TOKENS_PER_BYTE = 1
+_USAGE_BOUND_UNSERIALIZABLE = object()
 
 
 def _route_recovery_state_key(request_data: Optional[dict]) -> str:
@@ -152,7 +155,125 @@ def _jsonable(value: Any) -> Any:
     return None
 
 
-def _normalize_sse_response_completed_block(block: str, delimiter: str) -> str:
+def _usage_bound_jsonable(value: Any, *, depth: int = 0) -> Any:
+    if depth > 32:
+        return _USAGE_BOUND_UNSERIALIZABLE
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Enum):
+        return _usage_bound_jsonable(value.value, depth=depth + 1)
+    if isinstance(value, (list, tuple)):
+        items = []
+        for item in value:
+            converted = _usage_bound_jsonable(item, depth=depth + 1)
+            if converted is _USAGE_BOUND_UNSERIALIZABLE:
+                return _USAGE_BOUND_UNSERIALIZABLE
+            items.append(converted)
+        return items
+    if isinstance(value, dict):
+        converted_dict: dict[str, Any] = {}
+        for key, item in value.items():
+            converted = _usage_bound_jsonable(item, depth=depth + 1)
+            if converted is _USAGE_BOUND_UNSERIALIZABLE:
+                return _USAGE_BOUND_UNSERIALIZABLE
+            converted_dict[str(key)] = converted
+        return converted_dict
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump(mode="json", exclude_none=True)
+        except TypeError:
+            try:
+                dumped = value.model_dump()
+            except Exception:
+                return _USAGE_BOUND_UNSERIALIZABLE
+        except Exception:
+            return _USAGE_BOUND_UNSERIALIZABLE
+        return _usage_bound_jsonable(dumped, depth=depth + 1)
+    return _USAGE_BOUND_UNSERIALIZABLE
+
+
+def _explicit_route_model_group(request_data: Optional[dict]) -> Optional[str]:
+    route_key = _image_generation_module._request_model_info(request_data).get(
+        "route_key"
+    )
+    if not isinstance(route_key, str) or not route_key.strip():
+        return None
+    for route_part in route_key.split(" / "):
+        key, separator, value = route_part.partition("=")
+        if separator and key.strip().lower() == "model" and value.strip():
+            return value.strip()
+    return None
+
+
+def _codex_request_input_token_upper_bound(
+    request_data: Optional[dict],
+) -> Optional[int]:
+    if not _image_generation_module._request_has_codex_client_evidence(request_data):
+        return None
+    if not _image_generation_module._request_has_responses_shape(request_data):
+        return None
+    request_data = request_data or {}
+    if "input" not in request_data:
+        return None
+    if request_data.get("previous_response_id"):
+        return None
+    if _image_generation_module._request_has_image_input(request_data):
+        return None
+    payload: dict[str, Any] = {}
+    for key in (
+        "model",
+        "input",
+        "instructions",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "reasoning",
+        "text",
+        "include",
+        "temperature",
+        "top_p",
+        "max_output_tokens",
+        "truncation",
+        "response_format",
+        "user",
+        "service_tier",
+        "seed",
+        "stop",
+        "store",
+        "client_metadata",
+        "prompt_cache_key",
+        "metadata",
+        "extra_body",
+    ):
+        value = request_data.get(key)
+        if key not in request_data or value is None:
+            continue
+        json_value = _usage_bound_jsonable(value)
+        if json_value is _USAGE_BOUND_UNSERIALIZABLE:
+            return None
+        payload[key] = json_value
+    try:
+        payload_bytes = len(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception:
+        return None
+    return (
+        payload_bytes + _CODEX_USAGE_REQUEST_OVERHEAD_BYTES
+    ) * _CODEX_USAGE_TOKENS_PER_BYTE
+
+
+def _normalize_sse_response_completed_block(
+    block: str,
+    delimiter: str,
+    *,
+    input_token_upper_bound: Optional[int] = None,
+) -> str:
     if "data:" not in block or "response.completed" not in block:
         return block + delimiter
     line_separator = "\r\n" if "\r\n" in block else "\n"
@@ -173,7 +294,10 @@ def _normalize_sse_response_completed_block(block: str, delimiter: str) -> str:
         return block + delimiter
     if not isinstance(payload, dict) or payload.get("type") != "response.completed":
         return block + delimiter
-    _normalize_response_completed_event_usage(payload)
+    _normalize_response_completed_event_usage(
+        payload,
+        input_token_upper_bound=input_token_upper_bound,
+    )
     normalized_data = json.dumps(payload, ensure_ascii=False)
     next_lines: list[str] = []
     replaced_data = False
@@ -187,7 +311,11 @@ def _normalize_sse_response_completed_block(block: str, delimiter: str) -> str:
     return line_separator.join(next_lines) + delimiter
 
 
-def _normalize_sse_response_completed_text(text: str) -> str:
+def _normalize_sse_response_completed_text(
+    text: str,
+    *,
+    input_token_upper_bound: Optional[int] = None,
+) -> str:
     if "data:" not in text or "response.completed" not in text:
         return text
     output: list[str] = []
@@ -204,39 +332,75 @@ def _normalize_sse_response_completed_text(text: str) -> str:
             if position >= 0
         ]
         if not candidates:
-            output.append(_normalize_sse_response_completed_block(text[index:], ""))
+            output.append(
+                _normalize_sse_response_completed_block(
+                    text[index:],
+                    "",
+                    input_token_upper_bound=input_token_upper_bound,
+                )
+            )
             break
         position, delimiter = min(candidates, key=lambda item: item[0])
-        output.append(_normalize_sse_response_completed_block(text[index:position], delimiter))
+        output.append(
+            _normalize_sse_response_completed_block(
+                text[index:position],
+                delimiter,
+                input_token_upper_bound=input_token_upper_bound,
+            )
+        )
         index = position + len(delimiter)
     return "".join(output)
 
 
-def _normalize_sse_response_completed_chunk(chunk: str | bytes) -> str | bytes:
+def _normalize_sse_response_completed_chunk(
+    chunk: str | bytes,
+    *,
+    input_token_upper_bound: Optional[int] = None,
+) -> str | bytes:
     if isinstance(chunk, bytes):
         try:
             text = chunk.decode("utf-8")
         except Exception:
             return chunk
-        normalized_text = _normalize_sse_response_completed_text(text)
+        normalized_text = _normalize_sse_response_completed_text(
+            text,
+            input_token_upper_bound=input_token_upper_bound,
+        )
         if normalized_text == text:
             return chunk
         return normalized_text.encode("utf-8")
-    return _normalize_sse_response_completed_text(chunk)
+    return _normalize_sse_response_completed_text(
+        chunk,
+        input_token_upper_bound=input_token_upper_bound,
+    )
 
 
-def _responses_stream_chunk_for_delivery(chunk: Any) -> Any:
+def _responses_stream_chunk_for_delivery(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> Any:
+    input_token_upper_bound = _codex_request_input_token_upper_bound(request_data)
     if isinstance(chunk, _JSONStreamEvent):
-        _normalize_response_completed_event_usage(chunk)
+        _normalize_response_completed_event_usage(
+            chunk,
+            input_token_upper_bound=input_token_upper_bound,
+        )
         return chunk
     if isinstance(chunk, (str, bytes)):
-        return _normalize_sse_response_completed_chunk(chunk)
+        return _normalize_sse_response_completed_chunk(
+            chunk,
+            input_token_upper_bound=input_token_upper_bound,
+        )
     dumped = _stream_chunk_dump(chunk)
     chunk_type = _stream_chunk_type(dumped)
     if not chunk_type.startswith("response.") and chunk_type != "error":
         return chunk
     json_chunk = _jsonable(chunk)
     if isinstance(json_chunk, dict):
+        _normalize_response_completed_event_usage(
+            json_chunk,
+            input_token_upper_bound=input_token_upper_bound,
+        )
         return _json_stream_event(json_chunk)
     return chunk
 
@@ -898,26 +1062,39 @@ def _responses_incomplete_stream_exception(
     reason: str,
     *,
     buffer: Optional[List[Any]] = None,
+    request_data: Optional[dict] = None,
 ) -> Exception:
-    exception = RuntimeError(f"Responses stream incomplete: {reason}")
+    terminal_chunk = buffer[-1] if buffer else None
+    terminal_summary = _responses_incomplete_terminal_summary(terminal_chunk)
+    terminal_error_text = " ".join(
+        str(terminal_summary.get(key) or "").strip()
+        for key in ("error_code", "error_type", "error_message", "error_detail")
+        if terminal_summary.get(key)
+    ).strip()
+    message = f"Responses stream incomplete: {reason}"
+    if terminal_error_text:
+        message = f"{message}; upstream terminal error: {terminal_error_text}"
+    candidate = RuntimeError(message)
+    exception = candidate
     try:
         exception.responses_stream_incomplete = True  # type: ignore[attr-defined]
     except Exception:
         pass
     try:
-        exception.status_code = 502  # type: ignore[attr-defined]
+        exception.status_code = (  # type: ignore[attr-defined]
+            400 if _routing_module._is_context_size_error(exception) else 502
+        )
     except Exception:
         pass
     if buffer is not None:
         try:
-            terminal_chunk = buffer[-1] if buffer else None
             exception.body = {  # type: ignore[attr-defined]
                 "reason": reason,
                 "buffered_event_types": [_stream_chunk_type(chunk) for chunk in buffer],
                 "buffered_has_visible_output": any(
                     _stream_chunk_has_visible_output(chunk) for chunk in buffer
                 ),
-                "terminal_event": _responses_incomplete_terminal_summary(terminal_chunk),
+                "terminal_event": terminal_summary,
             }
         except Exception:
             pass
@@ -930,6 +1107,10 @@ def _responses_incomplete_terminal_summary(chunk: Any) -> dict[str, Any]:
     response = response if isinstance(response, dict) else {}
     error = response.get("error")
     error = error if isinstance(error, dict) else {}
+    incomplete_details = response.get("incomplete_details")
+    incomplete_details = (
+        incomplete_details if isinstance(incomplete_details, dict) else {}
+    )
     output = response.get("output")
     text_fragment, _is_done = _stream_chunk_text_fragment(dumped)
     return {
@@ -940,6 +1121,22 @@ def _responses_incomplete_terminal_summary(chunk: Any) -> dict[str, Any]:
         "has_text_fragment": bool(text_fragment.strip()),
         "error_type": error.get("type") if isinstance(error.get("type"), str) else None,
         "error_code": error.get("code") if isinstance(error.get("code"), str) else None,
+        "error_message": (
+            _trace_module._sanitize_trace_text(error.get("message"), limit=800)
+            if isinstance(error.get("message"), str)
+            else None
+        ),
+        "error_detail": (
+            _trace_module._sanitize_trace_text(
+                error.get("detail") or incomplete_details.get("detail"),
+                limit=800,
+            )
+            if isinstance(
+                error.get("detail") or incomplete_details.get("detail"),
+                str,
+            )
+            else None
+        ),
     }
 
 
@@ -1216,24 +1413,16 @@ def _route_recovery_terminal_chunk_exception(
     dumped = _stream_chunk_dump(chunk)
     chunk_type = _stream_chunk_type(dumped)
     if chunk_type == "response.failed":
-        exception = RuntimeError("Responses stream failed before response.completed")
-        try:
-            exception.status_code = 502  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        try:
-            response = dumped.get("response") if isinstance(dumped, dict) else None
-            response = response if isinstance(response, dict) else {}
-            exception.body = {  # type: ignore[attr-defined]
-                "reason": "response_failed_terminal_event",
-                "status": response.get("status"),
-            }
-        except Exception:
-            pass
+        exception = _responses_incomplete_stream_exception(
+            "response.failed before response.completed",
+            buffer=buffer or [chunk],
+            request_data=request_data,
+        )
     elif _responses_stream_chunk_is_incomplete_terminal(dumped):
         exception = _responses_incomplete_stream_exception(
             "terminal response event before response.completed",
             buffer=buffer,
+            request_data=request_data,
         )
     else:
         return None
@@ -1476,7 +1665,9 @@ def _build_streaming_error_fallback_payload(
             or _routing_module._deployment_route_key_from_request(request_data)
         )
     ):
-        payload["model"] = selected_route_upstream_model
+        explicit_route_model_group = _explicit_route_model_group(request_data)
+        if explicit_route_model_group != payload_model:
+            payload["model"] = selected_route_upstream_model
 
     if not payload.get("model"):
         return None
@@ -1503,9 +1694,6 @@ def _build_streaming_error_fallback_payload(
     compaction_payload = _image_generation_module._with_codex_compaction_controls(payload)
     if compaction_payload is not None:
         payload = compaction_payload
-    compacted_tool_payload = _image_generation_module._with_codex_large_tool_outputs_compacted(payload)
-    if compacted_tool_payload is not None:
-        payload = compacted_tool_payload
     extra_body_payload = _image_generation_module._with_responses_native_extra_body(payload)
     if extra_body_payload is not None:
         payload = extra_body_payload
@@ -1540,15 +1728,9 @@ def _apply_streaming_error_fallback_constraints(
 
     peer_entry = _responses_execution_module._ordered_deployment_fallback_entry(router, exception, request_data)
     if peer_entry is not None:
-        for key in (
-            "_target_order",
-            "_excluded_deployment_ids",
-            "_litellm_menu_upstream_url_surface",
-            "_litellm_menu_attempted_upstream_url_surfaces",
-            "_litellm_menu_surface_target_deployment_id",
-        ):
-            if key in peer_entry:
-                payload[key] = peer_entry[key]
+        for key, value in peer_entry.items():
+            if key != "model":
+                payload[key] = value
         return
 
     def explicit_request_order() -> Optional[int]:
@@ -2146,6 +2328,7 @@ async def _stream_route_recovery_poll_attempt(
                 raise _responses_incomplete_stream_exception(
                     "route recovery attempt ended before response.completed",
                     buffer=buffered_chunks,
+                    request_data=request_data,
                 )
 
             started_delivery = True
@@ -4098,6 +4281,7 @@ async def _yield_guarded_original_stream(
             raise _responses_incomplete_stream_exception(
                 "terminal response event before response.completed",
                 buffer=event_tail,
+                request_data=request_data,
             )
         if should_suppress_internal_bridge_chunk(chunk):
             continue
@@ -4214,6 +4398,7 @@ async def _yield_guarded_original_stream(
                 raise _responses_incomplete_stream_exception(
                     "terminal response event before response.completed",
                     buffer=event_tail,
+                    request_data=request_data,
                 )
             if should_suppress_internal_bridge_chunk(chunk):
                 continue
@@ -4304,6 +4489,7 @@ async def _yield_guarded_original_stream(
         raise _responses_incomplete_stream_exception(
             "stream ended before response.completed",
             buffer=event_tail,
+            request_data=request_data,
         )
 
 async def _yield_streaming_error_fallback_or_raise(
@@ -4316,6 +4502,8 @@ async def _yield_streaming_error_fallback_or_raise(
         "litellm_metadata",
     ) or {}
     route_recovery_poll_payload = litellm_metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True
+    if is_responses_stream and _routing_module._is_context_size_error(exception):
+        raise exception
     if _routing_module._should_block_external_web_search_original_recovery(request_data):
         _trace_module._route_trace(
             "external_web_search_original_stream_fallback_blocked",
@@ -4548,6 +4736,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
     stream_started_at = time.monotonic()
     completion_state = _ResponsesStreamCompletionState(request_data)
     raw_tool_call_text_filter = _responses_web_search_bridge_module._RawToolCallTextFilter()
+
     try:
         async for chunk in _stream_with_idle_timeout(
             response,
@@ -4648,6 +4837,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     incomplete_exception = _responses_incomplete_stream_exception(
                         "terminal response event before response.completed",
                         buffer=buffer,
+                        request_data=request_data,
                     )
                     if output_limit_terminal:
                         _trace_module._route_trace(
@@ -4689,7 +4879,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 stream_exhausted = False
                 break
     except Exception as exc:
-        _routing_module._mark_exception_for_deployment_failover(exc, request_data)
+        if _routing_module._is_priority_deployment_failover_error(exc):
+            _routing_module._mark_exception_for_deployment_failover(
+                exc,
+                request_data,
+            )
         async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
             request_data,
             exc,
@@ -4701,6 +4895,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
         incomplete_exception = _responses_incomplete_stream_exception(
             "stream ended before response.completed",
             buffer=buffer,
+            request_data=request_data,
         )
         async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
             request_data,

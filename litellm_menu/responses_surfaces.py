@@ -1102,6 +1102,7 @@ def _native_responses_client_tools_unsupported_error(
     return any(
         marker in text
         for marker in (
+            "no endpoints found that support",
             "unsupported tool",
             "unsupported tool type",
             "tool type is unsupported",

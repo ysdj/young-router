@@ -254,7 +254,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         if modified is not None:
             self.assertNotIn("extra_body", modified)
 
-    def test_codex_large_tool_output_compaction_preserves_response_structure(self) -> None:
+    def test_structured_codex_compaction_is_bounded_without_changing_protocol_shape(self) -> None:
         hooks, _ = load_hook_module()
         first_output = "alpha-" + ("a" * 125000) + "-omega"
         second_output = "start-" + ("b" * 125000) + "-finish"
@@ -265,7 +265,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "prompt_cache_key": "thread-test-0002",
             "client_metadata": {
                 "thread_id": "thread-test-0002",
-                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
             },
             "input": [
                 {"type": "message", "role": "user", "content": "continue"},
@@ -285,6 +285,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
                     "call_id": "call_second",
                     "output": second_output,
                 },
+                {"type": "compaction_trigger", "id": "compact_keep"},
             ],
             "tools": [{"type": "function", "name": "exec_command"}],
             "tool_choice": "auto",
@@ -292,7 +293,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "reasoning": {"effort": "xhigh"},
         }
 
-        modified = hooks._with_codex_large_tool_outputs_compacted(original)
+        modified = hooks._with_codex_compaction_input_bounded(original)
 
         self.assertIsNotNone(modified)
         assert modified is not None
@@ -301,6 +302,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(modified["input"][1], original["input"][1])
         self.assertEqual(modified["input"][2]["call_id"], "call_keep")
         self.assertEqual(modified["input"][3]["call_id"], "call_second")
+        self.assertEqual(
+            modified["input"][4],
+            {"type": "compaction_trigger", "id": "compact_keep"},
+        )
         self.assertEqual(modified["tools"], original["tools"])
         self.assertEqual(modified["tool_choice"], "auto")
         self.assertTrue(modified["parallel_tool_calls"])
@@ -314,13 +319,85 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertTrue(modified["input"][2]["output"].endswith("-omega"))
         self.assertEqual(original["input"][2]["output"], first_output)
 
-    def test_codex_large_tool_output_compaction_leaves_small_request_untouched(self) -> None:
+    def test_structured_codex_compaction_bounds_custom_tool_output_content_only(self) -> None:
+        hooks, _ = load_hook_module()
+        first_output = [
+            {"type": "input_text", "text": "Script completed\n"},
+            {
+                "type": "input_text",
+                "text": "alpha-" + ("a" * 125000) + "-omega",
+            },
+        ]
+        second_output = [
+            {"type": "input_text", "text": "Script completed\n"},
+            {
+                "type": "input_text",
+                "text": "start-" + ("b" * 125000) + "-finish",
+            },
+        ]
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-test-custom",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_keep",
+                    "call_id": "call_keep",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({});",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_keep",
+                    "output": first_output,
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_second",
+                    "output": second_output,
+                },
+                {"type": "compaction_trigger", "id": "compact_custom"},
+            ],
+        }
+
+        modified = hooks._with_codex_compaction_input_bounded(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["input"][1], original["input"][1])
+        self.assertEqual(modified["input"][2]["type"], "custom_tool_call_output")
+        self.assertEqual(modified["input"][2]["call_id"], "call_keep")
+        self.assertIsInstance(modified["input"][2]["output"], list)
+        self.assertEqual(
+            [part["type"] for part in modified["input"][2]["output"]],
+            ["input_text", "input_text"],
+        )
+        compacted_text = "".join(
+            part["text"] for part in modified["input"][2]["output"]
+        )
+        self.assertLessEqual(
+            len(compacted_text),
+            hooks._CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS,
+        )
+        self.assertIn("original_chars=", compacted_text)
+        self.assertTrue(compacted_text.startswith("Script completed\nalpha-"))
+        self.assertTrue(compacted_text.endswith("-omega"))
+        self.assertEqual(original["input"][2]["output"], first_output)
+        self.assertEqual(modified["input"][-1], original["input"][-1])
+
+    def test_structured_codex_compaction_leaves_small_request_untouched(self) -> None:
         hooks, _ = load_hook_module()
         original = {
             "call_type": "aresponses",
             "client_metadata": {
                 "thread_id": "thread-test-0002",
-                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
             },
             "input": [
                 {"type": "message", "role": "user", "content": "continue"},
@@ -329,12 +406,13 @@ class HookResponsesRequestPrepTests(HookTestCase):
                     "call_id": "call_small",
                     "output": "x" * (hooks._CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS + 200),
                 },
+                {"type": "compaction_trigger"},
             ],
         }
 
-        self.assertIsNone(hooks._with_codex_large_tool_outputs_compacted(original))
+        self.assertIsNone(hooks._with_codex_compaction_input_bounded(original))
 
-    def test_codex_large_tool_output_compaction_ignores_non_codex_request(self) -> None:
+    def test_codex_compaction_bounding_ignores_non_codex_request(self) -> None:
         hooks, _ = load_hook_module()
         original = {
             "call_type": "aresponses",
@@ -348,9 +426,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ],
         }
 
-        self.assertIsNone(hooks._with_codex_large_tool_outputs_compacted(original))
+        self.assertIsNone(hooks._with_codex_compaction_input_bounded(original))
 
-    async def test_pre_call_deployment_hook_does_not_compact_codex_large_tool_outputs(self) -> None:
+    async def test_pre_call_deployment_hook_keeps_ordinary_codex_turn_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         original = {
@@ -390,6 +468,55 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertEqual(modified["input"][1]["call_id"], "call_a")
         self.assertEqual(modified["input"][2]["call_id"], "call_b")
+
+    async def test_pre_call_deployment_hook_bounds_structured_compaction_before_upstream(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "client_metadata": {
+                "thread_id": "thread-preflight-compaction",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                {
+                    "type": "message",
+                    "id": "msg_keep",
+                    "role": "developer",
+                    "content": "d" * 40_000,
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "out_keep",
+                    "call_id": "call_keep",
+                    "output": "x" * 600_000,
+                },
+                {"type": "compaction_trigger", "id": "trigger_keep"},
+            ],
+        }
+
+        modified = await hook.async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual([item["type"] for item in modified["input"]], [
+            "message",
+            "custom_tool_call_output",
+            "compaction_trigger",
+        ])
+        self.assertEqual(modified["input"][0]["id"], "msg_keep")
+        self.assertEqual(modified["input"][1]["id"], "out_keep")
+        self.assertEqual(modified["input"][1]["call_id"], "call_keep")
+        self.assertEqual(modified["input"][2], original["input"][2])
+        self.assertLessEqual(
+            hooks._compaction_text_length(modified["input"]),
+            hooks._CODEX_COMPACTION_HISTORY_TEXT_CHARS,
+        )
+        self.assertEqual(original["input"][1]["output"], "x" * 600_000)
 
     async def test_pre_call_deployment_hook_ignores_other_api_bases(self) -> None:
         hooks, _ = load_hook_module()

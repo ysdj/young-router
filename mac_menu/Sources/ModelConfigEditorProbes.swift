@@ -619,7 +619,7 @@ extension ModelConfigEditorController {
         listHeight: CGFloat,
         chooserController: FetchedModelChooserController
     ) -> NSPanel {
-        let contentHeight: CGFloat = 96 + listHeight + 52
+        let contentHeight: CGFloat = 132 + listHeight + 52
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight),
             styleMask: [.titled, .closable, .resizable],
@@ -627,7 +627,7 @@ extension ModelConfigEditorController {
             defer: false
         )
         panel.title = "Choose Models to Add"
-        panel.minSize = NSSize(width: 520, height: 300)
+        panel.minSize = NSSize(width: 520, height: 340)
         panel.isReleasedWhenClosed = false
         panel.delegate = chooserController
         chooserController.modalWindow = panel
@@ -638,9 +638,14 @@ extension ModelConfigEditorController {
         let titleLabel = NSTextField(labelWithString: "Choose models to add")
         titleLabel.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
 
-        let subtitleLabel = NSTextField(labelWithString: "Provider: \(providerName)    Key: \(keyName)    Models: \(modelCount)")
+        let subtitleLabel = NSTextField(labelWithString: "Provider: \(providerName)    Key: \(keyName)")
         subtitleLabel.textColor = .secondaryLabelColor
         subtitleLabel.lineBreakMode = .byTruncatingMiddle
+
+        let searchField = NSSearchField()
+        searchField.placeholderString = "Search models"
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
 
         let selectionControls = NSStackView()
         selectionControls.orientation = .horizontal
@@ -653,6 +658,13 @@ extension ModelConfigEditorController {
         selectionControls.addArrangedSubview(selectAllButton)
         selectionControls.addArrangedSubview(invertSelectionButton)
         selectionControls.addArrangedSubview(spacer())
+        let resultCountLabel = NSTextField(labelWithString: "")
+        resultCountLabel.textColor = .secondaryLabelColor
+        resultCountLabel.alignment = .right
+        resultCountLabel.usesSingleLineMode = true
+        resultCountLabel.setContentHuggingPriority(.required, for: .horizontal)
+        resultCountLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        selectionControls.addArrangedSubview(resultCountLabel)
 
         let scroll = FetchedModelScrollView()
         scroll.wantsLayer = true
@@ -678,7 +690,17 @@ extension ModelConfigEditorController {
         addButton.bezelStyle = .rounded
         addButton.keyEquivalent = "\r"
 
-        for view in [titleLabel, subtitleLabel, selectionControls, scroll, cancelButton, addButton] {
+        chooserController.configureControls(
+            searchField: searchField,
+            scrollView: scroll,
+            resultCountLabel: resultCountLabel,
+            selectAllButton: selectAllButton,
+            invertSelectionButton: invertSelectionButton,
+            addButton: addButton,
+            minimumListHeight: listHeight
+        )
+
+        for view in [titleLabel, subtitleLabel, searchField, selectionControls, scroll, cancelButton, addButton] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -692,9 +714,14 @@ extension ModelConfigEditorController {
             subtitleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
             subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
 
+            searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            searchField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            searchField.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 12),
+            searchField.heightAnchor.constraint(equalToConstant: 28),
+
             selectionControls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
             selectionControls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            selectionControls.topAnchor.constraint(equalTo: subtitleLabel.bottomAnchor, constant: 12),
+            selectionControls.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 8),
             selectionControls.heightAnchor.constraint(equalToConstant: 28),
 
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
@@ -709,6 +736,7 @@ extension ModelConfigEditorController {
             cancelButton.centerYAnchor.constraint(equalTo: addButton.centerYAnchor),
         ])
 
+        panel.initialFirstResponder = searchField
         panel.center()
         return panel
     }

@@ -111,7 +111,7 @@ extension ModelConfigEditorController {
         let routeButtons = NSStackView()
         routeButtons.orientation = .horizontal
         routeButtons.spacing = 8
-        for button in [routeMoveUpButton, routeMoveDownButton, routeNormalizeButton] {
+        for button in [routeMoveUpButton, routeMoveDownButton] {
             button.bezelStyle = .rounded
             routeButtons.addArrangedSubview(button)
         }

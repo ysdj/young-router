@@ -4,6 +4,150 @@ from hook_test_utils import *
 
 
 class HookStreamingResponseEventTests(HookTestCase):
+    async def test_context_failed_terminal_propagates_without_replay(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        async def original_stream():
+            yield {"type": "response.created", "response": {"id": "resp-original"}}
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-original",
+                    "status": "failed",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                        "message": "Your input exceeds the context window of this model.",
+                    },
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                raise AssertionError("context failure must not be replayed")
+
+        proxy_server.llm_router = FakeRouter()
+        first_output = [
+            {"type": "input_text", "text": "alpha-" + ("a" * 125000)},
+            {"type": "input_text", "text": "-omega"},
+        ]
+        second_output = [
+            {"type": "input_text", "text": "start-" + ("b" * 125000)},
+            {"type": "input_text", "text": "-finish"},
+        ]
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "Continue."},
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_keep",
+                    "call_id": "call_keep",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({});",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_keep",
+                    "call_id": "call_keep",
+                    "output": first_output,
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "ctco_second",
+                    "call_id": "call_second",
+                    "output": second_output,
+                },
+            ],
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-context-stream-retry",
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "model_info": {
+                "id": "same-deployment",
+                "route_key": "provider / default-chat / key=primary",
+            },
+        }
+
+        with self.assertRaises(RuntimeError) as raised:
+            async for _chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            ):
+                pass
+
+        self.assertTrue(hooks._is_context_size_error(raised.exception))
+        self.assertEqual(calls, [])
+        self.assertEqual(request_data["input"][2]["output"], first_output)
+        self.assertFalse(hasattr(raised.exception, "failed_deployment_id"))
+        self.assertNotIn("_excluded_deployment_ids", request_data)
+
+    async def test_context_failed_terminal_propagates_second_context_error_without_looping(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        def context_failed_stream(response_id):
+            async def stream():
+                yield {"type": "response.created", "response": {"id": response_id}}
+                yield {
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id,
+                        "status": "failed",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "context_length_exceeded",
+                            "message": "Your input exceeds the context window of this model.",
+                        },
+                    },
+                }
+            return stream()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return context_failed_stream("resp-retry")
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "Continue."},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_large",
+                    "output": "x" * 250000,
+                },
+            ],
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-context-stream-retry",
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "model_info": {
+                "id": "same-deployment",
+                "route_key": "provider / default-chat / key=primary",
+            },
+        }
+
+        with self.assertRaises(RuntimeError) as raised:
+            chunks = []
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=context_failed_stream("resp-original"),
+                request_data=request_data,
+            ):
+                chunks.append(chunk)
+
+        self.assertTrue(hooks._is_context_size_error(raised.exception))
+        self.assertEqual(getattr(raised.exception, "status_code", None), 400)
+        self.assertEqual(calls, [])
+        self.assertFalse(hasattr(raised.exception, "failed_deployment_id"))
+        self.assertNotIn("_excluded_deployment_ids", request_data)
     async def test_responses_stream_with_text_delta_is_not_buffered_until_completed(self) -> None:
         hooks, proxy_server = load_hook_module()
 
@@ -272,6 +416,117 @@ class HookStreamingResponseEventTests(HookTestCase):
 
         self.assertEqual(parsed["response"]["usage"]["input_tokens"], 19)
         self.assertEqual(parsed["response"]["usage"]["output_tokens"], 6)
+
+    async def test_codex_completed_usage_ignores_impossible_input_count(self) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("complete streams must not replay")
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def original_stream():
+            yield {"type": "response.output_text.delta", "delta": "done"}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-impossible-usage",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 300_000,
+                        "input_tokens_details": {"cached_tokens": 250_000},
+                        "output_tokens": 7,
+                        "total_tokens": 300_007,
+                    },
+                },
+            }
+
+        request_data = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Say done."}],
+            "stream": True,
+            "tools": [{"type": "function", "name": "sample_tool"}],
+            "proxy_server_request": {
+                "headers": {"Originator": "Codex Desktop"},
+            },
+        }
+        upper_bound = hooks._codex_request_input_token_upper_bound(request_data)
+        self.assertIsNotNone(upper_bound)
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        usage = chunks[-1]["response"]["usage"]
+        self.assertEqual(usage["input_tokens"], upper_bound)
+        self.assertEqual(usage["input_tokens_details"]["cached_tokens"], upper_bound)
+        self.assertEqual(usage["output_tokens"], 7)
+        self.assertEqual(usage["total_tokens"], upper_bound + 7)
+
+    async def test_non_codex_completed_usage_remains_unchanged(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-non-codex-usage",
+                "usage": {
+                    "input_tokens": 300_000,
+                    "input_tokens_details": {"cached_tokens": 250_000},
+                    "output_tokens": 7,
+                    "total_tokens": 300_007,
+                },
+            },
+        }
+
+        normalized = hooks._responses_stream_chunk_for_delivery(
+            event,
+            {"call_type": "aresponses", "input": "short request"},
+        )
+
+        self.assertEqual(normalized["response"]["usage"]["input_tokens"], 300_000)
+        self.assertEqual(
+            normalized["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            250_000,
+        )
+
+    async def test_codex_usage_guard_skips_remote_response_context(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "call_type": "aresponses",
+            "input": "short continuation",
+            "previous_response_id": "resp-remote-context",
+            "proxy_server_request": {
+                "headers": {"Originator": "Codex Desktop"},
+            },
+        }
+
+        self.assertIsNone(
+            hooks._codex_request_input_token_upper_bound(request_data)
+        )
+
+    async def test_codex_usage_guard_skips_unserializable_request_fields(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "call_type": "aresponses",
+            "input": "short request",
+            "tools": [object()],
+            "proxy_server_request": {
+                "headers": {"Originator": "Codex Desktop"},
+            },
+        }
+
+        self.assertIsNone(
+            hooks._codex_request_input_token_upper_bound(request_data)
+        )
 
     async def test_responses_stream_terminal_event_after_text_yields_failed_event(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -562,7 +817,7 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertEqual(chunks[-1]["response"]["status"], "completed")
         self.assertEqual(chunks[-1]["response"]["output"], [tool_item])
 
-    async def test_responses_stream_output_limit_terminal_without_output_falls_back_with_compacted_history(self) -> None:
+    async def test_responses_stream_output_limit_terminal_without_output_falls_back_without_compacting_turn(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
 
@@ -663,13 +918,7 @@ class HookStreamingResponseEventTests(HookTestCase):
         retry_input = calls[0]["input"]
         self.assertEqual(retry_input[1], request_data["input"][1])
         self.assertEqual(retry_input[2]["call_id"], "call_keep")
-        self.assertEqual(
-            len(retry_input[2]["output"]),
-            hooks._CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS,
-        )
-        self.assertIn("original_chars=", retry_input[2]["output"])
-        self.assertTrue(retry_input[2]["output"].startswith("alpha-"))
-        self.assertTrue(retry_input[2]["output"].endswith("-omega"))
+        self.assertEqual(retry_input[2]["output"], first_output)
         self.assertEqual(request_data["input"][2]["output"], first_output)
 
     async def test_responses_stream_error_after_text_yields_failed_event_without_retry(self) -> None:

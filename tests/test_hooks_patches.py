@@ -664,6 +664,7 @@ class HookPatchTests(HookTestCase):
                         "model": "gpt-image-2",
                         "_target_order": 1,
                         "_excluded_deployment_ids": ["x-pro"],
+                        hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["r-pro"],
                     }
                 ]
             ],
@@ -1024,9 +1025,53 @@ class HookPatchTests(HookTestCase):
                 "model": "runtime-model-alias",
                 "_target_order": 1,
                 "_excluded_deployment_ids": ["order1-a"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["order1-b"],
             },
         )
         self.assertEqual(router.seen_model_name, "runtime-model-alias")
+
+    async def test_constrained_no_healthy_error_recovers_verified_same_order_peer(self) -> None:
+        hooks, _ = load_hook_module()
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"order": 1},
+                        "model_info": {"id": "primary-a"},
+                    },
+                    {
+                        "litellm_params": {"order": 1},
+                        "model_info": {"id": "peer-b"},
+                    },
+                ]
+
+        error = RuntimeError(
+            "You passed in model=default-chat. There are no healthy deployments for this model."
+        )
+        error.status_code = 400
+        error.failed_deployment_order = 1
+
+        entry = hooks._ordered_deployment_fallback_entry(
+            Router(),
+            error,
+            {
+                "model": "default-chat",
+                "_target_order": 1,
+                "_excluded_deployment_ids": ["primary-a"],
+                "_litellm_menu_upstream_url_surface_deployment_id": "primary-a",
+            },
+        )
+
+        self.assertEqual(
+            entry,
+            {
+                "model": "default-chat",
+                "_target_order": 1,
+                "_excluded_deployment_ids": ["primary-a"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["peer-b"],
+            },
+        )
 
     async def test_rate_limit_does_not_sweep_same_order_peer_fallback(self) -> None:
         hooks, _ = load_hook_module()
@@ -1085,6 +1130,134 @@ class HookPatchTests(HookTestCase):
             [deployment["model_info"]["id"] for deployment in deployments],
             ["order1-b", "order2-c"],
         )
+
+    async def test_sync_selection_uses_verified_same_order_peer_after_litellm_health_rejection(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        deployments = [
+            {
+                "litellm_params": {"order": 1, "model": "openai/primary"},
+                "model_info": {"id": "primary-a"},
+            },
+            {
+                "litellm_params": {"order": 1, "model": "openai/peer"},
+                "model_info": {"id": "peer-b"},
+            },
+        ]
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return list(deployments)
+
+            def get_available_deployment(self, model, request_kwargs=None):
+                error = RuntimeError(
+                    "You passed in model=default-chat. There are no healthy deployments for this model."
+                )
+                error.status_code = 400
+                raise error
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+        request_kwargs = {
+            "model": "default-chat",
+            "_target_order": 1,
+            "_excluded_deployment_ids": ["primary-a"],
+            hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["peer-b"],
+        }
+
+        selected = Router().get_available_deployment(
+            "default-chat",
+            request_kwargs=request_kwargs,
+        )
+
+        self.assertEqual(selected["model_info"]["id"], "peer-b")
+        self.assertNotIn(hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY, request_kwargs)
+
+    async def test_async_selection_uses_verified_same_order_peer_after_litellm_health_rejection(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        deployments = [
+            {
+                "litellm_params": {"order": 1, "model": "openai/primary"},
+                "model_info": {"id": "primary-a"},
+            },
+            {
+                "litellm_params": {"order": 1, "model": "openai/peer"},
+                "model_info": {"id": "peer-b"},
+            },
+        ]
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return list(deployments)
+
+            async def async_get_available_deployment(self, model, request_kwargs):
+                error = RuntimeError(
+                    "You passed in model=default-chat. There are no healthy deployments for this model."
+                )
+                error.status_code = 400
+                raise error
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+        request_kwargs = {
+            "model": "default-chat",
+            "_target_order": 1,
+            "_excluded_deployment_ids": ["primary-a"],
+            hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["peer-b"],
+        }
+
+        selected = await Router().async_get_available_deployment(
+            "default-chat",
+            request_kwargs,
+        )
+
+        self.assertEqual(selected["model_info"]["id"], "peer-b")
+        self.assertNotIn(hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY, request_kwargs)
+
+    async def test_verified_peer_selection_still_respects_menu_cooldown(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        router_module = types.ModuleType("litellm.router")
+        peer = {
+            "litellm_params": {"order": 1, "model": "openai/peer"},
+            "model_info": {"id": "peer-b"},
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [peer]
+
+            async def async_get_available_deployment(self, model, request_kwargs):
+                error = RuntimeError("no healthy deployments")
+                error.status_code = 400
+                raise error
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+        cooldown_error = RuntimeError("upstream peer failure")
+        cooldown_error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            cooldown_error,
+            {
+                "model": "default-chat",
+                "model_info": {"id": "peer-b", "order": 1},
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "no healthy deployments"):
+            await Router().async_get_available_deployment(
+                "default-chat",
+                {
+                    "model": "default-chat",
+                    "_target_order": 1,
+                    hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["peer-b"],
+                },
+            )
 
     async def test_routing_constraint_patch_uses_request_surface_for_cooldown(self) -> None:
         hooks, _ = load_hook_module()
@@ -1224,6 +1397,7 @@ class HookPatchTests(HookTestCase):
                         "model": "runtime-model-alias",
                         "_target_order": 1,
                         "_excluded_deployment_ids": ["order1-a"],
+                        hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["order1-b"],
                     }
                 ]
             ],
@@ -1397,6 +1571,9 @@ class HookPatchTests(HookTestCase):
                         "model": "default-chat",
                         "_target_order": 2,
                         "_excluded_deployment_ids": ["backup_provider-x-plus"],
+                        hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: [
+                            "compat_provider-r-plus"
+                        ],
                     }
                 ]
             ],
@@ -1478,6 +1655,7 @@ class HookPatchTests(HookTestCase):
                         "model": "runtime-model-alias",
                         "_target_order": 1,
                         "_excluded_deployment_ids": ["order2-a"],
+                        hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["order1-a"],
                     }
                 ]
             ],
@@ -1520,6 +1698,7 @@ class HookPatchTests(HookTestCase):
                 "model": "runtime-model-alias",
                 "_target_order": 1,
                 "_excluded_deployment_ids": ["order3-a"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["order1-a"],
             },
         )
 
@@ -1563,6 +1742,9 @@ class HookPatchTests(HookTestCase):
                 "model": "gpt-image-2",
                 "_target_order": 1,
                 "_excluded_deployment_ids": ["backup_provider-x-pro"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: [
+                    "compat_provider-r-pro"
+                ],
             },
         )
 
@@ -1602,6 +1784,9 @@ class HookPatchTests(HookTestCase):
                 "model": "gpt-image-2",
                 "_target_order": 2,
                 "_excluded_deployment_ids": ["backup_provider-x-pro"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: [
+                    "backup_provider-x-image"
+                ],
             },
         )
 
@@ -1645,6 +1830,7 @@ class HookPatchTests(HookTestCase):
                 "model": "gpt-image-2",
                 "_target_order": 3,
                 "_excluded_deployment_ids": ["backup_provider-x-image"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["last-resort"],
             },
         )
 

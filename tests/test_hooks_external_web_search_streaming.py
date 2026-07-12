@@ -56,6 +56,46 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertEqual(payload["model"], "openai/vendor-chat")
         self.assertNotEqual(payload["model"], "llmwebsearch")
 
+    def test_streaming_fallback_payload_keeps_explicit_route_model_group(self) -> None:
+        hooks, _ = load_hook_module()
+        payload = hooks._build_streaming_error_fallback_payload(
+            {
+                "call_type": "aresponses",
+                "model": "logical-chat",
+                "input": "Original request",
+                "stream": True,
+                "model_info": {
+                    "id": "failed-primary",
+                    "route_key": "model=logical-chat / provider=primary / upstream=openai/primary-chat / order=1",
+                },
+            },
+            method_name="aresponses",
+            allow_repeated_attempt=True,
+        )
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["model"], "logical-chat")
+
+    def test_streaming_fallback_payload_does_not_infer_group_from_upstream_only(self) -> None:
+        hooks, _ = load_hook_module()
+        payload = hooks._build_streaming_error_fallback_payload(
+            {
+                "call_type": "aresponses",
+                "model": "logical-chat",
+                "input": "Original request",
+                "stream": True,
+                "litellm_params": {"model": "openai/primary-chat"},
+                "model_info": {"id": "failed-primary"},
+            },
+            method_name="aresponses",
+            allow_repeated_attempt=True,
+        )
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["model"], "openai/primary-chat")
+
     def test_streaming_fallback_payload_preserves_selected_runtime_credentials(self) -> None:
         hooks, _ = load_hook_module()
         payload = hooks._build_streaming_error_fallback_payload(

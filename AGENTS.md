@@ -29,7 +29,30 @@ These instructions apply to the entire `litellm-menu` repository.
   ./mac_menu/build.sh
   ```
 
+- For macOS app or native UI changes, `swiftc -typecheck`, a temporary preview
+  app, or a build using an alternate `LITELLM_APP_PATH` is supplemental
+  verification only. Unless the user explicitly requests a non-installed
+  artifact, completion requires running `./mac_menu/build.sh` with its default
+  `/Applications/LiteLLM Menu.app` target, verifying the installed bundle and
+  signature, restarting the real app, confirming a new app PID, and checking
+  the menu-owned service on its normal local endpoint. If any required step is
+  skipped or fails, report the task as incomplete; do not say it was built,
+  deployed, executed, or completed.
+
 - Keep `VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Formula/litellm-menu.rb` version handling in sync through `scripts/version.py` when version changes are requested.
+
+## Codex / Responses Completion Gate
+
+- For Codex/Responses tool regressions, final proof requires a fresh
+  `codex exec` through the Menu-configured local proxy; `resume`, UI `continue`,
+  unit tests, and hand-written HTTP probes are not substitutes.
+- The CLI must execute real command and namespace/MCP tools, and sanitized
+  trace must confirm the tool types survived routing without duplicate calls.
+- `No connected db` from an ad-hoc CLI usually means the local endpoint or
+  master-key auth was not applied. Fix configuration before diagnosing tools.
+- Completion requires targeted and full tests, app rebuild, menu-owned service
+  restart/health, source-to-bundle match, and the fresh CLI check. Invocation or
+  orchestration errors do not count; rerun once and use one waiter per process.
 
 ## Native UI Screenshots
 
@@ -46,6 +69,9 @@ These instructions apply to the entire `litellm-menu` repository.
 - Keep `litellm_menu/__init__.py` side-effect free. Callback object creation belongs in `litellm_menu/callbacks.py`.
 - Route image-generation tool requests by structured request fields and deployment metadata, especially `model_info.supports_responses_image_generation_tool`, not by prompt wording or provider names.
 - Preserve Responses stream semantics. Once assistant text has been emitted to the client, do not hide a later upstream error by synthesizing a successful completion.
+- Preserve the client-facing native Responses protocol. Codex must not be asked
+  to switch to a LiteLLM-specific API to work around proxy compatibility; fix
+  the translation or passthrough in the proxy instead.
 - Keep compatibility bridges generic: web search, vision fallback, image-generation fallback, and Responses tool mapping must not contain request-specific or provider-specific hacks.
 
 ## Public Repository Hygiene
@@ -59,4 +85,4 @@ These instructions apply to the entire `litellm-menu` repository.
 
 ## Detailed Runbooks
 
-Read `docs/agent-runbooks.md` before changing routing, Responses streaming, web search bridge, vision bridge, image generation fallback, macOS lifecycle, WebDAV sync, or release packaging.
+Read `docs/agent-runbooks.md` before changing routing, Codex/Responses client tools or streaming, web search bridge, vision bridge, image generation fallback, macOS lifecycle, WebDAV sync, or release packaging.

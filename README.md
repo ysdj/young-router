@@ -90,7 +90,7 @@ The facade intercepts computer action calls, routes them to the configured backe
 
 LiteLLM Menu includes targeted optimizations for [Codex](https://github.com/openai/codex) CLI and similar Responses API clients:
 
-- **Codex config integration** — the menu switches only the required connection fields: top-level `model_provider`, provider `base_url`, `wire_api = "responses"`, `requires_openai_auth = true`, and `OPENAI_API_KEY`. It never changes `model`. A field-level state file records only the previous values of managed fields, so restore cannot overwrite later changes to models, MCP servers, compaction, or other Codex settings.
+- **Codex config integration** — the menu switches only the required connection fields: top-level `model_provider`, provider `name = "OpenAI"`, provider `base_url`, `wire_api = "responses"`, `requires_openai_auth = true`, and `OPENAI_API_KEY`. The OpenAI provider identity keeps Codex's standalone `web.run` search available through the local `/alpha/search` endpoint. It never changes `model`. A field-level state file records only the previous values of managed fields, so restore cannot overwrite later changes to models, MCP servers, compaction, or other Codex settings.
 - **Compaction controls** — request pre-processing adds compaction-related metadata and headers that Codex expects.
 - **Reasoning effort compatibility** — when an upstream returns an error indicating `xhigh` reasoning effort is unsupported, the proxy retries with a compatible effort level (`high` or `max`) and records the compat retry.
 - **Usage normalization** — the `response.completed` event's `usage` block is normalized to the Codex-expected schema (`input_tokens`, `output_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens`), including conversion from Chat Completions `prompt_tokens`/`completion_tokens` naming.
@@ -368,7 +368,7 @@ Facade 拦截 computer 动作调用，路由到已配置的后端，并返回观
 
 LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似 Responses API 客户端的定向优化：
 
-- **Codex 配置集成** — 菜单只切换必要连接字段：顶层 `model_provider`、供应商 `base_url`、`wire_api = "responses"`、`requires_openai_auth = true` 和 `OPENAI_API_KEY`，绝不修改 `model`。恢复状态只记录这些受管字段的原值，因此不会覆盖之后修改的模型、MCP、压缩或其他 Codex 设置。
+- **Codex 配置集成** — 菜单只切换必要连接字段：顶层 `model_provider`、供应商 `name = "OpenAI"`、`base_url`、`wire_api = "responses"`、`requires_openai_auth = true` 和 `OPENAI_API_KEY`。OpenAI 供应商身份会让 Codex 保留 standalone `web.run` 搜索，并通过本地 `/alpha/search` 端点执行。绝不修改 `model`。恢复状态只记录这些受管字段的原值，因此不会覆盖之后修改的模型、MCP、压缩或其他 Codex 设置。
 - **压缩控制** — 请求预处理添加 Codex 所需的压缩相关元数据和头信息。
 - **推理强度兼容** — 上游返回表明 `xhigh` 推理强度不支持的错误时，代理以兼容强度级别（`high` 或 `max`）重试，并记录兼容重试。
 - **用量归一化** — `response.completed` 事件的 `usage` 块被归一化为 Codex 期望的架构（`input_tokens`、`output_tokens`、`input_tokens_details.cached_tokens`、`output_tokens_details.reasoning_tokens`、`total_tokens`），包括从 Chat Completions 的 `prompt_tokens`/`completion_tokens` 命名转换。

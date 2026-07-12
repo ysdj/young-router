@@ -36,8 +36,9 @@ DEFAULT_PROVIDER = "newapi"
 LOCAL_HOST = "127.0.0.1"
 DEFAULT_LOCAL_PORT = "4000"
 LOCAL_CONFIG_STATE_FILE = ".litellm-menu-codex-local-config-state.json"
-LOCAL_CONFIG_STATE_SCHEMA_VERSION = 2
+LOCAL_CONFIG_STATE_SCHEMA_VERSION = 3
 PROVIDER_MANAGED_VALUES = {
+    "name": "OpenAI",
     "base_url": None,
     "wire_api": "responses",
     "requires_openai_auth": True,
@@ -437,6 +438,7 @@ def update_codex_files(
         new_config,
         f"model_providers.{provider}",
         {
+            "name": "OpenAI",
             "base_url": api_base,
             "wire_api": "responses",
             "requires_openai_auth": True,

@@ -6,6 +6,595 @@ from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    async def test_context_fallback_emulates_auto_truncation_on_same_deployment(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        previous_budget = (
+            hooks._RESPONSES_CONTEXT_TRUNCATION_FALLBACK_HISTORY_TEXT_CHARS
+        )
+        hooks._RESPONSES_CONTEXT_TRUNCATION_FALLBACK_HISTORY_TEXT_CHARS = 800
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_RESPONSES_CONTEXT_TRUNCATION_FALLBACK_HISTORY_TEXT_CHARS",
+            previous_budget,
+        )
+        calls = []
+        original_input = [
+            {
+                "type": "message",
+                "id": "developer-keep",
+                "role": "developer",
+                "content": "d" * 100,
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "old-call",
+                "call_id": "call-old",
+                "name": "exec",
+                "input": "old input",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "old-output",
+                "call_id": "call-old",
+                "output": "o" * 900,
+            },
+            {
+                "type": "message",
+                "id": "assistant-recent",
+                "role": "assistant",
+                "content": "a" * 100,
+            },
+            {
+                "type": "function_call",
+                "id": "recent-call",
+                "call_id": "call-recent",
+                "name": "inspect",
+                "arguments": "r" * 100,
+            },
+            {
+                "type": "function_call_output",
+                "id": "recent-output",
+                "call_id": "call-recent",
+                "output": "v" * 300,
+            },
+            {
+                "type": "message",
+                "id": "latest-user",
+                "role": "user",
+                "content": "continue from the latest result",
+            },
+        ]
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.copy())
+            if len(calls) == 1:
+                exc = RuntimeError(
+                    "context_length_exceeded: input exceeds the context window"
+                )
+                exc.status_code = 400
+                raise exc
+            return {"ok": True}
+
+        wrapped = hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )
+        response = await wrapped(
+            call_type="aresponses",
+            model="configured-upstream-model",
+            input=original_input,
+            stream=True,
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"turn"}'
+            },
+            model_info={
+                "id": "same-deployment",
+                "route_key": "provider / configured-upstream-model / key=primary",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["truncation"], "auto")
+        self.assertEqual(calls[1]["model"], "configured-upstream-model")
+        self.assertEqual(calls[1]["model_info"]["id"], "same-deployment")
+        retry_ids = [item.get("id") for item in calls[1]["input"]]
+        self.assertEqual(
+            retry_ids,
+            [
+                "developer-keep",
+                "assistant-recent",
+                "recent-call",
+                "recent-output",
+                "latest-user",
+            ],
+        )
+        self.assertNotIn("old-call", retry_ids)
+        self.assertNotIn("old-output", retry_ids)
+        self.assertEqual(
+            [item["id"] for item in original_input],
+            [
+                "developer-keep",
+                "old-call",
+                "old-output",
+                "assistant-recent",
+                "recent-call",
+                "recent-output",
+                "latest-user",
+            ],
+        )
+        self.assertNotIn("_excluded_deployment_ids", calls[1])
+
+    def test_context_fallback_uses_upstream_token_counts_for_retry_budget(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        exc = RuntimeError(
+            "This model's maximum context length is 100,000 tokens, "
+            "but the input contains 200,000 tokens."
+        )
+        request = {
+            "call_type": "aresponses",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": f"old-{index}-" + ("x" * 20_000),
+                }
+                for index in range(5)
+            ]
+            + [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "latest request",
+                }
+            ],
+            "stream": True,
+        }
+
+        retry = hooks._responses_context_truncation_fallback_kwargs(exc, request)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry["truncation"], "auto")
+        self.assertLess(
+            hooks._compaction_text_length(retry["input"]),
+            50_000,
+        )
+        self.assertEqual(retry["input"][-1]["content"], "latest request")
+
+    def test_context_fallback_honors_explicit_auto_by_emulating_it(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        exc = RuntimeError(
+            "context_length_exceeded: input exceeds the context window"
+        )
+        request = {
+            "call_type": "aresponses",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "old history " + ("x" * 450_000),
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "latest request",
+                },
+            ],
+            "stream": True,
+            "truncation": "auto",
+        }
+
+        retry = hooks._responses_context_truncation_fallback_kwargs(exc, request)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry["truncation"], "auto")
+        self.assertEqual(
+            retry["input"],
+            [{"type": "message", "role": "user", "content": "latest request"}],
+        )
+
+    async def test_generic_response_wrapper_retries_context_error_with_native_truncation(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        calls = []
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.copy())
+            exc = RuntimeError(
+                "context_length_exceeded: your input exceeds the context window"
+            )
+            exc.status_code = 400
+            raise exc
+
+        first_output = [
+            {"type": "input_text", "text": "alpha-" + ("a" * 125000)},
+            {"type": "input_text", "text": "-omega"},
+        ]
+        second_output = [
+            {"type": "input_text", "text": "start-" + ("b" * 125000)},
+            {"type": "input_text", "text": "-finish"},
+        ]
+        original_input = [
+            {"type": "message", "role": "user", "content": "Continue."},
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_keep",
+                "call_id": "call_keep",
+                "name": "exec",
+                "input": "const result = await tools.exec_command({});",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_keep",
+                "call_id": "call_keep",
+                "output": first_output,
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_second",
+                "call_id": "call_second",
+                "output": second_output,
+            },
+        ]
+
+        async def succeeds_with_truncation(**kwargs):
+            calls.append(kwargs.copy())
+            if len(calls) == 1:
+                exc = RuntimeError(
+                    "context_length_exceeded: your input exceeds the context window"
+                )
+                exc.status_code = 400
+                raise exc
+            return {"ok": True}
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            succeeds_with_truncation,
+            call_type="aresponses",
+            input=original_input,
+            stream=True,
+            client_metadata={
+                "thread_id": "thread-context-retry",
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            model_info={"id": "same-deployment"},
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["input"], original_input)
+        self.assertNotIn("truncation", calls[0])
+        self.assertEqual(calls[1]["truncation"], "auto")
+        self.assertEqual(calls[1]["model_info"], {"id": "same-deployment"})
+        self.assertIs(calls[1]["input"], original_input)
+        self.assertTrue(
+            calls[1]["litellm_metadata"][
+                hooks._RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY
+            ]
+        )
+        self.assertEqual(original_input[2]["output"], first_output)
+
+    async def test_generic_response_wrapper_does_not_override_explicit_truncation(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        calls = []
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.copy())
+            exc = RuntimeError(
+                "context_length_exceeded: your input exceeds the context window"
+            )
+            exc.status_code = 400
+            raise exc
+
+        large_output = "x" * 250000
+        with self.assertRaises(RuntimeError):
+            await Router()._ageneric_api_call_with_fallbacks_helper(
+                "default-chat",
+                original_generic_function,
+                input=[
+                    {"type": "message", "role": "user", "content": "Continue."},
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_large",
+                        "output": large_output,
+                    },
+                ],
+                stream=True,
+                truncation="disabled",
+                client_metadata={
+                    "thread_id": "thread-context-retry",
+                    "x-codex-turn-metadata": '{"request_kind":"turn"}',
+                },
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"][1]["output"], large_output)
+
+    async def test_generic_response_wrapper_does_not_context_retry_compaction_request(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.copy())
+            exc = RuntimeError(
+                "context_length_exceeded: your input exceeds the context window"
+            )
+            exc.status_code = 400
+            raise exc
+
+        wrapped = hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )
+        with self.assertRaises(RuntimeError):
+            await wrapped(
+                call_type="aresponses",
+                model="default-chat",
+                input=[
+                    {"type": "message", "role": "user", "content": "history"},
+                    {"type": "compaction_trigger", "id": "compact-now"},
+                ],
+                stream=True,
+                client_metadata={
+                    "x-codex-turn-metadata": '{"request_kind":"compaction"}'
+                },
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("truncation", calls[0])
+
+    async def test_stream_context_terminal_retries_before_failed_events_are_delivered(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        calls = []
+
+        async def first_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-too-large", "status": "in_progress"},
+            }
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-too-large",
+                    "status": "failed",
+                    "error": {
+                        "code": "context_length_exceeded",
+                        "type": "invalid_request_error",
+                        "message": "Your input exceeds the context window of this model.",
+                    },
+                },
+            }
+
+        async def retry_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-truncated", "status": "in_progress"},
+            }
+            yield {"type": "response.output_text.delta", "delta": "continued"}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-truncated",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "continued"}
+                            ],
+                        }
+                    ],
+                },
+            }
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.copy())
+            return first_stream() if len(calls) == 1 else retry_stream()
+
+        wrapped = hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )
+        response = await wrapped(
+            call_type="aresponses",
+            model="configured-upstream-model",
+            input=[{"type": "message", "role": "user", "content": "continue"}],
+            stream=True,
+            client_metadata={
+                "thread_id": "thread-stream-context",
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            model_info={"id": "same-deployment", "order": 2},
+        )
+        chunks = [chunk async for chunk in response]
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["truncation"], "auto")
+        self.assertEqual(calls[1]["model"], "configured-upstream-model")
+        self.assertEqual(
+            calls[1]["model_info"],
+            {"id": "same-deployment", "order": 2},
+        )
+        serialized = json.dumps(chunks)
+        self.assertNotIn("resp-too-large", serialized)
+        self.assertNotIn("response.failed", serialized)
+        self.assertIn("resp-truncated", serialized)
+        self.assertIn("continued", serialized)
+
+    async def test_stream_context_fallback_exception_does_not_loop(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        calls = []
+
+        async def context_exception_stream():
+            raise RuntimeError(
+                "context_length_exceeded: input exceeds the context window"
+            )
+            yield  # pragma: no cover
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.copy())
+            return context_exception_stream()
+
+        wrapped = hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )
+        response = await wrapped(
+            call_type="aresponses",
+            model="configured-upstream-model",
+            input=[{"type": "message", "role": "user", "content": "continue"}],
+            stream=True,
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"turn"}'
+            },
+            model_info={"id": "same-deployment"},
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "context_length_exceeded"):
+            async for _chunk in response:
+                pass
+
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("truncation", calls[0])
+        self.assertEqual(calls[1]["truncation"], "auto")
+
+    async def test_second_context_terminal_never_becomes_deployment_failover(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        def context_failed_stream(response_id):
+            async def stream():
+                yield {
+                    "type": "response.created",
+                    "response": {"id": response_id, "status": "in_progress"},
+                }
+                yield {
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id,
+                        "status": "failed",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "context_length_exceeded",
+                            "message": "Input exceeds the context window.",
+                        },
+                    },
+                }
+
+            return stream()
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.copy())
+            return context_failed_stream(f"resp-{len(calls)}")
+
+        class FakeRouter:
+            async def aresponses(self, **_payload):
+                raise AssertionError("context fallback must not re-enter Router")
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "call_type": "aresponses",
+            "model": "configured-upstream-model",
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"}
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}'
+            },
+            "model_info": {
+                "id": "same-deployment",
+                "route_key": "provider / configured-upstream-model / key=primary",
+            },
+        }
+        wrapped = hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )
+        response = await wrapped(**request_data)
+
+        with self.assertRaises(RuntimeError) as raised:
+            async for _chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=response,
+                request_data=request_data,
+            ):
+                pass
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["truncation"], "auto")
+        self.assertTrue(hooks._is_context_size_error(raised.exception))
+        self.assertFalse(hasattr(raised.exception, "failed_deployment_id"))
+        self.assertNotIn("_excluded_deployment_ids", request_data)
+
+    async def test_stream_context_error_after_visible_output_is_not_replayed(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        calls = []
+
+        async def visible_then_context_error():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-visible", "status": "in_progress"},
+            }
+            yield {"type": "response.output_text.delta", "delta": "visible"}
+            raise RuntimeError(
+                "context_length_exceeded: input exceeds the context window"
+            )
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs.copy())
+            return visible_then_context_error()
+
+        wrapped = hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )
+        response = await wrapped(
+            call_type="aresponses",
+            model="configured-upstream-model",
+            input=[{"type": "message", "role": "user", "content": "continue"}],
+            stream=True,
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"turn"}'
+            },
+            model_info={"id": "same-deployment"},
+        )
+
+        chunks = []
+        with self.assertRaisesRegex(RuntimeError, "context_length_exceeded"):
+            async for chunk in response:
+                chunks.append(chunk)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            chunks[-1],
+            {"type": "response.output_text.delta", "delta": "visible"},
+        )
     async def test_pre_call_deployment_hook_preserves_upstream_metadata_when_opted_in(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()

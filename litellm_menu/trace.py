@@ -19,6 +19,7 @@ from .base import (
     _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
+    _RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
@@ -377,7 +378,28 @@ def _trace_responses_input_shape(request_kwargs: Optional[dict]) -> dict[str, An
             content = item.get("content")
             status = item.get("status")
             content_kind = type(content).__name__ if content is not None else None
-            text_len = _trace_text_length(content)
+            content_text_len = _trace_text_length(content)
+            tool_output_text_len = (
+                _trace_text_length(item.get("output"))
+                if isinstance(item_type, str)
+                and item_type in {
+                    "function_call_output",
+                    "custom_tool_call_output",
+                    "computer_call_output",
+                }
+                else 0
+            )
+            tool_call_input_text_len = (
+                _trace_text_length(item.get("input"))
+                + _trace_text_length(item.get("arguments"))
+                if _trace_tool_call_item(item) is not None
+                else 0
+            )
+            text_len = (
+                content_text_len
+                + tool_output_text_len
+                + tool_call_input_text_len
+            )
             add_count(top_type_counts, item_type)
             if role is not None:
                 add_count(role_counts, role)
@@ -389,7 +411,13 @@ def _trace_responses_input_shape(request_kwargs: Optional[dict]) -> dict[str, An
                 add_count(status_counts, status)
             if (
                 isinstance(item_type, str)
-                and item_type in {"function_call_output", "tool_output", "tool_result"}
+                and item_type in {
+                    "function_call_output",
+                    "custom_tool_call_output",
+                    "computer_call_output",
+                    "tool_output",
+                    "tool_result",
+                }
             ) or role == "tool":
                 tool_output_count += 1
             if _trace_tool_call_item(item) is not None:
@@ -409,6 +437,10 @@ def _trace_responses_input_shape(request_kwargs: Optional[dict]) -> dict[str, An
                     sample["part_types"] = part_types
                 if isinstance(status, str):
                     sample["status"] = status
+                if tool_output_text_len:
+                    sample["tool_output_text_len"] = tool_output_text_len
+                if tool_call_input_text_len:
+                    sample["tool_call_input_text_len"] = tool_call_input_text_len
                 sample_items.append(sample)
         else:
             add_count(top_type_counts, type(item).__name__)
@@ -726,6 +758,7 @@ def _trace_metadata_flags(request_kwargs: Optional[dict]) -> dict[str, Any]:
         _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
         _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
         _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY,
+        _RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY,
         _STREAM_FALLBACK_METADATA_KEY,
         _STREAM_ERROR_FALLBACK_METADATA_KEY,
         _STREAM_IDLE_TIMEOUT_METADATA_KEY,

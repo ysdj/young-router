@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -87,8 +88,12 @@ def collect_urls(value: Any) -> list[str]:
     def add(raw: Any) -> None:
         if not isinstance(raw, str):
             return
-        for match in re.findall(r"https?://[^\s\])}>\"']+", raw):
-            url = match.rstrip(".,;:")
+        raw_urls = re.findall(r"https?://[^\s<>\"']+", raw)
+        # A provider citation can concatenate the cited URL and the Markdown
+        # target without whitespace; inspect the target separately as well.
+        raw_urls.extend(re.findall(r"\]\]\((https?://[^)]+)\)", raw))
+        for match in raw_urls:
+            url = _clean_extracted_url(match)
             if url and url not in seen:
                 seen.add(url)
                 urls.append(url)
@@ -107,6 +112,17 @@ def collect_urls(value: Any) -> list[str]:
 
     visit(value)
     return urls
+
+
+def _clean_extracted_url(value: str) -> str:
+    """Normalize URLs found inside prose/Markdown without breaking paths."""
+    url = value.strip().rstrip(".,;:]}")
+    citation_marker = re.search(r"\[\[\d+\]\]\(https?://", url)
+    if citation_marker:
+        url = url[: citation_marker.start()].rstrip(".,;:]}")
+    while url.endswith(")") and url.count(")") > url.count("("):
+        url = url[:-1].rstrip(".,;:]}")
+    return url
 
 
 def summarize_payload(payload: Any, events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -166,10 +182,14 @@ def trace_log_offset(trace_log: str) -> int:
         return 0
 
 
-def read_route_trace_events(trace_log: str, offset: int) -> list[dict[str, Any]]:
+def _trace_log_paths(trace_log: str) -> list[Path]:
     if not trace_log:
         return []
     path = Path(trace_log)
+    return [Path(f"{path}.1"), path]
+
+
+def _route_trace_raw_lines(path: Path, offset: int = 0) -> list[str]:
     try:
         with path.open("rb") as handle:
             handle.seek(offset)
@@ -177,18 +197,59 @@ def read_route_trace_events(trace_log: str, offset: int) -> list[dict[str, Any]]
     except OSError:
         return []
 
-    events: list[dict[str, Any]] = []
     prefix = "litellm_route_trace "
+    raw_lines: list[str] = []
     for line in text.splitlines():
         marker = line.find(prefix)
-        if marker < 0:
-            continue
-        raw = line[marker + len(prefix) :].strip()
+        if marker >= 0:
+            raw_lines.append(line[marker + len(prefix) :].strip())
+    return raw_lines
+
+
+def _route_trace_line_digest(raw: str) -> bytes:
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).digest()
+
+
+def route_trace_cursor(trace_log: str) -> set[bytes]:
+    """Snapshot trace lines across the current and rotated service logs."""
+    return {
+        _route_trace_line_digest(raw)
+        for path in _trace_log_paths(trace_log)
+        for raw in _route_trace_raw_lines(path)
+    }
+
+
+def read_route_trace_events(trace_log: str, offset: int) -> list[dict[str, Any]]:
+    if not trace_log:
+        return []
+    events: list[dict[str, Any]] = []
+    for raw in _route_trace_raw_lines(Path(trace_log), offset):
         try:
             event = json.loads(raw)
         except Exception:
             continue
         events.append(event)
+    return events
+
+
+def read_route_trace_events_since(
+    trace_log: str,
+    cursor: set[bytes],
+) -> list[dict[str, Any]]:
+    """Read new trace events even if the service log rotated mid-request."""
+    events: list[dict[str, Any]] = []
+    seen = set(cursor)
+    for path in _trace_log_paths(trace_log):
+        for raw in _route_trace_raw_lines(path):
+            digest = _route_trace_line_digest(raw)
+            if digest in seen:
+                continue
+            seen.add(digest)
+            try:
+                event = json.loads(raw)
+            except Exception:
+                continue
+            events.append(event)
     return events
 
 
@@ -250,9 +311,23 @@ def select_route_trace_events(
             "selected_request_id": request_id,
         }
 
+    exact_model_request_ids = {
+        candidate_id
+        for candidate_id, candidate_events in by_request_id.items()
+        if any(
+            event.get("model_group") == model
+            or (
+                isinstance(event.get("deployment"), dict)
+                and event["deployment"].get("id") == model
+            )
+            for event in candidate_events
+        )
+    }
     needles = [value.lower() for value in (query, model) if value]
     scored: list[tuple[int, int, str, list[dict[str, Any]]]] = []
     for index, candidate_id in enumerate(request_ids):
+        if exact_model_request_ids and candidate_id not in exact_model_request_ids:
+            continue
         candidate_events = by_request_id[candidate_id]
         text = "\n".join(route_trace_event_text(event) for event in candidate_events).lower()
         score = sum(10 for needle in needles if needle and needle in text)
@@ -263,7 +338,7 @@ def select_route_trace_events(
         ):
             score += 100
         if any(event.get("model_group") == model for event in candidate_events):
-            score += 10
+            score += 1000
         scored.append((score, index, candidate_id, candidate_events))
 
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
@@ -271,7 +346,11 @@ def select_route_trace_events(
     if best_score > 0:
         return best_events, {
             "available_request_ids": request_ids,
-            "matched_by": "log_offset_score",
+            "matched_by": (
+                "exact_model_group_score"
+                if exact_model_request_ids
+                else "log_offset_score"
+            ),
             "score": best_score,
             "selected_request_id": best_id,
         }
@@ -469,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
 
     url = responses_url(args.base_url)
     payload = build_payload(args)
-    log_offset = trace_log_offset(args.trace_log)
+    trace_cursor = route_trace_cursor(args.trace_log)
     status, headers, response_payload, events = request_responses(
         url=url,
         api_key=args.api_key,
@@ -479,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.trace_wait > 0:
         time.sleep(args.trace_wait)
-    all_trace_events = read_route_trace_events(args.trace_log, log_offset)
+    all_trace_events = read_route_trace_events_since(args.trace_log, trace_cursor)
     trace_events, trace_match = select_route_trace_events(
         all_trace_events,
         request_id=args.request_id,

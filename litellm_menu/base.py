@@ -151,6 +151,9 @@ _INLINE_IMAGE_SINGLE_MAX_EDGE = 2200
 _GENERIC_HELPER_PATCH_ATTR = "_generic_deployment_failover_patch"
 _ORDER_PEER_FAILOVER_PATCH_ATTR = "_order_peer_failover_patch"
 _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR = "_selected_deployment_marker_patch"
+_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY = (
+    "_litellm_menu_verified_fallback_deployment_ids"
+)
 _SANITIZED_UPSTREAM_ROUTE_FAILURE_ATTR = "_sanitized_upstream_route_failure"
 _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE = 503
 _ROUTING_CONSTRAINT_PATCH_ATTR = "_routing_constraint_patch"
@@ -170,6 +173,9 @@ _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY = (
 )
 _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY = (
     "responses_function_tool_bridge_fallback_reason"
+)
+_RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY = (
+    "responses_context_truncation_fallback_attempted"
 )
 _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY = (
     "responses_native_client_tool_passthrough"
@@ -322,6 +328,14 @@ _CURRENT_EXCLUDED_DEPLOYMENT_IDS = contextvars.ContextVar(
     "current_excluded_deployment_ids",
     default=None,
 )
+_CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS = contextvars.ContextVar(
+    "current_verified_fallback_deployment_ids",
+    default=None,
+)
+_CURRENT_ROUTING_REQUEST_KWARGS = contextvars.ContextVar(
+    "current_routing_request_kwargs",
+    default=None,
+)
 _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID = contextvars.ContextVar(
     "current_surface_target_deployment_id",
     default=None,
@@ -362,7 +376,11 @@ def _object_get(value: Any, key: str, default: Any = None) -> Any:
     return getattr(value, key, default)
 
 
-def _responses_usage_for_codex(usage: Any) -> Optional[dict[str, Any]]:
+def _responses_usage_for_codex(
+    usage: Any,
+    *,
+    input_token_upper_bound: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
     if usage is None:
         return None
     input_tokens = _int_or_none(_object_get(usage, "input_tokens"))
@@ -382,10 +400,18 @@ def _responses_usage_for_codex(usage: Any) -> Optional[dict[str, Any]]:
     if output_details is None:
         output_details = _object_get(usage, "completion_tokens_details")
 
+    cached_tokens = _int_or_zero(_object_get(input_details, "cached_tokens"))
+    bounded_input_tokens = _int_or_none(input_token_upper_bound)
+    if bounded_input_tokens is not None and bounded_input_tokens >= 0:
+        if input_tokens > bounded_input_tokens:
+            input_tokens = bounded_input_tokens
+            cached_tokens = min(cached_tokens, input_tokens)
+            total_tokens = input_tokens + output_tokens
+
     return {
         "input_tokens": input_tokens,
         "input_tokens_details": {
-            "cached_tokens": _int_or_zero(_object_get(input_details, "cached_tokens")),
+            "cached_tokens": cached_tokens,
         },
         "output_tokens": output_tokens,
         "output_tokens_details": {
@@ -395,10 +421,17 @@ def _responses_usage_for_codex(usage: Any) -> Optional[dict[str, Any]]:
     }
 
 
-def _normalize_response_completed_event_usage(event: Any) -> Any:
+def _normalize_response_completed_event_usage(
+    event: Any,
+    *,
+    input_token_upper_bound: Optional[int] = None,
+) -> Any:
     response = _object_get(event, "response")
     usage = _object_get(response, "usage")
-    normalized_usage = _responses_usage_for_codex(usage)
+    normalized_usage = _responses_usage_for_codex(
+        usage,
+        input_token_upper_bound=input_token_upper_bound,
+    )
     if normalized_usage is None:
         return event
     if isinstance(response, dict):

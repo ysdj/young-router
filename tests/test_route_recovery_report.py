@@ -113,6 +113,46 @@ class RouteRecoveryReportTests(unittest.TestCase):
             self.assertIn("Recent Recovery Timeouts", html)
             self.assertIn("recovering threads", html)
 
+    def test_render_shows_live_cooldown_countdown(self) -> None:
+        report = load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            recovery_path = Path(tmp) / "route-recovery-state.json"
+            cooldown_path = Path(tmp) / "deployment-cooldowns.json"
+            recent_path = Path(tmp) / "recent-requests.jsonl"
+            until = time.time() + 125
+            recovery_path.write_text(json.dumps({"recoveries": {}}), encoding="utf-8")
+            cooldown_path.write_text(
+                json.dumps(
+                    {
+                        "cooldowns": {
+                            "id:route:responses": {
+                                "deployment_id": "route",
+                                "route_key": "id:route:responses",
+                                "provider": "example",
+                                "failures": 2,
+                                "cooldown_until": until,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            recent_path.write_text("", encoding="utf-8")
+
+            html = report.render(
+                recovery_state_path=str(recovery_path),
+                cooldown_state_path=str(cooldown_path),
+                recent_requests_path=str(recent_path),
+            )
+
+            self.assertIn("data-countdown-until=", html)
+            self.assertIn("countdown-badge", html)
+            self.assertIn("tickCountdowns", html)
+            self.assertIn("data-generated-at=", html)
+            self.assertIn("2m ", html)
+            self.assertIn("ends at", html)
+            self.assertIn("Deployment Cooldowns", html)
+
 
 if __name__ == "__main__":
     unittest.main()

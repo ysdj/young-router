@@ -15,6 +15,47 @@ This document keeps lower-frequency operational notes out of `AGENTS.md`. Read t
 - Once assistant text has been yielded, preserve it and emit a terminal failure if the upstream later errors, stalls, or ends without a real completion.
 - Recovery and synthesized completion are only acceptable before any assistant answer text has been delivered, or while only tool/search UI events have been emitted.
 - Preserve item ids and tool call ids when bridging function, custom, `tool_search`, or `web_search` events. Do not deduplicate repeated tool calls by command text or arguments.
+- Keep context handling split by request kind. Bound a structured Codex remote
+  compaction request before its first upstream call; never hide a malformed
+  compaction request behind a retry. For an ordinary native Responses turn,
+  an upstream `context_length_exceeded` before visible output may replay the
+  already selected deployment once with the Responses API's documented
+  `truncation: auto`. Because compatible endpoints may accept that field but
+  fail to implement it, the retry may emulate its oldest-first item eviction
+  locally while preserving protected instructions and complete tool
+  call/output pairs. Preserve an explicit `disabled` choice, do not modify the
+  first ordinary-turn request, do not re-enter Router selection, and never
+  loop or mark a context error as a deployment failure.
+
+## Codex Responses Client Tools
+
+- Keep Codex on the native Responses protocol; fix proxy passthrough or mapping
+  instead of requiring a LiteLLM-specific client payload.
+- Merge top-level `tools` with leading `additional_tools` before compatibility
+  processing. Preserve order, remaining input, `tool_choice`,
+  `parallel_tool_calls`, and raw unfamiliar tool definitions.
+- Capability is three-state: `true` and unknown try native first; only `false`
+  may pre-bridge. After a native attempt, bridge once only for a clear
+  tool/schema incompatibility, never for auth, quota, policy, network, timeout,
+  or an unrelated bad request.
+- When bridging `custom`/`namespace` tools, default omitted
+  `parallel_tool_calls` to `false`; preserve explicit values and all item/call
+  IDs. Never deduplicate calls by tool name or arguments.
+- HTTP success is insufficient: verify that the client actually receives and
+  executes tools, and distinguish native, pre-bridge, and fallback in trace.
+
+### Required Codex Integration Verification
+
+- Run targeted tests and the full suite via `./scripts/test.sh`; invocation
+  errors are not test results.
+- Build the app, restart the menu-owned service, check health, and rebuild again
+  if source changed afterward.
+- Apply the Menu-supported local Codex config, then start a fresh `codex exec`
+  (not `resume`/`continue`). A partial config can cause `No connected db` by
+  sending the wrong key.
+- Execute a command tool and, when available, a namespace/MCP/file tool. Match
+  the fresh task in sanitized trace and confirm tools survived fallback and
+  each expected call occurred once.
 
 ## Web Search Bridge
 

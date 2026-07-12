@@ -79,23 +79,6 @@ extension ModelConfigEditorController {
         moveSelectedRoute(by: 1)
     }
 
-    @objc func normalizeRouteOrder() {
-        let selectedIdentity = selectedRouteIdentity ?? modelEditorTarget
-        commitEditor()
-        guard let selectedIdentity,
-              let current = modelSelectionIndices(for: selectedIdentity) else {
-            refreshRouteControlsEnabled()
-            return
-        }
-        let publicModel = routePublicModelName(providers[current.provider].models[current.model])
-        let group = routeGroup(for: publicModel)
-        guard !group.isEmpty else {
-            refreshRouteControlsEnabled()
-            return
-        }
-        rewriteRouteGroupOrder(group, preserving: selectedIdentity, status: "Normalized \(publicModel) route order.")
-    }
-
     func commitProviderEditor() {
         guard providerEditorDirty else { return }
         guard let providerIndex = providerEditorTargetIndex,

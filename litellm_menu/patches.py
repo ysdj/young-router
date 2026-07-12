@@ -18,6 +18,8 @@ from .base import (
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID,
     _CURRENT_SELECTED_DEPLOYMENT,
+    _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS,
+    _CURRENT_ROUTING_REQUEST_KWARGS,
     _GENERIC_HELPER_PATCH_ATTR,
     _ORDER_PEER_FAILOVER_PATCH_ATTR,
     _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR,
@@ -26,6 +28,7 @@ from .base import (
     _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR,
     _ROUTING_CONSTRAINT_PATCH_ATTR,
     _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR,
+    _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _normalize_response_completed_event_usage,
 )
 
@@ -90,6 +93,62 @@ def _request_is_external_web_search_internal_call(request_kwargs: Optional[dict]
     return False
 
 
+def _request_local_verified_fallback_deployment(
+    router: Any,
+    model: Any,
+    request_kwargs: Optional[dict],
+    *,
+    verified_ids: set[str],
+    target_order: Any,
+) -> Optional[dict]:
+    if not verified_ids or not isinstance(model, str) or not model.strip():
+        return None
+    request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
+    metadata = _image_generation_module._request_metadata_dict(
+        request_kwargs,
+        "metadata",
+    ) or {}
+    try:
+        configured = _routing_module._router_configured_deployments(
+            router,
+            model,
+            team_id=metadata.get("user_api_key_team_id"),
+        )
+    except Exception:
+        return None
+
+    constraints = request_kwargs.copy()
+    if target_order is not None:
+        constraints["_target_order"] = target_order
+    constraints[_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY] = sorted(verified_ids)
+    candidates = _image_generation_module._with_retry_target_constraints(
+        list(configured or []),
+        constraints,
+    )
+    candidates, cooldown_deployments, cooldown_filtered = (
+        _routing_module._with_active_deployment_cooldowns(
+            candidates,
+            request_kwargs=constraints,
+        )
+    )
+    if not candidates:
+        return None
+    deployment = candidates[0]
+    _trace_module._route_trace(
+        "request_local_verified_fallback_selected",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=model,
+        target_order=target_order,
+        verified_deployment_ids=sorted(verified_ids),
+        deployment=_routing_module._trace_deployment(deployment),
+        cooldown_filtered=cooldown_filtered,
+        cooldown_deployments=cooldown_deployments,
+        request=_trace_module._trace_request_summary(request_kwargs),
+    )
+    return deployment
+
+
 def _install_routing_constraint_patch() -> None:
     try:
         from litellm.router import Router
@@ -115,6 +174,14 @@ def _install_routing_constraint_patch() -> None:
                     for deployment in constrained
                     if _image_generation_module._deployment_id(deployment) not in excluded_ids
                 ]
+            verified_ids = _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.get()
+            if verified_ids:
+                constrained = [
+                    deployment
+                    for deployment in constrained
+                    if _image_generation_module._deployment_id(deployment)
+                    in verified_ids
+                ]
             target_deployment_id = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.get()
             if target_deployment_id:
                 constrained = [
@@ -126,9 +193,7 @@ def _install_routing_constraint_patch() -> None:
             constrained, _cooldown_deployments, _cooldown_filtered = (
                 _routing_module._with_active_deployment_cooldowns(
                     constrained,
-                    request_kwargs=(
-                        _routing_module._deployment_cooldown_request_for_current_surface()
-                    ),
+                    request_kwargs=_CURRENT_ROUTING_REQUEST_KWARGS.get(),
                 )
             )
             return constrained
@@ -155,18 +220,47 @@ def _install_routing_constraint_patch() -> None:
                 positional_index=4,
             )
             excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
+            verified_ids = _image_generation_module._request_verified_fallback_deployment_ids(
+                request_kwargs
+            )
+            target_order = _image_generation_module._request_target_order(request_kwargs)
             excluded_token = _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids or None)
+            verified_token = _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.set(
+                verified_ids or None
+            )
             target_token = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.set(
                 _routing_module._request_surface_target_deployment_id(request_kwargs)
             )
             cooldown_token = _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.set(
                 _routing_module._deployment_cooldown_surface(request_kwargs)
             )
+            request_token = _CURRENT_ROUTING_REQUEST_KWARGS.set(request_kwargs)
             try:
-                return original_get_available_deployment(self, *args, **kwargs)
+                try:
+                    return original_get_available_deployment(self, *args, **kwargs)
+                except Exception as exc:
+                    if not _routing_module._is_no_deployments_available_error(exc):
+                        raise
+                    model = kwargs.get("model")
+                    if model is None and args:
+                        model = args[0]
+                    deployment = _request_local_verified_fallback_deployment(
+                        self,
+                        model,
+                        request_kwargs,
+                        verified_ids=verified_ids,
+                        target_order=target_order,
+                    )
+                    if deployment is None:
+                        raise
+                    return deployment
             finally:
+                if isinstance(request_kwargs, dict):
+                    request_kwargs.pop(_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY, None)
+                _CURRENT_ROUTING_REQUEST_KWARGS.reset(request_token)
                 _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.reset(cooldown_token)
                 _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.reset(target_token)
+                _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.reset(verified_token)
                 _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(excluded_token)
 
         setattr(patched_get_available_deployment, _ROUTING_CONSTRAINT_PATCH_ATTR, True)
@@ -200,18 +294,51 @@ def _install_routing_constraint_patch() -> None:
             positional_index=1,
         )
         excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
+        verified_ids = _image_generation_module._request_verified_fallback_deployment_ids(
+            request_kwargs
+        )
+        target_order = _image_generation_module._request_target_order(request_kwargs)
         excluded_token = _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids or None)
+        verified_token = _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.set(
+            verified_ids or None
+        )
         target_token = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.set(
             _routing_module._request_surface_target_deployment_id(request_kwargs)
         )
         cooldown_token = _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.set(
             _routing_module._deployment_cooldown_surface(request_kwargs)
         )
+        request_token = _CURRENT_ROUTING_REQUEST_KWARGS.set(request_kwargs)
         try:
-            return await original_async_get_available_deployment(self, *args, **kwargs)
+            try:
+                return await original_async_get_available_deployment(
+                    self,
+                    *args,
+                    **kwargs,
+                )
+            except Exception as exc:
+                if not _routing_module._is_no_deployments_available_error(exc):
+                    raise
+                model = kwargs.get("model")
+                if model is None and args:
+                    model = args[0]
+                deployment = _request_local_verified_fallback_deployment(
+                    self,
+                    model,
+                    request_kwargs,
+                    verified_ids=verified_ids,
+                    target_order=target_order,
+                )
+                if deployment is None:
+                    raise
+                return deployment
         finally:
+            if isinstance(request_kwargs, dict):
+                request_kwargs.pop(_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY, None)
+            _CURRENT_ROUTING_REQUEST_KWARGS.reset(request_token)
             _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.reset(cooldown_token)
             _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.reset(target_token)
+            _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.reset(verified_token)
             _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(excluded_token)
 
     setattr(patched_async_get_available_deployment, _ROUTING_CONSTRAINT_PATCH_ATTR, True)
@@ -568,6 +695,7 @@ def _install_generic_deployment_failover_patch() -> None:
         for update_request in (
             _image_generation_module._with_empty_tool_controls_removed,
             _image_generation_module._with_codex_compaction_controls,
+            _image_generation_module._with_codex_compaction_input_bounded,
             _image_generation_module._with_responses_native_extra_body,
             _image_generation_module._with_codex_compaction_headers,
         ):

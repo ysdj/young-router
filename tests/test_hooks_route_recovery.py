@@ -119,6 +119,51 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertFalse(hooks._is_route_recovery_poll_error(exc))
         self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
 
+    def test_failed_responses_terminal_preserves_context_error_and_stops_polling(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+        terminal = {
+            "type": "response.failed",
+            "response": {
+                "id": "resp-context",
+                "status": "failed",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": (
+                        "This model's maximum context length is 140000 tokens, "
+                        "but the input contains 140100 tokens."
+                    ),
+                },
+            },
+        }
+
+        exc = hooks._route_recovery_terminal_chunk_exception(
+            terminal,
+            request_data,
+            {},
+            buffer=[
+                {"type": "response.created", "response": {"id": "resp-context"}},
+                terminal,
+            ],
+        )
+
+        self.assertIsNotNone(exc)
+        assert exc is not None
+        self.assertTrue(hooks._is_context_size_error(exc))
+        self.assertEqual(exc.status_code, 400)
+        self.assertEqual(
+            exc.body["terminal_event"]["error_code"],
+            "context_length_exceeded",
+        )
+        self.assertIn("maximum context length", exc.body["terminal_event"]["error_message"])
+        self.assertFalse(hooks._is_route_recovery_poll_error(exc))
+
     def test_route_recovery_does_not_poll_on_upstream_model_not_found(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
@@ -292,6 +337,97 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertIn({"type": "response.output_text.delta", "delta": "recovered"}, chunks)
         self.assertIn({"type": "response.completed", "response": {"id": "resp-recovered"}}, chunks)
         self.assertFalse(any(isinstance(chunk, str) for chunk in chunks))
+
+    async def test_route_recovery_keeps_logical_group_and_uses_healthy_peer(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        cooldown_file = Path(temp_dir.name) / "deployment-cooldowns.json"
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(cooldown_file))
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+
+        class BalanceError(Exception):
+            status_code = 403
+
+        async def healthy_peer_stream():
+            yield {"type": "response.output_text.delta", "delta": "healthy peer"}
+            yield {"type": "response.completed", "response": {"id": "resp-healthy-peer"}}
+
+        deployments = [
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {
+                    "id": "failed-primary",
+                    "route_key": "model=logical-chat / provider=primary / upstream=openai/primary-chat / order=1",
+                },
+            },
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {
+                    "id": "healthy-peer",
+                    "route_key": "model=logical-chat / provider=peer / upstream=openai/peer-chat / order=1",
+                },
+            },
+        ]
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                self.last_model_name = model_name
+                return deployments if model_name == "logical-chat" else []
+
+            async def aresponses(self, **payload):
+                calls.append(payload.copy())
+                assert payload["model"] == "logical-chat"
+                assert payload["_target_order"] == 1
+                assert payload["_excluded_deployment_ids"] == ["failed-primary"]
+                return healthy_peer_stream()
+
+        router = FakeRouter()
+        proxy_server.llm_router = router
+        request_data = {
+            "call_type": "aresponses",
+            "model": "logical-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {
+                "id": "failed-primary",
+                "order": 1,
+                "route_key": "model=logical-chat / provider=primary / upstream=openai/primary-chat / order=1",
+            },
+        }
+        first_exception = BalanceError("insufficient account balance")
+        first_exception.failed_deployment_id = "failed-primary"
+        first_exception.failed_deployment_order = 1
+        hooks._mark_exception_for_deployment_failover(first_exception, request_data)
+
+        cooled, active_cooldowns, cooldown_filtered = (
+            hooks._with_active_deployment_cooldowns(
+                deployments,
+                request_kwargs=request_data,
+            )
+        )
+        self.assertTrue(cooldown_filtered)
+        self.assertEqual(
+            [item["model_info"]["id"] for item in cooled],
+            ["healthy-peer"],
+        )
+        self.assertEqual(len(active_cooldowns), 1)
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                first_exception,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(router.last_model_name, "logical-chat")
+        self.assertIn({"type": "response.output_text.delta", "delta": "healthy peer"}, chunks)
+        self.assertEqual(chunks[-1]["response"]["id"], "resp-healthy-peer")
 
     async def test_route_recovery_poll_reuses_stream_error_fallback_marker(self) -> None:
         hooks, proxy_server = load_hook_module()

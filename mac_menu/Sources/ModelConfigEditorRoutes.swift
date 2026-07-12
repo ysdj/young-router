@@ -423,19 +423,16 @@ extension ModelConfigEditorController {
         guard viewMode == .routes, let selected = selectedRouteRow() else {
             routeMoveUpButton.isEnabled = false
             routeMoveDownButton.isEnabled = false
-            routeNormalizeButton.isEnabled = false
             return
         }
         let group = routeGroup(for: selected.publicModel)
         guard let index = group.firstIndex(where: { $0.providerIndex == selected.providerIndex && $0.modelIndex == selected.modelIndex }) else {
             routeMoveUpButton.isEnabled = false
             routeMoveDownButton.isEnabled = false
-            routeNormalizeButton.isEnabled = false
             return
         }
         routeMoveUpButton.isEnabled = index > 0
         routeMoveDownButton.isEnabled = index < group.count - 1
-        routeNormalizeButton.isEnabled = !group.isEmpty
     }
 
     func applyEditorViewMode() {
