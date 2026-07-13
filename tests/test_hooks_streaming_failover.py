@@ -6,6 +6,118 @@ from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    async def test_structured_compaction_uses_longer_stream_start_deadline(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        routing_module = importlib.import_module("litellm_menu.routing")
+        previous_compaction_timeout = (
+            routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
+        )
+        routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS = 0.05
+        self.addCleanup(
+            setattr,
+            routing_module,
+            "_CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS",
+            previous_compaction_timeout,
+        )
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "1")
+
+        async def delayed_stream():
+            yield {"type": "response.completed", "response": {"id": "resp-compact"}}
+
+        async def original_generic_function(**_kwargs):
+            await asyncio.sleep(0.02)
+            return delayed_stream()
+
+        request = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "_target_order": 1,
+        }
+
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(request),
+            0.05,
+        )
+        response = await hooks._wrap_generic_function_for_deployment_failover(
+            original_generic_function
+        )(**request)
+        chunks = [chunk async for chunk in response]
+
+        self.assertEqual(
+            chunks,
+            [{"type": "response.completed", "response": {"id": "resp-compact"}}],
+        )
+
+    def test_structured_compaction_stream_start_deadline_respects_request_override(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "120")
+        request = {
+            "call_type": "aresponses",
+            "input": [{"type": "compaction_trigger"}],
+            "stream": True,
+            "litellm_metadata": {
+                "route_recovery_attempt_timeout_seconds": 17,
+            },
+        }
+
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(request),
+            17.0,
+        )
+
+    def test_streaming_fallback_preserves_leading_additional_tools_and_controls(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        additional_tools = {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [{"type": "function", "name": "spawn_agent"}],
+                },
+            ],
+        }
+        request = {
+            "model": "default-chat",
+            "input": [
+                additional_tools,
+                {"role": "user", "content": "Inspect the workspace."},
+            ],
+            "stream": True,
+            "tools": [],
+            "tool_choice": {"type": "custom", "name": "exec"},
+            "parallel_tool_calls": False,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+        }
+
+        payload = hooks._build_streaming_error_fallback_payload(
+            request,
+            method_name="aresponses",
+        )
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["input"][0], additional_tools)
+        self.assertEqual(payload["tools"], [])
+        self.assertEqual(
+            payload["tool_choice"],
+            {"type": "custom", "name": "exec"},
+        )
+        self.assertFalse(payload["parallel_tool_calls"])
+
     async def test_context_fallback_emulates_auto_truncation_on_same_deployment(self) -> None:
         hooks, _proxy_server = load_hook_module()
         previous_budget = (

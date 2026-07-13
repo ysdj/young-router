@@ -693,6 +693,7 @@ def _install_generic_deployment_failover_patch() -> None:
             metadata["responses_custom_tool_item_ids_normalized"] = normalized_input_stats
             kwargs["litellm_metadata"] = metadata
         for update_request in (
+            _image_generation_module._with_codex_tool_runtime_recovery_hints,
             _image_generation_module._with_empty_tool_controls_removed,
             _image_generation_module._with_codex_compaction_controls,
             _image_generation_module._with_codex_compaction_input_bounded,

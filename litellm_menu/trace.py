@@ -11,6 +11,7 @@ from . import tools as _tools_module
 
 from .base import (
     Any,
+    _CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY,
     Dict,
     List,
     Optional,
@@ -252,6 +253,24 @@ def _trace_tool_names(tools: Any) -> list[str]:
     return tool_names
 
 
+def _trace_effective_tools(
+    request_kwargs: Optional[dict],
+) -> tuple[list[Any], list[Any], list[Any]]:
+    request_kwargs = request_kwargs or {}
+    top_level_value = request_kwargs.get("tools")
+    top_level_tools = list(top_level_value) if isinstance(top_level_value, list) else []
+    additional_tools: list[Any] = []
+    input_value = request_kwargs.get("input")
+    if isinstance(input_value, list):
+        for item in input_value:
+            if not isinstance(item, dict) or item.get("type") != "additional_tools":
+                break
+            item_tools = item.get("tools")
+            if isinstance(item_tools, list):
+                additional_tools.extend(item_tools)
+    return top_level_tools, additional_tools, [*top_level_tools, *additional_tools]
+
+
 def _trace_request_preview(
     request_kwargs: Optional[dict],
     *,
@@ -309,7 +328,7 @@ def _trace_request_preview(
         "text_block_count": len(blocks),
         "internal_context_block_count": len(internal_context_blocks),
         "message_count": len(source_value) if isinstance(source_value, list) else None,
-        "tool_types": _trace_tool_types(request_kwargs.get("tools")),
+        "tool_types": _trace_tool_types(_trace_effective_tools(request_kwargs)[2]),
         "tool_choice": _sanitize_trace_text(str(request_kwargs.get("tool_choice")), limit=120)
         if request_kwargs.get("tool_choice") is not None
         else None,
@@ -730,22 +749,37 @@ def _trace_exposed_tools(tools: Any) -> list[dict[str, Any]]:
 
 def _trace_tools_summary(request_kwargs: Optional[dict]) -> dict[str, Any]:
     request_kwargs = request_kwargs or {}
-    tools = request_kwargs.get("tools")
-    tool_count = len(tools) if isinstance(tools, list) else 0
+    top_level_tools, additional_tools, effective_tools = _trace_effective_tools(
+        request_kwargs
+    )
+    origins = []
+    if top_level_tools:
+        origins.append("top_level")
+    if additional_tools:
+        origins.append("additional_tools")
+    effective_request = request_kwargs.copy()
+    effective_request["tools"] = effective_tools
     return {
-        "count": tool_count,
-        "types": _trace_tool_types(tools),
-        "names": _trace_tool_names(tools),
-        "exposed": _trace_exposed_tools(tools),
+        "count": len(effective_tools),
+        "top_level_count": len(top_level_tools),
+        "additional_tools_count": len(additional_tools),
+        "origins": origins,
+        "types": _trace_tool_types(effective_tools),
+        "names": _trace_tool_names(effective_tools),
+        "exposed": _trace_exposed_tools(effective_tools),
         "tool_choice": _trace_limited_value(request_kwargs.get("tool_choice"), limit=160)
         if request_kwargs.get("tool_choice") is not None
         else None,
         "parallel_tool_calls": request_kwargs.get("parallel_tool_calls"),
-        "has_web_search_tool": _tools_module._request_has_web_search_tool(request_kwargs),
-        "has_litellm_web_search_bridge": _tools_module._request_has_litellm_web_search_bridge(
-            request_kwargs
+        "has_web_search_tool": _tools_module._request_has_web_search_tool(
+            effective_request
         ),
-        "has_image_generation_tool": _tools_module._request_has_image_generation_tool(request_kwargs),
+        "has_litellm_web_search_bridge": _tools_module._request_has_litellm_web_search_bridge(
+            effective_request
+        ),
+        "has_image_generation_tool": _tools_module._request_has_image_generation_tool(
+            effective_request
+        ),
         "has_image_input": _image_generation_module._request_has_image_input(request_kwargs),
         "has_web_search_options": "web_search_options" in request_kwargs,
     }
@@ -754,6 +788,7 @@ def _trace_tools_summary(request_kwargs: Optional[dict]) -> dict[str, Any]:
 def _trace_metadata_flags(request_kwargs: Optional[dict]) -> dict[str, Any]:
     request_kwargs = request_kwargs or {}
     flag_keys = (
+        _CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY,
         _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
         _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
         _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
@@ -811,6 +846,14 @@ def _trace_request_summary(
         ),
         "reasoning": _trace_reasoning_summary(request_kwargs),
         "generation": _trace_generation_summary(request_kwargs),
+        "timeouts": {
+            "stream_start_seconds": _routing_module._stream_start_timeout_seconds_for_request(
+                request_kwargs
+            ),
+            "recovery_max_seconds": _routing_module._recovery_max_seconds_for_request(
+                request_kwargs
+            ),
+        },
         "tools": _trace_tools_summary(request_kwargs),
         "metadata_flags": _trace_metadata_flags(request_kwargs),
     }

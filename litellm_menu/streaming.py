@@ -1443,13 +1443,21 @@ async def _stream_with_idle_timeout(
     saw_visible_output: bool = False,
     initial_chunk_count: int = 0,
 ) -> AsyncIterator[Any]:
-    timeout_seconds = _routing_module._stall_timeout_seconds()
+    idle_timeout_seconds = _routing_module._stall_timeout_seconds()
+    start_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(
+        request_data
+    )
     iterator = response.__aiter__()
     chunk_count = max(0, initial_chunk_count)
     saw_chunk = chunk_count > 0
     visible_output_seen = saw_visible_output
     while True:
-        effective_timeout: Optional[float] = timeout_seconds if timeout_seconds > 0 else None
+        timeout_seconds = (
+            idle_timeout_seconds if saw_chunk else start_timeout_seconds
+        )
+        effective_timeout: Optional[float] = (
+            timeout_seconds if timeout_seconds > 0 else None
+        )
         try:
             if effective_timeout is not None:
                 chunk = await asyncio.wait_for(iterator.__anext__(), timeout=effective_timeout)
@@ -1458,6 +1466,13 @@ async def _stream_with_idle_timeout(
         except StopAsyncIteration:
             return
         except asyncio.TimeoutError:
+            if not saw_chunk:
+                raise _stream_start_timeout_exception(
+                    request_data,
+                    start_seconds=timeout_seconds,
+                    saw_chunk=False,
+                    buffered_chunks=chunk_count,
+                ) from None
             raise _stream_idle_timeout_exception(
                 request_data,
                 idle_seconds=timeout_seconds,
@@ -1691,6 +1706,11 @@ def _build_streaming_error_fallback_payload(
     payload["stream"] = True
     if method_name == "aresponses":
         payload.setdefault("call_type", "aresponses")
+    runtime_recovery_payload = (
+        _image_generation_module._with_codex_tool_runtime_recovery_hints(payload)
+    )
+    if runtime_recovery_payload is not None:
+        payload = runtime_recovery_payload
     compaction_payload = _image_generation_module._with_codex_compaction_controls(payload)
     if compaction_payload is not None:
         payload = compaction_payload
@@ -4017,7 +4037,7 @@ async def _yield_guarded_original_stream(
                 evidence_task.cancel()
         recovered_payload: Optional[dict[str, Any]] = None
         if (
-            _routing_module._recovery_max_seconds() > 0
+            _routing_module._recovery_max_seconds_for_request(request_data) > 0
             and (
                 _external_web_search_recovery_poll_error(recovery_exception)
                 or search_results.strip()
@@ -4611,7 +4631,7 @@ async def _yield_streaming_error_fallback_or_raise(
             if (
                 is_responses_stream
                 and not fallback_delivered_terminal_or_visible
-                and _routing_module._recovery_max_seconds() > 0
+                and _routing_module._recovery_max_seconds_for_request(request_data) > 0
                 and _external_web_search_recovery_poll_error(exc)
             ):
                 _trace_module._route_trace(
@@ -4660,7 +4680,7 @@ async def _yield_streaming_error_fallback_or_raise(
     final_exception = fallback_exception or exception
     if (
         is_responses_stream
-        and _routing_module._recovery_max_seconds() > 0
+        and _routing_module._recovery_max_seconds_for_request(request_data) > 0
         and _external_web_search_recovery_poll_error(final_exception)
     ):
         yielded_recovery = False

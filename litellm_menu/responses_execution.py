@@ -965,6 +965,7 @@ def _wrap_generic_function_for_deployment_failover(
 
     async def wrapped_generic_function(**kwargs: Any) -> Any:
         for update_request in (
+            _image_generation_module._with_codex_tool_runtime_recovery_hints,
             _image_generation_module._with_empty_tool_controls_removed,
             _image_generation_module._with_codex_compaction_controls,
             _image_generation_module._with_codex_compaction_input_bounded,

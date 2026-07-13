@@ -41,6 +41,11 @@ This document keeps lower-frequency operational notes out of `AGENTS.md`. Read t
 - When bridging `custom`/`namespace` tools, default omitted
   `parallel_tool_calls` to `false`; preserve explicit values and all item/call
   IDs. Never deduplicate calls by tool name or arguments.
+- Treat an expired `wait` cell and a mode-specific `request_user_input`
+  rejection as call-local runtime failures, not evidence that the tool set was
+  removed. When structured history proves either failure, keep the other tools
+  intact, add a bounded recovery hint, and remove only the tool the client has
+  explicitly reported unavailable.
 - HTTP success is insufficient: verify that the client actually receives and
   executes tools, and distinguish native, pre-bridge, and fallback in trace.
 
@@ -50,9 +55,13 @@ This document keeps lower-frequency operational notes out of `AGENTS.md`. Read t
   errors are not test results.
 - Build the app, restart the menu-owned service, check health, and rebuild again
   if source changed afterward.
-- Apply the Menu-supported local Codex config, then start a fresh `codex exec`
-  (not `resume`/`continue`). A partial config can cause `No connected db` by
-  sending the wrong key.
+- Hash the existing `~/.codex/config.toml` and `auth.json`, then start a fresh
+  `codex exec` (not `resume`/`continue`) through the installed `codex-litellm`
+  launcher. The launcher must use process-local provider overrides and
+  command-backed auth; do not call the retired persistent config switch.
+- Recheck both hashes after the run. A partial provider override can cause
+  `No connected db` by sending the wrong key, while a changed hash means the
+  isolation contract failed.
 - Execute a command tool and, when available, a namespace/MCP/file tool. Match
   the fresh task in sanitized trace and confirm tools survived fallback and
   each expected call occurred once.

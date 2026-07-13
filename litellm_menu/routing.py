@@ -16,6 +16,8 @@ from .base import (
     Optional,
     _CHAT_TOOL_NAME_PATTERN,
     _ATTEMPTED_UPSTREAM_URL_SURFACES_KEY,
+    _CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+    _CODEX_INTERACTIVE_RECOVERY_MAX_SECONDS,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE,
     _CURRENT_UPSTREAM_URL_SURFACE_KEY,
@@ -318,6 +320,16 @@ def _stream_start_timeout_seconds_for_request(request_data: Optional[dict]) -> f
         return override
     stall_timeout = _stall_timeout_seconds()
     request_timeout = _request_timeout_seconds()
+    if _image_generation_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        compaction_timeout = max(
+            stall_timeout,
+            _CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+        )
+        if request_timeout <= 0:
+            return compaction_timeout
+        return min(compaction_timeout, request_timeout)
     if stall_timeout <= 0:
         return request_timeout
     if request_timeout <= 0:
@@ -446,13 +458,28 @@ def _should_block_external_web_search_original_recovery(request_kwargs: Optional
 
 
 def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
+    if _image_generation_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        return 0.0
     override = _request_metadata_positive_float(
         request_data,
         "route_recovery_max_seconds",
     )
-    if override is not None:
-        return override
-    return _recovery_max_seconds()
+    configured_max_seconds = (
+        override if override is not None else _recovery_max_seconds()
+    )
+    if (
+        _image_generation_module._request_has_responses_shape(request_data)
+        and _image_generation_module._request_has_codex_client_evidence(
+            request_data
+        )
+    ):
+        return min(
+            configured_max_seconds,
+            _CODEX_INTERACTIVE_RECOVERY_MAX_SECONDS,
+        )
+    return configured_max_seconds
 
 
 def _recovery_interval_seconds() -> float:
@@ -527,7 +554,7 @@ def _should_return_route_recovery_stream(
         return False
     if not _is_route_recovery_poll_error(exception):
         return False
-    if _recovery_max_seconds() <= 0:
+    if _recovery_max_seconds_for_request(request_kwargs) <= 0:
         return False
     if (
         router is not None
@@ -850,6 +877,7 @@ def _request_log_record(
         _deployment_route_key_from_request(request_kwargs),
         limit=260,
     )
+    tools_summary = _trace_module._trace_tools_summary(request_kwargs)
 
     record: dict[str, Any] = {
         "ts": _event_time(end_time) or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -879,11 +907,15 @@ def _request_log_record(
         "api_base_host": _state_module._safe_log_text(_image_generation_module._api_base_host(api_base), limit=180),
         "request_id": _state_module._safe_log_text(_trace_request_id(request_kwargs), limit=180),
         "session": _trace_session_context(request_kwargs),
-        "tool_types": _trace_module._trace_tool_types(request_kwargs.get("tools")),
-        "tool_names": _trace_module._trace_tool_names(request_kwargs.get("tools")),
+        "tool_types": tools_summary["types"],
+        "tool_names": tools_summary["names"],
+        "tool_count": tools_summary["count"],
+        "top_level_tool_count": tools_summary["top_level_count"],
+        "additional_tools_count": tools_summary["additional_tools_count"],
+        "tool_origins": tools_summary["origins"],
         "tool_choice": _state_module._safe_log_text(request_kwargs.get("tool_choice"), limit=120),
-        "has_web_search_tool": _tools_module._request_has_web_search_tool(request_kwargs),
-        "has_image_generation_tool": _tools_module._request_has_image_generation_tool(request_kwargs),
+        "has_web_search_tool": tools_summary["has_web_search_tool"],
+        "has_image_generation_tool": tools_summary["has_image_generation_tool"],
         "has_image_input": _image_generation_module._request_has_image_input(request_kwargs),
         "cache_hit": request_kwargs.get("cache_hit"),
         "response_cost": response_cost,

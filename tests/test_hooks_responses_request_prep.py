@@ -4,6 +4,127 @@ from hook_test_utils import *
 
 
 class HookResponsesRequestPrepTests(HookTestCase):
+    def test_codex_stale_wait_output_gets_fresh_exec_recovery_hint(self) -> None:
+        hooks, _ = load_hook_module()
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {"type": "custom", "name": "exec"},
+                        {"type": "function", "name": "wait"},
+                        {"type": "function", "name": "request_user_input"},
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-wait",
+                    "name": "wait",
+                    "arguments": '{"cell_id":"expired-cell"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-wait",
+                    "output": "Script error: exec cell expired-cell not found",
+                },
+            ],
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+
+        modified = hooks._with_codex_tool_runtime_recovery_hints(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        output = modified["input"][-1]["output"]
+        self.assertIn("Start a fresh exec call", output)
+        self.assertIn("exec tool itself remains available", output)
+        self.assertEqual(
+            [tool["name"] for tool in modified["input"][0]["tools"]],
+            ["exec", "wait", "request_user_input"],
+        )
+        self.assertEqual(
+            original["input"][-1]["output"],
+            "Script error: exec cell expired-cell not found",
+        )
+        stats = modified["litellm_metadata"][
+            hooks._CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY
+        ]
+        self.assertEqual(stats["stale_wait_outputs_hinted"], 1)
+        self.assertEqual(stats["unavailable_request_user_input_outputs_hinted"], 0)
+
+    async def test_pre_call_removes_proven_unavailable_request_user_input_only(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {"type": "custom", "name": "exec"},
+                        {"type": "function", "name": "wait"},
+                        {"type": "function", "name": "request_user_input"},
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-question",
+                    "name": "request_user_input",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-question",
+                    "output": "request_user_input is unavailable in Default mode",
+                },
+            ],
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+
+        modified = await hook.async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            [tool["name"] for tool in modified["tools"]],
+            ["exec", "wait"],
+        )
+        self.assertNotIn("additional_tools", json.dumps(modified["input"]))
+        output = modified["input"][-1]["output"]
+        self.assertIn("only to request_user_input", output)
+        self.assertIn("custom exec tool remains available", output)
+        self.assertEqual(modified["tool_choice"], "auto")
+        self.assertFalse(modified["parallel_tool_calls"])
+        stats = modified["litellm_metadata"][
+            hooks._CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY
+        ]
+        self.assertEqual(stats["unavailable_request_user_input_outputs_hinted"], 1)
+        self.assertEqual(stats["removed_request_user_input_tools"], 1)
+        self.assertEqual(
+            [tool["name"] for tool in original["input"][0]["tools"]],
+            ["exec", "wait", "request_user_input"],
+        )
+
     async def test_pre_call_deployment_hook_adds_compat_provider_browser_headers(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()

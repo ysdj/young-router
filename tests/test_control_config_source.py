@@ -127,6 +127,53 @@ class ControlConfigSourceTests(unittest.TestCase):
             self.assertEqual(model_info["id"], "c0dec003")
             self.assertFalse((staged.parent / "litellm_menu" / "callbacks.py").exists())
 
+    def test_codex_local_exec_reads_active_staged_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            checkout = self.make_checkout(temp)
+            home = temp / "home"
+            runtime = temp / "runtime"
+            staged_dir = runtime / ".litellm-runtime"
+            staged_dir.mkdir(parents=True)
+            editable_config = runtime / "config.yaml"
+            staged_config = staged_dir / "config.yaml"
+            editable_config.write_text("general_settings: {master_key: sk-test-pending}\n", encoding="utf-8")
+            staged_config.write_text("general_settings: {master_key: sk-test-active}\n", encoding="utf-8")
+            (checkout / "codex_launcher.py").write_text(
+                "import os\nprint(os.environ['LITELLM_CONFIG_FILE'])\n",
+                encoding="utf-8",
+            )
+
+            helper_python = ROOT / ".venv/bin/python"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "LITELLM_ALLOW_CHECKOUT_SERVICE": "1",
+                    "LITELLM_RUNTIME_ROOT": str(runtime),
+                    "PYTHON": str(helper_python if helper_python.exists() else sys.executable),
+                    "PYTHONPATH": os.pathsep.join(
+                        value
+                        for value in (
+                            str(YAML_SITE_PACKAGES),
+                            env.get("PYTHONPATH", ""),
+                        )
+                        if value
+                    ),
+                }
+            )
+            result = subprocess.run(
+                [str(checkout / "service.sh"), "codex-local-exec", "--version"],
+                cwd=checkout,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), str(staged_config))
+
     def test_unchanged_installed_config_is_not_rewritten(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

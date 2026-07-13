@@ -19,6 +19,7 @@ from .base import (
     _BROWSER_COMPATIBLE_HEADER_HOSTS,
     _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY,
     _CHAT_COMPAT_REASONING_EFFORT,
+    _CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY,
     _FALLBACK_BROWSER_USER_AGENT,
     _INLINE_IMAGE_MANY_MAX_EDGE,
     _INLINE_IMAGE_MANY_TARGET_BYTES,
@@ -1375,6 +1376,222 @@ def _request_has_codex_client_evidence(request_kwargs: Optional[dict]) -> bool:
             if isinstance(value, str) and value.strip():
                 return True
     return False
+
+
+def _codex_tool_definition_name(tool: Any) -> Optional[str]:
+    if not isinstance(tool, dict):
+        return None
+    function = tool.get("function")
+    function_dict = function if isinstance(function, dict) else {}
+    name = function_dict.get("name") or tool.get("name")
+    return name if isinstance(name, str) and name.strip() else None
+
+
+def _codex_declared_tools(request_kwargs: Optional[dict]) -> list[dict]:
+    if not isinstance(request_kwargs, dict):
+        return []
+    tools = request_kwargs.get("tools")
+    declared = [tool for tool in tools if isinstance(tool, dict)] if isinstance(tools, list) else []
+    input_value = request_kwargs.get("input")
+    if isinstance(input_value, list):
+        for item in input_value:
+            if not isinstance(item, dict) or item.get("type") != "additional_tools":
+                break
+            item_tools = item.get("tools")
+            if isinstance(item_tools, list):
+                declared.extend(
+                    tool for tool in item_tools if isinstance(tool, dict)
+                )
+    return declared
+
+
+def _codex_tool_output_text(output: Any) -> str:
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return ""
+    chunks: list[str] = []
+    for part in output:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text") or part.get("input_text")
+        if isinstance(text, str):
+            chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _codex_tool_output_with_hint(output: Any, hint: str) -> Optional[Any]:
+    if hint in _codex_tool_output_text(output):
+        return None
+    if isinstance(output, str):
+        return f"{output.rstrip()}\n\n{hint}"
+    if not isinstance(output, list):
+        return None
+    updated_output = copy.deepcopy(output)
+    for index in range(len(updated_output) - 1, -1, -1):
+        part = updated_output[index]
+        if not isinstance(part, dict):
+            continue
+        for key in ("text", "input_text"):
+            text = part.get(key)
+            if isinstance(text, str):
+                part[key] = f"{text.rstrip()}\n\n{hint}"
+                return updated_output
+    return None
+
+
+def _codex_tool_choice_name(tool_choice: Any) -> Optional[str]:
+    if isinstance(tool_choice, str):
+        return tool_choice if tool_choice not in {"auto", "required", "none"} else None
+    if not isinstance(tool_choice, dict):
+        return None
+    function = tool_choice.get("function")
+    function_dict = function if isinstance(function, dict) else {}
+    name = function_dict.get("name") or tool_choice.get("name")
+    return name if isinstance(name, str) and name.strip() else None
+
+
+def _with_codex_tool_runtime_recovery_hints(
+    request_kwargs: dict,
+) -> Optional[dict]:
+    """Clarify local tool-runtime failures without fabricating tool loss.
+
+    A completed/expired ``wait`` handle says nothing about whether a fresh
+    ``exec`` call is available. Likewise, Codex exposes ``request_user_input``
+    in Default mode even though the client deterministically rejects it. Keep
+    the original structured history, annotate only those exact runtime
+    failures, and remove only the tool that the client has proven unavailable.
+    """
+    if not _request_has_responses_shape(request_kwargs):
+        return None
+    if not _request_has_codex_client_evidence(request_kwargs):
+        return None
+    input_value = request_kwargs.get("input")
+    if not isinstance(input_value, list):
+        return None
+    declared_tools = _codex_declared_tools(request_kwargs)
+    declared_names = {
+        name
+        for name in (_codex_tool_definition_name(tool) for tool in declared_tools)
+        if name is not None
+    }
+    if "exec" not in declared_names:
+        return None
+
+    recent_items = input_value[-40:]
+    call_names: dict[str, str] = {}
+    for item in recent_items:
+        if not isinstance(item, dict) or item.get("type") not in {
+            "function_call",
+            "custom_tool_call",
+        }:
+            continue
+        call_id = item.get("call_id") or item.get("id")
+        name = _codex_tool_definition_name(item)
+        if isinstance(call_id, str) and name is not None:
+            call_names[call_id] = name
+
+    updated_input = list(input_value)
+    stale_wait_outputs_hinted = 0
+    unavailable_question_outputs_hinted = 0
+    recent_start = len(input_value) - len(recent_items)
+    for offset, item in enumerate(recent_items):
+        if not isinstance(item, dict) or item.get("type") not in {
+            "function_call_output",
+            "custom_tool_call_output",
+        }:
+            continue
+        call_id = item.get("call_id") or item.get("id")
+        call_name = call_names.get(call_id) if isinstance(call_id, str) else None
+        output = item.get("output")
+        output_text = _codex_tool_output_text(output)
+        hint = None
+        if call_name == "wait" and re.search(
+            r"\bexec cell [^\r\n]{1,80} not found\b",
+            output_text,
+            flags=re.IGNORECASE,
+        ):
+            hint = (
+                "The referenced exec cell has expired or completed. Start a fresh exec call; "
+                "the exec tool itself remains available."
+            )
+            stale_wait_outputs_hinted += 1
+        elif (
+            call_name == "request_user_input"
+            and "request_user_input is unavailable in Default mode" in output_text
+        ):
+            hint = (
+                "This failure applies only to request_user_input in Default mode. "
+                "The other declared tools remain available; the custom exec tool remains "
+                "available for shell, file, and test work. Continue with those tools."
+            )
+            unavailable_question_outputs_hinted += 1
+        if hint is None:
+            continue
+        hinted_output = _codex_tool_output_with_hint(output, hint)
+        if hinted_output is None:
+            if hint in output_text:
+                if call_name == "wait":
+                    stale_wait_outputs_hinted -= 1
+                else:
+                    unavailable_question_outputs_hinted -= 1
+            continue
+        updated_item = item.copy()
+        updated_item["output"] = hinted_output
+        updated_input[recent_start + offset] = updated_item
+
+    if not stale_wait_outputs_hinted and not unavailable_question_outputs_hinted:
+        return None
+
+    removed_question_tools = 0
+    if (
+        unavailable_question_outputs_hinted
+        and _codex_tool_choice_name(request_kwargs.get("tool_choice"))
+        != "request_user_input"
+    ):
+        top_level_tools = request_kwargs.get("tools")
+        if isinstance(top_level_tools, list):
+            filtered_tools = [
+                tool
+                for tool in top_level_tools
+                if _codex_tool_definition_name(tool) != "request_user_input"
+            ]
+            removed_question_tools += len(top_level_tools) - len(filtered_tools)
+        else:
+            filtered_tools = None
+
+        for index, item in enumerate(updated_input):
+            if not isinstance(item, dict) or item.get("type") != "additional_tools":
+                continue
+            item_tools = item.get("tools")
+            if not isinstance(item_tools, list):
+                continue
+            filtered_item_tools = [
+                tool
+                for tool in item_tools
+                if _codex_tool_definition_name(tool) != "request_user_input"
+            ]
+            removed_question_tools += len(item_tools) - len(filtered_item_tools)
+            if len(filtered_item_tools) != len(item_tools):
+                updated_item = item.copy()
+                updated_item["tools"] = filtered_item_tools
+                updated_input[index] = updated_item
+    else:
+        filtered_tools = None
+
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = updated_input
+    if filtered_tools is not None:
+        modified_kwargs["tools"] = filtered_tools
+    metadata = _request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    updated_metadata = metadata.copy()
+    updated_metadata[_CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY] = {
+        "stale_wait_outputs_hinted": stale_wait_outputs_hinted,
+        "unavailable_request_user_input_outputs_hinted": unavailable_question_outputs_hinted,
+        "removed_request_user_input_tools": removed_question_tools,
+    }
+    modified_kwargs["litellm_metadata"] = updated_metadata
+    return modified_kwargs
 
 
 def _compact_history_text(

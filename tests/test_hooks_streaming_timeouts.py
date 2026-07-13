@@ -4,6 +4,52 @@ from hook_test_utils import *
 
 
 class HookStreamingTimeoutTests(HookTestCase):
+    async def test_structured_compaction_waits_longer_for_first_stream_chunk(self) -> None:
+        hooks, _ = load_hook_module()
+        routing_module = importlib.import_module("litellm_menu.routing")
+        previous_compaction_timeout = (
+            routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
+        )
+        routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS = 0.05
+        self.addCleanup(
+            setattr,
+            routing_module,
+            "_CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS",
+            previous_compaction_timeout,
+        )
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "1")
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"role": "user", "content": "continue"},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        async def upstream():
+            await asyncio.sleep(0.02)
+            yield {"type": "response.created", "response": {"id": "resp-compact"}}
+            await asyncio.sleep(0.005)
+            yield {"type": "response.completed", "response": {"id": "resp-compact"}}
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_with_idle_timeout(
+                upstream(),
+                request_data,
+            )
+        ]
+
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            ["response.created", "response.completed"],
+        )
+
     async def test_stream_records_first_meaningful_delta_time(self) -> None:
         hooks, _ = load_hook_module()
         request_data = {"model": "default-chat"}
@@ -23,7 +69,7 @@ class HookStreamingTimeoutTests(HookTestCase):
             datetime,
         )
 
-    async def test_streaming_idle_before_first_chunk_replays_via_router_and_logs_stuck(self) -> None:
+    async def test_streaming_start_timeout_replays_via_router_and_logs_stuck(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
 
@@ -93,7 +139,7 @@ class HookStreamingTimeoutTests(HookTestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0]["_excluded_deployment_ids"], ["order1-a"])
             self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
-            self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_IDLE_TIMEOUT_METADATA_KEY])
+            self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_START_TIMEOUT_METADATA_KEY])
 
             records = [
                 json.loads(line)
@@ -102,8 +148,8 @@ class HookStreamingTimeoutTests(HookTestCase):
             ]
             stuck_records = [record for record in records if record.get("status") == "stuck"]
             self.assertEqual(len(stuck_records), 1)
-            self.assertEqual(stuck_records[0]["stuck"]["reason"], "stream_idle_timeout")
-            self.assertEqual(stuck_records[0]["stuck"]["stream_idle_timeout_seconds"], 0.01)
+            self.assertEqual(stuck_records[0]["stuck"]["reason"], "stream_start_timeout")
+            self.assertEqual(stuck_records[0]["stuck"]["stream_start_timeout_seconds"], 0.01)
             self.assertFalse(stuck_records[0]["stuck"]["stream_saw_chunk"])
             self.assertEqual(stuck_records[0]["session"]["id"], "thread-idle")
 

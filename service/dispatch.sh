@@ -190,6 +190,16 @@ case "$ACTION" in
       LITELLM_RUNTIME_ROOT="$ROOT" \
       "$PYTHON" "$TEMPLATE_ROOT/codex_config.py" local
     ;;
+  codex-local-exec)
+    ensure_python_tools
+    codex_runtime_config="$RUNTIME_CONFIG"
+    if [[ ! -f "$codex_runtime_config" ]]; then
+      codex_runtime_config="$CONFIG_FILE"
+    fi
+    LITELLM_CONFIG_FILE="$codex_runtime_config" \
+      LITELLM_RUNTIME_ROOT="$ROOT" \
+      "$PYTHON" "$TEMPLATE_ROOT/codex_launcher.py" exec "${@:2}"
+    ;;
   codex-reapply-pre-switch-config)
     ensure_python_tools
     LITELLM_CONFIG_FILE="$CONFIG_FILE" \
@@ -205,7 +215,7 @@ case "$ACTION" in
     verify_runtime_config
     ;;
   *)
-    echo "usage: $0 {bootstrap|config-editor-bootstrap|start|run-native|stop|reload|restart|hard-restart|apply-config|status|tail|recent-requests|logs-summary|menu-actions-tail|route-trace|route-trace-html|route-recovery-html|route-recovery-summary|route-trace-enable|route-trace-disable|route-trace-status|computer-facade-smoke|runtime-settings|runtime-settings-configure|runtime-settings-reset|webdav-settings|webdav-configure|webdav-enable|webdav-disable|webdav-enabled-status|webdav-status|webdav-last-status|webdav-sync-interval-seconds|webdav-probe|webdav-sync|webdav-push|webdav-pull|validate|verify-runtime-config|stage-config|autostart-enable|autostart-disable|autostart-status|config-watch-enable|config-watch-ensure|config-watch-disable|config-watch-status|config-watch-tail|codex-local-config|codex-reapply-pre-switch-config}" >&2
+    echo "usage: $0 {bootstrap|config-editor-bootstrap|start|run-native|stop|reload|restart|hard-restart|apply-config|status|tail|recent-requests|logs-summary|menu-actions-tail|route-trace|route-trace-html|route-recovery-html|route-recovery-summary|route-trace-enable|route-trace-disable|route-trace-status|computer-facade-smoke|runtime-settings|runtime-settings-configure|runtime-settings-reset|webdav-settings|webdav-configure|webdav-enable|webdav-disable|webdav-enabled-status|webdav-status|webdav-last-status|webdav-sync-interval-seconds|webdav-probe|webdav-sync|webdav-push|webdav-pull|validate|verify-runtime-config|stage-config|autostart-enable|autostart-disable|autostart-status|config-watch-enable|config-watch-ensure|config-watch-disable|config-watch-status|config-watch-tail|codex-local-config|codex-local-exec|codex-reapply-pre-switch-config}" >&2
     exit 64
     ;;
 esac

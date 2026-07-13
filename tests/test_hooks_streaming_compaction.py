@@ -164,7 +164,7 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertNotIn("codex_compaction_max_output_tokens", metadata)
         self.assertEqual(chunks[-1]["type"], "response.completed")
 
-    async def test_codex_compaction_incomplete_fallback_stream_enters_route_recovery_poll(self) -> None:
+    async def test_structured_codex_compaction_failure_does_not_enter_route_recovery_poll(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
@@ -193,14 +193,26 @@ class HookStreamingCompactionTests(HookTestCase):
             "model": "default-chat",
             "input": [
                 {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{"type": "custom", "name": "exec"}],
+                },
+                {
                     "role": "user",
                     "content": (
                         "Create a compact handoff summary for resuming this Codex session. "
                         "Target at most 1024 tokens. Preserve only unresolved work."
                     ),
-                }
+                },
+                {"type": "compaction_trigger", "id": "compact-now"},
             ],
             "stream": True,
+            "tools": [],
+            "tool_choice": {"type": "custom", "name": "exec"},
+            "parallel_tool_calls": False,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
             "model_info": {
                 "id": "third-party-large",
                 "provider": "compat_provider",
@@ -217,12 +229,57 @@ class HookStreamingCompactionTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
-        self.assertNotIn("use_chat_completions_api", calls[1])
-        self.assertEqual(chunks[-1]["type"], "response.completed")
-        self.assertEqual(chunks[-1]["response"]["id"], "resp-recovered")
+        self.assertEqual(calls[0]["input"][0]["type"], "additional_tools")
+        self.assertEqual(
+            calls[0]["tool_choice"],
+            {"type": "custom", "name": "exec"},
+        )
+        self.assertFalse(calls[0]["parallel_tool_calls"])
+        self.assertEqual([chunk.get("type") for chunk in chunks], ["response.failed"])
+        self.assertEqual(chunks[-1]["response"]["status"], "failed")
+
+    def test_codex_recovery_is_bounded_and_structured_compaction_disables_polling(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "43200")
+        ordinary_codex_request = {
+            "call_type": "aresponses",
+            "input": [{"role": "user", "content": "continue"}],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+        }
+        structured_compaction_request = {
+            **ordinary_codex_request,
+            "input": [
+                {"role": "user", "content": "continue"},
+                {"type": "compaction_trigger"},
+            ],
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        self.assertEqual(
+            hooks._recovery_max_seconds_for_request(ordinary_codex_request),
+            hooks._CODEX_INTERACTIVE_RECOVERY_MAX_SECONDS,
+        )
+        self.assertEqual(
+            hooks._recovery_max_seconds_for_request(structured_compaction_request),
+            0.0,
+        )
+        error = RuntimeError("temporary upstream rate limit")
+        error.status_code = 429
+        self.assertFalse(
+            hooks._should_return_route_recovery_stream(
+                error,
+                structured_compaction_request,
+            )
+        )
+
 
     async def test_codex_compaction_rate_limit_still_enters_route_recovery_poll(self) -> None:
         hooks, proxy_server = load_hook_module()

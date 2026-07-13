@@ -140,10 +140,66 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertTrue(summary["interface"]["stream"])
         self.assertEqual(summary["reasoning"]["effort"], "xhigh")
         self.assertEqual(summary["reasoning"]["text_verbosity"], "low")
+        self.assertEqual(summary["timeouts"]["stream_start_seconds"], 120.0)
+        self.assertEqual(summary["timeouts"]["recovery_max_seconds"], 43200.0)
         self.assertEqual(summary["tools"]["count"], 2)
         self.assertIn("web_search", summary["tools"]["types"])
         self.assertIn("lookup_order", summary["tools"]["names"])
         self.assertTrue(summary["tools"]["has_web_search_tool"])
+
+    def test_trace_request_summary_reports_effective_additional_tools_without_schemas(self) -> None:
+        hooks, _ = load_hook_module()
+
+        summary = hooks._trace_request_summary(
+            {
+                "model": "default-chat",
+                "input": [
+                    {
+                        "type": "additional_tools",
+                        "role": "developer",
+                        "tools": [
+                            {
+                                "type": "custom",
+                                "name": "exec",
+                                "description": "SECRET_TOOL_DESCRIPTION",
+                            },
+                            {
+                                "type": "namespace",
+                                "name": "collaboration",
+                                "tools": [
+                                    {
+                                        "type": "function",
+                                        "name": "spawn_agent",
+                                        "parameters": {
+                                            "secret_schema": "SECRET_TOOL_SCHEMA"
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {"role": "user", "content": "Use the available tools."},
+                ],
+                "tools": [],
+                "tool_choice": {"type": "custom", "name": "exec"},
+                "parallel_tool_calls": False,
+            }
+        )
+
+        tools = summary["tools"]
+        self.assertEqual(tools["count"], 2)
+        self.assertEqual(tools["top_level_count"], 0)
+        self.assertEqual(tools["additional_tools_count"], 2)
+        self.assertEqual(tools["origins"], ["additional_tools"])
+        self.assertEqual(summary["timeouts"]["stream_start_seconds"], 120.0)
+        self.assertIn("custom", tools["types"])
+        self.assertIn("namespace", tools["types"])
+        self.assertIn("exec", tools["names"])
+        self.assertIn("collaboration", tools["names"])
+        self.assertIn("spawn_agent", tools["names"])
+        serialized = json.dumps(summary, ensure_ascii=False)
+        self.assertNotIn("SECRET_TOOL_DESCRIPTION", serialized)
+        self.assertNotIn("SECRET_TOOL_SCHEMA", serialized)
 
     def test_trace_request_summary_identifies_standalone_image_generation(self) -> None:
         hooks, _ = load_hook_module()

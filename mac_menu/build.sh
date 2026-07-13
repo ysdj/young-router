@@ -50,6 +50,8 @@ for file in \
   watch_config.sh \
   config_editor.py \
   codex_config.py \
+  codex_launcher.py \
+  codex-litellm \
   webdav_sync.py \
   route_trace_report.py \
   route_recovery_report.py \
@@ -63,15 +65,19 @@ for file in \
 do
   cp "$ROOT/$file" "$APP_RES/$file"
 done
-cp -R "$ROOT/service" "$APP_RES/service"
-cp -R "$ROOT/litellm_menu" "$APP_RES/litellm_menu"
-cp -R "$ROOT/config_editor_core" "$APP_RES/config_editor_core"
-cp -R "$ROOT/trace_report" "$APP_RES/trace_report"
-cp -R "$ROOT/webdav" "$APP_RES/webdav"
+for directory in service litellm_menu config_editor_core trace_report webdav
+do
+  mkdir -p "$APP_RES/$directory"
+  /usr/bin/rsync -a \
+    --exclude '__pycache__/' \
+    --exclude '*.pyc' \
+    --exclude '*.pyo' \
+    "$ROOT/$directory/" "$APP_RES/$directory/"
+done
 cp "$UV_BIN" "$APP_RES/bin/uv"
 swiftc "$ROOT/mac_menu/vision_ocr.swift" -o "$APP_RES/bin/vision_ocr" -framework Vision -framework ImageIO -framework CoreGraphics -framework Foundation
 chmod +x "$APP/Contents/MacOS/LiteLLMMenu"
-chmod +x "$APP_RES/service.sh" "$APP_RES/app.sh" "$APP_RES/run.sh" "$APP_RES/watch_config.sh" "$APP_RES/config_editor.py" "$APP_RES/route_trace_report.py" "$APP_RES/route_recovery_report.py" "$APP_RES/scripts/smoke_websearch.py" "$APP_RES/scripts/smoke_responses_tool_bridge_compare.py" "$APP_RES/bin/uv" "$APP_RES/bin/vision_ocr"
+chmod +x "$APP_RES/service.sh" "$APP_RES/app.sh" "$APP_RES/run.sh" "$APP_RES/watch_config.sh" "$APP_RES/config_editor.py" "$APP_RES/codex_launcher.py" "$APP_RES/codex-litellm" "$APP_RES/route_trace_report.py" "$APP_RES/route_recovery_report.py" "$APP_RES/scripts/smoke_websearch.py" "$APP_RES/scripts/smoke_responses_tool_bridge_compare.py" "$APP_RES/bin/uv" "$APP_RES/bin/vision_ocr"
 chmod +x "$APP_RES"/service/*.sh
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 codesign --force --deep --sign - "$APP" >/dev/null

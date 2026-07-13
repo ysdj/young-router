@@ -195,6 +195,7 @@ extension AppDelegate {
         environment["LITELLM_CONFIG_WATCH_LOG"] = "\(root)/config-watch.log"
         environment["LITELLM_MENU_LOG_MAX_BYTES"] = "\(localLogMaxBytes())"
         environment["LITELLM_MENU_OWNER_PID"] = "\(ProcessInfo.processInfo.processIdentifier)"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         return environment
     }
 
