@@ -4,6 +4,232 @@ from hook_test_utils import *
 
 
 class HookStreamingCompactionTests(HookTestCase):
+    async def test_structured_compaction_done_item_clean_eof_synthesizes_terminal_event(self) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        async def original_stream():
+            response = {
+                "id": "resp-original",
+                "object": "response",
+                "status": "in_progress",
+                "output": [],
+            }
+            compaction = {
+                "id": "cmp-complete",
+                "type": "compaction",
+                "encrypted_content": "encrypted-summary",
+            }
+            yield {"type": "response.created", "response": response}
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": compaction,
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction,
+            }
+
+        class UnexpectedRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("completed compaction item must not be retried")
+
+        proxy_server.llm_router = UnexpectedRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-compaction-eof",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0],
+            {
+                "id": "cmp-complete",
+                "type": "compaction",
+                "encrypted_content": "encrypted-summary",
+            },
+        )
+
+    async def test_structured_compaction_done_item_idle_timeout_synthesizes_terminal_event(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+
+        async def stalled_after_done_stream():
+            compaction = {
+                "id": "cmp-stalled-terminal",
+                "type": "compaction",
+                "encrypted_content": "encrypted-summary",
+            }
+            yield {
+                "type": "response.created",
+                "response": {
+                    "id": "resp-stalled-terminal",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction,
+            }
+            await asyncio.sleep(1)
+
+        class UnexpectedRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("completed compaction item must not be retried")
+
+        proxy_server.llm_router = UnexpectedRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-compaction-stalled-terminal",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=stalled_after_done_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(chunks[-1]["response"]["output"][0]["type"], "compaction")
+
+    async def test_route_recovery_accepts_compaction_done_item_at_clean_eof(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        async def recovered_stream_round(
+            request_data,
+            exception,
+            *,
+            allow_repeated_attempt=False,
+            route_recovery_poll=False,
+        ):
+            compaction = {
+                "id": "cmp-recovery-eof",
+                "type": "compaction",
+                "encrypted_content": "encrypted-recovery-summary",
+            }
+            yield {
+                "type": "response.created",
+                "response": {
+                    "id": "resp-recovery-eof",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction,
+            }
+
+        hooks._stream_streaming_error_fallback_round = recovered_stream_round
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-compaction-recovery-eof",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        original_exception = RuntimeError("upstream stream ended early")
+        original_exception.status_code = 502
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._stream_route_recovery_poll_attempt(
+                request_data,
+                original_exception,
+                attempt=1,
+            )
+        ]
+
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0]["encrypted_content"],
+            "encrypted-recovery-summary",
+        )
+
+    async def test_compaction_done_item_does_not_hide_explicit_failed_terminal(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        async def failed_stream_round(*_args, **_kwargs):
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "cmp-before-failure",
+                    "type": "compaction",
+                    "encrypted_content": "encrypted-but-failed",
+                },
+            }
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-explicit-failure",
+                    "status": "failed",
+                    "error": {"message": "explicit upstream failure"},
+                },
+            }
+
+        hooks._stream_streaming_error_fallback_round = failed_stream_round
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "compaction_trigger", "id": "compact-now"}],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        original_exception = RuntimeError("retry compaction")
+        original_exception.status_code = 502
+
+        with self.assertRaises(RuntimeError) as captured:
+            _ = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll_attempt(
+                    request_data,
+                    original_exception,
+                    attempt=1,
+                )
+            ]
+        self.assertIn("response.failed", str(captured.exception))
+
     async def test_codex_compaction_incomplete_responses_stream_retries_responses_route(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
@@ -164,7 +390,7 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertNotIn("codex_compaction_max_output_tokens", metadata)
         self.assertEqual(chunks[-1]["type"], "response.completed")
 
-    async def test_structured_codex_compaction_failure_does_not_enter_route_recovery_poll(self) -> None:
+    async def test_structured_codex_compaction_failure_enters_shared_route_recovery_poll(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
@@ -229,19 +455,21 @@ class HookStreamingCompactionTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
-        self.assertEqual(calls[0]["input"][0]["type"], "additional_tools")
-        self.assertEqual(
-            calls[0]["tool_choice"],
-            {"type": "custom", "name": "exec"},
-        )
-        self.assertFalse(calls[0]["parallel_tool_calls"])
-        self.assertEqual([chunk.get("type") for chunk in chunks], ["response.failed"])
-        self.assertEqual(chunks[-1]["response"]["status"], "failed")
+        for call in calls:
+            self.assertNotIn("use_chat_completions_api", call)
+            self.assertEqual(call["input"][0]["type"], "additional_tools")
+            self.assertEqual(
+                call["tool_choice"],
+                {"type": "custom", "name": "exec"},
+            )
+            self.assertFalse(call["parallel_tool_calls"])
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(chunks[-1]["response"]["id"], "resp-recovered")
 
-    def test_codex_recovery_is_bounded_and_structured_compaction_disables_polling(self) -> None:
+    def test_structured_compaction_uses_full_recovery_window(self) -> None:
         hooks, _proxy_server = load_hook_module()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "43200")
         ordinary_codex_request = {
@@ -269,11 +497,11 @@ class HookStreamingCompactionTests(HookTestCase):
         )
         self.assertEqual(
             hooks._recovery_max_seconds_for_request(structured_compaction_request),
-            0.0,
+            hooks._RECOVERY_MAX_DEFAULT_SECONDS,
         )
         error = RuntimeError("temporary upstream rate limit")
         error.status_code = 429
-        self.assertFalse(
+        self.assertTrue(
             hooks._should_return_route_recovery_stream(
                 error,
                 structured_compaction_request,

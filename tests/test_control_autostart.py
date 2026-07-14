@@ -543,6 +543,7 @@ class ControlAutoStartTests(unittest.TestCase):
                 source {q(str(ROOT / 'service/process.sh'))}
                 require_menu_app_owner() {{ printf '4242\\n'; }}
                 route_trace_effective_value() {{ printf '0\\n'; }}
+                use_system_proxies_value() {{ printf '0\\n'; }}
                 ensure_native_environment() {{ :; }}
                 sync_runtime_config() {{ :; }}
                 apply_system_proxy_guard() {{ :; }}
@@ -562,9 +563,23 @@ class ControlAutoStartTests(unittest.TestCase):
                 LOCAL_LOG_MAX_BYTES=1024
                 REQUEST_TIMEOUT_SECONDS=7200
                 STALL_TIMEOUT_SECONDS=120
+                STREAM_START_TIMEOUT_SECONDS=120
+                CODEX_COMPACTION_START_TIMEOUT_SECONDS=300
                 RECOVERY_MAX_SECONDS=43200
                 RECOVERY_INTERVAL_SECONDS=5
                 WEB_FETCH_TIMEOUT_SECONDS=30
+                WEB_SEARCH_MAX_RESULTS=8
+                WEB_SEARCH_READ_RESULTS=4
+                WEB_SEARCH_READ_CHARS=1400
+                WEB_SEARCH_DDGS_BACKEND=auto
+                WEB_SEARCH_REGION=us-en
+                WEB_SEARCH_MAX_ROUNDS=6
+                WEB_SEARCH_MAX_QUERIES=16
+                WEB_SEARCH_MAX_OPEN_PAGES=8
+                WEB_SEARCH_MAX_FIND_IN_PAGE=12
+                EXTERNAL_WEB_SEARCH_MODEL_RETRIES=2
+                EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS=1
+                IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS=3
                 DEPLOYMENT_COOLDOWN_FAILURES=0
                 DEPLOYMENT_COOLDOWN_SECONDS=0
                 COMPUTER_FACADE_BACKEND=auto

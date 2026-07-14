@@ -2230,6 +2230,7 @@ async def _stream_route_recovery_poll_attempt(
         route_recovery_poll=True,
     ).__aiter__()
     buffered_chunks: List[Any] = []
+    completion_state = _ResponsesStreamCompletionState(request_data)
     started_delivery = False
     next_chunk_task = None
     configured_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(request_data)
@@ -2284,6 +2285,20 @@ async def _stream_route_recovery_poll_attempt(
                     remaining_seconds = attempt_deadline - time.monotonic()
                     if remaining_seconds <= 0:
                         await _cancel_next_chunk_task()
+                        completed_compat = (
+                            _codex_compaction_done_item_completed_compat(
+                                completion_state,
+                                request_data,
+                                reason="route_recovery_attempt_deadline",
+                            )
+                        )
+                        if completed_compat is not None:
+                            for buffered_chunk in buffered_chunks:
+                                yield _responses_stream_chunk_for_delivery(
+                                    buffered_chunk
+                                )
+                            yield completed_compat
+                            return
                         raise _stream_route_recovery_wait_timeout_exception(
                             request_data,
                             buffered_chunks=len(buffered_chunks),
@@ -2298,6 +2313,15 @@ async def _stream_route_recovery_poll_attempt(
                 next_chunk_task = None
             except StopAsyncIteration:
                 next_chunk_task = None
+                completed_compat = _codex_compaction_done_item_completed_compat(
+                    completion_state,
+                    request_data,
+                    reason="route_recovery_clean_eof",
+                )
+                if completed_compat is not None:
+                    for buffered_chunk in buffered_chunks:
+                        yield _responses_stream_chunk_for_delivery(buffered_chunk)
+                    yield completed_compat
                 return
             except asyncio.TimeoutError:
                 if not started_delivery:
@@ -2306,6 +2330,20 @@ async def _stream_route_recovery_poll_attempt(
                         and (attempt_deadline - time.monotonic()) <= 0
                     ):
                         await _cancel_next_chunk_task()
+                        completed_compat = (
+                            _codex_compaction_done_item_completed_compat(
+                                completion_state,
+                                request_data,
+                                reason="route_recovery_attempt_timeout",
+                            )
+                        )
+                        if completed_compat is not None:
+                            for buffered_chunk in buffered_chunks:
+                                yield _responses_stream_chunk_for_delivery(
+                                    buffered_chunk
+                                )
+                            yield completed_compat
+                            return
                         raise _stream_route_recovery_wait_timeout_exception(
                             request_data,
                             buffered_chunks=len(buffered_chunks),
@@ -2325,6 +2363,7 @@ async def _stream_route_recovery_poll_attempt(
                 continue
 
             buffered_chunks.append(chunk)
+            completion_state.remember(chunk)
             terminal_exception = _route_recovery_terminal_chunk_exception(
                 chunk,
                 request_data,
@@ -2355,6 +2394,19 @@ async def _stream_route_recovery_poll_attempt(
             for buffered_chunk in buffered_chunks:
                 yield _responses_stream_chunk_for_delivery(buffered_chunk)
             buffered_chunks.clear()
+    except Exception as exc:
+        completed_compat = _codex_compaction_done_item_completed_compat(
+            completion_state,
+            request_data,
+            reason="route_recovery_stream_error_after_completed_compaction_item",
+            exception=exc,
+        )
+        if completed_compat is not None:
+            for buffered_chunk in buffered_chunks:
+                yield _responses_stream_chunk_for_delivery(buffered_chunk)
+            yield completed_compat
+            return
+        raise
     finally:
         await _cancel_next_chunk_task()
         try:
@@ -3318,6 +3370,91 @@ class _ResponsesStreamCompletionState:
             if text.strip():
                 response["output_text"] = text
         return _completed_response_payload(response, request_data)
+
+
+def _codex_compaction_done_item_completed_compat(
+    completion_state: _ResponsesStreamCompletionState,
+    request_data: dict,
+    *,
+    reason: str,
+    exception: Optional[Exception] = None,
+) -> Optional[_JSONStreamEvent]:
+    """Complete a compaction stream that already delivered its encrypted item.
+
+    Some OpenAI-compatible Responses endpoints finish remote compaction with a
+    ``response.output_item.done`` compaction item and then close or stall
+    without the required ``response.completed`` event.  The encrypted
+    compaction item is the result Codex needs, so retrying the whole expensive
+    compaction loses a valid result and can loop for minutes.  This compatibility
+    path is deliberately limited to structured Codex compaction and to items
+    observed in ``output_item.done`` (never merely ``output_item.added``).
+    """
+    if not _image_generation_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        return None
+    exception_body = getattr(exception, "body", None)
+    terminal_event = (
+        exception_body.get("terminal_event")
+        if isinstance(exception_body, dict)
+        else None
+    )
+    if isinstance(terminal_event, dict) and terminal_event.get("type") in {
+        "error",
+        "response.failed",
+        "response.incomplete",
+    }:
+        return None
+
+    completed_output_items = completion_state.output_by_index
+    has_encrypted_compaction = any(
+        isinstance(item, dict)
+        and _responses_web_search_bridge_module._response_item_get(item, "type")
+        == "compaction"
+        and isinstance(
+            _responses_web_search_bridge_module._response_item_get(
+                item,
+                "encrypted_content",
+            ),
+            str,
+        )
+        and bool(
+            _responses_web_search_bridge_module._response_item_get(
+                item,
+                "encrypted_content",
+            )
+        )
+        for item in completed_output_items.values()
+    )
+    if not has_encrypted_compaction:
+        return None
+
+    completed_event = _synthesized_completed_response_event(
+        completed_output_items,
+        completion_state.created_response,
+        completion_state.model,
+    )
+    if completed_event is None:
+        return None
+
+    _trace_module._route_trace(
+        "codex_compaction_missing_terminal_completed_compat",
+        request_id=_routing_module._trace_request_id(request_data),
+        session=_routing_module._trace_session_context(request_data),
+        model_group=_responses_execution_module._request_model_group(request_data),
+        reason=reason,
+        buffered_events=completion_state.event_count,
+        completed_output_types=[
+            _responses_web_search_bridge_module._response_item_get(item, "type")
+            for _index, item in sorted(completed_output_items.items())
+        ],
+        exception=(
+            _routing_module._trace_exception(exception)
+            if exception is not None
+            else None
+        ),
+    )
+    return completed_event
 
 
 def _responses_stream_events_to_completed_payload(
@@ -4899,6 +5036,18 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 stream_exhausted = False
                 break
     except Exception as exc:
+        completed_compat = _codex_compaction_done_item_completed_compat(
+            completion_state,
+            request_data,
+            reason="stream_error_after_completed_compaction_item",
+            exception=exc,
+        )
+        if completed_compat is not None:
+            for buffered_chunk in buffer:
+                yield _responses_stream_chunk_for_delivery(buffered_chunk)
+            yield completed_compat
+            await _close_async_iterator_safely(response)
+            return
         if _routing_module._is_priority_deployment_failover_error(exc):
             _routing_module._mark_exception_for_deployment_failover(
                 exc,
@@ -4912,6 +5061,16 @@ async def _yield_start_buffered_stream_with_error_fallback(
         return
 
     if is_responses_stream and stream_exhausted and not saw_responses_completed:
+        completed_compat = _codex_compaction_done_item_completed_compat(
+            completion_state,
+            request_data,
+            reason="clean_eof_after_completed_compaction_item",
+        )
+        if completed_compat is not None:
+            for buffered_chunk in buffer:
+                yield _responses_stream_chunk_for_delivery(buffered_chunk)
+            yield completed_compat
+            return
         incomplete_exception = _responses_incomplete_stream_exception(
             "stream ended before response.completed",
             buffer=buffer,

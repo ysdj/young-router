@@ -751,7 +751,7 @@ class HookStreamingFailoverTests(HookTestCase):
     async def test_generic_response_wrapper_times_out_before_stream_object(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "60")
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
 
         async def original_generic_function(**kwargs):
             await asyncio.sleep(60)
@@ -773,10 +773,10 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(getattr(exc, "failed_deployment_id", None), "slow-before-stream")
         self.assertNotIn("_excluded_deployment_ids", request_kwargs)
 
-    def test_responses_function_bridge_uses_stall_timeout_for_stream_start(self) -> None:
+    def test_responses_function_bridge_uses_first_event_timeout(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "123")
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "45")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "45")
         request_kwargs = {
             "call_type": "aresponses",
             "model": "balanced-chat",
@@ -916,7 +916,7 @@ class HookStreamingFailoverTests(HookTestCase):
     async def test_generic_streaming_fallback_times_out_silent_route_and_reaches_next_order(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "60")
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
         sleeps = []
         original_sleep = hooks.asyncio.sleep
 
@@ -1011,10 +1011,10 @@ class HookStreamingFailoverTests(HookTestCase):
             ],
         )
 
-    async def test_generic_streaming_fallback_uses_configured_stall_timeout(self) -> None:
+    async def test_generic_streaming_fallback_uses_configured_first_event_timeout(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "60")
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
         sleeps = []
         original_sleep = hooks.asyncio.sleep
 

@@ -51,12 +51,40 @@ write_launch_agent() {
     <string>$(xml_escape "$REQUEST_TIMEOUT_SECONDS")</string>
     <key>LITELLM_MENU_STALL_TIMEOUT_SECONDS</key>
     <string>$(xml_escape "$STALL_TIMEOUT_SECONDS")</string>
+    <key>LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS</key>
+    <string>$(xml_escape "$STREAM_START_TIMEOUT_SECONDS")</string>
+    <key>LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS</key>
+    <string>$(xml_escape "$CODEX_COMPACTION_START_TIMEOUT_SECONDS")</string>
     <key>LITELLM_MENU_RECOVERY_MAX_SECONDS</key>
     <string>$(xml_escape "$RECOVERY_MAX_SECONDS")</string>
     <key>LITELLM_MENU_RECOVERY_INTERVAL_SECONDS</key>
     <string>$(xml_escape "$RECOVERY_INTERVAL_SECONDS")</string>
     <key>LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS</key>
     <string>$(xml_escape "$WEB_FETCH_TIMEOUT_SECONDS")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_MAX_RESULTS</key>
+    <string>$(xml_escape "$WEB_SEARCH_MAX_RESULTS")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_READ_RESULTS</key>
+    <string>$(xml_escape "$WEB_SEARCH_READ_RESULTS")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_READ_CHARS</key>
+    <string>$(xml_escape "$WEB_SEARCH_READ_CHARS")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND</key>
+    <string>$(xml_escape "$WEB_SEARCH_DDGS_BACKEND")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_REGION</key>
+    <string>$(xml_escape "$WEB_SEARCH_REGION")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_MAX_ROUNDS</key>
+    <string>$(xml_escape "$WEB_SEARCH_MAX_ROUNDS")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_MAX_QUERIES</key>
+    <string>$(xml_escape "$WEB_SEARCH_MAX_QUERIES")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_MAX_OPEN_PAGES</key>
+    <string>$(xml_escape "$WEB_SEARCH_MAX_OPEN_PAGES")</string>
+    <key>LITELLM_MENU_WEB_SEARCH_MAX_FIND_IN_PAGE</key>
+    <string>$(xml_escape "$WEB_SEARCH_MAX_FIND_IN_PAGE")</string>
+    <key>LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRIES</key>
+    <string>$(xml_escape "$EXTERNAL_WEB_SEARCH_MODEL_RETRIES")</string>
+    <key>LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS</key>
+    <string>$(xml_escape "$EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS")</string>
+    <key>LITELLM_MENU_IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS</key>
+    <string>$(xml_escape "$IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS")</string>
     <key>LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES</key>
     <string>$(xml_escape "$DEPLOYMENT_COOLDOWN_FAILURES")</string>
     <key>LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS</key>

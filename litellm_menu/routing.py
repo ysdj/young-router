@@ -17,6 +17,7 @@ from .base import (
     _CHAT_TOOL_NAME_PATTERN,
     _ATTEMPTED_UPSTREAM_URL_SURFACES_KEY,
     _CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+    _CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV,
     _CODEX_INTERACTIVE_RECOVERY_MAX_SECONDS,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE,
@@ -51,6 +52,8 @@ from .base import (
     _SESSION_NAME_KEY_FRAGMENTS,
     _STALL_TIMEOUT_DEFAULT_SECONDS,
     _STALL_TIMEOUT_SECONDS_ENV,
+    _STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+    _STREAM_START_TIMEOUT_SECONDS_ENV,
     _STREAM_ROUTE_EXHAUSTION_DEFAULT_RETRIES,
     _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS,
     _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
@@ -292,6 +295,22 @@ def _request_timeout_seconds() -> float:
     return max(0.0, parsed)
 
 
+def _stream_start_timeout_seconds() -> float:
+    return _env_float_seconds(
+        _STREAM_START_TIMEOUT_SECONDS_ENV,
+        _STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+        minimum=0.0,
+    )
+
+
+def _codex_compaction_stream_start_timeout_seconds() -> float:
+    return _env_float_seconds(
+        _CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV,
+        _CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+        minimum=0.0,
+    )
+
+
 def _request_metadata_positive_float(
     request_data: Optional[dict],
     key: str,
@@ -318,23 +337,22 @@ def _stream_start_timeout_seconds_for_request(request_data: Optional[dict]) -> f
     )
     if override is not None:
         return override
-    stall_timeout = _stall_timeout_seconds()
+    stream_start_timeout = _stream_start_timeout_seconds()
     request_timeout = _request_timeout_seconds()
     if _image_generation_module._request_has_structured_codex_compaction(
         request_data
     ):
-        compaction_timeout = max(
-            stall_timeout,
-            _CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
-        )
+        compaction_timeout = _codex_compaction_stream_start_timeout_seconds()
         if request_timeout <= 0:
             return compaction_timeout
+        if compaction_timeout <= 0:
+            return request_timeout
         return min(compaction_timeout, request_timeout)
-    if stall_timeout <= 0:
+    if stream_start_timeout <= 0:
         return request_timeout
     if request_timeout <= 0:
-        return stall_timeout
-    return min(stall_timeout, request_timeout)
+        return stream_start_timeout
+    return min(stream_start_timeout, request_timeout)
 
 
 def _stream_route_exhaustion_retries() -> int:
@@ -458,10 +476,6 @@ def _should_block_external_web_search_original_recovery(request_kwargs: Optional
 
 
 def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
-    if _image_generation_module._request_has_structured_codex_compaction(
-        request_data
-    ):
-        return 0.0
     override = _request_metadata_positive_float(
         request_data,
         "route_recovery_max_seconds",
@@ -469,6 +483,10 @@ def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
     configured_max_seconds = (
         override if override is not None else _recovery_max_seconds()
     )
+    if _image_generation_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        return configured_max_seconds
     if (
         _image_generation_module._request_has_responses_shape(request_data)
         and _image_generation_module._request_has_codex_client_evidence(
@@ -2863,6 +2881,7 @@ def _with_active_deployment_cooldowns(
     def filter_active(cooldowns: dict[str, Any], now: float) -> tuple[List[dict], list[dict[str, Any]], bool]:
         available: list[dict] = []
         cooled: list[dict[str, Any]] = []
+        cooled_candidates: list[tuple[dict, dict[str, Any]]] = []
         for deployment in deployments:
             requested_surface = _deployment_cooldown_surface(request_kwargs)
             if requested_surface is not None:
@@ -2918,11 +2937,32 @@ def _with_active_deployment_cooldowns(
                             break
             if active_cooldown is not None:
                 cooldown_key, state = active_cooldown
-                cooled.append(_deployment_cooldown_trace_entry(deployment, state, now, cooldown_key=cooldown_key))
+                trace_entry = _deployment_cooldown_trace_entry(
+                    deployment,
+                    state,
+                    now,
+                    cooldown_key=cooldown_key,
+                )
+                cooled.append(trace_entry)
+                cooled_candidates.append((deployment, trace_entry))
                 continue
             available.append(deployment)
 
         if cooled:
+            if (
+                not available
+                and cooled_candidates
+                and _is_route_recovery_poll_payload(request_kwargs)
+            ):
+                probe_deployment, probe_trace = min(
+                    cooled_candidates,
+                    key=lambda candidate: candidate[1].get(
+                        "cooldown_remaining_seconds",
+                        float("inf"),
+                    ),
+                )
+                probe_trace["half_open_probe"] = True
+                return [probe_deployment], cooled, True
             return available, cooled, True
         return deployments, [], False
 

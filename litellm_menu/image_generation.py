@@ -263,7 +263,8 @@ _CODEX_COMPACTION_UPSTREAM_HEADER_NAMES = (
 
 _CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS = 200_000
 _CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS = 2_000
-_CODEX_COMPACTION_HISTORY_TEXT_CHARS = 500_000
+_CODEX_COMPACTION_HISTORY_TEXT_CHARS = 300_000
+_CODEX_COMPACTION_HISTORY_MAX_ITEMS = 240
 _CODEX_COMPACTION_MESSAGE_ITEM_CHARS = 32_000
 _CODEX_COMPACTION_TOOL_CALL_ITEM_CHARS = 8_000
 _CODEX_COMPACTION_MIN_HISTORY_ITEM_CHARS = 128
@@ -1931,6 +1932,71 @@ def _compact_history_value(
     return compact(value)
 
 
+def _compaction_image_observation_boundary(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    role = str(item.get("role") or "").strip().lower()
+    return (
+        role == "assistant"
+        or item.get("type") == "agent_message"
+        or item.get("type") == "compaction"
+    )
+
+
+def _omit_historical_inline_images(value: Any) -> tuple[Any, int, int]:
+    """Replace already-observed inline history images with a visible placeholder."""
+    if isinstance(value, list):
+        changed = False
+        omitted_count = 0
+        omitted_chars = 0
+        updated_items: List[Any] = []
+        for item in value:
+            updated_item, item_count, item_chars = (
+                _omit_historical_inline_images(item)
+            )
+            updated_items.append(updated_item)
+            changed = changed or item_count > 0
+            omitted_count += item_count
+            omitted_chars += item_chars
+        return (updated_items if changed else value), omitted_count, omitted_chars
+
+    if not isinstance(value, dict):
+        return value, 0, 0
+
+    item_type = value.get("type")
+    if item_type in {"input_image", "image_url"}:
+        reference = _image_reference_string(
+            value.get("image_url") or value.get("url") or value.get("file_id")
+        )
+        if _split_image_data_url(reference) is not None:
+            return (
+                {
+                    "type": "input_text",
+                    "text": (
+                        "[LiteLLM Menu omitted a historical inline image before "
+                        "compaction because a later assistant response or "
+                        "compaction summary had already observed it.]"
+                    ),
+                },
+                1,
+                len(reference),
+            )
+
+    changed = False
+    omitted_count = 0
+    omitted_chars = 0
+    updated_dict: Dict[Any, Any] = {}
+    for key, item in value.items():
+        updated_item, item_count, item_chars = _omit_historical_inline_images(
+            item
+        )
+        updated_dict[key] = updated_item
+        changed = changed or item_count > 0
+        omitted_count += item_count
+        omitted_chars += item_chars
+    return (updated_dict if changed else value), omitted_count, omitted_chars
+
+
 def _recent_weighted_allocations(
     maximums: List[int],
     *,
@@ -2014,6 +2080,88 @@ def _compaction_history_fields(
     return fields
 
 
+def _compaction_history_units(input_items: List[Any]) -> List[List[int]]:
+    """Group matching calls and outputs so item eviction never orphans one."""
+    call_indices: dict[str, List[int]] = {}
+    output_indices: dict[str, List[int]] = {}
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            continue
+        item_type = item.get("type")
+        if item_type in {"function_call", "custom_tool_call", "computer_call"}:
+            call_indices.setdefault(call_id.strip(), []).append(index)
+        elif item_type in _CODEX_TOOL_OUTPUT_ITEM_TYPES:
+            output_indices.setdefault(call_id.strip(), []).append(index)
+
+    grouped: dict[int, List[int]] = {}
+    consumed: set[int] = set()
+    for call_id, calls in call_indices.items():
+        outputs = output_indices.get(call_id, [])
+        if not outputs:
+            continue
+        indices = sorted(set(calls + outputs))
+        grouped[indices[0]] = indices
+        consumed.update(indices)
+
+    units: List[List[int]] = []
+    for index in range(len(input_items)):
+        if index in grouped:
+            units.append(grouped[index])
+        elif index not in consumed:
+            units.append([index])
+    return units
+
+
+def _compaction_history_item_is_protected(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") in {"additional_tools", "compaction", "compaction_trigger"}:
+        return True
+    role = str(item.get("role") or "").strip().lower()
+    return role in {"developer", "system"}
+
+
+def _with_compaction_history_items_bounded(
+    input_items: List[Any],
+) -> tuple[List[Any], int]:
+    """Keep protected protocol state and the newest complete history suffix."""
+    if len(input_items) <= _CODEX_COMPACTION_HISTORY_MAX_ITEMS:
+        return input_items, 0
+
+    units = _compaction_history_units(input_items)
+    protected_units = {
+        unit_index
+        for unit_index, unit in enumerate(units)
+        if any(
+            _compaction_history_item_is_protected(input_items[index])
+            for index in unit
+        )
+    }
+    selected_units = set(protected_units)
+    selected_items = sum(len(units[index]) for index in selected_units)
+    for unit_index in reversed(range(len(units))):
+        if unit_index in selected_units:
+            continue
+        unit_size = len(units[unit_index])
+        if selected_items + unit_size > _CODEX_COMPACTION_HISTORY_MAX_ITEMS:
+            continue
+        selected_units.add(unit_index)
+        selected_items += unit_size
+
+    kept_indices = {
+        index
+        for unit_index in selected_units
+        for index in units[unit_index]
+    }
+    bounded = [
+        item for index, item in enumerate(input_items) if index in kept_indices
+    ]
+    return bounded, len(input_items) - len(bounded)
+
+
 def _with_codex_compaction_input_bounded(
     request_kwargs: dict,
 ) -> Optional[dict]:
@@ -2031,8 +2179,58 @@ def _with_codex_compaction_input_bounded(
     original_fields = _compaction_history_fields(input_items)
     original_history_text_chars = sum(field[3] for field in original_fields)
     updated_items = list(input_items)
-    output_entries: List[tuple[int, int]] = []
+    last_image_observation_index = max(
+        (
+            index
+            for index, item in enumerate(input_items)
+            if _compaction_image_observation_boundary(item)
+        ),
+        default=-1,
+    )
+    omitted_historical_images = 0
+    omitted_historical_image_chars = 0
     for index, item in enumerate(input_items):
+        if (
+            index >= last_image_observation_index
+            or not isinstance(item, dict)
+            or item.get("type") == "compaction"
+        ):
+            continue
+        item_type = item.get("type")
+        role = str(item.get("role") or "").strip().lower()
+        if item_type in _CODEX_TOOL_OUTPUT_ITEM_TYPES:
+            history_key = "output"
+        elif item_type == "message" or role in {
+            "assistant",
+            "developer",
+            "system",
+            "user",
+        }:
+            history_key = "content"
+        elif item_type in {"input_image", "image_url"}:
+            updated_item, omitted_count, omitted_chars = (
+                _omit_historical_inline_images(item)
+            )
+            if omitted_count:
+                updated_items[index] = updated_item
+                omitted_historical_images += omitted_count
+                omitted_historical_image_chars += omitted_chars
+            continue
+        else:
+            continue
+        updated_history, omitted_count, omitted_chars = (
+            _omit_historical_inline_images(item.get(history_key))
+        )
+        if omitted_count == 0:
+            continue
+        updated_item = item.copy()
+        updated_item[history_key] = updated_history
+        updated_items[index] = updated_item
+        omitted_historical_images += omitted_count
+        omitted_historical_image_chars += omitted_chars
+
+    output_entries: List[tuple[int, int]] = []
+    for index, item in enumerate(updated_items):
         if (
             not isinstance(item, dict)
             or item.get("type") not in _CODEX_TOOL_OUTPUT_ITEM_TYPES
@@ -2105,7 +2303,15 @@ def _with_codex_compaction_input_bounded(
             updated_items[item_index] = updated_item
             truncated_count += 1
 
-    if truncated_count == 0:
+    updated_items, dropped_history_items = _with_compaction_history_items_bounded(
+        updated_items
+    )
+
+    if (
+        truncated_count == 0
+        and omitted_historical_images == 0
+        and dropped_history_items == 0
+    ):
         return None
 
     modified_kwargs = request_kwargs.copy()
@@ -2126,6 +2332,9 @@ def _with_codex_compaction_input_bounded(
         deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
         route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
         input_items=len(input_items),
+        bounded_input_items=len(updated_items),
+        dropped_history_items=dropped_history_items,
+        history_item_limit=_CODEX_COMPACTION_HISTORY_MAX_ITEMS,
         tool_call_outputs=len(output_entries),
         truncated_history_fields=truncated_count,
         original_output_chars=total_output_chars,
@@ -2136,6 +2345,8 @@ def _with_codex_compaction_input_bounded(
         per_item_limit=_CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS,
         tool_output_total_limit=_CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS,
         history_text_total_limit=_CODEX_COMPACTION_HISTORY_TEXT_CHARS,
+        omitted_historical_images=omitted_historical_images,
+        omitted_historical_image_chars=omitted_historical_image_chars,
     )
     return modified_kwargs
 

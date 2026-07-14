@@ -19,10 +19,23 @@ import tempfile
 
 SPECS = [
     ("LITELLM_MENU_REQUEST_TIMEOUT_SECONDS", "float", "7200", 0, 7200),
+    ("LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS", "float", "120", 0, 3600),
+    ("LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS", "float", "300", 0, 3600),
     ("LITELLM_MENU_STALL_TIMEOUT_SECONDS", "float", "120", 0, 3600),
     ("LITELLM_MENU_RECOVERY_MAX_SECONDS", "float", "43200", 0, 86400),
     ("LITELLM_MENU_RECOVERY_INTERVAL_SECONDS", "float", "5", 0.001, 3600),
     ("LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS", "float", "30", 3, 60),
+    ("LITELLM_MENU_WEB_SEARCH_MAX_RESULTS", "int", "8", 1, 20),
+    ("LITELLM_MENU_WEB_SEARCH_READ_RESULTS", "int", "4", 0, 20),
+    ("LITELLM_MENU_WEB_SEARCH_READ_CHARS", "int", "1400", 200, 5000),
+    ("LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND", "string", "auto", None, None),
+    ("LITELLM_MENU_WEB_SEARCH_REGION", "string", "us-en", None, None),
+    ("LITELLM_MENU_WEB_SEARCH_MAX_ROUNDS", "int", "6", 1, 8),
+    ("LITELLM_MENU_WEB_SEARCH_MAX_QUERIES", "int", "16", 1, 64),
+    ("LITELLM_MENU_WEB_SEARCH_MAX_OPEN_PAGES", "int", "8", 0, 32),
+    ("LITELLM_MENU_WEB_SEARCH_MAX_FIND_IN_PAGE", "int", "12", 0, 64),
+    ("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRIES", "int", "2", 0, 5),
+    ("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS", "float", "1", 0, 30),
     ("LITELLM_MENU_VISION_BRIDGE_BACKEND", "enum", "auto", None, None),
     ("LITELLM_MENU_VISION_BRIDGE_API_BASE", "string", "http://127.0.0.1:11434/v1", None, None),
     ("LITELLM_MENU_VISION_BRIDGE_MODEL", "string", "qwen2.5vl:3b", None, None),
@@ -32,6 +45,7 @@ SPECS = [
     ("LITELLM_MENU_VISION_BRIDGE_PROMPT", "string", "Describe the image accurately for a text-only language model. Include visible text, UI elements, layout, objects, and any important details.", None, None),
     ("LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES", "int", "2", 0, 20),
     ("LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS", "float", "300", 0, 86400),
+    ("LITELLM_MENU_IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS", "int", "3", 0, 20),
     ("LITELLM_MENU_COMPUTER_FACADE_BACKEND", "enum", "auto", None, None),
     ("LITELLM_MENU_COMPUTER_FACADE_MODEL", "string", "", None, None),
     ("LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS", "int", "20", 1, 200),
@@ -40,6 +54,8 @@ SPECS = [
     ("LITELLM_MENU_COMPUTER_FACADE_ACTION_DENYLIST", "string", "", None, None),
     ("LITELLM_MENU_COMPUTER_FACADE_REQUIRE_OBSERVATION", "bool", "1", None, None),
     ("LITELLM_MENU_LOG_MAX_BYTES", "mb", "10", 0.25, 100),
+    ("LITELLM_MENU_ROUTE_TRACE_PREVIEW_CHARS", "int", "2000", 80, 2000),
+    ("LITELLM_USE_SYSTEM_PROXIES", "bool", "0", None, None),
     ("LITELLM_PORT", "int", "4000", 1, 65535),
     ("LITELLM_NUM_WORKERS", "int", "16", 1, 64),
     ("LITELLM_MAX_REQUESTS_BEFORE_RESTART", "int", "1000", 1, 100000),
@@ -100,7 +116,10 @@ def normalize_value(key: str, raw: object) -> str:
     _, kind, default, minimum, maximum = SPEC_BY_KEY[key]
     if kind in {"int", "float", "mb"}:
         return normalize_number(key, raw)
-    text = str(raw if raw is not None else default).strip()
+    raw_text = str(raw if raw is not None else default)
+    if kind == "string" and any(character in raw_text for character in "\n\r#"):
+        raise ValueError(f"{key} cannot contain newlines or #.")
+    text = raw_text.strip()
     if not text:
         text = default
     if kind == "bool":
@@ -128,6 +147,10 @@ def normalize_value(key: str, raw: object) -> str:
             raise ValueError(f"{key} must be one of: {', '.join(sorted(options))}")
         return lowered
     if kind == "string":
+        if key == "LITELLM_MENU_WEB_SEARCH_REGION" and any(
+            character.isspace() for character in text
+        ):
+            raise ValueError(f"{key} cannot contain whitespace.")
         return text
     raise ValueError(f"Unsupported runtime setting kind: {kind}")
 

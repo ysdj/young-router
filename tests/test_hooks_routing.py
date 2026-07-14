@@ -407,6 +407,44 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(filtered, deployments)
 
+    async def test_stream_start_does_not_clear_deployment_cooldown(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        request_kwargs = {
+            "model": "default-chat",
+            "stream": True,
+            "litellm_params": {"model": "openai/x-cheap"},
+            "model_info": {"id": "x-cheap"},
+        }
+        error = RuntimeError("temporary upstream failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+        self.assertTrue(hooks._DEPLOYMENT_COOLDOWNS)
+
+        await hook.async_log_success_event(
+            request_kwargs,
+            {"type": "response.created", "response": {"status": "in_progress"}},
+            datetime.now(timezone.utc),
+            datetime.now(timezone.utc),
+        )
+        await hook.async_log_stream_event(
+            request_kwargs,
+            {"type": "response.created", "response": {"status": "in_progress"}},
+            datetime.now(timezone.utc),
+            datetime.now(timezone.utc),
+        )
+        self.assertTrue(hooks._DEPLOYMENT_COOLDOWNS)
+
+        await hook.async_log_stream_event(
+            request_kwargs,
+            {"type": "response.completed", "response": {"status": "completed"}},
+            datetime.now(timezone.utc),
+            datetime.now(timezone.utc),
+        )
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
     async def test_deployment_cooldown_does_not_count_sanitized_wrapper(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
@@ -480,6 +518,86 @@ class HookRoutingTests(HookTestCase):
             request_kwargs={},
         )
         self.assertEqual(filtered, [])
+
+    async def test_route_recovery_half_opens_one_candidate_when_all_are_cooled(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        deployments = [
+            {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
+            {"litellm_params": {"model": "openai/x-plus"}, "model_info": {"id": "x-plus"}},
+        ]
+
+        for deployment in deployments:
+            error = RuntimeError("temporary upstream failure")
+            error.status_code = 503
+            hooks._mark_exception_for_deployment_failover(
+                error,
+                {
+                    "model": "default-chat",
+                    "litellm_params": deployment["litellm_params"],
+                    "model_info": deployment["model_info"],
+                },
+            )
+
+        recovery_request = {
+            "litellm_metadata": {
+                hooks._ROUTE_RECOVERY_POLL_METADATA_KEY: True,
+            },
+        }
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=None,
+            request_kwargs=recovery_request,
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertIn(filtered[0], deployments)
+
+        available, cooled, cooldown_filtered = hooks._with_active_deployment_cooldowns(
+            deployments,
+            request_kwargs=recovery_request,
+        )
+        self.assertTrue(cooldown_filtered)
+        self.assertEqual(available, filtered)
+        self.assertEqual(
+            [entry.get("half_open_probe") is True for entry in cooled].count(True),
+            1,
+        )
+
+    async def test_route_recovery_still_prefers_healthy_peer_over_half_open_probe(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        deployments = [
+            {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
+            {"litellm_params": {"model": "openai/x-plus"}, "model_info": {"id": "x-plus"}},
+        ]
+        error = RuntimeError("temporary upstream failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            error,
+            {
+                "model": "default-chat",
+                "litellm_params": deployments[0]["litellm_params"],
+                "model_info": deployments[0]["model_info"],
+            },
+        )
+
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=None,
+            request_kwargs={
+                "litellm_metadata": {
+                    hooks._ROUTE_RECOVERY_POLL_METADATA_KEY: True,
+                },
+            },
+        )
+
+        self.assertEqual(filtered, [deployments[1]])
 
     async def test_deployment_cooldown_expires_after_ttl(self) -> None:
         hooks, _ = load_hook_module()

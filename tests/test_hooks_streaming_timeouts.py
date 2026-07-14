@@ -4,6 +4,60 @@ from hook_test_utils import *
 
 
 class HookStreamingTimeoutTests(HookTestCase):
+    async def test_first_event_compaction_and_stream_idle_timeouts_are_independent(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "10")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.2")
+        self.set_env(
+            hooks._CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV,
+            "0.4",
+        )
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+
+        ordinary_request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "continue"}],
+            "stream": True,
+        }
+        compaction_request = {
+            "model": "default-chat",
+            "input": [
+                {"role": "user", "content": "continue"},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(ordinary_request),
+            0.2,
+        )
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(compaction_request),
+            0.4,
+        )
+        self.assertEqual(hooks._stall_timeout_seconds(), 0.01)
+
+        async def stalls_after_first_event():
+            yield {"type": "response.created", "response": {"id": "resp-idle"}}
+            await asyncio.sleep(1)
+
+        stream = hooks._stream_with_idle_timeout(
+            stalls_after_first_event(),
+            ordinary_request,
+        ).__aiter__()
+        first = await stream.__anext__()
+        self.assertEqual(first["type"], "response.created")
+        with self.assertRaises(TimeoutError) as captured:
+            await stream.__anext__()
+        self.assertEqual(
+            getattr(captured.exception, "body", {}).get("reason"),
+            "stream_idle_timeout",
+        )
+
     async def test_structured_compaction_waits_longer_for_first_stream_chunk(self) -> None:
         hooks, _ = load_hook_module()
         routing_module = importlib.import_module("litellm_menu.routing")
@@ -104,7 +158,7 @@ class HookStreamingTimeoutTests(HookTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
             self.set_log_env(log_path)
-            self.set_env("LITELLM_MENU_STALL_TIMEOUT_SECONDS", "0.01")
+            self.set_env("LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS", "0.01")
             request_data = {
                 "model": "default-chat",
                 "input": [{"role": "user", "content": "Say pong only."}],
@@ -984,7 +1038,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 return silent_stream()
 
         proxy_server.llm_router = FakeRouter()
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.03")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
 

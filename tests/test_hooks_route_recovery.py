@@ -1287,7 +1287,7 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertFalse(any(isinstance(chunk, str) for chunk in chunks))
         assert_upstream_route_failed_terminal(self, chunks)
 
-    async def test_route_recovery_poll_uses_stall_timeout_for_stream_start(self) -> None:
+    async def test_route_recovery_poll_uses_first_event_timeout_for_stream_start(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.012")
@@ -1306,7 +1306,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
         proxy_server.llm_router = FakeRouter()
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "60")
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Continue."}],
@@ -1326,13 +1326,13 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertGreaterEqual(len(calls), 1)
         assert_upstream_route_failed_terminal(self, chunks)
 
-    async def test_route_recovery_poll_uses_stall_timeout_for_delayed_recovery(self) -> None:
+    async def test_route_recovery_poll_uses_first_event_timeout_for_delayed_recovery(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.04")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "60")
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.03")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.03")
 
         async def recovered_stream():
             yield {"type": "response.output_text.delta", "delta": "recovered despite fallback timeout"}

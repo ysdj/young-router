@@ -32,7 +32,8 @@ class LiteLLMMenuHook(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
-        _routing_module._record_deployment_success_for_cooldown(kwargs)
+        if kwargs.get("stream") is not True:
+            _routing_module._record_deployment_success_for_cooldown(kwargs)
         _state_module._append_recent_request(
             _routing_module._request_log_record("success", kwargs, response_obj, start_time, end_time)
         )
@@ -57,7 +58,8 @@ class LiteLLMMenuHook(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
-        _routing_module._record_deployment_success_for_cooldown(kwargs)
+        if _streaming_module._responses_stream_chunk_is_completed(response_obj):
+            _routing_module._record_deployment_success_for_cooldown(kwargs)
         _state_module._append_recent_request(
             _routing_module._request_log_record("stream", kwargs, response_obj, start_time, end_time)
         )

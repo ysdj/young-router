@@ -54,6 +54,31 @@ These instructions apply to the entire `litellm-menu` repository.
   restart/health, source-to-bundle match, and the fresh CLI check. Invocation or
   orchestration errors do not count; rerun once and use one waiter per process.
 
+## Codex Compaction And Recovery
+
+- Diagnose compaction stalls from protocol events, not elapsed time alone.
+  Repeated explicit upstream 5xx responses are routing/deployment failures, not
+  first-event timeouts, and raising a timeout must not be used to mask them.
+- Bound structured compaction history by both text size and protocol item count.
+  Preserve developer/system state and compaction markers, keep every tool call
+  paired with its output, and never truncate encrypted compaction content.
+- A complete, non-empty encrypted compaction output item is valid recovery
+  evidence when a compatible upstream closes the stream without the final
+  `response.completed`. Synthesize that terminal event only for this narrowly
+  identified compaction case; never hide an explicit `response.failed`,
+  `response.incomplete`, or `error` event.
+- Do not treat `response.created` or mere stream establishment as deployment
+  success. Clear failure cooldown only after a genuinely completed stream;
+  otherwise recovery can retry the same failing deployment indefinitely.
+- Keep ordinary first-event, compaction first-event, post-first-event idle, and
+  total recovery limits independently configurable and exposed consistently in
+  Runtime Settings. Compaction recovery may use the full recovery window, while
+  ordinary turns retain their bounded retry window.
+- A compaction/recovery fix is not complete until the installed launcher can
+  resume a representative large local task, finish compaction, and proceed to a
+  normal response or tool call. Keep the task id, provider, host, request ids,
+  and trace content out of committed files.
+
 ## Native UI Screenshots
 
 - Computer Use can inspect LiteLLM Menu when a normal editor or settings `NSWindow` is open. A menu-bar-only process exposes only `NSStatusItem` / `NSMenu`; `get_app_state` may time out in that state even when the app is healthy. Retry once by bundle id (`menu.litellm.menu`), then open the target window before treating the timeout as an app defect. Do not add a persistent or hidden window solely to satisfy screenshot tooling.

@@ -512,6 +512,213 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(original["input"][2]["output"], first_output)
         self.assertEqual(modified["input"][-1], original["input"][-1])
 
+    def test_structured_codex_compaction_omits_only_already_observed_tool_images(self) -> None:
+        hooks, _ = load_hook_module()
+        old_image = "data:image/png;base64," + ("a" * 200_000)
+        recent_image = "data:image/png;base64," + ("b" * 200_000)
+        original = {
+            "call_type": "aresponses",
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_old",
+                    "output": [
+                        {"type": "input_text", "text": "old screenshot"},
+                        {"type": "input_image", "image_url": old_image},
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I inspected it."}],
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_recent",
+                    "output": [
+                        {"type": "input_text", "text": "new screenshot"},
+                        {"type": "input_image", "image_url": recent_image},
+                    ],
+                },
+                {"type": "compaction_trigger"},
+            ],
+        }
+
+        modified = hooks._with_codex_compaction_input_bounded(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["input"][0]["call_id"], "call_old")
+        self.assertEqual(modified["input"][0]["output"][0], original["input"][0]["output"][0])
+        self.assertEqual(modified["input"][0]["output"][1]["type"], "input_text")
+        self.assertIn(
+            "historical inline image",
+            modified["input"][0]["output"][1]["text"],
+        )
+        self.assertEqual(modified["input"][2], original["input"][2])
+        self.assertEqual(original["input"][0]["output"][1]["image_url"], old_image)
+
+    def test_structured_codex_compaction_omits_old_message_image_before_compaction_summary(self) -> None:
+        hooks, _ = load_hook_module()
+        old_image = "data:image/png;base64," + ("a" * 200_000)
+        recent_image = "data:image/png;base64," + ("b" * 200_000)
+        previous_compaction = {
+            "type": "compaction",
+            "id": "compaction_previous",
+            "encrypted_content": "opaque-encrypted-summary",
+        }
+        original = {
+            "call_type": "aresponses",
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "old screenshot"},
+                        {"type": "input_image", "image_url": old_image},
+                    ],
+                },
+                previous_compaction,
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "new screenshot"},
+                        {"type": "input_image", "image_url": recent_image},
+                    ],
+                },
+                {"type": "compaction_trigger"},
+            ],
+        }
+
+        modified = hooks._with_codex_compaction_input_bounded(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["input"][0]["content"][0], original["input"][0]["content"][0])
+        self.assertEqual(modified["input"][0]["content"][1]["type"], "input_text")
+        self.assertIn(
+            "compaction summary",
+            modified["input"][0]["content"][1]["text"],
+        )
+        self.assertEqual(modified["input"][1], previous_compaction)
+        self.assertEqual(
+            modified["input"][1]["encrypted_content"],
+            "opaque-encrypted-summary",
+        )
+        self.assertEqual(modified["input"][2], original["input"][2])
+        self.assertEqual(original["input"][0]["content"][1]["image_url"], old_image)
+
+    def test_structured_codex_compaction_bounds_large_text_history_to_safe_budget(self) -> None:
+        hooks, _ = load_hook_module()
+        original = {
+            "call_type": "aresponses",
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "d" * 40_000,
+                },
+                *[
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": f"call_{index}",
+                        "output": "x" * 20_000,
+                    }
+                    for index in range(20)
+                ],
+                {"type": "compaction_trigger"},
+            ],
+        }
+
+        modified = hooks._with_codex_compaction_input_bounded(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertLessEqual(
+            hooks._compaction_text_length(modified["input"]),
+            hooks._CODEX_COMPACTION_HISTORY_TEXT_CHARS,
+        )
+        self.assertEqual(modified["input"][-1], original["input"][-1])
+
+    def test_structured_codex_compaction_bounds_item_count_without_orphaning_calls(self) -> None:
+        hooks, _ = load_hook_module()
+        previous_compaction = {
+            "type": "compaction",
+            "id": "compaction_previous",
+            "encrypted_content": "opaque-encrypted-summary",
+        }
+        original = {
+            "call_type": "aresponses",
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": []},
+                {"type": "message", "role": "developer", "content": "rules"},
+                previous_compaction,
+                *[
+                    item
+                    for index in range(200)
+                    for item in (
+                        {
+                            "type": "custom_tool_call",
+                            "call_id": f"call_{index}",
+                            "name": "exec",
+                            "input": "{}",
+                        },
+                        {
+                            "type": "custom_tool_call_output",
+                            "call_id": f"call_{index}",
+                            "output": "ok",
+                        },
+                    )
+                ],
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+        }
+
+        modified = hooks._with_codex_compaction_input_bounded(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertLessEqual(
+            len(modified["input"]),
+            hooks._CODEX_COMPACTION_HISTORY_MAX_ITEMS,
+        )
+        self.assertEqual(modified["input"][:3], original["input"][:3])
+        self.assertEqual(modified["input"][-1], original["input"][-1])
+        calls = {
+            item["call_id"]
+            for item in modified["input"]
+            if item.get("type") == "custom_tool_call"
+        }
+        outputs = {
+            item["call_id"]
+            for item in modified["input"]
+            if item.get("type") == "custom_tool_call_output"
+        }
+        self.assertEqual(calls, outputs)
+        self.assertIn("call_199", calls)
+        self.assertNotIn("call_0", calls)
+        self.assertEqual(
+            previous_compaction["encrypted_content"],
+            "opaque-encrypted-summary",
+        )
+
     def test_structured_codex_compaction_leaves_small_request_untouched(self) -> None:
         hooks, _ = load_hook_module()
         original = {
