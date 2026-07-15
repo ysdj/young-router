@@ -117,7 +117,28 @@ def sync_formula(paths: VersionPaths) -> bool:
         return False
     version = format_version(read_version(paths))
     text = paths.formula_file.read_text(encoding="utf-8")
-    updated = re.sub(r'(^\s*version\s+")([^"]+)(")', rf"\g<1>{version}\3", text, count=1, flags=re.MULTILINE)
+    updated = re.sub(
+        r'(^\s*url\s+"[^"]+",\s*tag:\s*")([^"]+)(")',
+        rf"\g<1>v{version}\3",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    updated = re.sub(
+        r'(releases/download/v)(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
+        r'(/litellm-menu-)(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
+        r'(-macos-[^"]+)',
+        rf"\g<1>{version}\g<2>{version}\g<3>",
+        updated,
+        count=1,
+    )
+    updated = re.sub(
+        r'(^\s*version\s+")([^"]+)(")',
+        rf"\g<1>{version}\3",
+        updated,
+        count=1,
+        flags=re.MULTILINE,
+    )
     if updated == text:
         return False
     paths.formula_file.write_text(updated, encoding="utf-8")

@@ -17,6 +17,9 @@ import re
 import sys
 import tempfile
 
+RETAIN_EXISTING_VALUE = "__LITELLM_MENU_RETAIN_EXISTING__"
+SECRET_KEYS = {"LITELLM_MENU_VISION_BRIDGE_API_KEY"}
+
 SPECS = [
     ("LITELLM_MENU_REQUEST_TIMEOUT_SECONDS", "float", "7200", 0, 7200),
     ("LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS", "float", "120", 0, 3600),
@@ -80,6 +83,24 @@ def parse_payload() -> dict[str, object]:
     values = payload.get("values", payload)
     if not isinstance(values, dict):
         raise ValueError("Settings payload must contain an object at values.")
+    return values
+
+
+def read_configured(path: pathlib.Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "#" in line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key in SPEC_BY_KEY and value and value != RETAIN_EXISTING_VALUE:
+            values[key] = value
     return values
 
 
@@ -180,33 +201,54 @@ def normalize_stored_number(key: str, raw: object) -> str:
     return str(numeric)
 
 
+def differs_from_default(value: str, default: str, kind: str) -> bool:
+    if kind in {"int", "float", "mb"}:
+        return not numeric_equal(value, default, kind)
+    return value != default
+
+
+path = pathlib.Path(os.environ["RUNTIME_SETTINGS_FILE"])
 try:
     submitted = parse_payload()
     unknown = sorted(set(submitted) - set(SPEC_BY_KEY))
     if unknown:
         raise ValueError("Unknown runtime setting(s): " + ", ".join(unknown))
+    configured = read_configured(path)
     normalized: dict[str, str] = {}
     for key, kind, default, _, _ in SPECS:
         if key in submitted:
-            value = normalize_value(key, submitted[key])
-        else:
+            raw_value = submitted[key]
+            if str(raw_value) == RETAIN_EXISTING_VALUE:
+                if key not in SECRET_KEYS:
+                    raise ValueError(f"{key} cannot use the retain-existing marker.")
+                if key not in configured:
+                    continue
+                raw_value = configured[key]
+            value = normalize_value(key, raw_value)
+        elif key in configured:
             if kind == "mb":
-                value = normalize_stored_number(key, os.environ.get(key))
+                value = normalize_stored_number(key, configured[key])
             else:
-                value = normalize_value(key, os.environ.get(key))
-        if kind in {"int", "float", "mb"}:
-            if not numeric_equal(value, default, kind):
-                normalized[key] = value
-        elif kind == "bool_auto":
-            if value != str(default):
-                normalized[key] = value
-        elif value != str(default):
+                value = normalize_value(key, configured[key])
+        else:
+            continue
+        if differs_from_default(value, str(default), kind):
             normalized[key] = value
+    max_results = int(
+        normalized.get("LITELLM_MENU_WEB_SEARCH_MAX_RESULTS", "8")
+    )
+    read_results = int(
+        normalized.get("LITELLM_MENU_WEB_SEARCH_READ_RESULTS", "4")
+    )
+    if read_results > max_results:
+        raise ValueError(
+            "LITELLM_MENU_WEB_SEARCH_READ_RESULTS cannot exceed "
+            "LITELLM_MENU_WEB_SEARCH_MAX_RESULTS."
+        )
 except Exception as exc:
     print(str(exc), file=sys.stderr)
     sys.exit(1)
 
-path = pathlib.Path(os.environ["RUNTIME_SETTINGS_FILE"])
 path.parent.mkdir(parents=True, exist_ok=True)
 if normalized:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -225,8 +267,153 @@ else:
         path.unlink()
     except FileNotFoundError:
         pass
-print(json.dumps({"path": str(path), "saved": normalized}, ensure_ascii=False, indent=2))
+print(
+    json.dumps(
+        {"path": str(path), "saved_keys": list(normalized)},
+        ensure_ascii=False,
+        indent=2,
+    )
+)
 PY
+}
+
+runtime_settings_control() {
+  local action="$1"
+  local key
+  local -a clean_environment=()
+  local control_path
+  shift
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    clean_environment+=("-u" "$key")
+  done < <(runtime_settings_managed_keys)
+  control_path="${LITELLM_RUNTIME_SETTINGS_CONTROL_PATH:-$TEMPLATE_ROOT/service.sh}"
+  env "${clean_environment[@]}" \
+    LITELLM_RUNTIME_ROOT="$ROOT" \
+    LITELLM_TEMPLATE_ROOT="$TEMPLATE_ROOT" \
+    LITELLM_MENU_RUNTIME_SETTINGS_FILE="$RUNTIME_SETTINGS_FILE" \
+    /bin/bash -c '
+      set -euo pipefail
+      service_fragment_dir="$1"
+      control_path="$2"
+      action="$3"
+      shift 3
+      source "$service_fragment_dir/environment.sh" "$action" "$@"
+      exec /bin/bash "$control_path" "$action" "$@"
+    ' runtime-settings-control "$SERVICE_FRAGMENT_DIR" "$control_path" "$action" "$@"
+}
+
+runtime_settings_reload_environment() {
+  local key
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    unset "$key"
+  done < <(runtime_settings_managed_keys)
+  # shellcheck source=/dev/null
+  source "$SERVICE_FRAGMENT_DIR/environment.sh"
+}
+
+runtime_settings_lifecycle_action() {
+  local action="$1"
+
+  # The override is used only by isolated tests. The installed app reloads this
+  # shell's environment and invokes the already-loaded lifecycle functions so
+  # its transaction lock remains held across watcher and restart work.
+  if [[ -n "${LITELLM_RUNTIME_SETTINGS_CONTROL_PATH:-}" ]]; then
+    runtime_settings_control "$action"
+    return
+  fi
+
+  runtime_settings_reload_environment
+  case "$action" in
+    config-watch-ensure)
+      ensure_config_watch
+      ;;
+    restart)
+      restart_server
+      ;;
+    *)
+      echo "Unsupported Runtime Settings lifecycle action: $action" >&2
+      return 64
+      ;;
+  esac
+}
+
+runtime_settings_managed_keys() {
+  sed -n 's/^[[:space:]]*("\(LITELLM_[A-Z0-9_]*\)",.*/\1/p' \
+    "$SERVICE_FRAGMENT_DIR/runtime_settings_configure.sh"
+}
+
+runtime_settings_restore_snapshot() {
+  local backup_path="$1" had_settings="$2"
+  if [[ "$had_settings" == "1" ]]; then
+    chmod 600 "$backup_path" 2>/dev/null || true
+    mv -f "$backup_path" "$RUNTIME_SETTINGS_FILE"
+    chmod 600 "$RUNTIME_SETTINGS_FILE" 2>/dev/null || true
+  else
+    rm -f "$RUNTIME_SETTINGS_FILE" "$backup_path"
+  fi
+}
+
+runtime_settings_transaction() {
+  local mode="$1" payload backup_path had_settings=0
+
+  payload="$(cat)"
+  mkdir -p "$(dirname "$RUNTIME_SETTINGS_FILE")"
+  backup_path="$(mktemp "$(dirname "$RUNTIME_SETTINGS_FILE")/.${RUNTIME_SETTINGS_FILE##*/}.backup.XXXXXX")"
+  chmod 600 "$backup_path" 2>/dev/null || true
+  if [[ -f "$RUNTIME_SETTINGS_FILE" ]]; then
+    had_settings=1
+    cp -p "$RUNTIME_SETTINGS_FILE" "$backup_path"
+    chmod 600 "$backup_path" 2>/dev/null || true
+  fi
+
+  if ! runtime_settings_configure <<<"$payload" >/dev/null; then
+    rm -f "$backup_path"
+    echo "Runtime settings were not saved: validation failed." >&2
+    return 1
+  fi
+
+  if ! runtime_settings_lifecycle_action config-watch-ensure >/dev/null 2>&1; then
+    runtime_settings_restore_snapshot "$backup_path" "$had_settings"
+    if ! runtime_settings_lifecycle_action config-watch-ensure >/dev/null 2>&1; then
+      echo "Runtime settings were rolled back, but the previous config watcher could not be restored." >&2
+      return 1
+    fi
+    echo "Runtime settings were rolled back: config watcher update failed." >&2
+    return 1
+  fi
+
+  if [[ "$mode" == "apply" ]]; then
+    if ! runtime_settings_lifecycle_action restart >/dev/null 2>&1; then
+      runtime_settings_restore_snapshot "$backup_path" "$had_settings"
+      if ! runtime_settings_lifecycle_action config-watch-ensure >/dev/null 2>&1; then
+        echo "Runtime settings were rolled back, but the previous config watcher could not be restored." >&2
+        return 1
+      fi
+      if ! runtime_settings_lifecycle_action restart >/dev/null 2>&1; then
+        echo "Runtime settings were rolled back, but the service could not restart with the previous settings." >&2
+        return 1
+      fi
+      echo "Runtime settings were rolled back: service restart failed." >&2
+      return 1
+    fi
+  fi
+
+  rm -f "$backup_path"
+  if [[ "$mode" == "apply" ]]; then
+    echo "Runtime settings saved and applied."
+  else
+    echo "Runtime settings saved."
+  fi
+}
+
+runtime_settings_apply() {
+  runtime_settings_transaction apply
+}
+
+runtime_settings_save() {
+  runtime_settings_transaction save
 }
 
 runtime_settings_reset() {

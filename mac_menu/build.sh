@@ -37,7 +37,12 @@ SWIFT_SOURCES=()
 while IFS= read -r source_file; do
   SWIFT_SOURCES+=("$source_file")
 done < <(find "$ROOT/mac_menu/Sources" -name '*.swift' -type f | sort)
-swiftc "${SWIFT_SOURCES[@]}" -o "$APP/Contents/MacOS/LiteLLMMenu" -framework Cocoa
+swiftc \
+  -file-prefix-map "$ROOT=." \
+  -debug-prefix-map "$ROOT=." \
+  "${SWIFT_SOURCES[@]}" \
+  -o "$APP/Contents/MacOS/LiteLLMMenu" \
+  -framework Cocoa
 cp "$ROOT/mac_menu/Info.plist" "$APP/Contents/Info.plist"
 sync_version_to_plist "$APP/Contents/Info.plist"
 cp "$ICON" "$APP/Contents/Resources/LiteLLMMenu.icns"
@@ -75,7 +80,15 @@ do
     "$ROOT/$directory/" "$APP_RES/$directory/"
 done
 cp "$UV_BIN" "$APP_RES/bin/uv"
-swiftc "$ROOT/mac_menu/vision_ocr.swift" -o "$APP_RES/bin/vision_ocr" -framework Vision -framework ImageIO -framework CoreGraphics -framework Foundation
+swiftc \
+  -file-prefix-map "$ROOT=." \
+  -debug-prefix-map "$ROOT=." \
+  "$ROOT/mac_menu/vision_ocr.swift" \
+  -o "$APP_RES/bin/vision_ocr" \
+  -framework Vision \
+  -framework ImageIO \
+  -framework CoreGraphics \
+  -framework Foundation
 chmod +x "$APP/Contents/MacOS/LiteLLMMenu"
 chmod +x "$APP_RES/service.sh" "$APP_RES/app.sh" "$APP_RES/run.sh" "$APP_RES/watch_config.sh" "$APP_RES/config_editor.py" "$APP_RES/codex_launcher.py" "$APP_RES/codex-litellm" "$APP_RES/route_trace_report.py" "$APP_RES/route_recovery_report.py" "$APP_RES/scripts/smoke_websearch.py" "$APP_RES/scripts/smoke_responses_tool_bridge_compare.py" "$APP_RES/bin/uv" "$APP_RES/bin/vision_ocr"
 chmod +x "$APP_RES"/service/*.sh

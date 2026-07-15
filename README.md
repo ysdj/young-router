@@ -10,7 +10,7 @@ LiteLLM Menu is a native macOS menu bar application that runs and manages a loca
 
 ### Native Menu Bar App
 
-LiteLLM Menu runs as a macOS status bar application written in Swift. The menu app owns the local LiteLLM proxy lifecycle: it starts, stops, restarts, and monitors the proxy process. No Docker container, database, or system Python installation is required. On first launch, the app uses the bundled `uv` package manager to create a private Python runtime under `~/.litellm-menu`, isolated from the system Python.
+LiteLLM Menu runs as a macOS status bar application written in Swift. The menu app owns the local LiteLLM proxy lifecycle: it starts, stops, restarts, and monitors the proxy process. No Docker container, database, or system Python installation is required. Homebrew releases include a self-contained Python runtime and LiteLLM dependencies, so first launch does not download or compile packages. Source builds retain a bundled `uv` fallback for development.
 
 The menu provides direct access to:
 
@@ -118,7 +118,8 @@ A launchd-backed config watcher monitors `config.yaml` for changes. On detection
 ### Requirements
 
 - macOS 13.0 or later
-- [uv](https://docs.astral.sh/uv/) package manager (installed automatically via Homebrew, or set `LITELLM_UV_BIN` to a custom path)
+- Apple silicon Mac for the prebuilt Homebrew package
+- [uv](https://docs.astral.sh/uv/) only when building from source (or set `LITELLM_UV_BIN` to a custom path)
 
 ### Homebrew (Recommended)
 
@@ -133,7 +134,7 @@ After installation:
 litellm-menu open
 ```
 
-This builds the app bundle (if needed) and launches the menu bar app. The app creates its private Python runtime on first launch.
+Homebrew downloads the prebuilt app and bundled runtime. Opening it starts the menu-owned service without a first-run dependency install.
 
 ### Manual Build
 
@@ -160,7 +161,7 @@ Launch the app:
 ### First Launch
 
 1. Open LiteLLM Menu from the menu bar icon (the "LL" status item).
-2. The app bootstraps a private Python runtime using `uv` and starts the local LiteLLM proxy.
+2. The Homebrew app starts the local LiteLLM proxy from its bundled runtime. A source-built app bootstraps its development runtime with `uv` when needed.
 3. Click **Edit Models Config** to configure providers, API keys, models, and deployment order.
 4. Click **Apply Config** (or restart the service) to stage and activate the configuration.
 5. Optionally click **Configure Codex for LiteLLM** to point Codex at the local endpoint.
@@ -266,7 +267,7 @@ For installed app behavior verification, the complete path is: build the app, re
 
 `VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Formula/litellm-menu.rb` are kept in sync through `scripts/version.py`.
 
-LiteLLM uses a two-stage version policy. Development explicitly advances `LITELLM_VERSION` to the latest stable PyPI release with `./scripts/update-litellm.sh`; `./scripts/update-litellm.sh --check` fails when the lock is stale. Built and released apps copy that lock and install exactly `litellm[proxy]==<locked version>`, so a release never changes SDK versions merely because a user starts or restarts the service later. After advancing the lock, rebuild, restart, and run the full test suite before release.
+LiteLLM uses a two-stage version policy. Development explicitly advances `LITELLM_VERSION` to the latest stable PyPI release that provides a universal wheel with `./scripts/update-litellm.sh`; releases without a macOS-compatible binary are skipped so app startup never compiles LiteLLM from source. `./scripts/update-litellm.sh --check` fails when the compatible lock is stale. Built and released apps copy that lock and install exactly `litellm[proxy]==<locked version>`, so a release never changes SDK versions merely because a user starts or restarts the service later. After advancing the lock, rebuild, restart, and run the full test suite before release.
 
 ---
 
@@ -288,7 +289,7 @@ LiteLLM Menu 是一个原生 macOS 菜单栏应用，用于运行和管理本地
 
 ### 原生菜单栏应用
 
-LiteLLM Menu 以 Swift 编写，作为 macOS 状态栏应用运行。菜单应用拥有本地 LiteLLM 代理进程的完整生命周期管理：启动、停止、重启和监控。无需 Docker 容器、数据库或系统 Python 安装。首次启动时，应用使用内置的 `uv` 包管理器在 `~/.litellm-menu` 下创建私有 Python 运行时，与系统 Python 隔离。
+LiteLLM Menu 以 Swift 编写，作为 macOS 状态栏应用运行。菜单应用拥有本地 LiteLLM 代理进程的完整生命周期管理：启动、停止、重启和监控。无需 Docker 容器、数据库或系统 Python 安装。Homebrew 发布包已内置独立 Python 运行时与 LiteLLM 依赖，首次启动无需下载或编译软件包；源码构建仍保留内置 `uv` 作为开发兜底。
 
 菜单提供以下功能的直接访问：
 
@@ -396,7 +397,8 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 ### 系统要求
 
 - macOS 13.0 或更高版本
-- [uv](https://docs.astral.sh/uv/) 包管理器（通过 Homebrew 自动安装，或设置 `LITELLM_UV_BIN` 指向自定义路径）
+- 预构建 Homebrew 包目前要求 Apple silicon Mac
+- 仅源码构建需要 [uv](https://docs.astral.sh/uv/)（也可设置 `LITELLM_UV_BIN` 指向自定义路径）
 
 ### Homebrew 安装（推荐）
 
@@ -411,7 +413,7 @@ brew install litellm-menu
 litellm-menu open
 ```
 
-此命令构建应用包（如需要）并启动菜单栏应用。应用在首次启动时创建私有 Python 运行时。
+Homebrew 会下载预构建应用及其内置运行时。打开后直接启动由菜单管理的服务，首次运行不会安装依赖。
 
 ### 手动构建
 
@@ -438,7 +440,7 @@ LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
 ### 首次启动
 
 1. 从菜单栏图标（"LL" 状态项）打开 LiteLLM Menu。
-2. 应用使用 `uv` 引导私有 Python 运行时并启动本地 LiteLLM 代理。
+2. Homebrew 应用直接从内置运行时启动本地 LiteLLM 代理；源码构建仅在需要时使用 `uv` 引导开发运行时。
 3. 点击 **Edit Models Config** 配置供应商、API 密钥、模型和部署顺序。
 4. 点击 **Apply Config**（或重启服务）暂存并激活配置。
 5. 可选：点击 **Configure Codex for LiteLLM** 将 Codex 指向本地端点。
@@ -544,7 +546,7 @@ litellm-menu-service route-trace-html
 
 `VERSION`、`BUILD_NUMBER`、`mac_menu/Info.plist` 和 `Formula/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
 
-LiteLLM 采用两阶段版本策略。开发时用 `./scripts/update-litellm.sh` 显式把 `LITELLM_VERSION` 推进到 PyPI 最新稳定版；`./scripts/update-litellm.sh --check` 会在锁定版本落后时失败。构建和发布的应用会复制这个锁，并精确安装 `litellm[proxy]==<锁定版本>`，因此用户以后启动或重启服务时不会意外漂移 SDK 版本。更新版本锁后，发布前必须重新构建、重启并运行全套测试。
+LiteLLM 采用两阶段版本策略。开发时用 `./scripts/update-litellm.sh` 显式把 `LITELLM_VERSION` 推进到提供通用 wheel 的 PyPI 最新稳定版；缺少 macOS 兼容二进制包的版本会被跳过，避免应用启动时现场编译 LiteLLM。`./scripts/update-litellm.sh --check` 会在兼容版本锁落后时失败。构建和发布的应用会复制这个锁，并精确安装 `litellm[proxy]==<锁定版本>`，因此用户以后启动或重启服务时不会意外漂移 SDK 版本。更新版本锁后，发布前必须重新构建、重启并运行全套测试。
 
 ---
 

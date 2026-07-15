@@ -201,26 +201,25 @@ extension AppDelegate {
 
     func localLogMaxBytes() -> UInt64 {
         let defaultBytes: UInt64 = 10 * 1024 * 1024
+        let settingsPath = "\(root)/runtime-settings.env"
+        if let text = try? String(contentsOfFile: settingsPath, encoding: .utf8) {
+            for rawLine in text.components(separatedBy: .newlines) {
+                let line = rawLine.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard line.hasPrefix("LITELLM_MENU_LOG_MAX_BYTES=") else { continue }
+                let value = line.dropFirst("LITELLM_MENU_LOG_MAX_BYTES=".count)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let bytes = UInt64(value), bytes > 0 {
+                    return bytes
+                }
+            }
+        }
+
         let environment = ProcessInfo.processInfo.environment
         if let rawValue = environment["LITELLM_MENU_LOG_MAX_BYTES"],
            let bytes = UInt64(rawValue.trimmingCharacters(in: .whitespacesAndNewlines)),
            bytes > 0 {
             return bytes
-        }
-
-        let settingsPath = "\(root)/runtime-settings.env"
-        guard let text = try? String(contentsOfFile: settingsPath, encoding: .utf8) else {
-            return defaultBytes
-        }
-        for rawLine in text.components(separatedBy: .newlines) {
-            let line = rawLine.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard line.hasPrefix("LITELLM_MENU_LOG_MAX_BYTES=") else { continue }
-            let value = line.dropFirst("LITELLM_MENU_LOG_MAX_BYTES=".count)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if let bytes = UInt64(value), bytes > 0 {
-                return bytes
-            }
         }
         return defaultBytes
     }

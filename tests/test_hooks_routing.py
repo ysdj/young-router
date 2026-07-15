@@ -354,6 +354,16 @@ class HookRoutingTests(HookTestCase):
                 error.status_code = 403
                 hooks._mark_exception_for_deployment_failover(error, request_kwargs)
 
+            cooldown_payload = json.loads(
+                Path(temp_dir, "deployment-cooldowns.json").read_text(encoding="utf-8")
+            )
+            cooldown_state = cooldown_payload["cooldowns"]["id:stable-backup_provider"]
+            self.assertEqual(cooldown_state["model_group"], "default-chat")
+            self.assertEqual(cooldown_state["provider"], "backup_provider")
+            self.assertEqual(cooldown_state["upstream_model"], "openai/default-chat")
+            self.assertEqual(cooldown_state["api_base_host"], "api.backup.example")
+            self.assertEqual(cooldown_state["deployment_order"], 2)
+
             hooks._DEPLOYMENT_COOLDOWNS.clear()
 
             filtered = await hook.async_filter_deployments(

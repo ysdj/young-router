@@ -2758,6 +2758,7 @@ def _record_deployment_failure_for_cooldown(
 
     threshold = _deployment_cooldown_failure_threshold()
     cooldown_seconds = _deployment_cooldown_seconds()
+    request_log = _request_log_record("cooldown", request_kwargs)
 
     def record(cooldowns: dict[str, Any], now: float) -> list[tuple[str, int, float]]:
         started: list[tuple[str, int, float]] = []
@@ -2777,6 +2778,16 @@ def _record_deployment_failure_for_cooldown(
             state["last_failure_at"] = now
             state["deployment_id"] = deployment_id
             state["route_key"] = route_key
+            for key in (
+                "model_group",
+                "provider",
+                "upstream_model",
+                "api_base_host",
+                "deployment_order",
+            ):
+                value = request_log.get(key)
+                if value not in (None, ""):
+                    state[key] = value
 
             if failures >= threshold:
                 cooldown_until = now + cooldown_seconds

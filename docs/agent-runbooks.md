@@ -90,7 +90,7 @@ This document keeps lower-frequency operational notes out of `AGENTS.md`. Read t
 ## macOS App And Service
 
 - LiteLLM Menu is a native app that owns the local service lifecycle. The default path should not require Docker, a database, or a system Python install.
-- Homebrew installs `uv`; the app uses it to create a private Python runtime under `~/.litellm-menu` on first launch.
+- Homebrew releases include a self-contained Python runtime and the locked LiteLLM dependencies. First launch must not download or compile packages; `uv` bootstrap is only a source-build fallback.
 - The service must start from `.litellm-runtime/config.yaml`. Editable `config.yaml` is the source, not the live file.
 - Config watch should validate and stage changes, then require apply/restart. It should not silently restart the service on every file write.
 - Autostart should launch the menu app, not a standalone proxy detached from the menu owner process.

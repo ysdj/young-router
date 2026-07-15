@@ -112,6 +112,12 @@ case "$ACTION" in
   runtime-settings-configure)
     runtime_settings_configure
     ;;
+  runtime-settings-apply)
+    with_service_lifecycle_lock runtime-settings-apply runtime_settings_apply
+    ;;
+  runtime-settings-save)
+    with_service_lifecycle_lock runtime-settings-save runtime_settings_save
+    ;;
   runtime-settings-reset)
     runtime_settings_reset
     ;;
@@ -215,7 +221,7 @@ case "$ACTION" in
     verify_runtime_config
     ;;
   *)
-    echo "usage: $0 {bootstrap|config-editor-bootstrap|start|run-native|stop|reload|restart|hard-restart|apply-config|status|tail|recent-requests|logs-summary|menu-actions-tail|route-trace|route-trace-html|route-recovery-html|route-recovery-summary|route-trace-enable|route-trace-disable|route-trace-status|computer-facade-smoke|runtime-settings|runtime-settings-configure|runtime-settings-reset|webdav-settings|webdav-configure|webdav-enable|webdav-disable|webdav-enabled-status|webdav-status|webdav-last-status|webdav-sync-interval-seconds|webdav-probe|webdav-sync|webdav-push|webdav-pull|validate|verify-runtime-config|stage-config|autostart-enable|autostart-disable|autostart-status|config-watch-enable|config-watch-ensure|config-watch-disable|config-watch-status|config-watch-tail|codex-local-config|codex-local-exec|codex-reapply-pre-switch-config}" >&2
+    echo "usage: $0 {bootstrap|config-editor-bootstrap|start|run-native|stop|reload|restart|hard-restart|apply-config|status|tail|recent-requests|logs-summary|menu-actions-tail|route-trace|route-trace-html|route-recovery-html|route-recovery-summary|route-trace-enable|route-trace-disable|route-trace-status|computer-facade-smoke|runtime-settings|runtime-settings-configure|runtime-settings-apply|runtime-settings-save|runtime-settings-reset|webdav-settings|webdav-configure|webdav-enable|webdav-disable|webdav-enabled-status|webdav-status|webdav-last-status|webdav-sync-interval-seconds|webdav-probe|webdav-sync|webdav-push|webdav-pull|validate|verify-runtime-config|stage-config|autostart-enable|autostart-disable|autostart-status|config-watch-enable|config-watch-ensure|config-watch-disable|config-watch-status|config-watch-tail|codex-local-config|codex-local-exec|codex-reapply-pre-switch-config}" >&2
     exit 64
     ;;
 esac

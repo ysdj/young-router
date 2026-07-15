@@ -336,6 +336,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
                     "x-codex-beta-features": "remote_compaction_v2",
                     "x-codex-turn-metadata": turn_metadata,
                     "x-codex-window-id": "thread-test-0001:7",
+                    "x-openai-internal-codex-responses-lite": "true",
                 }
             },
         }
@@ -354,6 +355,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(headers["x-codex-beta-features"], "remote_compaction_v2")
         self.assertEqual(headers["x-codex-turn-metadata"], turn_metadata)
         self.assertEqual(headers["accept-encoding"], "identity")
+        self.assertEqual(
+            headers["x-openai-internal-codex-responses-lite"],
+            "true",
+        )
         self.assertEqual(
             headers["x-codex-window-id"],
             "thread-test-0001:7",

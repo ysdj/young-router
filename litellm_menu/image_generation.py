@@ -259,6 +259,7 @@ _CODEX_COMPACTION_UPSTREAM_HEADER_NAMES = (
     "X-Codex-Beta-Features",
     "X-Codex-Turn-Metadata",
     "X-Codex-Window-Id",
+    "X-OpenAI-Internal-Codex-Responses-Lite",
 )
 
 _CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS = 200_000

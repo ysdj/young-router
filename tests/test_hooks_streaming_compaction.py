@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from hook_test_utils import *
 
 
@@ -339,6 +341,7 @@ class HookStreamingCompactionTests(HookTestCase):
                     "x-codex-beta-features": "remote_compaction_v2",
                     "x-codex-turn-metadata": '{"request_kind":"compaction"}',
                     "x-codex-window-id": "thread-test-0001:7",
+                    "x-openai-internal-codex-responses-lite": "true",
                 }
             },
             "model_info": {
@@ -380,6 +383,10 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertEqual(headers["x-codex-beta-features"], "remote_compaction_v2")
         self.assertEqual(headers["x-codex-turn-metadata"], '{"request_kind":"compaction"}')
         self.assertEqual(headers["accept-encoding"], "identity")
+        self.assertEqual(
+            headers["x-openai-internal-codex-responses-lite"],
+            "true",
+        )
         self.assertEqual(
             headers["x-codex-window-id"],
             "thread-test-0001:7",
@@ -535,6 +542,7 @@ class HookStreamingCompactionTests(HookTestCase):
                 }
             ],
             "stream": True,
+            "prompt_cache_key": "thread-rate-limit-kept",
             "model_info": {
                 "id": "third-party-large",
                 "provider": "compat_provider",
@@ -554,12 +562,122 @@ class HookStreamingCompactionTests(HookTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertNotIn("use_chat_completions_api", calls[0])
+        self.assertEqual(calls[0]["prompt_cache_key"], "thread-rate-limit-kept")
         self.assertIn(
             {"type": "response.output_text.delta", "delta": "compact recovered"},
             chunks,
         )
         self.assertEqual(chunks[-1]["type"], "response.completed")
         self.assertEqual(chunks[-1]["response"]["id"], "resp-recovered")
+
+    async def test_codex_compaction_temporary_failure_retries_without_prompt_cache_key(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        async def recovered_stream():
+            compaction_item = {
+                "id": "cmp-recovered",
+                "type": "compaction_summary",
+                "encrypted_content": "opaque-encrypted-summary",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-recovered",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(copy.deepcopy(payload))
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        tools = [
+            {"type": "custom", "name": "exec", "description": "run a command"},
+            {"type": "function", "name": "wait", "parameters": {"type": "object"}},
+            {
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [{"type": "function", "name": "list_agents"}],
+            },
+        ]
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": tools,
+                },
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+            "prompt_cache_key": "thread-compaction-failing-cache",
+            "extra_body": {
+                "prompt_cache_key": "thread-compaction-failing-cache",
+                "client_metadata": {"thread_id": "thread-compaction-cache-recovery"},
+            },
+            "client_metadata": {
+                "thread_id": "thread-compaction-cache-recovery",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "model_info": {
+                "id": "third-party-large",
+                "provider": "compat_provider",
+                "route_key": "compat_provider / openai/default-chat / key=x-plus",
+            },
+        }
+        original_request = copy.deepcopy(request_data)
+        first_exception = RuntimeError("temporary upstream server error")
+        first_exception.status_code = 500
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                first_exception,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("prompt_cache_key", calls[0])
+        self.assertNotIn("prompt_cache_key", calls[0]["extra_body"])
+        self.assertEqual(
+            calls[0]["extra_body"]["client_metadata"]["thread_id"],
+            "thread-compaction-cache-recovery",
+        )
+        self.assertEqual(
+            calls[0]["extra_body"]["client_metadata"]["x-codex-turn-metadata"],
+            '{"request_kind":"compaction"}',
+        )
+        self.assertEqual(calls[0]["input"], original_request["input"])
+        self.assertEqual(calls[0]["input"][0]["tools"], tools)
+        self.assertEqual(
+            request_data["prompt_cache_key"],
+            "thread-compaction-failing-cache",
+        )
+        self.assertEqual(
+            request_data["extra_body"]["prompt_cache_key"],
+            "thread-compaction-failing-cache",
+        )
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0]["type"],
+            "compaction_summary",
+        )
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0]["encrypted_content"],
+            "opaque-encrypted-summary",
+        )
 
     async def test_codex_compaction_recovery_restores_model_from_metadata(self) -> None:
         hooks, proxy_server = load_hook_module()

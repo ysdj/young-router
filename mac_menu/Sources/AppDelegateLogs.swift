@@ -374,11 +374,15 @@ extension AppDelegate {
         return "\(name)-\(stamp).\(ext)"
     }
 
-    func showAlert(title: String, message: String) {
+    func showAlert(
+        title: String,
+        message: String,
+        style: NSAlert.Style = .warning
+    ) {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = shortAlertMessage(message)
-        alert.alertStyle = .warning
+        alert.alertStyle = style
         alert.runModal()
     }
 }

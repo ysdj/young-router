@@ -1197,6 +1197,24 @@ def _response_item_is_web_search_call(item: Any) -> bool:
     return _responses_web_search_bridge_module._is_litellm_web_search_call_item(json_item)
 
 
+def _response_item_has_encrypted_codex_compaction(item: Any) -> bool:
+    """Recognize both canonical and server-reference compaction item names."""
+    json_item = _jsonable(item)
+    if not isinstance(json_item, dict):
+        return False
+    item_type = _responses_web_search_bridge_module._response_item_get(
+        json_item,
+        "type",
+    )
+    if item_type not in {"compaction", "compaction_summary"}:
+        return False
+    encrypted_content = _responses_web_search_bridge_module._response_item_get(
+        json_item,
+        "encrypted_content",
+    )
+    return isinstance(encrypted_content, str) and bool(encrypted_content)
+
+
 def _response_item_has_assistant_text(item: Any) -> bool:
     json_item = _jsonable(item)
     if not isinstance(json_item, dict):
@@ -1229,6 +1247,8 @@ def _responses_completed_chunk_has_route_recovery_output(chunk: Any) -> bool:
         return _stream_chunk_has_visible_output(dumped)
     output = response.get("output")
     if isinstance(output, list) and output:
+        if any(_response_item_has_encrypted_codex_compaction(item) for item in output):
+            return True
         if any(_response_item_has_assistant_text(item) for item in output):
             return True
         if all(_response_item_is_web_search_call(item) for item in output):
@@ -2426,6 +2446,61 @@ def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     )
 
 
+def _without_failed_codex_compaction_prompt_cache_key(
+    request_data: Optional[dict],
+    exception: Exception,
+) -> Optional[dict]:
+    """Retry a temporary v2 compaction failure without upstream prompt caching.
+
+    Some Responses-compatible upstreams accept ``prompt_cache_key`` on ordinary
+    turns but emit ``response.failed`` when the same field is present beside a
+    ``compaction_trigger``.  Preserve the native Codex request on its first
+    attempt, then remove only the cache hint during shared route recovery.  The
+    compaction history and complete Responses Lite tool catalog stay untouched.
+    """
+    if not _image_generation_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        return None
+
+    exception_summary = _routing_module._trace_exception(exception)
+    reason = exception_summary.get("reason")
+    if not (
+        reason in {"upstream-temporary-class", "upstream-temporary-text"}
+        or (isinstance(reason, str) and reason.startswith("upstream-status-5"))
+    ):
+        return None
+
+    assert isinstance(request_data, dict)
+    modified_request = request_data.copy()
+    removed_locations: list[str] = []
+    if "prompt_cache_key" in modified_request:
+        modified_request.pop("prompt_cache_key", None)
+        removed_locations.append("prompt_cache_key")
+
+    extra_body = modified_request.get("extra_body")
+    if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
+        updated_extra_body = extra_body.copy()
+        updated_extra_body.pop("prompt_cache_key", None)
+        modified_request["extra_body"] = updated_extra_body
+        removed_locations.append("extra_body.prompt_cache_key")
+
+    if not removed_locations:
+        return None
+
+    _trace_module._route_trace(
+        "codex_compaction_prompt_cache_key_removed",
+        request_id=_routing_module._trace_request_id(request_data),
+        session=_routing_module._trace_session_context(request_data),
+        model_group=_responses_execution_module._request_model_group(request_data),
+        deployment_id=_routing_module._deployment_id_from_request(request_data),
+        route_key=_routing_module._deployment_route_key_from_request(request_data),
+        removed_locations=removed_locations,
+        exception=exception_summary,
+    )
+    return modified_request
+
+
 def _external_web_search_exception_has_recovery_request(
     exception: Exception,
 ) -> bool:
@@ -2785,6 +2860,14 @@ async def _stream_route_recovery_poll(
                     exception=_routing_module._trace_exception(last_exception),
                 )
                 break
+            cacheless_compaction_request = (
+                _without_failed_codex_compaction_prompt_cache_key(
+                    request_data,
+                    last_exception,
+                )
+            )
+            if cacheless_compaction_request is not None:
+                request_data = cacheless_compaction_request
             now = time.monotonic()
             if attempt > 0 and max_poll_seconds > 0 and now >= deadline:
                 _trace_module._route_trace(
@@ -3408,22 +3491,7 @@ def _codex_compaction_done_item_completed_compat(
 
     completed_output_items = completion_state.output_by_index
     has_encrypted_compaction = any(
-        isinstance(item, dict)
-        and _responses_web_search_bridge_module._response_item_get(item, "type")
-        == "compaction"
-        and isinstance(
-            _responses_web_search_bridge_module._response_item_get(
-                item,
-                "encrypted_content",
-            ),
-            str,
-        )
-        and bool(
-            _responses_web_search_bridge_module._response_item_get(
-                item,
-                "encrypted_content",
-            )
-        )
+        _response_item_has_encrypted_codex_compaction(item)
         for item in completed_output_items.values()
     )
     if not has_encrypted_compaction:

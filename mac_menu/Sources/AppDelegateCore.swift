@@ -109,8 +109,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        let sourceURL = URL(fileURLWithPath: #filePath)
-        return sourceURL.deletingLastPathComponent().deletingLastPathComponent().path
+        let environment = ProcessInfo.processInfo.environment
+        if let override = environment["LITELLM_TEMPLATE_ROOT"], !override.isEmpty {
+            return (override as NSString).expandingTildeInPath
+        }
+        return FileManager.default.currentDirectoryPath
     }
 
     static func runtimeRoot() -> String {

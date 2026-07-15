@@ -551,7 +551,7 @@ start_server() {
     print_native_health_failure "Timed out waiting for old native LiteLLM listener to stop."
     exit 1
   fi
-  clear_transient_routing_state || exit 1
+  clear_transient_routing_state || return 1
   write_state starting
   start_service_process "$owner_pid"
 
@@ -580,17 +580,17 @@ stop_server() {
 restart_server() {
   local owner_pid
   owner_pid="$(require_menu_app_owner "restart")" || return $?
-  ensure_native_environment || exit 1
-  sync_runtime_config || exit 1
+  ensure_native_environment || return 1
+  sync_runtime_config || return 1
   write_state starting
   bootout_launch_agent
   request_native_processes_to_stop >/dev/null 2>&1 || true
   if ! wait_for_native_port_released 5; then
     write_state unhealthy
     print_native_health_failure "Timed out waiting for old native LiteLLM listener to stop."
-    exit 1
+    return 1
   fi
-  clear_transient_routing_state || exit 1
+  clear_transient_routing_state || return 1
   start_service_process "$owner_pid"
 
   if wait_for_managed_health && wait_for_runtime_config; then
@@ -602,7 +602,7 @@ restart_server() {
 
   write_state unhealthy
   print_native_health_failure "Timed out waiting for native LiteLLM."
-  exit 1
+  return 1
 }
 
 reload_server() {

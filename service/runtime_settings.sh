@@ -3,6 +3,7 @@ service_action_requires_isolated_target() {
   case "$1" in
     bootstrap|config-editor-bootstrap|\
     start|run-native|stop|reload|restart|hard-restart|apply-config|\
+    runtime-settings-apply|runtime-settings-save|\
     autostart-enable|autostart-disable|autostart-status|\
     config-watch-enable|config-watch-ensure|config-watch-disable)
       return 0
@@ -353,6 +354,9 @@ import os
 import pathlib
 import re
 
+RETAIN_EXISTING_VALUE = "__LITELLM_MENU_RETAIN_EXISTING__"
+SECRET_KEYS = {"LITELLM_MENU_VISION_BRIDGE_API_KEY"}
+
 SPECS = [
     {"key": "LITELLM_MENU_REQUEST_TIMEOUT_SECONDS", "category": "Timeouts", "label": "Request timeout", "unit": "seconds", "kind": "float", "default": "7200", "minimum": 0, "maximum": 7200, "help": "Overall timeout for upstream model requests, continuation synthesis, and each recovery probe. 0 disables the local request cap."},
     {"key": "LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS", "category": "Timeouts", "label": "First-event timeout", "unit": "seconds", "kind": "float", "default": "120", "minimum": 0, "maximum": 3600, "help": "Maximum wait for the first upstream stream event on ordinary requests. 0 falls back to Request timeout."},
@@ -375,7 +379,7 @@ SPECS = [
     {"key": "LITELLM_MENU_VISION_BRIDGE_BACKEND", "category": "Vision Bridge", "label": "Backend", "kind": "enum", "default": "auto", "options": ["auto", "local", "api", "off"], "help": "Auto tries the configured OpenAI-compatible endpoint first, then falls back to bundled local Vision OCR. Local skips any external vision endpoint. API requires a reachable OpenAI-compatible vision service. Off disables image-to-text fallback."},
     {"key": "LITELLM_MENU_VISION_BRIDGE_API_BASE", "category": "Vision Bridge", "label": "API base", "kind": "string", "default": "http://127.0.0.1:11434/v1", "help": "OpenAI-compatible local vision endpoint, such as Ollama /v1 or another local APIURL bridge."},
     {"key": "LITELLM_MENU_VISION_BRIDGE_MODEL", "category": "Vision Bridge", "label": "Model", "kind": "string", "default": "qwen2.5vl:3b", "help": "Vision model used only to convert images into text before retrying the original route."},
-    {"key": "LITELLM_MENU_VISION_BRIDGE_API_KEY", "category": "Vision Bridge", "label": "API key", "kind": "string", "default": "", "help": "Optional bearer token for the vision bridge endpoint. Leave empty for local Ollama."},
+    {"key": "LITELLM_MENU_VISION_BRIDGE_API_KEY", "category": "Vision Bridge", "label": "API key", "kind": "string", "default": "", "secret": True, "retain_existing": "__LITELLM_MENU_RETAIN_EXISTING__", "help": "Optional bearer token for the vision bridge endpoint. Leave unchanged to retain the saved token, or clear it to remove the token."},
     {"key": "LITELLM_MENU_VISION_BRIDGE_TIMEOUT_SECONDS", "category": "Vision Bridge", "label": "Timeout", "unit": "seconds", "kind": "float", "default": "45", "minimum": 1, "maximum": 600, "help": "Timeout for each local image-to-text bridge call."},
     {"key": "LITELLM_MENU_VISION_BRIDGE_LOCAL_FORMAT", "category": "Vision Bridge", "label": "Local format", "kind": "enum", "default": "compact", "options": ["compact", "detailed"], "help": "Compact keeps local fallback summaries shorter to save tokens. Detailed includes the fuller region and element breakdown."},
     {"key": "LITELLM_MENU_VISION_BRIDGE_PROMPT", "category": "Vision Bridge", "label": "Prompt", "kind": "string", "default": "Describe the image accurately for a text-only language model. Include visible text, UI elements, layout, objects, and any important details.", "help": "Instruction sent to the local vision model when converting an image into text."},
@@ -421,7 +425,7 @@ def read_configured(path: pathlib.Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if key in allowed and value:
+        if key in allowed and value and value != RETAIN_EXISTING_VALUE:
             values[key] = value
     return values
 
@@ -507,7 +511,10 @@ settings = []
 for spec in SPECS:
     item = dict(spec)
     env_key = spec["key"]
-    if spec["kind"] == "mb":
+    if env_key in SECRET_KEYS:
+        effective_secret = str(os.environ.get(env_key, "")).strip()
+        value = RETAIN_EXISTING_VALUE if effective_secret else ""
+    elif spec["kind"] == "mb":
         value = os.environ.get(env_key, str(10 * 1024 * 1024))
         value = bytes_to_mb_text(value)
     elif spec["kind"] == "bool":

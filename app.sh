@@ -133,6 +133,9 @@ wait_for_service_running() {
 }
 
 needs_build() {
+  if [[ ! -f "$ROOT/mac_menu/build.sh" || ! -d "$ROOT/mac_menu/Sources" ]]; then
+    return 1
+  fi
   if [[ ! -x "$BIN" \
     || "$ROOT/mac_menu/Info.plist" -nt "$INFO" \
     || "$ROOT/VERSION" -nt "$INFO" \

@@ -125,10 +125,17 @@ class RouteRecoveryReportTests(unittest.TestCase):
                 json.dumps(
                     {
                         "cooldowns": {
-                            "id:route:responses": {
+                            "id:route|surface:openai/responses": {
                                 "deployment_id": "route",
-                                "route_key": "id:route:responses",
+                                "route_key": (
+                                    "model=default-chat / provider=example / "
+                                    "upstream=chat-model / host=api.example.test / order=1"
+                                ),
+                                "model_group": "default-chat",
                                 "provider": "example",
+                                "upstream_model": "chat-model",
+                                "api_base_host": "api.example.test",
+                                "last_failure_at": time.time() - 5,
                                 "failures": 2,
                                 "cooldown_until": until,
                             }
@@ -146,12 +153,53 @@ class RouteRecoveryReportTests(unittest.TestCase):
             )
 
             self.assertIn("data-countdown-until=", html)
+            self.assertIn(
+                "querySelectorAll('.countdown-badge[data-countdown-until]')",
+                html,
+            )
+            self.assertNotIn(
+                'class="request-card cooldown-card" data-countdown-until=',
+                html,
+            )
             self.assertIn("countdown-badge", html)
             self.assertIn("tickCountdowns", html)
             self.assertIn("data-generated-at=", html)
             self.assertIn("2m ", html)
-            self.assertIn("ends at", html)
-            self.assertIn("Deployment Cooldowns", html)
+            self.assertIn("Routing resumes in", html)
+            self.assertIn("Temporarily Paused Routes", html)
+            self.assertIn("OpenAI Responses", html)
+            self.assertIn("Only OpenAI Responses on this deployment is paused", html)
+            self.assertIn("2 consecutive upstream failures", html)
+            self.assertIn("Show technical details", html)
+            self.assertIn("default-chat", html)
+            self.assertIn("chat-model", html)
+            self.assertNotIn("cooldown threads", html)
+
+    def test_cooldown_card_falls_back_to_route_key_metadata(self) -> None:
+        report = load_report_module()
+        now = time.time()
+        html = report.cooldown_card(
+            {
+                "cooldown_key": "id:backup|surface:openai/chat",
+                "deployment_id": "backup",
+                "route_key": (
+                    "model=fast-chat / provider=example / upstream=fast-model / "
+                    "host=api.example.test / order=2"
+                ),
+                "failures": 3,
+                "last_failure_at": now - 10,
+                "cooldown_until": now + 40,
+                "remaining_seconds": 40,
+            },
+            index=1,
+        )
+
+        self.assertIn("fast-chat", html)
+        self.assertIn("example", html)
+        self.assertIn("fast-model", html)
+        self.assertIn("OpenAI Chat Completions", html)
+        self.assertIn("3 consecutive upstream failures", html)
+        self.assertIn("api.example.test", html)
 
 
 if __name__ == "__main__":

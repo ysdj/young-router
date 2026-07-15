@@ -1,20 +1,19 @@
 class LitellmMenu < Formula
   desc "macOS menu bar app for running a local LiteLLM service"
   homepage "https://github.com/ysdj/litellm-menu"
-  url "https://github.com/ysdj/litellm-menu.git", tag: "v1.0.0"
-  version "1.0.0"
+  url "https://github.com/ysdj/litellm-menu/releases/download/v1.0.1/litellm-menu-1.0.1-macos-arm64.tar.zst"
+  version "1.0.1"
+  sha256 "21e3d7ffe3a47c4ad9007770369f715f2de5a6246e61b4d501b61dc64e2e71ed"
   license "MIT"
   head "https://github.com/ysdj/litellm-menu.git", branch: "main"
 
+  depends_on arch: :arm64
   depends_on :macos
-  depends_on "uv"
 
   def install
-    app = libexec/"LiteLLM Menu.app"
-    ENV["LITELLM_APP_PATH"] = app.to_s
-    ENV["LITELLM_UV_BIN"] = (Formula["uv"].opt_bin/"uv").to_s
-    system "./mac_menu/build.sh"
+    libexec.install "LiteLLM Menu.app"
 
+    app = libexec/"LiteLLM Menu.app"
     app_resources = app/"Contents/Resources/App"
     (bin/"litellm-menu").write <<~SH
       #!/bin/bash
@@ -40,9 +39,8 @@ class LitellmMenu < Formula
       Start the menu app with:
         litellm-menu open
 
-      LiteLLM Menu does not require macOS to provide Python. The formula
-      installs uv, and the app uses uv on first launch to create its private
-      Python runtime under ~/.litellm-menu.
+      The Homebrew package includes its Python runtime and LiteLLM dependencies.
+      First launch starts the local service without downloading or compiling them.
 
       Restart after upgrades with:
         litellm-menu restart
@@ -56,5 +54,7 @@ class LitellmMenu < Formula
     assert_match version.to_s, shell_output("#{bin}/litellm-menu version")
     assert_path_exists libexec/"LiteLLM Menu.app/Contents/MacOS/LiteLLMMenu"
     assert_path_exists libexec/"LiteLLM Menu.app/Contents/Resources/App/service.sh"
+    assert_path_exists libexec/"LiteLLM Menu.app/Contents/Resources/App/runtime/bin/python"
+    assert_path_exists libexec/"LiteLLM Menu.app/Contents/Resources/App/runtime/bin/litellm"
   end
 end

@@ -43,7 +43,8 @@ extension AppDelegate {
             guard let self else { return }
             let action = self.readAutoStartState() == .enabled ? "autostart-disable" : "autostart-enable"
             let result = self.control(action)
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
                 self.setBusy(false, title: "Status: Checking")
                 self.updateStatus()
                 if result.0 != 0 {
@@ -60,7 +61,8 @@ extension AppDelegate {
             guard let self else { return }
             let action = self.isRouteTraceEnabled() ? "route-trace-disable" : "route-trace-enable"
             let result = self.control(action)
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
                 self.setBusy(false, title: "Status: Checking")
                 self.updateStatus()
                 if result.0 != 0 {
@@ -76,7 +78,8 @@ extension AppDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let result = self.control(action)
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
                 self.setBusy(false, title: "Status: Checking")
                 self.updateStatus()
                 self.showAlert(
@@ -407,7 +410,8 @@ extension AppDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let result = self.control("runtime-settings", logCommand: false)
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
                 self.setBusy(false, title: "Status: Checking")
                 self.updateStatus()
                 guard result.0 == 0, let data = result.1.data(using: .utf8) else {
@@ -420,9 +424,22 @@ extension AppDelegate {
                         self.showAlert(title: "Runtime settings unavailable", message: "No editable runtime settings were returned.")
                         return
                     }
-                    let dialog = RuntimeSettingsDialogController(settings: payload.settings)
-                    guard let values = dialog.runModal() else { return }
-                    self.saveRuntimeSettings(values)
+                    let serviceRunning = self.readServiceState().isRunning
+                    let dialog = RuntimeSettingsDialogController(
+                        settings: payload.settings,
+                        serviceRunning: serviceRunning
+                    ) { [weak self] values, completion in
+                        guard let self else {
+                            completion(false, "LiteLLM Menu is no longer available.")
+                            return
+                        }
+                        self.saveRuntimeSettings(
+                            values,
+                            restartService: serviceRunning,
+                            completion: completion
+                        )
+                    }
+                    _ = dialog.runModal()
                 } catch {
                     self.showAlert(title: "Runtime settings unavailable", message: String(describing: error))
                 }
@@ -439,44 +456,30 @@ extension AppDelegate {
         return input
     }
 
-    func saveRuntimeSettings(_ values: [String: String]) {
+    func saveRuntimeSettings(
+        _ values: [String: String],
+        restartService: Bool,
+        completion: @escaping (_ succeeded: Bool, _ message: String) -> Void
+    ) {
         do {
             let input = try runtimeSettingsInput(values)
             setBusy(true, title: "Status: Saving runtime settings")
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
-                let configureResult = self.control(arguments: ["runtime-settings-configure"], input: input + "\n")
-                var finalExit = configureResult.0
-                var outputs = [configureResult.1]
+                let action = restartService ? "runtime-settings-apply" : "runtime-settings-save"
+                let result = self.control(arguments: [action], input: input + "\n")
+                let succeeded = result.0 == 0
+                let message = result.1.trimmingCharacters(in: .whitespacesAndNewlines)
 
-                if configureResult.0 == 0 {
-                    let watchResult = self.control("config-watch-ensure", logCommand: false)
-                    outputs.append(watchResult.1)
-                    let restartResult = self.control("restart")
-                    outputs.append(restartResult.1)
-                    if restartResult.0 != 0 {
-                        finalExit = restartResult.0
-                    } else if watchResult.0 != 0 {
-                        finalExit = watchResult.0
-                    }
-                }
-
-                let output = outputs
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                    .joined(separator: "\n")
-
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
                     self.setBusy(false, title: "Status: Checking")
                     self.updateStatus()
-                    self.showAlert(
-                        title: finalExit == 0 ? "Runtime settings saved" : "Runtime settings failed",
-                        message: output
-                    )
+                    completion(succeeded, message)
                 }
             }
         } catch {
-            showAlert(title: "Runtime settings failed", message: String(describing: error))
+            completion(false, String(describing: error))
         }
     }
 

@@ -33,23 +33,22 @@ func isValidTCPPortText(_ value: String) -> Bool {
 
 func localServicePort(runtimeRoot: String, environment: [String: String]) -> String {
     let defaultPort = "4000"
-    if let rawValue = environment["LITELLM_PORT"] {
-        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isValidTCPPortText(value) {
-            return value
+    let settingsPath = "\(runtimeRoot)/runtime-settings.env"
+    if let text = try? String(contentsOfFile: settingsPath, encoding: .utf8) {
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("LITELLM_PORT=") else { continue }
+            let value = line.dropFirst("LITELLM_PORT=".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if isValidTCPPortText(value) {
+                return value
+            }
         }
     }
 
-    let settingsPath = "\(runtimeRoot)/runtime-settings.env"
-    guard let text = try? String(contentsOfFile: settingsPath, encoding: .utf8) else {
-        return defaultPort
-    }
-    for rawLine in text.components(separatedBy: .newlines) {
-        let line = rawLine.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard line.hasPrefix("LITELLM_PORT=") else { continue }
-        let value = line.dropFirst("LITELLM_PORT=".count)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    if let rawValue = environment["LITELLM_PORT"] {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if isValidTCPPortText(value) {
             return value
         }
