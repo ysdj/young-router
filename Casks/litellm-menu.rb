@@ -1,6 +1,6 @@
 cask "litellm-menu" do
-  version "1.0.1,4"
-  sha256 "b54d70f3fda909d49cd1748338c85a43f6a1f002fc783e9f637f2d6eb170568a"
+  version "1.0.1,5"
+  sha256 "a77e651e3101aab988ce6726eefc05e03164718f2bf2f068694327d161796e65"
 
   url "https://github.com/ysdj/litellm-menu/releases/download/v#{version.csv.first}/litellm-menu-#{version.csv.first}-#{version.csv.second}-macos-arm64.tar.zst"
   name "LiteLLM Menu"

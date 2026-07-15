@@ -185,6 +185,94 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertEqual({}, saved["router_settings"])
         self.assertEqual(2, len(saved["model_list"]))
 
+    def test_deleting_provider_replaces_anchored_sections_without_intermediate_alias_failure(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              primary:
+                api_base: &primary_api_base "https://primary.example.test/v1"
+                api_keys:
+                  - name: default
+                    value: &primary_api_key "replace-primary"
+              backup:
+                api_base: &backup_api_base "https://backup.example.test/v1"
+                api_keys:
+                  - name: default
+                    value: &backup_api_key "replace-backup"
+            model_list:
+              - model_name: default-chat
+                litellm_params:
+                  model: openai/default-chat
+                  api_base: *primary_api_base
+                  api_key: *primary_api_key
+                model_info:
+                  id: "00000031"
+                  provider: primary
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+              - model_name: default-chat
+                litellm_params:
+                  model: openai/default-chat
+                  api_base: *backup_api_base
+                  api_key: *backup_api_key
+                model_info:
+                  id: "00000032"
+                  provider: backup
+                  upstream_url_surface: openai/chat
+                  supported_upstream_url_surfaces: [openai/chat]
+            litellm_settings:
+              public_model_groups: [default-chat]
+            router_settings: {}
+            """
+        )
+        payload = config_editor.load_config(path)
+        remaining = [
+            provider for provider in payload["providers"] if provider["name"] != "primary"
+        ]
+
+        result = config_editor.save_config(remaining, path, payload["revision"])
+        saved = config_editor._load_yaml(path)
+
+        self.assertEqual(1, result["providers"])
+        self.assertEqual({"backup"}, set(saved["providers"]))
+        self.assertEqual(["backup"], [row["model_info"]["provider"] for row in saved["model_list"]])
+        self.assertNotIn("primary_api_base", path.read_text(encoding="utf-8"))
+        self.assertEqual({}, saved["router_settings"])
+
+    def test_deleting_the_only_provider_writes_a_valid_empty_config(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              default:
+                api_base: "https://api.example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "replace-me"
+            model_list:
+              - model_name: default-chat
+                litellm_params:
+                  model: openai/chat-model
+                  api_base: "https://api.example.test/v1"
+                  api_key: "replace-me"
+                model_info:
+                  id: "00000033"
+                  provider: default
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+            litellm_settings:
+              public_model_groups: [default-chat]
+            """
+        )
+        payload = config_editor.load_config(path)
+
+        result = config_editor.save_config([], path, payload["revision"])
+        saved = config_editor._load_yaml(path)
+
+        self.assertEqual(0, result["providers"])
+        self.assertEqual({}, saved["providers"])
+        self.assertEqual([], saved["model_list"])
+        self.assertEqual([], saved["litellm_settings"]["public_model_groups"])
+
     def test_save_drops_legacy_supports_vision_model_info(self) -> None:
         path = self.write_config(
             """
@@ -864,28 +952,13 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertNotIn("supported_upstream_api_modes", text)
         self.assertGreater(len(config_editor.load_config(example)["providers"]), 0)
 
-    def test_example_config_prefers_image_provider_for_image_model(self) -> None:
+    def test_example_config_starts_with_one_deletable_provider(self) -> None:
         example = ROOT / "config.example.yaml"
         payload = config_editor.load_config(example)
-        routes = [
-            model
-            for provider in payload["providers"]
-            for model in provider["models"]
-            if model["model_name"] == "image-model"
-        ]
 
-        ordered = sorted(routes, key=lambda model: int(model["order"] or 9999))
-
-        self.assertGreaterEqual(len(ordered), 2)
-        self.assertEqual("image", ordered[0]["provider"])
-        self.assertEqual("default", ordered[0]["api_key_name"])
-        self.assertEqual("1", ordered[0]["order"])
-        self.assertFalse(ordered[0]["supports_responses_image_generation_tool"])
-        self.assertFalse(ordered[0]["supports_responses_image_generation_tool_present"])
-        self.assertNotIn(
-            ("backup_provider", "1"),
-            {(route["provider"], route["order"]) for route in routes},
-        )
+        self.assertEqual(["default"], [provider["name"] for provider in payload["providers"]])
+        self.assertEqual(1, len(payload["providers"][0]["models"]))
+        self.assertEqual("default-chat", payload["providers"][0]["models"][0]["model_name"])
 
     def test_save_rejects_stale_editor_revision(self) -> None:
         path = self.write_config(

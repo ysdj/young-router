@@ -1,109 +1,25 @@
 providers:
-  primary: &primary
-    api_base: &primary_api_base https://api.primary.example/v1
+  default: &default
+    api_base: &default_api_base https://api.example.test/v1
     api_keys:
       - name: default
-        value: &primary_api_key "sk-primary-replace-me"
-  backup: &backup
-    api_base: &backup_api_base https://api.backup.example/v1
-    api_keys:
-      - name: default
-        value: &backup_api_key "sk-backup-replace-me"
-  image: &image
-    api_base: &image_api_base https://api.image.example/v1
-    api_keys:
-      - name: default
-        value: &image_api_key "sk-image-replace-me"
+        value: &default_api_key "replace-me"
 
 model_list:
   - model_name: default-chat
     litellm_params:
       model: openai/chat-model
-      api_base: *primary_api_base
-      api_key: *primary_api_key
+      api_base: *default_api_base
+      api_key: *default_api_key
       order: 1
     model_info:
       id: a1b2c3d4
-      provider: primary
-      route_key: primary / openai/chat-model / key=default / order=1
+      provider: default
+      route_key: model=default-chat / provider=default / upstream=openai/chat-model / host=api.example.test / key=default / order=1
       api_key_name: default
       upstream_url_surface: openai/responses
       supported_upstream_url_surfaces: [openai/responses]
       supports_responses_image_generation_tool: false
-
-  - model_name: default-chat
-    litellm_params:
-      model: openai/chat-model
-      api_base: *backup_api_base
-      api_key: *backup_api_key
-      order: 2
-    model_info:
-      id: b1c2d3e4
-      provider: backup
-      route_key: backup / openai/chat-model / key=default / order=2
-      api_key_name: default
-      upstream_url_surface: openai/responses
-      supported_upstream_url_surfaces: [openai/responses]
-      supports_responses_image_generation_tool: false
-
-  - model_name: fast-chat
-    litellm_params:
-      model: openai/fast-chat-model
-      api_base: *backup_api_base
-      api_key: *backup_api_key
-      order: 1
-    model_info:
-      id: c1d2e3f4
-      provider: backup
-      route_key: backup / openai/fast-chat-model / key=default / order=1
-      api_key_name: default
-      upstream_url_surface: openai/responses
-      supported_upstream_url_surfaces: [openai/responses]
-
-  - model_name: image-chat
-    litellm_params:
-      model: openai/chat-model-with-image-tool
-      api_base: *image_api_base
-      api_key: *image_api_key
-      order: 1
-    model_info:
-      id: d1e2f3a4
-      provider: image
-      route_key: image / openai/chat-model-with-image-tool / key=default / order=1
-      api_key_name: default
-      upstream_url_surface: openai/responses
-      supported_upstream_url_surfaces: [openai/responses]
-      supports_responses_image_generation_tool: true
-
-  - model_name: image-model
-    litellm_params:
-      model: openai/image-generation-model
-      api_base: *image_api_base
-      api_key: *image_api_key
-      order: 1
-    model_info:
-      id: e1f2a3b4
-      provider: image
-      route_key: image / openai/image-generation-model / key=default / order=1
-      api_key_name: default
-      mode: image_generation
-      upstream_url_surface: openai/responses
-      supported_upstream_url_surfaces: [openai/responses]
-
-  - model_name: image-model
-    litellm_params:
-      model: openai/image-generation-model-compatible
-      api_base: *backup_api_base
-      api_key: *backup_api_key
-      order: 2
-    model_info:
-      id: f1a2b3c4
-      provider: backup
-      route_key: backup / openai/image-generation-model-compatible / key=default / order=2
-      api_key_name: default
-      mode: image_generation
-      upstream_url_surface: openai/responses
-      supported_upstream_url_surfaces: [openai/responses]
 
 litellm_settings:
   drop_params: true
@@ -111,9 +27,6 @@ litellm_settings:
     - litellm_menu.callbacks.image_generation_routing_hook
   public_model_groups:
     - default-chat
-    - fast-chat
-    - image-chat
-    - image-model
 
 general_settings:
   master_key: sk-local-litellm

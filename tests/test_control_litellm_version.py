@@ -165,6 +165,7 @@ class ControlLiteLLMVersionTests(unittest.TestCase):
         self.assertIn("LITELLM_RELEASE_RUNTIME_SOURCE", package_script)
         self.assertIn("$VERSION-$BUILD_NUMBER-macos-$ARCH.tar.zst", package_script)
         self.assertIn('"$APP_RES/config_editor.py" --config "$CONFIG_EDITOR_RUNTIME/config.yaml" load', package_script)
+        self.assertIn("assert result[\"providers\"] == 0", package_script)
 
     def test_config_editor_prefers_the_bundled_release_runtime(self) -> None:
         source = (ROOT / "mac_menu" / "Sources" / "ModelConfigEditorPersistence.swift").read_text(

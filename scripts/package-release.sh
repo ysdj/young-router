@@ -140,6 +140,20 @@ mkdir -p "$CONFIG_EDITOR_RUNTIME"
 cp "$APP_RES/config.example.yaml" "$CONFIG_EDITOR_RUNTIME/config.yaml"
 PYTHONDONTWRITEBYTECODE=1 "$RUNTIME/bin/python" \
   "$APP_RES/config_editor.py" --config "$CONFIG_EDITOR_RUNTIME/config.yaml" load >/dev/null
+PYTHONPATH="$APP_RES" PYTHONDONTWRITEBYTECODE=1 "$RUNTIME/bin/python" \
+  - "$CONFIG_EDITOR_RUNTIME/config.yaml" <<'PY'
+import pathlib
+import sys
+
+from config_editor_core.api import save_config
+from config_editor_core.load import load_config
+
+path = pathlib.Path(sys.argv[1])
+payload = load_config(path)
+result = save_config([], path, payload["revision"])
+assert result["providers"] == 0
+assert load_config(path)["providers"] == []
+PY
 
 SMOKE_PORT="$("$RUNTIME/bin/python" - <<'PY'
 import socket

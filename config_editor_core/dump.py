@@ -193,6 +193,8 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
                 lines.append(f"        value: {_anchor_scalar(item['value'], _provider_key_anchor(name, item['name']))}")
         for key, value in _as_dict(provider.get("extra")).items():
             lines.append(f"    {key}: {_plain_scalar(value)}")
+    if len(lines) == 1:
+        return "providers: {}\n"
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -389,6 +391,38 @@ def _replace_top_level_section(text: str, key: str, block: str) -> str:
     prefix = f"{before}\n\n" if before else ""
     suffix = f"\n{after}" if after else ""
     return f"{prefix}{block.rstrip()}\n{suffix}"
+
+
+def _replace_top_level_sections(text: str, blocks: dict[str, str]) -> str:
+    document = yaml.compose(text)
+    if not isinstance(document, yaml.nodes.MappingNode):
+        raise ValueError("config.yaml must be a YAML mapping")
+
+    entries = document.value
+    sections: dict[str, tuple[int, int]] = {}
+    for index, (key_node, _value_node) in enumerate(entries):
+        if not isinstance(key_node, yaml.nodes.ScalarNode):
+            continue
+        end = (
+            entries[index + 1][0].start_mark.index
+            if index + 1 < len(entries)
+            else len(text)
+        )
+        sections[key_node.value] = (key_node.start_mark.index, end)
+
+    updated = text
+    replacements = [
+        (sections[key][0], sections[key][1], block.rstrip() + "\n")
+        for key, block in blocks.items()
+        if key in sections
+    ]
+    for start, end, block in sorted(replacements, reverse=True):
+        updated = updated[:start] + block + updated[end:]
+
+    missing = [block.rstrip() for key, block in blocks.items() if key not in sections]
+    if missing:
+        updated = updated.rstrip() + "\n\n" + "\n\n".join(missing) + "\n"
+    return updated
 
 
 def _unique_model_groups(active_entries: list[dict[str, Any]], existing_groups: list[Any] | None = None) -> list[str]:

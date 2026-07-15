@@ -67,14 +67,15 @@ def save_config(
     original = path.read_text(encoding="utf-8")
     original_data = _load_yaml(path)
     existing_groups = _as_list(_as_dict(original_data.get("litellm_settings")).get("public_model_groups"))
-    next_text = _replace_top_level_section(original, "providers", _dump_providers_section(providers))
-    next_text = _replace_top_level_section(next_text, "model_list", _dump_model_list_section("model_list", active_entries))
     settings = dict(_as_dict(original_data.get("litellm_settings")))
     settings["public_model_groups"] = _unique_model_groups(active_entries, existing_groups)
-    next_text = _replace_top_level_section(
-        next_text,
-        "litellm_settings",
-        _dump_section("litellm_settings", settings),
+    next_text = _replace_top_level_sections(
+        original,
+        {
+            "providers": _dump_providers_section(providers),
+            "model_list": _dump_model_list_section("model_list", active_entries),
+            "litellm_settings": _dump_section("litellm_settings", settings),
+        },
     )
 
     parsed = yaml.safe_load(next_text)
