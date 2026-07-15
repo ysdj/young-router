@@ -105,5 +105,5 @@ This document keeps lower-frequency operational notes out of `AGENTS.md`. Read t
 
 - Keep public docs promotional and user-facing. Avoid internal debug language, private model names, request ids, local paths, or domain-specific examples.
 - `config.example.yaml` should remain fully sanitized and runnable as a structure template.
-- Before a public release, run tests, build the app bundle, validate the formula syntax, parse the example config, and run a sensitive-string scan.
+- Before a public release, run tests, build the app bundle, validate the Cask syntax, parse the example config, and run a sensitive-string scan.
 - If the repository is being prepared as a first public release, reset git history only after docs, examples, tests, and scans are clean.

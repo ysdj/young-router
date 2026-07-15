@@ -21,7 +21,7 @@ class VersionPaths:
     version_file: Path
     build_file: Path
     info_plist: Path
-    formula_file: Path
+    cask_file: Path
 
     @classmethod
     def for_root(cls, root: Path) -> "VersionPaths":
@@ -31,7 +31,7 @@ class VersionPaths:
             version_file=root / "VERSION",
             build_file=root / "BUILD_NUMBER",
             info_plist=root / "mac_menu" / "Info.plist",
-            formula_file=root / "Formula" / "litellm-menu.rb",
+            cask_file=root / "Casks" / "litellm-menu.rb",
         )
 
 
@@ -112,43 +112,28 @@ def sync_info_plist(paths: VersionPaths, plist_path: Path | None = None) -> bool
     return changed
 
 
-def sync_formula(paths: VersionPaths) -> bool:
-    if not paths.formula_file.exists():
+def sync_cask(paths: VersionPaths) -> bool:
+    if not paths.cask_file.exists():
         return False
     version = format_version(read_version(paths))
-    text = paths.formula_file.read_text(encoding="utf-8")
-    updated = re.sub(
-        r'(^\s*url\s+"[^"]+",\s*tag:\s*")([^"]+)(")',
-        rf"\g<1>v{version}\3",
-        text,
-        count=1,
-        flags=re.MULTILINE,
-    )
-    updated = re.sub(
-        r'(releases/download/v)(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
-        r'(/litellm-menu-)(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)'
-        r'(-macos-[^"]+)',
-        rf"\g<1>{version}\g<2>{version}\g<3>",
-        updated,
-        count=1,
-    )
+    text = paths.cask_file.read_text(encoding="utf-8")
     updated = re.sub(
         r'(^\s*version\s+")([^"]+)(")',
         rf"\g<1>{version}\3",
-        updated,
+        text,
         count=1,
         flags=re.MULTILINE,
     )
     if updated == text:
         return False
-    paths.formula_file.write_text(updated, encoding="utf-8")
+    paths.cask_file.write_text(updated, encoding="utf-8")
     return True
 
 
 def sync_metadata(paths: VersionPaths, plist_path: Path | None = None) -> bool:
     changed = sync_info_plist(paths, plist_path=plist_path)
     if plist_path is None or plist_path == paths.info_plist:
-        changed = sync_formula(paths) or changed
+        changed = sync_cask(paths) or changed
     return changed
 
 
@@ -170,8 +155,8 @@ def stage_version_files(paths: VersionPaths) -> None:
         paths.build_file.relative_to(paths.root),
         paths.info_plist.relative_to(paths.root),
     ]
-    if paths.formula_file.exists():
-        files.append(paths.formula_file.relative_to(paths.root))
+    if paths.cask_file.exists():
+        files.append(paths.cask_file.relative_to(paths.root))
     subprocess.run(["git", "add", "--", *map(str, files)], cwd=paths.root, check=True)
 
 

@@ -39,7 +39,7 @@ These instructions apply to the entire `litellm-menu` repository.
   skipped or fails, report the task as incomplete; do not say it was built,
   deployed, executed, or completed.
 
-- Keep `VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Formula/litellm-menu.rb` version handling in sync through `scripts/version.py` when version changes are requested.
+- Keep `VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Casks/litellm-menu.rb` version handling in sync through `scripts/version.py` when version changes are requested.
 
 ## Codex / Responses Completion Gate
 

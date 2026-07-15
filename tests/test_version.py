@@ -13,11 +13,11 @@ VERSION_SCRIPT = ROOT / "scripts" / "version.py"
 
 
 class VersionScriptTests(unittest.TestCase):
-    def test_bump_keeps_formula_tag_and_version_in_sync(self) -> None:
+    def test_bump_keeps_cask_version_in_sync(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "mac_menu").mkdir()
-            (root / "Formula").mkdir()
+            (root / "Casks").mkdir()
             (root / "VERSION").write_text("1.0.0\n", encoding="utf-8")
             (root / "BUILD_NUMBER").write_text("1\n", encoding="utf-8")
             with (root / "mac_menu" / "Info.plist").open("wb") as handle:
@@ -28,12 +28,12 @@ class VersionScriptTests(unittest.TestCase):
                     },
                     handle,
                 )
-            formula = root / "Formula" / "litellm-menu.rb"
-            formula.write_text(
-                'class LitellmMenu < Formula\n'
-                '  url "https://github.com/example/litellm-menu/releases/download/'
-                'v1.0.0/litellm-menu-1.0.0-macos-arm64.tar.zst"\n'
+            cask = root / "Casks" / "litellm-menu.rb"
+            cask.write_text(
+                'cask "litellm-menu" do\n'
                 '  version "1.0.0"\n'
+                '  url "https://github.com/example/litellm-menu/releases/download/'
+                'v#{version}/litellm-menu-#{version}-macos-arm64.tar.zst"\n'
                 'end\n',
                 encoding="utf-8",
             )
@@ -54,10 +54,9 @@ class VersionScriptTests(unittest.TestCase):
                 info = plistlib.load(handle)
             self.assertEqual(info["CFBundleShortVersionString"], "1.0.1")
             self.assertEqual(info["CFBundleVersion"], "2")
-            formula_text = formula.read_text(encoding="utf-8")
-            self.assertIn("releases/download/v1.0.1/", formula_text)
-            self.assertIn("litellm-menu-1.0.1-macos-arm64.tar.zst", formula_text)
-            self.assertIn('version "1.0.1"', formula_text)
+            cask_text = cask.read_text(encoding="utf-8")
+            self.assertIn('version "1.0.1"', cask_text)
+            self.assertIn("releases/download/v#{version}/", cask_text)
 
 
 if __name__ == "__main__":

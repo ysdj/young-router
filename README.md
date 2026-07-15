@@ -118,21 +118,24 @@ A launchd-backed config watcher monitors `config.yaml` for changes. On detection
 ### Requirements
 
 - macOS 13.0 or later
-- Apple silicon Mac for the prebuilt Homebrew package
+- Apple silicon Mac for the prebuilt Homebrew Cask
 - [uv](https://docs.astral.sh/uv/) only when building from source (or set `LITELLM_UV_BIN` to a custom path)
 
 ### Homebrew (Recommended)
 
+Add the tap once:
+
 ```bash
 brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu
-brew install ysdj/litellm-menu/litellm-menu
 ```
 
-After installation:
+Then install the app directly into `/Applications`:
 
 ```bash
-litellm-menu open
+brew install --cask litellm-menu
 ```
+
+Open **LiteLLM Menu** from Applications after installation. Future updates only need `brew upgrade --cask litellm-menu`.
 
 Homebrew downloads the prebuilt app and bundled runtime. Opening it starts the menu-owned service without a first-run dependency install.
 
@@ -226,15 +229,15 @@ The `app.sh` script provides app-level control:
 ./app.sh version   # Print app version
 ```
 
-The `service.sh` script provides direct service control (also available as `litellm-menu-service` after Homebrew install):
+The `service.sh` script provides direct service control for source checkouts:
 
 ```bash
-litellm-menu-service status
-litellm-menu-service start
-litellm-menu-service stop
-litellm-menu-service restart
-litellm-menu-service tail
-litellm-menu-service route-trace-html
+./service.sh status
+./service.sh start
+./service.sh stop
+./service.sh restart
+./service.sh tail
+./service.sh route-trace-html
 ```
 
 ---
@@ -265,7 +268,7 @@ For installed app behavior verification, the complete path is: build the app, re
 
 ### Version Management
 
-`VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Formula/litellm-menu.rb` are kept in sync through `scripts/version.py`.
+`VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Casks/litellm-menu.rb` are kept in sync through `scripts/version.py`.
 
 LiteLLM uses a two-stage version policy. Development explicitly advances `LITELLM_VERSION` to the latest stable PyPI release that provides a universal wheel with `./scripts/update-litellm.sh`; releases without a macOS-compatible binary are skipped so app startup never compiles LiteLLM from source. `./scripts/update-litellm.sh --check` fails when the compatible lock is stale. Built and released apps copy that lock and install exactly `litellm[proxy]==<locked version>`, so a release never changes SDK versions merely because a user starts or restarts the service later. After advancing the lock, rebuild, restart, and run the full test suite before release.
 
@@ -397,21 +400,24 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 ### 系统要求
 
 - macOS 13.0 或更高版本
-- 预构建 Homebrew 包目前要求 Apple silicon Mac
+- 预构建 Homebrew Cask 目前要求 Apple silicon Mac
 - 仅源码构建需要 [uv](https://docs.astral.sh/uv/)（也可设置 `LITELLM_UV_BIN` 指向自定义路径）
 
 ### Homebrew 安装（推荐）
 
+首次添加一次 tap：
+
 ```bash
 brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu
-brew install ysdj/litellm-menu/litellm-menu
 ```
 
-安装后：
+之后用短命令直接把应用安装到 `/Applications`：
 
 ```bash
-litellm-menu open
+brew install --cask litellm-menu
 ```
+
+安装后直接从“应用程序”打开 **LiteLLM Menu**。以后更新只需运行 `brew upgrade --cask litellm-menu`。
 
 Homebrew 会下载预构建应用及其内置运行时。打开后直接启动由菜单管理的服务，首次运行不会安装依赖。
 
@@ -505,15 +511,15 @@ LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
 ./app.sh version   # 输出应用版本
 ```
 
-`service.sh` 脚本提供直接服务控制（Homebrew 安装后也可通过 `litellm-menu-service` 使用）：
+`service.sh` 脚本为源码检出目录提供直接服务控制：
 
 ```bash
-litellm-menu-service status
-litellm-menu-service start
-litellm-menu-service stop
-litellm-menu-service restart
-litellm-menu-service tail
-litellm-menu-service route-trace-html
+./service.sh status
+./service.sh start
+./service.sh stop
+./service.sh restart
+./service.sh tail
+./service.sh route-trace-html
 ```
 
 ---
@@ -544,7 +550,7 @@ litellm-menu-service route-trace-html
 
 ### 版本管理
 
-`VERSION`、`BUILD_NUMBER`、`mac_menu/Info.plist` 和 `Formula/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
+`VERSION`、`BUILD_NUMBER`、`mac_menu/Info.plist` 和 `Casks/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
 
 LiteLLM 采用两阶段版本策略。开发时用 `./scripts/update-litellm.sh` 显式把 `LITELLM_VERSION` 推进到提供通用 wheel 的 PyPI 最新稳定版；缺少 macOS 兼容二进制包的版本会被跳过，避免应用启动时现场编译 LiteLLM。`./scripts/update-litellm.sh --check` 会在兼容版本锁落后时失败。构建和发布的应用会复制这个锁，并精确安装 `litellm[proxy]==<锁定版本>`，因此用户以后启动或重启服务时不会意外漂移 SDK 版本。更新版本锁后，发布前必须重新构建、重启并运行全套测试。
 
