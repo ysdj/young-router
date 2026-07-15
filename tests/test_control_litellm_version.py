@@ -164,6 +164,29 @@ class ControlLiteLLMVersionTests(unittest.TestCase):
         self.assertIn("runtime-requirements.txt", package_script)
         self.assertIn("LITELLM_RELEASE_RUNTIME_SOURCE", package_script)
         self.assertIn("$VERSION-$BUILD_NUMBER-macos-$ARCH.tar.zst", package_script)
+        self.assertIn('"$APP_RES/config_editor.py" --config "$CONFIG_EDITOR_RUNTIME/config.yaml" load', package_script)
+
+    def test_config_editor_prefers_the_bundled_release_runtime(self) -> None:
+        source = (ROOT / "mac_menu" / "Sources" / "ModelConfigEditorPersistence.swift").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('let bundledPython = "\\(bundleRoot)/runtime/bin/python"', source)
+        self.assertIn('let developmentPython = "\\(root)/.venv/bin/python"', source)
+        self.assertIn("FileManager.default.isExecutableFile(atPath: bundledPython)", source)
+        self.assertLess(source.index("let bundledPython"), source.index("let developmentPython"))
+
+    def test_status_item_has_a_stable_identity_and_clear_native_label(self) -> None:
+        source = (ROOT / "mac_menu" / "Sources" / "AppDelegateCore.swift").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('let statusItemAutosaveName = "menu.litellm.menu.status-item"', source)
+        self.assertIn("statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)", source)
+        self.assertIn("statusItem.autosaveName = statusItemAutosaveName", source)
+        self.assertIn('string: "LL"', source)
+        self.assertIn("button.image = nil", source)
+        self.assertIn('appendStatusItemDiagnostic(stage: "one-second")', source)
 
 
 if __name__ == "__main__":

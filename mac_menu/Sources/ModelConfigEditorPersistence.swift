@@ -336,7 +336,20 @@ extension ModelConfigEditorController {
         let stderrPipe = Pipe()
         let stdinPipe = input == nil ? nil : Pipe()
 
-        process.executableURL = URL(fileURLWithPath: "\(root)/.venv/bin/python")
+        let bundledPython = "\(bundleRoot)/runtime/bin/python"
+        let developmentPython = "\(root)/.venv/bin/python"
+        let pythonPath: String
+        if FileManager.default.isExecutableFile(atPath: bundledPython) {
+            pythonPath = bundledPython
+        } else if FileManager.default.isExecutableFile(atPath: developmentPython) {
+            pythonPath = developmentPython
+        } else {
+            throw ConfigEditorError(
+                message: "No bundled Python runtime is available for the config editor."
+            )
+        }
+
+        process.executableURL = URL(fileURLWithPath: pythonPath)
         process.arguments = ["\(bundleRoot)/config_editor.py", "--config", "\(root)/config.yaml"] + arguments
         process.currentDirectoryURL = URL(fileURLWithPath: root)
         process.environment = environment

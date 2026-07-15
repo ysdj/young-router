@@ -172,6 +172,7 @@ extension AppDelegate {
     func controlEnvironment() -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         let guiSafePath = [
+            "\(bundleRoot)/runtime/bin",
             "\(bundleRoot)/bin",
             "\(root)/.venv/bin",
             "/usr/bin",

@@ -135,6 +135,12 @@ import litellm.proxy.proxy_server  # noqa: F401
 PY
 PYTHONDONTWRITEBYTECODE=1 "$RUNTIME/bin/litellm" --help >/dev/null
 
+CONFIG_EDITOR_RUNTIME="$WORK_DIR/config-editor-runtime"
+mkdir -p "$CONFIG_EDITOR_RUNTIME"
+cp "$APP_RES/config.example.yaml" "$CONFIG_EDITOR_RUNTIME/config.yaml"
+PYTHONDONTWRITEBYTECODE=1 "$RUNTIME/bin/python" \
+  "$APP_RES/config_editor.py" --config "$CONFIG_EDITOR_RUNTIME/config.yaml" load >/dev/null
+
 SMOKE_PORT="$("$RUNTIME/bin/python" - <<'PY'
 import socket
 

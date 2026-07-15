@@ -144,8 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let codexHome = AppDelegate.codexHome()
     var controlPath: String { "\(bundleRoot)/service.sh" }
     var menuLogPath: String { "\(root)/menu-actions.log" }
+    let statusItemAutosaveName = "menu.litellm.menu.status-item"
 
     var statusItem: NSStatusItem!
+    var statusItemVisibilityObservation: NSKeyValueObservation?
+    var statusItemVisibilityRecoveryAttempted = false
     var statusMenuItem = NSMenuItem(title: "Status: Checking", action: nil, keyEquivalent: "")
     var startMenuItem = NSMenuItem()
     var stopMenuItem = NSMenuItem()
@@ -182,9 +185,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         installMainMenu()
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.autosaveName = statusItemAutosaveName
         configureStatusButton()
         buildMenu()
+        statusItemVisibilityObservation = statusItem.observe(\.isVisible, options: [.initial, .new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.appendStatusItemDiagnostic(stage: "visibility-change")
+            }
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.appendStatusItemDiagnostic(stage: "next-run-loop")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.appendStatusItemDiagnostic(stage: "one-second")
+        }
+        scheduleStatusItemVisibilityRecoveryCheck()
         startServiceOnLaunch()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             self?.updateStatus()
@@ -194,6 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        statusItemVisibilityObservation = nil
         serviceShouldBeRunning = false
         appendLog("application quit requested; disabling config watcher")
         let watchResult = control("config-watch-disable")
@@ -326,41 +343,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func configureStatusButton() {
         guard let button = statusItem.button else { return }
-        button.title = ""
-        button.image = makeStatusIcon()
-        button.imagePosition = .imageOnly
+        button.image = nil
+        button.attributedTitle = NSAttributedString(
+            string: "LL",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            ]
+        )
+        button.imagePosition = .noImage
         button.toolTip = "LiteLLM Menu Service"
+        button.setAccessibilityLabel("LiteLLM Menu")
     }
 
-    func makeStatusIcon() -> NSImage {
-        let size = NSSize(width: 22, height: 18)
-        let image = NSImage(size: size)
-        image.lockFocus()
-
-        let scale: CGFloat = 1.0
-        let transform = NSAffineTransform()
-        transform.translateX(by: size.width * (1 - scale) / 2, yBy: size.height * (1 - scale) / 2)
-        transform.scale(by: scale)
-        transform.concat()
-
-        NSColor.black.setFill()
-        let bigFont = NSFont.systemFont(ofSize: 18, weight: .regular)
-        let smallFont = NSFont.systemFont(ofSize: 13, weight: .regular)
-        let attributes: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.black
-        ]
-
-        ("L" as NSString).draw(
-            at: NSPoint(x: 2.5, y: -1.0),
-            withAttributes: attributes.merging([.font: bigFont]) { _, new in new }
+    func appendStatusItemDiagnostic(stage: String) {
+        guard let item = statusItem else {
+            appendLog("status item \(stage): unavailable")
+            return
+        }
+        let button = item.button
+        let window = button?.window
+        let autosaveName = item.autosaveName ?? "none"
+        appendLog(
+            "status item \(stage): visible=\(item.isVisible), button=\(button != nil), "
+                + "image=\(button?.image != nil), window=\(window != nil), "
+                + "window-visible=\(window?.isVisible ?? false), screen=\(window?.screen != nil), "
+                + "autosave=\(autosaveName)"
         )
-        ("L" as NSString).draw(
-            at: NSPoint(x: 13.0, y: 2.0),
-            withAttributes: attributes.merging([.font: smallFont]) { _, new in new }
-        )
-
-        image.unlockFocus()
-        image.isTemplate = true
-        return image
     }
+
+    func statusItemLooksOffscreen() -> Bool {
+        guard let item = statusItem, item.isVisible, let button = item.button else {
+            return false
+        }
+        guard button.frame.width > 0 else {
+            return true
+        }
+        return button.window?.screen == nil
+    }
+
+    func scheduleStatusItemVisibilityRecoveryCheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self else { return }
+            self.appendStatusItemDiagnostic(stage: "two-seconds")
+            guard self.statusItemLooksOffscreen() else { return }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                guard let self else { return }
+                self.appendStatusItemDiagnostic(stage: "three-seconds")
+                guard !self.statusItemVisibilityRecoveryAttempted,
+                      self.statusItemLooksOffscreen()
+                else {
+                    return
+                }
+                self.recreateStatusItemAfterVisibilityFailure()
+            }
+        }
+    }
+
+    func recreateStatusItemAfterVisibilityFailure() {
+        guard let oldItem = statusItem, oldItem.isVisible else { return }
+
+        statusItemVisibilityRecoveryAttempted = true
+        let menu = oldItem.menu
+        statusItemVisibilityObservation = nil
+        NSStatusBar.system.removeStatusItem(oldItem)
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.autosaveName = statusItemAutosaveName
+        configureStatusButton()
+        statusItem.menu = menu
+        statusItemVisibilityObservation = statusItem.observe(\.isVisible, options: [.initial, .new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.appendStatusItemDiagnostic(stage: "visibility-change-after-recovery")
+            }
+        }
+        appendLog("status item remained offscreen; recreated once without changing system visibility settings")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.appendStatusItemDiagnostic(stage: "one-second-after-recovery")
+        }
+    }
+
 }
