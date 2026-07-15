@@ -31,7 +31,7 @@ class LitellmMenu < Formula
       export LITELLM_APP_PATH="#{app}"
       exec "#{app_resources}/service.sh" "$@"
     SH
-    chmod 0755, bin/"litellm-menu", bin/"litellm-menu-service"
+    chmod 0755, [bin/"litellm-menu", bin/"litellm-menu-service"]
   end
 
   def caveats
