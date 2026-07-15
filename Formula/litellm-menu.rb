@@ -11,9 +11,9 @@ class LitellmMenu < Formula
   depends_on :macos
 
   def install
-    libexec.install "LiteLLM Menu.app"
-
     app = libexec/"LiteLLM Menu.app"
+    app.install "Contents"
+
     app_resources = app/"Contents/Resources/App"
     (bin/"litellm-menu").write <<~SH
       #!/bin/bash
