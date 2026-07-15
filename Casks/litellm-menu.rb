@@ -12,5 +12,10 @@ cask "litellm-menu" do
 
   app "LiteLLM Menu.app"
 
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/LiteLLM Menu.app"]
+  end
+
   uninstall quit: "menu.litellm.menu"
 end

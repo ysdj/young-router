@@ -127,6 +127,7 @@ Add the tap once:
 
 ```bash
 brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu
+brew trust ysdj/litellm-menu
 ```
 
 Then install the app directly into `/Applications`:
@@ -409,6 +410,7 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 
 ```bash
 brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu
+brew trust ysdj/litellm-menu
 ```
 
 之后用短命令直接把应用安装到 `/Applications`：
