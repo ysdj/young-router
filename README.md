@@ -140,6 +140,13 @@ Open **LiteLLM Menu** from Applications after installation. Future updates only 
 
 Homebrew downloads the prebuilt app and bundled runtime. Opening it starts the menu-owned service without a first-run dependency install.
 
+If the tap was added before v1.0.1 and Homebrew reports `No Cask with this name exists`, refresh the existing tap once:
+
+```bash
+brew update --force
+brew install --cask ysdj/litellm-menu/litellm-menu
+```
+
 ### Manual Build
 
 Clone the repository and build the app bundle:
@@ -422,6 +429,13 @@ brew install --cask litellm-menu
 安装后直接从“应用程序”打开 **LiteLLM Menu**。以后更新只需运行 `brew upgrade --cask litellm-menu`。
 
 Homebrew 会下载预构建应用及其内置运行时。打开后直接启动由菜单管理的服务，首次运行不会安装依赖。
+
+如果该 tap 是在 v1.0.1 之前添加的，并出现 `No Cask with this name exists`，执行一次刷新：
+
+```bash
+brew update --force
+brew install --cask ysdj/litellm-menu/litellm-menu
+```
 
 ### 手动构建
 
