@@ -124,8 +124,8 @@ A launchd-backed config watcher monitors `config.yaml` for changes. On detection
 ### Homebrew (Recommended)
 
 ```bash
-brew tap ysdj/litellm-menu
-brew install litellm-menu
+brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu
+brew install ysdj/litellm-menu/litellm-menu
 ```
 
 After installation:
@@ -403,8 +403,8 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 ### Homebrew 安装（推荐）
 
 ```bash
-brew tap ysdj/litellm-menu
-brew install litellm-menu
+brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu
+brew install ysdj/litellm-menu/litellm-menu
 ```
 
 安装后：
