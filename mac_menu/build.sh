@@ -7,6 +7,22 @@ APP_RES="$APP/Contents/Resources/App"
 ICON="$ROOT/mac_menu/LiteLLMMenu.icns"
 ICON_GENERATOR="$ROOT/mac_menu/generate_app_icon.swift"
 UV_BIN="${LITELLM_UV_BIN:-$(command -v uv 2>/dev/null || true)}"
+MACOS_DEPLOYMENT_TARGET="${LITELLM_MACOS_DEPLOYMENT_TARGET:-13.0}"
+SWIFT_TARGET="${LITELLM_SWIFT_TARGET:-$(uname -m)-apple-macosx$MACOS_DEPLOYMENT_TARGET}"
+
+if [[ ! "$MACOS_DEPLOYMENT_TARGET" =~ ^[0-9]+([.][0-9]+){1,2}$ ]]; then
+  echo "Invalid macOS deployment target: $MACOS_DEPLOYMENT_TARGET" >&2
+  exit 1
+fi
+
+verify_deployment_target() {
+  local binary="$1" actual
+  actual="$(xcrun vtool -show-build "$binary" | awk '$1 == "minos" { print $2; exit }')"
+  if [[ "$actual" != "$MACOS_DEPLOYMENT_TARGET" ]]; then
+    echo "Unexpected deployment target for $binary: expected $MACOS_DEPLOYMENT_TARGET, got ${actual:-unknown}" >&2
+    exit 1
+  fi
+}
 
 sync_version_to_plist() {
   local plist="$1" version build
@@ -38,6 +54,7 @@ while IFS= read -r source_file; do
   SWIFT_SOURCES+=("$source_file")
 done < <(find "$ROOT/mac_menu/Sources" -name '*.swift' -type f | sort)
 swiftc \
+  -target "$SWIFT_TARGET" \
   -file-prefix-map "$ROOT=." \
   -debug-prefix-map "$ROOT=." \
   "${SWIFT_SOURCES[@]}" \
@@ -81,6 +98,7 @@ do
 done
 cp "$UV_BIN" "$APP_RES/bin/uv"
 swiftc \
+  -target "$SWIFT_TARGET" \
   -file-prefix-map "$ROOT=." \
   -debug-prefix-map "$ROOT=." \
   "$ROOT/mac_menu/vision_ocr.swift" \
@@ -92,6 +110,8 @@ swiftc \
 chmod +x "$APP/Contents/MacOS/LiteLLMMenu"
 chmod +x "$APP_RES/service.sh" "$APP_RES/app.sh" "$APP_RES/run.sh" "$APP_RES/watch_config.sh" "$APP_RES/config_editor.py" "$APP_RES/codex_launcher.py" "$APP_RES/codex-litellm" "$APP_RES/route_trace_report.py" "$APP_RES/route_recovery_report.py" "$APP_RES/scripts/smoke_websearch.py" "$APP_RES/scripts/smoke_responses_tool_bridge_compare.py" "$APP_RES/bin/uv" "$APP_RES/bin/vision_ocr"
 chmod +x "$APP_RES"/service/*.sh
+verify_deployment_target "$APP/Contents/MacOS/LiteLLMMenu"
+verify_deployment_target "$APP_RES/bin/vision_ocr"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 codesign --force --deep --sign - "$APP" >/dev/null
 echo "$APP"

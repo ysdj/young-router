@@ -3,11 +3,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+BUILD_NUMBER="$(tr -d '[:space:]' < "$ROOT/BUILD_NUMBER")"
 LITELLM_VERSION="$(tr -d '[:space:]' < "$ROOT/LITELLM_VERSION")"
 ARCH="$(uname -m)"
-OUTPUT="${1:-$ROOT/artifacts/litellm-menu-$VERSION-macos-$ARCH.tar.zst}"
+OUTPUT="${1:-$ROOT/artifacts/litellm-menu-$VERSION-$BUILD_NUMBER-macos-$ARCH.tar.zst}"
 UV_BIN="${LITELLM_UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 ZSTD_BIN="${LITELLM_ZSTD_BIN:-$(command -v zstd 2>/dev/null || true)}"
+RUNTIME_SOURCE="${LITELLM_RELEASE_RUNTIME_SOURCE:-}"
 
 if [[ "$ARCH" != "arm64" ]]; then
   echo "Release packaging currently requires an Apple silicon build host." >&2
@@ -39,22 +41,34 @@ PYTHON_INSTALLS="$WORK_DIR/python-installs"
 SITE_PACKAGES="$RUNTIME/site-packages"
 
 LITELLM_APP_PATH="$APP" LITELLM_UV_BIN="$UV_BIN" "$ROOT/mac_menu/build.sh" >/dev/null
-mkdir -p "$RUNTIME/bin" "$SITE_PACKAGES" "$PYTHON_INSTALLS"
+mkdir -p "$RUNTIME/bin" "$SITE_PACKAGES"
 
-UV_PYTHON_INSTALL_DIR="$PYTHON_INSTALLS" \
-  "$UV_BIN" python install 3.12 >/dev/null
-PYTHON_SOURCE="$(printf '%s\n' "$PYTHON_INSTALLS"/cpython-3.12.*-macos-aarch64-none | head -n 1)"
-if [[ ! -x "$PYTHON_SOURCE/bin/python3.12" ]]; then
-  echo "uv did not install the expected macOS arm64 Python 3.12 runtime." >&2
-  exit 1
+if [[ -n "$RUNTIME_SOURCE" ]]; then
+  if [[ ! -x "$RUNTIME_SOURCE/bin/python" \
+    || ! -x "$RUNTIME_SOURCE/bin/litellm" \
+    || ! -f "$RUNTIME_SOURCE/LITELLM_VERSION" \
+    || "$(tr -d '[:space:]' < "$RUNTIME_SOURCE/LITELLM_VERSION")" != "$LITELLM_VERSION" ]]; then
+    echo "The supplied release runtime is missing or does not match LiteLLM $LITELLM_VERSION." >&2
+    exit 1
+  fi
+  rsync -a "$RUNTIME_SOURCE/" "$RUNTIME/"
+else
+  mkdir -p "$PYTHON_INSTALLS"
+  UV_PYTHON_INSTALL_DIR="$PYTHON_INSTALLS" \
+    "$UV_BIN" python install 3.12 >/dev/null
+  PYTHON_SOURCE="$(printf '%s\n' "$PYTHON_INSTALLS"/cpython-3.12.*-macos-aarch64-none | head -n 1)"
+  if [[ ! -x "$PYTHON_SOURCE/bin/python3.12" ]]; then
+    echo "uv did not install the expected macOS arm64 Python 3.12 runtime." >&2
+    exit 1
+  fi
+  mv "$PYTHON_SOURCE" "$RUNTIME/python"
+
+  "$UV_BIN" pip install \
+    --python "$RUNTIME/python/bin/python3.12" \
+    --target "$SITE_PACKAGES" \
+    "litellm==$LITELLM_VERSION" \
+    -r "$ROOT/scripts/runtime-requirements.txt" >/dev/null
 fi
-mv "$PYTHON_SOURCE" "$RUNTIME/python"
-
-"$UV_BIN" pip install \
-  --python "$RUNTIME/python/bin/python3.12" \
-  --target "$SITE_PACKAGES" \
-  "litellm==$LITELLM_VERSION" \
-  -r "$ROOT/scripts/runtime-requirements.txt" >/dev/null
 
 cp "$ROOT/scripts/runtime/python-wrapper.sh" "$RUNTIME/bin/python"
 cp "$ROOT/scripts/runtime/litellm-wrapper.sh" "$RUNTIME/bin/litellm"

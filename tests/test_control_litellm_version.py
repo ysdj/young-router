@@ -157,8 +157,13 @@ class ControlLiteLLMVersionTests(unittest.TestCase):
         self.assertIn("LITELLM_VERSION", build_script)
         self.assertIn('-file-prefix-map "$ROOT=."', build_script)
         self.assertIn('-debug-prefix-map "$ROOT=."', build_script)
+        self.assertIn('LITELLM_MACOS_DEPLOYMENT_TARGET:-13.0', build_script)
+        self.assertEqual(build_script.count('-target "$SWIFT_TARGET"'), 2)
+        self.assertEqual(build_script.count("verify_deployment_target"), 3)
         self.assertIn('"litellm==$LITELLM_VERSION"', package_script)
         self.assertIn("runtime-requirements.txt", package_script)
+        self.assertIn("LITELLM_RELEASE_RUNTIME_SOURCE", package_script)
+        self.assertIn("$VERSION-$BUILD_NUMBER-macos-$ARCH.tar.zst", package_script)
 
 
 if __name__ == "__main__":

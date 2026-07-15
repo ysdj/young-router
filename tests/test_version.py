@@ -31,9 +31,10 @@ class VersionScriptTests(unittest.TestCase):
             cask = root / "Casks" / "litellm-menu.rb"
             cask.write_text(
                 'cask "litellm-menu" do\n'
-                '  version "1.0.0"\n'
+                '  version "1.0.0,1"\n'
                 '  url "https://github.com/example/litellm-menu/releases/download/'
-                'v#{version}/litellm-menu-#{version}-macos-arm64.tar.zst"\n'
+                'v#{version.csv.first}/litellm-menu-#{version.csv.first}-'
+                '#{version.csv.second}-macos-arm64.tar.zst"\n'
                 'end\n',
                 encoding="utf-8",
             )
@@ -55,8 +56,8 @@ class VersionScriptTests(unittest.TestCase):
             self.assertEqual(info["CFBundleShortVersionString"], "1.0.1")
             self.assertEqual(info["CFBundleVersion"], "2")
             cask_text = cask.read_text(encoding="utf-8")
-            self.assertIn('version "1.0.1"', cask_text)
-            self.assertIn("releases/download/v#{version}/", cask_text)
+            self.assertIn('version "1.0.1,2"', cask_text)
+            self.assertIn("releases/download/v#{version.csv.first}/", cask_text)
 
 
 if __name__ == "__main__":

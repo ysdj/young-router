@@ -115,7 +115,7 @@ def sync_info_plist(paths: VersionPaths, plist_path: Path | None = None) -> bool
 def sync_cask(paths: VersionPaths) -> bool:
     if not paths.cask_file.exists():
         return False
-    version = format_version(read_version(paths))
+    version = f"{format_version(read_version(paths))},{read_build_number(paths)}"
     text = paths.cask_file.read_text(encoding="utf-8")
     updated = re.sub(
         r'(^\s*version\s+")([^"]+)(")',
