@@ -123,29 +123,15 @@ A launchd-backed config watcher monitors `config.yaml` for changes. On detection
 
 ### Homebrew (Recommended)
 
-Add the tap once:
+Install with one command. It also refreshes an existing pre-v1.0.1 tap:
 
 ```bash
-brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu
-brew trust ysdj/litellm-menu
-```
-
-Then install the app directly into `/Applications`:
-
-```bash
-brew install --cask litellm-menu
+brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu && brew update --force && brew trust ysdj/litellm-menu && brew install --cask ysdj/litellm-menu/litellm-menu
 ```
 
 Open **LiteLLM Menu** from Applications after installation. Future updates only need `brew upgrade --cask litellm-menu`.
 
 Homebrew downloads the prebuilt app and bundled runtime. Opening it starts the menu-owned service without a first-run dependency install.
-
-If the tap was added before v1.0.1 and Homebrew reports `No Cask with this name exists`, refresh the existing tap once:
-
-```bash
-brew update --force
-brew install --cask ysdj/litellm-menu/litellm-menu
-```
 
 ### Manual Build
 
@@ -413,29 +399,15 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 
 ### Homebrew 安装（推荐）
 
-首次添加一次 tap：
+使用一条命令完成安装；如果已有 v1.0.1 之前的旧 tap，也会自动刷新：
 
 ```bash
-brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu
-brew trust ysdj/litellm-menu
-```
-
-之后用短命令直接把应用安装到 `/Applications`：
-
-```bash
-brew install --cask litellm-menu
+brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu && brew update --force && brew trust ysdj/litellm-menu && brew install --cask ysdj/litellm-menu/litellm-menu
 ```
 
 安装后直接从“应用程序”打开 **LiteLLM Menu**。以后更新只需运行 `brew upgrade --cask litellm-menu`。
 
 Homebrew 会下载预构建应用及其内置运行时。打开后直接启动由菜单管理的服务，首次运行不会安装依赖。
-
-如果该 tap 是在 v1.0.1 之前添加的，并出现 `No Cask with this name exists`，执行一次刷新：
-
-```bash
-brew update --force
-brew install --cask ysdj/litellm-menu/litellm-menu
-```
 
 ### 手动构建
 
