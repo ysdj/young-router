@@ -69,7 +69,7 @@ class CodexConfigTests(unittest.TestCase):
                     model_context_window = 1048576
                     compact_prompt = "keep me"
 
-                    [model_providers.newapi]
+                    [model_providers.remote]
                     name = "User display name"
                     base_url = "https://remote.example.test/v1"
                     wire_api = "responses"
@@ -93,7 +93,7 @@ class CodexConfigTests(unittest.TestCase):
             config = (codex_home / "config.toml").read_text(encoding="utf-8")
             auth = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
             self.assertIn(original_model_line, config)
-            self.assertIn('model_provider = "newapi"', config)
+            self.assertIn('model_provider = "remote"', config)
             self.assertIn('base_url = "http://127.0.0.1:4000/v1"', config)
             self.assertIn('wire_api = "responses"', config)
             self.assertIn("requires_openai_auth = true", config)
@@ -109,7 +109,7 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual(state["schema_version"], 3)
             self.assertEqual(state["config"]["top_level"]["model_provider"]["value"], "remote")
             self.assertEqual(
-                state["config"]["providers"]["newapi"]["fields"]["base_url"]["value"],
+                state["config"]["providers"]["remote"]["fields"]["base_url"]["value"],
                 "https://remote.example.test/v1",
             )
 
@@ -120,7 +120,10 @@ class CodexConfigTests(unittest.TestCase):
             codex_home = temp / "codex-home"
             codex_home.mkdir()
             self.write_runtime_config(runtime_config)
-            (codex_home / "config.toml").write_text('model = "keep-this-model"\n', encoding="utf-8")
+            (codex_home / "config.toml").write_text(
+                'model = "keep-this-model"\nmodel_provider = "custom"\n',
+                encoding="utf-8",
+            )
 
             result = self.run_command(
                 codex_home,
@@ -135,6 +138,38 @@ class CodexConfigTests(unittest.TestCase):
             self.assertNotIn("must-be-ignored", config)
             self.assertIn('base_url = "http://127.0.0.1:49240/v1"', config)
 
+    def test_local_uses_the_active_provider_and_ignores_provider_override_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            runtime_config = temp / "runtime-config.yaml"
+            codex_home = temp / "codex-home"
+            codex_home.mkdir()
+            self.write_runtime_config(runtime_config)
+            (codex_home / "config.toml").write_text(
+                textwrap.dedent(
+                    """
+                    model_provider = "existing"
+
+                    [model_providers.existing]
+                    base_url = "https://before.example.test/v1"
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+
+            result = self.run_command(
+                codex_home,
+                runtime_config,
+                "local",
+                extra_env={"CODEX_MODEL_PROVIDER": "different-provider"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = (codex_home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model_provider = "existing"', config)
+            self.assertIn("[model_providers.existing]", config)
+            self.assertNotIn("different-provider", config)
+
     def test_repeated_local_preserves_first_field_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -147,7 +182,7 @@ class CodexConfigTests(unittest.TestCase):
                     model = "initial-model"
                     model_provider = "remote"
 
-                    [model_providers.newapi]
+                    [model_providers.remote]
                     base_url = "https://original.example.test/v1"
                     wire_api = "responses"
                     requires_openai_auth = false
@@ -196,6 +231,10 @@ class CodexConfigTests(unittest.TestCase):
             codex_home = temp / "codex-home"
             self.write_runtime_config(runtime_config)
 
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                'model_provider = "custom"\n', encoding="utf-8"
+            )
             applied = self.run_command(codex_home, runtime_config, "local")
             self.assertEqual(applied.returncode, 0, applied.stderr)
             config_path = codex_home / "config.toml"
@@ -214,7 +253,7 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual(restored.returncode, 0, restored.stderr)
             restored_config = config_path.read_text(encoding="utf-8")
             restored_auth = json.loads(auth_path.read_text(encoding="utf-8"))
-            self.assertNotIn("model_provider =", restored_config)
+            self.assertIn('model_provider = "custom"', restored_config)
             self.assertNotIn("base_url =", restored_config)
             self.assertNotIn("wire_api =", restored_config)
             self.assertNotIn("requires_openai_auth =", restored_config)
@@ -229,12 +268,17 @@ class CodexConfigTests(unittest.TestCase):
             codex_home = temp / "codex-home"
             self.write_runtime_config(runtime_config)
 
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                'model_provider = "custom"\n', encoding="utf-8"
+            )
             applied = self.run_command(codex_home, runtime_config, "local")
             restored = self.run_command(codex_home, runtime_config, "reapply-pre-switch")
 
             self.assertEqual(applied.returncode, 0, applied.stderr)
             self.assertEqual(restored.returncode, 0, restored.stderr)
-            self.assertFalse((codex_home / "config.toml").exists())
+            restored_config = (codex_home / "config.toml").read_text(encoding="utf-8")
+            self.assertEqual(restored_config, 'model_provider = "custom"\n')
             self.assertFalse((codex_home / "auth.json").exists())
 
     def test_restore_requires_current_field_state_schema(self) -> None:
@@ -253,6 +297,26 @@ class CodexConfigTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             self.assertIn("No active pre-switch Codex config state found.", result.stderr)
+
+    def test_local_requires_an_existing_active_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            runtime_config = temp / "runtime-config.yaml"
+            codex_home = temp / "codex-home"
+            codex_home.mkdir()
+            self.write_runtime_config(runtime_config)
+            (codex_home / "config.toml").write_text(
+                'model = "keep-this-model"\n', encoding="utf-8"
+            )
+
+            result = self.run_command(codex_home, runtime_config, "local")
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("no active model_provider to take over", result.stderr)
+            self.assertEqual(
+                (codex_home / "config.toml").read_text(encoding="utf-8"),
+                'model = "keep-this-model"\n',
+            )
 
 
 if __name__ == "__main__":

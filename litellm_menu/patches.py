@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
+
+from . import api_base as _api_base_module
 from . import image_generation as _image_generation_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
@@ -31,6 +34,54 @@ from .base import (
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _normalize_response_completed_event_usage,
 )
+
+
+_ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR = (
+    "_litellm_menu_anthropic_unversioned_endpoint_patch"
+)
+
+
+def _install_anthropic_unversioned_endpoint_patch() -> None:
+    try:
+        from litellm import main as litellm_main
+    except Exception:
+        return
+
+    original_complete = getattr(litellm_main, "_complete_anthropic", None)
+    original_get_secret_bool = getattr(litellm_main, "get_secret_bool", None)
+    if (
+        not callable(original_complete)
+        or not callable(original_get_secret_bool)
+        or getattr(original_complete, _ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR, False)
+    ):
+        return
+
+    skip_suffix = ContextVar("litellm_menu_skip_anthropic_url_suffix", default=False)
+
+    def patched_get_secret_bool(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "LITELLM_ANTHROPIC_DISABLE_URL_SUFFIX" and skip_suffix.get():
+            return True
+        return original_get_secret_bool(name, *args, **kwargs)
+
+    def patched_complete(ctx: Any) -> Any:
+        if not _api_base_module.is_unversioned_anthropic_messages_endpoint(
+            getattr(ctx, "api_base", None)
+        ):
+            return original_complete(ctx)
+        token = skip_suffix.set(True)
+        try:
+            return original_complete(ctx)
+        finally:
+            skip_suffix.reset(token)
+
+    setattr(
+        patched_complete,
+        _ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR,
+        True,
+    )
+    setattr(patched_complete, "_original_complete_anthropic", original_complete)
+    litellm_main.get_secret_bool = patched_get_secret_bool
+    litellm_main._complete_anthropic = patched_complete
 
 
 def _browser_compatible_headers_retry_kwargs(
@@ -1180,6 +1231,7 @@ def _install_responses_tool_search_bridge_patch() -> None:
 
 
 def install_all() -> None:
+    _install_anthropic_unversioned_endpoint_patch()
     _install_routing_constraint_patch()
     _install_selected_deployment_marker_patch()
     _install_order_peer_failover_patch()

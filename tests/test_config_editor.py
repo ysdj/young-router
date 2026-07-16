@@ -761,6 +761,106 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
         self.assertNotEqual(route_keys[0], route_keys[1])
 
+    def test_save_preserves_a_full_api_endpoint_for_protocol_aware_routing(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              endpoint_provider:
+                api_base: "https://example.com/v1/messages/"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: default-chat
+                litellm_params:
+                  model: anthropic/claude-compatible
+                  api_base: "https://example.com/v1/messages/"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000020"
+                  provider: endpoint_provider
+                  upstream_url_surface: anthropic
+                  supported_upstream_url_surfaces: [anthropic]
+            """
+        )
+        payload = config_editor.load_config(path)
+
+        config_editor.save_config(payload["providers"], path)
+
+        saved = config_editor._load_yaml(path)
+        self.assertEqual(
+            saved["providers"]["endpoint_provider"]["api_base"],
+            "https://example.com/v1/messages",
+        )
+        self.assertEqual(
+            saved["model_list"][0]["litellm_params"]["api_base"],
+            "https://example.com/v1/messages",
+        )
+
+    def test_save_preserves_an_unversioned_complete_api_endpoint(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              endpoint_provider:
+                api_base: "https://example.com/messages/"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: default-chat
+                litellm_params:
+                  model: anthropic/claude-compatible
+                  api_base: "https://example.com/messages/"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000022"
+                  provider: endpoint_provider
+                  upstream_url_surface: anthropic
+                  supported_upstream_url_surfaces: [anthropic]
+            """
+        )
+        payload = config_editor.load_config(path)
+
+        config_editor.save_config(payload["providers"], path)
+
+        saved = config_editor._load_yaml(path)
+        self.assertEqual(
+            saved["providers"]["endpoint_provider"]["api_base"],
+            "https://example.com/messages",
+        )
+
+    def test_save_adds_https_and_v1_to_a_bare_provider_host(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              endpoint_provider:
+                api_base: "example.com"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: default-chat
+                litellm_params:
+                  model: openai/compatible
+                  api_base: "example.com"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000021"
+                  provider: endpoint_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+            """
+        )
+        payload = config_editor.load_config(path)
+
+        config_editor.save_config(payload["providers"], path)
+
+        saved = config_editor._load_yaml(path)
+        self.assertEqual(
+            saved["providers"]["endpoint_provider"]["api_base"],
+            "https://example.com/v1",
+        )
+
     def test_save_makes_generated_deployment_tokens_unique(self) -> None:
         path = self.write_config(
             """

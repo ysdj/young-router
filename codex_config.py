@@ -32,7 +32,6 @@ def default_config_yaml() -> Path:
 
 
 CONFIG_YAML = default_config_yaml()
-DEFAULT_PROVIDER = "newapi"
 LOCAL_HOST = "127.0.0.1"
 DEFAULT_LOCAL_PORT = "4000"
 LOCAL_CONFIG_STATE_FILE = ".litellm-menu-codex-local-config-state.json"
@@ -222,6 +221,13 @@ def key_value_in_range(lines: list[str], start: int, end: int, key: str) -> tupl
 def top_level_value(text: str, key: str) -> tuple[bool, object | None]:
     lines = split_lines(text)
     return key_value_in_range(lines, 0, first_table_index(lines), key)
+
+
+def active_model_provider(text: str) -> str:
+    present, value = top_level_value(text, "model_provider")
+    if present and isinstance(value, str) and value.strip():
+        return value.strip()
+    return ""
 
 
 def table_value(text: str, table: str, key: str) -> tuple[bool, object | None]:
@@ -414,9 +420,12 @@ def update_codex_files(
     home = codex_home()
     config_path = home / "config.toml"
     auth_path = home / "auth.json"
-    provider = os.environ.get("CODEX_MODEL_PROVIDER", DEFAULT_PROVIDER)
-
     old_config = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    provider = active_model_provider(old_config)
+    if not provider:
+        raise ValueError(
+            "config.toml has no active model_provider to take over; configure one in Codex first"
+        )
     config_mode = (config_path.stat().st_mode & 0o777) if config_path.exists() else 0o600
     old_auth, auth_mode = load_auth(auth_path)
     state = load_local_config_state(home)

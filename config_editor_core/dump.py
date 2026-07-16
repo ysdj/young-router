@@ -4,6 +4,63 @@ from .schema import *
 from .load import *
 from urllib.parse import urlparse
 
+
+_KNOWN_API_ENDPOINT_SUFFIXES = (
+    ("v1", "chat", "completions"),
+    ("v1", "chat", "completion"),
+    ("v1", "images", "generations"),
+    ("v1", "images", "generation"),
+    ("v1", "completions"),
+    ("v1", "completion"),
+    ("v1", "complete"),
+    ("v1", "responses"),
+    ("v1", "response"),
+    ("v1", "messages"),
+    ("v1", "message"),
+    ("v1", "models"),
+    ("v1", "model"),
+    ("v1", "chat"),
+    ("v1", "images"),
+    ("chat", "completions"),
+    ("chat", "completion"),
+    ("images", "generations"),
+    ("images", "generation"),
+    ("completions",),
+    ("completion",),
+    ("complete",),
+    ("responses",),
+    ("response",),
+    ("messages",),
+    ("message",),
+    ("models",),
+    ("model",),
+    ("chat",),
+    ("images",),
+)
+
+
+def _normalize_configured_api_base(value: Any) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        if "://" in text:
+            return text
+        parsed = urlparse(f"https://{text}")
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    parts = [part for part in parsed.path.split("/") if part]
+    lowered = [part.lower() for part in parts]
+    for suffix in _KNOWN_API_ENDPOINT_SUFFIXES:
+        if len(lowered) >= len(suffix) and tuple(lowered[-len(suffix) :]) == suffix:
+            break
+    else:
+        if not parts or parts[-1].lower() != "v1":
+            parts.append("v1")
+    path = f"/{'/'.join(parts)}" if parts else ""
+    return parsed._replace(path=path, params="", query="", fragment="").geturl().rstrip("/")
+
 def _parse_scalar(text: str) -> Any:
     stripped = text.strip()
     if not stripped:
@@ -183,7 +240,7 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
         lines.append(f"  {name}: &{provider_anchor}")
         if not _bool_value(provider.get("enabled"), True):
             lines.append("    enabled: false")
-        api_base = str(provider.get("api_base", "")).strip()
+        api_base = _normalize_configured_api_base(provider.get("api_base", ""))
         if api_base:
             lines.append(f"    api_base: {_anchor_scalar(api_base, base_anchor)}")
         if keys:
@@ -225,7 +282,7 @@ def _entry_from_editor(
     model_info.pop("supports_vision", None)
     _set_if_text(entry, "model_name", model_name)
     _set_if_text(params, "model", litellm_model)
-    api_base = str(provider.get("api_base", "")).strip()
+    api_base = _normalize_configured_api_base(provider.get("api_base", ""))
     key_name = str(model.get("api_key_name", "")).strip()
     if not key_name:
         model_api_key = str(model.get("api_key", "")).strip()

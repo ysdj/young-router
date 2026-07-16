@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import image_generation as _image_generation_module
+from . import api_base as _api_base_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import state as _state_module
@@ -1463,6 +1464,7 @@ def _apply_surface_adapter_to_request(
             "custom_llm_provider"
         ]
         request_kwargs["litellm_params"] = updated_params
+    _api_base_module.apply_surface_api_base(request_kwargs, surface)
 
 
 def _next_upstream_surface_for_failed_deployment(

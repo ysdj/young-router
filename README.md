@@ -90,7 +90,7 @@ The facade intercepts computer action calls, routes them to the configured backe
 
 LiteLLM Menu includes targeted optimizations for [Codex](https://github.com/openai/codex) CLI and similar Responses API clients:
 
-- **Codex config integration** — the menu switches only the required connection fields: top-level `model_provider`, provider `name = "OpenAI"`, provider `base_url`, `wire_api = "responses"`, `requires_openai_auth = true`, and `OPENAI_API_KEY`. The OpenAI provider identity keeps Codex's standalone `web.run` search available through the local `/alpha/search` endpoint. It never changes `model`. A field-level state file records only the previous values of managed fields, so restore cannot overwrite later changes to models, MCP servers, compaction, or other Codex settings.
+- **Codex config integration** — the menu takes over the provider already selected by top-level `model_provider` and switches only its required connection fields: provider `name = "OpenAI"`, provider `base_url`, `wire_api = "responses"`, `requires_openai_auth = true`, and `OPENAI_API_KEY`. It never invents a provider name or changes `model`. The OpenAI provider identity keeps Codex's standalone `web.run` search available through the local `/alpha/search` endpoint. A field-level state file records only the previous values of managed fields, so restore cannot overwrite later changes to models, MCP servers, compaction, or other Codex settings.
 - **Compaction controls** — request pre-processing adds compaction-related metadata and headers that Codex expects.
 - **Reasoning effort compatibility** — when an upstream returns an error indicating `xhigh` reasoning effort is unsupported, the proxy retries with a compatible effort level (`high` or `max`) and records the compat retry.
 - **Usage normalization** — the `response.completed` event's `usage` block is normalized to the Codex-expected schema (`input_tokens`, `output_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens`), including conversion from Chat Completions `prompt_tokens`/`completion_tokens` naming.
@@ -178,6 +178,8 @@ The primary configuration file is `~/.litellm-menu/config.yaml`. A sanitized exa
 - **`general_settings`** — master key, UI toggle.
 
 The model editor keeps the client-facing public model name separate from the exact upstream model ID. It derives LiteLLM's internal provider prefix from the first configured upstream API surface (`openai` for OpenAI Responses or Chat, `anthropic` for Anthropic Messages), so there is no separate adapter setting. This permits mappings such as a GPT-compatible public route backed by a differently named OpenAI-compatible upstream model without changing the upstream ID.
+
+Provider Base URLs may be entered as a host/root, with or without `/v1` and a trailing slash, or as a complete compatible endpoint such as `/v1/responses`, `/v1/chat/completions`, `/v1/messages`, `/v1/completions`, or their unversioned equivalents. The editor preserves an explicit endpoint, uses the same parsing for **Fetch /v1/models** and **Probe**, and replaces rather than duplicates endpoint suffixes. Probe saves every successful API surface in priority order as the deployment's fallback chain.
 
 ### Capability Flags
 
@@ -366,7 +368,7 @@ Facade 拦截 computer 动作调用，路由到已配置的后端，并返回观
 
 LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似 Responses API 客户端的定向优化：
 
-- **Codex 配置集成** — 菜单只切换必要连接字段：顶层 `model_provider`、供应商 `name = "OpenAI"`、`base_url`、`wire_api = "responses"`、`requires_openai_auth = true` 和 `OPENAI_API_KEY`。OpenAI 供应商身份会让 Codex 保留 standalone `web.run` 搜索，并通过本地 `/alpha/search` 端点执行。绝不修改 `model`。恢复状态只记录这些受管字段的原值，因此不会覆盖之后修改的模型、MCP、压缩或其他 Codex 设置。
+- **Codex 配置集成** — 菜单接管顶层 `model_provider` 当前选中的既有供应商，只切换该段必要的连接字段：`name = "OpenAI"`、`base_url`、`wire_api = "responses"`、`requires_openai_auth = true` 和 `OPENAI_API_KEY`。不会凭空创建供应商名称，也绝不修改 `model`。OpenAI 供应商身份会让 Codex 保留 standalone `web.run` 搜索，并通过本地 `/alpha/search` 端点执行。恢复状态只记录这些受管字段的原值，因此不会覆盖之后修改的模型、MCP、压缩或其他 Codex 设置。
 - **压缩控制** — 请求预处理添加 Codex 所需的压缩相关元数据和头信息。
 - **推理强度兼容** — 上游返回表明 `xhigh` 推理强度不支持的错误时，代理以兼容强度级别（`high` 或 `max`）重试，并记录兼容重试。
 - **用量归一化** — `response.completed` 事件的 `usage` 块被归一化为 Codex 期望的架构（`input_tokens`、`output_tokens`、`input_tokens_details.cached_tokens`、`output_tokens_details.reasoning_tokens`、`total_tokens`），包括从 Chat Completions 的 `prompt_tokens`/`completion_tokens` 命名转换。
@@ -454,6 +456,8 @@ LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
 - **`general_settings`** — 主密钥、UI 开关。
 
 模型编辑器将客户端看到的公开模型名与上游原始模型 ID 分开保存。LiteLLM 内部供应商前缀由第一个上游 API 协议自动派生（OpenAI Responses 或 Chat 使用 `openai`，Anthropic Messages 使用 `anthropic`），不再单独配置 adapter。这样可以把 GPT 兼容的公开路由映射到名称不同的 OpenAI-compatible 上游模型，同时保持上游 ID 不变。
+
+Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不带末尾斜杠，也可以直接填写 `/v1/responses`、`/v1/chat/completions`、`/v1/messages`、`/v1/completions` 及其无版本完整端点。编辑器会保留明确填写的端点，**Fetch /v1/models** 与 **Probe** 也使用同一解析逻辑，因此会替换已有端点后缀而不会重复拼接；Probe 会按优先级把全部成功协议保存为该部署的 fallback 链。
 
 ### 能力标志
 

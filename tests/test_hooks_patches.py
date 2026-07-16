@@ -4,6 +4,46 @@ from hook_test_utils import *
 
 
 class HookPatchTests(HookTestCase):
+    def test_anthropic_unversioned_messages_endpoint_skips_only_the_duplicate_suffix(self) -> None:
+        hooks, _ = load_hook_module()
+        litellm_module = sys.modules["litellm"]
+        litellm_main = types.ModuleType("litellm.main")
+        calls = []
+
+        def get_secret_bool(name, *_args, **_kwargs):
+            return False
+
+        def complete(ctx):
+            calls.append((ctx.api_base, litellm_main.get_secret_bool("LITELLM_ANTHROPIC_DISABLE_URL_SUFFIX")))
+            return ctx.api_base
+
+        litellm_main.get_secret_bool = get_secret_bool
+        litellm_main._complete_anthropic = complete
+        litellm_module.main = litellm_main
+        sys.modules["litellm.main"] = litellm_main
+
+        hooks._install_anthropic_unversioned_endpoint_patch()
+
+        self.assertEqual(
+            litellm_main._complete_anthropic(
+                types.SimpleNamespace(api_base="https://api.example.test/messages")
+            ),
+            "https://api.example.test/messages",
+        )
+        self.assertEqual(
+            litellm_main._complete_anthropic(
+                types.SimpleNamespace(api_base="https://api.example.test/v1/messages")
+            ),
+            "https://api.example.test/v1/messages",
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("https://api.example.test/messages", True),
+                ("https://api.example.test/v1/messages", False),
+            ],
+        )
+
     def test_selected_deployment_marker_applies_each_protocol_adapter(self) -> None:
         hooks, _ = load_hook_module()
         router_module = types.ModuleType("litellm.router")
@@ -43,6 +83,52 @@ class HookPatchTests(HookTestCase):
             self.assertEqual(kwargs["litellm_params"]["model"], model)
             self.assertEqual(kwargs["custom_llm_provider"], provider)
             self.assertEqual(kwargs.get("use_chat_completions_api") is True, uses_chat)
+
+    def test_selected_deployment_marker_normalizes_full_api_base_for_each_protocol(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _update_kwargs_with_deployment(self, deployment, kwargs, function_name=None):
+                kwargs["litellm_params"] = dict(deployment["litellm_params"])
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        deployment = {
+            "litellm_params": {
+                "model": "openai/vendor/model",
+                "api_base": "https://api.example.test/v1/messages/",
+                "order": 1,
+            },
+            "model_info": {
+                "id": "endpoint-route",
+                "supported_upstream_url_surfaces": [
+                    "openai/responses",
+                    "anthropic",
+                    "openai/chat",
+                ],
+            },
+        }
+
+        expected_api_bases = {
+            "openai/responses": "https://api.example.test/v1",
+            "anthropic": "https://api.example.test/v1/messages",
+            "openai/chat": "https://api.example.test/v1",
+        }
+        for surface, expected_api_base in expected_api_bases.items():
+            with self.subTest(surface=surface):
+                kwargs = {
+                    "model": "default-chat",
+                    "_litellm_menu_upstream_url_surface": surface,
+                    "_litellm_menu_upstream_url_surface_deployment_id": "endpoint-route",
+                }
+                Router()._update_kwargs_with_deployment(deployment, kwargs)
+                self.assertEqual(
+                    kwargs["litellm_params"]["api_base"],
+                    expected_api_base,
+                )
+                self.assertEqual(kwargs["litellm_metadata"]["api_base"], expected_api_base)
 
     def test_selected_deployment_update_preserves_original_route_model_group(self) -> None:
         hooks, _ = load_hook_module()

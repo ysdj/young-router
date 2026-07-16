@@ -549,23 +549,7 @@ extension ModelConfigEditorController {
     }
 
     func endpointURLCandidates(baseURL: String, endpoint: String) -> [URL] {
-        let base = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let endpointPath = endpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !base.isEmpty, !endpointPath.isEmpty else { return [] }
-
-        var strings = ["\(base)/\(endpointPath)"]
-        if !base.lowercased().hasSuffix("/v1") {
-            strings.append("\(base)/v1/\(endpointPath)")
-        }
-
-        var urls: [URL] = []
-        var seen: Set<String> = []
-        for string in strings {
-            guard !seen.contains(string), let url = URL(string: string) else { continue }
-            seen.insert(string)
-            urls.append(url)
-        }
-        return urls
+        apiEndpointURLCandidates(baseURL: baseURL, endpoint: endpoint)
     }
 
     func modelAvailabilityProbeBody(model: String) throws -> Data {
