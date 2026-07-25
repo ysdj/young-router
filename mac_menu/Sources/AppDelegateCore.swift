@@ -13,18 +13,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case unhealthy
         case stopped
 
-        var isRunning: Bool {
-            self == .running
-        }
-
-        var canRecover: Bool {
-            self == .running || self == .unhealthy
-        }
-
-        var isTransitional: Bool {
-            self == .starting
-        }
-
         var title: String {
             switch self {
             case .running:
@@ -42,24 +30,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     struct MenuState {
         let serviceState: ServiceState
         let autoStartState: AutoStartState
-        let routeTraceEnabled: Bool
         let routeRecoverySummary: String
+        let routeRecovery: RouteRecoveryStatus
         let webdavSyncEnabled: Bool
         let webdavLastStatus: WebDAVLastStatus
-        let codexConfigState: CodexConfigState
 
-        var running: Bool {
-            serviceState.isRunning
-        }
+    }
 
-        var canRecover: Bool {
-            serviceState.canRecover
+    struct MenuStatusPayload: Decodable {
+        let serviceState: String
+        let autoStartState: String
+        let routeRecoverySummary: String
+        let routeRecovery: RouteRecoveryStatus?
+        let webdavSyncEnabled: Bool
+        let webdavLastStatus: WebDAVLastStatus
+
+        enum CodingKeys: String, CodingKey {
+            case serviceState = "service_state"
+            case autoStartState = "auto_start_state"
+            case routeRecoverySummary = "route_recovery_summary"
+            case routeRecovery = "route_recovery"
+            case webdavSyncEnabled = "webdav_sync_enabled"
+            case webdavLastStatus = "webdav_last_status"
         }
     }
 
-    struct CodexConfigState {
-        let configuredForLiteLLM: Bool
-        let preSwitchReapplyAvailable: Bool
+    struct RouteRecoveryStatus: Decodable {
+        struct Current: Decodable {
+            let status: String
+            let activity: String
+            let kind: String
+            let title: String
+            let detail: String
+            let attempt: Int?
+            let heartbeatAgeSeconds: Double?
+            let cooldownRemainingSeconds: Double?
+
+            enum CodingKeys: String, CodingKey {
+                case status
+                case activity
+                case kind
+                case title
+                case detail
+                case attempt
+                case heartbeatAgeSeconds = "heartbeat_age_seconds"
+                case cooldownRemainingSeconds = "cooldown_remaining_seconds"
+            }
+        }
+
+        let summary: String
+        let recovering: Int
+        let cooldown: Int
+        let overdue: Int
+        let current: Current?
+
+        static let empty = RouteRecoveryStatus(
+            summary: "0 recovering / 0 cooldown",
+            recovering: 0,
+            cooldown: 0,
+            overdue: 0,
+            current: nil
+        )
     }
 
     struct WebDAVSyncSettings: Codable {
@@ -129,56 +160,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .path
     }
 
-    static func codexHome() -> String {
-        let environment = ProcessInfo.processInfo.environment
-        if let override = environment["CODEX_HOME"], !override.isEmpty {
-            return (override as NSString).expandingTildeInPath
-        }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex", isDirectory: true)
-            .path
-    }
-
     let bundleRoot = AppDelegate.bundledAppRoot()
     let root = AppDelegate.runtimeRoot()
-    let codexHome = AppDelegate.codexHome()
     var controlPath: String { "\(bundleRoot)/service.sh" }
     var menuLogPath: String { "\(root)/menu-actions.log" }
     let statusItemAutosaveName = "menu.litellm.menu.status-item"
+    var isHeadlessIsolatedTest: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["LITELLM_MENU_TEST_HEADLESS"] == "1"
+            && !(environment["LITELLM_RUNTIME_ROOT"] ?? "").isEmpty
+    }
 
     var statusItem: NSStatusItem!
     var statusItemVisibilityObservation: NSKeyValueObservation?
     var statusItemVisibilityRecoveryAttempted = false
     var statusMenuItem = NSMenuItem(title: "Status: Checking", action: nil, keyEquivalent: "")
-    var startMenuItem = NSMenuItem()
-    var stopMenuItem = NSMenuItem()
-    var restartServiceMenuItem = NSMenuItem()
     var autoStartMenuItem = NSMenuItem()
-    var routeTraceStartupMenuItem = NSMenuItem()
-    var codexLocalMenuItem = NSMenuItem()
-    var codexPreSwitchReapplyMenuItem = NSMenuItem()
+    var codexConfigurationMenuItem = NSMenuItem()
     var modelConfigEditorMenuItem = NSMenuItem()
     var runtimeSettingsMenuItem = NSMenuItem()
+    var configurationPackageMenuItem = NSMenuItem()
     var routeRecoveryStatusMenuItem = NSMenuItem()
-    var routeRecoveryDetailsMenuItem = NSMenuItem()
     var webdavStatusMenuItem = NSMenuItem()
     var webdavEnabledMenuItem = NSMenuItem()
     var webdavConfigureMenuItem = NSMenuItem()
     var logsMenuItem = NSMenuItem()
+    var logWindowController: LogWindowController?
     var versionMenuItem = NSMenuItem()
     var refreshTimer: Timer?
     var busy = false
     var statusRefreshInFlight = false
     var statusRefreshGeneration = 0
-    var lastRenderedServiceState: ServiceState?
-    var stoppedRecheckPending = false
     var serviceShouldBeRunning = false
     var serviceStartInFlight = false
-    var lastStoppedRecoveryAttempt: Date?
+    var terminationCleanupInFlight = false
+    var lastServiceRecoveryAttempt: Date?
     var modelConfigEditor: ModelConfigEditorController?
+    var codexConfigDialog: CodexConfigDialogController?
     var lastFailedWebDAVSettings: WebDAVSettingsDialogResult?
+    let lifecycleProcessLock = NSLock()
+    var lifecycleProcess: Process?
+    var lifecycleCancellationRequested = false
     let lifecycleQueue = DispatchQueue(label: "menu.litellm.lifecycle", qos: .userInitiated)
-    let stoppedRecoveryRetryInterval: TimeInterval = 15.0
+    let terminationQueue = DispatchQueue(label: "menu.litellm.termination", qos: .userInitiated)
+    let configWatchQueue = DispatchQueue(label: "menu.litellm.config-watch", qos: .utility)
+    let serviceRecoveryRetryInterval: TimeInterval = 15.0
     let statusCommandTimeout: TimeInterval = 5.0
     let statusRefreshTimeout: TimeInterval = 12.0
 
@@ -189,42 +215,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.autosaveName = statusItemAutosaveName
         configureStatusButton()
         buildMenu()
-        statusItemVisibilityObservation = statusItem.observe(\.isVisible, options: [.initial, .new]) { [weak self] _, _ in
-            DispatchQueue.main.async {
-                self?.appendStatusItemDiagnostic(stage: "visibility-change")
+        if isHeadlessIsolatedTest {
+            statusItem.isVisible = false
+        }
+        if !isHeadlessIsolatedTest {
+            statusItemVisibilityObservation = statusItem.observe(\.isVisible, options: [.initial, .new]) { [weak self] _, _ in
+                DispatchQueue.main.async {
+                    self?.appendStatusItemDiagnostic(stage: "visibility-change")
+                }
             }
+            DispatchQueue.main.async { [weak self] in
+                self?.appendStatusItemDiagnostic(stage: "next-run-loop")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.appendStatusItemDiagnostic(stage: "one-second")
+            }
+            scheduleStatusItemVisibilityRecoveryCheck()
         }
-        DispatchQueue.main.async { [weak self] in
-            self?.appendStatusItemDiagnostic(stage: "next-run-loop")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-            self?.appendStatusItemDiagnostic(stage: "one-second")
-        }
-        scheduleStatusItemVisibilityRecoveryCheck()
         startServiceOnLaunch()
+        startStatusRefreshTimer()
+    }
+
+    func startStatusRefreshTimer() {
+        refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             self?.updateStatus()
         }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if terminationCleanupInFlight {
+            return .terminateLater
+        }
+        terminationCleanupInFlight = true
         refreshTimer?.invalidate()
         refreshTimer = nil
         statusItemVisibilityObservation = nil
         serviceShouldBeRunning = false
-        appendLog("application quit requested; disabling config watcher")
-        let watchResult = control("config-watch-disable")
-        if watchResult.0 != 0 {
-            appendLog("config watcher disable on quit failed: \(elidedDisplayText(watchResult.1, limit: 240))")
+        serviceStartInFlight = false
+        terminationQueue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async {
+                    sender.reply(toApplicationShouldTerminate: true)
+                }
+                return
+            }
+            self.modelConfigEditor?.cancelRuntimeApplyInFlight()
+            self.cancelLifecycleControl()
+            self.appendLog("application quit requested; stopping LiteLLM service")
+            let stopResult = self.control("stop", timeoutSeconds: 12)
+            let serviceStopped = stopResult.0 == 0
+            if serviceStopped {
+                self.appendLog("LiteLLM service stopped on application quit")
+            } else {
+                self.appendLog("LiteLLM service stop on quit failed: \(elidedDisplayText(stopResult.1, limit: 240))")
+            }
+            self.appendLog("application quit requested; disabling config watcher")
+            let watchResult = self.configWatchQueue.sync {
+                self.control("config-watch-disable", timeoutSeconds: 8)
+            }
+            if watchResult.0 != 0 {
+                self.appendLog("config watcher disable on quit failed: \(elidedDisplayText(watchResult.1, limit: 240))")
+            }
+            DispatchQueue.main.async {
+                guard serviceStopped, watchResult.0 == 0 else {
+                    self.terminationCleanupInFlight = false
+                    self.resumeLifecycleControl()
+                    self.serviceShouldBeRunning = true
+                    self.startStatusRefreshTimer()
+                    if !self.isHeadlessIsolatedTest {
+                        self.showAlert(
+                            title: "LiteLLM Menu is still running",
+                            message: "The local service or its config watcher did not stop cleanly. The app remains open and will recover the service."
+                        )
+                    }
+                    self.beginServiceStart(
+                        logMessage: "termination cleanup failed; restoring LiteLLM service",
+                        failureTitle: "LiteLLM service recovery failed"
+                    )
+                    sender.reply(toApplicationShouldTerminate: false)
+                    return
+                }
+                sender.reply(toApplicationShouldTerminate: true)
+            }
         }
-        appendLog("application quit requested; stopping LiteLLM service")
-        let result = control("stop")
-        if result.0 == 0 {
-            appendLog("LiteLLM service stopped on application quit")
-        } else {
-            appendLog("LiteLLM service stop on quit failed: \(elidedDisplayText(result.1, limit: 240))")
-        }
-        return .terminateNow
+        return .terminateLater
     }
 
     func installMainMenu() {
@@ -262,38 +337,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(statusMenuItem)
         menu.addItem(NSMenuItem.separator())
 
-        startMenuItem = menuItem("Start LiteLLM Service", #selector(startLiteLLMService))
-        stopMenuItem = menuItem("Stop LiteLLM Service", #selector(stopLiteLLMService))
-        restartServiceMenuItem = menuItem("Restart LiteLLM Service", #selector(restartLiteLLMService))
-        menu.addItem(startMenuItem)
-        menu.addItem(stopMenuItem)
-        menu.addItem(restartServiceMenuItem)
-        menu.addItem(NSMenuItem.separator())
-
         autoStartMenuItem = menuItem("Auto Start at Login", #selector(toggleAutoStart))
         menu.addItem(autoStartMenuItem)
-        routeTraceStartupMenuItem = menuItem("Route Trace", #selector(toggleRouteTraceStartup))
-        menu.addItem(routeTraceStartupMenuItem)
         menu.addItem(NSMenuItem.separator())
 
-        codexLocalMenuItem = menuItem("Configure Codex for LiteLLM", #selector(applyCodexLocalConfig))
-        codexPreSwitchReapplyMenuItem = menuItem("Reapply Pre-Switch Codex Config", #selector(reapplyCodexPreSwitchConfig))
-        menu.addItem(codexLocalMenuItem)
-        menu.addItem(codexPreSwitchReapplyMenuItem)
-        menu.addItem(NSMenuItem.separator())
-
-        modelConfigEditorMenuItem = menuItem("Edit Models Config", #selector(editModelsConfig))
+        codexConfigurationMenuItem = menuItem("Codex Settings...", #selector(configureCodexSettings))
+        modelConfigEditorMenuItem = menuItem("Providers & Models...", #selector(editModelsConfig))
         runtimeSettingsMenuItem = menuItem("Runtime Settings...", #selector(configureRuntimeSettings))
+        configurationPackageMenuItem = menuItem("Import / Export Config...", #selector(showConfigurationPackageDialog))
         menu.addItem(modelConfigEditorMenuItem)
         menu.addItem(runtimeSettingsMenuItem)
-        menu.addItem(NSMenuItem.separator())
-
-        routeRecoveryStatusMenuItem = NSMenuItem(title: "Recovery: 0 recovering / 0 cooldown", action: nil, keyEquivalent: "")
-        routeRecoveryStatusMenuItem.isEnabled = false
-        routeRecoveryDetailsMenuItem = menuItem("View Recovery Details", #selector(showRouteRecoveryDetails))
-        routeRecoveryDetailsMenuItem.isEnabled = true
-        menu.addItem(routeRecoveryStatusMenuItem)
-        menu.addItem(routeRecoveryDetailsMenuItem)
+        menu.addItem(codexConfigurationMenuItem)
+        menu.addItem(configurationPackageMenuItem)
         menu.addItem(NSMenuItem.separator())
 
         webdavStatusMenuItem = NSMenuItem(title: "WebDAV: Checking...", action: nil, keyEquivalent: "")
@@ -305,7 +360,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(webdavConfigureMenuItem)
         menu.addItem(NSMenuItem.separator())
 
-        logsMenuItem = menuItem("View Route Trace Log", #selector(openRouteTraceVisual))
+        routeRecoveryStatusMenuItem = menuItem("Recovery: 0 recovering / 0 cooldown", #selector(showRouteRecoveryDetails))
+        menu.addItem(routeRecoveryStatusMenuItem)
+
+        logsMenuItem = menuItem("View Logs", #selector(openLogs))
         menu.addItem(logsMenuItem)
         menu.addItem(NSMenuItem.separator())
 
@@ -343,15 +401,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func configureStatusButton() {
         guard let button = statusItem.button else { return }
+        statusItem.length = 32
         button.image = nil
-        button.attributedTitle = NSAttributedString(
-            string: "LL",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
-            ]
-        )
         button.imagePosition = .noImage
-        button.toolTip = "LiteLLM Menu Service"
+        renderStatusButton(.empty)
+    }
+
+    /// Keep the menu-bar affordance stable. Recovery is intentionally reported
+    /// inside the menu (and in its tooltip), never by changing the icon, color,
+    /// or text shown in the system menu bar.
+    func renderStatusButton(_ status: RouteRecoveryStatus) {
+        guard let button = statusItem.button else { return }
+        let active = status.recovering > 0 || status.cooldown > 0
+        button.title = "LL"
+        button.toolTip = active
+            ? routeRecoveryStatusTooltip(status)
+            : "LiteLLM Menu Service"
         button.setAccessibilityLabel("LiteLLM Menu")
     }
 

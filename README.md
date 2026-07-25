@@ -1,8 +1,8 @@
 # LiteLLM Menu
 
-LiteLLM Menu is a native macOS menu bar application that runs and manages a local [LiteLLM](https://github.com/BerriAI/litellm) proxy service. It consolidates multi-provider model routing, deployment fallback, Responses API compatibility, vision bridging, web search bridging, image generation tool adaptation, and Codex configuration into a single app-owned local endpoint.
+LiteLLM Menu is a native macOS menu bar application that runs and manages a local [LiteLLM](https://github.com/BerriAI/litellm) proxy service. It consolidates multi-provider model routing, deployment fallback, Responses API compatibility, vision bridging, web search bridging, image generation tool adaptation, and selectable Codex configuration into a single app-owned local endpoint.
 
-![LiteLLM Menu Providers and Routes views showing multiple example models, protocol probing, deployment order, and the runtime fallback map](docs/images/model-editor.png)
+![LiteLLM Menu Providers and Routes views showing multiple example models, protocol probing, and deployment order](docs/images/model-editor.png)
 
 ---
 
@@ -10,18 +10,15 @@ LiteLLM Menu is a native macOS menu bar application that runs and manages a loca
 
 ### Native Menu Bar App
 
-LiteLLM Menu runs as a macOS status bar application written in Swift. The menu app owns the local LiteLLM proxy lifecycle: it starts, stops, restarts, and monitors the proxy process. No Docker container, database, or system Python installation is required. Homebrew releases include a self-contained Python runtime and LiteLLM dependencies, so first launch does not download or compile packages. Source builds retain a bundled `uv` fallback for development.
+LiteLLM Menu runs as a macOS status bar application written in Swift. The menu app automatically starts and monitors its local LiteLLM proxy while it is open, and shuts that proxy down before it exits. No Docker container, database, or system Python installation is required. Homebrew releases include a self-contained Python runtime and LiteLLM dependencies, so first launch does not download or compile packages. Source builds retain a bundled `uv` fallback for development.
 
-The menu provides direct access to:
+The native menu is grouped by task:
 
-- Service status, start, stop, and restart
-- Model configuration editor (providers, API keys, model routes, deployment order)
-- Runtime settings (timeouts, cooldowns, web search limits, vision bridge, computer facade)
-- Codex configuration (apply local LiteLLM endpoint, restore pre-switch config)
-- WebDAV sync enable/disable and settings
-- Route trace toggle and visual HTML report
-- Service log, config watch log, and recent request log viewers
-- Auto-start at login
+- **App** — control launch at login; the owned LiteLLM service is kept running while the app is open.
+- **Configuration** — open **Providers & Models...**, **Codex Settings...**, or **Runtime Settings...**; import or export a configuration package; and inspect live billing.
+- **Diagnostics** — record or inspect route traces, inspect recovery state and recent requests, open service or config-watch logs, and configure WebDAV sync.
+
+The status item remains a neutral `LL` at all times. During route recovery, its hover text and the clickable recovery row in the menu show the current step, classified cause, attempt, heartbeat age, and whether recovery is still progressing or may be stuck.
 
 ### Deployment Fallback and Routing
 
@@ -90,7 +87,8 @@ The facade intercepts computer action calls, routes them to the configured backe
 
 LiteLLM Menu includes targeted optimizations for [Codex](https://github.com/openai/codex) CLI and similar Responses API clients:
 
-- **Codex config integration** — the menu takes over the provider already selected by top-level `model_provider` and switches only its required connection fields: provider `name = "OpenAI"`, provider `base_url`, `wire_api = "responses"`, `requires_openai_auth = true`, and `OPENAI_API_KEY`. It never invents a provider name or changes `model`. The OpenAI provider identity keeps Codex's standalone `web.run` search available through the local `/alpha/search` endpoint. A field-level state file records only the previous values of managed fields, so restore cannot overwrite later changes to models, MCP servers, compaction, or other Codex settings.
+- **Codex Settings** — a single staged editor combines typed settings for connection, behavior, features, permissions, providers, MCP/plugins, and advanced options with synchronized `config.toml` and `auth.json` text views. Selecting a LiteLLM deployment stages its local endpoint/key without overwriting unrelated Codex settings or credentials.
+- **Fast default tier** — when effective `CODEX_HOME/config.toml` has `service_tier = "fast"` (or `"priority"`) and `[features].fast_mode = true`, Menu injects the upstream value `"priority"` only into reliably identified Codex native `/v1/responses` requests whose original body has no `service_tier`. The config is refreshed on the next request after Apply; explicit tiers and non-Codex traffic are never overwritten. Known boundary: if Desktop strips a manual Standard selection into an absent HTTP field while config remains Fast, the gateway cannot distinguish it; the config file is this shim's explicit switch.
 - **Compaction controls** — request pre-processing adds compaction-related metadata and headers that Codex expects.
 - **Reasoning effort compatibility** — when an upstream returns an error indicating `xhigh` reasoning effort is unsupported, the proxy retries with a compatible effort level (`high` or `max`) and records the compat retry.
 - **Usage normalization** — the `response.completed` event's `usage` block is normalized to the Codex-expected schema (`input_tokens`, `output_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens`), including conversion from Chat Completions `prompt_tokens`/`completion_tokens` naming.
@@ -109,7 +107,7 @@ A recent requests log stores routing and status metadata in JSONL format. Prompt
 
 ### Config Watch and Validation
 
-A launchd-backed config watcher monitors `config.yaml` for changes. On detection, it validates the config, stages the validated config to `.litellm-runtime/config.yaml`, and requires an explicit apply/restart to activate. The watcher does not silently restart the service on every file write. The runtime service always starts from the staged runtime config, not the editable source config.
+A launchd-backed config watcher monitors `config.yaml` for changes. On detection, it validates the config and stages the validated config to `.litellm-runtime/config.yaml`; use the explicit Apply action to activate it. The watcher does not silently restart the service on every file write. The runtime service always starts from the staged runtime config, not the editable source config.
 
 ---
 
@@ -119,14 +117,15 @@ A launchd-backed config watcher monitors `config.yaml` for changes. On detection
 
 - macOS 13.0 or later
 - Apple silicon Mac for the prebuilt Homebrew Cask
-- [uv](https://docs.astral.sh/uv/) only when building from source (or set `LITELLM_UV_BIN` to a custom path)
+- Xcode Command Line Tools when building from source (`xcode-select --install`)
+- [uv](https://docs.astral.sh/uv/) when building from source (or set `LITELLM_UV_BIN` to a custom path)
 
 ### Homebrew (Recommended)
 
-Install with one command. It also refreshes an existing pre-v1.0.1 tap:
+Install the app and its self-contained runtime with one command:
 
 ```bash
-brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu && brew update --force && brew trust ysdj/litellm-menu && brew install --cask ysdj/litellm-menu/litellm-menu
+brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu && brew trust ysdj/litellm-menu && brew install --cask ysdj/litellm-menu/litellm-menu
 ```
 
 Open **LiteLLM Menu** from Applications after installation. Future updates only need `brew upgrade --cask litellm-menu`.
@@ -159,9 +158,9 @@ Launch the app:
 
 1. Open LiteLLM Menu from the menu bar icon (the "LL" status item).
 2. The Homebrew app starts the local LiteLLM proxy from its bundled runtime. A source-built app bootstraps its development runtime with `uv` when needed.
-3. Click **Edit Models Config** to configure providers, API keys, models, and deployment order.
-4. Click **Apply Config** (or restart the service) to stage and activate the configuration.
-5. Optionally click **Configure Codex for LiteLLM** to point Codex at the local endpoint.
+3. Click **Providers & Models...** to configure providers, API keys, models, and deployment order.
+4. Click **Apply Config** to stage and activate the configuration.
+5. To use Codex through LiteLLM, open **Codex Settings...**, choose a LiteLLM deployment in **Connection & model**, and choose **Apply**. The change is staged first, then updates only the user-level Codex `config.toml` / `auth.json` fields you selected while preserving unrelated values and the model group's LiteLLM route order.
 
 ---
 
@@ -171,7 +170,7 @@ The primary configuration file is `~/.litellm-menu/config.yaml`. A sanitized exa
 
 ### Key Sections
 
-- **`providers`** — named provider groups with `api_base` and `api_keys` (each key has `name`, `value`, and `enabled` flag).
+- **`providers`** — named provider groups with `api_base` and `api_keys` (each key has `name` and `value`; remove keys that are no longer used).
 - **`model_list`** — model group entries with `litellm_params` (model, api_base, api_key, order) and `model_info` (id, provider, route_key, api_key_name, capability flags).
 - **`litellm_settings`** — callbacks registration, `public_model_groups`, `drop_params`.
 - **`router_settings`** — routing strategy, retry policy, max fallbacks, cooldown configuration.
@@ -179,7 +178,15 @@ The primary configuration file is `~/.litellm-menu/config.yaml`. A sanitized exa
 
 The model editor keeps the client-facing public model name separate from the exact upstream model ID. It derives LiteLLM's internal provider prefix from the first configured upstream API surface (`openai` for OpenAI Responses or Chat, `anthropic` for Anthropic Messages), so there is no separate adapter setting. This permits mappings such as a GPT-compatible public route backed by a differently named OpenAI-compatible upstream model without changing the upstream ID.
 
-Provider Base URLs may be entered as a host/root, with or without `/v1` and a trailing slash, or as a complete compatible endpoint such as `/v1/responses`, `/v1/chat/completions`, `/v1/messages`, `/v1/completions`, or their unversioned equivalents. The editor preserves an explicit endpoint, uses the same parsing for **Fetch /v1/models** and **Probe**, and replaces rather than duplicates endpoint suffixes. Probe saves every successful API surface in priority order as the deployment's fallback chain.
+### Providers & Models Editor
+
+The **Providers** view is a fixed three-column workspace: provider list, model list, and selected deployment details. Provider identity, billing, and model count remain distinct; model billing and independent probe state are visible beside the selected provider. Upstream ID and route order remain in the selected deployment form and the dedicated **Routes** view. Provider and model billing stays visible inline, including the effective multiplier when available. The menu keeps current billing as direct, compact rows with a separate **Refresh Billing** action; hovering a provider row reveals account details. A refresh failure keeps the most recent successful snapshot visible and marks it as stale instead of clearing the values.
+
+Billing always tries the provider's direct endpoint first. **Browser billing fallback** is off by default and can be enabled in **Runtime Settings**. When enabled, a failed direct lookup may use an already-open same-origin `/keys` tab through the page context; it never reads Chrome Profile/Cookie files, creates or switches tabs, focuses or closes a tab, or starts Chrome. Chrome must allow **View > Developer > Allow JavaScript from Apple Events** for this optional path.
+
+The **Routes** view groups deployments by public model and shows order, provider/key, upstream ID, and explicit state: **Available**, **Unavailable**, **Uncertain**, **Not probed**, or **Disabled**. Route order controls change only the selected deployment's configured fallback position.
+
+Provider Base URLs may be entered as a host/root, with or without `/v1` and a trailing slash, or as a complete compatible endpoint such as `/v1/responses`, `/v1/chat/completions`, `/v1/messages`, `/v1/completions`, or their unversioned equivalents. The editor preserves an explicit endpoint, uses the same parsing for **Fetch /v1/models** and **Probe**, and replaces rather than duplicates endpoint suffixes.
 
 ### Capability Flags
 
@@ -191,7 +198,17 @@ Each deployment's `model_info` supports:
 - `upstream_url_surface` — generated mirror of the first ordered surface.
 - `supports_responses_web_search` / `supports_web_search` — web search capability.
 
-The model editor has one **Probe** action. For text models it checks the upstream Responses, Chat Completions, and Anthropic Messages APIs serially. **Upstream API order** means the fallback order from LiteLLM to the deployment endpoint; it does not change the client-facing API. Move a row to change priority and check it to enable that API. The default recommendation is Responses → Chat → Anthropic. When the recommendation already matches the numbered order, probing completes without an alert and leaves the enabled APIs unchanged. Known standalone image models probe only `/v1/images/generations`; an unconfigured new model is classified as an image model only when all three text APIs are definitively unavailable and the image probe succeeds.
+Each model deployment has its own **Probe** action. For text models it checks Responses, Chat Completions, and Anthropic Messages serially and records that model's availability without enabling or disabling the model. Probe recommends exactly one best available protocol: Anthropic for Claude-family model identifiers when available, otherwise Responses before Chat and Anthropic. Saving the recommendation selects only that protocol; additional checked protocols are reserved for explicit user selection. **Upstream API order** is the fallback order from LiteLLM to the deployment endpoint and does not change the client-facing API. Known standalone image models probe only `/v1/images/generations`; an unconfigured model may also test that endpoint only after all three text APIs are definitively unavailable.
+
+### Provider and Model Imports
+
+**Import Providers & Models** in the editor accepts only an explicit source and stages the result as a reviewable draft:
+
+- **Current Codex** reads the current `CODEX_HOME/config.toml`. It uses the current file-backed OpenAI credential only for the selected built-in OpenAI route or a selected custom provider that declares `requires_openai_auth = true`; it never resolves arbitrary provider environment variables.
+- **Choose File** accepts Codex, LiteLLM/OpenAI-compatible, and generic JSON/TOML/YAML; documented CLIProxyAPI `openai-compatibility` and `codex-api-key` data; and current CC Switch `.sql` text exports. SQL is parsed as text and is never executed.
+- **Paste Link** accepts a New API or CC Switch `ccswitch://v1/import` provider link through a masked field and standard input so its embedded key is not placed in process arguments.
+
+Imported providers and models are not written until **Apply Config**.
 
 ### Runtime Settings
 
@@ -208,9 +225,14 @@ Adjustable through the menu without editing config files:
 | Web fetch timeout | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 30 |
 | Vision bridge backend | `LITELLM_MENU_VISION_BRIDGE_BACKEND` | auto |
 | Vision bridge model | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
+| Browser billing fallback | `LITELLM_BROWSER_BILLING` | 0 (off) |
 | Computer facade backend | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
 | Computer facade max steps | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
 | Route recovery interval | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
+
+### Configuration Packages
+
+Use **Import / Export Config...** to choose the direction in one compact native panel. Export lets you select **Runtime Settings**, **Providers & Models**, or both. Packages are JSON files with restrictive `0600` permissions and can contain credentials. Import validates the selected package first: provider and route data becomes an editor draft, and runtime values are staged in the settings window. Nothing is written until the normal **Apply** or **Save** confirmation.
 
 ---
 
@@ -220,21 +242,22 @@ The `app.sh` script provides app-level control:
 
 ```bash
 ./app.sh open      # Launch or focus the menu app (builds if needed)
-./app.sh restart   # Rebuild, stop, and relaunch
-./app.sh close     # Stop service and quit the app
+./app.sh restart   # Refuse disruptive restart by default; protect active requests
+./app.sh restart --disruptive   # Rebuild, quit, and relaunch during a maintenance window
+./app.sh close     # Quit the app and stop its owned service
 ./app.sh version   # Print app version
 ```
 
-The `service.sh` script provides direct service control for source checkouts:
+Use the bundled `service.sh` for read-only status, validation, and diagnostics. App lifecycle is controlled through `app.sh`; the menu has no manual service stop or restart action.
 
 ```bash
-./service.sh status
-./service.sh start
-./service.sh stop
-./service.sh restart
-./service.sh tail
-./service.sh route-trace-html
+"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" status
+"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" validate
+"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" logs-summary
+"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" route-trace
 ```
+
+Use **Codex Settings...** in the menu to select a configured LiteLLM provider/model deployment and to manage the rest of the user-level Codex configuration.
 
 ---
 
@@ -276,11 +299,9 @@ MIT License. See [LICENSE](LICENSE).
 
 ---
 
----
-
 # LiteLLM Menu（中文）
 
-LiteLLM Menu 是一个原生 macOS 菜单栏应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、视觉桥接、网页搜索桥接、图像生成工具适配，以及 Codex 配置整合到一个由应用管理的本地端点中。
+LiteLLM Menu 是一个原生 macOS 菜单栏应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、视觉桥接、网页搜索桥接、图像生成工具适配，以及可选择模型的 Codex 配置整合到一个由应用管理的本地端点中。
 
 ---
 
@@ -288,18 +309,15 @@ LiteLLM Menu 是一个原生 macOS 菜单栏应用，用于运行和管理本地
 
 ### 原生菜单栏应用
 
-LiteLLM Menu 以 Swift 编写，作为 macOS 状态栏应用运行。菜单应用拥有本地 LiteLLM 代理进程的完整生命周期管理：启动、停止、重启和监控。无需 Docker 容器、数据库或系统 Python 安装。Homebrew 发布包已内置独立 Python 运行时与 LiteLLM 依赖，首次启动无需下载或编译软件包；源码构建仍保留内置 `uv` 作为开发兜底。
+LiteLLM Menu 以 Swift 编写，作为 macOS 状态栏应用运行。应用打开时会自动启动并监控其本地 LiteLLM 代理，退出前会关闭该代理。无需 Docker 容器、数据库或系统 Python 安装。Homebrew 发布包已内置独立 Python 运行时与 LiteLLM 依赖，首次启动无需下载或编译软件包；源码构建仍保留内置 `uv` 作为开发兜底。
 
-菜单提供以下功能的直接访问：
+原生菜单按任务分为三组：
 
-- 服务状态、启动、停止和重启
-- 模型配置编辑器（供应商、API 密钥、模型路由、部署顺序）
-- 运行时设置（超时、冷却、网页搜索限制、视觉桥接、computer facade）
-- Codex 配置（应用本地 LiteLLM 端点、恢复切换前配置）
-- WebDAV 同步启用/禁用和设置
-- 路由追踪开关和可视化 HTML 报告
-- 服务日志、配置监听日志和最近请求日志查看器
-- 登录时自启动
+- **App** — 控制登录时自动启动；应用打开期间会保持其所辖 LiteLLM 服务运行。
+- **Configuration** — 打开 **Providers & Models...**、**Codex Settings...** 或 **Runtime Settings...**，导入或导出配置包，并查看实时计费信息。
+- **Diagnostics** — 记录或查看路由追踪，检查恢复状态与最近请求，打开服务或配置监听日志，以及配置 WebDAV 同步。
+
+状态项始终保持中性的 `LL`，不会用颜色或符号表达异常。发生路由恢复时，悬停文字和菜单中的可点击恢复状态行会显示当前步骤、分类原因、尝试次数、心跳时间，以及恢复仍在推进还是可能卡住。
 
 ### 部署回退与路由
 
@@ -368,7 +386,8 @@ Facade 拦截 computer 动作调用，路由到已配置的后端，并返回观
 
 LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似 Responses API 客户端的定向优化：
 
-- **Codex 配置集成** — 菜单接管顶层 `model_provider` 当前选中的既有供应商，只切换该段必要的连接字段：`name = "OpenAI"`、`base_url`、`wire_api = "responses"`、`requires_openai_auth = true` 和 `OPENAI_API_KEY`。不会凭空创建供应商名称，也绝不修改 `model`。OpenAI 供应商身份会让 Codex 保留 standalone `web.run` 搜索，并通过本地 `/alpha/search` 端点执行。恢复状态只记录这些受管字段的原值，因此不会覆盖之后修改的模型、MCP、压缩或其他 Codex 设置。
+- **Codex Settings** — 单一草稿窗口把连接、行为、功能开关、权限、provider、MCP/plugin 与高级选项的结构化控制，同 `config.toml` / `auth.json` 的实时文本视图同步；选择 LiteLLM 部署只会暂存本地端点与密钥，直到点击 Apply 才会写入，且保留其余 Codex 设置和认证字段。
+- **Fast 默认 tier** — 当有效 `CODEX_HOME/config.toml` 同时包含 `service_tier = "fast"`（也兼容 `"priority"`）和 `[features].fast_mode = true` 时，Menu 只会为可可靠识别的 Codex 原生 `/v1/responses` 请求、且原始请求未提供 `service_tier` 时注入上游标准值 `"priority"`。配置文件每次请求按变更刷新，因此 Codex Settings 的 Apply 后下一请求生效；显式 tier 与非 Codex 流量绝不覆盖。已知边界：若 Desktop 在用户手动选择 Standard 后先把该选择剥为“字段缺失”，而配置仍为 Fast，网关无法仅从 HTTP 请求区分这种情形；此 shim 的明确开关是配置文件。
 - **压缩控制** — 请求预处理添加 Codex 所需的压缩相关元数据和头信息。
 - **推理强度兼容** — 上游返回表明 `xhigh` 推理强度不支持的错误时，代理以兼容强度级别（`high` 或 `max`）重试，并记录兼容重试。
 - **用量归一化** — `response.completed` 事件的 `usage` 块被归一化为 Codex 期望的架构（`input_tokens`、`output_tokens`、`input_tokens_details.cached_tokens`、`output_tokens_details.reasoning_tokens`、`total_tokens`），包括从 Chat Completions 的 `prompt_tokens`/`completion_tokens` 命名转换。
@@ -387,7 +406,7 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 
 ### 配置监听与验证
 
-由 launchd 支持的配置监听器监控 `config.yaml` 的变更。检测到变更后，验证配置，将验证通过的配置暂存到 `.litellm-runtime/config.yaml`，并要求显式的应用/重启操作才能激活。监听器不会在每次文件写入时静默重启服务。运行时服务始终从暂存的运行时配置启动，而非可编辑的源配置。
+由 launchd 支持的配置监听器监控 `config.yaml` 的变更。检测到变更后，验证配置并将验证通过的配置暂存到 `.litellm-runtime/config.yaml`；需通过显式的 Apply 操作激活。监听器不会在每次文件写入时静默重启服务。运行时服务始终从暂存的运行时配置启动，而非可编辑的源配置。
 
 ---
 
@@ -397,14 +416,15 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 
 - macOS 13.0 或更高版本
 - 预构建 Homebrew Cask 目前要求 Apple silicon Mac
-- 仅源码构建需要 [uv](https://docs.astral.sh/uv/)（也可设置 `LITELLM_UV_BIN` 指向自定义路径）
+- 源码构建需要 Xcode Command Line Tools（`xcode-select --install`）
+- 源码构建需要 [uv](https://docs.astral.sh/uv/)（也可设置 `LITELLM_UV_BIN` 指向自定义路径）
 
 ### Homebrew 安装（推荐）
 
-使用一条命令完成安装；如果已有 v1.0.1 之前的旧 tap，也会自动刷新：
+使用一条命令安装应用及其自带运行时：
 
 ```bash
-brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu && brew update --force && brew trust ysdj/litellm-menu && brew install --cask ysdj/litellm-menu/litellm-menu
+brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu && brew trust ysdj/litellm-menu && brew install --cask ysdj/litellm-menu/litellm-menu
 ```
 
 安装后直接从“应用程序”打开 **LiteLLM Menu**。以后更新只需运行 `brew upgrade --cask litellm-menu`。
@@ -437,9 +457,9 @@ LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
 
 1. 从菜单栏图标（"LL" 状态项）打开 LiteLLM Menu。
 2. Homebrew 应用直接从内置运行时启动本地 LiteLLM 代理；源码构建仅在需要时使用 `uv` 引导开发运行时。
-3. 点击 **Edit Models Config** 配置供应商、API 密钥、模型和部署顺序。
-4. 点击 **Apply Config**（或重启服务）暂存并激活配置。
-5. 可选：点击 **Configure Codex for LiteLLM** 将 Codex 指向本地端点。
+3. 点击 **Providers & Models...** 配置供应商、API 密钥、模型和部署顺序。
+4. 点击 **Apply Config** 暂存并激活配置。
+5. 如需让 Codex 通过 LiteLLM 运行，点击 **Codex Settings...**，在 **Connection & model** 中选择一个已配置的 provider/model 部署，然后点击 **Apply**。
 
 ---
 
@@ -449,7 +469,7 @@ LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
 
 ### 主要配置段
 
-- **`providers`** — 命名供应商组，包含 `api_base` 和 `api_keys`（每个密钥有 `name`、`value` 和 `enabled` 标志）。
+- **`providers`** — 命名供应商组，包含 `api_base` 和 `api_keys`（每个密钥只有 `name` 和 `value`；不再使用的密钥应直接删除）。
 - **`model_list`** — 模型组条目，包含 `litellm_params`（model、api_base、api_key、order）和 `model_info`（id、provider、route_key、api_key_name、能力标志）。
 - **`litellm_settings`** — 回调注册、`public_model_groups`、`drop_params`。
 - **`router_settings`** — 路由策略、重试策略、最大回退数、冷却配置。
@@ -457,7 +477,15 @@ LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
 
 模型编辑器将客户端看到的公开模型名与上游原始模型 ID 分开保存。LiteLLM 内部供应商前缀由第一个上游 API 协议自动派生（OpenAI Responses 或 Chat 使用 `openai`，Anthropic Messages 使用 `anthropic`），不再单独配置 adapter。这样可以把 GPT 兼容的公开路由映射到名称不同的 OpenAI-compatible 上游模型，同时保持上游 ID 不变。
 
-Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不带末尾斜杠，也可以直接填写 `/v1/responses`、`/v1/chat/completions`、`/v1/messages`、`/v1/completions` 及其无版本完整端点。编辑器会保留明确填写的端点，**Fetch /v1/models** 与 **Probe** 也使用同一解析逻辑，因此会替换已有端点后缀而不会重复拼接；Probe 会按优先级把全部成功协议保存为该部署的 fallback 链。
+### Providers & Models 编辑器
+
+**Providers** 视图将 provider 名称、计费信息和模型数量分列显示，并在 **Models** 中展示每个模型部署的计费信息和独立探测状态；上游 ID 与路由顺序保留在右侧部署表单和专用 **Routes** 视图中。Provider 与模型的余额会直接显示；上游提供倍率时，也会同时显示有效计费倍率。菜单中的 **Billing** 子菜单可展开查看 provider 与账户明细，并提供 **Refresh Now**。刷新失败时，界面保留最近一次成功快照并标记为过期，不会清空已有值。
+
+计费刷新始终先调用 provider 的直连接口，因此常规刷新不需要打开 Chrome。浏览器 fallback 默认关闭，可在 **Runtime Settings** 中明确打开；直连没有得到余额时，才会检查已打开的同源 `/keys` 标签，在页面上下文发起请求并返回脱敏 quota、group 和倍率。它不会读取 Chrome 的 Cookie/Profile 文件，不会新建、切换、聚焦或关闭标签，也不会启动未运行的 Chrome。启用 fallback 时，Chrome 需要允许 **View > Developer > Allow JavaScript from Apple Events**；未授权会安全地保留直连结果。
+
+**Routes** 视图按公开模型对部署分组，显示顺序、provider/API key、上游 ID 和明确状态：**Available**、**Unavailable**、**Uncertain**、**Not probed** 或 **Disabled**。路由顺序按钮只修改所选部署的配置回退位置。
+
+Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不带末尾斜杠，也可以直接填写 `/v1/responses`、`/v1/chat/completions`、`/v1/messages`、`/v1/completions` 及其无版本完整端点。编辑器会保留明确填写的端点，**Fetch /v1/models** 与 **Probe** 也使用同一解析逻辑，因此会替换已有端点后缀而不会重复拼接。
 
 ### 能力标志
 
@@ -469,7 +497,17 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 - `upstream_url_surface` — 自动生成的第一项镜像。
 - `supports_responses_web_search` / `supports_web_search` — 网页搜索能力。
 
-模型编辑器只保留一个 **Probe** 操作。文本模型会依次探测上游 Responses、Chat Completions 和 Anthropic Messages API。**上游 API 顺序** 指 LiteLLM 到该部署端点的回退顺序，不会改变客户端接口。移动行调整优先级，勾选决定是否启用该 API。默认推荐顺序为 Responses → Chat → Anthropic。当推荐顺序已与编号顺序一致时，探测不会弹窗，也不会改变当前启用状态。已知的独立图片模型只探测 `/v1/images/generations`；尚未配置的新模型只有在三个文本 API 都明确不可用且图片探针成功时，才会被识别为图片模型。
+每个模型部署都有独立的 **Probe** 操作。文本模型会依次探测 Responses、Chat Completions 和 Anthropic Messages，并只记录该模型的可用性，不会启用、禁用或重写模型。手动探测不会静默改变协议勾选或顺序；当探测出的支持协议与当前选择不同时，编辑器会显示建议，只有明确选择 **Save Supported Protocols** 才修改草稿，选择 **Keep Current Order** 则保持原样。**上游 API 顺序** 指 LiteLLM 到该部署端点的回退顺序，不会改变客户端接口。已知的独立图片模型只探测 `/v1/images/generations`；尚未配置的模型也只会在三个文本 API 都明确不可用后才尝试该端点。
+
+### Provider 与模型导入
+
+编辑器中的 **Import Providers & Models** 只接受显式选择的来源，并将结果暂存为可检查的草稿：
+
+- **Current Codex** 读取当前 `CODEX_HOME/config.toml`。只有选中内置 OpenAI 路由，或选中的自定义 provider 明确设置 `requires_openai_auth = true` 时，才使用当前文件型 OpenAI 凭据；不会解析任意 provider 的环境变量。
+- **Choose File** 支持 Codex、LiteLLM/OpenAI-compatible 及通用 JSON/TOML/YAML，CLIProxyAPI 文档格式中的 `openai-compatibility` 与 `codex-api-key`，以及当前 CC Switch `.sql` 文本导出。SQL 只按文本解析，绝不会执行。
+- **Paste Link** 通过掩码输入框和标准输入接收 New API 或 CC Switch 的 `ccswitch://v1/import` provider 链接，内嵌 API key 不会进入进程参数。
+
+导入的 provider 和模型只有点击 **Apply Config** 后才会写入。
 
 ### 运行时设置
 
@@ -488,7 +526,12 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 | 视觉桥接模型 | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
 | Computer facade 后端 | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
 | Computer facade 最大步数 | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
+| 浏览器计费回退 | `LITELLM_BROWSER_BILLING` | 0（关闭） |
 | 路由恢复间隔 | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
+
+### 配置包
+
+菜单直接提供 **Import Configuration...** 与 **Export Configuration...**；导出时可选择 **Runtime Settings**、**Providers & Models** 或两者。配置包为 JSON 文件，权限为 `0600`，可能包含凭据。导入会先校验：provider 与路由只替换编辑器草稿，运行时值只暂存到设置窗口；只有在正常点击 **Apply** 或 **Save** 后才会写入配置。
 
 ---
 
@@ -498,21 +541,22 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 
 ```bash
 ./app.sh open      # 启动或聚焦菜单应用（需要时构建）
-./app.sh restart   # 重新构建、停止并重启
-./app.sh close     # 停止服务并退出应用
+./app.sh restart   # 默认拒绝有中断风险的重启，保护正在进行的请求
+./app.sh restart --disruptive   # 维护窗口内重新构建、退出并重新启动应用
+./app.sh close     # 退出应用并停止其所辖服务
 ./app.sh version   # 输出应用版本
 ```
 
-`service.sh` 脚本为源码检出目录提供直接服务控制：
+内置的 `service.sh` 用于只读状态、校验和诊断。应用生命周期通过 `app.sh` 控制；菜单不提供手动停止或重启服务的操作。
 
 ```bash
-./service.sh status
-./service.sh start
-./service.sh stop
-./service.sh restart
-./service.sh tail
-./service.sh route-trace-html
+"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" status
+"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" validate
+"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" logs-summary
+"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" route-trace
 ```
+
+请在菜单中使用 **Codex Settings...** 选择已配置的 LiteLLM provider/model 部署，并管理用户级 Codex 配置。
 
 ---
 

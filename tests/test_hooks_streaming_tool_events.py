@@ -1517,11 +1517,17 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertEqual(calls[0]["input"], request_data["input"])
         self.assertTrue(calls[0]["stream"])
         self.assertEqual(calls[0]["_target_order"], 1)
-        self.assertNotIn("_excluded_deployment_ids", calls[0])
+        # The default same-route retry budget is zero: after the first
+        # recoverable failure, advance directly to the verified peer.
+        self.assertEqual(calls[0]["_excluded_deployment_ids"], ["order1-a"])
+        self.assertEqual(
+            calls[0]["_litellm_menu_verified_fallback_deployment_ids"],
+            ["order1-b"],
+        )
         self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
         self.assertNotIn("metadata", calls[0])
-        self.assertFalse(hasattr(router, "seen_model_name"))
-        self.assertFalse(hasattr(router, "seen_team_id"))
+        self.assertEqual(router.seen_model_name, "default-chat")
+        self.assertEqual(router.seen_team_id, "team-a")
         self.assertEqual(error.failed_deployment_id, "order1-a")
         self.assertEqual(error.failed_deployment_order, 1)
         self.assertTrue(hooks._should_retry_same_deployment_before_fallback(error))

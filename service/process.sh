@@ -27,6 +27,132 @@ native_running() {
   native_pid_from_file >/dev/null 2>&1
 }
 
+native_owner_file_path() {
+  if [[ -n "${NATIVE_OWNER_FILE:-}" ]]; then
+    printf '%s\n' "$NATIVE_OWNER_FILE"
+    return 0
+  fi
+  [[ -n "${NATIVE_PID_FILE:-}" ]] || return 1
+  printf '%s/litellm.owner\n' "$(dirname "$NATIVE_PID_FILE")"
+}
+
+native_owner_record() {
+  local owner_file owner_pid native_pid extra
+  owner_file="$(native_owner_file_path)" || return 1
+  [[ -f "$owner_file" ]] || return 1
+  IFS=' ' read -r owner_pid native_pid extra < "$owner_file" || return 1
+  [[ "$owner_pid" =~ ^[0-9]+$ && "$native_pid" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+  printf '%s %s\n' "$owner_pid" "$native_pid"
+}
+
+native_owned_by_menu_pid() {
+  local expected_owner="$1" record owner_pid native_pid current_pid
+  [[ "$expected_owner" =~ ^[0-9]+$ ]] || return 1
+  process_is_menu_app_pid "$expected_owner" || return 1
+  record="$(native_owner_record)" || return 1
+  read -r owner_pid native_pid <<<"$record"
+  current_pid="$(native_pid_from_file)" || return 1
+  [[ "$owner_pid" == "$expected_owner" && "$native_pid" == "$current_pid" ]]
+}
+
+write_native_lifecycle_records() {
+  local owner_pid="$1" native_pid="$2" owner_file owner_temp pid_temp
+  [[ "$owner_pid" =~ ^[0-9]+$ && "$native_pid" =~ ^[0-9]+$ ]] || return 1
+  owner_file="$(native_owner_file_path)" || return 1
+  mkdir -p "$(dirname "$NATIVE_PID_FILE")" "$(dirname "$owner_file")"
+  owner_temp="${owner_file}.tmp.$$"
+  pid_temp="${NATIVE_PID_FILE}.tmp.$$"
+  printf '%s %s\n' "$owner_pid" "$native_pid" > "$owner_temp"
+  printf '%s\n' "$native_pid" > "$pid_temp"
+  chmod 600 "$owner_temp" "$pid_temp"
+  mv -f "$owner_temp" "$owner_file"
+  mv -f "$pid_temp" "$NATIVE_PID_FILE"
+}
+
+native_owner_for_pid() {
+  local expected_native_pid="$1" record owner_pid recorded_native_pid
+  [[ "$expected_native_pid" =~ ^[0-9]+$ ]] || return 1
+  record="$(native_owner_record)" || return 1
+  read -r owner_pid recorded_native_pid <<<"$record"
+  [[ "$recorded_native_pid" == "$expected_native_pid" ]] || return 1
+  printf '%s\n' "$owner_pid"
+}
+
+adopt_native_service_for_menu_pid() {
+  local new_owner_pid="$1" native_pid record recorded_owner_pid recorded_native_pid
+  [[ "$new_owner_pid" =~ ^[0-9]+$ ]] || return 1
+  process_is_menu_app_pid "$new_owner_pid" || return 1
+  native_pid="$(native_pid_from_file 2>/dev/null || true)"
+  [[ -n "$native_pid" ]] || native_pid="$(native_master_pid)" || return 1
+  native_pid_alive "$native_pid" || return 1
+
+  record="$(native_owner_record || true)"
+  if [[ -z "$record" ]]; then
+    # A retained service can outlive the process that was about to maintain its
+    # lifecycle records. Recover the records instead of restarting the proxy.
+    write_native_lifecycle_records "$new_owner_pid" "$native_pid"
+    return $?
+  fi
+  read -r recorded_owner_pid recorded_native_pid <<<"$record"
+
+  if [[ "$recorded_owner_pid" == "$new_owner_pid" && "$recorded_native_pid" == "$native_pid" ]]; then
+    write_native_lifecycle_records "$new_owner_pid" "$native_pid"
+    return $?
+  fi
+  # A second live menu process must not steal a service from its current owner.
+  process_is_menu_app_pid "$recorded_owner_pid" && return 1
+  write_native_lifecycle_records "$new_owner_pid" "$native_pid"
+}
+
+watch_native_owner() {
+  local native_pid="$1" owner_pid="$2" replacement_owner
+  local owner_missing_since=-1 owner_grace_seconds="${OWNER_GRACE_SECONDS:-30}"
+  local log_rotation_countdown=0 now_seconds
+  [[ "$owner_grace_seconds" =~ ^[0-9]+$ ]] || owner_grace_seconds=30
+  while kill -0 "$native_pid" >/dev/null 2>&1; do
+    if (( log_rotation_countdown <= 0 )); then
+      rotate_log_if_needed "$LOG_FILE"
+      log_rotation_countdown=30
+    else
+      log_rotation_countdown=$((log_rotation_countdown - 1))
+    fi
+
+    if process_is_menu_app_pid "$owner_pid"; then
+      owner_missing_since=-1
+    else
+      replacement_owner="$(native_owner_for_pid "$native_pid" || true)"
+      if [[ "$replacement_owner" != "$owner_pid" ]] \
+        && process_is_menu_app_pid "$replacement_owner"; then
+        {
+          printf '[%s] LiteLLM Menu owner handoff: pid %s -> pid %s for native LiteLLM service pid %s\n' \
+            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$owner_pid" "$replacement_owner" "$native_pid"
+        } >>"$LOG_FILE"
+        owner_pid="$replacement_owner"
+        owner_missing_since=-1
+      else
+        now_seconds="$SECONDS"
+        if (( owner_missing_since < 0 )); then
+          owner_missing_since="$now_seconds"
+          {
+            printf '[%s] LiteLLM Menu owner pid %s exited; retaining native LiteLLM service pid %s for recovery or handoff\n' \
+              "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$owner_pid" "$native_pid"
+          } >>"$LOG_FILE"
+        elif (( now_seconds - owner_missing_since >= owner_grace_seconds )); then
+          {
+            printf '[%s] LiteLLM Menu owner pid %s was not replaced within %ss; stopping native LiteLLM service pid %s\n' \
+              "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$owner_pid" "$owner_grace_seconds" "$native_pid"
+          } >>"$LOG_FILE"
+          kill "$native_pid" >/dev/null 2>&1 || true
+          sleep 2
+          kill -KILL "$native_pid" >/dev/null 2>&1 || true
+          return 0
+        fi
+      fi
+    fi
+    sleep 1
+  done
+}
+
 native_port_pids() {
   local pid
   command -v lsof >/dev/null 2>&1 || return 0
@@ -43,20 +169,32 @@ native_pid_candidates() {
   } | awk 'NF && !seen[$0]++'
 }
 
+native_live_pid_candidates() {
+  local pid
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    native_pid_alive "$pid" && printf '%s\n' "$pid"
+  done < <(native_pid_candidates)
+}
+
 process_ppid() {
   local pid="$1"
   ps -p "$pid" -o ppid= 2>/dev/null | awk 'NF { print $1; exit }'
 }
 
 native_master_pid() {
-  local pid candidates ppid
-  if pid="$(native_pid_from_file 2>/dev/null)"; then
-    echo "$pid"
+  local pid recorded_pid candidates ppid
+  recorded_pid="$(native_pid_from_file 2>/dev/null || true)"
+  candidates="$(native_port_pids || true)"
+  if [[ -z "$candidates" ]]; then
+    [[ -n "$recorded_pid" ]] || return 1
+    echo "$recorded_pid"
     return 0
   fi
-
-  candidates="$(native_port_pids || true)"
-  [[ -n "$candidates" ]] || return 1
+  if [[ -n "$recorded_pid" ]] && pid_list_contains "$recorded_pid" <<<"$candidates"; then
+    echo "$recorded_pid"
+    return 0
+  fi
 
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
@@ -71,10 +209,12 @@ native_master_pid() {
 }
 
 wait_for_managed_health() {
-  local attempt max_attempts
+  local expected_owner="${1:-}" attempt max_attempts
   max_attempts=$((HEALTH_WAIT_SECONDS * 10))
   for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-    if health_ok && { native_running || [[ -n "$(native_port_pids)" ]]; }; then
+    if health_ok \
+      && { native_running || [[ -n "$(native_port_pids)" ]]; } \
+      && { [[ -z "$expected_owner" ]] || native_owned_by_menu_pid "$expected_owner"; }; then
       return 0
     fi
     sleep 0.1
@@ -90,6 +230,28 @@ wait_for_native_port_released() {
   max_attempts=$((HEALTH_WAIT_SECONDS * 10))
   for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     pids="$(native_port_pids || true)"
+    [[ -z "$pids" ]] && return 0
+    request_native_process_stop_list "$pids" >/dev/null 2>&1 || true
+    if (( attempt >= force_after_attempt )); then
+      force_native_process_stop_list "$pids" >/dev/null 2>&1 || true
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_for_native_processes_stopped() {
+  local attempt max_attempts pids force_after_attempt requested_max_attempts
+  force_after_attempt="${1:-20}"
+  requested_max_attempts="${2:-$((HEALTH_WAIT_SECONDS * 10))}"
+  [[ "$force_after_attempt" =~ ^[0-9]+$ ]] || force_after_attempt=20
+  [[ "$requested_max_attempts" =~ ^[0-9]+$ ]] || requested_max_attempts=$((HEALTH_WAIT_SECONDS * 10))
+  (( force_after_attempt > 0 )) || force_after_attempt=1
+  (( requested_max_attempts > 0 )) || requested_max_attempts=1
+  max_attempts="$requested_max_attempts"
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    pids="$(native_live_pid_candidates || true)"
     [[ -z "$pids" ]] && return 0
     request_native_process_stop_list "$pids" >/dev/null 2>&1 || true
     if (( attempt >= force_after_attempt )); then
@@ -168,9 +330,31 @@ with_service_lifecycle_lock() {
 }
 
 run_native_process() {
-  local owner_pid route_trace native_pid watchdog_pid exit_code
+  local owner_pid native_pid watchdog_pid exit_code
+  local same_deployment_retries recovery_policy_balance recovery_policy_rate_limit
+  local recovery_policy_server recovery_policy_network recovery_policy_stream_start_timeout
+  local recovery_policy_stream_idle_timeout recovery_policy_request_error
   owner_pid="$(require_menu_app_owner "run-native")" || exit $?
-  route_trace="$(route_trace_effective_value)"
+  if health_ok; then
+    if adopt_native_service_for_menu_pid "$owner_pid"; then
+      echo "LiteLLM retained the healthy native service on http://127.0.0.1:$PORT; duplicate native start skipped"
+      return 0
+    fi
+    if [[ -n "$(native_port_pids)" ]]; then
+      echo "LiteLLM is already healthy under another live menu owner; duplicate native start skipped"
+      return 0
+    fi
+    echo "Port $PORT is serving LiteLLM health, but no owned native process could be identified." >&2
+    return 1
+  fi
+  same_deployment_retries="${SAME_DEPLOYMENT_RETRIES:-0}"
+  recovery_policy_balance="${RECOVERY_POLICY_BALANCE:-recovery_cooldown}"
+  recovery_policy_rate_limit="${RECOVERY_POLICY_RATE_LIMIT:-recovery_cooldown}"
+  recovery_policy_server="${RECOVERY_POLICY_SERVER:-recovery_cooldown}"
+  recovery_policy_network="${RECOVERY_POLICY_NETWORK:-recovery}"
+  recovery_policy_stream_start_timeout="${RECOVERY_POLICY_STREAM_START_TIMEOUT:-recovery_cooldown}"
+  recovery_policy_stream_idle_timeout="${RECOVERY_POLICY_STREAM_IDLE_TIMEOUT:-recovery}"
+  recovery_policy_request_error="${RECOVERY_POLICY_REQUEST_ERROR:-error}"
   ensure_native_environment
   if [[ ! -f "$RUNTIME_CONFIG" ]]; then
     sync_runtime_config
@@ -190,7 +374,7 @@ run_native_process() {
 
   {
     printf '\n[%s] running native LiteLLM service on %s:%s with %s workers; recycling after %s requests\n' \
-      "$(date '+%Y-%m-%d %H:%M:%S')" "$HOST" "$PORT" "$NATIVE_WORKERS" "$NATIVE_MAX_REQUESTS_BEFORE_RESTART"
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$HOST" "$PORT" "$NATIVE_WORKERS" "$NATIVE_MAX_REQUESTS_BEFORE_RESTART"
   } >>"$LOG_FILE"
 
   cd "$ROOT"
@@ -207,6 +391,14 @@ run_native_process() {
     LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS="$CODEX_COMPACTION_START_TIMEOUT_SECONDS" \
     LITELLM_MENU_RECOVERY_MAX_SECONDS="$RECOVERY_MAX_SECONDS" \
     LITELLM_MENU_RECOVERY_INTERVAL_SECONDS="$RECOVERY_INTERVAL_SECONDS" \
+    LITELLM_MENU_SAME_DEPLOYMENT_RETRIES="$same_deployment_retries" \
+    LITELLM_MENU_RECOVERY_POLICY_BALANCE="$recovery_policy_balance" \
+    LITELLM_MENU_RECOVERY_POLICY_RATE_LIMIT="$recovery_policy_rate_limit" \
+    LITELLM_MENU_RECOVERY_POLICY_SERVER="$recovery_policy_server" \
+    LITELLM_MENU_RECOVERY_POLICY_NETWORK="$recovery_policy_network" \
+    LITELLM_MENU_RECOVERY_POLICY_STREAM_START_TIMEOUT="$recovery_policy_stream_start_timeout" \
+    LITELLM_MENU_RECOVERY_POLICY_STREAM_IDLE_TIMEOUT="$recovery_policy_stream_idle_timeout" \
+    LITELLM_MENU_RECOVERY_POLICY_REQUEST_ERROR="$recovery_policy_request_error" \
     LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS="$WEB_FETCH_TIMEOUT_SECONDS" \
     LITELLM_MENU_WEB_SEARCH_MAX_RESULTS="$WEB_SEARCH_MAX_RESULTS" \
     LITELLM_MENU_WEB_SEARCH_READ_RESULTS="$WEB_SEARCH_READ_RESULTS" \
@@ -232,10 +424,9 @@ run_native_process() {
     LITELLM_MENU_COMPUTER_FACADE_ACTION_DENYLIST="$COMPUTER_FACADE_ACTION_DENYLIST" \
     LITELLM_MENU_COMPUTER_FACADE_REQUIRE_OBSERVATION="$COMPUTER_FACADE_REQUIRE_OBSERVATION" \
     LITELLM_LOCAL_MODEL_COST_MAP="$LOCAL_MODEL_COST_MAP" \
+    CODEX_HOME="${CODEX_HOME:-$HOME/.codex}" \
     LITELLM_MENU_DISABLE_SYSTEM_PROXY_LOOKUP="${LITELLM_MENU_DISABLE_SYSTEM_PROXY_LOOKUP:-0}" \
     LITELLM_TEMPLATE_ROOT="$TEMPLATE_ROOT" \
-    LITELLM_ROUTE_TRACE_STATE_FILE="$ROUTE_TRACE_STATE_FILE" \
-    LITELLM_MENU_ROUTE_TRACE="$route_trace" \
     LITELLM_MENU_ROUTE_TRACE_PREVIEW_CHARS="$ROUTE_TRACE_PREVIEW_CHARS" \
     LITELLM_USE_SYSTEM_PROXIES="$(use_system_proxies_value)" \
     LITELLM_WORKER_STARTUP_HOOKS="${LITELLM_WORKER_STARTUP_HOOKS:+${LITELLM_WORKER_STARTUP_HOOKS},}litellm_menu.search_endpoint:register" \
@@ -249,30 +440,15 @@ run_native_process() {
       --telemetry "$PROXY_TELEMETRY" \
       --run_gunicorn &
   native_pid="$!"
-  printf '%s\n' "$native_pid" > "$NATIVE_PID_FILE"
-  chmod 600 "$NATIVE_PID_FILE"
+  if ! write_native_lifecycle_records "$owner_pid" "$native_pid"; then
+    echo "Could not record LiteLLM service ownership." >&2
+    kill "$native_pid" >/dev/null 2>&1 || true
+    wait "$native_pid" >/dev/null 2>&1 || true
+    exit 1
+  fi
 
   (
-    log_rotation_countdown=0
-    while kill -0 "$native_pid" >/dev/null 2>&1; do
-      if (( log_rotation_countdown <= 0 )); then
-        rotate_log_if_needed "$LOG_FILE"
-        log_rotation_countdown=30
-      else
-        log_rotation_countdown=$((log_rotation_countdown - 1))
-      fi
-      if ! process_is_menu_app_pid "$owner_pid"; then
-        {
-          printf '[%s] LiteLLM Menu owner pid %s exited; stopping native LiteLLM service pid %s\n' \
-            "$(date '+%Y-%m-%d %H:%M:%S')" "$owner_pid" "$native_pid"
-        } >>"$LOG_FILE"
-        kill "$native_pid" >/dev/null 2>&1 || true
-        sleep 2
-        kill -KILL "$native_pid" >/dev/null 2>&1 || true
-        exit 0
-      fi
-      sleep 1
-    done
+    watch_native_owner "$native_pid" "$owner_pid"
   ) &
   watchdog_pid="$!"
 
@@ -284,11 +460,14 @@ run_native_process() {
   }
   trap cleanup_native_child INT TERM
 
-  wait "$native_pid"
-  exit_code="$?"
+  if wait "$native_pid"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
   kill "$watchdog_pid" >/dev/null 2>&1 || true
   wait "$watchdog_pid" >/dev/null 2>&1 || true
-  rm -f "$NATIVE_PID_FILE"
+  clear_native_pid_file_if_stale_or_targeted "$native_pid"
   exit "$exit_code"
 }
 
@@ -301,34 +480,44 @@ pid_list_contains() {
   return 1
 }
 
+clear_native_owner_file_if_stale_or_targeted() {
+  local pids="$1" owner_file record owner_pid native_pid
+  owner_file="$(native_owner_file_path)" || return 0
+  [[ -f "$owner_file" ]] || return 0
+  record="$(native_owner_record || true)"
+  if [[ -z "$record" ]]; then
+    rm -f "$owner_file"
+    return 0
+  fi
+  read -r owner_pid native_pid <<<"$record"
+  if pid_list_contains "$native_pid" <<<"$pids"; then
+    rm -f "$owner_file"
+    return 0
+  fi
+  native_pid_alive "$native_pid" || rm -f "$owner_file"
+}
+
 clear_native_pid_file_if_stale_or_targeted() {
   local pids="$1" current_pid
-  [[ -f "$NATIVE_PID_FILE" ]] || return 0
+  if [[ ! -f "$NATIVE_PID_FILE" ]]; then
+    clear_native_owner_file_if_stale_or_targeted "$pids"
+    return 0
+  fi
   current_pid="$(tr -d '[:space:]' < "$NATIVE_PID_FILE" 2>/dev/null || true)"
   if [[ -z "$current_pid" ]]; then
     rm -f "$NATIVE_PID_FILE"
+    clear_native_owner_file_if_stale_or_targeted "$pids"
     return 0
   fi
   if pid_list_contains "$current_pid" <<<"$pids"; then
+    clear_native_owner_file_if_stale_or_targeted "$pids"
     rm -f "$NATIVE_PID_FILE"
     return 0
   fi
-  native_pid_alive "$current_pid" || rm -f "$NATIVE_PID_FILE"
-}
-
-stop_native_process_list() {
-  local pids="$1" pid
-  if [[ -z "$pids" ]]; then
-    clear_native_pid_file_if_stale_or_targeted ""
-    return 1
+  if ! native_pid_alive "$current_pid"; then
+    rm -f "$NATIVE_PID_FILE"
   fi
-
-  while IFS= read -r pid; do
-    [[ -n "$pid" && "$pid" != "$$" ]] || continue
-    kill -KILL "$pid" >/dev/null 2>&1 || true
-  done <<<"$pids"
-
-  clear_native_pid_file_if_stale_or_targeted "$pids"
+  clear_native_owner_file_if_stale_or_targeted "$pids"
 }
 
 request_native_process_stop_list() {
@@ -364,18 +553,6 @@ request_native_processes_to_stop() {
   request_native_process_stop_list "$pids"
 }
 
-launch_agent_loaded() {
-  launchctl print "$LAUNCHCTL_DOMAIN/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1
-}
-
-bootout_launch_agent() {
-  launchctl bootout "$LAUNCHCTL_DOMAIN/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 \
-    || launchctl bootout "$LAUNCHCTL_DOMAIN" "$LAUNCH_AGENT_PLIST" >/dev/null 2>&1 \
-    || launchctl bootout "$LAUNCHCTL_DOMAIN" "$SESSION_LAUNCH_AGENT_PLIST" >/dev/null 2>&1 \
-    || launchctl bootout "$LAUNCHCTL_DOMAIN" "$AUTOSTART_LAUNCH_AGENT_PLIST" >/dev/null 2>&1 \
-    || true
-}
-
 bootstrap_launch_agent() {
   local plist="$1" attempt output status
   for ((attempt = 1; attempt <= 10; attempt++)); do
@@ -391,18 +568,6 @@ bootstrap_launch_agent() {
   done
 }
 
-bool_xml() {
-  if [[ "$(normalize_bool "${1:-}")" == "1" ]]; then
-    echo "<true/>"
-  else
-    echo "<false/>"
-  fi
-}
-
-autostart_enabled() {
-  [[ -f "$AUTOSTART_STATE_FILE" ]]
-}
-
 start_native_detached() {
   local owner_pid="${1:-}"
   if [[ -z "$owner_pid" ]]; then
@@ -412,26 +577,30 @@ start_native_detached() {
   rotate_log_if_needed "$LOG_FILE"
   touch "$LOG_FILE"
   chmod 600 "$LOG_FILE" 2>/dev/null || true
-  LITELLM_MENU_OWNER_PID="$owner_pid" "$NATIVE_PYTHON" - "$TEMPLATE_ROOT/service.sh" "$LOG_FILE" "$ROOT" <<'PY'
+  local log_runner="$TEMPLATE_ROOT/service/timestamp_log_runner.py"
+  if [[ ! -f "$log_runner" ]]; then
+    echo "Missing LiteLLM service log runner." >&2
+    return 1
+  fi
+  LITELLM_MENU_OWNER_PID="$owner_pid" "$NATIVE_PYTHON" - "$log_runner" "$TEMPLATE_ROOT/service.sh" "$LOG_FILE" "$ROOT" <<'PY'
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
 
-script, log_file, root = sys.argv[1:4]
+runner, script, log_file, root = sys.argv[1:5]
 env = os.environ.copy()
-with open(log_file, "ab", buffering=0) as log:
-    subprocess.Popen(
-        ["/bin/bash", script, "run-native"],
-        cwd=root,
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        env=env,
-        close_fds=True,
-        start_new_session=True,
-    )
+subprocess.Popen(
+    [sys.executable, runner, script, log_file, root],
+    cwd=root,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    env=env,
+    close_fds=True,
+    start_new_session=True,
+)
 PY
 }
 
@@ -526,25 +695,51 @@ start_server() {
   local owner_pid
   owner_pid="$(require_menu_app_owner "start")" || return $?
   ensure_runtime_layout
-  if ! webdav_sync_enabled && runtime_config_matches_source && managed_server_reachable; then
+  if managed_server_reachable "$owner_pid"; then
     clear_state
     echo "LiteLLM already running on http://127.0.0.1:$PORT with native worker target $NATIVE_WORKERS"
     return 0
+  fi
+  if health_ok; then
+    # A config watcher only stages changes for an explicit Apply. Do not turn
+    # menu-process recovery into a proxy restart because a staged config is
+    # pending, lifecycle records are missing, or an older menu owner overlaps.
+    if adopt_native_service_for_menu_pid "$owner_pid"; then
+      clear_state
+      echo "LiteLLM adopted the healthy native service on http://127.0.0.1:$PORT"
+      return 0
+    fi
+    if [[ -n "$(native_port_pids)" ]]; then
+      clear_state
+      echo "LiteLLM is healthy under another live menu owner; leaving the native service untouched"
+      return 0
+    fi
+    echo "Port $PORT is serving LiteLLM health, but it is not managed by this app." >&2
+    return 1
   fi
 
   ensure_native_environment || exit 1
   sync_runtime_config || exit 1
 
-  if managed_server_reachable; then
+  if managed_server_reachable "$owner_pid"; then
     clear_state
     echo "LiteLLM already running on http://127.0.0.1:$PORT with native worker target $NATIVE_WORKERS"
     return 0
-  elif health_ok && [[ -z "$(native_port_pids)" ]]; then
+  elif health_ok; then
+    if adopt_native_service_for_menu_pid "$owner_pid"; then
+      clear_state
+      echo "LiteLLM adopted the healthy native service on http://127.0.0.1:$PORT"
+      return 0
+    fi
+    if [[ -n "$(native_port_pids)" ]]; then
+      clear_state
+      echo "LiteLLM is healthy under another live menu owner; leaving the native service untouched"
+      return 0
+    fi
     echo "Port $PORT is already serving LiteLLM health, but it is not managed by this app." >&2
-    exit 1
+    return 1
   fi
 
-  bootout_launch_agent
   request_native_processes_to_stop >/dev/null 2>&1 || true
   if ! wait_for_native_port_released 5; then
     write_state unhealthy
@@ -555,7 +750,7 @@ start_server() {
   write_state starting
   start_service_process "$owner_pid"
 
-  if wait_for_managed_health; then
+  if wait_for_managed_health "$owner_pid"; then
     clear_state
     echo "LiteLLM started on http://127.0.0.1:$PORT with $NATIVE_WORKERS native workers"
     return 0
@@ -568,11 +763,16 @@ start_server() {
 
 stop_server() {
   local target_pids
-  target_pids="$(native_pid_candidates || true)"
-  stop_native_process_list "$target_pids" >/dev/null 2>&1 || true
-  if [[ ! -f "$AUTOSTART_STATE_FILE" ]]; then
-    rm -f "$LAUNCH_AGENT_PLIST" "$SESSION_LAUNCH_AGENT_PLIST"
+  target_pids="$(native_live_pid_candidates || true)"
+  if [[ -n "$target_pids" ]]; then
+    request_native_process_stop_list "$target_pids" >/dev/null 2>&1 || true
+    if ! wait_for_native_processes_stopped 5 100; then
+      write_state unhealthy
+      print_native_health_failure "Timed out waiting for native LiteLLM processes to stop."
+      return 1
+    fi
   fi
+  clear_native_pid_file_if_stale_or_targeted ""
   clear_state
   echo "LiteLLM stopped"
 }
@@ -583,7 +783,6 @@ restart_server() {
   ensure_native_environment || return 1
   sync_runtime_config || return 1
   write_state starting
-  bootout_launch_agent
   request_native_processes_to_stop >/dev/null 2>&1 || true
   if ! wait_for_native_port_released 5; then
     write_state unhealthy
@@ -593,7 +792,7 @@ restart_server() {
   clear_transient_routing_state || return 1
   start_service_process "$owner_pid"
 
-  if wait_for_managed_health && wait_for_runtime_config; then
+  if wait_for_managed_health "$owner_pid" && wait_for_runtime_config; then
     write_runtime_reload_fingerprint || true
     clear_state
     echo "LiteLLM restarted on http://127.0.0.1:$PORT with $NATIVE_WORKERS native workers; runtime routes verified"

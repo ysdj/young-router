@@ -4,6 +4,78 @@ from hook_test_utils import *
 
 
 class HookRoutingTests(HookTestCase):
+    def test_recovery_diagnostic_classifies_user_actionable_failures_without_error_text(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        cases = [
+            (RuntimeError("insufficient credits for this account"), "billing"),
+            (RuntimeError("API key unauthorized"), "authentication"),
+            (RuntimeError("Cannot connect to host api.example.test"), "network"),
+            (RuntimeError("rate limit exceeded"), "rate_limit"),
+            (TimeoutError("upstream request timed out"), "timeout"),
+            (RuntimeError("temporary upstream issue"), "unknown"),
+        ]
+        for error, expected_kind in cases:
+            with self.subTest(expected_kind=expected_kind):
+                diagnostic = hooks._recovery_diagnostic(error)
+                self.assertEqual(diagnostic["kind"], expected_kind)
+                self.assertIn("title", diagnostic)
+                self.assertIn("detail", diagnostic)
+                self.assertNotIn("api.example.test", json.dumps(diagnostic))
+
+        forbidden = RuntimeError("provider rejected secret-token-should-not-appear")
+        diagnostic = hooks._recovery_diagnostic(forbidden)
+        self.assertNotIn("secret-token-should-not-appear", json.dumps(diagnostic))
+
+    def test_recovery_policy_defaults_match_error_boundaries(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        balance = RuntimeError("insufficient account balance")
+        balance.status_code = 403
+        rate_limit = RuntimeError("rate limit exceeded")
+        rate_limit.status_code = 429
+        overload = RuntimeError("upstream overloaded")
+        overload.status_code = 503
+        network = RuntimeError("Cannot connect to host api.example.test")
+        network.status_code = 500
+        start_timeout = TimeoutError("stream did not start")
+        start_timeout.status_code = 504
+        start_timeout.body = {"reason": "stream_start_timeout"}
+        idle_timeout = TimeoutError("stream idle timeout")
+        idle_timeout.status_code = 504
+        idle_timeout.body = {"reason": "stream_idle_timeout"}
+        request_error = RuntimeError("OpenAIException invalid_request_error: invalid input")
+        request_error.status_code = 400
+
+        self.assertEqual(hooks._recovery_policy_for_exception(balance), "recovery_cooldown")
+        self.assertEqual(hooks._recovery_policy_for_exception(rate_limit), "recovery_cooldown")
+        self.assertEqual(hooks._recovery_policy_for_exception(overload), "recovery_cooldown")
+        self.assertEqual(hooks._recovery_policy_for_exception(network), "recovery")
+        self.assertEqual(hooks._recovery_policy_for_exception(start_timeout), "recovery_cooldown")
+        self.assertEqual(hooks._recovery_policy_for_exception(idle_timeout), "recovery")
+        self.assertEqual(hooks._recovery_policy_for_exception(request_error), "error")
+        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(network))
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(start_timeout))
+
+    def test_recovery_policy_is_runtime_configurable(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        error = RuntimeError("Cannot connect to host api.example.test")
+        error.status_code = 500
+        self.set_env("LITELLM_MENU_RECOVERY_POLICY_NETWORK", "recovery_cooldown")
+
+        self.assertEqual(hooks._recovery_policy_for_exception(error), "recovery_cooldown")
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(error))
+
+    def test_deterministic_request_error_never_enters_recovery_even_when_marked_failed(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        error = RuntimeError("OpenAIException invalid_request_error: invalid input[89].id")
+        error.status_code = 400
+        error.failed_deployment_id = "route-a"
+
+        self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
+        self.assertFalse(hooks._is_route_recovery_poll_error(error))
+
     async def test_filter_deployments_keeps_image_tool_candidates_for_runtime_probe(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
@@ -157,7 +229,7 @@ class HookRoutingTests(HookTestCase):
         self.assertTrue(hooks._is_no_deployments_available_error(error))
         self.assertTrue(hooks._is_route_recovery_poll_error(error))
 
-    def test_mark_exception_preserves_existing_exclusions_and_adds_failed_deployment(self) -> None:
+    def test_mark_exception_defers_recoverable_route_exclusion_until_budget_exhausts(self) -> None:
         hooks, _ = load_hook_module()
         error = RuntimeError("temporary upstream failure")
         error.status_code = 503
@@ -170,13 +242,10 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(error.failed_deployment_id, "newly-failed")
         self.assertEqual(error.failed_deployment_order, 2)
-        self.assertEqual(
-            request_kwargs["_excluded_deployment_ids"],
-            ["already-failed", "newly-failed"],
-        )
+        self.assertEqual(request_kwargs["_excluded_deployment_ids"], ["already-failed"])
         self.assertEqual(error.num_retries, 0)
 
-    def test_mark_exception_keeps_timeout_route_retryable_without_excluding_deployment(self) -> None:
+    def test_mark_exception_defers_timeout_route_exclusion_until_budget_exhausts(self) -> None:
         hooks, _ = load_hook_module()
         error = RuntimeError("upstream gateway timeout after 60s")
         error.status_code = 504
@@ -197,7 +266,7 @@ class HookRoutingTests(HookTestCase):
         self.assertFalse(hasattr(error, "excluded_deployment_ids"))
         self.assertTrue(hooks._should_retry_same_deployment_before_fallback(error))
 
-    def test_mark_exception_keeps_rate_limit_route_retryable_without_excluding_deployment(self) -> None:
+    def test_mark_exception_defers_rate_limit_route_exclusion_until_budget_exhausts(self) -> None:
         hooks, _ = load_hook_module()
         error = RuntimeError("upstream 429 rate limit exceeded; retry after 10 seconds")
         error.status_code = 429
@@ -215,7 +284,7 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(error.failed_deployment_id, "chatroute")
         self.assertEqual(error.failed_deployment_order, 1)
         self.assertEqual(request_kwargs["_excluded_deployment_ids"], ["already-failed"])
-        self.assertEqual(error.excluded_deployment_ids, ["already-failed"])
+        self.assertFalse(hasattr(error, "excluded_deployment_ids"))
         self.assertTrue(hooks._should_retry_same_deployment_before_fallback(error))
 
     async def test_deployment_cooldown_respects_configured_failure_threshold(self) -> None:
@@ -529,7 +598,7 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(filtered, [])
 
-    async def test_route_recovery_half_opens_one_candidate_when_all_are_cooled(self) -> None:
+    async def test_route_recovery_does_not_half_open_cooled_candidates(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -562,21 +631,184 @@ class HookRoutingTests(HookTestCase):
             messages=None,
             request_kwargs=recovery_request,
         )
-        self.assertEqual(len(filtered), 1)
-        self.assertIn(filtered[0], deployments)
+        self.assertEqual(filtered, [])
 
         available, cooled, cooldown_filtered = hooks._with_active_deployment_cooldowns(
             deployments,
             request_kwargs=recovery_request,
         )
         self.assertTrue(cooldown_filtered)
-        self.assertEqual(available, filtered)
-        self.assertEqual(
-            [entry.get("half_open_probe") is True for entry in cooled].count(True),
-            1,
+        self.assertEqual(available, [])
+        self.assertEqual(len(cooled), 2)
+        self.assertFalse(any(entry.get("half_open_probe") is True for entry in cooled))
+
+    async def test_interactive_route_recovery_waits_when_all_candidates_are_cooling_down(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        recovery_state_path = Path(temp_dir.name) / "route-recovery-state.json"
+        self.set_env(hooks._ROUTE_RECOVERY_STATE_FILE_ENV, str(recovery_state_path))
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "0.05")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.15")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.005")
+        deployments = [
+            {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
+            {"litellm_params": {"model": "openai/x-plus"}, "model_info": {"id": "x-plus"}},
+        ]
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "default-chat" else []
+
+        proxy_server.llm_router = Router()
+        for deployment in deployments:
+            error = RuntimeError("temporary upstream failure")
+            error.status_code = 503
+            hooks._mark_exception_for_deployment_failover(
+                error,
+                {
+                    "model": "default-chat",
+                    "litellm_params": deployment["litellm_params"],
+                    "model_info": deployment["model_info"],
+                },
+            )
+
+        request_data = {
+            "model": "default-chat",
+            "stream": True,
+            "input": [{"role": "user", "content": "Continue."}],
+            "_target_order": 1,
+            "_excluded_deployment_ids": ["x-cheap", "x-plus"],
+        }
+        self.assertTrue(
+            hooks._route_recovery_poll_cooldown_wait(
+                request_data,
+                ignore_constraints=True,
+            )
         )
 
-    async def test_route_recovery_still_prefers_healthy_peer_over_half_open_probe(self) -> None:
+        calls = []
+        first_cooldown_until = None
+
+        async def recovered_stream():
+            yield {"type": "response.output_text.delta", "delta": "recovered after cooldown"}
+            yield {"type": "response.completed", "response": {"id": "resp-after-cooldown"}}
+
+        async def upstream_after_cooldown(**payload):
+            self.assertIsNotNone(first_cooldown_until)
+            assert first_cooldown_until is not None
+            self.assertGreaterEqual(time.time(), first_cooldown_until)
+            calls.append(payload.copy())
+            return recovered_stream()
+
+        proxy_server.llm_router.aresponses = upstream_after_cooldown
+        failure = RuntimeError("temporary upstream failure")
+        failure.status_code = 503
+        failure.failed_deployment_id = "x-cheap"
+        failure.failed_deployment_order = 1
+        request_data["_route_recovery_ignore_local_constraints"] = True
+        stream = hooks._stream_route_recovery_poll(request_data, failure)
+        first_chunk = jsonable_stream_chunk(await anext(stream))
+        self.assertTrue(hooks._is_route_recovery_sse_keepalive(first_chunk))
+        self.assertEqual(first_chunk["response"]["metadata"]["phase"], "cooldown")
+        self.assertEqual(calls, [])
+        waiting_state = json.loads(recovery_state_path.read_text(encoding="utf-8"))
+        record = next(iter(waiting_state["recoveries"].values()))
+        self.assertEqual(record["status"], "waiting")
+        self.assertGreater(record["cooldown_until"], time.time())
+        self.assertGreater(record["cooldown_remaining_seconds"], 0)
+        first_cooldown_until = record["cooldown_until"]
+
+        await asyncio.sleep(0.01)
+        next_chunk = jsonable_stream_chunk(await anext(stream))
+        self.assertTrue(hooks._is_route_recovery_sse_keepalive(next_chunk))
+        self.assertEqual(next_chunk["response"]["metadata"]["phase"], "cooldown")
+        self.assertEqual(calls, [])
+
+        chunks = [first_chunk, next_chunk]
+        async for chunk in stream:
+            chunks.append(jsonable_stream_chunk(chunk))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("_excluded_deployment_ids", calls[0])
+        self.assertNotIn("_target_order", calls[0])
+        self.assertTrue(any(hooks._is_route_recovery_sse_keepalive(chunk) for chunk in chunks))
+        self.assertIn(
+            {"type": "response.output_text.delta", "delta": "recovered after cooldown"},
+            chunks,
+        )
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+
+    async def test_stream_fallback_recovery_waits_for_a_shared_cooldown(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "0.05")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.15")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.005")
+        deployments = [
+            {"litellm_params": {"order": 1}, "model_info": {"id": "route-a"}},
+            {"litellm_params": {"order": 2}, "model_info": {"id": "route-b"}},
+        ]
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "default-chat" else []
+
+            async def aresponses(self, **payload):
+                self_calls.append((time.time(), payload.copy()))
+                async def recovered_stream():
+                    yield {"type": "response.output_text.delta", "delta": "recovered"}
+                    yield {"type": "response.completed", "response": {"id": "resp-recovered"}}
+                return recovered_stream()
+
+        proxy_server.llm_router = Router()
+        for deployment in deployments:
+            error = RuntimeError("temporary upstream failure")
+            error.status_code = 503
+            hooks._mark_exception_for_deployment_failover(
+                error,
+                {
+                    "model": "default-chat",
+                    "litellm_params": deployment["litellm_params"],
+                    "model_info": deployment["model_info"],
+                },
+            )
+
+        available, cooled, _ = hooks._with_active_deployment_cooldowns(
+            deployments,
+            request_kwargs={"model": "default-chat"},
+        )
+        self.assertEqual(available, [])
+        cooldown_until = min(entry["cooldown_until"] for entry in cooled)
+        self_calls = []
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "_target_order": 1,
+            "_excluded_deployment_ids": ["route-a", "route-b"],
+        }
+        initial_failure = RuntimeError("No deployments available for selected model")
+        initial_failure.status_code = 503
+        initial_failure.failed_deployment_id = "route-a"
+        initial_failure.failed_deployment_order = 1
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_streaming_error_fallback_or_raise(
+                request_data,
+                initial_failure,
+            )
+        ]
+
+        self.assertEqual(len(self_calls), 1)
+        self.assertGreaterEqual(self_calls[0][0], cooldown_until)
+        self.assertNotIn("_target_order", self_calls[0][1])
+        self.assertNotIn("_excluded_deployment_ids", self_calls[0][1])
+        self.assertTrue(any(hooks._is_route_recovery_sse_keepalive(chunk) for chunk in chunks))
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+
+    async def test_route_recovery_prefers_healthy_peer_over_cooled_candidates(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -646,7 +878,7 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(filtered, deployments)
 
-    async def test_deployment_cooldown_does_not_count_request_shape_context_or_rate_limit_errors(self) -> None:
+    async def test_deployment_cooldown_counts_rate_limit_but_not_request_shape_or_context_errors(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -687,9 +919,9 @@ class HookRoutingTests(HookTestCase):
             messages=None,
             request_kwargs={},
         )
-        self.assertEqual(filtered, deployments)
+        self.assertEqual(filtered, [deployments[1]])
 
-    async def test_deployment_cooldown_does_not_count_timeout_or_long_wait_errors(self) -> None:
+    async def test_deployment_cooldown_counts_server_timeouts_but_not_stream_idle_errors(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -726,7 +958,7 @@ class HookRoutingTests(HookTestCase):
             messages=None,
             request_kwargs={},
         )
-        self.assertEqual(filtered, deployments)
+        self.assertEqual(filtered, [deployments[1]])
 
     async def test_deployment_cooldown_does_not_count_network_connectivity_errors(self) -> None:
         hooks, _ = load_hook_module()
@@ -1051,10 +1283,6 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(
             hooks._surface_adapter_model("openai/vendor/model", "openai/responses"),
             "openai/vendor/model",
-        )
-        self.assertEqual(
-            hooks._surface_adapter_model("openai/responses/vendor/model", "anthropic"),
-            "anthropic/vendor/model",
         )
         self.assertEqual(
             hooks._surface_adapter_model("anthropic/vendor/model", "openai/chat"),
@@ -1646,7 +1874,7 @@ class HookRoutingTests(HookTestCase):
 
         self.assertTrue(hooks._is_image_parameter_or_capability_bad_request_error(exc))
         self.assertTrue(hooks._is_priority_deployment_failover_error(exc))
-        self.assertTrue(hooks._should_sanitize_final_upstream_route_error(exc))
+        self.assertFalse(hooks._should_sanitize_final_upstream_route_error(exc))
 
     def test_image_generation_tool_unsupported_422_is_fallback_eligible(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -1690,7 +1918,7 @@ class HookRoutingTests(HookTestCase):
         self.assertTrue(hooks._is_ssl_verification_error(exc))
         self.assertFalse(hooks._exception_indicates_network_connectivity_error(exc))
         self.assertTrue(hooks._is_priority_deployment_failover_error(exc))
-        self.assertTrue(hooks._should_sanitize_final_upstream_route_error(exc))
+        self.assertFalse(hooks._should_sanitize_final_upstream_route_error(exc))
         self.assertFalse(hooks._should_retry_same_deployment_before_fallback(exc))
 
     def test_image_generation_tool_runtime_fallback_attempt_limit(self) -> None:
@@ -1742,6 +1970,43 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(hooks._deployment_order_from_request(request_kwargs), 2)
         self.assertTrue(hooks._request_allows_failed_deployment_order(request_kwargs))
+
+    def test_order_parsing_preserves_zero_negative_and_fractional_values(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        self.assertEqual(hooks._coerce_order(0), 0)
+        self.assertEqual(hooks._coerce_order("-2.5"), -2.5)
+        self.assertEqual(hooks._coerce_order("0.25"), 0.25)
+        self.assertIsNone(hooks._coerce_order("not-a-number"))
+        self.assertEqual(
+            hooks._deployment_order_from_request(
+                {"model_info": {"route_key": "provider / upstream / order=-0.5"}}
+            ),
+            -0.5,
+        )
+
+    def test_fractional_orders_sort_and_rotate_numerically(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        deployments = [
+            {"litellm_params": {"order": 0.25}, "model_info": {"id": "quarter"}},
+            {"litellm_params": {"order": -1.5}, "model_info": {"id": "negative"}},
+            {"litellm_params": {"order": 0}, "model_info": {"id": "zero"}},
+        ]
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+        def original_get_all_deployments(self, model_name, team_id=None):
+            return deployments
+
+        FakeRouter._get_all_deployments._original_get_all_deployments = original_get_all_deployments
+        self.assertEqual(
+            hooks._configured_deployment_orders(FakeRouter(), {"model": "default-chat"}),
+            [-1.5, 0, 0.25],
+        )
+        self.assertEqual(hooks._next_configured_order([-1.5, 0, 0.25], -1.5), 0)
+        self.assertEqual(hooks._next_configured_order([-1.5, 0, 0.25], 0), 0.25)
 
 if __name__ == "__main__":
     unittest.main()

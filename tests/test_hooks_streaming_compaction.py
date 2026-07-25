@@ -500,11 +500,11 @@ class HookStreamingCompactionTests(HookTestCase):
 
         self.assertEqual(
             hooks._recovery_max_seconds_for_request(ordinary_codex_request),
-            hooks._CODEX_INTERACTIVE_RECOVERY_MAX_SECONDS,
+            43200.0,
         )
         self.assertEqual(
             hooks._recovery_max_seconds_for_request(structured_compaction_request),
-            hooks._RECOVERY_MAX_DEFAULT_SECONDS,
+            43200.0,
         )
         error = RuntimeError("temporary upstream rate limit")
         error.status_code = 429

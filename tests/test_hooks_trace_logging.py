@@ -4,43 +4,6 @@ from hook_test_utils import *
 
 
 class HookTraceLoggingTests(HookTestCase):
-    def test_route_trace_enabled_reads_state_file_live(self) -> None:
-        hooks, _ = load_hook_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_file = Path(temp_dir) / "route-trace.enabled"
-            self.set_env("LITELLM_ROUTE_TRACE_STATE_FILE", str(state_file))
-            self.set_env("LITELLM_MENU_ROUTE_TRACE", None)
-
-            self.assertFalse(hooks._route_trace_enabled())
-
-            state_file.write_text("1\n", encoding="utf-8")
-            self.assertTrue(hooks._route_trace_enabled())
-
-            state_file.unlink()
-            self.assertFalse(hooks._route_trace_enabled())
-
-    def test_route_trace_falls_back_to_env_when_state_file_is_missing(self) -> None:
-        hooks, _ = load_hook_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_file = Path(temp_dir) / "route-trace.enabled"
-            self.set_env("LITELLM_ROUTE_TRACE_STATE_FILE", str(state_file))
-            self.set_env("LITELLM_MENU_ROUTE_TRACE", "debug")
-
-            self.assertTrue(hooks._route_trace_enabled())
-
-    def test_route_trace_state_file_overrides_stale_startup_env(self) -> None:
-        hooks, _ = load_hook_module()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            state_file = Path(temp_dir) / "route-trace.enabled"
-            self.set_env("LITELLM_ROUTE_TRACE_STATE_FILE", str(state_file))
-            self.set_env("LITELLM_MENU_ROUTE_TRACE", "1")
-
-            state_file.write_text("on\n", encoding="utf-8")
-            self.assertTrue(hooks._route_trace_enabled())
-
-            state_file.write_text("0\ndisabled_at=2026-06-12T06:00:00Z\n", encoding="utf-8")
-            self.assertFalse(hooks._route_trace_enabled())
-
     def test_trace_request_preview_scans_tail_of_long_responses_input(self) -> None:
         hooks, _ = load_hook_module()
         input_items = [
@@ -141,7 +104,7 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertEqual(summary["reasoning"]["effort"], "xhigh")
         self.assertEqual(summary["reasoning"]["text_verbosity"], "low")
         self.assertEqual(summary["timeouts"]["stream_start_seconds"], 120.0)
-        self.assertEqual(summary["timeouts"]["recovery_max_seconds"], 43200.0)
+        self.assertEqual(summary["timeouts"]["recovery_max_seconds"], 14400.0)
         self.assertEqual(summary["tools"]["count"], 2)
         self.assertIn("web_search", summary["tools"]["types"])
         self.assertIn("lookup_order", summary["tools"]["names"])
@@ -310,6 +273,36 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertIn("lookup_order", summary["names"])
         self.assertIn("web_search_call", summary["types"])
 
+    def test_trace_tool_call_summary_keeps_safe_range_metadata_without_path_values(self) -> None:
+        hooks, _ = load_hook_module()
+
+        summary = hooks._trace_tool_call_summary(
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "call_read",
+                        "name": "read_file",
+                        "arguments": json.dumps(
+                            {
+                                "path": "/private/example/source.js",
+                                "line_start": 20,
+                                "line_end": 48,
+                                "limit": 29,
+                            }
+                        ),
+                    }
+                ]
+            }
+        )
+
+        call = summary["calls"][0]
+        self.assertEqual(call["argument_keys"], ["path", "line_start", "line_end", "limit"])
+        self.assertEqual(
+            call["numeric_ranges"],
+            {"line_start": 20, "line_end": 48, "limit": 29},
+        )
+
     def test_trace_session_context_extracts_thread_id_and_name(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -365,6 +358,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             raw = log_path.read_text(encoding="utf-8")
             record = json.loads(raw)
+            self.assertEqual(record["ts"], "2026-06-09T12:00:00Z")
             self.assertEqual(record["status"], "success")
             self.assertEqual(record["duration_ms"], 321)
             self.assertEqual(record["time_to_first_token_ms"], 123)
@@ -374,7 +368,7 @@ class HookTraceLoggingTests(HookTestCase):
             )
             self.assertEqual(
                 record["first_stream_output_at"],
-                "2026-06-09T12:00:00.123000Z",
+                "2026-06-09T12:00:00Z",
             )
             self.assertEqual(record["model_group"], "default-chat")
             self.assertEqual(record["deployment_id"], "deployment-1")
@@ -393,6 +387,13 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertNotIn("SECRETKEYVALUE", raw)
             self.assertNotIn("SECRET_AUTH_VALUE", raw)
             self.assertNotIn("Authorization", raw)
+
+    def test_recent_request_timestamp_treats_naive_callback_time_as_local(self) -> None:
+        hooks, _ = load_hook_module()
+        callback_time = datetime(2026, 6, 9, 12, 0, 0)
+        expected = callback_time.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+        self.assertEqual(hooks._event_time(callback_time), expected)
 
     async def test_recent_request_failure_log_omits_error_message_body(self) -> None:
         hooks, _ = load_hook_module()
@@ -568,8 +569,6 @@ class HookTraceLoggingTests(HookTestCase):
         class TemporaryFailure(Exception):
             status_code = 503
 
-        self.set_env("LITELLM_MENU_ROUTE_TRACE", "1")
-        self.set_env("LITELLM_ROUTE_TRACE_STATE_FILE", None)
         request_kwargs = {
             "model": "default-chat",
             "litellm_params": {
@@ -593,6 +592,7 @@ class HookTraceLoggingTests(HookTestCase):
         raw_payload = captured.output[0].split("litellm_route_trace ", 1)[1]
         record = json.loads(raw_payload)
         self.assertEqual(record["event"], "deployment_failover_marked")
+        self.assertRegex(record["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertEqual(record["deployment_token"], "openai-default-chat-provider_alpha-team-o1")
         self.assertEqual(record["route_key"], "provider_alpha / openai/default-chat / key=team / order=1")
         self.assertEqual(

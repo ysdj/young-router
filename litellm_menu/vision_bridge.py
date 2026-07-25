@@ -27,8 +27,6 @@ from .base import (
     _VISION_BRIDGE_LOCAL_FORMAT_ENV,
     _VISION_BRIDGE_MODEL_DEFAULT,
     _VISION_BRIDGE_MODEL_ENV,
-    _VISION_BRIDGE_MODE_DEFAULT,
-    _VISION_BRIDGE_MODE_ENV,
     _VISION_BRIDGE_PROMPT_DEFAULT,
     _VISION_BRIDGE_PROMPT_ENV,
     _VISION_BRIDGE_TIMEOUT_DEFAULT,
@@ -93,18 +91,10 @@ def _env_float(name: str, default: float, *, minimum: float = 0.001) -> float:
 
 
 def _bridge_backend() -> str:
-    raw = os.environ.get(_VISION_BRIDGE_BACKEND_ENV)
-    mode = os.environ.get(_VISION_BRIDGE_MODE_ENV)
-    if isinstance(raw, str) and raw.strip():
-        value = raw.strip().lower()
-    elif isinstance(mode, str) and mode.strip():
-        value = mode.strip().lower()
-    else:
-        value = _VISION_BRIDGE_BACKEND_DEFAULT
-    if value in {"0", "false", "no", "off", "disabled"}:
-        return _VISION_BRIDGE_BACKEND_OFF
-    if value in {"1", "true", "yes", "on", "enabled"}:
-        return _VISION_BRIDGE_BACKEND_AUTO
+    value = _env_text(
+        _VISION_BRIDGE_BACKEND_ENV,
+        _VISION_BRIDGE_BACKEND_DEFAULT,
+    ).lower()
     if value in _VISION_BRIDGE_BACKEND_VALUES:
         return value
     return _VISION_BRIDGE_BACKEND_AUTO

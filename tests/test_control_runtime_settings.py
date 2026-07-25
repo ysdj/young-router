@@ -18,7 +18,6 @@ RUNTIME_SETTINGS_SOURCE = ROOT / "service" / "runtime_settings.sh"
 RUNTIME_SETTINGS_CONFIGURE_SOURCE = ROOT / "service" / "runtime_settings_configure.sh"
 ENVIRONMENT_SOURCE = ROOT / "service" / "environment.sh"
 PROCESS_SOURCE = ROOT / "service" / "process.sh"
-LAUNCHD_SOURCE = ROOT / "service" / "launchd_watch.sh"
 
 
 class ControlRuntimeSettingsTests(unittest.TestCase):
@@ -30,11 +29,9 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
         env = os.environ.copy()
         env.update(
             {
-                "LITELLM_ALLOW_CHECKOUT_SERVICE": "1",
                 "LITELLM_RUNTIME_ROOT": str(temp / "runtime"),
                 "LITELLM_TEMPLATE_ROOT": str(ROOT),
                 "LITELLM_PORT": "49239",
-                "LITELLM_LAUNCH_AGENT_LABEL": "menu.litellm.service.runtime-settings-test",
                 "LITELLM_APP_LAUNCH_AGENT_LABEL": "menu.litellm.menu-login.runtime-settings-test",
                 "LITELLM_CONFIG_WATCH_LABEL": "menu.litellm.config-watch.runtime-settings-test",
                 "PYTHON": sys.executable,
@@ -148,13 +145,79 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
         self.assertEqual("detailed", setting["value"])
         self.assertEqual(["compact", "detailed"], setting["options"])
 
-    def test_runtime_settings_legacy_mode_maps_to_backend(self) -> None:
-        result = self.run_runtime_settings({"LITELLM_MENU_VISION_BRIDGE_MODE": "off"})
+    def test_runtime_settings_reports_recovery_defaults_and_policy_choices(self) -> None:
+        result = self.run_runtime_settings()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        backend = next(item for item in payload["settings"] if item["key"] == "LITELLM_MENU_VISION_BRIDGE_BACKEND")
-        self.assertEqual("off", backend["value"])
+        recovery_max = self.setting(payload, "LITELLM_MENU_RECOVERY_MAX_SECONDS")
+        same_route = self.setting(payload, "LITELLM_MENU_SAME_DEPLOYMENT_RETRIES")
+        balance = self.setting(payload, "LITELLM_MENU_RECOVERY_POLICY_BALANCE")
+        network = self.setting(payload, "LITELLM_MENU_RECOVERY_POLICY_NETWORK")
+        request_error = self.setting(payload, "LITELLM_MENU_RECOVERY_POLICY_REQUEST_ERROR")
+
+        self.assertEqual("14400", recovery_max["default"])
+        self.assertEqual("0", same_route["default"])
+        self.assertEqual("recovery_cooldown", balance["default"])
+        self.assertEqual("recovery", network["default"])
+        self.assertEqual("error", request_error["default"])
+        self.assertEqual(
+            ["error", "recovery", "recovery_cooldown"],
+            balance["options"],
+        )
+
+    def test_runtime_settings_reports_and_validates_editor_balance_refresh_interval(self) -> None:
+        result = self.run_runtime_settings({"LITELLM_MENU_BALANCE_REFRESH_MINUTES": "12"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        refresh = self.setting(json.loads(result.stdout), "LITELLM_MENU_BALANCE_REFRESH_MINUTES")
+        self.assertEqual("Billing", refresh["category"])
+        self.assertEqual("5", refresh["default"])
+        self.assertEqual("12", refresh["value"])
+        self.assertEqual(0, refresh["minimum"])
+        self.assertEqual(1440, refresh["maximum"])
+
+        def accepts(value: str) -> bool:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = self.run_control(
+                    Path(temp_dir),
+                    "runtime-settings-configure",
+                    input_text=json.dumps(
+                        {"values": {"LITELLM_MENU_BALANCE_REFRESH_MINUTES": value}}
+                    ),
+                )
+            return result.returncode == 0
+
+        for value in ("0", "5", "1440"):
+            with self.subTest(value=value):
+                self.assertTrue(accepts(value))
+        self.assertFalse(accepts("1441"))
+        self.assertFalse(accepts("1.5"))
+
+    def test_runtime_settings_reports_and_validates_browser_billing_fallback(self) -> None:
+        result = self.run_runtime_settings({"LITELLM_BROWSER_BILLING": "1"})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        browser = self.setting(json.loads(result.stdout), "LITELLM_BROWSER_BILLING")
+        self.assertEqual("Billing", browser["category"])
+        self.assertEqual("0", browser["default"])
+        self.assertEqual("1", browser["value"])
+
+        def accepts(value: str) -> bool:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = self.run_control(
+                    Path(temp_dir),
+                    "runtime-settings-configure",
+                    input_text=json.dumps({"values": {"LITELLM_BROWSER_BILLING": value}}),
+                )
+            return result.returncode == 0
+
+        for value in ("0", "1", "true", "off", "yes"):
+            with self.subTest(value=value):
+                self.assertTrue(accepts(value))
+        for value in ("2", "maybe", "1.0"):
+            with self.subTest(value=value):
+                self.assertFalse(accepts(value))
 
     def test_runtime_settings_reports_custom_local_port(self) -> None:
         result = self.run_runtime_settings({"LITELLM_PORT": "49240"})
@@ -177,7 +240,7 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
         self.assertNotIn(secret, result.stdout)
         payload = json.loads(result.stdout)
         api_key = self.setting(payload, "LITELLM_MENU_VISION_BRIDGE_API_KEY")
-        self.assertEqual(api_key["value"], RETAIN_EXISTING_VALUE)
+        self.assertEqual(api_key["value"], "")
         self.assertEqual(api_key["default"], "")
         self.assertFalse(api_key["configured"])
         self.assertTrue(api_key["secret"])
@@ -233,7 +296,7 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
             self.assertEqual(item.get("minimum"), configured[3], key)
             self.assertEqual(item.get("maximum"), configured[4], key)
 
-    def test_model_runtime_settings_reach_loader_direct_process_and_launchd(self) -> None:
+    def test_model_runtime_settings_reach_loader_and_direct_process(self) -> None:
         propagated_keys = {
             "LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS",
             "LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS",
@@ -249,13 +312,20 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
             "LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRIES",
             "LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS",
             "LITELLM_MENU_IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS",
+            "LITELLM_MENU_SAME_DEPLOYMENT_RETRIES",
+            "LITELLM_MENU_RECOVERY_POLICY_BALANCE",
+            "LITELLM_MENU_RECOVERY_POLICY_RATE_LIMIT",
+            "LITELLM_MENU_RECOVERY_POLICY_SERVER",
+            "LITELLM_MENU_RECOVERY_POLICY_NETWORK",
+            "LITELLM_MENU_RECOVERY_POLICY_STREAM_START_TIMEOUT",
+            "LITELLM_MENU_RECOVERY_POLICY_STREAM_IDLE_TIMEOUT",
+            "LITELLM_MENU_RECOVERY_POLICY_REQUEST_ERROR",
             "LITELLM_MENU_ROUTE_TRACE_PREVIEW_CHARS",
             "LITELLM_USE_SYSTEM_PROXIES",
         }
         sources = {
             "loader": ENVIRONMENT_SOURCE.read_text(encoding="utf-8"),
             "direct process": PROCESS_SOURCE.read_text(encoding="utf-8"),
-            "launchd": LAUNCHD_SOURCE.read_text(encoding="utf-8"),
         }
         for key in sorted(propagated_keys):
             for source_name, source in sources.items():
@@ -445,6 +515,30 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
             self.assertFalse(settings_file.exists())
             self.assertEqual(json.loads(cleared_last_value.stdout)["saved_keys"], [])
 
+    def test_cleared_saved_secret_overrides_an_inherited_environment_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            runtime_root = temp / "runtime"
+            runtime_root.mkdir()
+            (runtime_root / "runtime-settings.env").write_text(
+                "LITELLM_PORT=49240\n",
+                encoding="utf-8",
+            )
+            inherited = "synthetic-inherited-vision-secret"
+
+            result = self.run_control(
+                temp,
+                "runtime-settings",
+                env_overrides={"LITELLM_MENU_VISION_BRIDGE_API_KEY": inherited},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(inherited, result.stdout)
+            payload = json.loads(result.stdout)
+            api_key = self.setting(payload, "LITELLM_MENU_VISION_BRIDGE_API_KEY")
+            self.assertFalse(api_key["configured"])
+            self.assertEqual("", api_key["value"])
+
     def test_runtime_settings_patch_normalizes_all_supported_kinds(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -459,6 +553,7 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
                             "LITELLM_MENU_LOG_MAX_BYTES": "0.5",
                             "LITELLM_USE_SYSTEM_PROXIES": "yes",
                             "LITELLM_MENU_VISION_BRIDGE_BACKEND": "LOCAL",
+                            "LITELLM_MENU_RECOVERY_POLICY_NETWORK": "RECOVERY_COOLDOWN",
                             "LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND": "brave bing",
                         }
                     }
@@ -474,6 +569,7 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
             self.assertIn("LITELLM_MENU_LOG_MAX_BYTES=524288\n", saved_text)
             self.assertIn("LITELLM_USE_SYSTEM_PROXIES=1\n", saved_text)
             self.assertIn("LITELLM_MENU_VISION_BRIDGE_BACKEND=local\n", saved_text)
+            self.assertIn("LITELLM_MENU_RECOVERY_POLICY_NETWORK=recovery_cooldown\n", saved_text)
             self.assertIn("LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND=brave bing\n", saved_text)
 
     def test_runtime_settings_patch_rejects_invalid_values_without_replacing_file(self) -> None:
@@ -483,6 +579,7 @@ class ControlRuntimeSettingsTests(unittest.TestCase):
             {"LITELLM_MENU_LOG_MAX_BYTES": ".5"},
             {"LITELLM_USE_SYSTEM_PROXIES": "maybe"},
             {"LITELLM_MENU_VISION_BRIDGE_BACKEND": "unknown"},
+            {"LITELLM_MENU_RECOVERY_POLICY_NETWORK": "wait-forever"},
             {"LITELLM_MENU_WEB_SEARCH_REGION": "us en"},
             {"LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND": RETAIN_EXISTING_VALUE},
             {"UNKNOWN_RUNTIME_SETTING": "1"},

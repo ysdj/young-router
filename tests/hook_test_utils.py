@@ -20,6 +20,7 @@ HOOK_PATH = ROOT / "litellm_menu" / "callbacks.py"
 HOOK_MODULE_NAMES = (
     "base",
     "api_base",
+    "codex_fast_tier",
     "trace",
     "state",
     "routing",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import image_generation as _image_generation_module
+from . import codex_fast_tier as _codex_fast_tier_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
@@ -32,6 +33,7 @@ class LiteLLMMenuHook(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
+        _trace_codex_fast_tier_result(kwargs, response_obj, outcome="success")
         if kwargs.get("stream") is not True:
             _routing_module._record_deployment_success_for_cooldown(kwargs)
         _state_module._append_recent_request(
@@ -45,6 +47,7 @@ class LiteLLMMenuHook(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
+        _trace_codex_fast_tier_result(kwargs, response_obj, outcome="failure")
         if _routing_module._should_suppress_recent_failure_log(kwargs, response_obj):
             return
         _state_module._append_recent_request(
@@ -58,6 +61,10 @@ class LiteLLMMenuHook(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
+        if _codex_fast_tier_module._response_indicates_failure(response_obj):
+            _trace_codex_fast_tier_result(kwargs, response_obj, outcome="stream_failure")
+        elif _streaming_module._responses_stream_chunk_is_completed(response_obj):
+            _trace_codex_fast_tier_result(kwargs, response_obj, outcome="stream_completed")
         if _streaming_module._responses_stream_chunk_is_completed(response_obj):
             _routing_module._record_deployment_success_for_cooldown(kwargs)
         _state_module._append_recent_request(
@@ -73,6 +80,7 @@ class LiteLLMMenuHook(CustomLogger):
         modified_kwargs = kwargs
         changed = False
         for update_request in (
+            _codex_fast_tier_module._with_codex_fast_default_service_tier,
             _image_generation_module._with_bounded_image_inputs,
             _image_generation_module._with_internal_litellm_metadata,
             _image_generation_module._with_codex_tool_runtime_recovery_hints,
@@ -90,6 +98,8 @@ class LiteLLMMenuHook(CustomLogger):
                 continue
             modified_kwargs = updated_kwargs
             changed = True
+            if update_request is _codex_fast_tier_module._with_codex_fast_default_service_tier:
+                _trace_codex_fast_tier_injected(modified_kwargs)
         native_client_tool_kwargs = (
             _responses_surfaces_module._with_responses_native_client_tool_passthrough(
                 modified_kwargs
@@ -99,7 +109,6 @@ class LiteLLMMenuHook(CustomLogger):
             modified_kwargs = native_client_tool_kwargs
             changed = True
         return modified_kwargs if changed else None
-
     async def async_filter_deployments(
         self,
         model: str,
@@ -353,3 +362,65 @@ class LiteLLMMenuHook(CustomLogger):
 
         async for chunk in _streaming_module._yield_guarded_original_stream(buffer, _streaming_module._empty_async_iterator(), request_data):
             yield deliver_chunk(chunk)
+
+
+def _trace_codex_fast_tier_result(
+    request_kwargs: dict,
+    response_obj: Any,
+    *,
+    outcome: str,
+) -> None:
+    """Record the requested/final tier without serializing request credentials."""
+
+    injected_tier = _codex_fast_tier_module._codex_fast_default_service_tier(
+        request_kwargs
+    )
+    if injected_tier is None:
+        return
+    upstream_tier = _codex_fast_tier_module._response_service_tier(response_obj)
+    _trace_module._route_trace(
+        "codex_fast_default_service_tier_result",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
+        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
+        outcome=outcome,
+        codex_fast_default_injected=True,
+        service_tier=injected_tier,
+        requested_service_tier=injected_tier,
+        upstream_service_tier=upstream_tier,
+        final_service_tier=upstream_tier,
+        final_request_service_tier=_codex_fast_tier_module._request_service_tier(
+            request_kwargs
+        ),
+        final_tier_confirmed=upstream_tier is not None,
+        upstream_tier_reported=upstream_tier is not None,
+        upstream_priority_confirmed=upstream_tier == injected_tier,
+        upstream_tier_differs=(
+            upstream_tier is not None and upstream_tier != injected_tier
+        ),
+        priority_rejected_or_unconfirmed=(
+            outcome in {"failure", "stream_failure"}
+            or upstream_tier != injected_tier
+        ),
+    )
+
+
+def _trace_codex_fast_tier_injected(request_kwargs: dict) -> None:
+    _trace_module._route_trace(
+        "codex_fast_default_service_tier_injected",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
+        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
+        codex_fast_default_injected=True,
+        service_tier=_codex_fast_tier_module._codex_fast_default_service_tier(
+            request_kwargs
+        ),
+        requested_service_tier=_codex_fast_tier_module._codex_fast_default_service_tier(
+            request_kwargs
+        ),
+        source="codex_config_fast_default",
+    )

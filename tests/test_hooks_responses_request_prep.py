@@ -960,7 +960,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(request_kwargs["_excluded_deployment_ids"], ["temporary-failure"])
         self.assertEqual(error.num_retries, 0)
 
-    async def test_generic_response_wrapper_marks_capacity_error_for_same_deployment_retry(self) -> None:
+    async def test_generic_response_wrapper_advances_capacity_error_when_default_budget_is_zero(self) -> None:
         hooks, _ = load_hook_module()
 
         class UpstreamCapacityError(Exception):
@@ -983,9 +983,12 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
 
         self.assertEqual(error.failed_deployment_id, "capacity-full-deployment")
-        self.assertNotIn("_excluded_deployment_ids", request_kwargs)
-        self.assertFalse(hasattr(error, "excluded_deployment_ids"))
-        self.assertTrue(hooks._should_retry_same_deployment_before_fallback(error))
+        self.assertEqual(
+            request_kwargs["_excluded_deployment_ids"],
+            ["capacity-full-deployment"],
+        )
+        self.assertEqual(error.excluded_deployment_ids, ["capacity-full-deployment"])
+        self.assertFalse(hooks._should_retry_same_deployment_before_fallback(error))
         self.assertEqual(error.num_retries, 0)
 
     async def test_generic_response_wrapper_retries_responses_404_via_chat_bridge(self) -> None:

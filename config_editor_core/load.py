@@ -1,6 +1,34 @@
 from __future__ import annotations
 
-from .schema import *
+import pathlib
+import re
+from typing import Any
+
+from .schema import (
+    CONFIG_YAML,
+    DEFAULT_API_KEY_NAME,
+    DISABLED_MODELS_KEY,
+    MENU_API_KEY_NAME_KEY,
+    MENU_MODEL_ENABLED_KEY,
+    MENU_ROUTE_KEY,
+    SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
+    UPSTREAM_URL_SURFACE_KEY,
+    _as_dict,
+    _as_list,
+    _bool_value,
+    _config_revision,
+    _disabled_models_path,
+    _editor_deployment_id,
+    _jsonable,
+    _string_value,
+    _upstream_url_surfaces,
+    load_yaml_text,
+)
+
+
+CONFIG_DOCUMENT_CONFIG_KEY = "config"
+CONFIG_DOCUMENT_DISABLED_KEY = "disabled"
+CONFIG_DOCUMENT_KEYS = {CONFIG_DOCUMENT_CONFIG_KEY, CONFIG_DOCUMENT_DISABLED_KEY}
 
 def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
     provider = _as_dict(value)
@@ -34,7 +62,6 @@ def _provider_api_keys_from_raw(provider: dict[str, Any]) -> list[dict[str, Any]
         keys.append({
             "name": key_name,
             "value": key_value,
-            "enabled": True,
         })
         seen_names.add(key_name)
         seen_values.add(key_value)
@@ -53,7 +80,8 @@ def _unique_key_name(existing: list[dict[str, Any]], preferred: str) -> str:
 
 
 def _key_name_from_model_name(model_name: str) -> str:
-    name = _slug(model_name)
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", model_name.strip())
+    name = re.sub(r"-+", "-", name).strip("-")
     if not name:
         return "imported"
     return name[:40]
@@ -83,7 +111,6 @@ def _ensure_provider_key(provider: dict[str, Any], api_key: str, preferred_name:
         {
             "name": _string_value(_as_dict(item).get("name")).strip(),
             "value": _string_value(_as_dict(item).get("value")),
-            "enabled": _bool_value(_as_dict(item).get("enabled"), True),
         }
         for item in _as_list(provider.get("api_keys"))
         if _string_value(_as_dict(item).get("value"))
@@ -202,7 +229,7 @@ def _append_model_to_provider(
             "enabled": True,
             "api_base": str(model.get("api_base", "")).strip(),
             "api_key": api_key,
-            "api_keys": [{"name": key_name, "value": api_key, "enabled": True}] if api_key else [],
+            "api_keys": [{"name": key_name, "value": api_key}] if api_key else [],
             "models": [],
             "extra": {},
         }
@@ -220,19 +247,55 @@ def _append_model_to_provider(
     provider_index[provider]["models"].append(model)
 
 
-def _refresh_effective_model_enabled(providers: list[dict[str, Any]]) -> None:
+def _refresh_model_enabled_states(providers: list[dict[str, Any]]) -> None:
     for provider in providers:
-        provider_enabled = _bool_value(provider.get("enabled"), True)
         for model in _as_list(provider.get("models")):
             model_dict = _as_dict(model)
-            model_dict["enabled"] = (
-                provider_enabled
-                and _bool_value(model_dict.get("model_enabled"), _bool_value(model_dict.get("enabled"), True))
+            model_dict["enabled"] = _bool_value(
+                model_dict.get("model_enabled"),
+                _bool_value(model_dict.get("enabled"), True),
             )
 
 
-def load_config(path: pathlib.Path = CONFIG_YAML) -> dict[str, Any]:
-    data = _load_yaml(path)
+def normalize_config_document(document: Any) -> dict[str, str | None]:
+    if not isinstance(document, dict) or set(document) != CONFIG_DOCUMENT_KEYS:
+        raise ValueError("Config document must contain exactly config and disabled fields")
+
+    config_text = document.get(CONFIG_DOCUMENT_CONFIG_KEY)
+    disabled_text = document.get(CONFIG_DOCUMENT_DISABLED_KEY)
+    if not isinstance(config_text, str):
+        raise ValueError("Config document config must be text")
+    if disabled_text is not None and not isinstance(disabled_text, str):
+        raise ValueError("Config document disabled must be text or null")
+
+    load_yaml_text(config_text, pathlib.Path("config.yaml"))
+    if disabled_text is not None:
+        load_yaml_text(disabled_text, pathlib.Path("config.disabled-models.yaml"))
+    return {
+        CONFIG_DOCUMENT_CONFIG_KEY: config_text,
+        CONFIG_DOCUMENT_DISABLED_KEY: disabled_text,
+    }
+
+
+def config_document_from_path(path: pathlib.Path = CONFIG_YAML) -> dict[str, str | None]:
+    config_text = path.read_text(encoding="utf-8")
+    disabled_path = _disabled_models_path(path)
+    disabled_text = (
+        disabled_path.read_text(encoding="utf-8") if disabled_path.exists() else None
+    )
+    return normalize_config_document(
+        {
+            CONFIG_DOCUMENT_CONFIG_KEY: config_text,
+            CONFIG_DOCUMENT_DISABLED_KEY: disabled_text,
+        }
+    )
+
+
+def load_config_document(document: Any) -> dict[str, Any]:
+    normalized_document = normalize_config_document(document)
+    data = load_yaml_text(
+        normalized_document[CONFIG_DOCUMENT_CONFIG_KEY], pathlib.Path("config.yaml")
+    )
     raw_providers = _as_dict(data.get("providers"))
     providers = [_provider_to_editor(name, raw) for name, raw in raw_providers.items()]
     provider_index = {provider["name"]: provider for provider in providers}
@@ -248,7 +311,6 @@ def load_config(path: pathlib.Path = CONFIG_YAML) -> dict[str, Any]:
             {
                 "name": _string_value(_as_dict(item).get("name")).strip(),
                 "value": _string_value(_as_dict(item).get("value")),
-                "enabled": True,
             }
             for item in _as_list(provider.get("api_keys"))
             if _string_value(_as_dict(item).get("value"))
@@ -268,14 +330,20 @@ def load_config(path: pathlib.Path = CONFIG_YAML) -> dict[str, Any]:
         model = _model_to_editor(item, True, known_provider_names, provider_by_pair, provider_by_key, provider_by_base, provider_keys)
         _append_model_to_provider(providers, provider_index, model)
 
-    disabled_path = _disabled_models_path(path)
-    if disabled_path.exists():
-        disabled_data = _load_yaml(disabled_path)
+    disabled_text = normalized_document[CONFIG_DOCUMENT_DISABLED_KEY]
+    if disabled_text is not None:
+        disabled_data = load_yaml_text(
+            disabled_text, pathlib.Path("config.disabled-models.yaml")
+        )
         for item in _as_list(disabled_data.get(DISABLED_MODELS_KEY)):
             model = _model_to_editor(item, False, known_provider_names, provider_by_pair, provider_by_key, provider_by_base, provider_keys)
             _append_model_to_provider(providers, provider_index, model)
 
-    _refresh_effective_model_enabled(providers)
-    return {"providers": providers, "revision": _config_revision(path)}
+    _refresh_model_enabled_states(providers)
+    return {"providers": providers, "document": normalized_document}
 
-__all__ = [name for name in globals() if not name.startswith("__")]
+
+def load_config(path: pathlib.Path = CONFIG_YAML) -> dict[str, Any]:
+    payload = load_config_document(config_document_from_path(path))
+    payload["revision"] = _config_revision(path)
+    return payload

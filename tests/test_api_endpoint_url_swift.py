@@ -79,7 +79,22 @@ class APIEndpointURLSwiftTests(unittest.TestCase):
                 "https://api.example.test/v1/models",
             ],
             "https://api.example.test/v1/messages": ["https://api.example.test/v1/models"],
-            "https://api.example.test/v1/completion": ["https://api.example.test/v1/models"],
+            "https://api.example.test/model": [
+                "https://api.example.test/model/v1/models",
+                "https://api.example.test/model/models",
+            ],
+            "https://api.example.test/chat": [
+                "https://api.example.test/chat/v1/models",
+                "https://api.example.test/chat/models",
+            ],
+            "https://api.example.test/response": [
+                "https://api.example.test/response/v1/models",
+                "https://api.example.test/response/models",
+            ],
+            "https://api.example.test/tenant/models": [
+                "https://api.example.test/tenant/models",
+                "https://api.example.test/tenant/v1/models",
+            ],
         }
         for base_url, expected in cases.items():
             with self.subTest(base_url=base_url):
@@ -95,7 +110,7 @@ class APIEndpointURLSwiftTests(unittest.TestCase):
             ["https://api.example.test/v1/messages"],
         )
         self.assertEqual(
-            self.candidates("https://api.example.test/v1/completion", "responses"),
+            self.candidates("https://api.example.test/v1/completions", "responses"),
             ["https://api.example.test/v1/responses"],
         )
 

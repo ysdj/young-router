@@ -40,6 +40,7 @@ from .base import (
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
+    _RouteOrder,
     _STREAM_ERROR_FALLBACK_METADATA_KEY,
     _STREAM_FALLBACK_METADATA_KEY,
     _UPSTREAM_METADATA_FORWARD_FLAGS,
@@ -629,7 +630,7 @@ def _with_browser_compatible_headers_retry(request_kwargs: dict) -> Optional[dic
     return _with_browser_compatible_headers(modified_kwargs) or modified_kwargs
 
 
-def _deployment_order(deployment: Any) -> Optional[int]:
+def _deployment_order(deployment: Any) -> Optional[_RouteOrder]:
     if not isinstance(deployment, dict):
         return None
     saw_defaultable_order = False
@@ -642,35 +643,21 @@ def _deployment_order(deployment: Any) -> Optional[int]:
             saw_defaultable_order = True
             continue
         order = section.get("order")
-        if order is None:
+        if isinstance(order, str) and not order.strip():
+            saw_defaultable_order = True
             continue
-        if isinstance(order, int):
-            return order
-        if isinstance(order, str):
-            if not order.strip():
-                saw_defaultable_order = True
-                continue
-            try:
-                return int(order)
-            except ValueError:
-                saw_invalid_order = True
-                continue
+        normalized = _routing_module._coerce_order(order)
+        if normalized is not None:
+            return normalized
+        saw_invalid_order = True
     if saw_invalid_order:
         return None
     return 1 if saw_defaultable_order else None
 
 
-def _request_target_order(request_kwargs: Optional[dict]) -> Optional[int]:
+def _request_target_order(request_kwargs: Optional[dict]) -> Optional[_RouteOrder]:
     request_kwargs = request_kwargs or {}
-    target_order = request_kwargs.get("_target_order")
-    if isinstance(target_order, int):
-        return target_order
-    if isinstance(target_order, str):
-        try:
-            return int(target_order)
-        except ValueError:
-            return None
-    return None
+    return _routing_module._coerce_order(request_kwargs.get("_target_order"))
 
 
 def _deployment_id(deployment: Any) -> Optional[str]:

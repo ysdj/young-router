@@ -13,7 +13,7 @@ struct WebDAVSettingsDialogResult {
 final class WebDAVSettingsDialogController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     var didStopModal = false
     var result: WebDAVSettingsDialogResult?
-    let hasExistingPassword: Bool
+    var hasExistingPassword: Bool
     let probeHandler: (WebDAVSettingsDialogResult, @escaping (Int32, String) -> Void) -> Void
     let urlField: NSTextField
     let usernameField: NSTextField
@@ -26,6 +26,8 @@ final class WebDAVSettingsDialogController: NSObject, NSWindowDelegate, NSTextFi
     var applyButton: NSButton!
     var closeButton: NSButton!
     var window: NSPanel!
+    var hasUserEdits = false
+    var isApplyingLoadedSettings = false
 
     init(
         url: String,
@@ -62,17 +64,48 @@ final class WebDAVSettingsDialogController: NSObject, NSWindowDelegate, NSTextFi
     }
 
     func runModal() -> WebDAVSettingsDialogResult? {
-        NSApp.activate(ignoringOtherApps: true)
+        beginSettingsWindowPresentation(window)
         window.center()
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(urlField)
         let response = NSApp.runModal(for: window)
         window.orderOut(nil)
+        endSettingsWindowPresentation(window)
         return response == .OK ? result : nil
     }
 
     func windowWillClose(_ notification: Notification) {
         stopModal(with: .cancel)
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard !isApplyingLoadedSettings else { return }
+        hasUserEdits = true
+        if probeStatusLabel.stringValue == "Loading saved settings…" {
+            probeStatusLabel.stringValue = ""
+        }
+    }
+
+    func setSavedSettingsLoading(_ loading: Bool) {
+        guard !didStopModal else { return }
+        probeStatusLabel.textColor = .secondaryLabelColor
+        probeStatusLabel.stringValue = loading ? "Loading saved settings…" : ""
+    }
+
+    func applyLoadedSettings(_ settings: AppDelegate.WebDAVSyncSettings) {
+        guard !didStopModal, !hasUserEdits else { return }
+        isApplyingLoadedSettings = true
+        urlField.stringValue = settings.url ?? ""
+        usernameField.stringValue = settings.username ?? ""
+        remoteNameField.stringValue = webDAVRemoteName(settings.remoteName)
+        syncIntervalField.stringValue = String(settings.syncIntervalMinutes ?? defaultWebDAVSyncIntervalMinutes)
+        timeoutField.stringValue = formatSeconds(settings.timeoutSeconds ?? Double(defaultWebDAVTimeoutSeconds))
+        hasExistingPassword = settings.hasPassword ?? false
+        passwordField.placeholderString = hasExistingPassword
+            ? "leave blank to keep current password"
+            : "optional"
+        isApplyingLoadedSettings = false
+        setSavedSettingsLoading(false)
     }
 
     @objc func applyAction(_ sender: Any?) {
@@ -88,10 +121,10 @@ final class WebDAVSettingsDialogController: NSObject, NSWindowDelegate, NSTextFi
                 guard let self else { return }
                 self.setProbeInFlight(false)
                 if exitCode == 0 {
-                    self.probeStatusLabel.textColor = .systemGreen
+                    self.probeStatusLabel.textColor = .labelColor
                     self.probeStatusLabel.stringValue = "Probe OK"
                 } else {
-                    self.probeStatusLabel.textColor = .systemRed
+                    self.probeStatusLabel.textColor = .secondaryLabelColor
                     self.probeStatusLabel.stringValue = "Probe failed"
                 }
                 let title = exitCode == 0 ? "WebDAV probe OK" : "WebDAV probe failed"
@@ -115,6 +148,11 @@ final class WebDAVSettingsDialogController: NSObject, NSWindowDelegate, NSTextFi
             syncIntervalMinutes: normalizedSyncIntervalMinutes(syncIntervalField.stringValue),
             timeoutSeconds: normalizedTimeoutSeconds(timeoutField.stringValue)
         )
+    }
+
+    func webDAVRemoteName(_ value: String?) -> String {
+        let raw = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? defaultWebDAVRemoteName : raw
     }
 
     func setProbeInFlight(_ inFlight: Bool) {

@@ -19,7 +19,6 @@ from .base import (
     _ATTEMPTED_UPSTREAM_URL_SURFACES_KEY,
     _CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV,
-    _CODEX_INTERACTIVE_RECOVERY_MAX_SECONDS,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE,
     _CURRENT_UPSTREAM_URL_SURFACE_KEY,
@@ -41,14 +40,31 @@ from .base import (
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
     _RECOVERY_INTERVAL_DEFAULT_SECONDS,
     _RECOVERY_INTERVAL_SECONDS_ENV,
+    _RECOVERY_POLICY_BALANCE_ENV,
+    _RECOVERY_POLICY_COOLDOWN,
+    _RECOVERY_POLICY_ERROR,
+    _RECOVERY_POLICY_NETWORK_ENV,
+    _RECOVERY_POLICY_RATE_LIMIT_ENV,
+    _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+    _RECOVERY_POLICY_SERVER_ENV,
+    _RECOVERY_POLICY_STREAM_IDLE_TIMEOUT_ENV,
+    _RECOVERY_POLICY_STREAM_START_TIMEOUT_ENV,
+    _RECOVERY_POLICY_VALUES,
+    _RECOVERY_POLICY_RECOVERY,
     _RECOVERY_MAX_DEFAULT_SECONDS,
     _RECOVERY_MAX_SECONDS_ENV,
     _REQUEST_TIMEOUT_DEFAULT_SECONDS,
     _REQUEST_TIMEOUT_SECONDS_ENV,
     _ROUTE_RECOVERY_POLL_METADATA_KEY,
+    _ROUTE_FAILURE_POLICY_ATTR,
+    _RouteOrder,
+    _SAME_DEPLOYMENT_RETRY_EXHAUSTED_ATTR,
     _RouteRecoveryStreamResponse,
     _SANITIZED_UPSTREAM_ROUTE_FAILURE_ATTR,
+    _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR,
     _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE,
+    _SAME_DEPLOYMENT_RETRIES_DEFAULT,
+    _SAME_DEPLOYMENT_RETRIES_ENV,
     _SESSION_ID_KEY_FRAGMENTS,
     _SESSION_NAME_KEY_FRAGMENTS,
     _STALL_TIMEOUT_DEFAULT_SECONDS,
@@ -79,6 +95,7 @@ from .base import (
     datetime,
     json,
     litellm,
+    math,
     os,
     re,
     time,
@@ -190,8 +207,16 @@ def _request_started_time(request_kwargs: Optional[dict]) -> Optional[datetime]:
 def _event_time(value: Any) -> Optional[str]:
     if isinstance(value, datetime):
         if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            # LiteLLM's callback can hand us a naive local wall-clock value.
+            # Treating that as UTC makes every request look offset from the
+            # user's actual completion time in the native log viewer.
+            value = value.astimezone()
+        return (
+            value.astimezone(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
     return None
 
 
@@ -360,6 +385,40 @@ def _stream_route_exhaustion_retries() -> int:
     return _STREAM_ROUTE_EXHAUSTION_DEFAULT_RETRIES
 
 
+def _same_deployment_retries() -> int:
+    value = os.getenv(_SAME_DEPLOYMENT_RETRIES_ENV, "").strip()
+    if not value:
+        return _SAME_DEPLOYMENT_RETRIES_DEFAULT
+    try:
+        return max(0, min(20, int(value)))
+    except ValueError:
+        return _SAME_DEPLOYMENT_RETRIES_DEFAULT
+
+
+def _same_deployment_retry_exhausted(exception: Exception) -> bool:
+    return bool(getattr(exception, _SAME_DEPLOYMENT_RETRY_EXHAUSTED_ATTR, False))
+
+
+def _mark_same_deployment_retry_exhausted(exception: Exception) -> None:
+    try:
+        setattr(exception, _SAME_DEPLOYMENT_RETRY_EXHAUSTED_ATTR, True)
+    except Exception:
+        pass
+
+
+def _same_deployment_retry_pending(exception: Exception) -> bool:
+    """Whether this failure may stay on its selected deployment.
+
+    A class can be recoverable without being entitled to another attempt on
+    the same route: the explicit same-route budget owns that decision. Once
+    it is exhausted, all fallback paths must advance.
+    """
+    return (
+        _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
+        and not _same_deployment_retry_exhausted(exception)
+    )
+
+
 def _stream_route_exhaustion_retry_delay_seconds() -> float:
     return _recovery_interval_seconds()
 
@@ -386,6 +445,97 @@ def _env_float_seconds(name: str, default: float, *, minimum: float = 0.0) -> fl
     if parsed < minimum:
         return default
     return parsed
+
+
+def _recovery_policy_setting(name: str, default: str) -> str:
+    value = os.getenv(name, "").strip().lower()
+    return value if value in _RECOVERY_POLICY_VALUES else default
+
+
+def _recovery_policy_for_exception(exception: Exception) -> str:
+    """Classify an exhausted route failure before deciding to wait or cool down.
+
+    This deliberately does not use a failed deployment id as evidence that an
+    error is transient. A deployment-specific 400 is still deterministic until
+    a protocol/input compatibility bridge fixes it.
+    """
+    preserved = getattr(exception, _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR, None)
+    if preserved in _RECOVERY_POLICY_VALUES:
+        return preserved
+    preserved = getattr(exception, _ROUTE_FAILURE_POLICY_ATTR, None)
+    if preserved in _RECOVERY_POLICY_VALUES:
+        return preserved
+
+    if _is_local_stream_start_timeout_error(exception):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_STREAM_START_TIMEOUT_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+    if _is_local_stream_timeout_error(exception):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_STREAM_IDLE_TIMEOUT_ENV,
+            _RECOVERY_POLICY_RECOVERY,
+        )
+
+    status_code = _exception_status_code(exception)
+    text = _exception_text(exception)
+    if status_code == 402 or any(
+        marker in text for marker in _UPSTREAM_BALANCE_ERROR_MARKERS
+    ):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_BALANCE_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+    if _is_no_deployments_available_error(exception):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+    if (
+        _is_context_size_error(exception)
+        or _is_terminal_prompt_or_policy_error(exception)
+        or _is_ssl_verification_error(exception)
+        or _is_upstream_model_not_found_error(exception)
+        or _is_responses_schema_unsupported_error(exception)
+        or _is_upstream_gateway_bad_request_error(exception)
+        or _is_image_parameter_or_capability_bad_request_error(exception)
+        or _is_deployment_compatible_bad_request_error(exception)
+        or _is_upstream_surface_failover_error(exception)
+        or status_code in {400, 401, 403, 404, 405, 409, 422}
+    ):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            _RECOVERY_POLICY_ERROR,
+        )
+
+    if _exception_indicates_network_connectivity_error(exception):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_NETWORK_ENV,
+            _RECOVERY_POLICY_RECOVERY,
+        )
+
+    if status_code == 429 or any(
+        marker in text for marker in _UPSTREAM_TEMPORARY_ERROR_MARKERS
+    ):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_RATE_LIMIT_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+
+    if (
+        status_code == 408
+        or (status_code is not None and status_code >= 500)
+        or type(exception).__name__ in _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES
+    ):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+
+    return _recovery_policy_setting(
+        _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+        _RECOVERY_POLICY_ERROR,
+    )
 
 
 def _recovery_max_seconds() -> float:
@@ -488,16 +638,6 @@ def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
         request_data
     ):
         return configured_max_seconds
-    if (
-        _image_generation_module._request_has_responses_shape(request_data)
-        and _image_generation_module._request_has_codex_client_evidence(
-            request_data
-        )
-    ):
-        return min(
-            configured_max_seconds,
-            _CODEX_INTERACTIVE_RECOVERY_MAX_SECONDS,
-        )
     return configured_max_seconds
 
 
@@ -529,33 +669,7 @@ def _is_route_recovery_poll_payload(request_kwargs: Optional[dict]) -> bool:
 
 
 def _is_route_recovery_poll_error(exception: Exception) -> bool:
-    if _is_context_size_error(exception):
-        return False
-    if _is_upstream_model_not_found_error(exception):
-        return False
-    if _is_upstream_gateway_bad_request_error(exception):
-        return False
-    if _is_deployment_compatible_bad_request_error(exception):
-        return False
-    if _is_no_deployments_available_error(exception):
-        return True
-    if _exception_indicates_network_connectivity_error(exception):
-        return True
-    if _responses_execution_module._failed_deployment_id(exception):
-        return True
-    if _is_upstream_deployment_failover_error(exception):
-        return True
-    status_code = _exception_status_code(exception)
-    if status_code == 429:
-        return True
-    if type(exception).__name__ in _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES:
-        return True
-    if status_code == 408:
-        return True
-    if status_code is not None and status_code >= 500:
-        return True
-    text = _exception_text(exception)
-    return any(marker in text for marker in _UPSTREAM_TEMPORARY_ERROR_MARKERS)
+    return _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
 
 
 def _should_return_route_recovery_stream(
@@ -577,7 +691,6 @@ def _should_return_route_recovery_stream(
         return False
     if (
         router is not None
-        and not _is_sanitized_upstream_route_failure_error(exception)
         and _responses_execution_module._ordered_deployment_fallback_entry(router, exception, request_kwargs)
     ):
         return False
@@ -613,7 +726,7 @@ def _is_sanitized_upstream_route_failure_error(exception: Exception) -> bool:
 def _is_terminal_responses_stream_failure_error(exception: Exception) -> bool:
     if _is_sanitized_upstream_route_failure_error(exception):
         return True
-    return _should_sanitize_final_upstream_route_error(exception)
+    return _recovery_policy_for_exception(exception) == _RECOVERY_POLICY_ERROR
 
 
 def _should_return_failed_responses_stream(
@@ -899,7 +1012,8 @@ def _request_log_record(
     tools_summary = _trace_module._trace_tools_summary(request_kwargs)
 
     record: dict[str, Any] = {
-        "ts": _event_time(end_time) or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ts": _event_time(end_time)
+        or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "status": status,
         "duration_ms": _duration_ms(start_time, end_time),
         "time_to_first_token_ms": _time_to_first_token_ms(
@@ -1137,7 +1251,9 @@ def _trace_deployment(value: Any) -> dict[str, Any]:
         model_info = {}
     if not isinstance(litellm_params, dict):
         litellm_params = {}
-    order = _coerce_order(litellm_params.get("order")) or _coerce_order(model_info.get("order"))
+    order = _coerce_order(litellm_params.get("order"))
+    if order is None:
+        order = _coerce_order(model_info.get("order"))
     model = litellm_params.get("model")
     provider = model_info.get("provider")
     api_key_name = model_info.get("api_key_name")
@@ -1426,7 +1542,6 @@ def _surface_adapter_model(model: Any, surface: str) -> Any:
         return model
     upstream = model.strip()
     for prefix in (
-        "openai/responses/",
         "anthropic/",
         "openai/",
     ):
@@ -1837,19 +1952,106 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         "failed_deployment_id": _responses_execution_module._failed_deployment_id(exception),
         "failed_deployment_route_key": _responses_execution_module._failed_deployment_route_key(exception),
         "failed_deployment_order": _responses_execution_module._failed_deployment_order(exception),
+        "recovery_policy": _recovery_policy_for_exception(exception),
     }
 
 
-def _coerce_order(value: Any) -> Optional[int]:
+def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
+    """Return a stable, secret-free explanation for local recovery status."""
+    status_code = _exception_status_code(exception)
+    text = _exception_text(exception)
+
+    if any(marker in text for marker in _UPSTREAM_BALANCE_ERROR_MARKERS):
+        result = {
+            "kind": "billing",
+            "title": "Billing or credit limit",
+            "detail": "The upstream reported insufficient balance, quota, or credits.",
+        }
+    elif status_code in (401, 403) or any(
+        marker in text
+        for marker in (
+            "authentication",
+            "unauthorized",
+            "api key",
+            "invalid key",
+            "permission denied",
+            "access denied",
+        )
+    ):
+        result = {
+            "kind": "authentication",
+            "title": "Authentication rejected",
+            "detail": "Check the provider API key and account permissions.",
+        }
+    elif _exception_indicates_network_connectivity_error(exception):
+        result = {
+            "kind": "network",
+            "title": "Network connection failed",
+            "detail": "LiteLLM cannot currently reach the upstream service.",
+        }
+    elif status_code == 429 or any(
+        marker in text
+        for marker in (
+            "rate limit",
+            "too many requests",
+            "concurrency limit",
+            "retry later",
+            "try again later",
+        )
+    ):
+        result = {
+            "kind": "rate_limit",
+            "title": "Rate limited",
+            "detail": "The upstream is asking LiteLLM to wait before trying again.",
+        }
+    elif _is_local_stream_timeout_error(exception) or _exception_indicates_timeout_or_long_wait(exception):
+        result = {
+            "kind": "timeout",
+            "title": "Upstream timed out",
+            "detail": "The upstream did not complete within the configured time.",
+        }
+    elif _is_no_deployments_available_error(exception):
+        result = {
+            "kind": "unknown",
+            "title": "No healthy route",
+            "detail": "No configured upstream route is currently available.",
+        }
+    elif status_code is not None and status_code >= 500:
+        result = {
+            "kind": "unknown",
+            "title": "Upstream service unavailable",
+            "detail": "The upstream returned a temporary server error.",
+        }
+    else:
+        result = {
+            "kind": "unknown",
+            "title": "Recovery is retrying",
+            "detail": "LiteLLM is waiting for the upstream to become available.",
+        }
+
+    if status_code is not None:
+        result["status_code"] = status_code
+    return result
+
+
+def _coerce_order(value: Any) -> Optional[_RouteOrder]:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, str):
-        if not value.strip():
+        text = value.strip()
+        if not text:
             return 1
         try:
-            return int(value)
+            number = float(text)
         except ValueError:
             return None
+        if not math.isfinite(number):
+            return None
+        return int(number) if number.is_integer() else number
     return None
 
 
@@ -2363,16 +2565,19 @@ def _deployment_route_key_from_request(request_kwargs: Optional[dict]) -> Option
     )
 
 
-def _order_from_route_key(route_key: Any) -> Optional[int]:
+def _order_from_route_key(route_key: Any) -> Optional[_RouteOrder]:
     if not isinstance(route_key, str):
         return None
-    match = re.search(r"(?:^|/)\s*order\s*=\s*(\d+)\s*(?:/|$)", route_key)
+    match = re.search(
+        r"(?:^|/)\s*order\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(?:/|$)",
+        route_key,
+    )
     if match is None:
         return None
     return _coerce_order(match.group(1))
 
 
-def _deployment_order_from_request(request_kwargs: Optional[dict]) -> Optional[int]:
+def _deployment_order_from_request(request_kwargs: Optional[dict]) -> Optional[_RouteOrder]:
     request_kwargs = request_kwargs or {}
     order = _coerce_order(request_kwargs.get("order"))
     if order is not None:
@@ -2465,6 +2670,14 @@ def _mark_exception_for_deployment_failover(
     exception: Exception,
     request_kwargs: Optional[dict],
 ) -> None:
+    try:
+        setattr(
+            exception,
+            _ROUTE_FAILURE_POLICY_ATTR,
+            _recovery_policy_for_exception(exception),
+        )
+    except Exception:
+        pass
     _apply_current_selected_deployment_to_request(request_kwargs)
     deployment_id = _deployment_id_from_request(request_kwargs)
     route_key = _deployment_route_key_from_request(request_kwargs)
@@ -2490,16 +2703,18 @@ def _mark_exception_for_deployment_failover(
     if (
         deployment_order is not None
         and _request_allows_failed_deployment_order(request_kwargs)
-        and not getattr(exception, "failed_deployment_order", None)
+        and getattr(exception, "failed_deployment_order", None) is None
     ):
         try:
             exception.failed_deployment_order = deployment_order  # type: ignore[attr-defined]
         except Exception:
             pass
-    should_sync_exclusions = bool(
+    should_sync_exclusions = (
         not _is_local_stream_timeout_error(exception)
-        and not _exception_indicates_timeout_or_long_wait(exception)
-        and not _exception_indicates_network_connectivity_error(exception)
+        and (
+            not _should_retry_same_deployment_before_fallback(exception)
+            or _same_deployment_retry_exhausted(exception)
+        )
     )
     if not deployment_surface and should_sync_exclusions:
         _sync_failed_deployment_exclusions(
@@ -2584,7 +2799,10 @@ def _sync_failed_deployment_exclusions(
         failed_id
         and not surface_retry_pending
         and not _is_local_stream_timeout_error(exception)
-        and not _should_retry_same_deployment_before_fallback(exception)
+        and (
+            not _should_retry_same_deployment_before_fallback(exception)
+            or _same_deployment_retry_exhausted(exception)
+        )
     ):
         excluded_ids.add(failed_id)
     if excluded_ids:
@@ -2691,43 +2909,9 @@ def _should_count_deployment_failure_for_cooldown(
     exception: Exception,
     request_kwargs: Optional[dict] = None,
 ) -> bool:
-    stream_start_timeout = _is_local_stream_start_timeout_error(exception)
-    if _is_context_size_error(exception):
-        return False
     if _is_sanitized_upstream_route_failure_error(exception):
         return False
-    if _is_terminal_prompt_or_policy_error(exception):
-        return False
-    if _is_local_stream_timeout_error(exception) and not stream_start_timeout:
-        return False
-    if _is_no_deployments_available_error(exception):
-        return False
-    if _should_retry_same_deployment_before_fallback(exception):
-        return False
-    if _is_upstream_gateway_bad_request_error(exception):
-        return False
-    if _is_image_parameter_or_capability_bad_request_error(exception):
-        return False
-    if _is_deployment_compatible_bad_request_error(exception):
-        return False
-    if _exception_indicates_network_connectivity_error(exception):
-        return False
-
-    if _is_upstream_deployment_failover_error(exception):
-        return True
-    if _exception_indicates_timeout_or_long_wait(exception) and not stream_start_timeout:
-        return False
-    duration_seconds = _request_duration_seconds(request_kwargs)
-    if duration_seconds is not None and duration_seconds >= 30.0 and not stream_start_timeout:
-        return False
-    if stream_start_timeout:
-        return True
-    if _is_upstream_surface_failover_error(exception):
-        return True
-    status_code = _exception_status_code(exception)
-    if status_code is not None and status_code >= 500:
-        return True
-    return False
+    return _recovery_policy_for_exception(exception) == _RECOVERY_POLICY_COOLDOWN
 
 
 def _record_deployment_failure_for_cooldown(
@@ -2880,6 +3064,10 @@ def _deployment_cooldown_trace_entry(
         max(0.0, float(state.get("cooldown_until") or 0.0) - now),
         3,
     )
+    entry["cooldown_until"] = round(
+        max(0.0, float(state.get("cooldown_until") or 0.0)),
+        3,
+    )
     return entry
 
 
@@ -2894,7 +3082,6 @@ def _with_active_deployment_cooldowns(
     def filter_active(cooldowns: dict[str, Any], now: float) -> tuple[List[dict], list[dict[str, Any]], bool]:
         available: list[dict] = []
         cooled: list[dict[str, Any]] = []
-        cooled_candidates: list[tuple[dict, dict[str, Any]]] = []
         for deployment in deployments:
             requested_surface = _deployment_cooldown_surface(request_kwargs)
             if requested_surface is not None:
@@ -2957,25 +3144,10 @@ def _with_active_deployment_cooldowns(
                     cooldown_key=cooldown_key,
                 )
                 cooled.append(trace_entry)
-                cooled_candidates.append((deployment, trace_entry))
                 continue
             available.append(deployment)
 
         if cooled:
-            if (
-                not available
-                and cooled_candidates
-                and _is_route_recovery_poll_payload(request_kwargs)
-            ):
-                probe_deployment, probe_trace = min(
-                    cooled_candidates,
-                    key=lambda candidate: candidate[1].get(
-                        "cooldown_remaining_seconds",
-                        float("inf"),
-                    ),
-                )
-                probe_trace["half_open_probe"] = True
-                return [probe_deployment], cooled, True
             return available, cooled, True
         return deployments, [], False
 
@@ -3097,7 +3269,9 @@ def _mark_no_deployments_for_order_exhaustion(
             exception.failed_deployment_order = target_order  # type: ignore[attr-defined]
         except Exception:
             pass
-    _sync_failed_deployment_exclusions(request_kwargs, exception)
+    # No-healthy means the selected pool has no candidate, rather than a
+    # newly identified failed deployment. Keep existing constraints intact;
+    # recovery will deliberately rotate/reset orders on its next poll.
 
 
 def _raise_retryable_stream_disconnect(
@@ -3129,78 +3303,20 @@ def _should_sanitize_final_upstream_route_error(exception: Exception) -> bool:
         return False
     if _is_image_generation_tool_runtime_fallback_error(exception):
         return True
-    if _is_upstream_deployment_failover_error(exception):
-        return True
-    if _exception_indicates_network_connectivity_error(exception):
-        return True
-    if _is_no_deployments_available_error(exception):
-        return True
-    if _is_upstream_gateway_bad_request_error(exception):
-        return True
-    if _is_image_parameter_or_capability_bad_request_error(exception):
-        return True
-    if _is_deployment_compatible_bad_request_error(exception):
-        return True
-    status_code = _exception_status_code(exception)
-    if status_code in (408, 429):
-        return True
-    if status_code is not None and status_code >= 500:
-        return True
-    if type(exception).__name__ in _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES:
-        return True
-    text = _exception_text(exception)
-    return any(marker in text for marker in _UPSTREAM_TEMPORARY_ERROR_MARKERS)
+    return _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
 
 
 def _should_retry_final_upstream_route_error(
     exception: Exception,
     request_kwargs: Optional[dict] = None,
 ) -> bool:
-    if _is_local_stream_timeout_error(exception):
-        return False
-    if _is_context_size_error(exception):
-        return False
-    if _is_terminal_prompt_or_policy_error(exception):
-        return False
-    if _exception_indicates_network_connectivity_error(exception):
-        return True
-    if _is_upstream_deployment_failover_error(exception):
-        return False
-    if _is_deployment_compatible_bad_request_error(exception):
-        return False
     if _is_constrained_no_deployments_error(exception, request_kwargs):
         return False
-    return _should_sanitize_final_upstream_route_error(exception)
+    return _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
 
 
 def _should_retry_same_deployment_before_fallback(exception: Exception) -> bool:
-    if _is_local_stream_timeout_error(exception):
-        return False
-    if _is_context_size_error(exception):
-        return False
-    if _exception_indicates_timeout_or_long_wait(exception):
-        return True
-    if _exception_indicates_network_connectivity_error(exception):
-        return True
-    if _exception_status_code(exception) == 429:
-        return True
-    text = _exception_text(exception)
-    return any(
-        marker in text
-        for marker in (
-            "high demand",
-            "selected model is at capacity",
-            "model is at capacity",
-            "server is at capacity",
-            "service is at capacity",
-            "capacity reached",
-            "concurrency limit",
-            "rate limit",
-            "retry later",
-            "try again later",
-            "too many requests",
-        )
-    )
+    return _same_deployment_retry_pending(exception)
 
 
 async def _sleep_before_final_route_retry(
@@ -3231,10 +3347,7 @@ async def _sleep_before_final_route_retry(
     _streaming_module._reset_route_exhaustion_retry_state(
         request_kwargs,
         exception,
-        preserve_failed_deployment=(
-            not no_deployments_available
-            and not _should_retry_same_deployment_before_fallback(exception)
-        ),
+        preserve_failed_deployment=not no_deployments_available,
         preserve_existing_exclusions=no_deployments_available,
     )
     if delay_seconds > 0:
@@ -3306,6 +3419,14 @@ def _sanitized_upstream_route_exception(
             sanitized = RuntimeError(message)
     try:
         setattr(sanitized, _SANITIZED_UPSTREAM_ROUTE_FAILURE_ATTR, True)
+    except Exception:
+        pass
+    try:
+        setattr(
+            sanitized,
+            _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR,
+            _recovery_policy_for_exception(exception),
+        )
     except Exception:
         pass
     try:

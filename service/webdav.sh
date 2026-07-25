@@ -175,19 +175,6 @@ webdav_sync_enabled_status() {
   return 1
 }
 
-webdav_sync_last_status() {
-  ensure_runtime_layout
-  if [[ -f "$WEBDAV_SYNC_STATUS_FILE" ]]; then
-    cat "$WEBDAV_SYNC_STATUS_FILE"
-    return 0
-  fi
-  if webdav_sync_enabled; then
-    printf '{"enabled":true,"ok":null,"action":null,"checked_at":null,"output":""}\n'
-  else
-    printf '{"enabled":false,"ok":null,"action":null,"checked_at":null,"output":""}\n'
-  fi
-}
-
 webdav_sync_interval_seconds() {
   local output
   if ! ensure_python_tools >/dev/null 2>&1; then

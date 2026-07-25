@@ -66,8 +66,10 @@ else
   "$UV_BIN" pip install \
     --python "$RUNTIME/python/bin/python3.12" \
     --target "$SITE_PACKAGES" \
-    "litellm==$LITELLM_VERSION" \
-    -r "$ROOT/scripts/runtime-requirements.txt" >/dev/null
+    "litellm[proxy]==$LITELLM_VERSION" \
+    Pillow \
+    PyYAML \
+    ddgs >/dev/null
 fi
 
 cp "$ROOT/scripts/runtime/python-wrapper.sh" "$RUNTIME/bin/python"

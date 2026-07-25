@@ -1,8 +1,34 @@
 from __future__ import annotations
 
-from .schema import *
-from .load import *
-from .dump import *
+import argparse
+import datetime as _dt
+import json
+import os
+import pathlib
+import shutil
+import sys
+from typing import Any
+
+from .load import (
+    CONFIG_DOCUMENT_CONFIG_KEY,
+    CONFIG_DOCUMENT_DISABLED_KEY,
+    config_document_from_path,
+    load_config,
+    load_config_document,
+    normalize_config_document,
+)
+from .schema import (
+    CONFIG_YAML,
+    DISABLED_MODELS_KEY,
+    _as_dict,
+    _as_list,
+    _assert_expected_revision,
+    _bool_value,
+    _config_revision,
+    _disabled_models_path,
+    _string_value,
+    load_yaml_text,
+)
 
 
 def _assert_unique_deployment_ids(entries: list[dict[str, Any]]) -> None:
@@ -25,8 +51,26 @@ def save_config(
     providers: list[dict[str, Any]],
     path: pathlib.Path = CONFIG_YAML,
     expected_revision: Any = None,
+    document: Any = None,
 ) -> dict[str, Any]:
+    # Loading the editor only needs PyYAML. Import the write path here because
+    # it reaches LiteLLM and otherwise adds seconds to every editor open.
+    from .dump import (
+        _dump_model_list_section,
+        _dump_providers_section,
+        _dump_section,
+        _entry_from_editor,
+        _replace_top_level_sections,
+        _unique_model_groups,
+        _write_atomic,
+    )
+
     _assert_expected_revision(path, expected_revision)
+    source_document = (
+        config_document_from_path(path)
+        if document is None
+        else normalize_config_document(document)
+    )
 
     active_entries: list[dict[str, Any]] = []
     disabled_entries: list[dict[str, Any]] = []
@@ -64,8 +108,8 @@ def save_config(
 
     _assert_unique_deployment_ids(active_entries + disabled_entries)
 
-    original = path.read_text(encoding="utf-8")
-    original_data = _load_yaml(path)
+    original = source_document[CONFIG_DOCUMENT_CONFIG_KEY]
+    original_data = load_yaml_text(original, pathlib.Path("config.yaml"))
     existing_groups = _as_list(_as_dict(original_data.get("litellm_settings")).get("public_model_groups"))
     settings = dict(_as_dict(original_data.get("litellm_settings")))
     settings["public_model_groups"] = _unique_model_groups(active_entries, existing_groups)
@@ -78,14 +122,33 @@ def save_config(
         },
     )
 
-    parsed = yaml.safe_load(next_text)
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("providers"), dict) or not isinstance(parsed.get("model_list"), list):
-        raise ValueError("Refusing to save invalid config.yaml")
-    _validate_current_schema(parsed, path)
+    load_yaml_text(next_text, path)
+
+    next_disabled_text: str | None = None
+    if disabled_entries:
+        disabled_block = _dump_model_list_section(
+            DISABLED_MODELS_KEY, disabled_entries
+        )
+        original_disabled = source_document[CONFIG_DOCUMENT_DISABLED_KEY]
+        next_disabled_text = (
+            _replace_top_level_sections(
+                original_disabled,
+                {DISABLED_MODELS_KEY: disabled_block},
+            )
+            if original_disabled is not None
+            else disabled_block
+        )
+    if next_disabled_text is not None:
+        load_yaml_text(
+            next_disabled_text,
+            pathlib.Path("config.disabled-models.yaml"),
+        )
+        next_disabled_text = next_disabled_text.rstrip() + "\n"
 
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     backup = path.with_name(f"{path.name}.bak-{stamp}")
     shutil.copy2(path, backup)
+    os.chmod(backup, 0o600)
     _write_atomic(path, next_text)
 
     disabled_path = _disabled_models_path(path)
@@ -94,11 +157,13 @@ def save_config(
         if disabled_path.exists():
             disabled_backup_path = disabled_path.with_name(f"{disabled_path.name}.bak-{stamp}")
             shutil.copy2(disabled_path, disabled_backup_path)
+            os.chmod(disabled_backup_path, 0o600)
             disabled_backup = str(disabled_backup_path)
-        _write_atomic(disabled_path, _dump_model_list_section(DISABLED_MODELS_KEY, disabled_entries))
+        _write_atomic(disabled_path, next_disabled_text)
     elif disabled_path.exists():
         disabled_backup_path = disabled_path.with_name(f"{disabled_path.name}.bak-{stamp}")
         shutil.copy2(disabled_path, disabled_backup_path)
+        os.chmod(disabled_backup_path, 0o600)
         disabled_backup = str(disabled_backup_path)
         disabled_path.unlink()
 
@@ -110,11 +175,15 @@ def save_config(
         "disabled_path": str(disabled_path) if disabled_entries else "",
         "disabled_backup": disabled_backup,
         "revision": _config_revision(path),
+        "document": {
+            CONFIG_DOCUMENT_CONFIG_KEY: next_text.rstrip() + "\n",
+            CONFIG_DOCUMENT_DISABLED_KEY: next_disabled_text,
+        },
     }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Load and save LiteLLM Menu provider/model config.")
+    parser = argparse.ArgumentParser(description="Load and save LiteLLM Menu provider configuration.")
     parser.add_argument("command", choices=["load", "save"])
     parser.add_argument("--config", default=str(CONFIG_YAML))
     args = parser.parse_args()
@@ -126,11 +195,19 @@ def main() -> int:
             print()
             return 0
 
-        payload = json.load(sys.stdin)
-        providers = payload.get("providers") if isinstance(payload, dict) else None
-        if not isinstance(providers, list):
-            raise ValueError("Save payload must contain a providers list")
-        result = save_config(providers, path, payload.get("expected_revision"))
+        if args.command == "save":
+            payload = json.load(sys.stdin)
+            providers = payload.get("providers") if isinstance(payload, dict) else None
+            if not isinstance(providers, list):
+                raise ValueError("Save payload must contain a providers list")
+            result = save_config(
+                providers,
+                path,
+                payload.get("expected_revision"),
+                payload.get("document"),
+            )
+        else:
+            raise ValueError("Unsupported configuration editor command.")
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
         print()
         return 0
@@ -141,5 +218,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-__all__ = [name for name in globals() if not name.startswith("__")]

@@ -2,10 +2,21 @@
 service_action_requires_isolated_target() {
   case "$1" in
     bootstrap|config-editor-bootstrap|\
-    start|run-native|stop|reload|restart|hard-restart|apply-config|\
-    runtime-settings-apply|runtime-settings-save|\
+    start|run-native|stop|reload|restart|apply-config|status|\
+    tail|recent-requests|logs-summary|menu-actions-tail|\
+    route-trace|\
+    computer-facade-smoke|\
+    runtime-settings-configure|runtime-settings-apply|runtime-settings-save|\
+    configuration-package-export|configuration-package-import|external-provider-import|\
+    webdav-settings|webdav-status|webdav-sync-interval-seconds|\
+    webdav-configure|webdav-enable|webdav-disable|\
+    webdav-probe|webdav-sync|webdav-push|webdav-pull|\
+    stage-config|codex-config-status|codex-config-apply|\
+    codex-config-editor-load|codex-config-editor-sync|codex-config-editor-apply|\
+    provider-billing|remote-usage-logs|\
+    validate|verify-runtime-config|\
     autostart-enable|autostart-disable|autostart-status|\
-    config-watch-enable|config-watch-ensure|config-watch-disable)
+    config-watch-enable|config-watch-ensure|config-watch-disable|config-watch-tail)
       return 0
       ;;
     *)
@@ -14,19 +25,86 @@ service_action_requires_isolated_target() {
   esac
 }
 
-running_from_default_installed_app() {
-  [[ "$SCRIPT_DIR" == "$DEFAULT_APP_RESOURCE_ROOT" && "$APP_BUNDLE_PATH" == "$DEFAULT_APP_BUNDLE_PATH" ]]
+running_from_owned_app_bundle() {
+  [[ "$SCRIPT_DIR" == "$APP_BUNDLE_PATH/Contents/Resources/App" ]] || return 1
+  [[ -x "$APP_BUNDLE_PATH/Contents/MacOS/LiteLLMMenu" ]] || return 1
+  if [[ "$SCRIPT_DIR" == "$DEFAULT_APP_RESOURCE_ROOT" && "$APP_BUNDLE_PATH" == "$DEFAULT_APP_BUNDLE_PATH" ]]; then
+    return 0
+  fi
+  menu_app_running
+}
+
+enforce_isolated_runtime_paths() {
+  local unsafe variable path mapping shell_variable
+  local runtime_paths=(
+    LITELLM_MENU_RUNTIME_SETTINGS_FILE:RUNTIME_SETTINGS_FILE
+    LITELLM_CONFIG_FILE:CONFIG_FILE
+    LITELLM_RUNTIME_DIR:RUNTIME_DIR
+    LITELLM_RUNTIME_CONFIG:RUNTIME_CONFIG
+    LITELLM_RUNTIME_RELOAD_FINGERPRINT:RUNTIME_RELOAD_FINGERPRINT
+    LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE:DEPLOYMENT_COOLDOWN_FILE
+    LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE:ROUTE_RECOVERY_STATE_FILE
+    LITELLM_MENU_LOG:LOG_FILE
+    LITELLM_MENU_ACTIONS_LOG:MENU_ACTIONS_LOG
+    LITELLM_RECENT_REQUESTS_LOG:RECENT_REQUESTS_LOG
+    LITELLM_VENV_DIR:VENV_DIR
+    LITELLM_NATIVE_PID_FILE:NATIVE_PID_FILE
+    LITELLM_NATIVE_OWNER_FILE:NATIVE_OWNER_FILE
+    UV_PYTHON_INSTALL_DIR:UV_PYTHON_INSTALL_DIR
+    LITELLM_STATE_FILE:STATE_FILE
+    LITELLM_SERVICE_LIFECYCLE_LOCK_DIR:SERVICE_LIFECYCLE_LOCK_DIR
+    LITELLM_AUTOSTART_STATE_FILE:AUTOSTART_STATE_FILE
+    LITELLM_CONFIG_WATCH_LOG:CONFIG_WATCH_LOG
+    LITELLM_WEBDAV_SYNC_SETTINGS:WEBDAV_SYNC_SETTINGS
+    LITELLM_WEBDAV_SYNC_ENABLED_FILE:WEBDAV_SYNC_ENABLED_FILE
+    LITELLM_WEBDAV_SYNC_STATUS_FILE:WEBDAV_SYNC_STATUS_FILE
+    LITELLM_WEBDAV_SYNC_STATE:WEBDAV_SYNC_STATE_FILE
+  )
+  local arguments=("$ROOT" "$PWD")
+  for mapping in "${runtime_paths[@]}"; do
+    variable="${mapping%%:*}"
+    shell_variable="${mapping#*:}"
+    path="${!shell_variable}"
+    arguments+=("$variable=$path")
+  done
+
+  unsafe="$(/usr/bin/python3 - "${arguments[@]}" <<'PY'
+import os
+import sys
+
+root, cwd, *entries = sys.argv[1:]
+if not os.path.isabs(root):
+    root = os.path.join(cwd, root)
+root = os.path.realpath(root)
+unsafe = []
+for entry in entries:
+    name, path = entry.split("=", 1)
+    if not os.path.isabs(path):
+        path = os.path.join(cwd, path)
+    candidate = os.path.realpath(path)
+    try:
+        contained = os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        contained = False
+    if not contained:
+        unsafe.append(name)
+print(" ".join(unsafe))
+PY
+)" || return 64
+  if [[ -n "$unsafe" ]]; then
+    echo "Refusing an isolated checkout target with runtime paths outside LITELLM_RUNTIME_ROOT: $unsafe" >&2
+    return 64
+  fi
 }
 
 enforce_isolated_service_target() {
   local action="$1"
   local unsafe=()
   service_action_requires_isolated_target "$action" || return 0
-  running_from_default_installed_app && return 0
+  running_from_owned_app_bundle && return 0
 
   [[ "$ROOT" == "$USER_DEFAULT_RUNTIME_ROOT" ]] && unsafe+=("LITELLM_RUNTIME_ROOT=$ROOT")
   [[ "$PORT" == "$DEFAULT_PORT" ]] && unsafe+=("LITELLM_PORT=$PORT")
-  [[ "$LAUNCH_AGENT_LABEL" == "$DEFAULT_LAUNCH_AGENT_LABEL" ]] && unsafe+=("LITELLM_LAUNCH_AGENT_LABEL=$LAUNCH_AGENT_LABEL")
   [[ "$APP_LAUNCH_AGENT_LABEL" == "$DEFAULT_APP_LAUNCH_AGENT_LABEL" ]] && unsafe+=("LITELLM_APP_LAUNCH_AGENT_LABEL=$APP_LAUNCH_AGENT_LABEL")
   [[ "$CONFIG_WATCH_LABEL" == "$DEFAULT_CONFIG_WATCH_LABEL" ]] && unsafe+=("LITELLM_CONFIG_WATCH_LABEL=$CONFIG_WATCH_LABEL")
 
@@ -35,6 +113,8 @@ enforce_isolated_service_target() {
     echo "Use an isolated runtime root, port, and launch agent labels for copies/tests." >&2
     return 64
   fi
+
+  enforce_isolated_runtime_paths
 }
 
 if [[ -z "${LITELLM_UV_BIN:-}" && ! -x "$BUNDLED_UV" ]]; then
@@ -68,22 +148,6 @@ normalize_bool() {
       echo "0"
       ;;
   esac
-}
-
-route_trace_state_value() {
-  local value=""
-  if [[ -f "$ROUTE_TRACE_STATE_FILE" ]]; then
-    value="$(tr -d '[:space:]' < "$ROUTE_TRACE_STATE_FILE" 2>/dev/null || true)"
-  fi
-  normalize_bool "$value"
-}
-
-route_trace_effective_value() {
-  if [[ -n "${LITELLM_MENU_ROUTE_TRACE:-}" ]]; then
-    normalize_bool "$LITELLM_MENU_ROUTE_TRACE"
-    return
-  fi
-  route_trace_state_value
 }
 
 use_system_proxies_value() {
@@ -183,28 +247,39 @@ ensure_runtime_layout() {
 }
 
 find_bootstrap_python() {
-  if [[ -n "${PYTHON:-}" && -x "$PYTHON" ]]; then
+  if [[ -n "${PYTHON:-}" && -x "$PYTHON" ]] && python_supports_runtime "$PYTHON"; then
     echo "$PYTHON"
     return 0
   fi
-  if [[ -x "$BUNDLED_PYTHON" ]]; then
+  if [[ -x "$BUNDLED_PYTHON" ]] && python_supports_runtime "$BUNDLED_PYTHON"; then
     echo "$BUNDLED_PYTHON"
     return 0
   fi
-  if command -v python3 >/dev/null 2>&1; then
-    command -v python3
+  local system_python
+  if system_python="$(command -v python3 2>/dev/null)" && python_supports_runtime "$system_python"; then
+    echo "$system_python"
     return 0
   fi
-  if [[ -x /usr/bin/python3 ]]; then
+  if [[ -x /usr/bin/python3 ]] && python_supports_runtime /usr/bin/python3; then
     echo /usr/bin/python3
     return 0
   fi
   return 1
 }
 
-helper_python_ready() {
+python_supports_runtime() {
   local python="$1"
   [[ -x "$python" ]] || return 1
+  "$python" - <<'PY' >/dev/null 2>&1
+import sys
+
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+}
+
+helper_python_ready() {
+  local python="$1"
+  python_supports_runtime "$python" || return 1
   "$python" - <<'PY' >/dev/null 2>&1
 import yaml  # noqa: F401
 PY
@@ -362,8 +437,16 @@ SPECS = [
     {"key": "LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS", "category": "Timeouts", "label": "First-event timeout", "unit": "seconds", "kind": "float", "default": "120", "minimum": 0, "maximum": 3600, "help": "Maximum wait for the first upstream stream event on ordinary requests. 0 falls back to Request timeout."},
     {"key": "LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS", "category": "Timeouts", "label": "Compaction first-event", "unit": "seconds", "kind": "float", "default": "300", "minimum": 0, "maximum": 3600, "help": "Maximum wait for the first event from a structured Codex compaction request. 0 falls back to Request timeout."},
     {"key": "LITELLM_MENU_STALL_TIMEOUT_SECONDS", "category": "Timeouts", "label": "Stream idle timeout", "unit": "seconds", "kind": "float", "default": "120", "minimum": 0, "maximum": 3600, "help": "Maximum gap between stream events after the first event has arrived. 0 disables the local stream-idle cap."},
-    {"key": "LITELLM_MENU_RECOVERY_MAX_SECONDS", "category": "Timeouts", "label": "Recovery max", "unit": "seconds", "kind": "float", "default": "43200", "minimum": 0, "maximum": 86400, "help": "Maximum route recovery polling time. Structured Codex compaction uses this full window so it can survive long outages; other interactive Codex turns are capped at 300 seconds. 0 disables polling."},
+    {"key": "LITELLM_MENU_RECOVERY_MAX_SECONDS", "category": "Recovery", "label": "Recovery max", "unit": "seconds", "kind": "float", "default": "14400", "minimum": 0, "maximum": 86400, "help": "Maximum route recovery polling time. The same connection stays alive with progress heartbeats while every route is cooling down, then retries after the first cooldown ends. 0 disables polling."},
     {"key": "LITELLM_MENU_RECOVERY_INTERVAL_SECONDS", "category": "Timeouts", "label": "Recovery interval", "unit": "seconds", "kind": "float", "default": "5", "minimum": 0.001, "maximum": 3600, "help": "Delay between real route recovery probes."},
+    {"key": "LITELLM_MENU_SAME_DEPLOYMENT_RETRIES", "category": "Recovery", "label": "Same-route retries", "unit": "retries", "kind": "int", "default": "0", "minimum": 0, "maximum": 20, "help": "Additional attempts on the failed deployment before the next peer or order. Default 0 advances immediately; this also overrides LiteLLM Router retry-policy counts."},
+    {"key": "LITELLM_MENU_RECOVERY_POLICY_BALANCE", "category": "Recovery", "label": "Balance / quota", "kind": "enum", "default": "recovery_cooldown", "options": ["error", "recovery", "recovery_cooldown"], "help": "How insufficient balance, quota, or billing failures are handled."},
+    {"key": "LITELLM_MENU_RECOVERY_POLICY_RATE_LIMIT", "category": "Recovery", "label": "Rate limit / overload", "kind": "enum", "default": "recovery_cooldown", "options": ["error", "recovery", "recovery_cooldown"], "help": "How HTTP 429 and upstream overload or capacity failures are handled."},
+    {"key": "LITELLM_MENU_RECOVERY_POLICY_SERVER", "category": "Recovery", "label": "Server / gateway", "kind": "enum", "default": "recovery_cooldown", "options": ["error", "recovery", "recovery_cooldown"], "help": "How temporary server failures, no healthy route, and gateway timeouts are handled."},
+    {"key": "LITELLM_MENU_RECOVERY_POLICY_NETWORK", "category": "Recovery", "label": "Network", "kind": "enum", "default": "recovery", "options": ["error", "recovery", "recovery_cooldown"], "help": "How disconnects, DNS failures, and connection errors are handled. Default recovery does not cool down the deployment."},
+    {"key": "LITELLM_MENU_RECOVERY_POLICY_STREAM_START_TIMEOUT", "category": "Recovery", "label": "First-event timeout", "kind": "enum", "default": "recovery_cooldown", "options": ["error", "recovery", "recovery_cooldown"], "help": "How a local timeout before the first upstream stream event is handled."},
+    {"key": "LITELLM_MENU_RECOVERY_POLICY_STREAM_IDLE_TIMEOUT", "category": "Recovery", "label": "Stream idle timeout", "kind": "enum", "default": "recovery", "options": ["error", "recovery", "recovery_cooldown"], "help": "How a local timeout after streaming has begun is handled. Default recovery does not cool down the deployment."},
+    {"key": "LITELLM_MENU_RECOVERY_POLICY_REQUEST_ERROR", "category": "Recovery", "label": "Request / format error", "kind": "enum", "default": "error", "options": ["error", "recovery", "recovery_cooldown"], "help": "How deterministic request, format, model, policy, and context errors are handled. Default error returns a terminal failure so the proxy can be patched instead of waiting."},
     {"key": "LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS", "category": "Timeouts", "label": "Web fetch timeout", "unit": "seconds", "kind": "float", "default": "30", "minimum": 3, "maximum": 60, "help": "Timeout for DDGS search and Jina page fetches. This does not cap model generation."},
     {"key": "LITELLM_MENU_WEB_SEARCH_MAX_RESULTS", "category": "Web Search", "label": "Search results", "unit": "results", "kind": "int", "default": "8", "minimum": 1, "maximum": 20, "help": "Maximum deduplicated DDGS results collected per search action across configured backends."},
     {"key": "LITELLM_MENU_WEB_SEARCH_READ_RESULTS", "category": "Web Search", "label": "Readable pages", "unit": "pages", "kind": "int", "default": "4", "minimum": 0, "maximum": 20, "help": "Number of top search results expanded through Jina Reader for stronger snippets. 0 disables page expansion."},
@@ -386,6 +469,8 @@ SPECS = [
     {"key": "LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES", "category": "Fallback", "label": "Cooldown failures", "unit": "failures", "kind": "int", "default": "2", "minimum": 0, "maximum": 20, "help": "Consecutive upstream failures before that deployment/protocol pair is temporarily skipped. Other configured protocols on the same deployment remain eligible. 0 disables cooldown."},
     {"key": "LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS", "category": "Fallback", "label": "Cooldown duration", "unit": "seconds", "kind": "float", "default": "300", "minimum": 0, "maximum": 86400, "help": "How long a failed deployment/protocol pair is skipped after reaching the threshold. The deployment is excluded only while all configured protocols are cooling down. 0 disables cooldown."},
     {"key": "LITELLM_MENU_IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS", "category": "Fallback", "label": "Image tool attempts", "unit": "attempts", "kind": "int", "default": "3", "minimum": 0, "maximum": 20, "help": "Maximum same-request image-generation tool recovery attempts before returning a safe failure. 0 disables this recovery."},
+    {"key": "LITELLM_MENU_BALANCE_REFRESH_MINUTES", "category": "Billing", "label": "Balance refresh", "unit": "minutes", "kind": "int", "default": "5", "minimum": 0, "maximum": 1440, "help": "Refresh model balances in the background while Providers & Models is open. 0 disables timed refresh; Model Probe still refreshes once."},
+    {"key": "LITELLM_BROWSER_BILLING", "category": "Billing", "label": "Browser billing fallback", "kind": "bool", "default": "0", "help": "After direct billing endpoints fail, allow a request in an already-open same-origin Chrome page. This does not read Chrome profile or cookie files, open or switch tabs, or start Chrome."},
     {"key": "LITELLM_MENU_COMPUTER_FACADE_BACKEND", "category": "Computer Facade", "label": "Backend", "kind": "enum", "default": "auto", "options": ["auto", "mcp", "browser", "chrome", "playwright", "cua", "mock"], "help": "Executor backend. Explicit choices do not silently fall back to another real backend."},
     {"key": "LITELLM_MENU_COMPUTER_FACADE_MODEL", "category": "Computer Facade", "label": "Planner model", "kind": "string", "default": "", "help": "Optional model group or route for the internal JSON planner. Empty uses the request model."},
     {"key": "LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS", "category": "Computer Facade", "label": "Max steps", "unit": "steps", "kind": "int", "default": "20", "minimum": 1, "maximum": 200, "help": "Maximum computer observation/action turns before safe failure."},
@@ -394,7 +479,7 @@ SPECS = [
     {"key": "LITELLM_MENU_COMPUTER_FACADE_ACTION_DENYLIST", "category": "Computer Facade", "label": "Action denylist", "kind": "string", "default": "", "help": "Comma-separated actions to block, for example click,type,drag."},
     {"key": "LITELLM_MENU_COMPUTER_FACADE_REQUIRE_OBSERVATION", "category": "Computer Facade", "label": "Require observation", "kind": "bool", "default": "1", "help": "Require executor observation before planner completion or action success."},
     {"key": "LITELLM_MENU_LOG_MAX_BYTES", "category": "Logs", "label": "Local log file cap", "unit": "MB", "kind": "mb", "default": "10", "minimum": 0.25, "maximum": 100, "help": "Per-file cap for local logs: recent requests, service stdout/stderr, menu actions, and config watch. Each log keeps one .1 backup containing the previous tail."},
-    {"key": "LITELLM_MENU_ROUTE_TRACE_PREVIEW_CHARS", "category": "Logs", "label": "Trace preview chars", "unit": "chars", "kind": "int", "default": "2000", "minimum": 80, "maximum": 2000, "help": "Maximum request-preview characters retained in local route trace. The separate Route Trace menu controls whether tracing is enabled."},
+    {"key": "LITELLM_MENU_ROUTE_TRACE_PREVIEW_CHARS", "category": "Logs", "label": "Trace preview chars", "unit": "chars", "kind": "int", "default": "2000", "minimum": 80, "maximum": 2000, "help": "Maximum request-preview characters retained in the always-on local route trace."},
     {"key": "LITELLM_USE_SYSTEM_PROXIES", "category": "Network", "label": "Use system proxies", "kind": "bool", "default": "0", "help": "Allow upstream HTTP clients to use macOS system proxy settings. Off isolates LiteLLM from system proxy auto-discovery."},
     {"key": "LITELLM_PORT", "category": "Service", "label": "Local port", "kind": "int", "default": "4000", "minimum": 1, "maximum": 65535, "help": "Local HTTP port for the LiteLLM proxy. Changing this updates health checks and requires a service restart."},
     {"key": "LITELLM_NUM_WORKERS", "category": "Service", "label": "Worker count", "unit": "workers", "kind": "int", "default": "16", "minimum": 1, "maximum": 64, "help": "Gunicorn workers for the local LiteLLM proxy."},
@@ -403,7 +488,6 @@ SPECS = [
     {"key": "LITELLM_HEALTH_WAIT_SECONDS", "category": "Service", "label": "Health wait", "unit": "seconds", "kind": "int", "default": "60", "minimum": 1, "maximum": 600, "help": "How long start/restart waits for the health endpoint."},
     {"key": "LITELLM_RUNTIME_VERIFY_WAIT_SECONDS", "category": "Service", "label": "Runtime verify wait", "unit": "seconds", "kind": "int", "default": "30", "minimum": 1, "maximum": 600, "help": "How long runtime config verification may wait."},
     {"key": "LITELLM_SERVICE_LIFECYCLE_LOCK_WAIT_SECONDS", "category": "Service", "label": "Lifecycle lock wait", "unit": "seconds", "kind": "int", "default": "120", "minimum": 1, "maximum": 1800, "help": "Maximum wait for concurrent start/restart/apply-config operations."},
-    {"key": "LITELLM_SERVICE_THROTTLE_INTERVAL_SECONDS", "category": "Service", "label": "Launchd throttle interval", "unit": "seconds", "kind": "int", "default": "1", "minimum": 1, "maximum": 300, "help": "Launchd restart throttle interval for the proxy service."},
     {"key": "LITELLM_CONFIG_WATCH_INTERVAL", "category": "Config Watch", "label": "Poll interval", "unit": "seconds", "kind": "float", "default": "5", "minimum": 0.2, "maximum": 300, "help": "How often config.yaml is checked for changes."},
     {"key": "LITELLM_CONFIG_WATCH_SETTLE_INTERVAL", "category": "Config Watch", "label": "Settle interval", "unit": "seconds", "kind": "float", "default": "2", "minimum": 0, "maximum": 300, "help": "How long the watcher waits for file writes to settle."},
 ]
@@ -522,21 +606,11 @@ for spec in SPECS:
     elif spec["kind"] == "bool_auto":
         value = normalize_value(spec, os.environ.get(env_key, spec["default"]))
     else:
-        if env_key == "LITELLM_MENU_VISION_BRIDGE_BACKEND":
-            value = os.environ.get(env_key) or os.environ.get("LITELLM_MENU_VISION_BRIDGE_MODE") or spec["default"]
-            if str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}:
-                value = "auto"
-            elif str(value).strip().lower() in {"0", "false", "no", "off", "disabled"}:
-                value = "off"
-        else:
-            value = os.environ.get(env_key, spec["default"])
+        value = os.environ.get(env_key, spec["default"])
         if spec["kind"] == "enum":
             value = str(value).strip().lower()
     item["value"] = value
-    if env_key == "LITELLM_MENU_VISION_BRIDGE_BACKEND":
-        item["configured"] = env_key in configured or "LITELLM_MENU_VISION_BRIDGE_MODE" in configured
-    else:
-        item["configured"] = env_key in configured
+    item["configured"] = env_key in configured
     settings.append(item)
 print(json.dumps({"path": str(path), "settings": settings}, ensure_ascii=False, indent=2))
 PY

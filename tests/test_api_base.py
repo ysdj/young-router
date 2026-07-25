@@ -23,7 +23,7 @@ class APIBaseTests(unittest.TestCase):
             "https://api.example.test/v1/responses": "https://api.example.test/v1/responses",
             "https://api.example.test/v1/messages/": "https://api.example.test/v1/messages",
             "https://api.example.test/messages": "https://api.example.test/messages",
-            "https://api.example.test/v1/completion": "https://api.example.test/v1/completion",
+            "https://api.example.test/v1/completions": "https://api.example.test/v1/completions",
             "https://api.example.test/v1/images/generations": "https://api.example.test/v1/images/generations",
             "https://api.example.test/gateway/v1/messages": "https://api.example.test/gateway/v1/messages",
         }
@@ -41,7 +41,7 @@ class APIBaseTests(unittest.TestCase):
             ("https://api.example.test/v1/messages", "https://api.example.test/v1"),
             ("https://api.example.test/messages", "https://api.example.test"),
             ("https://api.example.test/v1/responses", "https://api.example.test/v1"),
-            ("https://api.example.test/v1/completion", "https://api.example.test/v1"),
+            ("https://api.example.test/v1/completions", "https://api.example.test/v1"),
         )
         for surface in ("openai/responses", "openai/chat"):
             for source, expected in cases:
@@ -90,6 +90,12 @@ class APIBaseTests(unittest.TestCase):
         self.assertEqual(request["litellm_params"]["api_base"], "https://api.example.test/v1/messages")
         self.assertEqual(request["api_base"], "https://api.example.test/v1/messages")
         self.assertEqual(request["litellm_metadata"]["api_base"], "https://api.example.test/v1/messages")
+
+    def test_gateway_path_names_are_not_mistaken_for_complete_endpoints(self) -> None:
+        for path in ("model", "chat", "response", "tenant/model"):
+            with self.subTest(path=path):
+                source = f"https://api.example.test/{path}"
+                self.assertEqual(normalize_configured_api_base(source), f"{source}/v1")
 
 
 

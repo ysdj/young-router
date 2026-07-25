@@ -8,9 +8,6 @@ extension ModelConfigEditorController {
         if tableView == routeTableView {
             return routeTableRows().count
         }
-        if tableView == runtimeMapTableView {
-            return runtimeMapRows.count
-        }
         if tableView == providerKeyTableView {
             guard let providerIndex = selectedProviderIndex else { return 0 }
             return providers[providerIndex].apiKeys.count
@@ -19,31 +16,19 @@ extension ModelConfigEditorController {
         return providers[providerIndex].models.count
     }
 
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        if tableView == runtimeMapTableView {
-            guard runtimeMapRows.indices.contains(row) else { return 28 }
-            switch runtimeMapRows[row] {
-            case .summary: return 30
-            case .model: return 27
-            case .order: return 23
-            case .deployment: return 28
-            case .empty: return 44
-            }
-        }
-        if tableView == routeTableView {
-            let rows = routeTableRows()
-            if row >= 0, row < rows.count {
-                if case .modelGroup = rows[row] {
-                    return 30
-                }
-            }
-        }
-        return 28
-    }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 28 }
 
     func selectionShouldChange(in tableView: NSTableView) -> Bool {
         if isRenderingSelection {
             return true
+        }
+        if tableView == routeTableView {
+            let clickedRow = tableView.clickedRow
+            pendingRouteSelectionIdentity = clickedRow >= 0
+                ? routeSelectionIdentity(atTableRow: clickedRow)
+                : nil
+        } else {
+            pendingRouteSelectionIdentity = nil
         }
         commitEditor()
         return true
@@ -52,9 +37,6 @@ extension ModelConfigEditorController {
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !isRenderingSelection else { return }
         guard let tableView = notification.object as? NSTableView else { return }
-        if tableView == runtimeMapTableView {
-            return
-        }
         if tableView == providerTableView {
             renderProviderSelection()
         } else if tableView == providerKeyTableView {
@@ -67,64 +49,64 @@ extension ModelConfigEditorController {
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        if tableView == runtimeMapTableView {
-            return runtimeMapCell(at: row)
-        }
         let text: String
         var tooltip: String?
         var enabled = true
         if tableView == providerTableView {
             guard row >= 0, row < providers.count else { return nil }
             let provider = providers[row]
-            text = tableColumn?.identifier == providerCountColumnIdentifier ? "\(provider.models.count)" : provider.displayName
+            if tableColumn?.identifier == providerCountColumnIdentifier {
+                text = "\(provider.models.count)"
+            } else {
+                text = provider.displayName
+            }
+            tooltip = provider.displayName
             enabled = provider.enabled
         } else if tableView == modelTableView {
             guard let providerIndex = selectedProviderIndex,
                   row >= 0,
                   row < providers[providerIndex].models.count else { return nil }
             let model = providers[providerIndex].models[row]
-            if tableColumn?.identifier == modelUpstreamColumnIdentifier {
-                text = modelUpstreamPart(model.litellmModel)
-            } else if tableColumn?.identifier == modelRouteColumnIdentifier {
-                text = modelRouteSummary(model)
+            if tableColumn?.identifier == modelBillingColumnIdentifier {
+                text = modelBillingSummary(provider: providers[providerIndex], model: model)
+            } else if tableColumn?.identifier == modelUpstreamColumnIdentifier {
+                let upstream = modelUpstreamPart(model.litellmModel)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                text = upstream.isEmpty ? "N/A" : upstream
+            } else if tableColumn?.identifier == modelApiKeyOrderColumnIdentifier {
+                let apiKeyName = model.apiKeyName.trimmingCharacters(in: .whitespacesAndNewlines)
+                let order = model.order.trimmingCharacters(in: .whitespacesAndNewlines)
+                text = "\(apiKeyName.isEmpty ? "N/A" : apiKeyName) / \(order.isEmpty ? "1" : order)"
             } else {
                 text = model.displayName
             }
-            tooltip = modelRouteTooltip(model)
+            switch tableColumn?.identifier {
+            case modelBillingColumnIdentifier:
+                tooltip = modelBillingTooltip(provider: providers[providerIndex], model: model)
+            case modelApiKeyOrderColumnIdentifier:
+                tooltip = "API key and route order: \(text)"
+            default:
+                tooltip = modelDeploymentTooltip(model)
+            }
             enabled = modelEffectivelyEnabled(providerIndex: providerIndex, model: model)
         } else if tableView == routeTableView {
             let rows = routeTableRows()
             guard row >= 0, row < rows.count else { return nil }
-            switch rows[row] {
-            case .modelGroup(let group):
-                if tableColumn?.identifier == routeModelColumnIdentifier {
-                    text = group.publicModel
-                } else if tableColumn?.identifier == routeProviderKeyColumnIdentifier {
-                    text = "\(group.routeCount) \(group.routeCount == 1 ? "route" : "routes")"
-                } else if tableColumn?.identifier == routeUpstreamColumnIdentifier {
-                    text = "RUN \(group.runningCount) / OFF \(group.offCount)"
-                } else if tableColumn?.identifier == routeStatusColumnIdentifier {
-                    text = group.runningCount > 0 ? "RUN" : "OFF"
-                } else {
-                    text = ""
-                }
-                tooltip = routeGroupTooltip(group)
-                enabled = group.runningCount > 0
-            case .deployment(let route):
-                if tableColumn?.identifier == routeOrderColumnIdentifier {
-                    text = route.order.map { "\($0)" } ?? "-"
-                } else if tableColumn?.identifier == routeProviderKeyColumnIdentifier {
-                    text = "  \(route.providerName) / \(route.keyName)"
-                } else if tableColumn?.identifier == routeUpstreamColumnIdentifier {
-                    text = route.upstreamModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "(blank upstream)" : route.upstreamModel
-                } else if tableColumn?.identifier == routeStatusColumnIdentifier {
-                    text = route.enabled ? "RUN" : "OFF"
-                } else {
-                    text = ""
-                }
-                tooltip = routeTooltip(route)
-                enabled = route.enabled
+            let route = rows[row]
+            if tableColumn?.identifier == routeModelColumnIdentifier {
+                text = routeStartsModelGroup(atTableRow: row) ? route.publicModel : ""
+            } else if tableColumn?.identifier == routeOrderColumnIdentifier {
+                text = route.order.map(orderDisplayText) ?? "-"
+            } else if tableColumn?.identifier == routeProviderKeyColumnIdentifier {
+                text = "\(route.providerName) / \(route.keyName)"
+            } else if tableColumn?.identifier == routeUpstreamColumnIdentifier {
+                let upstream = route.upstreamModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                text = upstream.isEmpty ? "N/A" : upstream
+            } else {
+                text = ""
             }
+            tooltip = routeProbeTooltip(route)
+            enabled = route.enabled
         } else {
             guard let providerIndex = selectedProviderIndex,
                   row >= 0,
@@ -132,31 +114,39 @@ extension ModelConfigEditorController {
             text = providers[providerIndex].apiKeys[row].displayName
         }
         let label = NSTextField(labelWithString: text)
-        label.lineBreakMode = .byTruncatingMiddle
-        label.textColor = enabled ? .labelColor : .secondaryLabelColor
-        if tableView == routeTableView, routeGroup(atTableRow: row) != nil {
+        if tableView == modelTableView,
+           tableColumn?.identifier == modelBillingColumnIdentifier {
+            label.lineBreakMode = .byClipping
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        } else {
+            label.lineBreakMode = .byTruncatingMiddle
+        }
+        if tableView == routeTableView,
+           tableColumn?.identifier == routeModelColumnIdentifier,
+           routeStartsModelGroup(atTableRow: row) {
             label.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        } else if tableView == modelTableView,
+                  tableColumn?.identifier == modelBillingColumnIdentifier,
+                  let providerIndex = selectedProviderIndex {
+            label.textColor = modelEffectivelyEnabled(providerIndex: providerIndex, model: providers[providerIndex].models[row])
+                ? .labelColor
+                : .secondaryLabelColor
+            label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        } else {
+            label.textColor = enabled ? .labelColor : .secondaryLabelColor
         }
         label.alignment = tableColumn?.identifier == providerCountColumnIdentifier
-            || tableColumn?.identifier == routeOrderColumnIdentifier
-            || tableColumn?.identifier == routeStatusColumnIdentifier ? .right : .left
+            || tableColumn?.identifier == routeOrderColumnIdentifier ? .right : .left
         label.toolTip = tooltip ?? text
         return verticallyCenteredTableCell(label: label)
     }
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-        tableView != runtimeMapTableView
+        true
     }
 
     func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool {
-        guard tableView == runtimeMapTableView,
-              runtimeMapRows.indices.contains(row) else {
-            return false
-        }
-        if case .model = runtimeMapRows[row] {
-            return true
-        }
-        return false
+        false
     }
 
     func verticallyCenteredTableCell(label: NSTextField) -> NSTableCellView {
@@ -190,9 +180,7 @@ extension ModelConfigEditorController {
     }
 
     var selectedRouteIdentity: ModelSelectionIdentity? {
-        let row = routeTableView.selectedRow
-        guard let route = routeDeployment(atTableRow: row) else { return nil }
-        return modelSelectionIdentity(providerIndex: route.providerIndex, modelIndex: route.modelIndex)
+        routeSelectionIdentity(atTableRow: routeTableView.selectedRow)
     }
 
     func selectedRouteRow() -> RouteDeploymentRow? {
@@ -257,19 +245,39 @@ extension ModelConfigEditorController {
         }
     }
 
-    func selectRoute(providerIndex: Int, modelIndex: Int) {
-        let rows = routeTableRows()
-        guard let rowIndex = rows.firstIndex(where: {
-            if case .deployment(let route) = $0 {
-                return route.providerIndex == providerIndex && route.modelIndex == modelIndex
-            }
-            return false
-        }) else {
+    func routeSelectionIdentity(atTableRow row: Int) -> ModelSelectionIdentity? {
+        guard let route = routeDeployment(atTableRow: row) else { return nil }
+        return modelSelectionIdentity(providerIndex: route.providerIndex, modelIndex: route.modelIndex)
+    }
+
+    func routeTableRowIndex(for identity: ModelSelectionIdentity) -> Int? {
+        guard let current = modelSelectionIndices(for: identity) else { return nil }
+        return routeTableRows().firstIndex {
+            $0.providerIndex == current.provider && $0.modelIndex == current.model
+        }
+    }
+
+    func selectRoute(
+        providerIndex: Int,
+        modelIndex: Int,
+        scrollIntoView: Bool = false
+    ) {
+        guard let identity = modelSelectionIdentity(providerIndex: providerIndex, modelIndex: modelIndex) else {
+            routeTableView.deselectAll(nil)
+            return
+        }
+        selectRoute(identity, scrollIntoView: scrollIntoView)
+    }
+
+    func selectRoute(_ identity: ModelSelectionIdentity, scrollIntoView: Bool = false) {
+        guard let rowIndex = routeTableRowIndex(for: identity) else {
             routeTableView.deselectAll(nil)
             return
         }
         routeTableView.selectRowIndexes(IndexSet(integer: rowIndex), byExtendingSelection: false)
-        routeTableView.scrollRowToVisible(rowIndex)
+        if scrollIntoView {
+            routeTableView.scrollRowToVisible(rowIndex)
+        }
     }
 
     func selectProviderKey(at keyIndex: Int) {
@@ -334,9 +342,12 @@ extension ModelConfigEditorController {
         reloadRouteTable(preserving: routeIdentity)
     }
 
-    func showProvider(at providerIndex: Int) {
+    func showProvider(at providerIndex: Int, preservingModelSource: Bool = false) {
         guard providerIndex >= 0, providerIndex < providers.count else { return }
         commitEditor()
+        if !preservingModelSource {
+            providerEditorSourceModel = nil
+        }
         isRenderingSelection = true
         selectProvider(at: providerIndex)
         isRenderingSelection = false
@@ -349,6 +360,7 @@ extension ModelConfigEditorController {
               modelIndex >= 0,
               modelIndex < providers[providerIndex].models.count else { return }
         commitEditor()
+        providerEditorSourceModel = nil
         isRenderingSelection = true
         selectProvider(at: providerIndex)
         modelTableView.reloadData()
@@ -370,20 +382,26 @@ extension ModelConfigEditorController {
     }
 
     func renderRouteSelection() {
-        guard let route = selectedRouteRow() else {
+        let target = pendingRouteSelectionIdentity ?? selectedRouteIdentity
+        defer { pendingRouteSelectionIdentity = nil }
+        guard let target,
+              let current = modelSelectionIndices(for: target) else {
             refreshRouteControlsEnabled()
             return
         }
-        showModel(providerIndex: route.providerIndex, modelIndex: route.modelIndex)
+        isRenderingSelection = true
+        selectRoute(target)
+        isRenderingSelection = false
+        showModel(providerIndex: current.provider, modelIndex: current.model)
         refreshRouteControlsEnabled()
     }
 
     func renderProviderSelection() {
-        setDetailLayout(modelIsSelected: false)
         isRenderingSelection = true
         defer { isRenderingSelection = false }
         detailMode = .provider
         modelEditorTarget = nil
+        providerNameAutofillProviderID = nil
         let hasProvider = selectedProviderIndex != nil
         deleteProviderButton.isEnabled = hasProvider
         addModelButton.isEnabled = hasProvider
@@ -401,6 +419,8 @@ extension ModelConfigEditorController {
             providerApiBaseField.stringValue = ""
             providerKeyNameField.stringValue = ""
             providerApiKeyField.stringValue = ""
+            providerEditorSourceModel = nil
+            renderProviderEditorHeader()
             providerKeyTableView.reloadData()
             refreshModelCandidateApiKeyPopup(providerIndex: nil)
             clearModelForm()
@@ -410,6 +430,10 @@ extension ModelConfigEditorController {
         ensureProviderHasKey(providerIndex)
         providerEditorTargetIndex = providerIndex
         let provider = providers[providerIndex]
+        if let source = providerEditorSourceModel,
+           (source.provider != providerIndex || modelSelectionIndices(for: source) == nil) {
+            providerEditorSourceModel = nil
+        }
         providerEditorTargetID = provider.editorID
         providerEnabledCheckbox.state = provider.enabled ? .on : .off
         providerNameField.stringValue = provider.name
@@ -431,11 +455,10 @@ extension ModelConfigEditorController {
         reloadRouteTable()
         clearModelForm()
         providerEditorDirty = false
-        refreshRuntimeMap()
+        renderProviderEditorHeader()
     }
 
     func renderProviderKeySelection() {
-        setDetailLayout(modelIsSelected: false)
         detailMode = .provider
         modelEditorTarget = nil
         let hasKey = selectedProviderKeyIndex != nil
@@ -460,21 +483,20 @@ extension ModelConfigEditorController {
             keyIndex,
             providers[providerIndex].apiKeys[keyIndex].editorID
         )
-        providers[providerIndex].apiKeys[keyIndex].enabled = true
         providerKeyNameField.stringValue = providers[providerIndex].apiKeys[keyIndex].name
         providerApiKeyField.stringValue = providers[providerIndex].apiKeys[keyIndex].value
         providerEditorDirty = false
-        refreshRuntimeMap()
     }
 
     func renderModelSelection() {
-        setDetailLayout(modelIsSelected: selectedModelIndex != nil)
         isRenderingSelection = true
         defer { isRenderingSelection = false }
         detailMode = .model
         providerEditorTargetIndex = nil
         providerEditorTargetID = nil
         providerKeyEditorTarget = nil
+        providerNameAutofillProviderID = nil
+        providerEditorSourceModel = nil
         providerEditorDirty = false
         let hasModel = selectedModelIndex != nil
         selectedModelImageGenerationEndpointDisabled = false
@@ -495,8 +517,11 @@ extension ModelConfigEditorController {
 
         modelEditorTarget = modelSelectionIdentity(providerIndex: providerIndex, modelIndex: modelIndex)
         let model = providers[providerIndex].models[modelIndex]
+        renderModelBreadcrumb(providerIndex: providerIndex, modelIndex: modelIndex)
+        refreshModelBillingDetail(provider: providers[providerIndex], model: model)
         enabledCheckbox.state = model.modelEnabled ? .on : .off
         modelNameField.stringValue = model.modelName
+        refreshModelProviderPopup(providerIndex: providerIndex)
         refreshModelApiKeyPopup(providerIndex: providerIndex, selected: model.apiKeyName)
         upstreamModelField.stringValue = modelUpstreamPart(model.litellmModel)
         let order = model.order.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -509,7 +534,6 @@ extension ModelConfigEditorController {
         }
         refreshSelectedModelInfoState(providerIndex: providerIndex, modelIndex: modelIndex)
         refreshRouteControlsEnabled()
-        refreshRuntimeMap()
     }
 
     func clearModelForm() {
@@ -524,8 +548,19 @@ extension ModelConfigEditorController {
         for field in modelFields {
             field.stringValue = ""
         }
+        modelBreadcrumbProviderButton.isEnabled = false
+        modelBreadcrumbProviderButton.setNavigationTitle("")
+        modelBreadcrumbModelLabel.stringValue = ""
+        modelProviderPopupButton.removeAllItems()
+        modelProviderPopupButton.isEnabled = false
         modelApiKeyPopupButton.removeAllItems()
         modelApiKeyPopupButton.isEnabled = false
+        modelBillingStatusLabel.stringValue = ""
+        modelBillingStatusLabel.toolTip = nil
+        modelUsageStatusLabel.stringValue = ""
+        modelUsageStatusLabel.toolTip = nil
+        modelMultiplierStatusLabel.stringValue = ""
+        modelMultiplierStatusLabel.toolTip = nil
         loadUpstreamApiModeOrder([defaultUpstreamApiMode])
         refreshResponsesEndpointSupportControls()
         refreshRouteControlsEnabled()
@@ -540,6 +575,52 @@ extension ModelConfigEditorController {
 
     var modelFields: [NSTextField] {
         [modelNameField, upstreamModelField, orderField]
+    }
+
+    func renderModelBreadcrumb(providerIndex: Int, modelIndex: Int) {
+        guard providers.indices.contains(providerIndex),
+              providers[providerIndex].models.indices.contains(modelIndex) else {
+            modelBreadcrumbProviderButton.setNavigationTitle("")
+            modelBreadcrumbProviderButton.isEnabled = false
+            modelBreadcrumbModelLabel.stringValue = ""
+            return
+        }
+        let provider = providers[providerIndex]
+        let model = provider.models[modelIndex]
+        let providerName = provider.displayName
+        modelBreadcrumbProviderButton.setNavigationTitle(providerName)
+        modelBreadcrumbProviderButton.isEnabled = true
+        modelBreadcrumbProviderButton.toolTip = "Edit provider \(providerName)"
+        modelBreadcrumbProviderButton.setAccessibilityLabel("Edit provider \(providerName)")
+        modelBreadcrumbModelLabel.stringValue = routePublicModelName(model)
+    }
+
+    func renderProviderEditorHeader() {
+        guard let providerIndex = selectedProviderIndex,
+              providers.indices.contains(providerIndex) else {
+            providerEditorTitleLabel.stringValue = "Provider"
+            providerReturnToModelButton.isHidden = true
+            providerReturnToModelButton.isEnabled = false
+            providerReturnToModelButton.setNavigationTitle("")
+            return
+        }
+
+        providerEditorTitleLabel.stringValue = "Provider: \(providers[providerIndex].displayName)"
+        guard let source = providerEditorSourceModel,
+              source.provider == providerIndex,
+              let current = modelSelectionIndices(for: source) else {
+            providerReturnToModelButton.isHidden = true
+            providerReturnToModelButton.isEnabled = false
+            providerReturnToModelButton.setNavigationTitle("")
+            return
+        }
+
+        let modelName = routePublicModelName(providers[current.provider].models[current.model])
+        providerReturnToModelButton.isHidden = false
+        providerReturnToModelButton.isEnabled = true
+        providerReturnToModelButton.setNavigationTitle("Back to model \(modelName)")
+        providerReturnToModelButton.toolTip = "Back to model \(modelName)"
+        providerReturnToModelButton.setAccessibilityLabel("Back to model \(modelName)")
     }
 
     func isProviderField(_ field: NSTextField) -> Bool {
@@ -561,6 +642,7 @@ extension ModelConfigEditorController {
 
     func setModelFormEnabled(_ enabled: Bool) {
         enabledCheckbox.isEnabled = enabled
+        modelProviderPopupButton.isEnabled = enabled && providers.count > 1
         modelApiKeyPopupButton.isEnabled = enabled
         supportsOpenAIChatCheckbox.isEnabled = enabled
         supportsOpenAIResponsesCheckbox.isEnabled = enabled

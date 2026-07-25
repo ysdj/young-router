@@ -25,8 +25,16 @@ SPECS = [
     ("LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS", "float", "120", 0, 3600),
     ("LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS", "float", "300", 0, 3600),
     ("LITELLM_MENU_STALL_TIMEOUT_SECONDS", "float", "120", 0, 3600),
-    ("LITELLM_MENU_RECOVERY_MAX_SECONDS", "float", "43200", 0, 86400),
+    ("LITELLM_MENU_RECOVERY_MAX_SECONDS", "float", "14400", 0, 86400),
     ("LITELLM_MENU_RECOVERY_INTERVAL_SECONDS", "float", "5", 0.001, 3600),
+    ("LITELLM_MENU_SAME_DEPLOYMENT_RETRIES", "int", "0", 0, 20),
+    ("LITELLM_MENU_RECOVERY_POLICY_BALANCE", "enum", "recovery_cooldown", None, None),
+    ("LITELLM_MENU_RECOVERY_POLICY_RATE_LIMIT", "enum", "recovery_cooldown", None, None),
+    ("LITELLM_MENU_RECOVERY_POLICY_SERVER", "enum", "recovery_cooldown", None, None),
+    ("LITELLM_MENU_RECOVERY_POLICY_NETWORK", "enum", "recovery", None, None),
+    ("LITELLM_MENU_RECOVERY_POLICY_STREAM_START_TIMEOUT", "enum", "recovery_cooldown", None, None),
+    ("LITELLM_MENU_RECOVERY_POLICY_STREAM_IDLE_TIMEOUT", "enum", "recovery", None, None),
+    ("LITELLM_MENU_RECOVERY_POLICY_REQUEST_ERROR", "enum", "error", None, None),
     ("LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS", "float", "30", 3, 60),
     ("LITELLM_MENU_WEB_SEARCH_MAX_RESULTS", "int", "8", 1, 20),
     ("LITELLM_MENU_WEB_SEARCH_READ_RESULTS", "int", "4", 0, 20),
@@ -49,6 +57,8 @@ SPECS = [
     ("LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES", "int", "2", 0, 20),
     ("LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS", "float", "300", 0, 86400),
     ("LITELLM_MENU_IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS", "int", "3", 0, 20),
+    ("LITELLM_MENU_BALANCE_REFRESH_MINUTES", "int", "5", 0, 1440),
+    ("LITELLM_BROWSER_BILLING", "bool", "0", None, None),
     ("LITELLM_MENU_COMPUTER_FACADE_BACKEND", "enum", "auto", None, None),
     ("LITELLM_MENU_COMPUTER_FACADE_MODEL", "string", "", None, None),
     ("LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS", "int", "20", 1, 200),
@@ -66,7 +76,6 @@ SPECS = [
     ("LITELLM_HEALTH_WAIT_SECONDS", "int", "60", 1, 600),
     ("LITELLM_RUNTIME_VERIFY_WAIT_SECONDS", "int", "30", 1, 600),
     ("LITELLM_SERVICE_LIFECYCLE_LOCK_WAIT_SECONDS", "int", "120", 1, 1800),
-    ("LITELLM_SERVICE_THROTTLE_INTERVAL_SECONDS", "int", "1", 1, 300),
     ("LITELLM_CONFIG_WATCH_INTERVAL", "float", "5", 0.2, 300),
     ("LITELLM_CONFIG_WATCH_SETTLE_INTERVAL", "float", "2", 0, 300),
 ]
@@ -162,6 +171,13 @@ def normalize_value(key: str, raw: object) -> str:
             "LITELLM_MENU_COMPUTER_FACADE_BACKEND": {"auto", "mcp", "browser", "chrome", "playwright", "cua", "mock"},
             "LITELLM_MENU_VISION_BRIDGE_BACKEND": {"auto", "api", "local", "off"},
             "LITELLM_MENU_VISION_BRIDGE_LOCAL_FORMAT": {"compact", "detailed"},
+            "LITELLM_MENU_RECOVERY_POLICY_BALANCE": {"error", "recovery", "recovery_cooldown"},
+            "LITELLM_MENU_RECOVERY_POLICY_RATE_LIMIT": {"error", "recovery", "recovery_cooldown"},
+            "LITELLM_MENU_RECOVERY_POLICY_SERVER": {"error", "recovery", "recovery_cooldown"},
+            "LITELLM_MENU_RECOVERY_POLICY_NETWORK": {"error", "recovery", "recovery_cooldown"},
+            "LITELLM_MENU_RECOVERY_POLICY_STREAM_START_TIMEOUT": {"error", "recovery", "recovery_cooldown"},
+            "LITELLM_MENU_RECOVERY_POLICY_STREAM_IDLE_TIMEOUT": {"error", "recovery", "recovery_cooldown"},
+            "LITELLM_MENU_RECOVERY_POLICY_REQUEST_ERROR": {"error", "recovery", "recovery_cooldown"},
         }.get(key, set())
         lowered = text.lower()
         if lowered not in options:
@@ -416,11 +432,6 @@ runtime_settings_save() {
   runtime_settings_transaction save
 }
 
-runtime_settings_reset() {
-  rm -f "$RUNTIME_SETTINGS_FILE"
-  echo "Runtime settings reset to defaults: $RUNTIME_SETTINGS_FILE"
-}
-
 health_ok() {
   curl -fsS --max-time 1 "$HEALTH_URL" >/dev/null 2>&1
 }
@@ -431,7 +442,10 @@ runtime_config_matches_source() {
 }
 
 managed_server_reachable() {
-  health_ok && { native_running || launch_agent_loaded; }
+  local expected_owner="${1:-}"
+  health_ok \
+    && native_running \
+    && { [[ -z "$expected_owner" ]] || native_owned_by_menu_pid "$expected_owner"; }
 }
 
 menu_app_binary_path() {
@@ -476,18 +490,6 @@ menu_app_running() {
   menu_app_owner_pid >/dev/null 2>&1
 }
 
-stop_orphaned_service_if_menu_missing() {
-  local pids
-  menu_app_running && return 0
-  pids="$(native_pid_candidates || true)"
-  [[ -n "$pids" ]] || return 0
-  request_native_process_stop_list "$pids" >/dev/null 2>&1 || true
-  sleep 0.3
-  force_native_process_stop_list "$(native_pid_candidates || true)" >/dev/null 2>&1 || true
-  clear_state
-  return 0
-}
-
 require_menu_app_owner() {
   local action="$1" owner_pid
   if owner_pid="$(menu_app_owner_pid)"; then
@@ -495,7 +497,6 @@ require_menu_app_owner() {
     return 0
   fi
 
-  stop_orphaned_service_if_menu_missing
   echo "Refusing to $action LiteLLM service because LiteLLM Menu app is not running." >&2
   echo "Open LiteLLM Menu.app instead; the Menu app is the required service owner." >&2
   return 64

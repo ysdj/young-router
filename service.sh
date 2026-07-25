@@ -15,6 +15,7 @@ SERVICE_PARTS=(
   logs_trace.sh
   webdav.sh
   launchd_watch.sh
+  menu_status.sh
   smoke.sh
   dispatch.sh
 )

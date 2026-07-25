@@ -1,5 +1,77 @@
 import Cocoa
 
+final class NavigationLinkButton: NSButton {
+    private var hoverTrackingArea: NSTrackingArea?
+    private var isHovering = false {
+        didSet { updateNavigationAppearance() }
+    }
+
+    func setNavigationTitle(_ value: String) {
+        title = value
+        updateNavigationAppearance()
+    }
+
+    override var isEnabled: Bool {
+        didSet {
+            if !isEnabled {
+                isHovering = false
+            }
+            updateNavigationAppearance()
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        hoverTrackingArea = trackingArea
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled {
+            addCursorRect(bounds, cursor: .pointingHand)
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if isEnabled {
+            isHovering = true
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+    }
+
+    private func updateNavigationAppearance() {
+        let color: NSColor
+        if isEnabled {
+            color = isHovering ? .controlAccentColor : .linkColor
+        } else {
+            color = .secondaryLabelColor
+        }
+        attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: font ?? NSFont.systemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: color,
+                .underlineStyle: isHovering && isEnabled && !title.isEmpty ? NSUnderlineStyle.single.rawValue : 0,
+            ]
+        )
+        contentTintColor = color
+        window?.invalidateCursorRects(for: self)
+    }
+}
+
 final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSWindowDelegate {
     let root: String
     let bundleRoot: String
@@ -7,6 +79,8 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     let onSaved: (ConfigEditorSaveResult) -> Void
     let onClose: () -> Void
     var providers: [EditableProvider] = []
+    var configurationBaselineProviders: [EditableProvider] = []
+    var configurationBaselineDocument: ConfigEditorDocument?
     var window: NSWindow!
     enum DetailMode {
         case provider
@@ -24,10 +98,18 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     var providerEditorTargetID: UUID?
     var providerKeyEditorTarget: (provider: Int, providerID: UUID, key: Int, keyID: UUID)?
     var providerEditorDirty = false
+    var providerNameAutofillProviderID: UUID?
     var modelEditorTarget: ModelSelectionIdentity?
+    // A table click can commit the previously displayed editor before AppKit
+    // finishes changing the row selection. Keep the clicked deployment by ID
+    // so a route reorder cannot turn that click into a different deployment.
+    var pendingRouteSelectionIdentity: ModelSelectionIdentity?
+    var providerEditorSourceModel: ModelSelectionIdentity?
     var modelCandidateRequestGeneration = 0
     var modelCandidateFetchInFlight = false
     var modelAvailabilityProbeRuns: [ModelProbeKey: UUID] = [:]
+    var modelProbePresentations: [ModelProbeKey: ModelProbePresentation] = [:]
+    var displayedModelProbePresentationKey: ModelProbeKey?
     var selectedModelInfoRequestGeneration = 0
     var selectedModelInfoInFlight = false
     var selectedModelImageGenerationEndpointDisabled = false
@@ -43,6 +125,15 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     var fetchedModelChooserController: FetchedModelChooserController?
     var hasPendingChanges = false
     var loadedConfigRevision: JSONValue?
+    var sourceDocument: ConfigEditorDocument?
+    var providerBilling: ProviderBillingPayload?
+    var providerBillingFailureDetail: String?
+    var providerBillingRefreshInFlight = false
+    var providerBillingRefreshGeneration = 0
+    var providerBillingRefreshTimer: Timer?
+    var externalImportInFlight = false
+    var configurationLoadGeneration = 0
+    var configurationLoadInFlight = false
 
     let providerTableView = NSTableView()
     let modelTableView = NSTableView()
@@ -51,23 +142,31 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     let providerCountColumnIdentifier = NSUserInterfaceItemIdentifier("providerCount")
     let modelNameColumnIdentifier = NSUserInterfaceItemIdentifier("modelName")
     let modelUpstreamColumnIdentifier = NSUserInterfaceItemIdentifier("modelUpstream")
-    let modelRouteColumnIdentifier = NSUserInterfaceItemIdentifier("modelRoute")
+    let modelBillingColumnIdentifier = NSUserInterfaceItemIdentifier("modelBilling")
+    let modelApiKeyOrderColumnIdentifier = NSUserInterfaceItemIdentifier("modelApiKeyOrder")
     let providerKeyNameColumnIdentifier = NSUserInterfaceItemIdentifier("providerKeyName")
     let routeModelColumnIdentifier = NSUserInterfaceItemIdentifier("routeModel")
     let routeOrderColumnIdentifier = NSUserInterfaceItemIdentifier("routeOrder")
     let routeProviderKeyColumnIdentifier = NSUserInterfaceItemIdentifier("routeProviderKey")
     let routeUpstreamColumnIdentifier = NSUserInterfaceItemIdentifier("routeUpstream")
-    let routeStatusColumnIdentifier = NSUserInterfaceItemIdentifier("routeStatus")
-    let runtimeMapColumnIdentifier = NSUserInterfaceItemIdentifier("runtimeMap")
-    var providerCascadeView: NSView?
-    var routesListView: NSView?
+    var editorWorkspaceStack: NSStackView?
+    var modeWorkspaceColumn: NSStackView?
+    var modeWorkspaceHost: NSView?
+    var providersWorkspace: NSView?
+    var routesWorkspace: NSView?
+    var providersContentStack: NSStackView?
+    var providerPane: NSView?
+    var providerPaneWidthConstraint: NSLayoutConstraint?
+    var modelsRoutesPane: NSView?
+    var modelsView: NSView?
+    var detailScrollView: NSScrollView?
+    var detailDocumentView: NSView?
+    var modelTableScrollView: NSScrollView?
+    var routeTableScrollView: NSScrollView?
+    var editorFooterView: NSView?
+    var detailPaneMinimumWidthConstraint: NSLayoutConstraint?
     var providerDetailView: NSView?
     var modelDetailView: NSView?
-    var detailPaneHeightConstraint: NSLayoutConstraint?
-    var runtimeMapHeightConstraint: NSLayoutConstraint?
-    let runtimeMapTableView = NSTableView()
-    var runtimeMapScrollView: NSScrollView?
-    var runtimeMapRows: [RuntimeMapRow] = []
     let upstreamApiModes = ["openai/responses", "openai/chat", "anthropic"]
     let defaultUpstreamApiMode = "openai/responses"
     let modelFormLabelWidth: CGFloat = 96
@@ -86,54 +185,6 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     }
     let localLiteLLMMasterKey = "sk-local-litellm"
 
-    struct RuntimeDeployment {
-        var id: String
-        var publicModel: String
-        var providerName: String
-        var keyName: String
-        var upstreamModel: String
-        var apiBase: String
-        var order: Int?
-        var providerEnabled: Bool
-        var modelEnabled: Bool
-        var missingKey: Bool
-        var supportsImageGeneration: Bool
-        var isImageGenerationEndpoint: Bool
-        var supportedUpstreamApiModes: [String]
-
-        var enabled: Bool {
-            providerEnabled && modelEnabled && !missingKey
-        }
-    }
-
-    struct RuntimeMapSummaryRow {
-        var modelCount: Int
-        var runningCount: Int
-        var offCount: Int
-    }
-
-    struct RuntimeMapModelRow {
-        var publicModel: String
-        var runningCount: Int
-        var offCount: Int
-    }
-
-    struct RuntimeMapOrderRow {
-        var order: Int?
-        var previousOrder: Int?
-        var isFirst: Bool
-        var runningCount: Int
-        var offCount: Int
-    }
-
-    enum RuntimeMapRow {
-        case summary(RuntimeMapSummaryRow)
-        case model(RuntimeMapModelRow)
-        case order(RuntimeMapOrderRow)
-        case deployment(RuntimeDeployment)
-        case empty
-    }
-
     struct RouteDeploymentRow {
         var providerIndex: Int
         var modelIndex: Int
@@ -141,20 +192,8 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         var providerName: String
         var keyName: String
         var upstreamModel: String
-        var order: Int?
+        var order: Decimal?
         var enabled: Bool
-    }
-
-    struct RouteModelGroupRow {
-        var publicModel: String
-        var routeCount: Int
-        var runningCount: Int
-        var offCount: Int
-    }
-
-    enum RouteTableRow {
-        case modelGroup(RouteModelGroupRow)
-        case deployment(RouteDeploymentRow)
     }
 
     struct LiteLLMModelInfoLookup {
@@ -175,6 +214,28 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     struct ModelProbeKey: Hashable {
         var providerID: UUID
         var modelID: UUID
+    }
+
+    struct ModelProbePresentation {
+        enum State {
+            case probing
+            case available
+            case unavailable
+            case inconclusive
+
+            var label: String {
+                switch self {
+                case .probing: return "Probing..."
+                case .available: return "Available"
+                case .unavailable: return "Unavailable"
+                case .inconclusive: return "Uncertain"
+                }
+            }
+        }
+
+        var state: State
+        var summary: String
+        var detail: String
     }
 
     struct ModelAvailabilityProbeRequest {
@@ -265,7 +326,7 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
 
         var summary: String {
             var facts: [String] = []
-            if !id.isEmpty { facts.append("token=\(id)") }
+            if !id.isEmpty { facts.append("deployment_id=\(id)") }
             if !mode.isEmpty { facts.append("mode=\(mode)") }
             if !upstreamApiMode.isEmpty { facts.append("upstream_url_surface=\(upstreamApiMode)") }
             if let supportsImageGenerationFlag {
@@ -287,11 +348,29 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         )
         control.segmentStyle = .rounded
         control.selectedSegment = 0
-        control.setWidth(128, forSegment: 0)
-        control.setWidth(128, forSegment: 1)
-        control.widthAnchor.constraint(equalToConstant: 256).isActive = true
+        control.setWidth(112, forSegment: 0)
+        control.setWidth(112, forSegment: 1)
+        control.widthAnchor.constraint(equalToConstant: 224).isActive = true
         control.heightAnchor.constraint(equalToConstant: 28).isActive = true
         return control
+    }()
+
+    lazy var importSourcePopupButton: NSPopUpButton = {
+        let popup = NSPopUpButton(frame: .zero, pullsDown: true)
+        popup.bezelStyle = .rounded
+        popup.addItem(withTitle: "Import From")
+        popup.addItem(withTitle: "Current Codex")
+        popup.lastItem?.tag = 1
+        popup.addItem(withTitle: "Configuration File…")
+        popup.lastItem?.tag = 2
+        popup.addItem(withTitle: "CC Switch / New API Link…")
+        popup.lastItem?.tag = 3
+        popup.target = self
+        popup.action = #selector(importSourceSelected(_:))
+        popup.toolTip = "Import providers and models from a selected source"
+        popup.setAccessibilityLabel("Import providers and models from a selected source")
+        popup.widthAnchor.constraint(equalToConstant: 152).isActive = true
+        return popup
     }()
 
     func refreshViewModeButtons() {
@@ -299,17 +378,33 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     }
 
     lazy var providerEnabledCheckbox: NSButton = {
-        NSButton(checkboxWithTitle: "Provider enabled", target: self, action: #selector(formCheckboxChanged(_:)))
+        let button = NSButton(checkboxWithTitle: "Enabled", target: self, action: #selector(formCheckboxChanged(_:)))
+        button.toolTip = "Enable provider"
+        button.setAccessibilityLabel("Enable provider")
+        return button
     }()
-    lazy var providerNameField = makeTextField(width: 360)
-    lazy var providerApiBaseField = makeTextField(width: 360)
+    lazy var providerNameField = makeTextField(preferredWidth: 240, minWidth: 160)
+    lazy var providerApiBaseField = makeTextField(preferredWidth: 240, minWidth: 160)
     let providerKeyTableView = NSTableView()
-    lazy var providerKeyNameField = makeTextField(width: 220)
-    lazy var providerApiKeyField = makeTokenField(width: 220)
-    lazy var addProviderKeyButton = NSButton(title: "Add Key", target: self, action: #selector(addProviderKey))
-    lazy var deleteProviderKeyButton = NSButton(title: "Delete Key", target: self, action: #selector(deleteProviderKey))
+    lazy var providerKeyNameField = makeTextField(preferredWidth: 170, minWidth: 110)
+    lazy var providerApiKeyField = makeAPIKeyField(preferredWidth: 170, minWidth: 110)
+    lazy var addProviderKeyButton: NSButton = {
+        let button = textButton(title: "+", toolTip: "Add API key", accessibilityLabel: "Add API key")
+        button.target = self
+        button.action = #selector(addProviderKey)
+        return button
+    }()
+    lazy var deleteProviderKeyButton: NSButton = {
+        let button = textButton(title: "−", toolTip: "Remove API key", accessibilityLabel: "Remove API key")
+        button.target = self
+        button.action = #selector(deleteProviderKey)
+        return button
+    }()
     lazy var enabledCheckbox: NSButton = {
-        NSButton(checkboxWithTitle: "Model enabled", target: self, action: #selector(formCheckboxChanged(_:)))
+        let button = NSButton(checkboxWithTitle: "Enabled", target: self, action: #selector(formCheckboxChanged(_:)))
+        button.toolTip = "Enable model"
+        button.setAccessibilityLabel("Enable model")
+        return button
     }()
     lazy var probeModelAvailabilityButton: NSButton = {
         let button = NSButton(title: "Probe", target: self, action: #selector(probeModelAvailability))
@@ -317,7 +412,83 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         button.toolTip = "Check all three API protocols and recommend an order when needed"
         return button
     }()
+    lazy var modelProbeStatusLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "")
+        label.textColor = .secondaryLabelColor
+        label.usesSingleLineMode = true
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.isHidden = true
+        return label
+    }()
+    lazy var modelBillingStatusLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "")
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.usesSingleLineMode = true
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }()
+    lazy var modelUsageStatusLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "")
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.usesSingleLineMode = true
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }()
+    lazy var modelMultiplierStatusLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "")
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.usesSingleLineMode = true
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }()
+    lazy var providerEditorTitleLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "Provider")
+        label.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingMiddle
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }()
+    lazy var providerReturnToModelButton: NavigationLinkButton = {
+        let button = NavigationLinkButton(title: "", target: self, action: #selector(providerReturnToModelClicked(_:)))
+        button.bezelStyle = .inline
+        button.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        button.toolTip = "Back to the source model"
+        button.setAccessibilityLabel("Back to source model")
+        button.isHidden = true
+        button.isEnabled = false
+        return button
+    }()
+    lazy var modelBreadcrumbProviderButton: NavigationLinkButton = {
+        let button = NavigationLinkButton(title: "", target: self, action: #selector(modelBreadcrumbProviderClicked(_:)))
+        button.bezelStyle = .inline
+        button.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        button.toolTip = "Edit this model's provider"
+        button.setAccessibilityLabel("Edit selected model provider")
+        return button
+    }()
+    lazy var modelBreadcrumbModelLabel: NSTextField = {
+        let label = NSTextField(labelWithString: "")
+        label.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }()
     lazy var modelNameField = makeFlexibleTextField()
+    lazy var modelProviderPopupButton: NSPopUpButton = {
+        let popup = NSPopUpButton()
+        popup.target = self
+        popup.action = #selector(modelProviderSelectionChanged(_:))
+        popup.toolTip = "Move this deployment to another provider"
+        popup.setAccessibilityLabel("Model provider")
+        return popup
+    }()
     lazy var modelApiKeyPopupButton: NSPopUpButton = {
         let popup = NSPopUpButton()
         popup.target = self
@@ -325,8 +496,10 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         return popup
     }()
     lazy var fetchModelsButton: NSButton = {
-        let button = NSButton(title: "Fetch /v1/models", target: self, action: #selector(fetchModelCandidates))
+        let button = NSButton(title: "Fetch", target: self, action: #selector(fetchModelCandidates))
         button.bezelStyle = .rounded
+        button.toolTip = "Fetch models from /v1/models"
+        button.setAccessibilityLabel("Fetch models")
         return button
     }()
     lazy var modelCandidateApiKeyPopupButton: NSPopUpButton = {
@@ -355,12 +528,42 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         stack.spacing = 6
         return stack
     }()
-    lazy var deleteProviderButton = NSButton(title: "Delete", target: self, action: #selector(deleteProvider))
-    lazy var addModelButton = NSButton(title: "Add", target: self, action: #selector(addModel))
-    lazy var duplicateModelButton = NSButton(title: "Duplicate", target: self, action: #selector(duplicateModel))
-    lazy var deleteModelButton = NSButton(title: "Delete", target: self, action: #selector(deleteModel))
-    lazy var routeMoveUpButton = NSButton(title: "Move Up", target: self, action: #selector(moveRouteUp))
-    lazy var routeMoveDownButton = NSButton(title: "Move Down", target: self, action: #selector(moveRouteDown))
+    lazy var deleteProviderButton: NSButton = {
+        let button = textButton(title: "−", toolTip: "Remove provider", accessibilityLabel: "Remove provider")
+        button.target = self
+        button.action = #selector(deleteProvider)
+        return button
+    }()
+    lazy var addModelButton: NSButton = {
+        let button = textButton(title: "+", toolTip: "Add model", accessibilityLabel: "Add model")
+        button.target = self
+        button.action = #selector(addModel)
+        return button
+    }()
+    lazy var duplicateModelButton: NSButton = {
+        let button = textButton(title: "⧉", toolTip: "Duplicate model", accessibilityLabel: "Duplicate model")
+        button.target = self
+        button.action = #selector(duplicateModel)
+        return button
+    }()
+    lazy var deleteModelButton: NSButton = {
+        let button = textButton(title: "−", toolTip: "Remove model", accessibilityLabel: "Remove model")
+        button.target = self
+        button.action = #selector(deleteModel)
+        return button
+    }()
+    lazy var routeMoveUpButton: NSButton = {
+        let button = textButton(title: "↑", toolTip: "Move route up", accessibilityLabel: "Move route up")
+        button.target = self
+        button.action = #selector(moveRouteUp)
+        return button
+    }()
+    lazy var routeMoveDownButton: NSButton = {
+        let button = textButton(title: "↓", toolTip: "Move route down", accessibilityLabel: "Move route down")
+        button.target = self
+        button.action = #selector(moveRouteDown)
+        return button
+    }()
     lazy var applyStatusLabel: NSTextField = {
         let label = NSTextField(labelWithString: "")
         label.textColor = .secondaryLabelColor
@@ -392,50 +595,119 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
     }
 
     func showWindow() {
-        if let existingWindow = window, existingWindow.isVisible || existingWindow.isMiniaturized {
-            NSApp.activate(ignoringOtherApps: true)
-            if existingWindow.isMiniaturized {
-                existingWindow.deminiaturize(nil)
-            }
-            existingWindow.makeKeyAndOrderFront(nil)
-            existingWindow.makeFirstResponder(nil)
-            return
-        }
-
-        do {
-            let payload = try loadConfigPayload()
-            providers = payload.providers
-            loadedConfigRevision = payload.revision
-        } catch {
-            showAlert(title: "Open config editor failed", message: error.localizedDescription)
-            return
-        }
-
+        let reopeningExistingWindow = window != nil
         if window == nil {
             buildWindow()
+            prepareEditorSkeleton()
+            window.center()
         }
-        providerTableView.reloadData()
-        if providers.isEmpty {
-            renderProviderSelection()
-        } else {
-            showProvider(at: 0)
-        }
-        reloadRouteTable()
-        applyEditorViewMode()
 
-        window.center()
-        refreshRuntimeMap()
-        setPendingChanges(false)
-        NSApp.activate(ignoringOtherApps: true)
+        presentEditorWindow()
+        if reopeningExistingWindow {
+            configureProviderBillingRefreshTimer(refreshImmediately: true)
+        }
+    }
+
+    func prepareEditorSkeleton() {
+        providerTableView.reloadData()
+        modelTableView.reloadData()
+        reloadRouteTable()
+        renderProviderSelection()
+        applyEditorViewMode()
+        captureConfigurationBaseline()
+    }
+
+    func presentEditorWindow() {
+        guard let window else { return }
+        beginSettingsWindowPresentation(window)
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
         window.makeFirstResponder(nil)
     }
 
+    func loadConfigurationInBackground() {
+        guard !configurationLoadInFlight, !hasPendingChanges else { return }
+        configurationLoadGeneration += 1
+        let generation = configurationLoadGeneration
+        configurationLoadInFlight = true
+        setEditorStatus("Loading configuration…")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result: Result<ConfigEditorLoadPayload, Error>
+            do {
+                result = .success(try self.loadConfigPayload())
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                guard self.configurationLoadGeneration == generation else { return }
+                self.configurationLoadInFlight = false
+                guard !self.hasPendingChanges else { return }
+                switch result {
+                case .success(let payload):
+                    self.applyLoadedConfiguration(payload)
+                case .failure(let error):
+                    self.setEditorStatus(
+                        "Configuration could not be loaded.",
+                        tooltip: error.localizedDescription
+                    )
+                }
+            }
+        }
+    }
+
+    func applyLoadedConfiguration(_ payload: ConfigEditorLoadPayload) {
+        let previouslySelectedProviderName = selectedProviderIndex.map {
+            providers[$0].name.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        providers = payload.providers
+        loadedConfigRevision = payload.revision
+        sourceDocument = payload.document
+        modelAvailabilityProbeRuns.removeAll()
+        modelProbePresentations.removeAll()
+        displayedModelProbePresentationKey = nil
+        detailMode = .none
+        providerEditorTargetIndex = nil
+        providerEditorTargetID = nil
+        providerKeyEditorTarget = nil
+        providerEditorDirty = false
+        modelEditorTarget = nil
+        pendingRouteSelectionIdentity = nil
+        providerEditorSourceModel = nil
+        isRenderingSelection = true
+        providerTableView.deselectAll(nil)
+        modelTableView.deselectAll(nil)
+        providerKeyTableView.deselectAll(nil)
+        routeTableView.deselectAll(nil)
+        isRenderingSelection = false
+        providerTableView.reloadData()
+        if providers.isEmpty {
+            renderProviderSelection()
+        } else {
+            let providerIndex = previouslySelectedProviderName.flatMap { name in
+                providers.firstIndex {
+                    $0.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .localizedCaseInsensitiveCompare(name) == .orderedSame
+                }
+            } ?? 0
+            // A provider selection populates the model list without opening a
+            // deployment inspector until the user explicitly chooses a model.
+            showProvider(at: providerIndex)
+        }
+        reloadRouteTable()
+        applyEditorViewMode()
+        configureProviderBillingRefreshTimer(refreshImmediately: true)
+        captureConfigurationBaseline()
+        setEditorStatus("")
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
+        requestEditorClose()
         return false
     }
 
@@ -445,6 +717,9 @@ final class ModelConfigEditorController: NSObject, NSTableViewDataSource, NSTabl
         let onClose = self.onClose
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             onClose()
+        }
+        if let closedWindow = notification.object as? NSWindow {
+            endSettingsWindowPresentation(closedWindow)
         }
     }
 }

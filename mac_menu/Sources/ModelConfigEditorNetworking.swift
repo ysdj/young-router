@@ -1,6 +1,301 @@
 import Cocoa
 
 extension ModelConfigEditorController {
+    func refreshProviderBilling() {
+        guard !providerBillingRefreshInFlight else { return }
+        providerBillingRefreshInFlight = true
+        providerBillingRefreshGeneration += 1
+        let generation = providerBillingRefreshGeneration
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let result: Result<ProviderBillingPayload, Error>
+            do {
+                result = .success(try self.loadProviderBilling())
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                guard self.providerBillingRefreshGeneration == generation else { return }
+                self.providerBillingRefreshInFlight = false
+                switch result {
+                case .success(let payload):
+                    self.providerBilling = payload
+                    self.providerBillingFailureDetail = payload.status == "invalid_config"
+                        ? (payload.detail ?? "The runtime billing configuration is invalid.")
+                        : nil
+                    self.reloadModelBillingColumnPreservingViewport()
+                    self.refreshVisibleModelBillingDetail()
+                case .failure(let error):
+                    self.providerBillingFailureDetail = "Live model billing could not be refreshed: \(error.localizedDescription)"
+                    self.reloadModelBillingColumnPreservingViewport()
+                    self.refreshVisibleModelBillingDetail()
+                }
+            }
+        }
+    }
+
+    func billingProvider(named name: String) -> ProviderBillingProvider? {
+        providerBilling?.providers.first { $0.name == name }
+    }
+
+    func billingModel(providerName: String, model: EditableModel) -> ProviderBillingModel? {
+        let models = billingProvider(named: providerName)?.models ?? []
+        let deploymentID = model.deploymentToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !deploymentID.isEmpty,
+           let exact = models.first(where: { $0.deploymentID == deploymentID }) {
+            return exact
+        }
+        let publicModel = routePublicModelName(model)
+        let upstreamModel = model.litellmModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return models.first {
+            $0.name == publicModel && $0.upstreamModel == upstreamModel
+        }
+    }
+
+    func billingBalanceText(_ balance: ProviderBillingAmount?) -> String {
+        guard let balance else { return "Balance unavailable" }
+        return "Balance \(billingAmountText(balance))"
+    }
+
+    func billingMultiplierText(_ multiplier: ProviderBillingMultiplier) -> String {
+        guard multiplier.status == "ok", let value = multiplier.value else {
+            return "Multiplier unavailable: \(multiplier.detail)"
+        }
+        return String(format: "Multiplier %.2fx", value)
+    }
+
+    func billingSnapshotNotice() -> String? {
+        var notices: [String] = []
+        if hasPendingChanges {
+            notices.append("Saved configuration snapshot; apply changes to refresh the billing mapping.")
+        }
+        if let failure = providerBillingFailureDetail {
+            notices.append("Last refresh failed: \(failure)")
+            if let providerBilling {
+                notices.append(providerBillingSnapshotText(providerBilling))
+            }
+        }
+        return notices.isEmpty ? nil : notices.joined(separator: "\n")
+    }
+
+    func providerBillingSnapshotText(_ payload: ProviderBillingPayload) -> String {
+        let trimmed = payload.generatedAt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Updated: N/A" }
+        if let date = ISO8601DateFormatter().date(from: trimmed) {
+            let age = max(0, Int(Date().timeIntervalSince(date).rounded()))
+            return "Updated: \(DateFormatter.localizedString(from: date, dateStyle: .short, timeStyle: .medium)) (\(age)s ago)."
+        }
+        return "Updated: \(trimmed)"
+    }
+
+    func billingTooltip(_ detail: String?) -> String? {
+        let notice = billingSnapshotNotice()
+        switch (detail?.trimmingCharacters(in: .whitespacesAndNewlines), notice) {
+        case let (.some(detail), .some(notice)) where !detail.isEmpty:
+            return "\(detail)\n\n\(notice)"
+        case let (.some(detail), _ ) where !detail.isEmpty:
+            return detail
+        case let (_, .some(notice)):
+            return notice
+        default:
+            return nil
+        }
+    }
+
+    func billingAmountText(_ balance: ProviderBillingAmount) -> String {
+        let formatted = billingNumberText(balance.value)
+        return "\(formatted) \(balance.unit)"
+    }
+
+    func billingSummaryValue(_ balance: ProviderBillingAmount?) -> String? {
+        guard let balance,
+              balance.value.isFinite,
+              balance.value >= 0 else {
+            return nil
+        }
+        guard balance.kind == "balance" || balance.kind == "remaining_quota" else { return nil }
+        return compactBillingAmountText(balance)
+    }
+
+    func billingNumberText(_ value: Double) -> String {
+        Int(exactly: value).map(String.init) ?? String(format: "%.2f", value)
+    }
+
+    func billingStatusText(_ status: String) -> String {
+        switch status {
+        case "ok": return "Live"
+        case "partial": return "Partial"
+        case "timeout": return "Timed out"
+        case "network_error": return "Offline"
+        case "auth_error": return "Auth error"
+        case "rate_limited": return "Rate limited"
+        case "http_error": return "HTTP error"
+        case "credential_unavailable": return "No credential"
+        case "permission_required": return "Permission required"
+        case "invalid_config": return "Invalid config"
+        case "unsupported": return "N/A"
+        default: return "Unavailable"
+        }
+    }
+
+    func compactBillingAmountText(_ balance: ProviderBillingAmount) -> String {
+        let value = balance.value
+        let magnitude: (Double, String)
+        switch abs(value) {
+        case 1_000_000_000...:
+            magnitude = (value / 1_000_000_000, "B")
+        case 1_000_000...:
+            magnitude = (value / 1_000_000, "M")
+        case 1_000...:
+            magnitude = (value / 1_000, "K")
+        default:
+            magnitude = (value, "")
+        }
+        let number = String(format: magnitude.0.rounded() == magnitude.0 ? "%.0f" : "%.2f", magnitude.0)
+        let unit = balance.unit.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [number + magnitude.1, unit].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    func modelBillingSummary(provider: EditableProvider, model: EditableModel) -> String {
+        guard let billing = billingModel(providerName: provider.name, model: model) else {
+            return "N/A"
+        }
+        if billing.status == "ok" {
+            guard let balance = billingSummaryValue(billing.balance) else {
+                return "N/A"
+            }
+            return balance
+        }
+        return "N/A"
+    }
+
+    func modelBillingTooltip(provider: EditableProvider, model: EditableModel) -> String? {
+        guard let billing = billingModel(providerName: provider.name, model: model) else {
+            return billingTooltip(providerBilling.map(providerBillingSnapshotText))
+        }
+        var lines = ["Status: \(billingStatusText(billing.status))"]
+        lines.append(billing.status == "ok" ? billingBalanceText(billing.balance) : billing.detail)
+        if let usage = billing.usage {
+            lines.append("Usage \(usage.used) / \(usage.limit) \(usage.unit)")
+        }
+        lines.append(billingMultiplierText(billing.multiplier))
+        if let providerBilling {
+            lines.append(providerBillingSnapshotText(providerBilling))
+        }
+        return billingTooltip(lines.joined(separator: "\n"))
+    }
+
+    func reloadModelBillingColumnPreservingViewport() {
+        let selectedRows = modelTableView.selectedRowIndexes
+        let selectedIdentity = selectedModelIdentity()
+        let columnWidths = modelTableView.tableColumns.map(\.width)
+        let scrollView = modelTableView.enclosingScrollView
+        let scrollOrigin = scrollView?.contentView.bounds.origin
+        let rowCount = modelTableView.numberOfRows
+        guard let columnIndex = modelTableView.tableColumns.firstIndex(where: {
+            $0.identifier == modelBillingColumnIdentifier
+        }) else { return }
+
+        let wasRenderingSelection = isRenderingSelection
+        isRenderingSelection = true
+        if rowCount > 0 {
+            modelTableView.reloadData(
+                forRowIndexes: IndexSet(integersIn: 0..<rowCount),
+                columnIndexes: IndexSet(integer: columnIndex)
+            )
+        }
+        for (column, width) in zip(modelTableView.tableColumns, columnWidths) {
+            column.width = width
+        }
+        if let selectedIdentity,
+           let indices = modelSelectionIndices(for: selectedIdentity),
+           selectedProviderIndex == indices.provider {
+            modelTableView.selectRowIndexes(IndexSet(integer: indices.model), byExtendingSelection: false)
+        } else {
+            modelTableView.selectRowIndexes(selectedRows, byExtendingSelection: false)
+        }
+        if let scrollOrigin, let scrollView {
+            scrollView.contentView.setBoundsOrigin(scrollOrigin)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+        isRenderingSelection = wasRenderingSelection
+    }
+
+    func refreshVisibleModelBillingDetail() {
+        guard detailMode == .model,
+              let identity = modelEditorTarget,
+              let indices = modelSelectionIndices(for: identity) else {
+            return
+        }
+        refreshModelBillingDetail(
+            provider: providers[indices.provider],
+            model: providers[indices.provider].models[indices.model]
+        )
+    }
+
+    func providerBillingRefreshInterval() -> TimeInterval {
+        let defaultMinutes = 5.0
+        let settingsPath = "\(root)/runtime-settings.env"
+        let savedValue: String? = (try? String(contentsOfFile: settingsPath, encoding: .utf8))?
+            .components(separatedBy: .newlines)
+            .compactMap { line -> String? in
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trimmed.hasPrefix("LITELLM_MENU_BALANCE_REFRESH_MINUTES=") else { return nil }
+                return String(trimmed.dropFirst("LITELLM_MENU_BALANCE_REFRESH_MINUTES=".count))
+            }
+            .last
+        let raw = savedValue ?? environment["LITELLM_MENU_BALANCE_REFRESH_MINUTES"]
+        let minutes = Double(raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? defaultMinutes
+        return max(0, min(minutes, 1_440)) * 60
+    }
+
+    func configureProviderBillingRefreshTimer(refreshImmediately: Bool = false) {
+        providerBillingRefreshTimer?.invalidate()
+        providerBillingRefreshTimer = nil
+        let interval = providerBillingRefreshInterval()
+        guard interval > 0 else { return }
+        let timer = Timer(
+            timeInterval: interval,
+            repeats: true
+        ) { [weak self] _ in
+            self?.refreshProviderBilling()
+        }
+        providerBillingRefreshTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        if refreshImmediately {
+            refreshProviderBilling()
+        }
+    }
+
+    func refreshModelBillingDetail(provider: EditableProvider, model: EditableModel) {
+        let tooltip = modelBillingTooltip(provider: provider, model: model)
+        modelBillingStatusLabel.stringValue = modelBillingSummary(provider: provider, model: model)
+        modelBillingStatusLabel.textColor = .labelColor
+        modelBillingStatusLabel.toolTip = tooltip
+
+        guard let billing = billingModel(providerName: provider.name, model: model),
+              billing.status == "ok" else {
+            modelUsageStatusLabel.stringValue = "N/A"
+            modelMultiplierStatusLabel.stringValue = "N/A"
+            modelUsageStatusLabel.toolTip = tooltip
+            modelMultiplierStatusLabel.toolTip = tooltip
+            return
+        }
+
+        if let usage = billing.usage {
+            modelUsageStatusLabel.stringValue = "\(billingNumberText(usage.used)) / \(billingNumberText(usage.limit)) \(usage.unit)"
+        } else {
+            modelUsageStatusLabel.stringValue = "N/A"
+        }
+        if billing.multiplier.status == "ok", let value = billing.multiplier.value {
+            modelMultiplierStatusLabel.stringValue = String(format: "%.2fx", value)
+        } else {
+            modelMultiplierStatusLabel.stringValue = "N/A"
+        }
+        modelUsageStatusLabel.toolTip = tooltip
+        modelMultiplierStatusLabel.toolTip = tooltip
+    }
+
     func needsBrowserCompatibleHeaders(apiBase: String) -> Bool {
         let host = apiBaseHost(apiBase)
         return browserCompatibleHeaderHosts.contains { allowed in
@@ -233,7 +528,7 @@ extension ModelConfigEditorController {
         let matchedBy: String
         if idMatches {
             score = 100
-            matchedBy = "deployment token"
+            matchedBy = "deployment ID"
         } else if publicMatches && litellmMatches && apiBaseMatches {
             score = 90
             matchedBy = "model_name + litellm_params.model + api_base"
@@ -272,7 +567,7 @@ extension ModelConfigEditorController {
             "model_name=\(lookup.publicModel)",
             "litellm_params.model=\(lookup.litellmModel)",
             "api_base=\(lookup.apiBase)",
-            "deployment_token=\(lookup.deploymentToken.isEmpty ? "(blank)" : lookup.deploymentToken)",
+            "deployment_id=\(lookup.deploymentToken.isEmpty ? "(blank)" : lookup.deploymentToken)",
         ]
         return "LiteLLM /model/info did not return a matching deployment. " + facts.joined(separator: ", ")
     }
@@ -338,15 +633,15 @@ extension ModelConfigEditorController {
         modelApiKeyPopupButton.isEnabled = selectedModelIndex != nil && !keys.isEmpty
     }
 
-    func tokenPreview(_ value: String) -> String {
+    func apiKeyPreview(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "(no token)" }
+        guard !trimmed.isEmpty else { return "(no API key)" }
         guard trimmed.count > 12 else { return trimmed }
         return "\(trimmed.prefix(6))...\(trimmed.suffix(4))"
     }
 
     func modelCandidateKeyTitle(_ key: EditableProviderKey) -> String {
-        return "\(key.displayName) / \(tokenPreview(key.value))"
+        return "\(key.displayName) / \(apiKeyPreview(key.value))"
     }
 
     func selectedModelCandidateKeyName() -> String {
@@ -382,11 +677,87 @@ extension ModelConfigEditorController {
     }
 
     func refreshModelAvailabilityProbeControlsEnabled() {
-        let inFlight = selectedModelProbeKey().map { modelAvailabilityProbeRuns[$0] != nil } ?? false
+        let key = selectedModelProbeKey()
+        let inFlight = key.map { modelAvailabilityProbeRuns[$0] != nil } ?? false
         probeModelAvailabilityButton.title = inFlight
             ? "Probing..."
-            : (selectedModelImageGenerationEndpointDisabled ? "Probe Image Endpoint" : "Probe")
+            : (selectedModelImageGenerationEndpointDisabled ? "Probe image" : "Probe")
         probeModelAvailabilityButton.isEnabled = selectedModelIndex != nil && !inFlight
+        renderSelectedModelProbePresentation(for: key)
+    }
+
+    func setModelProbePresentation(
+        _ presentation: ModelProbePresentation,
+        for request: ModelAvailabilityProbeRequest
+    ) {
+        modelProbePresentations[request.probeKey] = presentation
+        reloadProbePresentationRows(for: request)
+        if selectedModelProbeKey() == request.probeKey {
+            renderSelectedModelProbePresentation(for: request.probeKey)
+        }
+    }
+
+    func renderSelectedModelProbePresentation(for key: ModelProbeKey?) {
+        displayedModelProbePresentationKey = key
+        guard let key, let presentation = modelProbePresentations[key] else {
+            modelProbeStatusLabel.stringValue = ""
+            modelProbeStatusLabel.toolTip = nil
+            modelProbeStatusLabel.isHidden = true
+            return
+        }
+        modelProbeStatusLabel.stringValue = presentation.summary
+        modelProbeStatusLabel.textColor = .labelColor
+        modelProbeStatusLabel.toolTip = presentation.detail.isEmpty
+            ? presentation.summary
+            : "\(presentation.summary)\n\n\(presentation.detail)"
+        modelProbeStatusLabel.isHidden = false
+    }
+
+    func reloadProbePresentationRows(for request: ModelAvailabilityProbeRequest) {
+        guard request.providerIndex >= 0,
+              request.providerIndex < providers.count,
+              request.modelIndex >= 0,
+              request.modelIndex < providers[request.providerIndex].models.count,
+              providers[request.providerIndex].editorID == request.providerEditorID,
+              providers[request.providerIndex].models[request.modelIndex].editorID == request.modelEditorID else {
+            return
+        }
+        if selectedProviderIndex == request.providerIndex {
+            modelTableView.reloadData(
+                forRowIndexes: IndexSet(integer: request.modelIndex),
+                columnIndexes: IndexSet(integersIn: 0..<modelTableView.numberOfColumns)
+            )
+        }
+        reloadRouteTable()
+    }
+
+    func modelProbePresentation(providerIndex: Int, modelIndex: Int) -> ModelProbePresentation? {
+        guard let identity = modelSelectionIdentity(providerIndex: providerIndex, modelIndex: modelIndex) else {
+            return nil
+        }
+        return modelProbePresentations[ModelProbeKey(providerID: identity.providerID, modelID: identity.modelID)]
+    }
+
+    func invalidateModelProbePresentation(providerIndex: Int, modelIndex: Int) {
+        guard let identity = modelSelectionIdentity(providerIndex: providerIndex, modelIndex: modelIndex) else {
+            return
+        }
+        let key = ModelProbeKey(providerID: identity.providerID, modelID: identity.modelID)
+        modelProbePresentations.removeValue(forKey: key)
+        modelAvailabilityProbeRuns.removeValue(forKey: key)
+        if displayedModelProbePresentationKey == key {
+            renderSelectedModelProbePresentation(for: key)
+        }
+    }
+
+    func invalidateProviderProbePresentations(providerIndex: Int) {
+        guard providerIndex >= 0, providerIndex < providers.count else { return }
+        let providerID = providers[providerIndex].editorID
+        modelProbePresentations = modelProbePresentations.filter { $0.key.providerID != providerID }
+        modelAvailabilityProbeRuns = modelAvailabilityProbeRuns.filter { $0.key.providerID != providerID }
+        if displayedModelProbePresentationKey?.providerID == providerID {
+            renderSelectedModelProbePresentation(for: selectedModelProbeKey())
+        }
     }
 
     func refreshResponsesEndpointProbeControlsEnabled() {
@@ -412,7 +783,6 @@ extension ModelConfigEditorController {
         let keys = normalizedProviderKeys(providerIndex)
         let modelKeyName = model.apiKeyName.trimmingCharacters(in: .whitespacesAndNewlines)
         return keys.first(where: { $0.name == modelKeyName })
-            ?? keys.first(where: { $0.enabled })
             ?? keys.first
     }
 
@@ -453,7 +823,7 @@ extension ModelConfigEditorController {
         }
         let apiKey = key?.value.trimmingCharacters(in: .whitespacesAndNewlines)
         if let key, apiKey?.isEmpty != false {
-            throw ConfigEditorError(message: "Provider key \(key.displayName) has no token.")
+            throw ConfigEditorError(message: "Provider API key \(key.displayName) has no value.")
         }
         let urls = endpointURLCandidates(
             baseURL: baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
@@ -498,7 +868,7 @@ extension ModelConfigEditorController {
             throw ConfigEditorError(message: "Provider \(provider.displayName) has no API key.")
         }
         if key.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw ConfigEditorError(message: "Provider key \(key.displayName) has no token.")
+            throw ConfigEditorError(message: "Provider API key \(key.displayName) has no value.")
         }
 
         let normalizedBaseURL = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))

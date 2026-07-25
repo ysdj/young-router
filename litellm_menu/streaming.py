@@ -28,6 +28,7 @@ from .base import (
     _RESPONSES_STREAM_INCOMPLETE_TYPES,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _ROUTE_RECOVERY_POLL_METADATA_KEY,
+    _RouteOrder,
     _STREAM_ERROR_FALLBACK_METADATA_KEY,
     _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS,
     _STREAM_FALLBACK_METADATA_KEY,
@@ -74,6 +75,8 @@ def _route_recovery_state_record(
     max_poll_seconds: Optional[float] = None,
     poll_interval_seconds: Optional[float] = None,
     target_order: Any = None,
+    cooldown_until: Optional[float] = None,
+    cooldown_deployments: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     now = time.monotonic()
     record: dict[str, Any] = {
@@ -86,9 +89,17 @@ def _route_recovery_state_record(
         "attempt": attempt,
         "max_poll_seconds": max_poll_seconds,
         "poll_interval_seconds": poll_interval_seconds,
+        "attempt_timeout_seconds": _routing_module._stream_start_timeout_seconds_for_request(request_data),
         "target_order": target_order,
         "request": _trace_module._trace_request_summary(request_data),
     }
+    if cooldown_until is not None and cooldown_until > 0:
+        record["cooldown_until"] = round(cooldown_until, 3)
+        record["cooldown_remaining_seconds"] = round(
+            max(0.0, cooldown_until - time.time()), 3
+        )
+    if cooldown_deployments:
+        record["cooldown_deployments"] = cooldown_deployments
     if started_at_monotonic is not None:
         record["elapsed_seconds"] = round(max(0.0, now - started_at_monotonic), 3)
         if max_poll_seconds is not None and max_poll_seconds > 0:
@@ -98,6 +109,7 @@ def _route_recovery_state_record(
             )
     if exception is not None:
         record["exception"] = _routing_module._trace_exception(exception)
+        record["diagnostic"] = _routing_module._recovery_diagnostic(exception)
     return record
 
 
@@ -111,6 +123,8 @@ def _route_recovery_state_upsert(
     max_poll_seconds: Optional[float] = None,
     poll_interval_seconds: Optional[float] = None,
     target_order: Any = None,
+    cooldown_until: Optional[float] = None,
+    cooldown_deployments: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     record = _route_recovery_state_record(
         request_data,
@@ -121,6 +135,8 @@ def _route_recovery_state_upsert(
         max_poll_seconds=max_poll_seconds,
         poll_interval_seconds=poll_interval_seconds,
         target_order=target_order,
+        cooldown_until=cooldown_until,
+        cooldown_deployments=cooldown_deployments,
     )
     _state_module._upsert_route_recovery_state(record)
     return str(record.get("key") or "")
@@ -1446,12 +1462,20 @@ def _route_recovery_terminal_chunk_exception(
         )
     else:
         return None
+    # The active request still names the route that started the recovery poll.
+    # Attribute a terminal event to the deployment that actually produced the
+    # stream instead.  Otherwise a same-order peer which ends early is never
+    # excluded: every poll reselects it and a Codex compaction can remain in
+    # progress forever.
+    failure_request = request_data.copy()
     _routing_module._apply_current_selected_deployment_to_request(
-        request_data,
+        failure_request,
         selected_box=selected_deployment_box,
-        update_top_level=False,
     )
-    _routing_module._mark_exception_for_deployment_failover(exception, request_data)
+    _routing_module._mark_exception_for_deployment_failover(
+        exception,
+        failure_request,
+    )
     return exception
 
 
@@ -1773,7 +1797,7 @@ def _apply_streaming_error_fallback_constraints(
                 payload[key] = value
         return
 
-    def explicit_request_order() -> Optional[int]:
+    def explicit_request_order() -> Optional[_RouteOrder]:
         for key in ("order", "_target_order"):
             order = _routing_module._coerce_order(request_data.get(key))
             if order is not None:
@@ -1860,6 +1884,10 @@ async def _streaming_error_fallback_response(
                 attempted_surfaces=attempted_surfaces,
                 deployment_id=_routing_module._deployment_id_from_request(request_data),
             )
+        # The stream itself consumed this deployment attempt.  It is not an
+        # additional same-route retry, so proceed to its compatible surface or
+        # the next ordered route immediately.
+        _routing_module._mark_same_deployment_retry_exhausted(exception)
     if (
         _routing_module._is_priority_deployment_failover_error(exception)
         and not _routing_module._should_retry_same_deployment_before_fallback(exception)
@@ -2049,6 +2077,16 @@ async def _stream_streaming_error_fallback_round(
             selected_box=selected_deployment_box,
             update_top_level=False,
         )
+        if route_recovery_poll and _routing_module._is_priority_deployment_failover_error(
+            fallback_exception
+        ):
+            # This iterator is one completed upstream attempt inside the poll;
+            # it must not be selected again on the next poll pass.  Ordinary
+            # streaming retries are owned by _stream_streaming_error_fallback,
+            # but route recovery invokes one round at a time.
+            _routing_module._mark_same_deployment_retry_exhausted(
+                fallback_exception
+            )
         if (
             _routing_module._is_priority_deployment_failover_error(fallback_exception)
             and not _routing_module._should_retry_same_deployment_before_fallback(fallback_exception)
@@ -2122,7 +2160,7 @@ def _reset_route_exhaustion_retry_state(
         request_data.pop("_target_order", None)
 
 
-def _configured_deployment_orders(router: Any, request_data: dict) -> list[int]:
+def _configured_deployment_orders(router: Any, request_data: dict) -> list[_RouteOrder]:
     model_group = _responses_execution_module._request_model_group(request_data)
     if not isinstance(model_group, str) or not model_group.strip():
         return []
@@ -2147,7 +2185,10 @@ def _configured_deployment_orders(router: Any, request_data: dict) -> list[int]:
     return sorted(orders)
 
 
-def _next_configured_order(orders: list[int], previous_order: Optional[int]) -> Optional[int]:
+def _next_configured_order(
+    orders: list[_RouteOrder],
+    previous_order: Optional[_RouteOrder],
+) -> Optional[_RouteOrder]:
     if not orders:
         return None
     if previous_order is None:
@@ -2161,19 +2202,20 @@ def _next_configured_order(orders: list[int], previous_order: Optional[int]) -> 
 def _route_recovery_exhausted_order(
     request_data: dict,
     exception: Exception,
-) -> Optional[int]:
-    return (
-        _responses_execution_module._failed_deployment_order(exception)
-        or _image_generation_module._request_target_order(request_data)
-        or _routing_module._deployment_order_from_request(request_data)
-    )
+) -> Optional[_RouteOrder]:
+    order = _responses_execution_module._failed_deployment_order(exception)
+    if order is None:
+        order = _image_generation_module._request_target_order(request_data)
+    if order is None:
+        order = _routing_module._deployment_order_from_request(request_data)
+    return order
 
 
 def _route_recovery_next_poll_order(
     router: Any,
     request_data: dict,
     exception: Exception,
-) -> Optional[int]:
+) -> Optional[_RouteOrder]:
     orders = _configured_deployment_orders(router, request_data)
     return _next_configured_order(orders, _route_recovery_exhausted_order(request_data, exception))
 
@@ -2182,7 +2224,9 @@ async def _stream_streaming_error_fallback(
     request_data: dict,
     exception: Exception,
 ) -> AsyncIterator[Any]:
-    max_retries = _routing_module._stream_route_exhaustion_retries()
+    # Streaming follows the same explicit same-route budget as ordinary
+    # Responses calls, then advances to a peer or next order.
+    max_retries = _routing_module._same_deployment_retries()
     delay_seconds = _routing_module._stream_route_exhaustion_retry_delay_seconds()
     attempt = 0
     last_exception: Optional[Exception] = None
@@ -2198,6 +2242,8 @@ async def _stream_streaming_error_fallback(
                 yielded
                 or attempt >= max_retries
             ):
+                _routing_module._mark_same_deployment_retry_exhausted(exc)
+                _routing_module._sync_failed_deployment_exclusions(request_data, exc)
                 raise
             if not _routing_module._is_no_deployments_available_error(exc) and not _routing_module._is_priority_deployment_failover_error(exc):
                 raise
@@ -2222,10 +2268,7 @@ async def _stream_streaming_error_fallback(
             _reset_route_exhaustion_retry_state(
                 request_data,
                 exc,
-                preserve_failed_deployment=(
-                    not no_deployments_available
-                    and not _routing_module._should_retry_same_deployment_before_fallback(exc)
-                ),
+                preserve_failed_deployment=False,
                 preserve_existing_exclusions=False,
             )
             exception = exc
@@ -2344,7 +2387,28 @@ async def _stream_route_recovery_poll_attempt(
                     yield completed_compat
                 return
             except asyncio.TimeoutError:
-                if not started_delivery:
+                if next_chunk_task is not None and next_chunk_task.done():
+                    completed_task = next_chunk_task
+                    next_chunk_task = None
+                    # The task may complete at the exact keepalive boundary.
+                    # Consume its chunk below rather than dropping it and
+                    # starting a second recovery attempt.
+                    try:
+                        chunk = completed_task.result()
+                    except StopAsyncIteration:
+                        completed_compat = _codex_compaction_done_item_completed_compat(
+                            completion_state,
+                            request_data,
+                            reason="route_recovery_clean_eof",
+                        )
+                        if completed_compat is not None:
+                            for buffered_chunk in buffered_chunks:
+                                yield _responses_stream_chunk_for_delivery(
+                                    buffered_chunk
+                                )
+                            yield completed_compat
+                        return
+                elif not started_delivery:
                     if (
                         attempt_deadline is not None
                         and (attempt_deadline - time.monotonic()) <= 0
@@ -2376,7 +2440,8 @@ async def _stream_route_recovery_poll_attempt(
                         phase="attempt",
                     )
                     continue
-                raise
+                else:
+                    raise
 
             if started_delivery:
                 yield _responses_stream_chunk_for_delivery(chunk)
@@ -2684,6 +2749,10 @@ def _route_recovery_sse_keepalive(
     request_data: Optional[dict] = None,
     phase: str = "poll",
 ) -> _JSONStreamEvent:
+    if request_data is not None:
+        _state_module._touch_route_recovery_state(
+            _route_recovery_state_key(request_data)
+        )
     response = {
         "id": f"resp_litellm_keepalive_{os.getpid()}_{time.time_ns()}",
         "object": "response",
@@ -2723,10 +2792,18 @@ async def _sleep_route_recovery_poll_interval(
     *,
     attempt: int,
     request_data: Optional[dict] = None,
+    phase: str = "interval",
+    emit_for_short_delay: bool = False,
 ) -> AsyncIterator[Any]:
     if delay_seconds <= 0:
         return
     if delay_seconds < _ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS:
+        if emit_for_short_delay:
+            yield _route_recovery_sse_keepalive(
+                attempt,
+                request_data=request_data,
+                phase=phase,
+            )
         await asyncio.sleep(delay_seconds)
         return
 
@@ -2735,7 +2812,7 @@ async def _sleep_route_recovery_poll_interval(
         yield _route_recovery_sse_keepalive(
             attempt,
             request_data=request_data,
-            phase="interval",
+            phase=phase,
         )
         sleep_seconds = min(_ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS, remaining)
         await asyncio.sleep(sleep_seconds)
@@ -2782,6 +2859,10 @@ async def _stream_route_recovery_poll(
     deadline = started_at_monotonic + max_poll_seconds
     last_exception = exception
     attempt = 0
+    waited_for_all_cooldown = False
+    ignore_local_constraints = bool(
+        request_data.pop("_route_recovery_ignore_local_constraints", False)
+    )
     recovery_state_key = _route_recovery_state_upsert(
         request_data,
         exception,
@@ -2835,6 +2916,68 @@ async def _stream_route_recovery_poll(
     try:
         while True:
             last_exception = nonlocal_last_exception[0]
+            cooldown_wait = _route_recovery_poll_cooldown_wait(
+                request_data,
+                ignore_constraints=ignore_local_constraints,
+            )
+            if cooldown_wait is not None:
+                waited_for_all_cooldown = True
+                now = time.monotonic()
+                if max_poll_seconds <= 0 or now >= deadline:
+                    _trace_module._route_trace(
+                        "route_recovery_poll_max_duration_reached",
+                        request_id=_routing_module._trace_request_id(request_data),
+                        session=_routing_module._trace_session_context(request_data),
+                        model_group=_responses_execution_module._request_model_group(request_data),
+                        poll_attempts=attempt,
+                        elapsed_seconds=round(now - started_at_monotonic, 3),
+                        max_poll_seconds=max_poll_seconds,
+                        exception=_routing_module._trace_exception(last_exception),
+                    )
+                    break
+                cooldown_until = cooldown_wait["cooldown_until"]
+                delay_seconds = _route_recovery_cooldown_wait_delay(
+                    cooldown_until,
+                    poll_interval_seconds=poll_interval_seconds,
+                    deadline=deadline,
+                )
+                _trace_module._route_trace(
+                    "route_recovery_poll_waiting_for_cooldown",
+                    request_id=_routing_module._trace_request_id(request_data),
+                    session=_routing_module._trace_session_context(request_data),
+                    model_group=_responses_execution_module._request_model_group(request_data),
+                    poll_attempt=attempt,
+                    cooldown_until=cooldown_until,
+                    cooldown_remaining_seconds=round(
+                        max(0.0, cooldown_until - time.time()), 3
+                    ),
+                    cooldown_deployments=cooldown_wait["cooldown_deployments"],
+                    exception=_routing_module._trace_exception(last_exception),
+                )
+                new_recovery_state_key = _route_recovery_state_upsert(
+                    request_data,
+                    last_exception,
+                    status="waiting",
+                    attempt=attempt,
+                    started_at_monotonic=started_at_monotonic,
+                    max_poll_seconds=max_poll_seconds,
+                    poll_interval_seconds=delay_seconds,
+                    target_order=_image_generation_module._request_target_order(request_data),
+                    cooldown_until=cooldown_until,
+                    cooldown_deployments=cooldown_wait["cooldown_deployments"],
+                )
+                if new_recovery_state_key and new_recovery_state_key != recovery_state_key:
+                    _route_recovery_state_remove(recovery_state_key)
+                    recovery_state_key = new_recovery_state_key
+                async for keepalive in _sleep_route_recovery_poll_interval(
+                    delay_seconds,
+                    attempt=attempt,
+                    request_data=request_data,
+                    phase="cooldown",
+                    emit_for_short_delay=True,
+                ):
+                    yield keepalive
+                continue
             recovery_request = _external_web_search_recovery_payload_for_blocked_original(
                 request_data,
                 last_exception,
@@ -2860,6 +3003,28 @@ async def _stream_route_recovery_poll(
                     exception=_routing_module._trace_exception(last_exception),
                 )
                 break
+            if waited_for_all_cooldown:
+                # Only this path deliberately reopens the full route pool.
+                # Normal recovery must retain its ordered fallback constraints.
+                request_data.pop("_excluded_deployment_ids", None)
+                request_data.pop("_target_order", None)
+                request_data.pop(_ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY, None)
+                _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(set())
+                for attribute in (
+                    "excluded_deployment_ids",
+                    "failed_deployment_id",
+                    "failed_deployment_route_key",
+                    "failed_deployment_order",
+                    "failed_deployment_surface",
+                ):
+                    try:
+                        delattr(last_exception, attribute)
+                    except AttributeError:
+                        pass
+                    except Exception:
+                        pass
+                waited_for_all_cooldown = False
+                ignore_local_constraints = False
             cacheless_compaction_request = (
                 _without_failed_codex_compaction_prompt_cache_key(
                     request_data,
@@ -2885,7 +3050,10 @@ async def _stream_route_recovery_poll(
             attempt_started_at = now
             if (
                 _routing_module._is_priority_deployment_failover_error(last_exception)
-                and not _routing_module._should_retry_same_deployment_before_fallback(last_exception)
+                and (
+                    not _routing_module._should_retry_same_deployment_before_fallback(last_exception)
+                    or _routing_module._is_local_stream_start_timeout_error(last_exception)
+                )
             ):
                 _routing_module._mark_exception_for_deployment_failover(last_exception, request_data)
                 _routing_module._sync_failed_deployment_exclusions(request_data, last_exception)
@@ -2925,7 +3093,6 @@ async def _stream_route_recovery_poll(
                 preserve_failed_deployment=(
                     _responses_execution_module._failed_deployment_id(last_exception) is not None
                     and not no_deployments_available
-                    and not _routing_module._should_retry_same_deployment_before_fallback(last_exception)
                 ),
                 preserve_existing_exclusions=(
                     no_deployments_available
@@ -2939,7 +3106,9 @@ async def _stream_route_recovery_poll(
             if forced_target_order is not None:
                 request_data[_ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY] = forced_target_order
 
-            target_order = forced_target_order or _image_generation_module._request_target_order(request_data)
+            target_order = forced_target_order
+            if target_order is None:
+                target_order = _image_generation_module._request_target_order(request_data)
             new_recovery_state_key = _route_recovery_state_upsert(
                 request_data,
                 last_exception,
@@ -3100,7 +3269,7 @@ async def _stream_route_recovery_poll(
             new_recovery_state_key = _route_recovery_state_upsert(
                 request_data,
                 last_exception,
-                status="cooldown",
+                status="waiting",
                 attempt=attempt,
                 started_at_monotonic=started_at_monotonic,
                 max_poll_seconds=max_poll_seconds,
@@ -3120,6 +3289,93 @@ async def _stream_route_recovery_poll(
         yield _synthesized_failed_response_event(request_data, last_exception)
     finally:
         _route_recovery_state_remove(recovery_state_key)
+
+
+def _route_recovery_poll_cooldown_wait(
+    request_data: dict,
+    *,
+    ignore_constraints: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Describe an all-cooled route pool without opening another upstream call."""
+
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except Exception:
+        return None
+    model_group = _responses_execution_module._request_model_group(request_data)
+    if not isinstance(model_group, str) or not model_group.strip():
+        return None
+    try:
+        metadata = _image_generation_module._request_metadata_dict(
+            request_data, "metadata"
+        ) or {}
+        deployments = _routing_module._router_configured_deployments(
+            llm_router,
+            model_group,
+            team_id=metadata.get("user_api_key_team_id"),
+        )
+    except Exception:
+        return None
+    if not deployments:
+        return None
+    if ignore_constraints:
+        # After a local fallback chain has exhausted its own route hints, the
+        # next recovery stream must distinguish that local exhaustion from an
+        # actual shared cooldown across the complete model group.
+        constraints = request_data.copy()
+        constraints.pop("_excluded_deployment_ids", None)
+        constraints.pop("_target_order", None)
+        constraints.pop(_ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY, None)
+    else:
+        # An active explicit target/order is a real request constraint. Do not
+        # hold an unrelated group route open merely because it is cooling.
+        constraints = request_data
+    constrained = _image_generation_module._with_retry_target_constraints(
+        deployments,
+        constraints,
+    )
+    if not constrained:
+        return None
+    available, cooled, cooldown_filtered = _routing_module._with_active_deployment_cooldowns(
+        constrained,
+        request_kwargs=request_data,
+    )
+    if not (cooldown_filtered and cooled and not available):
+        return None
+    cooldown_until_values: list[float] = []
+    for entry in cooled:
+        try:
+            cooldown_until = float(entry.get("cooldown_until") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if cooldown_until > time.time():
+            cooldown_until_values.append(cooldown_until)
+    if not cooldown_until_values:
+        return None
+    return {
+        "cooldown_until": min(cooldown_until_values),
+        "cooldown_deployments": cooled,
+    }
+
+
+def _route_recovery_poll_has_no_available_deployments(request_data: dict) -> bool:
+    """Compatibility predicate for callers that only need the cooling state."""
+
+    return _route_recovery_poll_cooldown_wait(request_data) is not None
+
+
+def _route_recovery_cooldown_wait_delay(
+    cooldown_until: float,
+    *,
+    poll_interval_seconds: float,
+    deadline: float,
+) -> float:
+    remaining_cooldown = max(0.0, cooldown_until - time.time())
+    remaining_poll = max(0.0, deadline - time.monotonic())
+    return max(
+        0.001,
+        min(poll_interval_seconds, remaining_cooldown or 0.001, remaining_poll or 0.001),
+    )
 
 def _build_forced_image_generation_payload(request_data: dict, *, stream: bool) -> Optional[dict]:
     allowed_keys = (
@@ -3239,6 +3495,29 @@ async def _yield_original_stream(
 async def _empty_async_iterator() -> AsyncIterator[Any]:
     if False:
         yield None
+
+
+def _responses_non_streaming_response_has_usable_output(
+    response: Any,
+    request_data: Optional[dict],
+) -> bool:
+    payload = _jsonable(response)
+    if not isinstance(payload, dict):
+        return not _image_generation_module._response_is_effectively_empty(response)
+    if (
+        _stream_chunk_has_visible_output(payload)
+        or _image_generation_module._payload_has_tool_activity(payload)
+    ):
+        return True
+    if _image_generation_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        output = payload.get("output")
+        if isinstance(output, list) and any(
+            _response_item_has_encrypted_codex_compaction(item) for item in output
+        ):
+            return True
+    return False
 
 
 def _completed_response_payload(response: Any, request_data: Optional[dict]) -> dict[str, Any]:
@@ -3584,6 +3863,15 @@ async def _non_streaming_response_as_stream(
     request_data: dict,
 ) -> AsyncIterator[Any]:
     if _request_is_responses_stream(request_data):
+        if not _responses_non_streaming_response_has_usable_output(
+            response,
+            request_data,
+        ):
+            raise _responses_incomplete_stream_exception(
+                "non-streaming response without usable output",
+                buffer=[response],
+                request_data=request_data,
+            )
         payload = _completed_response_payload(response, request_data)
         async for chunk in _computer_facade_module._external_web_search_bridge_stream(payload):
             yield chunk
@@ -4781,6 +5069,11 @@ async def _yield_streaming_error_fallback_or_raise(
     fallback_exception: Optional[Exception] = None
 
     async def route_recovery_chunks(exception: Exception) -> AsyncIterator[Any]:
+        def with_full_route_pool(recovery_request: dict) -> dict:
+            payload = recovery_request.copy()
+            payload["_route_recovery_ignore_local_constraints"] = True
+            return payload
+
         if _responses_web_search_bridge_module._external_web_search_has_recovery_context(
             request_data,
             exception,
@@ -4790,14 +5083,37 @@ async def _yield_streaming_error_fallback_or_raise(
                 exception=exception,
             )
             async for chunk in _stream_route_recovery_poll(
-                recovery_request,
+                with_full_route_pool(recovery_request),
                 exception,
             ):
                 yield chunk
             return
 
-        async for chunk in _stream_route_recovery_poll(request_data, exception):
+        async for chunk in _stream_route_recovery_poll(
+            with_full_route_pool(request_data),
+            exception,
+        ):
             yield chunk
+
+    if (
+        is_responses_stream
+        and not route_recovery_poll_payload
+        and _routing_module._recovery_max_seconds_for_request(request_data) > 0
+        # A normal priority failover still needs its ordinary one-shot router
+        # fallback.  Skip that call only when routing has already established
+        # that the group has no eligible deployment; then the shared cooldown
+        # check can keep the original stream alive without an upstream probe.
+        and _routing_module._is_no_deployments_available_error(exception)
+        and _external_web_search_recovery_poll_error(exception)
+        and _route_recovery_poll_cooldown_wait(
+            request_data,
+            ignore_constraints=True,
+        )
+        is not None
+    ):
+        async for chunk in route_recovery_chunks(exception):
+            yield chunk
+        return
 
     try:
         async for chunk in _stream_streaming_error_fallback(request_data, exception):
@@ -4937,8 +5253,15 @@ async def _yield_start_buffered_stream_with_error_fallback(
     request_data: dict,
 ) -> AsyncIterator[Any]:
     if not _image_generation_module._response_is_async_iterable(response):
-        async for chunk in _non_streaming_response_as_stream(response, request_data):
-            yield chunk
+        try:
+            async for chunk in _non_streaming_response_as_stream(response, request_data):
+                yield chunk
+        except Exception as exception:
+            async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
+                request_data,
+                exception,
+            ):
+                yield fallback_chunk
         return
     if _routing_module._is_route_recovery_stream_response(response):
         async for chunk in response:

@@ -41,15 +41,12 @@ sync_runtime_config() {
   fi
 
   if [[ -f "$RUNTIME_CONFIG" ]] && cmp -s "$CONFIG_FILE" "$RUNTIME_CONFIG"; then
-    if [[ "$MIRROR_CHECKOUT_CONFIG_TO_ROOT" != "1" ]] \
-      || { [[ -f "$ROOT/config.yaml" ]] && cmp -s "$CONFIG_FILE" "$ROOT/config.yaml"; }; then
-      echo "config.yaml unchanged: runtime config already current"
-      return 0
-    fi
+    echo "config.yaml unchanged: runtime config already current"
+    return 0
   fi
 
   PYTHONPATH="$TEMPLATE_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    "$PYTHON" - "$CONFIG_FILE" "$RUNTIME_CONFIG" "$MIRROR_CHECKOUT_CONFIG_TO_ROOT" "$ROOT/config.yaml" <<'PY'
+    "$PYTHON" - "$CONFIG_FILE" "$RUNTIME_CONFIG" <<'PY'
 from __future__ import annotations
 
 import os
@@ -78,15 +75,10 @@ def atomic_write(path: pathlib.Path, data: bytes) -> None:
 
 source_path = pathlib.Path(sys.argv[1])
 runtime_path = pathlib.Path(sys.argv[2])
-mirror_to_root = sys.argv[3] == "1"
-root_config_path = pathlib.Path(sys.argv[4])
 
 source_text = source_path.read_text(encoding="utf-8")
 data = _load_yaml(source_path)
 atomic_write(runtime_path, source_text.encode("utf-8"))
-if mirror_to_root and source_path.resolve() != root_config_path.resolve():
-    atomic_write(root_config_path, source_text.encode("utf-8"))
-    print(f"Mirrored checkout config to {root_config_path}")
 print(f"config.yaml OK: {len(data['model_list'])} model entries")
 PY
 }

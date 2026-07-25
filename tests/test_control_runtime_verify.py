@@ -25,7 +25,12 @@ class ControlRuntimeVerifyTests(unittest.TestCase):
             env = os.environ.copy()
             env.update(
                 {
-                    "LITELLM_ALLOW_CHECKOUT_SERVICE": "1",
+                    "HOME": str(temp / "home"),
+                    "LITELLM_RUNTIME_ROOT": str(temp),
+                    "LITELLM_TEMPLATE_ROOT": str(ROOT),
+                    "LITELLM_PORT": "49281",
+                    "LITELLM_APP_LAUNCH_AGENT_LABEL": "menu.litellm.menu-login.runtime-verify-test",
+                    "LITELLM_CONFIG_WATCH_LABEL": "menu.litellm.config-watch.runtime-verify-test",
                     "LITELLM_RUNTIME_CONFIG": str(config_path),
                     "LITELLM_MODEL_INFO_FILE": str(model_info_path),
                     "PYTHON": sys.executable,

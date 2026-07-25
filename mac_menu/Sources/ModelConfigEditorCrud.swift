@@ -5,7 +5,7 @@ extension ModelConfigEditorController {
         commitEditor()
         guard let providerIndex = selectedProviderIndex else { return }
         let name = uniqueProviderKeyName(providerIndex: providerIndex, preferred: defaultProviderKeyName)
-        providers[providerIndex].apiKeys.append(EditableProviderKey(name: name, value: "", enabled: true))
+        providers[providerIndex].apiKeys.append(EditableProviderKey(name: name, value: ""))
         markPendingChanges()
         providerKeyTableView.reloadData()
         reloadRouteTable()
@@ -41,6 +41,7 @@ extension ModelConfigEditorController {
         providerEditorDirty = false
 
         providers[currentProviderIndex].apiKeys.remove(at: currentKeyIndex)
+        invalidateProviderProbePresentations(providerIndex: currentProviderIndex)
         markPendingChanges()
         for modelIndex in providers[currentProviderIndex].models.indices where providers[currentProviderIndex].models[modelIndex].apiKeyName == currentKey.name {
             providers[currentProviderIndex].models[modelIndex].apiKeyName = currentReplacement
@@ -80,6 +81,8 @@ extension ModelConfigEditorController {
         modelEditorTarget = nil
         selectedModelInfoRequestGeneration += 1
 
+        modelProbePresentations = modelProbePresentations.filter { $0.key.providerID != providerID }
+        modelAvailabilityProbeRuns = modelAvailabilityProbeRuns.filter { $0.key.providerID != providerID }
         providers.remove(at: currentProviderIndex)
         markPendingChanges()
         providerTableView.reloadData()
@@ -145,6 +148,9 @@ extension ModelConfigEditorController {
         guard let currentProviderIndex = providers.firstIndex(where: { $0.editorID == providerID }),
               let currentModelIndex = providers[currentProviderIndex].models.firstIndex(where: { $0.editorID == modelID }) else { return }
 
+        let deletedProbeKey = ModelProbeKey(providerID: providerID, modelID: modelID)
+        modelProbePresentations.removeValue(forKey: deletedProbeKey)
+        modelAvailabilityProbeRuns.removeValue(forKey: deletedProbeKey)
         providers[currentProviderIndex].models.remove(at: currentModelIndex)
         modelEditorTarget = nil
         selectedModelInfoRequestGeneration += 1
@@ -163,11 +169,15 @@ extension ModelConfigEditorController {
     }
 
     @objc func save() {
+        commitEditor()
+        refreshPendingChanges()
         guard hasPendingChanges else { return }
         let generation = beginLatestRuntimeApply()
         do {
             let providersToSave = try validatedProvidersForSave()
             let expectedRevision = loadedConfigRevision
+            let providersSnapshot = providers
+            let documentSnapshot = sourceDocument
             setRuntimeApplyInFlight(true)
             setEditorStatus("Saving config...")
 
@@ -190,9 +200,12 @@ extension ModelConfigEditorController {
                     switch result {
                     case .success(let saveResult):
                         self.loadedConfigRevision = saveResult.revision
-                        self.setPendingChanges(false)
+                        self.captureConfigurationBaseline(
+                            providers: providersSnapshot,
+                            document: documentSnapshot,
+                            preservesNilDocument: false
+                        )
                         self.reloadRouteTable()
-                        self.refreshRuntimeMap()
                         self.applyRuntimeConfigAfterSave(
                             saveResult,
                             generation: generation
@@ -215,7 +228,36 @@ extension ModelConfigEditorController {
     }
 
     @objc func cancel() {
+        requestEditorClose()
+    }
+
+    func requestEditorClose() {
+        guard !externalImportInFlight else {
+            showAlert(title: "Import in progress", message: "Wait for the provider and model import to finish before closing this window.")
+            return
+        }
+        commitEditor()
+        refreshPendingChanges()
+        guard hasPendingChanges else {
+            hideEditorWindow()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Discard unsaved provider and route changes?"
+        alert.informativeText = "Imported or edited providers, models, keys, and route order have not been applied."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Keep")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        hideEditorWindow()
+    }
+
+    func hideEditorWindow() {
+        providerBillingRefreshTimer?.invalidate()
+        providerBillingRefreshTimer = nil
         window.orderOut(nil)
+        endSettingsWindowPresentation(window)
     }
 
     func showAlert(title: String, message: String) {

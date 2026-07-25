@@ -6,6 +6,377 @@ from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    async def test_empty_non_streaming_responses_result_enters_route_recovery(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        async def recovered_stream():
+            yield {"type": "response.output_text.delta", "delta": "recovered"}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-recovered",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "msg-recovered",
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "recovered",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            }
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"order": 1},
+                        "model_info": {"id": "route-recovery"},
+                    }
+                ]
+
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        hook = hooks.LiteLLMMenuHook()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "route-original", "order": 1},
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response={
+                    "id": "resp-empty",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                },
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[0]["delta"], "recovered")
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("resp-empty", json.dumps(chunks))
+
+    async def test_non_streaming_responses_tool_call_is_not_empty(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Call the tool."}],
+            "stream": True,
+        }
+        response = {
+            "id": "resp-tool",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "id": "call-tool",
+                    "type": "function_call",
+                    "name": "exec",
+                    "arguments": "{}",
+                }
+            ],
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=response,
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(chunks[-1]["response"]["output"][0]["type"], "function_call")
+
+    async def test_non_streaming_compaction_response_is_not_empty(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        response = {
+            "id": "resp-compaction",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "id": "cmp-summary",
+                    "type": "compaction",
+                    "encrypted_content": "encrypted-summary",
+                }
+            ],
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=response,
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0]["encrypted_content"],
+            "encrypted-summary",
+        )
+
+    async def test_non_streaming_reasoning_only_response_enters_route_recovery(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        async def recovered_stream():
+            yield {"type": "response.output_text.delta", "delta": "answer"}
+            yield {"type": "response.completed", "response": {"id": "resp-answer"}}
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response={
+                    "id": "resp-reasoning-only",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "reasoning-1",
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "internal"}],
+                        }
+                    ],
+                },
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[0]["delta"], "answer")
+        self.assertEqual(len(calls), 1)
+
+    async def test_context_truncation_stream_closes_after_completed_event(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class HangingAfterCompletionStream:
+            def __init__(self) -> None:
+                self.events = iter(
+                    [
+                        {"type": "response.created", "response": {"id": "resp-done"}},
+                        {"type": "response.output_text.delta", "delta": "done"},
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp-done",
+                                "status": "completed",
+                                "output": [],
+                            },
+                        },
+                    ]
+                )
+                self.closed = False
+                self.read_count = 0
+                self.completed_response = None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.read_count += 1
+                try:
+                    event = next(self.events)
+                except StopIteration:
+                    await asyncio.sleep(60)
+                    raise StopAsyncIteration
+                if event.get("type") == "response.completed":
+                    self.completed_response = event
+                return event
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        source = HangingAfterCompletionStream()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "finish"}],
+            "stream": True,
+        }
+        wrapped = hooks._with_responses_context_truncation_fallback_stream(
+            source,
+            request_data,
+            lambda **_kwargs: None,
+        )
+
+        async def collect() -> list:
+            return [chunk async for chunk in wrapped]
+
+        chunks = await asyncio.wait_for(collect(), 0.5)
+
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            ["response.created", "response.output_text.delta", "response.completed"],
+        )
+        self.assertTrue(source.closed)
+        self.assertEqual(source.read_count, 3)
+        self.assertEqual(
+            wrapped.completed_response,
+            source.completed_response["response"],
+        )
+
+    async def test_empty_completed_event_is_not_treated_as_success(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class EmptyCompletedStream:
+            def __init__(self) -> None:
+                self.events = iter(
+                    [
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp-empty"},
+                        },
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp-empty",
+                                "status": "completed",
+                                "output": [],
+                            },
+                        },
+                    ]
+                )
+                self.closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.events)
+                except StopIteration:
+                    raise AssertionError("the wrapper must stop at the empty terminal")
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        source = EmptyCompletedStream()
+        wrapped = hooks._with_responses_context_truncation_fallback_stream(
+            source,
+            {
+                "model": "default-chat",
+                "input": [{"role": "user", "content": "finish"}],
+                "stream": True,
+            },
+            lambda **_kwargs: None,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Responses stream incomplete: response.completed without usable output",
+        ):
+            async for _chunk in wrapped:
+                pass
+
+        self.assertTrue(source.closed)
+
+    async def test_context_truncation_stream_closes_after_failed_event(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class HangingAfterFailureStream:
+            def __init__(self) -> None:
+                self.events = iter(
+                    [
+                        {
+                            "type": "response.created",
+                            "response": {"id": "resp-failed", "status": "in_progress"},
+                        },
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "id": "resp-failed",
+                                "status": "failed",
+                                "error": {
+                                    "code": "invalid_request_error",
+                                    "message": "synthetic failure",
+                                },
+                            },
+                        },
+                    ]
+                )
+                self.closed = False
+                self.read_count = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.read_count += 1
+                try:
+                    return next(self.events)
+                except StopIteration:
+                    await asyncio.sleep(60)
+                    raise StopAsyncIteration
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        source = HangingAfterFailureStream()
+        wrapped = hooks._with_responses_context_truncation_fallback_stream(
+            source,
+            {
+                "model": "default-chat",
+                "input": [{"role": "user", "content": "finish"}],
+                "stream": True,
+            },
+            lambda **_kwargs: None,
+        )
+
+        async def collect() -> list:
+            return [chunk async for chunk in wrapped]
+
+        chunks = await asyncio.wait_for(collect(), 0.5)
+
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            ["response.created", "response.failed"],
+        )
+        self.assertTrue(source.closed)
+        self.assertEqual(source.read_count, 2)
+        self.assertEqual(wrapped.completed_response, chunks[-1]["response"])
+
     async def test_structured_compaction_uses_longer_stream_start_deadline(self) -> None:
         hooks, _proxy_server = load_hook_module()
         routing_module = importlib.import_module("litellm_menu.routing")
@@ -429,9 +800,10 @@ class HookStreamingFailoverTests(HookTestCase):
 
         large_output = "x" * 250000
         with self.assertRaises(RuntimeError):
-            await Router()._ageneric_api_call_with_fallbacks_helper(
-                "default-chat",
+            await hooks._wrap_generic_function_for_deployment_failover(
                 original_generic_function,
+                outer_request_kwargs={"truncation": "disabled"},
+            )(
                 input=[
                     {"type": "message", "role": "user", "content": "Continue."},
                     {
@@ -560,6 +932,8 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertNotIn("response.failed", serialized)
         self.assertIn("resp-truncated", serialized)
         self.assertIn("continued", serialized)
+        self.assertEqual(response.completed_response["id"], "resp-truncated")
+        self.assertEqual(response.completed_response["status"], "completed")
 
     async def test_stream_context_fallback_exception_does_not_loop(self) -> None:
         hooks, _proxy_server = load_hook_module()

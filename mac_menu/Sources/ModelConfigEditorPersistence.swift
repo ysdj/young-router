@@ -8,7 +8,7 @@ private final class ProcessOutputCollector {
     private var discardedBytes = 0
 
     init(maxBytes: Int = 1_048_576) {
-        self.maxBytes = maxBytes
+        self.maxBytes = max(1, maxBytes)
     }
 
     func append(_ chunk: Data) {
@@ -30,10 +30,12 @@ private final class ProcessOutputCollector {
         }
     }
 
-    func text() -> String {
+    func text(maxBytes: Int? = nil) -> String {
         lock.lock()
-        let snapshot = data
-        let discarded = discardedBytes
+        let limit = maxBytes.map { max(1, $0) }
+        let omitted = limit.map { max(0, data.count - $0) } ?? 0
+        let snapshot = omitted > 0 ? Data(data.suffix(limit!)) : data
+        let discarded = discardedBytes + omitted
         lock.unlock()
 
         var output = String(data: snapshot, encoding: .utf8) ?? String(decoding: snapshot, as: UTF8.self)
@@ -42,28 +44,92 @@ private final class ProcessOutputCollector {
         }
         return output
     }
+
+    func collectedData() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+
+    var didTruncate: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return discardedBytes > 0
+    }
 }
+
+private let configEditorHelperTimeoutSeconds: TimeInterval = 30
+private let configEditorHelperOutputLimitBytes = 32 * 1_024 * 1_024
+private let configEditorHelperDiagnosticLimitBytes = 64 * 1_024
+private let configEditorHelperDrainTimeoutSeconds: DispatchTimeInterval = .seconds(2)
+private let externalImportOutputLimitBytes = 8 * 1_024 * 1_024
 
 extension ModelConfigEditorController {
     func loadConfigPayload() throws -> ConfigEditorLoadPayload {
+        if configEditorPythonPath() == nil {
+            let bootstrap = runServiceControl(
+                arguments: ["config-editor-bootstrap"],
+                timeoutSeconds: 120
+            )
+            guard bootstrap.0 == 0 else {
+                let detail = bootstrap.1.trimmingCharacters(in: .whitespacesAndNewlines)
+                throw ConfigEditorError(
+                    message: detail.isEmpty
+                        ? "The config editor runtime could not be prepared."
+                        : detail
+                )
+            }
+        }
         let output = try runHelper(arguments: ["load"])
         return try JSONDecoder().decode(ConfigEditorLoadPayload.self, from: output)
     }
 
     func saveProviders(
         _ providers: [EditableProvider],
-        expectedRevision: JSONValue? = nil
+        expectedRevision: JSONValue? = nil,
+        document: ConfigEditorDocument? = nil
     ) throws -> ConfigEditorSaveResult {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let input = try encoder.encode(
             ConfigEditorSavePayload(
                 providers: providers,
-                expectedRevision: expectedRevision ?? loadedConfigRevision
+                expectedRevision: expectedRevision ?? loadedConfigRevision,
+                document: document ?? sourceDocument
             )
         )
         let output = try runHelper(arguments: ["save"], input: input)
         return try JSONDecoder().decode(ConfigEditorSaveResult.self, from: output)
+    }
+
+    func loadProviderBilling() throws -> ProviderBillingPayload {
+        let result = runServiceControl(arguments: ["provider-billing"], timeoutSeconds: 15)
+        guard result.0 == 0 else {
+            throw ConfigEditorError(message: result.1)
+        }
+        guard let data = result.1.data(using: .utf8) else {
+            throw ConfigEditorError(message: "Provider billing response was not valid UTF-8.")
+        }
+        return try JSONDecoder().decode(ProviderBillingPayload.self, from: data)
+    }
+
+    func importExternalProviders(
+        arguments: [String],
+        standardInput: Data? = nil
+    ) throws -> ExternalProviderImportPayload {
+        let result = runServiceControl(
+            arguments: ["external-provider-import"] + arguments,
+            timeoutSeconds: 60,
+            standardInput: standardInput,
+            outputLimitBytes: externalImportOutputLimitBytes
+        )
+        guard result.0 == 0 else {
+            throw ConfigEditorError(message: result.1)
+        }
+        guard let data = result.1.data(using: .utf8) else {
+            throw ConfigEditorError(message: "External provider import response was not valid UTF-8.")
+        }
+        return try JSONDecoder().decode(ExternalProviderImportPayload.self, from: data)
     }
 
     private func drainPipe(_ pipe: Pipe, into collector: ProcessOutputCollector, group: DispatchGroup) {
@@ -197,24 +263,43 @@ extension ModelConfigEditorController {
     }
 
     func runControl(_ action: String, generation: Int? = nil) -> (Int32, String) {
+        runServiceControl(arguments: [action], generation: generation)
+    }
+
+    func runServiceControl(
+        arguments: [String],
+        generation: Int? = nil,
+        timeoutSeconds: TimeInterval? = nil,
+        standardInput: Data? = nil,
+        outputLimitBytes: Int = 1_048_576
+    ) -> (Int32, String) {
+        guard let action = arguments.first else {
+            return (64, "A service action is required.")
+        }
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        let stdoutCollector = ProcessOutputCollector()
-        let stderrCollector = ProcessOutputCollector()
+        let stdoutCollector = ProcessOutputCollector(maxBytes: outputLimitBytes)
+        let stderrCollector = ProcessOutputCollector(maxBytes: outputLimitBytes)
         let drainGroup = DispatchGroup()
+        let stdinPipe = standardInput == nil ? nil : Pipe()
 
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = ["\(bundleRoot)/service.sh", action]
+        process.arguments = ["\(bundleRoot)/service.sh"] + arguments
         process.currentDirectoryURL = URL(fileURLWithPath: root)
         process.environment = environment
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        process.standardInput = stdinPipe
 
         do {
             try process.run()
             drainPipe(stdoutPipe, into: stdoutCollector, group: drainGroup)
             drainPipe(stderrPipe, into: stderrCollector, group: drainGroup)
+            if let standardInput, let stdinPipe {
+                stdinPipe.fileHandleForWriting.write(standardInput)
+                stdinPipe.fileHandleForWriting.closeFile()
+            }
             if let generation {
                 runtimeApplyLock.lock()
                 if runtimeApplyGeneration == generation {
@@ -224,7 +309,8 @@ extension ModelConfigEditorController {
                 }
                 runtimeApplyLock.unlock()
             }
-            let completed = waitForProcess(process, timeoutSeconds: generation == nil ? nil : 95)
+            let effectiveTimeout = timeoutSeconds ?? (generation == nil ? nil : 95)
+            let completed = waitForProcess(process, timeoutSeconds: effectiveTimeout)
             if !completed {
                 if generation != nil {
                     runtimeApplyLock.lock()
@@ -245,6 +331,10 @@ extension ModelConfigEditorController {
         }
 
         _ = drainGroup.wait(timeout: .now() + 2)
+
+        if stdoutCollector.didTruncate || stderrCollector.didTruncate {
+            return (1, "Output from \(action) exceeded the supported size limit.")
+        }
 
         if generation != nil {
             runtimeApplyLock.lock()
@@ -274,8 +364,8 @@ extension ModelConfigEditorController {
 
     func setRuntimeApplyInFlight(_ applying: Bool) {
         runtimeApplyInFlight = applying
-        applyButton.isEnabled = hasPendingChanges
-        applyButton.title = applying ? "Apply Latest" : "Apply"
+        applyButton.isEnabled = !applying && hasPendingChanges && !externalImportInFlight
+        applyButton.title = applying ? "Applying…" : "Apply"
     }
 
     func cancelRuntimeApplyInFlight() {
@@ -321,7 +411,6 @@ extension ModelConfigEditorController {
                     let summary = self.summarizeControlOutput(applyResult.1)
                     self.setEditorStatus(
                         "Config saved, but runtime apply failed.",
-                        color: .systemRed,
                         tooltip: self.configSaveTooltip(result, runtimeOutput: summary.isEmpty ? applyResult.1 : summary)
                     )
                 }
@@ -330,20 +419,48 @@ extension ModelConfigEditorController {
         }
     }
 
-    func runHelper(arguments: [String], input: Data? = nil) throws -> Data {
+    private func helperFailureMessage(
+        stdout: ProcessOutputCollector,
+        stderr: ProcessOutputCollector,
+        fallback: String
+    ) -> String {
+        let stderrText = stderr.text(maxBytes: configEditorHelperDiagnosticLimitBytes)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stderrText.isEmpty {
+            return stderrText
+        }
+        let stdoutText = stdout.text(maxBytes: configEditorHelperDiagnosticLimitBytes)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return stdoutText.isEmpty ? fallback : stdoutText
+    }
+
+    func configEditorPythonPath() -> String? {
+        let bundledPython = "\(bundleRoot)/runtime/bin/python"
+        let developmentPython = "\(root)/.venv/bin/python"
+        if FileManager.default.isExecutableFile(atPath: bundledPython) {
+            return bundledPython
+        }
+        if FileManager.default.isExecutableFile(atPath: developmentPython) {
+            return developmentPython
+        }
+        return nil
+    }
+
+    func runHelper(
+        arguments: [String],
+        input: Data? = nil,
+        timeoutSeconds: TimeInterval = configEditorHelperTimeoutSeconds
+    ) throws -> Data {
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
         let stdinPipe = input == nil ? nil : Pipe()
+        let stdoutCollector = ProcessOutputCollector(maxBytes: configEditorHelperOutputLimitBytes)
+        let stderrCollector = ProcessOutputCollector(maxBytes: configEditorHelperDiagnosticLimitBytes)
+        let drainGroup = DispatchGroup()
+        let inputWriteGroup = DispatchGroup()
 
-        let bundledPython = "\(bundleRoot)/runtime/bin/python"
-        let developmentPython = "\(root)/.venv/bin/python"
-        let pythonPath: String
-        if FileManager.default.isExecutableFile(atPath: bundledPython) {
-            pythonPath = bundledPython
-        } else if FileManager.default.isExecutableFile(atPath: developmentPython) {
-            pythonPath = developmentPython
-        } else {
+        guard let pythonPath = configEditorPythonPath() else {
             throw ConfigEditorError(
                 message: "No bundled Python runtime is available for the config editor."
             )
@@ -361,21 +478,68 @@ extension ModelConfigEditorController {
 
         do {
             try process.run()
+            drainPipe(stdoutPipe, into: stdoutCollector, group: drainGroup)
+            drainPipe(stderrPipe, into: stderrCollector, group: drainGroup)
             if let input, let stdinPipe {
-                stdinPipe.fileHandleForWriting.write(input)
-                stdinPipe.fileHandleForWriting.closeFile()
+                inputWriteGroup.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    defer {
+                        stdinPipe.fileHandleForWriting.closeFile()
+                        inputWriteGroup.leave()
+                    }
+                    try? stdinPipe.fileHandleForWriting.write(contentsOf: input)
+                }
             }
-            process.waitUntilExit()
+            let completed = waitForProcess(
+                process,
+                timeoutSeconds: max(1, timeoutSeconds)
+            )
+            if !completed {
+                _ = inputWriteGroup.wait(timeout: .now() + configEditorHelperDrainTimeoutSeconds)
+                _ = drainGroup.wait(timeout: .now() + configEditorHelperDrainTimeoutSeconds)
+                let detail = helperFailureMessage(
+                    stdout: stdoutCollector,
+                    stderr: stderrCollector,
+                    fallback: ""
+                )
+                let timeout = "Config editor timed out after \(Int(max(1, timeoutSeconds))) seconds and was terminated."
+                throw ConfigEditorError(
+                    message: detail.isEmpty ? timeout : "\(timeout)\n\(detail)"
+                )
+            }
+        } catch let error as ConfigEditorError {
+            throw error
         } catch {
+            _ = inputWriteGroup.wait(timeout: .now() + configEditorHelperDrainTimeoutSeconds)
+            _ = drainGroup.wait(timeout: .now() + configEditorHelperDrainTimeoutSeconds)
             throw ConfigEditorError(message: String(describing: error))
         }
 
-        let output = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorOutput = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        if process.terminationStatus != 0 {
-            let message = String(data: errorOutput + output, encoding: .utf8) ?? "config_editor.py failed"
-            throw ConfigEditorError(message: message.trimmingCharacters(in: .whitespacesAndNewlines))
+        _ = inputWriteGroup.wait(timeout: .now() + configEditorHelperDrainTimeoutSeconds)
+        let drained = drainGroup.wait(timeout: .now() + configEditorHelperDrainTimeoutSeconds) == .success
+        guard drained else {
+            stdoutPipe.fileHandleForReading.closeFile()
+            stderrPipe.fileHandleForReading.closeFile()
+            throw ConfigEditorError(
+                message: "Config editor output did not finish draining after the process exited."
+            )
         }
-        return output
+
+        if process.terminationStatus != 0 {
+            throw ConfigEditorError(
+                message: helperFailureMessage(
+                    stdout: stdoutCollector,
+                    stderr: stderrCollector,
+                    fallback: "config_editor.py failed"
+                )
+            )
+        }
+        if stdoutCollector.didTruncate {
+            throw ConfigEditorError(
+                message: "Config editor output exceeded \(configEditorHelperOutputLimitBytes / (1_024 * 1_024)) MB. Reduce the configuration size before reopening the editor."
+            )
+        }
+        return stdoutCollector.collectedData()
     }
+
 }

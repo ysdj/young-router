@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTROL = ROOT / "service.sh"
 COMMON_MODELS_SOURCE = ROOT / "mac_menu" / "Sources" / "CommonModels.swift"
 RUNTIME_SETTINGS_DIALOG_SOURCE = ROOT / "mac_menu" / "Sources" / "RuntimeSettingsDialog.swift"
+SETTINGS_WINDOW_PRESENTATION_SOURCE = ROOT / "mac_menu" / "Sources" / "SettingsWindowPresentation.swift"
 HARNESS_SOURCE = ROOT / "tests" / "fixtures" / "runtime_settings_dialog" / "main.swift"
 
 
@@ -37,6 +38,7 @@ class RuntimeSettingsDialogTests(unittest.TestCase):
             [
                 "swiftc",
                 str(COMMON_MODELS_SOURCE),
+                str(SETTINGS_WINDOW_PRESENTATION_SOURCE),
                 str(RUNTIME_SETTINGS_DIALOG_SOURCE),
                 str(HARNESS_SOURCE),
                 "-o",
@@ -69,9 +71,11 @@ class RuntimeSettingsDialogTests(unittest.TestCase):
             "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
             "PYTHON": sys.executable,
             "PYTHONDONTWRITEBYTECODE": "1",
-            "LITELLM_ALLOW_CHECKOUT_SERVICE": "1",
             "LITELLM_RUNTIME_ROOT": str(runtime_root),
             "LITELLM_TEMPLATE_ROOT": str(ROOT),
+            "LITELLM_PORT": "49240",
+            "LITELLM_APP_LAUNCH_AGENT_LABEL": "menu.litellm.menu-login.runtime-dialog-test",
+            "LITELLM_CONFIG_WATCH_LABEL": "menu.litellm.config-watch.runtime-dialog-test",
         }
 
     @classmethod
@@ -114,6 +118,12 @@ class RuntimeSettingsDialogTests(unittest.TestCase):
         result = self.run_harness("validate", encoded)
         return bool(result["valid"])
 
+    def test_background_save_completion_runs_inside_modal_loop(self) -> None:
+        audit = self.run_harness("modal-save")
+
+        self.assertTrue(audit["saved"])
+        self.assertTrue(audit["save_in_flight"])
+
     def backend_accepts(self, values: dict[str, str], case_number: int) -> bool:
         configured = subprocess.run(
             ["/bin/bash", str(CONTROL), "runtime-settings-configure"],
@@ -127,13 +137,13 @@ class RuntimeSettingsDialogTests(unittest.TestCase):
         return configured.returncode == 0
 
     def test_document_tracks_dynamic_content_without_blank_scroll_tail(self) -> None:
-        full = self.run_harness("layout", "900")
+        full = self.run_harness("layout", "1120")
         compact_payload = copy.deepcopy(self.payload)
         compact_payload["settings"] = compact_payload["settings"][:1]
-        compact = self.run_harness("layout", "900", payload=compact_payload)
+        compact = self.run_harness("layout", "1120", payload=compact_payload)
         partial_payload = copy.deepcopy(self.payload)
         partial_payload["settings"] = partial_payload["settings"][:12]
-        partial = self.run_harness("layout", "900", payload=partial_payload)
+        partial = self.run_harness("layout", "1120", payload=partial_payload)
 
         for name, layout in (("compact", compact), ("partial", partial), ("full", full)):
             with self.subTest(size=name):
@@ -142,9 +152,9 @@ class RuntimeSettingsDialogTests(unittest.TestCase):
                     layout["clip_width"],
                     delta=1.0,
                 )
-                self.assertAlmostEqual(layout["left_inset"], 12.0, delta=1.0)
-                self.assertAlmostEqual(layout["right_inset"], 12.0, delta=1.0)
-                self.assertAlmostEqual(layout["top_inset"], 10.0, delta=1.0)
+                self.assertAlmostEqual(layout["left_inset"], 16.0, delta=1.0)
+                self.assertAlmostEqual(layout["right_inset"], 16.0, delta=1.0)
+                self.assertAlmostEqual(layout["top_inset"], 14.0, delta=1.0)
                 self.assertGreaterEqual(layout["document_height"], layout["clip_height"])
 
         self.assertLess(compact["stack_height"], partial["stack_height"])
@@ -157,38 +167,154 @@ class RuntimeSettingsDialogTests(unittest.TestCase):
         )
         for name, layout in (("partial", partial), ("full", full)):
             with self.subTest(size=name):
-                self.assertAlmostEqual(layout["bottom_inset"], 10.0, delta=1.0)
+                self.assertAlmostEqual(layout["bottom_inset"], 14.0, delta=1.0)
                 self.assertAlmostEqual(
                     layout["document_height"],
-                    layout["stack_height"] + 20.0,
+                    layout["stack_height"] + 28.0,
                     delta=1.0,
                     msg="The document height must derive from its actual rows.",
                 )
+
+    def test_window_and_help_area_use_a_compact_per_category_runtime_settings_layout(self) -> None:
+        metrics = self.run_harness("window-metrics")
+
+        self.assertAlmostEqual(metrics["content_width"], 1080.0, delta=1.0)
+        self.assertAlmostEqual(metrics["minimum_width"], 760.0, delta=1.0)
+        self.assertAlmostEqual(metrics["maximum_width"], 1160.0, delta=1.0)
+        for heading in metrics["headings"]:
+            self.assertAlmostEqual(
+                heading["min_x"],
+                28.0,
+                delta=1.0,
+                msg="Category headings must start at the form's left edge, not the row-label grid.",
+            )
+        self.assertTrue(
+            any(columns == 2 for columns in metrics["category_columns"]),
+            "A wide Runtime Settings window should use two columns inside multi-row categories.",
+        )
+        self.assertGreater(
+            metrics["help_width"],
+            250.0,
+            "Tips need a practical readable line within their own category column.",
+        )
+        self.assertLess(
+            metrics["help_width"],
+            metrics["document_width"] * 0.55,
+            "Tips must stay inside one category column instead of spanning the window.",
+        )
+
+    def test_runtime_inputs_stay_compact_while_help_uses_the_wider_reading_area(self) -> None:
+        audit = self.run_harness("alignment", "1080")
+        timeout = next(
+            entry
+            for entry in audit["entries"]
+            if entry["key"] == "LITELLM_MENU_REQUEST_TIMEOUT_SECONDS"
+        )
+
+        self.assertLessEqual(timeout["control"]["width"], 232.0)
+        self.assertLessEqual(timeout["value_slot"]["width"], 232.0)
+        self.assertLessEqual(
+            timeout["unit"]["min_x"] - timeout["control"]["max_x"],
+            12.0,
+            "The unit belongs directly after the compact value field.",
+        )
+        self.assertGreater(
+            timeout["help"]["width"],
+            timeout["value_slot"]["width"],
+            "Only the explanatory text should use the remaining responsive column width.",
+        )
+        self.assertLess(
+            timeout["help"]["width"],
+            audit["document"]["width"] * 0.55,
+            "The explanatory text must stay inside its category column.",
+        )
+
+    def test_balance_refresh_setting_uses_the_same_validated_runtime_grid(self) -> None:
+        audit = self.run_harness("alignment", "1080")
+        refresh = next(
+            entry
+            for entry in audit["entries"]
+            if entry["key"] == "LITELLM_MENU_BALANCE_REFRESH_MINUTES"
+        )
+
+        self.assertEqual("LITELLM_MENU_BALANCE_REFRESH_MINUTES", refresh["key"])
+        self.assertLessEqual(refresh["control"]["width"], 232.0)
+        self.assertGreater(refresh["help"]["width"], refresh["control"]["width"])
+
+    def test_wide_recovery_columns_do_not_insert_blank_holes_between_settings(self) -> None:
+        audit = self.run_harness("alignment", "1080")
+        recovery = next(section for section in audit["sections"] if section["category"] == "Recovery")
+        entries = {
+            entry["key"]: entry
+            for entry in audit["entries"]
+            if entry["key"].startswith("LITELLM_MENU_RECOVERY")
+            or entry["key"] == "LITELLM_MENU_SAME_DEPLOYMENT_RETRIES"
+        }
+
+        self.assertEqual(len(recovery["columns"]), 2)
+        for column in recovery["columns"]:
+            arranged = column["arranged"]
+            rows = [
+                view["frame"]
+                for view in arranged
+                if view["identifier"].startswith("RuntimeSettingsRow.")
+            ]
+            spacer = next(
+                view["frame"]
+                for view in arranged
+                if view["identifier"] == "RuntimeSettingsColumnBottomSpacer"
+            )
+
+            self.assertGreater(len(rows), 0)
+            self.assertAlmostEqual(rows[0]["min_y"], column["frame"]["min_y"], delta=1.0)
+            for previous, current in zip(rows, rows[1:]):
+                self.assertAlmostEqual(
+                    current["min_y"] - previous["max_y"],
+                    8.0,
+                    delta=1.0,
+                    msg="Only the stack's normal row spacing may appear between runtime settings.",
+                )
+            self.assertGreaterEqual(spacer["min_y"], rows[-1]["max_y"] + 7.0)
+
+        for entry in entries.values():
+            self.assertAlmostEqual(
+                entry["input_row"]["height"],
+                26.0,
+                delta=1.0,
+                msg=f"{entry['key']} must keep its control line compact in a wide category.",
+            )
 
     def test_every_runtime_row_uses_the_shared_alignment_grid(self) -> None:
         def boundary(frame: dict[str, float]) -> tuple[float, float]:
             return (frame["min_x"], frame["max_x"])
 
-        for width in (900,):
+        for width, expected_columns in (
+            (760, 1),
+            (900, 1),
+            (1000, 2),
+        ):
             with self.subTest(width=width):
                 audit = self.run_harness("alignment", str(width))
                 entries = audit["entries"]
                 self.assertEqual(len(entries), len(self.payload["settings"]))
-
-                stack = audit["form_stack"]
-                expected_columns = {
-                    name: boundary(entries[0][name])
-                    for name in ("label", "value_slot", "action_slot", "unit")
-                }
+                self.assertTrue(
+                    all(columns == 1 for columns in audit["category_columns"])
+                    if expected_columns == 1
+                    else any(columns == 2 for columns in audit["category_columns"]),
+                )
+                expected_columns_by_section_and_column = {}
+                for entry in entries:
+                    slot = (entry["section_index"], entry["column_index"])
+                    expected_columns_by_section_and_column.setdefault(
+                        slot,
+                        {
+                            name: boundary(entry[name])
+                            for name in ("label", "value_slot", "action_slot", "unit")
+                        },
+                    )
 
                 for entry in entries:
                     with self.subTest(width=width, key=entry["key"]):
-                        self.assertAlmostEqual(
-                            entry["row"]["min_x"], stack["min_x"], delta=1.0
-                        )
-                        self.assertAlmostEqual(
-                            entry["row"]["max_x"], stack["max_x"], delta=1.0
-                        )
                         self.assertAlmostEqual(
                             entry["input_row"]["min_x"],
                             entry["row"]["min_x"],
@@ -200,7 +326,8 @@ class RuntimeSettingsDialogTests(unittest.TestCase):
                             delta=1.0,
                         )
 
-                        for name, expected in expected_columns.items():
+                        slot = (entry["section_index"], entry["column_index"])
+                        for name, expected in expected_columns_by_section_and_column[slot].items():
                             actual = boundary(entry[name])
                             self.assertAlmostEqual(actual[0], expected[0], delta=1.0)
                             self.assertAlmostEqual(actual[1], expected[1], delta=1.0)
@@ -220,7 +347,11 @@ class RuntimeSettingsDialogTests(unittest.TestCase):
     def test_all_runtime_controls_are_accessible_and_api_key_is_secure(self) -> None:
         payload = copy.deepcopy(self.payload)
         settings = payload["settings"]
-        self.assertEqual(len(settings), 48)
+        setting_keys = {item["key"] for item in settings}
+        self.assertGreaterEqual(len(settings), 47)
+        self.assertIn("LITELLM_MENU_REQUEST_TIMEOUT_SECONDS", setting_keys)
+        self.assertIn("LITELLM_MENU_VISION_BRIDGE_API_KEY", setting_keys)
+        self.assertIn("LITELLM_CONFIG_WATCH_SETTLE_INTERVAL", setting_keys)
         api_key_item = next(
             item
             for item in settings

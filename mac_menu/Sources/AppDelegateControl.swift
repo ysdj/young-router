@@ -10,7 +10,18 @@ extension AppDelegate {
         control(arguments: [action], logCommand: logCommand, timeoutSeconds: timeoutSeconds)
     }
 
-    func control(arguments: [String], input: String? = nil, logCommand: Bool = true, timeoutSeconds: TimeInterval? = nil) -> (Int32, String) {
+    func lifecycleControl(_ action: String) -> (Int32, String) {
+        control(arguments: [action], trackLifecycleProcess: true)
+    }
+
+    func control(
+        arguments: [String],
+        input: String? = nil,
+        logCommand: Bool = true,
+        timeoutSeconds: TimeInterval? = nil,
+        trackLifecycleProcess: Bool = false,
+        outputLimitBytes: Int = 16 * 1_024 * 1_024
+    ) -> (Int32, String) {
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -18,12 +29,20 @@ extension AppDelegate {
         let outputLock = NSLock()
         let terminationGroup = DispatchGroup()
         var output = Data()
+        var outputWasTruncated = false
+        let outputLimit = max(1, outputLimitBytes)
         let commandLabel = arguments.joined(separator: " ")
 
         func appendOutput(_ data: Data) {
             guard !data.isEmpty else { return }
             outputLock.lock()
-            output.append(data)
+            let remaining = max(0, outputLimit - output.count)
+            if remaining > 0 {
+                output.append(data.prefix(remaining))
+            }
+            if data.count > remaining {
+                outputWasTruncated = true
+            }
             outputLock.unlock()
         }
 
@@ -54,6 +73,26 @@ extension AppDelegate {
         }
         do {
             try process.run()
+            if trackLifecycleProcess {
+                lifecycleProcessLock.lock()
+                let shouldCancel = lifecycleCancellationRequested
+                if !shouldCancel {
+                    lifecycleProcess = process
+                }
+                lifecycleProcessLock.unlock()
+                if shouldCancel {
+                    terminateProcessTree(process)
+                }
+            }
+            defer {
+                if trackLifecycleProcess {
+                    lifecycleProcessLock.lock()
+                    if lifecycleProcess === process {
+                        lifecycleProcess = nil
+                    }
+                    lifecycleProcessLock.unlock()
+                }
+            }
             if let stdinPipe {
                 if let data = input?.data(using: .utf8) {
                     try? stdinPipe.fileHandleForWriting.write(contentsOf: data)
@@ -81,9 +120,13 @@ extension AppDelegate {
 
             outputLock.lock()
             let data = output
+            let truncated = outputWasTruncated
             outputLock.unlock()
 
             let text = String(data: data, encoding: .utf8) ?? ""
+            if truncated {
+                return (1, "Output from \(commandLabel) exceeded the supported size limit.")
+            }
             if !completed {
                 let detail = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 let message = "Timed out running control command: \(commandLabel)"
@@ -100,6 +143,23 @@ extension AppDelegate {
             }
             return (1, message)
         }
+    }
+
+    func cancelLifecycleControl() {
+        lifecycleProcessLock.lock()
+        lifecycleCancellationRequested = true
+        let process = lifecycleProcess
+        lifecycleProcess = nil
+        lifecycleProcessLock.unlock()
+        if let process, process.isRunning {
+            terminateProcessTree(process)
+        }
+    }
+
+    func resumeLifecycleControl() {
+        lifecycleProcessLock.lock()
+        lifecycleCancellationRequested = false
+        lifecycleProcessLock.unlock()
     }
 
     private func processIsAlive(_ pid: Int32) -> Bool {
@@ -259,7 +319,10 @@ extension AppDelegate {
     }
 
     func appendLog(_ message: String) {
-        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        let line = "[\(formatter.string(from: Date()))] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
         let url = URL(fileURLWithPath: menuLogPath)
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -312,30 +375,31 @@ extension AppDelegate {
     }
 
     func displayedServiceState(_ serviceState: ServiceState) -> ServiceState {
-        guard serviceState == .stopped, serviceShouldBeRunning else { return serviceState }
-        scheduleUnexpectedStoppedRecovery()
-        return serviceStartInFlight ? .starting : .unhealthy
+        guard serviceShouldBeRunning else { return serviceState }
+        switch serviceState {
+        case .running, .starting:
+            return serviceState
+        case .stopped, .unhealthy:
+            scheduleUnexpectedServiceRecovery()
+            return serviceStartInFlight ? .starting : .unhealthy
+        }
     }
 
-    func scheduleUnexpectedStoppedRecovery() {
+    func scheduleUnexpectedServiceRecovery() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             guard self.serviceShouldBeRunning, !self.busy, !self.serviceStartInFlight else { return }
             let now = Date()
-            if let previous = self.lastStoppedRecoveryAttempt,
-               now.timeIntervalSince(previous) < self.stoppedRecoveryRetryInterval {
+            if let previous = self.lastServiceRecoveryAttempt,
+               now.timeIntervalSince(previous) < self.serviceRecoveryRetryInterval {
                 return
             }
             self.beginServiceStart(
-                logMessage: "LiteLLM service reported stopped while the menu app expects it running; starting LiteLLM service",
-                failureTitle: "LiteLLM service restart failed",
+                logMessage: "LiteLLM service is not healthy while the menu app is open; starting LiteLLM service",
+                failureTitle: "LiteLLM service recovery failed",
                 showFailureAlert: false
             )
         }
-    }
-
-    func isRunning() -> Bool {
-        readServiceState().isRunning
     }
 
     func readAutoStartState(deadline: Date? = nil) -> AutoStartState {
@@ -349,157 +413,42 @@ extension AppDelegate {
         return .disabled
     }
 
-    func isRouteTraceEnabled(deadline: Date? = nil) -> Bool {
-        control("route-trace-status", logCommand: false, timeoutSeconds: statusTimeout(deadline: deadline)).0 == 0
-    }
-
-    func readRouteRecoverySummary(deadline: Date? = nil) -> String {
-        let result = control("route-recovery-summary", logCommand: false, timeoutSeconds: statusTimeout(deadline: deadline))
-        if result.0 != 0 {
-            return "0 recovering / 0 cooldown"
-        }
-        let output = result.1.trimmingCharacters(in: .whitespacesAndNewlines)
-        return output.isEmpty ? "0 recovering / 0 cooldown" : output
-    }
-
     func isWebDAVSyncEnabled(deadline: Date? = nil) -> Bool {
         control("webdav-enabled-status", logCommand: false, timeoutSeconds: statusTimeout(deadline: deadline)).0 == 0
     }
 
-    func tomlStringValue(_ rawValue: String) -> String? {
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let quote = trimmed.first else { return nil }
-        if quote == "\"" || quote == "'" {
-            var value = ""
-            var escaping = false
-            for character in trimmed.dropFirst() {
-                if escaping {
-                    value.append(character)
-                    escaping = false
-                    continue
-                }
-                if quote == "\"" && character == "\\" {
-                    escaping = true
-                    continue
-                }
-                if character == quote {
-                    return value
-                }
-                value.append(character)
-            }
-            return value
-        }
-
-        let withoutComment = trimmed
-            .split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
-            .first
-            .map(String.init) ?? ""
-        return withoutComment.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    func tomlValue(for key: String, in text: String, topLevelOnly: Bool = false) -> String? {
-        for line in text.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || trimmed.hasPrefix("#") {
-                continue
-            }
-            if trimmed.hasPrefix("[") {
-                if topLevelOnly {
-                    break
-                }
-                continue
-            }
-            let parts = trimmed.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            guard parts.count == 2 else { continue }
-            let candidateKey = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard candidateKey == key else { continue }
-            return tomlStringValue(String(parts[1]))
-        }
-        return nil
-    }
-
-    func tomlTableBody(_ table: String, in text: String) -> String? {
-        var lines: [String] = []
-        var collecting = false
-        let wantedHeader = "[\(table)]"
-        for line in text.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("[") && !trimmed.hasPrefix("#") {
-                let header = (trimmed.split(separator: "#", maxSplits: 1).first.map(String.init) ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if collecting {
-                    break
-                }
-                collecting = header == wantedHeader
-                continue
-            }
-            if collecting {
-                lines.append(line)
-            }
-        }
-        return collecting ? lines.joined(separator: "\n") : nil
-    }
-
-    func normalizedURL(_ value: String) -> String {
-        var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        while normalized.hasSuffix("/") {
-            normalized.removeLast()
-        }
-        return normalized
-    }
-
-    func codexConfigTextPointsToLiteLLM(_ text: String) -> Bool {
-        guard let provider = tomlValue(for: "model_provider", in: text, topLevelOnly: true),
-              !provider.isEmpty,
-              let table = tomlTableBody("model_providers.\(provider)", in: text),
-              let baseURL = tomlValue(for: "base_url", in: table) else {
-            return false
-        }
-
-        let port = localServicePort(runtimeRoot: root, environment: ProcessInfo.processInfo.environment)
-        return normalizedURL(baseURL) == normalizedURL("http://127.0.0.1:\(port)/v1")
-    }
-
-    func readCodexConfigState() -> CodexConfigState {
-        let fileManager = FileManager.default
-        let configPath = "\(codexHome)/config.toml"
-        let statePath = "\(codexHome)/.litellm-menu-codex-local-config-state.json"
-        let configText = try? String(contentsOfFile: configPath, encoding: .utf8)
-        let configured = configText.map { codexConfigTextPointsToLiteLLM($0) } ?? false
-        let preSwitchReapplyAvailable = codexPreSwitchStateIsActive(
-            atPath: statePath,
-            fileManager: fileManager
-        )
-        return CodexConfigState(
-            configuredForLiteLLM: configured,
-            preSwitchReapplyAvailable: preSwitchReapplyAvailable
-        )
-    }
-
-    func codexPreSwitchStateIsActive(atPath statePath: String, fileManager: FileManager) -> Bool {
-        guard fileManager.fileExists(atPath: statePath),
-              let data = fileManager.contents(atPath: statePath),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["schema_version"] as? Int == 3,
-              object["active"] as? Bool == true,
-              object["config"] as? [String: Any] != nil,
-              object["auth"] as? [String: Any] != nil,
-              normalizedURL(object["target_base_url"] as? String ?? "") == normalizedURL("http://127.0.0.1:\(localServicePort(runtimeRoot: root, environment: ProcessInfo.processInfo.environment))/v1") else {
-            return false
-        }
-        return true
-    }
-
     func currentMenuState(timeoutSeconds: TimeInterval? = nil) -> MenuState {
-        let deadline = timeoutSeconds.map { Date().addingTimeInterval($0) }
+        let result = control(
+            "menu-status",
+            logCommand: false,
+            timeoutSeconds: timeoutSeconds ?? statusRefreshTimeout
+        )
+        guard result.0 == 0,
+              let data = result.1.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(MenuStatusPayload.self, from: data) else {
+            return initialMenuState(serviceState: readServiceState())
+        }
+
+        let serviceState: ServiceState
+        switch payload.serviceState {
+        case "running": serviceState = .running
+        case "starting": serviceState = .starting
+        case "unhealthy": serviceState = .unhealthy
+        default: serviceState = .stopped
+        }
+        let autoStartState: AutoStartState
+        switch payload.autoStartState {
+        case "enabled": autoStartState = .enabled
+        case "incomplete": autoStartState = .incomplete
+        default: autoStartState = .disabled
+        }
         return MenuState(
-            serviceState: readServiceState(deadline: deadline),
-            autoStartState: readAutoStartState(deadline: deadline),
-            routeTraceEnabled: isRouteTraceEnabled(deadline: deadline),
-            routeRecoverySummary: readRouteRecoverySummary(deadline: deadline),
-            webdavSyncEnabled: isWebDAVSyncEnabled(deadline: deadline),
-            webdavLastStatus: readWebDAVLastStatus(deadline: deadline),
-            codexConfigState: readCodexConfigState()
+            serviceState: serviceState,
+            autoStartState: autoStartState,
+            routeRecoverySummary: payload.routeRecoverySummary,
+            routeRecovery: payload.routeRecovery ?? .empty,
+            webdavSyncEnabled: payload.webdavSyncEnabled,
+            webdavLastStatus: payload.webdavLastStatus
         )
     }
 }

@@ -153,6 +153,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "0")
         hook = hooks.LiteLLMMenuHook()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -789,6 +790,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
         proxy_server.llm_router = FakeRouter()
         hook = hooks.LiteLLMMenuHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "0")
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
         request_data = {
@@ -956,7 +958,7 @@ class HookStreamingTimeoutTests(HookTestCase):
         }
         self.assertTrue(hooks._is_route_recovery_poll_error(exc))
         self.assertTrue(hooks._should_return_route_recovery_stream(exc, request_data))
-        self.assertFalse(hooks._should_retry_final_upstream_route_error(exc, request_data))
+        self.assertTrue(hooks._should_retry_final_upstream_route_error(exc, request_data))
 
     def test_route_recovery_wait_timeout_after_buffered_chunks_is_idle_timeout(self) -> None:
         hooks, _proxy_server = load_hook_module()

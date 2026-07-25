@@ -51,10 +51,38 @@ typealias RuntimeSettingsSaveHandler = (
 final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     static let retainExistingValue = "__LITELLM_MENU_RETAIN_EXISTING__"
 
+    final class FormCategorySection {
+        let category: String
+        let itemKeys: [String]
+        let view: NSStackView
+        let heading: NSTextField
+        let body: NSStackView
+        let rows: [NSView]
+        var columns: [NSStackView] = []
+        var layoutConstraints: [NSLayoutConstraint] = []
+        var columnCount = 0
+        var arrangedRowColumnIndices: [Int] = []
+
+        init(
+            category: String,
+            itemKeys: [String],
+            view: NSStackView,
+            heading: NSTextField,
+            body: NSStackView,
+            rows: [NSView]
+        ) {
+            self.category = category
+            self.itemKeys = itemKeys
+            self.view = view
+            self.heading = heading
+            self.body = body
+            self.rows = rows
+        }
+    }
+
     var didStopModal = false
     var result: [String: String]?
     let settings: [RuntimeSettingItem]
-    let serviceRunning: Bool
     let saveHandler: RuntimeSettingsSaveHandler?
     var fields: [String: NSView] = [:]
     var sensitiveClearButtons: [String: NSButton] = [:]
@@ -64,21 +92,27 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
     var closeButton: NSButton!
     var resetButton: NSButton!
     var window: NSPanel!
+    var settingsScrollView: NSScrollView!
+    var formContainer: FlippedDocumentView!
+    var formContentStack: NSStackView!
+    var formLayoutConstraints: [NSLayoutConstraint] = []
+    var formCategorySections: [FormCategorySection] = []
     var initialValues: [String: String] = [:]
     var dirtyKeys: Set<String> = []
     var saveInFlight = false
-    let labelColumnWidth: CGFloat = 155
-    let actionColumnWidth: CGFloat = 76
-    let unitColumnWidth: CGFloat = 70
+    let labelColumnWidth: CGFloat = 150
+    let valueColumnWidth: CGFloat = 180
+    let actionColumnWidth: CGFloat = 72
+    let unitColumnWidth: CGFloat = 60
     let formColumnSpacing: CGFloat = 8
+    let categoryColumnSpacing: CGFloat = 20
+    let twoColumnMinimumContentWidth: CGFloat = 960
 
     init(
         settings: [RuntimeSettingItem],
-        serviceRunning: Bool = true,
         saveHandler: RuntimeSettingsSaveHandler? = nil
     ) {
         self.settings = settings
-        self.serviceRunning = serviceRunning
         self.saveHandler = saveHandler
         super.init()
         buildWindow()
@@ -86,7 +120,7 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
 
     @discardableResult
     func runModal() -> [String: String]? {
-        NSApp.activate(ignoringOtherApps: true)
+        beginSettingsWindowPresentation(window)
         window.center()
         window.makeKeyAndOrderFront(nil)
         if let firstField {
@@ -94,6 +128,7 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
         }
         let response = NSApp.runModal(for: window)
         window.orderOut(nil)
+        endSettingsWindowPresentation(window)
         return response == .OK ? result : nil
     }
 
@@ -104,6 +139,14 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         requestClose()
         return false
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        refreshCategoryLayoutsIfNeeded()
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        refreshCategoryLayoutsIfNeeded(force: true)
     }
 
     @objc func applyAction(_ sender: Any?) {
@@ -121,7 +164,7 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
 
         setSaveInFlight(true)
         saveHandler(values) { [weak self] succeeded, message in
-            DispatchQueue.main.async {
+            performOnMainRunLoop {
                 guard let self, self.saveInFlight else { return }
                 if succeeded {
                     self.showSaveSuccess(message: message) {
@@ -150,6 +193,21 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
             guard response == .alertFirstButtonReturn else { return }
             self?.restoreDefaults()
         }
+    }
+
+    @discardableResult
+    func stageImportedValues(_ values: [String: String]) -> Bool {
+        let unknown = Set(values.keys).subtracting(Set(settings.map(\.key)))
+        guard unknown.isEmpty else {
+            showAlert(title: "Runtime settings import failed", message: "The package contains unsupported settings.")
+            return false
+        }
+        for item in settings {
+            guard let value = values[item.key] else { continue }
+            setValue(value, for: item, explicitlyClearingSensitiveValue: value.isEmpty)
+        }
+        refreshDirtyState()
+        return true
     }
 
     func restoreDefaults() {
@@ -238,14 +296,11 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
     }
 
     var saveButtonTitle: String {
-        serviceRunning ? "Save & Restart" : "Save"
+        "Save & Apply"
     }
 
     var subtitleText: String {
-        if serviceRunning {
-            return "Saving these runtime defaults restarts the LiteLLM service."
-        }
-        return "These runtime defaults take effect the next time the LiteLLM service starts."
+        "Saving these runtime defaults applies them to the LiteLLM service."
     }
 
     func isSensitiveSetting(_ item: RuntimeSettingItem) -> Bool {
@@ -534,20 +589,29 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
 
     func buildWindow() {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 1080, height: 620),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
         panel.title = "Runtime Settings"
         panel.minSize = NSSize(width: 760, height: 500)
+        panel.maxSize = NSSize(width: 1160, height: CGFloat.greatestFiniteMagnitude)
         panel.isReleasedWhenClosed = false
         panel.delegate = self
         panel.animationBehavior = .none
         window = panel
 
-        let content = NSView()
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 1080, height: 620))
+        content.autoresizingMask = [.width, .height]
+        content.translatesAutoresizingMaskIntoConstraints = true
         panel.contentView = content
+        if let contentLayoutGuide = panel.contentLayoutGuide as? NSLayoutGuide {
+            NSLayoutConstraint.activate([
+                content.widthAnchor.constraint(equalTo: contentLayoutGuide.widthAnchor),
+                content.heightAnchor.constraint(equalTo: contentLayoutGuide.heightAnchor),
+            ])
+        }
 
         let titleLabel = NSTextField(labelWithString: "Runtime Settings")
         titleLabel.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
@@ -563,49 +627,39 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
         scrollView.hasHorizontalScroller = false
         scrollView.borderType = .bezelBorder
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        settingsScrollView = scrollView
 
         let formContainer = FlippedDocumentView()
         formContainer.translatesAutoresizingMaskIntoConstraints = false
-        let formStack = NSStackView()
-        formStack.orientation = .vertical
-        formStack.spacing = 8
-        formStack.alignment = .width
-        formStack.translatesAutoresizingMaskIntoConstraints = false
-        formStack.setContentHuggingPriority(.required, for: .vertical)
-        formStack.setContentCompressionResistancePriority(.required, for: .vertical)
-        formContainer.addSubview(formStack)
+        self.formContainer = formContainer
+        let formContentStack = NSStackView()
+        formContentStack.orientation = .vertical
+        formContentStack.spacing = 12
+        formContentStack.alignment = .width
+        formContentStack.distribution = .fill
+        formContentStack.translatesAutoresizingMaskIntoConstraints = false
+        formContentStack.setContentHuggingPriority(.required, for: .vertical)
+        formContentStack.setContentCompressionResistancePriority(.required, for: .vertical)
+        self.formContentStack = formContentStack
         scrollView.documentView = formContainer
+        buildFormCategorySections()
 
-        var currentCategory: String?
-        for item in settings {
-            if currentCategory != item.category {
-                currentCategory = item.category
-                let label = NSTextField(labelWithString: item.category)
-                label.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-                label.alignment = .left
-                label.textColor = .labelColor
-                label.setContentHuggingPriority(.required, for: .horizontal)
-                label.setContentCompressionResistancePriority(.required, for: .horizontal)
-                label.translatesAutoresizingMaskIntoConstraints = false
-                if #available(macOS 26.0, *) {
-                    label.setAccessibilityRole(NSAccessibility.Role(rawValue: "AXHeading"))
-                }
-                formStack.addArrangedSubview(label)
-            }
-            formStack.addArrangedSubview(formRow(item))
-        }
-
-        for arrangedSubview in formStack.arrangedSubviews {
-            arrangedSubview.widthAnchor.constraint(equalTo: formStack.widthAnchor).isActive = true
-        }
+        let formDocumentStack = NSStackView()
+        formDocumentStack.orientation = .vertical
+        formDocumentStack.alignment = .width
+        formDocumentStack.distribution = .fill
+        formDocumentStack.spacing = 0
+        formDocumentStack.translatesAutoresizingMaskIntoConstraints = false
+        formContainer.addSubview(formDocumentStack)
+        formDocumentStack.addArrangedSubview(formContentStack)
 
         NSLayoutConstraint.activate([
             formContainer.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
             formContainer.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
-            formStack.leadingAnchor.constraint(equalTo: formContainer.leadingAnchor, constant: 12),
-            formStack.trailingAnchor.constraint(equalTo: formContainer.trailingAnchor, constant: -12),
-            formStack.topAnchor.constraint(equalTo: formContainer.topAnchor, constant: 10),
-            formStack.bottomAnchor.constraint(equalTo: formContainer.bottomAnchor, constant: -10),
+            formDocumentStack.leadingAnchor.constraint(equalTo: formContainer.leadingAnchor, constant: 16),
+            formDocumentStack.trailingAnchor.constraint(equalTo: formContainer.trailingAnchor, constant: -16),
+            formDocumentStack.topAnchor.constraint(equalTo: formContainer.topAnchor, constant: 14),
+            formDocumentStack.bottomAnchor.constraint(equalTo: formContainer.bottomAnchor, constant: -14),
         ])
 
         resetButton = NSButton(title: "Restore Defaults…", target: self, action: #selector(resetAction(_:)))
@@ -663,8 +717,211 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
             closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 92),
         ])
 
+        content.layoutSubtreeIfNeeded()
+        refreshCategoryLayoutsIfNeeded(force: true)
         initialValues = currentValues()
         refreshDirtyState()
+    }
+
+    var formCategoryColumnCounts: [Int] {
+        formCategorySections.map(\.columnCount)
+    }
+
+    func buildFormCategorySections() {
+        var groups: [(category: String, items: [RuntimeSettingItem])] = []
+        for item in settings {
+            if let index = groups.firstIndex(where: { $0.category == item.category }) {
+                groups[index].items.append(item)
+            } else {
+                groups.append((category: item.category, items: [item]))
+            }
+        }
+
+        formCategorySections = groups.enumerated().map { index, group in
+            let section = NSStackView()
+            section.orientation = .vertical
+            section.spacing = 7
+            section.alignment = .width
+            section.distribution = .fill
+            section.translatesAutoresizingMaskIntoConstraints = false
+            section.identifier = NSUserInterfaceItemIdentifier("RuntimeSettingsSection.\(index)")
+            section.setContentHuggingPriority(.required, for: .vertical)
+            section.setContentCompressionResistancePriority(.required, for: .vertical)
+
+            let headingContainer = NSView()
+            headingContainer.translatesAutoresizingMaskIntoConstraints = false
+            headingContainer.identifier = NSUserInterfaceItemIdentifier(
+                "RuntimeSettingsHeadingContainer.\(index)"
+            )
+            headingContainer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            headingContainer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+            let label = NSTextField(labelWithString: group.category)
+            label.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+            label.alignment = .left
+            label.textColor = .labelColor
+            label.setContentHuggingPriority(.required, for: .horizontal)
+            label.setContentCompressionResistancePriority(.required, for: .horizontal)
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.identifier = NSUserInterfaceItemIdentifier("RuntimeSettingsHeading.\(index)")
+            if #available(macOS 26.0, *) {
+                label.setAccessibilityRole(NSAccessibility.Role(rawValue: "AXHeading"))
+            }
+            headingContainer.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: headingContainer.leadingAnchor),
+                label.topAnchor.constraint(equalTo: headingContainer.topAnchor),
+                label.bottomAnchor.constraint(equalTo: headingContainer.bottomAnchor),
+            ])
+            section.addArrangedSubview(headingContainer)
+            let body = NSStackView()
+            body.orientation = .vertical
+            body.spacing = 8
+            body.alignment = .width
+            body.distribution = .fill
+            body.translatesAutoresizingMaskIntoConstraints = false
+            body.identifier = NSUserInterfaceItemIdentifier("RuntimeSettingsSectionBody.\(index)")
+            section.addArrangedSubview(body)
+            let rows = group.items.map(formRow)
+            let categorySection = FormCategorySection(
+                category: group.category,
+                itemKeys: group.items.map(\.key),
+                view: section,
+                heading: label,
+                body: body,
+                rows: rows
+            )
+            installCategoryLayout(categorySection, columns: 1)
+            return categorySection
+        }
+        for section in formCategorySections {
+            formContentStack.addArrangedSubview(section.view)
+            formLayoutConstraints.append(contentsOf: [
+                section.view.leadingAnchor.constraint(equalTo: formContentStack.leadingAnchor),
+                section.view.trailingAnchor.constraint(equalTo: formContentStack.trailingAnchor),
+            ])
+        }
+        NSLayoutConstraint.activate(formLayoutConstraints)
+    }
+
+    func desiredColumnCount(for section: FormCategorySection) -> Int {
+        guard section.rows.count > 1 else { return 1 }
+        let contentWidth = window.contentView?.bounds.width ?? 0
+        return contentWidth >= twoColumnMinimumContentWidth ? 2 : 1
+    }
+
+    func makeFormColumn(index: Int) -> NSStackView {
+        let column = NSStackView()
+        column.orientation = .vertical
+        column.spacing = 8
+        column.alignment = .width
+        column.distribution = .fill
+        column.translatesAutoresizingMaskIntoConstraints = false
+        column.identifier = NSUserInterfaceItemIdentifier("RuntimeSettingsColumn.\(index)")
+        column.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        column.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        column.setContentHuggingPriority(.required, for: .vertical)
+        column.setContentCompressionResistancePriority(.required, for: .vertical)
+        return column
+    }
+
+    func addBottomSpacer(to column: NSStackView) {
+        // A horizontal category body takes the height of its taller column.  Without an
+        // expendable arranged view, NSStackView can assign that surplus to the first
+        // real row in the shorter column, which leaves a conspicuous blank hole above
+        // its control.  Keep the rows compact and put surplus only after the last row.
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.identifier = NSUserInterfaceItemIdentifier("RuntimeSettingsColumnBottomSpacer")
+        spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        column.addArrangedSubview(spacer)
+    }
+
+    func installRow(_ row: NSView, in column: NSStackView, constraints: inout [NSLayoutConstraint]) {
+        column.addArrangedSubview(row)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        constraints += [
+            row.leadingAnchor.constraint(equalTo: column.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: column.trailingAnchor),
+            row.widthAnchor.constraint(equalTo: column.widthAnchor),
+        ]
+    }
+
+    func installCategoryLayout(_ section: FormCategorySection, columns: Int) {
+        NSLayoutConstraint.deactivate(section.layoutConstraints)
+        section.layoutConstraints.removeAll()
+        for view in section.body.arrangedSubviews {
+            section.body.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        for column in section.columns {
+            column.removeFromSuperview()
+        }
+
+        let columnCount = min(columns, section.rows.count)
+        let columns = (0..<columnCount).map(makeFormColumn)
+        var rowColumnIndices: [Int] = []
+        if columnCount == 1 {
+            section.body.orientation = .vertical
+            section.body.alignment = .width
+            section.body.distribution = .fill
+            section.body.spacing = 8
+            let column = columns[0]
+            section.body.addArrangedSubview(column)
+            section.layoutConstraints += [
+                column.leadingAnchor.constraint(equalTo: section.body.leadingAnchor),
+                column.trailingAnchor.constraint(equalTo: section.body.trailingAnchor),
+            ]
+            for row in section.rows {
+                installRow(row, in: column, constraints: &section.layoutConstraints)
+                rowColumnIndices.append(0)
+            }
+        } else {
+            section.body.orientation = .horizontal
+            section.body.alignment = .top
+            section.body.distribution = .fillEqually
+            section.body.spacing = categoryColumnSpacing
+            let leftColumn = columns[0]
+            let rightColumn = columns[1]
+            section.body.addArrangedSubview(leftColumn)
+            section.body.addArrangedSubview(rightColumn)
+            section.layoutConstraints += [
+                leftColumn.widthAnchor.constraint(equalTo: rightColumn.widthAnchor),
+                leftColumn.leadingAnchor.constraint(equalTo: section.body.leadingAnchor),
+                rightColumn.trailingAnchor.constraint(equalTo: section.body.trailingAnchor),
+            ]
+            let split = Int(ceil(Double(section.rows.count) / 2))
+            for (index, row) in section.rows.enumerated() {
+                let columnIndex = index < split ? 0 : 1
+                let column = columns[columnIndex]
+                installRow(row, in: column, constraints: &section.layoutConstraints)
+                rowColumnIndices.append(columnIndex)
+            }
+            addBottomSpacer(to: leftColumn)
+            addBottomSpacer(to: rightColumn)
+        }
+        NSLayoutConstraint.activate(section.layoutConstraints)
+        section.columns = columns
+        section.columnCount = columnCount
+        section.arrangedRowColumnIndices = rowColumnIndices
+    }
+
+    func refreshCategoryLayoutsIfNeeded(force: Bool = false) {
+        guard formContentStack != nil else { return }
+        var didChange = false
+        for section in formCategorySections {
+            let columns = desiredColumnCount(for: section)
+            if force || section.columnCount != columns {
+                installCategoryLayout(section, columns: columns)
+                didChange = true
+            }
+        }
+        guard didChange else { return }
+        formContainer.invalidateIntrinsicContentSize()
+        formContentStack.invalidateIntrinsicContentSize()
+        window.contentView?.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
     }
 
     func settingsSpacer() -> NSView {
@@ -710,6 +967,8 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
         unitView.textColor = .secondaryLabelColor
         unitView.translatesAutoresizingMaskIntoConstraints = false
         unitView.identifier = NSUserInterfaceItemIdentifier("RuntimeSettingsUnit.\(item.key)")
+        unitView.setContentHuggingPriority(.required, for: .horizontal)
+        unitView.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         for view in [labelView, valueSlot, actionSlot, unitView] {
             inputRow.addSubview(view)
@@ -717,7 +976,10 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
         valueSlot.addSubview(control)
 
         NSLayoutConstraint.activate([
-            inputRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 26),
+            // A setting control is a single compact line.  Keep this fixed so a
+            // shorter wide-column cannot absorb its sibling column's extra height
+            // around the popup/text field.
+            inputRow.heightAnchor.constraint(equalToConstant: 26),
 
             labelView.leadingAnchor.constraint(equalTo: inputRow.leadingAnchor),
             labelView.widthAnchor.constraint(equalToConstant: labelColumnWidth),
@@ -727,24 +989,25 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
                 equalTo: labelView.trailingAnchor,
                 constant: formColumnSpacing
             ),
+            valueSlot.widthAnchor.constraint(equalToConstant: valueColumnWidth),
             valueSlot.topAnchor.constraint(equalTo: inputRow.topAnchor),
             valueSlot.bottomAnchor.constraint(equalTo: inputRow.bottomAnchor),
 
-            actionSlot.leadingAnchor.constraint(
+            unitView.leadingAnchor.constraint(
                 equalTo: valueSlot.trailingAnchor,
+                constant: formColumnSpacing
+            ),
+            unitView.widthAnchor.constraint(equalToConstant: unitColumnWidth),
+            unitView.centerYAnchor.constraint(equalTo: inputRow.centerYAnchor),
+
+            actionSlot.leadingAnchor.constraint(
+                equalTo: unitView.trailingAnchor,
                 constant: formColumnSpacing
             ),
             actionSlot.widthAnchor.constraint(equalToConstant: actionColumnWidth),
             actionSlot.topAnchor.constraint(equalTo: inputRow.topAnchor),
             actionSlot.bottomAnchor.constraint(equalTo: inputRow.bottomAnchor),
-
-            unitView.leadingAnchor.constraint(
-                equalTo: actionSlot.trailingAnchor,
-                constant: formColumnSpacing
-            ),
-            unitView.trailingAnchor.constraint(equalTo: inputRow.trailingAnchor),
-            unitView.widthAnchor.constraint(equalToConstant: unitColumnWidth),
-            unitView.centerYAnchor.constraint(equalTo: inputRow.centerYAnchor),
+            actionSlot.trailingAnchor.constraint(equalTo: inputRow.trailingAnchor),
 
             control.leadingAnchor.constraint(equalTo: valueSlot.leadingAnchor),
             control.centerYAnchor.constraint(equalTo: valueSlot.centerYAnchor),
@@ -782,6 +1045,7 @@ final class RuntimeSettingsDialogController: NSObject, NSWindowDelegate, NSTextF
         tipView.lineBreakMode = .byWordWrapping
         tipView.maximumNumberOfLines = 0
         tipView.translatesAutoresizingMaskIntoConstraints = false
+        tipView.setContentHuggingPriority(.required, for: .vertical)
         tipView.setContentCompressionResistancePriority(.required, for: .vertical)
         tipView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         tipView.toolTip = tipView.stringValue

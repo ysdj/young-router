@@ -3,6 +3,10 @@ import Cocoa
 let inlineStatusLimit = 180
 let alertMessageLimit = 420
 
+func shellQuoted(_ value: String) -> String {
+    "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+}
+
 func singleLineDisplayText(_ value: String) -> String {
     value
         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -125,8 +129,6 @@ struct EditableModel: Codable, Equatable {
     var sslVerify: String
     var sslVerifyPresent: Bool
     var deploymentToken: String
-    var supportsVision: Bool
-    var supportsVisionPresent: Bool
     var supportsImageGeneration: Bool
     var supportsImageGenerationPresent: Bool
     var upstreamApiMode: String
@@ -149,8 +151,6 @@ struct EditableModel: Codable, Equatable {
         case sslVerify = "ssl_verify"
         case sslVerifyPresent = "ssl_verify_present"
         case deploymentToken = "deployment_id"
-        case supportsVision = "supports_vision"
-        case supportsVisionPresent = "supports_vision_present"
         case supportsImageGeneration = "supports_responses_image_generation_tool"
         case supportsImageGenerationPresent = "supports_responses_image_generation_tool_present"
         case upstreamApiMode = "upstream_url_surface"
@@ -174,8 +174,6 @@ struct EditableModel: Codable, Equatable {
             sslVerify: "",
             sslVerifyPresent: false,
             deploymentToken: "",
-            supportsVision: true,
-            supportsVisionPresent: true,
             supportsImageGeneration: false,
             supportsImageGenerationPresent: false,
             upstreamApiMode: "openai/responses",
@@ -199,8 +197,6 @@ struct EditableModel: Codable, Equatable {
         sslVerify: String,
         sslVerifyPresent: Bool,
         deploymentToken: String,
-        supportsVision: Bool,
-        supportsVisionPresent: Bool,
         supportsImageGeneration: Bool,
         supportsImageGenerationPresent: Bool,
         upstreamApiMode: String,
@@ -221,8 +217,6 @@ struct EditableModel: Codable, Equatable {
         self.sslVerify = sslVerify
         self.sslVerifyPresent = sslVerifyPresent
         self.deploymentToken = deploymentToken
-        self.supportsVision = supportsVision
-        self.supportsVisionPresent = supportsVisionPresent
         self.supportsImageGeneration = supportsImageGeneration
         self.supportsImageGenerationPresent = supportsImageGenerationPresent
         self.upstreamApiMode = upstreamApiMode
@@ -247,8 +241,6 @@ struct EditableModel: Codable, Equatable {
             sslVerify: try container.decodeIfPresent(String.self, forKey: .sslVerify) ?? "",
             sslVerifyPresent: try container.decodeIfPresent(Bool.self, forKey: .sslVerifyPresent) ?? false,
             deploymentToken: try container.decodeIfPresent(String.self, forKey: .deploymentToken) ?? "",
-            supportsVision: try container.decodeIfPresent(Bool.self, forKey: .supportsVision) ?? true,
-            supportsVisionPresent: try container.decodeIfPresent(Bool.self, forKey: .supportsVisionPresent) ?? true,
             supportsImageGeneration: try container.decodeIfPresent(Bool.self, forKey: .supportsImageGeneration) ?? false,
             supportsImageGenerationPresent: try container.decodeIfPresent(Bool.self, forKey: .supportsImageGenerationPresent) ?? false,
             upstreamApiMode: try container.decode(String.self, forKey: .upstreamApiMode),
@@ -280,17 +272,15 @@ struct EditableModel: Codable, Equatable {
 struct EditableProviderKey: Codable, Equatable {
     var name: String
     var value: String
-    var enabled: Bool
     var editorID = UUID()
 
     enum CodingKeys: String, CodingKey {
         case name
         case value
-        case enabled
     }
 
     static func blank() -> EditableProviderKey {
-        EditableProviderKey(name: "default", value: "", enabled: true)
+        EditableProviderKey(name: "default", value: "")
     }
 
     var displayName: String {
@@ -345,16 +335,164 @@ struct EditableProvider: Codable, Equatable {
 struct ConfigEditorLoadPayload: Codable {
     var providers: [EditableProvider]
     var revision: JSONValue?
+    var document: ConfigEditorDocument?
+}
+
+struct ConfigEditorDocument: Codable, Equatable {
+    var config: String
+    var disabledModels: String?
+
+    enum CodingKeys: String, CodingKey {
+        case config
+        case disabledModels = "disabled"
+    }
 }
 
 struct ConfigEditorSavePayload: Codable {
     var providers: [EditableProvider]
     var expectedRevision: JSONValue?
+    var document: ConfigEditorDocument?
 
     enum CodingKeys: String, CodingKey {
         case providers
         case expectedRevision = "expected_revision"
+        case document
     }
+}
+
+struct ConfigurationPackageProvidersModelsPayload: Codable {
+    var providers: [EditableProvider]
+    var document: ConfigEditorDocument
+}
+
+struct ConfigurationPackageRuntimeSettingsPayload: Codable {
+    var values: [String: String]
+}
+
+struct ConfigurationPackageImportPayload: Codable {
+    var sections: [String]
+    var runtimeSettings: ConfigurationPackageRuntimeSettingsPayload?
+    var providersModels: ConfigurationPackageProvidersModelsPayload?
+
+    enum CodingKeys: String, CodingKey {
+        case sections
+        case runtimeSettings = "runtime_settings"
+        case providersModels = "providers_models"
+    }
+}
+
+struct ExternalProviderImportPayload: Codable {
+    var providers: [EditableProvider]
+    var source: String
+    var summary: ExternalProviderImportSummary
+}
+
+struct ExternalProviderImportSummary: Codable {
+    var providers: Int
+    var models: Int
+}
+
+struct ProviderBillingPayload: Codable {
+    var generatedAt: String
+    var providers: [ProviderBillingProvider]
+    var summary: ProviderBillingSummary
+    var status: String?
+    var detail: String?
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case providers
+        case summary
+        case status
+        case detail
+    }
+}
+
+struct ProviderBillingSummary: Codable {
+    var providers: Int
+    var models: Int
+    var availableModels: Int
+    var unavailableModels: Int
+
+    enum CodingKeys: String, CodingKey {
+        case providers
+        case models
+        case availableModels = "available_models"
+        case unavailableModels = "unavailable_models"
+    }
+}
+
+struct ProviderBillingProvider: Codable {
+    var name: String
+    var status: String
+    var accounts: [ProviderBillingAccount]
+    var models: [ProviderBillingModel]
+}
+
+struct ProviderBillingAccount: Codable {
+    var status: String
+    var detail: String
+    var source: String?
+    var balance: ProviderBillingAmount?
+    var usage: ProviderBillingUsage?
+    var group: String?
+    var mode: String?
+    var multiplier: ProviderBillingMultiplier
+    var models: [ProviderBillingModelIdentity]
+}
+
+struct ProviderBillingModelIdentity: Codable {
+    var name: String
+    var upstreamModel: String
+    var deploymentID: String
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case upstreamModel = "upstream_model"
+        case deploymentID = "deployment_id"
+    }
+}
+
+struct ProviderBillingModel: Codable {
+    var name: String
+    var upstreamModel: String
+    var deploymentID: String
+    var status: String
+    var detail: String
+    var source: String?
+    var balance: ProviderBillingAmount?
+    var usage: ProviderBillingUsage?
+    var multiplier: ProviderBillingMultiplier
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case upstreamModel = "upstream_model"
+        case deploymentID = "deployment_id"
+        case status
+        case detail
+        case source
+        case balance
+        case usage
+        case multiplier
+    }
+}
+
+struct ProviderBillingAmount: Codable {
+    var kind: String
+    var value: Double
+    var unit: String
+}
+
+struct ProviderBillingUsage: Codable {
+    var used: Double
+    var limit: Double
+    var unit: String
+}
+
+struct ProviderBillingMultiplier: Codable {
+    var status: String
+    var value: Double?
+    var detail: String
 }
 
 struct ConfigEditorSaveResult: Codable {

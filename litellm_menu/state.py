@@ -238,8 +238,40 @@ def _upsert_route_recovery_state(record: dict[str, Any]) -> None:
         merged["key"] = key
         merged["status"] = str(merged.get("status") or "polling")
         merged["started_at"] = existing.get("started_at") or merged.get("started_at") or now
+        merged["heartbeat_at"] = now
         merged["updated_at"] = now
         recoveries[key] = merged
+        payload["updated_at"] = now
+
+    try:
+        _locked_json_state_update(path, update)
+    except Exception:
+        pass
+
+
+def _touch_route_recovery_state(key: str) -> None:
+    path = _route_recovery_state_file_path()
+    safe_key = _safe_log_text(key, limit=240)
+    if not path or not safe_key:
+        return
+    now = _utc_now_iso()
+
+    def update(payload: dict[str, Any]) -> None:
+        recoveries = payload.setdefault("recoveries", {})
+        if not isinstance(recoveries, dict):
+            return
+        existing = recoveries.get(safe_key)
+        if not isinstance(existing, dict):
+            return
+        existing["heartbeat_at"] = now
+        existing["updated_at"] = now
+        cooldown_until = existing.get("cooldown_until")
+        try:
+            remaining = max(0.0, float(cooldown_until) - time.time())
+        except (TypeError, ValueError):
+            remaining = None
+        if remaining is not None:
+            existing["cooldown_remaining_seconds"] = round(remaining, 3)
         payload["updated_at"] = now
 
     try:

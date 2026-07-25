@@ -14,12 +14,22 @@ HELPER = ROOT / "mac_menu" / "Sources" / "ProbeProtocolOrder.swift"
 HARNESS = r'''
 import Foundation
 
-let priority = ["openai/responses", "openai/chat", "anthropic"]
-let available = Array(CommandLine.arguments.dropFirst())
+let arguments = Array(CommandLine.arguments.dropFirst())
+let modelIdentifier = arguments.first ?? ""
+let defaultPriority = ["openai/responses", "openai/chat", "anthropic"]
+let priority = probeProtocolPriority(
+    modelIdentifier: modelIdentifier,
+    defaultPriority: defaultPriority
+)
+let available = Array(arguments.dropFirst())
 let recommendation = probeProtocolRecommendation(
     priority: priority,
     availableModes: available
 )
+print(inferredPreferredUpstreamApiMode(
+    modelIdentifier: modelIdentifier,
+    defaultMode: defaultPriority[0]
+))
 print(recommendation.supported.joined(separator: ","))
 print(recommendation.displayOrder.joined(separator: ","))
 '''
@@ -47,9 +57,11 @@ class ProbeProtocolOrderSwiftTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.temp.cleanup()
 
-    def recommendation(self, *available: str) -> tuple[list[str], list[str]]:
+    def recommendation(
+        self, model_identifier: str, *available: str
+    ) -> tuple[str, list[str], list[str]]:
         result = subprocess.run(
-            [str(self.binary), *available],
+            [str(self.binary), model_identifier, *available],
             cwd=ROOT,
             text=True,
             capture_output=True,
@@ -57,29 +69,68 @@ class ProbeProtocolOrderSwiftTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
         return (
-            lines[0].split(",") if lines[0] else [],
+            lines[0],
             lines[1].split(",") if lines[1] else [],
+            lines[2].split(",") if lines[2] else [],
         )
 
-    def test_all_available_protocols_are_saved_in_fallback_priority(self) -> None:
-        supported, display_order = self.recommendation(
+    def test_all_available_protocols_select_only_the_best_protocol(self) -> None:
+        inferred, supported, display_order = self.recommendation(
+            "generic-chat",
             "anthropic", "openai/chat", "openai/responses"
         )
+        self.assertEqual(inferred, "openai/responses")
+        self.assertEqual(supported, ["openai/responses"])
         self.assertEqual(
-            supported,
+            display_order,
             ["openai/responses", "openai/chat", "anthropic"],
         )
-        self.assertEqual(display_order, supported)
 
     def test_unavailable_protocols_follow_the_saved_fallbacks(self) -> None:
-        supported, display_order = self.recommendation("anthropic", "openai/chat")
-        self.assertEqual(supported, ["openai/chat", "anthropic"])
+        _, supported, display_order = self.recommendation(
+            "generic-chat", "anthropic", "openai/chat"
+        )
+        self.assertEqual(supported, ["openai/chat"])
         self.assertEqual(
             display_order,
             ["openai/chat", "anthropic", "openai/responses"],
         )
+
+    def test_claude_prefers_anthropic_when_multiple_protocols_are_available(self) -> None:
+        inferred, supported, display_order = self.recommendation(
+            "claude-example-5",
+            "openai/responses",
+            "openai/chat",
+            "anthropic",
+        )
+        self.assertEqual(inferred, "anthropic")
+        self.assertEqual(supported, ["anthropic"])
+        self.assertEqual(
+            display_order,
+            ["anthropic", "openai/responses", "openai/chat"],
+        )
+
+    def test_probe_availability_overrides_the_claude_name_hint(self) -> None:
+        inferred, supported, display_order = self.recommendation(
+            "anthropic.claude-example-v1",
+            "openai/responses",
+            "openai/chat",
+        )
+        self.assertEqual(inferred, "anthropic")
+        self.assertEqual(supported, ["openai/responses"])
+        self.assertEqual(
+            display_order,
+            ["openai/responses", "openai/chat", "anthropic"],
+        )
+
+    def test_claude_must_be_a_complete_model_identifier_token(self) -> None:
+        inferred, supported, _ = self.recommendation(
+            "notclaude-proxy", "anthropic", "openai/responses"
+        )
+        self.assertEqual(inferred, "openai/responses")
+        self.assertEqual(supported, ["openai/responses"])
 
 
 if __name__ == "__main__":

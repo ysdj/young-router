@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          brew install uv
+          uv venv --python 3.12 "$RUNNER_TEMP/litellm-menu-ci"
+          uv pip install --python "$RUNNER_TEMP/litellm-menu-ci/bin/python" "litellm[proxy]==$(tr -d '[:space:]' < LITELLM_VERSION)" PyYAML Pillow ddgs
+
+      - name: Run full test suite
+        env:
+          LITELLM_TEST_PYTHON: ${{ runner.temp }}/litellm-menu-ci/bin/python
+        run: ./scripts/test.sh
+
+      - name: Type-check Swift sources
+        run: |
+          swiftc \
+            -typecheck \
+            -target "$(uname -m)-apple-macosx13.0" \
+            mac_menu/Sources/*.swift \
+            -framework Cocoa
+
+      - name: Validate scripts and metadata
+        shell: bash
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/pycache
+        run: |
+          while IFS= read -r -d '' file; do
+            [[ -f "$file" ]] || continue
+            bash -n "$file"
+          done < <(git ls-files -z '*.sh')
+
+          while IFS= read -r -d '' file; do
+            [[ -f "$file" ]] || continue
+            zsh -n "$file"
+          done < <(git ls-files -z '*.zsh')
+
+          while IFS= read -r -d '' file; do
+            [[ -f "$file" ]] || continue
+            "$RUNNER_TEMP/litellm-menu-ci/bin/python" -m py_compile "$file"
+          done < <(git ls-files -z '*.py')
+
+          ruby -c Casks/litellm-menu.rb
+          brew style Casks/litellm-menu.rb
+
+          while IFS= read -r -d '' file; do
+            [[ -f "$file" ]] || continue
+            plutil -lint "$file"
+          done < <(git ls-files -z '*.plist')
+
+      - name: Build and verify temporary app bundle
+        env:
+          LITELLM_APP_PATH: ${{ runner.temp }}/LiteLLM Menu.app
+        run: |
+          ./mac_menu/build.sh
+          test -x "$LITELLM_APP_PATH/Contents/MacOS/LiteLLMMenu"
+          plutil -lint "$LITELLM_APP_PATH/Contents/Info.plist"
+          codesign --verify --deep --strict --verbose=2 "$LITELLM_APP_PATH"

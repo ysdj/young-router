@@ -4,13 +4,6 @@ from hook_test_utils import *
 
 
 class HookVisionBridgeTests(HookTestCase):
-    async def test_backend_compat_reads_legacy_mode(self) -> None:
-        hooks, _ = load_hook_module()
-        self.set_env("LITELLM_MENU_VISION_BRIDGE_BACKEND", None)
-        self.set_env("LITELLM_MENU_VISION_BRIDGE_MODE", "off")
-
-        self.assertEqual("off", hooks._bridge_backend())
-
     async def test_local_backend_reads_data_url_without_api(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env("LITELLM_MENU_VISION_BRIDGE_BACKEND", "local")

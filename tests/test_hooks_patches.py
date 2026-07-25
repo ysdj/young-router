@@ -223,10 +223,9 @@ class HookPatchTests(HookTestCase):
                 original_generic_function,
             )
 
-        sanitized = context.exception
-        self.assertIs(sanitized.__cause__, error)
-        self.assertEqual(getattr(sanitized, "status_code", None), 503)
-        self.assertIn("upstream auth or balance error", str(sanitized))
+        terminal = context.exception
+        self.assertIs(terminal, error)
+        self.assertEqual(getattr(terminal, "status_code", None), 403)
         self.assertTrue(seen["wrapped"])
         self.assertEqual(error.failed_deployment_id, "picked-deployment")
         self.assertIsNone(getattr(error, "failed_deployment_order", None))
@@ -262,6 +261,19 @@ class HookPatchTests(HookTestCase):
                 "call_id": "call_exec",
                 "output": "done",
             },
+            {
+                "type": "function_call",
+                "id": "item_function",
+                "call_id": "call_function",
+                "name": "wait",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "id": "item_function_output",
+                "call_id": "call_function",
+                "output": "done",
+            },
         ]
 
         async def original_generic_function(**kwargs):
@@ -276,10 +288,15 @@ class HookPatchTests(HookTestCase):
 
         self.assertEqual(response["input"][0]["id"], "ctc_exec")
         self.assertEqual(response["input"][1]["id"], "ctco_exec")
+        self.assertEqual(response["input"][2]["id"], "fc_item_function")
+        self.assertEqual(response["input"][3]["id"], "fco_item_function_output")
+        self.assertEqual(response["input"][2]["call_id"], "call_function")
+        self.assertEqual(response["input"][3]["call_id"], "call_function")
         self.assertEqual(original_input[0]["id"], "fc_exec")
+        self.assertEqual(original_input[2]["id"], "item_function")
         self.assertEqual(
             response["litellm_metadata"]["responses_custom_tool_item_ids_normalized"],
-            {"changed": True, "normalized_item_ids": 1},
+            {"changed": True, "normalized_item_ids": 3},
         )
 
     async def test_generic_helper_patch_retries_image_unsupported_with_vision_bridge(self) -> None:
@@ -1159,7 +1176,7 @@ class HookPatchTests(HookTestCase):
             },
         )
 
-    async def test_rate_limit_does_not_sweep_same_order_peer_fallback(self) -> None:
+    async def test_rate_limit_advances_to_same_order_peer_after_same_route_budget(self) -> None:
         hooks, _ = load_hook_module()
 
         class Router:
@@ -1186,7 +1203,15 @@ class HookPatchTests(HookTestCase):
             {"model": "runtime-model-alias"},
         )
 
-        self.assertIsNone(entry)
+        self.assertEqual(
+            entry,
+            {
+                "model": "runtime-model-alias",
+                "_target_order": 1,
+                "_excluded_deployment_ids": ["order1-a"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["order1-b"],
+            },
+        )
 
     async def test_routing_constraint_patch_filters_excluded_deployments_for_sync_route(self) -> None:
         hooks, _ = load_hook_module()

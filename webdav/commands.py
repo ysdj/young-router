@@ -1,7 +1,38 @@
 from __future__ import annotations
 
-from .core import *
-from .operations import *
+import argparse
+import json
+import pathlib
+import sys
+from typing import Any
+
+from .core import (
+    CONFIG_BUNDLE_MAX_BYTES,
+    Settings,
+    SyncError,
+    WebDAVClient,
+    WebDAVHTTPError,
+    _redact_url,
+    _settings_from_raw,
+    baseline_manifest,
+    build_manifest,
+    bundle_url,
+    collection_url,
+    default_config_yaml,
+    default_settings_file,
+    default_state_file,
+    load_settings,
+    manifest_url,
+    manifests_match,
+    save_settings,
+    save_sync_state,
+)
+from .operations import (
+    print_manifest_summary,
+    pull_bundle,
+    push_bundle,
+    read_remote_manifest,
+)
 
 def command_settings(args: argparse.Namespace) -> int:
     settings = load_settings(args.settings)
@@ -235,7 +266,9 @@ def command_probe(args: argparse.Namespace) -> int:
             print("Test did not upload a temporary file. Use Push or Sync to create the configured remote file.")
             return 0
         if exc.code in {403, 405, 501}:
-            bundle_data = client.get(remote_bundle_url)
+            bundle_data = client.get(
+                remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES
+            )
             print(f"WebDAV probe OK via configured remote file: {_redact_url(remote_bundle_url)}")
             print(f"Remote bundle HEAD unavailable: HTTP {exc.code}; verified with GET instead")
             print(f"Remote bundle GET: bytes={len(bundle_data)}")
@@ -290,5 +323,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-__all__ = [name for name in globals() if not name.startswith("__")]

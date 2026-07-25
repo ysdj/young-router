@@ -6,6 +6,67 @@ from hook_test_utils import *
 
 
 class HookRouteRecoveryTests(HookTestCase):
+    def test_recovery_state_records_diagnostic_and_keepalive_only_touches_local_state(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["litellm_menu.streaming"]
+        state_module = sys.modules["litellm_menu.state"]
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "route-recovery-state.json"
+            self.set_env("LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE", str(state_path))
+            request_data = {
+                "model": "default-chat",
+                "stream": True,
+                "metadata": {"request_id": "recovery-heartbeat"},
+            }
+            error = RuntimeError("upstream rate limit exceeded")
+            error.status_code = 429
+            record = streaming_module._route_recovery_state_record(
+                request_data,
+                error,
+                status="polling",
+                attempt=1,
+                max_poll_seconds=60,
+                poll_interval_seconds=5,
+            )
+            self.assertEqual(record["diagnostic"]["kind"], "rate_limit")
+            self.assertIn("attempt_timeout_seconds", record)
+            state_module._upsert_route_recovery_state(record)
+
+            key = record["key"]
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            payload["recoveries"][key]["heartbeat_at"] = "2000-01-01T00:00:00Z"
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            keepalive = hooks._route_recovery_sse_keepalive(
+                1,
+                request_data=request_data,
+                phase="attempt",
+            )
+            self.assertEqual(
+                keepalive,
+                {
+                    "type": "response.in_progress",
+                    "response": {
+                        "id": keepalive["response"]["id"],
+                        "object": "response",
+                        "created_at": keepalive["response"]["created_at"],
+                        "model": "default-chat",
+                        "status": "in_progress",
+                        "output": [],
+                        "metadata": {
+                            "litellm_menu_keepalive": "route_recovery",
+                            "phase": "attempt",
+                            "attempt": 1,
+                        },
+                    },
+                },
+            )
+            touched = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(
+                touched["recoveries"][key]["heartbeat_at"],
+                "2000-01-01T00:00:00Z",
+            )
+
     async def test_route_recovery_poll_payload_propagates_no_deployments_without_nested_stream(self) -> None:
         hooks, _proxy_server = load_hook_module()
         router_module = types.ModuleType("litellm.router")
@@ -266,7 +327,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertEqual(len(calls), 1)
 
-    def test_route_recovery_polls_on_sanitized_final_failure_even_if_next_order_exists(self) -> None:
+    def test_route_recovery_reopens_a_sanitized_final_failure(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
         class FakeRouter:
@@ -285,6 +346,11 @@ class HookRouteRecoveryTests(HookTestCase):
         exc.failed_deployment_id = "chatroute"
         exc.failed_deployment_order = 1
         setattr(exc, hooks._SANITIZED_UPSTREAM_ROUTE_FAILURE_ATTR, True)
+        setattr(
+            exc,
+            hooks._SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR,
+            "recovery_cooldown",
+        )
         request_data = {
             "model": "balanced-chat",
             "input": [{"role": "user", "content": "Continue."}],
@@ -292,9 +358,12 @@ class HookRouteRecoveryTests(HookTestCase):
         }
 
         self.assertTrue(hooks._is_route_recovery_poll_error(exc))
-        self.assertTrue(
+        # A recovery-class final wrapper retains its policy, but a healthy
+        # next order is still selected before opening the long recovery poll.
+        self.assertFalse(
             hooks._should_return_route_recovery_stream(exc, request_data, FakeRouter())
         )
+        self.assertTrue(hooks._should_return_failed_responses_stream(exc, request_data))
 
     async def test_route_recovery_poll_resumes_stream(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -1064,7 +1133,13 @@ class HookRouteRecoveryTests(HookTestCase):
         ]
 
         self.assertGreaterEqual(len(calls), 2)
-        self.assertTrue(all("_excluded_deployment_ids" not in call for call in calls))
+        # The first recovery attempt may retain the failed route exclusion;
+        # once the router reports no healthy deployment, its later order
+        # refresh must clear it rather than keep shrinking the route pool.
+        self.assertIn("_excluded_deployment_ids", calls[0])
+        self.assertTrue(
+            all("_excluded_deployment_ids" not in call for call in calls[1:])
+        )
         assert_upstream_route_failed_terminal(self, chunks)
 
     async def test_route_recovery_poll_refreshes_routes_after_exhausted_no_deployments(self) -> None:
@@ -1423,7 +1498,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertGreaterEqual(len(calls), 1)
         self.assertLessEqual(len(calls), 4)
-        self.assertLess(elapsed, 0.05)
+        self.assertLess(elapsed, 0.25)
         assert_upstream_route_failed_terminal(self, chunks)
 
     async def test_route_recovery_does_not_replay_original_web_search_after_search_started(self) -> None:

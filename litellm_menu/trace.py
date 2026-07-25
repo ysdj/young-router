@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from . import image_generation as _image_generation_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
@@ -26,13 +28,11 @@ from .base import (
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
     _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY,
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
-    _ROUTE_TRACE_ENV,
     _ROUTE_TRACE_LIST_SCAN_ITEMS,
     _ROUTE_TRACE_LOGGER,
     _ROUTE_TRACE_PREVIEW_CHARS_ENV,
     _ROUTE_TRACE_PREVIEW_DEFAULT_CHARS,
     _ROUTE_TRACE_PREVIEW_MAX_CHARS,
-    _ROUTE_TRACE_STATE_FILE_ENV,
     _STREAM_ERROR_FALLBACK_METADATA_KEY,
     _STREAM_FALLBACK_METADATA_KEY,
     _STREAM_IDLE_TIMEOUT_METADATA_KEY,
@@ -62,27 +62,6 @@ from .base import (
 def _route_trace_bool(value: Any) -> bool:
     value = str(value or "").strip().lower()
     return value in {"1", "true", "yes", "on", "debug"}
-
-
-def _route_trace_state_token(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    return text.splitlines()[0].strip()
-
-
-def _route_trace_enabled() -> bool:
-    state_file = os.getenv(_ROUTE_TRACE_STATE_FILE_ENV, "").strip()
-    if state_file:
-        try:
-            with open(state_file, "r", encoding="utf-8") as handle:
-                return _route_trace_bool(_route_trace_state_token(handle.read()))
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return False
-
-    return _route_trace_bool(os.getenv(_ROUTE_TRACE_ENV, ""))
 
 
 def _clean_trace_text(value: str, *, limit: int = 320) -> tuple[str, bool]:
@@ -909,6 +888,38 @@ def _trace_tool_call_arguments(item: dict[str, Any]) -> Any:
         return ""
     return value
 
+
+def _trace_tool_call_argument_keys(arguments: Any) -> list[str]:
+    if not isinstance(arguments, dict):
+        return []
+    return [
+        _sanitize_trace_text(str(key), limit=80)
+        for key in arguments.keys()
+        if isinstance(key, str) and key.strip()
+    ][:20]
+
+
+def _trace_tool_call_numeric_ranges(arguments: Any) -> dict[str, int | float]:
+    if not isinstance(arguments, dict):
+        return {}
+    ranges: dict[str, int | float] = {}
+    for key, value in arguments.items():
+        if not isinstance(key, str) or not re.search(
+            r"(?:line|offset|limit|start|end|count|length)",
+            key,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        try:
+            if not math.isfinite(float(value)):
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        ranges[_sanitize_trace_text(key, limit=80)] = value
+    return ranges
+
 def _trace_web_search_action(item: dict[str, Any]) -> dict[str, Any]:
     action = item.get("action")
     if not isinstance(action, dict):
@@ -957,6 +968,12 @@ def _trace_tool_call_item(item: Any) -> Optional[dict[str, Any]]:
     if isinstance(namespace, str) and namespace.strip():
         call["namespace"] = namespace.strip()
     arguments = _trace_tool_call_arguments(item)
+    argument_keys = _trace_tool_call_argument_keys(arguments)
+    if argument_keys:
+        call["argument_keys"] = argument_keys
+    numeric_ranges = _trace_tool_call_numeric_ranges(arguments)
+    if numeric_ranges:
+        call["numeric_ranges"] = numeric_ranges
     if arguments not in (None, "", {}, []):
         call["arguments_preview"] = _trace_limited_value(arguments, limit=260)
     web_action = _trace_web_search_action(item)
@@ -1073,10 +1090,8 @@ def _trace_response_summary(
 
 
 def _route_trace(event: str, **fields: Any) -> None:
-    if not _route_trace_enabled():
-        return
     try:
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
             "+00:00",
             "Z",
         )

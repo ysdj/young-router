@@ -1,6 +1,25 @@
 from __future__ import annotations
 
-from .core import *
+import json
+import pathlib
+from typing import Any
+
+from .core import (
+    CONFIG_BUNDLE_MAX_BYTES,
+    MANIFEST_MAX_BYTES,
+    Settings,
+    SyncError,
+    WebDAVClient,
+    WebDAVHTTPError,
+    _validate_bundle_header,
+    bundle_url,
+    collection_url,
+    create_bundle,
+    install_bundle,
+    manifest_url,
+    read_config_bundle,
+    save_sync_state,
+)
 
 def print_manifest_summary(prefix: str, manifest: dict[str, Any]) -> None:
     summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
@@ -12,7 +31,7 @@ def print_manifest_summary(prefix: str, manifest: dict[str, Any]) -> None:
     )
 
 
-def create_outbound_bundle(config_path: pathlib.Path, remote_bundle_url: str) -> tuple[bytes, dict[str, Any], str]:
+def create_outbound_bundle(config_path: pathlib.Path) -> tuple[bytes, dict[str, Any], str]:
     bundle_data, manifest = create_bundle(config_path)
     bundle_content_type = "application/json; charset=utf-8"
     return bundle_data, manifest, bundle_content_type
@@ -21,7 +40,9 @@ def create_outbound_bundle(config_path: pathlib.Path, remote_bundle_url: str) ->
 def read_remote_manifest(client: WebDAVClient, settings: Settings) -> dict[str, Any] | None:
     remote_manifest_url = manifest_url(settings)
     try:
-        remote_manifest = json.loads(client.get(remote_manifest_url).decode("utf-8"))
+        remote_manifest = json.loads(
+            client.get(remote_manifest_url, max_bytes=MANIFEST_MAX_BYTES).decode("utf-8")
+        )
     except WebDAVHTTPError as exc:
         if exc.code in {403, 404, 405, 500, 502, 503, 504}:
             try:
@@ -42,7 +63,9 @@ def read_remote_manifest(client: WebDAVClient, settings: Settings) -> dict[str, 
 def read_manifest_from_remote_bundle(client: WebDAVClient, settings: Settings) -> dict[str, Any]:
     remote_bundle_url = bundle_url(settings)
     try:
-        manifest, _files = _read_bundle(client.get(remote_bundle_url))
+        manifest, _files = read_config_bundle(
+            client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
+        )
     except WebDAVHTTPError:
         raise
     except SyncError:
@@ -61,7 +84,7 @@ def push_bundle(
     action: str = "push",
 ) -> tuple[int, dict[str, Any]]:
     remote_bundle_url = bundle_url(settings)
-    bundle_data, manifest, bundle_content_type = create_outbound_bundle(config_path, remote_bundle_url)
+    bundle_data, manifest, bundle_content_type = create_outbound_bundle(config_path)
     manifest_data = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
 
     client.try_mkcol(collection_url(settings))
@@ -84,10 +107,8 @@ def pull_bundle(
     action: str = "pull",
 ) -> dict[str, Any]:
     remote_bundle_url = bundle_url(settings)
-    bundle_data = client.get(remote_bundle_url)
+    bundle_data = client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
     result = install_bundle(bundle_data, config_path)
     if state_path is not None:
         save_sync_state(state_path, settings, result["manifest"], action)
     return result
-
-__all__ = [name for name in globals() if not name.startswith("__")]

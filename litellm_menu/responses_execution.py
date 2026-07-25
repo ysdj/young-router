@@ -15,6 +15,7 @@ from .base import (
     Optional,
     _GENERIC_HELPER_PATCH_ATTR,
     _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY,
+    _RouteOrder,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
@@ -575,6 +576,70 @@ async def _execute_responses_context_truncation_fallback(
     return response, retry_kwargs
 
 
+class _ResponsesContextTruncationStream:
+    """Keep completion metadata and close the source through the retry wrapper."""
+
+    def __init__(self, stream: Any, source: Any) -> None:
+        self._stream = stream
+        self._source = source
+        self._closed = False
+        self.completed_response = getattr(source, "completed_response", None)
+
+    def __aiter__(self) -> "_ResponsesContextTruncationStream":
+        return self
+
+    def _remember_completion(self, chunk: Any) -> None:
+        if (
+            _streaming_module._responses_stream_chunk_is_completed(chunk)
+            or _streaming_module._responses_stream_chunk_is_incomplete_terminal(chunk)
+        ):
+            # This chunk can come from a retry after the source stored an older
+            # failure. The delivered terminal event is authoritative.
+            dumped = _streaming_module._stream_chunk_dump(chunk)
+            response = dumped.get("response")
+            self.completed_response = response if response is not None else chunk
+            return
+        source_completed = getattr(self._source, "completed_response", None)
+        if source_completed is None:
+            return
+        source_response = getattr(source_completed, "response", None)
+        if source_response is None and isinstance(source_completed, dict):
+            source_response = source_completed.get("response")
+        self.completed_response = (
+            source_response if source_response is not None else source_completed
+        )
+
+    async def __anext__(self) -> Any:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            chunk = await self._stream.__anext__()
+        except StopAsyncIteration:
+            self._remember_completion(None)
+            await self.aclose()
+            raise
+        except Exception:
+            await self.aclose()
+            raise
+        self._remember_completion(chunk)
+        if (
+            _streaming_module._responses_stream_chunk_is_completed(chunk)
+            or _streaming_module._responses_stream_chunk_is_incomplete_terminal(chunk)
+        ):
+            # The terminal event is the protocol end-of-stream marker. Do not
+            # make the caller perform another read just to discover EOF.
+            await self.aclose()
+        return chunk
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await _streaming_module._close_async_iterator_safely(self._stream)
+        if self._source is not self._stream:
+            await _streaming_module._close_async_iterator_safely(self._source)
+
+
 def _with_responses_context_truncation_fallback_stream(
     response: Any,
     request_kwargs: dict,
@@ -615,8 +680,43 @@ def _with_responses_context_truncation_fallback_stream(
             if _image_generation_module._response_is_async_iterable(
                 fallback_response
             ):
-                async for fallback_chunk in fallback_response:
-                    yield fallback_chunk
+                fallback_visible_output = False
+                try:
+                    async for fallback_chunk in fallback_response:
+                        fallback_visible_output = (
+                            fallback_visible_output
+                            or _streaming_module._stream_chunk_has_visible_output(
+                                fallback_chunk
+                            )
+                        )
+                        if (
+                            _streaming_module._responses_completed_chunk_is_empty(
+                                fallback_chunk
+                            )
+                            and not fallback_visible_output
+                        ):
+                            raise _streaming_module._responses_incomplete_stream_exception(
+                                "response.completed without usable output",
+                                buffer=[fallback_chunk],
+                                request_data=_fallback_kwargs,
+                            )
+                        yield fallback_chunk
+                        if (
+                            _streaming_module._responses_stream_chunk_is_completed(
+                                fallback_chunk
+                            )
+                            or _streaming_module._responses_stream_chunk_is_incomplete_terminal(
+                                fallback_chunk
+                            )
+                        ):
+                            await _streaming_module._close_async_iterator_safely(
+                                fallback_response
+                            )
+                            return
+                finally:
+                    await _streaming_module._close_async_iterator_safely(
+                        fallback_response
+                    )
             else:
                 yield fallback_response
 
@@ -634,6 +734,22 @@ def _with_responses_context_truncation_fallback_stream(
                     return
 
                 buffered.append(chunk)
+                if _streaming_module._stream_chunk_has_visible_output(chunk):
+                    delivery_started = True
+                if (
+                    _streaming_module._responses_completed_chunk_is_empty(chunk)
+                    and not any(
+                        _streaming_module._stream_chunk_has_visible_output(
+                            buffered_chunk
+                        )
+                        for buffered_chunk in buffered
+                    )
+                ):
+                    raise _streaming_module._responses_incomplete_stream_exception(
+                        "response.completed without usable output",
+                        buffer=buffered,
+                        request_data=request_kwargs,
+                    )
                 if _streaming_module._responses_stream_chunk_is_incomplete_terminal(
                     chunk
                 ):
@@ -654,14 +770,41 @@ def _with_responses_context_truncation_fallback_stream(
                 if (
                     _streaming_module._stream_chunk_has_visible_output(chunk)
                     or _streaming_module._responses_stream_chunk_is_completed(chunk)
+                    or _streaming_module._responses_stream_chunk_is_incomplete_terminal(
+                        chunk
+                    )
                     or len(buffered) >= 20
                 ):
                     delivery_started = True
+                    terminal_in_buffer = any(
+                        _streaming_module._responses_stream_chunk_is_completed(
+                            buffered_chunk
+                        )
+                        or _streaming_module._responses_stream_chunk_is_incomplete_terminal(
+                            buffered_chunk
+                        )
+                        for buffered_chunk in buffered
+                    )
                     for buffered_chunk in buffered:
                         yield buffered_chunk
                     buffered.clear()
+                    if terminal_in_buffer:
+                        await _streaming_module._close_async_iterator_safely(response)
+                        return
                     async for remaining_chunk in response:
                         yield remaining_chunk
+                        if (
+                            _streaming_module._responses_stream_chunk_is_completed(
+                                remaining_chunk
+                            )
+                            or _streaming_module._responses_stream_chunk_is_incomplete_terminal(
+                                remaining_chunk
+                            )
+                        ):
+                            await _streaming_module._close_async_iterator_safely(
+                                response
+                            )
+                            return
                     return
         except Exception as exception:
             if (
@@ -677,7 +820,7 @@ def _with_responses_context_truncation_fallback_stream(
         for buffered_chunk in buffered:
             yield buffered_chunk
 
-    return guarded_stream()
+    return _ResponsesContextTruncationStream(guarded_stream(), response)
 
 
 def _responses_router_function() -> Optional[Any]:
@@ -1104,6 +1247,23 @@ def _wrap_generic_function_for_deployment_failover(
                 outer_request_kwargs=outer_request_kwargs,
             )
         except Exception as exc:
+            original_exception = exc
+            if _routing_module._is_context_size_error(original_exception):
+                # Context-size errors are deterministic input errors until the
+                # dedicated native truncation fallback chooses to repair them.
+                # They must never enter an unrelated protocol bridge.
+                context_truncation_fallback = (
+                    await _execute_responses_context_truncation_fallback(
+                        original_function,
+                        exc,
+                        kwargs,
+                        outer_request_kwargs=outer_request_kwargs,
+                    )
+                )
+                if context_truncation_fallback is not None:
+                    response, _retry_kwargs = context_truncation_fallback
+                    return response
+                raise original_exception
             context_truncation_fallback = (
                 await _execute_responses_context_truncation_fallback(
                     original_function,
@@ -1115,6 +1275,8 @@ def _wrap_generic_function_for_deployment_failover(
             if context_truncation_fallback is not None:
                 response, _retry_kwargs = context_truncation_fallback
                 return response
+            if _routing_module._is_context_size_error(original_exception):
+                raise original_exception
             responses_function_bridge_retry_kwargs = (
                 _responses_surfaces_module._responses_function_tool_bridge_retry_kwargs(
                     exc,
@@ -1211,6 +1373,11 @@ def _wrap_generic_function_for_deployment_failover(
                 _routing_module._is_priority_deployment_failover_error(exc)
                 and not _routing_module._should_retry_with_browser_compatible_headers(exc, kwargs)
             ):
+                # This wrapper has completed the selected deployment call. It
+                # is not the explicit retry loop, so its error must advance on
+                # the next router decision when the configured budget is zero.
+                if _routing_module._same_deployment_retries() <= 0:
+                    _routing_module._mark_same_deployment_retry_exhausted(exc)
                 _routing_module._mark_exception_for_deployment_failover(exc, kwargs)
                 if isinstance(outer_request_kwargs, dict):
                     _routing_module._sync_failed_deployment_exclusions(outer_request_kwargs, exc)
@@ -1255,7 +1422,7 @@ def _failed_deployment_route_key(exception: Exception) -> Optional[str]:
     return route_key if isinstance(route_key, str) and route_key.strip() else None
 
 
-def _failed_deployment_order(exception: Exception) -> Optional[int]:
+def _failed_deployment_order(exception: Exception) -> Optional[_RouteOrder]:
     return _routing_module._coerce_order(getattr(exception, "failed_deployment_order", None))
 
 
@@ -1459,17 +1626,6 @@ def _ordered_deployment_fallback_entry(
         )
         return None
 
-    if _routing_module._should_retry_same_deployment_before_fallback(exception):
-        _trace_module._route_trace(
-            "same_deployment_retry_fallback_suppressed",
-            request_id=_routing_module._trace_request_id(request_kwargs),
-            session=_routing_module._trace_session_context(request_kwargs),
-            model_group=_request_model_group(request_kwargs),
-            request=_trace_module._trace_request_summary(request_kwargs),
-            exception=_routing_module._trace_exception(exception),
-        )
-        return None
-
     is_image_tool_runtime_probe = (
         _tools_module._request_has_image_generation_tool(request_kwargs)
         and (
@@ -1516,11 +1672,18 @@ def _ordered_deployment_fallback_entry(
         exception
     )
     surface_fallback = (
-        None
-        if _routing_module._should_retry_same_deployment_before_fallback(exception)
-        else _routing_module._next_upstream_surface_for_failed_deployment(
+        _routing_module._next_upstream_surface_for_failed_deployment(
             router, exception, request_kwargs
         )
+        # A protocol incompatibility is a targeted compatibility repair, not
+        # an ordinary same-route retry. Try the deployment's next supported
+        # surface immediately; all other classes wait for their explicit
+        # same-route budget to be exhausted.
+        if (
+            _routing_module._is_upstream_surface_failover_error(exception)
+            or _routing_module._same_deployment_retry_exhausted(exception)
+        )
+        else None
     )
     if surface_fallback is not None:
         next_surface, target_deployment_id = surface_fallback

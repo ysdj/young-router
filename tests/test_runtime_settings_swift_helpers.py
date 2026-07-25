@@ -17,6 +17,7 @@ import Foundation
 let root = CommandLine.arguments[1]
 let environment = ["LITELLM_PORT": "4100"]
 print(localServicePort(runtimeRoot: root, environment: environment))
+print(shellQuoted("/tmp/LiteLLM Menu/user's app"))
 """
 
 
@@ -64,7 +65,22 @@ class RuntimeSettingsSwiftHelperTests(unittest.TestCase):
                 check=False,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        return result.stdout.strip()
+        return result.stdout.splitlines()[0]
+
+    def test_shell_quote_handles_spaces_and_single_quotes(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime:
+            result = subprocess.run(
+                [str(self.binary), runtime],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines()[1],
+            "'/tmp/LiteLLM Menu/user'\\''s app'",
+        )
 
     def test_saved_port_overrides_process_environment_like_service_loader(self) -> None:
         self.assertEqual(self.port_for("LITELLM_PORT=4200\n"), "4200")

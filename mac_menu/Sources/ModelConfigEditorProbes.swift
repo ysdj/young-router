@@ -6,12 +6,27 @@ extension ModelConfigEditorController {
             return
         }
         markProviderEditorDirty(for: obj.object)
+        if let field = obj.object as? NSTextField, field === providerApiBaseField {
+            autofillProviderNameFromBaseURL()
+        }
+        synchronizeLiveEditorDraft()
         markPendingChanges()
+    }
+
+    func synchronizeLiveEditorDraft() {
+        let wasRenderingSelection = isRenderingSelection
+        isRenderingSelection = true
+        commitEditor()
+        isRenderingSelection = wasRenderingSelection
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
         if isRenderingSelection {
             return
+        }
+        if let field = obj.object as? NSTextField,
+           field === providerApiBaseField || field === providerNameField {
+            providerNameAutofillProviderID = nil
         }
         markProviderEditorDirty(for: obj.object)
         commitEditor()
@@ -43,7 +58,6 @@ extension ModelConfigEditorController {
             } else {
                 modelTableView.reloadData()
             }
-            refreshRuntimeMap()
             return
         }
 
@@ -52,7 +66,6 @@ extension ModelConfigEditorController {
             modelIndex: currentModelIndex,
             providerKeyIndex: currentProviderKeyIndex
         )
-        refreshRuntimeMap()
     }
 
     @objc func modelApiKeySelectionChanged(_ sender: NSPopUpButton) {
@@ -71,7 +84,7 @@ extension ModelConfigEditorController {
         let modes = selectedSupportedUpstreamApiModes()
         if modes.isEmpty {
             sender.state = .on
-            setEditorStatus("At least one upstream protocol is required.", color: .systemOrange)
+            setEditorStatus("At least one upstream protocol is required.")
             return
         }
         setUpstreamApiSupportCheckboxes(modes)
@@ -149,8 +162,17 @@ extension ModelConfigEditorController {
                 refreshModelAvailabilityProbeControlsEnabled()
                 return
             }
+            refreshProviderBilling()
             let runID = UUID()
             modelAvailabilityProbeRuns[request.probeKey] = runID
+            setModelProbePresentation(
+                ModelProbePresentation(
+                    state: .probing,
+                    summary: "Probing...",
+                    detail: "Checking model info and supported upstream APIs."
+                ),
+                for: request
+            )
             refreshModelAvailabilityProbeControlsEnabled()
             runFullModelProbe(request: request, runID: runID, automatic: false)
         } catch {
@@ -158,9 +180,15 @@ extension ModelConfigEditorController {
         }
     }
 
-    func recommendedUpstreamApiModes(from results: [UpstreamApiProbeResult]) -> [String] {
+    func recommendedUpstreamApiModes(
+        from results: [UpstreamApiProbeResult],
+        modelIdentifier: String
+    ) -> [String] {
         probeProtocolRecommendation(
-            priority: upstreamApiModes,
+            priority: probeProtocolPriority(
+                modelIdentifier: modelIdentifier,
+                defaultPriority: upstreamApiModes
+            ),
             availableModes: results.filter { $0.isAvailable }.map { $0.mode }
         ).supported
     }
@@ -176,13 +204,30 @@ extension ModelConfigEditorController {
         }
     }
 
+    func presentProbeStatus(
+        _ summary: String,
+        detail: String,
+        state: ModelProbePresentation.State,
+        for request: ModelAvailabilityProbeRequest
+    ) {
+        setModelProbePresentation(
+            ModelProbePresentation(state: state, summary: summary, detail: detail),
+            for: request
+        )
+    }
+
     func runFullModelProbe(
         request: ModelAvailabilityProbeRequest,
         runID: UUID,
         automatic: Bool,
         completion: (() -> Void)? = nil
     ) {
-        setEditorStatus("Full probe: checking model info and all API protocols for \(request.upstreamModel)...")
+        presentProbeStatus(
+            "Probing \(request.upstreamModel)...",
+            detail: "Checking model info and supported upstream APIs.",
+            state: .probing,
+            for: request
+        )
         fetchLiteLLMModelInfoCapability(lookup: request.modelInfoLookup) { [weak self] result in
             guard let self else { return }
             guard self.modelAvailabilityProbeRuns[request.probeKey] == runID else { return }
@@ -220,6 +265,7 @@ extension ModelConfigEditorController {
         completion: (() -> Void)? = nil
     ) {
         modelAvailabilityProbeRuns.removeValue(forKey: request.probeKey)
+        reloadProbePresentationRows(for: request)
         refreshModelAvailabilityProbeControlsEnabled()
         completion?()
     }
@@ -252,7 +298,10 @@ extension ModelConfigEditorController {
                     self.finishFullModelProbe(request: request, completion: completion)
                     return
                 }
-                let recommended = self.recommendedUpstreamApiModes(from: results)
+                let recommended = self.recommendedUpstreamApiModes(
+                    from: results,
+                    modelIdentifier: request.upstreamModel
+                )
                 guard !recommended.isEmpty else {
                     let detail = ([preflightDetail] + results.map { $0.detail }).joined(separator: "\n\n")
                     let hasInconclusive = results.contains { $0.availability == .inconclusive }
@@ -261,7 +310,6 @@ extension ModelConfigEditorController {
                             request: request,
                             runID: runID,
                             preflightDetail: detail,
-                            knownImageModel: false,
                             completion: completion
                         )
                         return
@@ -274,9 +322,8 @@ extension ModelConfigEditorController {
                     return
                 }
                 if automatic {
-                    self.applyFullProbeSelection(
+                    self.applyRecommendedProtocolOrder(
                         recommended,
-                        recommendedOrder: recommended,
                         request: request,
                         details: results,
                         preflightDetail: preflightDetail
@@ -286,9 +333,11 @@ extension ModelConfigEditorController {
                         for: self.providers[request.providerIndex].models[request.modelIndex]
                     )
                     if currentModes == recommended {
-                        self.setEditorStatus(
-                            "Probe complete. Available protocols are already saved in fallback order.",
-                            tooltip: ([preflightDetail] + results.map { $0.detail }).joined(separator: "\n\n")
+                        self.presentProbeStatus(
+                            "Available",
+                            detail: ([preflightDetail] + results.map { $0.detail }).joined(separator: "\n\n"),
+                            state: .available,
+                            for: request
                         )
                     } else {
                         self.presentFullProbeRecommendation(
@@ -330,7 +379,12 @@ extension ModelConfigEditorController {
             }
             run(0)
         } catch {
-            setEditorError("Full probe failed", message: error.localizedDescription)
+            presentProbeStatus(
+                "Probe failed",
+                detail: error.localizedDescription,
+                state: .inconclusive,
+                for: request
+            )
             finishFullModelProbe(request: request, completion: completion)
         }
     }
@@ -339,12 +393,8 @@ extension ModelConfigEditorController {
         request: ModelAvailabilityProbeRequest,
         runID: UUID,
         preflightDetail: String,
-        knownImageModel: Bool = true,
         completion: (() -> Void)?
     ) {
-        if knownImageModel {
-            markModelAsImageGenerationEndpoint(request: request)
-        }
         do {
             let body = try modelAvailabilityImageGenerationProbeBody(model: request.upstreamModel)
             postJSONProbe(urls: request.imageGenerationURLs, apiKey: request.apiKey, apiBase: request.apiBase, body: body, timeout: 60) { [weak self] url, response, data, error in
@@ -354,30 +404,12 @@ extension ModelConfigEditorController {
                     ?? response.map { self.probeDetail(surface: "image generation", url: url, statusCode: $0.statusCode, data: data) }
                     ?? "\(url.absoluteString)\nNo HTTP response returned."
                 let outcome = response.map { self.parseModelAvailabilityImageGenerationProbeOutcome(statusCode: $0.statusCode, data: data) } ?? .inconclusive(detail)
-                if case .available = outcome {
-                    self.markModelAsImageGenerationEndpoint(request: request)
-                }
                 self.applyModelAvailabilityProbeOutcome(self.probeOutcome(outcome, prefixing: "\(preflightDetail)\n\n\(detail)"), request: request)
                 self.finishFullModelProbe(request: request, completion: completion)
             }
         } catch {
             applyModelAvailabilityProbeOutcome(.inconclusive("\(preflightDetail)\n\n/images/generations probe failed: \(error.localizedDescription)"), request: request)
             finishFullModelProbe(request: request, completion: completion)
-        }
-    }
-
-    func markModelAsImageGenerationEndpoint(request: ModelAvailabilityProbeRequest) {
-        guard modelProbeRequestStillMatches(request) else { return }
-        var model = providers[request.providerIndex].models[request.modelIndex]
-        let originalModel = model
-        model.modelInfoExtra["mode"] = .string("image_generation")
-        model.supportsImageGeneration = false
-        model.supportsImageGenerationPresent = false
-        providers[request.providerIndex].models[request.modelIndex] = model
-        markPendingChangesIfNeeded(model != originalModel, updateStatus: false)
-        if selectedModelProbeKey() == request.probeKey {
-            selectedModelImageGenerationEndpointDisabled = true
-            refreshResponsesEndpointSupportControls()
         }
     }
 
@@ -400,9 +432,9 @@ extension ModelConfigEditorController {
         let lines = details.map { result in
             return "\(self.upstreamApiDisplayName(result.mode)): \(self.upstreamApiProbeSummary(result))"
         }
-        alert.informativeText = ([preflightDetail, ""] + lines + ["", "Recommended fallback order: \(recommendedOrder.map(upstreamApiDisplayName).joined(separator: " → "))"]).joined(separator: "\n")
-        alert.addButton(withTitle: "Save Supported Protocols")
-        alert.addButton(withTitle: "Keep Current Order")
+        alert.informativeText = ([preflightDetail, ""] + lines + ["", "Recommended protocol: \(recommendedOrder.map(upstreamApiDisplayName).joined(separator: " → "))"]).joined(separator: "\n")
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Keep")
         switch alert.runModal() {
         case .alertFirstButtonReturn:
             applyRecommendedProtocolOrder(
@@ -412,9 +444,11 @@ extension ModelConfigEditorController {
                 preflightDetail: preflightDetail
             )
         default:
-            setEditorStatus(
-                "Probe complete. Current protocol order kept.",
-                tooltip: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n")
+            presentProbeStatus(
+                "Available",
+                detail: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n"),
+                state: .available,
+                for: request
             )
         }
     }
@@ -430,7 +464,6 @@ extension ModelConfigEditorController {
             + upstreamApiModes.filter { !recommendedOrder.contains($0) }
         guard let primary = recommendedOrder.first else { return }
 
-        displayedUpstreamApiModes = completeOrder
         var model = providers[request.providerIndex].models[request.modelIndex]
         model.upstreamApiMode = primary
         model.supportedUpstreamApiModes = recommendedOrder
@@ -438,63 +471,31 @@ extension ModelConfigEditorController {
             upstreamModel: modelUpstreamPart(model.litellmModel),
             upstreamApiMode: primary
         )
+        model.modelInfoExtra[upstreamApiModeOrderMetadataKey] = .array(
+            completeOrder.map { .string($0) }
+        )
         providers[request.providerIndex].models[request.modelIndex] = model
         if selectedModelProbeKey() == request.probeKey {
+            displayedUpstreamApiModes = completeOrder
             setUpstreamApiSupportCheckboxes(recommendedOrder)
         }
-        persistDisplayedUpstreamApiModeOrder(
-            providerIndex: request.providerIndex,
-            modelIndex: request.modelIndex
-        )
         refreshUpstreamApiModeRows()
         markPendingChanges()
         reloadRouteTable(preserving: (request.providerIndex, request.modelIndex))
-        refreshRuntimeMap()
-        setEditorStatus(
-            "Probe complete. Supported protocols saved in recommended fallback order.",
-            tooltip: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n")
+        presentProbeStatus(
+            "Available",
+            detail: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n"),
+            state: .available,
+            for: request
         )
-    }
-
-    func applyFullProbeSelection(
-        _ selected: [String],
-        recommendedOrder: [String],
-        request: ModelAvailabilityProbeRequest,
-        details: [UpstreamApiProbeResult],
-        preflightDetail: String
-    ) {
-        guard modelProbeRequestStillMatches(request), let primary = selected.first else { return }
-        var model = providers[request.providerIndex].models[request.modelIndex]
-        model.modelEnabled = true
-        model.enabled = modelEffectivelyEnabled(providerIndex: request.providerIndex, model: model)
-        model.upstreamApiMode = primary
-        model.supportedUpstreamApiModes = selected
-        model.litellmModel = composedLiteLLMModel(
-            upstreamModel: modelUpstreamPart(model.litellmModel),
-            upstreamApiMode: primary
-        )
-        providers[request.providerIndex].models[request.modelIndex] = model
-        displayedUpstreamApiModes = recommendedOrder + upstreamApiModes.filter { !recommendedOrder.contains($0) }
-        persistDisplayedUpstreamApiModeOrder(
-            providerIndex: request.providerIndex,
-            modelIndex: request.modelIndex
-        )
-        if selectedModelProbeKey() == request.probeKey {
-            setUpstreamApiSupportCheckboxes(selected)
-            enabledCheckbox.state = .on
-        }
-        markPendingChanges()
-        reloadRouteTable(preserving: (request.providerIndex, request.modelIndex))
-        refreshRuntimeMap()
-        setEditorStatus("Probe complete: supported protocols saved in fallback order.", tooltip: ([preflightDetail] + details.map { $0.detail }).joined(separator: "\n\n"))
     }
 
     func setModelCandidateFetchState(_ loading: Bool) {
         modelCandidateFetchInFlight = loading
         if loading {
-            fetchModelsButton.title = "Fetching..."
+            fetchModelsButton.title = "Fetching…"
         } else {
-            fetchModelsButton.title = "Fetch /v1/models"
+            fetchModelsButton.title = "Fetch"
         }
         refreshModelCandidateControlsEnabled()
     }
@@ -507,21 +508,11 @@ extension ModelConfigEditorController {
             return
         }
 
-        var model = providers[request.providerIndex].models[request.modelIndex]
-        let originalModel = model
-        let label = "\(request.providerName)/\(request.keyName) \(request.upstreamModel)"
-
         switch outcome {
         case .available(let detail):
-            model.modelEnabled = true
-            providers[request.providerIndex].models[request.modelIndex] = model
-            providers[request.providerIndex].models[request.modelIndex].enabled =
-                modelEffectivelyEnabled(providerIndex: request.providerIndex, model: model)
-            if selectedProviderIndex == request.providerIndex, selectedModelIndex == request.modelIndex {
-                enabledCheckbox.state = .on
-            }
+            let model = providers[request.providerIndex].models[request.modelIndex]
             if modelEffectivelyEnabled(providerIndex: request.providerIndex, model: model) {
-                setEditorStatus("Model probe: available for \(label).", tooltip: detail)
+                presentProbeStatus("Available", detail: detail, state: .available, for: request)
             } else {
                 let reason = routeOffReason(RouteDeploymentRow(
                     providerIndex: request.providerIndex,
@@ -533,38 +524,35 @@ extension ModelConfigEditorController {
                     order: parseOrder(model.order),
                     enabled: false
                 ))
-                setEditorStatus("Model probe: available for \(label), but route is still OFF (\(reason)).", color: .secondaryLabelColor, tooltip: detail)
+                presentProbeStatus(
+                    "Available, disabled: \(reason)",
+                    detail: detail,
+                    state: .available,
+                    for: request
+                )
             }
         case .unavailable(let detail):
-            model.modelEnabled = false
-            providers[request.providerIndex].models[request.modelIndex] = model
-            providers[request.providerIndex].models[request.modelIndex].enabled = false
-            if selectedProviderIndex == request.providerIndex, selectedModelIndex == request.modelIndex {
-                enabledCheckbox.state = .off
-            }
-            let tooltip = "Model enabled was turned off for this deployment.\n\(detail)"
             let inlineDetail = inlineProbeFailureDetail(from: detail)
-            let message = inlineDetail.isEmpty
-                ? "Model probe: unavailable for \(label)."
-                : "Model probe: \(inlineDetail) for \(label)."
-            setEditorStatus(message, color: .secondaryLabelColor, tooltip: tooltip)
+            presentProbeStatus(
+                inlineDetail.isEmpty ? "Unavailable" : "Unavailable: \(inlineDetail)",
+                detail: detail,
+                state: .unavailable,
+                for: request
+            )
         case .inconclusive(let detail):
             let inlineDetail = inlineProbeFailureDetail(from: detail)
-            let message = inlineDetail.isEmpty
-                ? "Model probe: inconclusive for \(label); model enabled was not changed."
-                : "Model probe: inconclusive (\(inlineDetail)) for \(label); model enabled was not changed."
-            setEditorStatus(message, color: .secondaryLabelColor, tooltip: detail)
+            presentProbeStatus(
+                inlineDetail.isEmpty ? "Uncertain" : "Uncertain: \(inlineDetail)",
+                detail: detail,
+                state: .inconclusive,
+                for: request
+            )
         }
 
-        markPendingChangesIfNeeded(
-            providers[request.providerIndex].models[request.modelIndex] != originalModel,
-            updateStatus: false
-        )
         if selectedProviderIndex == request.providerIndex {
             modelTableView.reloadData(forRowIndexes: IndexSet(integer: request.modelIndex), columnIndexes: IndexSet(integersIn: 0..<modelTableView.numberOfColumns))
         }
         reloadRouteTable(preserving: (request.providerIndex, request.modelIndex))
-        refreshRuntimeMap()
     }
 
     func showFetchedModelChooser(
@@ -655,10 +643,12 @@ extension ModelConfigEditorController {
         selectionControls.orientation = .horizontal
         selectionControls.alignment = .centerY
         selectionControls.spacing = 8
-        let selectAllButton = NSButton(title: "Select All", target: chooserController, action: #selector(FetchedModelChooserController.selectAllAction(_:)))
-        selectAllButton.bezelStyle = .rounded
-        let invertSelectionButton = NSButton(title: "Invert", target: chooserController, action: #selector(FetchedModelChooserController.invertSelectionAction(_:)))
-        invertSelectionButton.bezelStyle = .rounded
+        let selectAllButton = textButton(title: "All", toolTip: "Select all visible models", accessibilityLabel: "Select all visible models")
+        selectAllButton.target = chooserController
+        selectAllButton.action = #selector(FetchedModelChooserController.selectAllAction(_:))
+        let invertSelectionButton = textButton(title: "Invert", toolTip: "Invert visible model selection", accessibilityLabel: "Invert visible model selection")
+        invertSelectionButton.target = chooserController
+        invertSelectionButton.action = #selector(FetchedModelChooserController.invertSelectionAction(_:))
         selectionControls.addArrangedSubview(selectAllButton)
         selectionControls.addArrangedSubview(invertSelectionButton)
         selectionControls.addArrangedSubview(spacer())
@@ -690,8 +680,9 @@ extension ModelConfigEditorController {
         let cancelButton = NSButton(title: "Cancel", target: chooserController, action: #selector(FetchedModelChooserController.cancelAction(_:)))
         cancelButton.bezelStyle = .rounded
         cancelButton.keyEquivalent = "\u{1b}"
-        let addButton = NSButton(title: "Add Selected", target: chooserController, action: #selector(FetchedModelChooserController.addSelectedAction(_:)))
-        addButton.bezelStyle = .rounded
+        let addButton = textButton(title: "+", toolTip: "Add selected models", accessibilityLabel: "Add selected models")
+        addButton.target = chooserController
+        addButton.action = #selector(FetchedModelChooserController.addSelectedAction(_:))
         addButton.keyEquivalent = "\r"
 
         chooserController.configureControls(
@@ -779,13 +770,17 @@ extension ModelConfigEditorController {
         var addedCount = 0
         var addedIndexes: [Int] = []
         for upstream in models {
+            let initialApiMode = inferredPreferredUpstreamApiMode(
+                modelIdentifier: upstream,
+                defaultMode: defaultUpstreamApiMode
+            )
             var model = EditableModel.blank()
             model.enabled = true
             model.modelEnabled = true
             model.modelName = upstream
             model.litellmModel = composedLiteLLMModel(
                 upstreamModel: upstream,
-                upstreamApiMode: defaultUpstreamApiMode
+                upstreamApiMode: initialApiMode
             )
             model.apiKeyName = key.name
             model.apiKey = key.value
@@ -793,8 +788,8 @@ extension ModelConfigEditorController {
             model.sslVerify = ""
             model.supportsImageGeneration = false
             model.supportsImageGenerationPresent = false
-            model.upstreamApiMode = defaultUpstreamApiMode
-            model.supportedUpstreamApiModes = [defaultUpstreamApiMode]
+            model.upstreamApiMode = initialApiMode
+            model.supportedUpstreamApiModes = [initialApiMode]
             providers[providerIndex].models.append(model)
             addedIndexes.append(providers[providerIndex].models.count - 1)
             addedCount += 1
@@ -811,7 +806,6 @@ extension ModelConfigEditorController {
         } else {
             reloadRouteTable()
         }
-        refreshRuntimeMap()
         markPendingChangesIfNeeded(addedCount > 0)
         if addedCount == 0 {
             setEditorStatus("No models added to \(provider.displayName).")
@@ -833,7 +827,14 @@ extension ModelConfigEditorController {
                 let probeRequest = try modelAvailabilityProbeRequest(providerIndex: providerIndex, modelIndex: modelIndex)
                 let runID = UUID()
                 modelAvailabilityProbeRuns[probeRequest.probeKey] = runID
-                setEditorStatus("Full probe \(position + 1) of \(indexes.count): \(probeRequest.upstreamModel)...")
+                setModelProbePresentation(
+                    ModelProbePresentation(
+                        state: .probing,
+                        summary: "Probing...",
+                        detail: "Automatic probe \(position + 1) of \(indexes.count)."
+                    ),
+                    for: probeRequest
+                )
                 runFullModelProbe(
                     request: probeRequest,
                     runID: runID,

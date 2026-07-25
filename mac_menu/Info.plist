@@ -22,6 +22,17 @@
   <string>13.0</string>
   <key>LSUIElement</key>
   <true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>LiteLLM Menu local window</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>litellm-menu</string>
+      </array>
+    </dict>
+  </array>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSAppTransportSecurity</key>

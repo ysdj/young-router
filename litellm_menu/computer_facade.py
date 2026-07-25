@@ -2449,7 +2449,7 @@ def _computer_facade_trace(event: str, **fields: Any) -> None:
     if not _computer_facade_trace_enabled():
         return
     try:
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
             "+00:00",
             "Z",
         )

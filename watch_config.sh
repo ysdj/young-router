@@ -82,7 +82,7 @@ control() {
 }
 
 timestamp() {
-  /bin/date "+%Y-%m-%d %H:%M:%S"
+  /bin/date -u "+%Y-%m-%dT%H:%M:%SZ"
 }
 
 mtime() {
@@ -117,17 +117,30 @@ log() {
   printf '[%s] %s\n' "$(timestamp)" "$*" >>"$LOG_FILE"
 }
 
+run_control_logged() {
+  local action="$1" output status line
+  if output="$(control "$action" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] && log "$line"
+  done <<<"$output"
+  return "$status"
+}
+
 stage_if_valid() {
   log "config.yaml changed; validating before staging runtime config"
   rotate_log_if_needed
-  if ! control validate >>"$LOG_FILE" 2>&1; then
+  if ! run_control_logged validate; then
     log "validation failed; keeping current runtime config"
     return 1
   fi
 
   log "validation passed; staging config for next runtime apply"
   rotate_log_if_needed
-  if control stage-config >>"$LOG_FILE" 2>&1; then
+  if run_control_logged stage-config; then
     log "runtime config staged; run apply-config to reload LiteLLM"
     return 0
   else
@@ -158,7 +171,7 @@ webdav_sync_if_due() {
   last_webdav_sync_at="$now"
   log "WebDAV scheduled sync due; running bidirectional sync"
   rotate_log_if_needed
-  if control webdav-sync >>"$LOG_FILE" 2>&1; then
+  if run_control_logged webdav-sync; then
     log "WebDAV scheduled sync finished"
   else
     log "WebDAV scheduled sync failed; see error above"

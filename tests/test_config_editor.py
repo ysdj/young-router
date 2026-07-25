@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -11,7 +15,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import config_editor  # noqa: E402
+from config_editor_core import api as config_api  # noqa: E402
+from config_editor_core import load as config_load  # noqa: E402
+from config_editor_core import schema as config_schema  # noqa: E402
 
 
 class ConfigEditorProviderKeyTests(unittest.TestCase):
@@ -21,6 +27,98 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         path = Path(temp_dir.name) / "config.yaml"
         path.write_text(textwrap.dedent(text).lstrip(), encoding="utf-8")
         return path
+
+    def test_cli_load_does_not_import_save_or_litellm_modules(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              primary:
+                api_base: "https://example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "synthetic-secret"
+            model_list: []
+            """
+        )
+        script = textwrap.dedent(
+            """
+            import sys
+
+            from config_editor_core.api import main
+
+            sys.argv = ["config_editor.py", "load", "--config", sys.argv[1]]
+            exit_code = main()
+            if "config_editor_core.dump" in sys.modules:
+                raise SystemExit("load imported the save-only dump module")
+            if any(name == "litellm" or name.startswith("litellm.") for name in sys.modules):
+                raise SystemExit("load imported LiteLLM")
+            raise SystemExit(exit_code)
+            """
+        )
+        env = dict(os.environ)
+        env.pop("LITELLM_MENU_PROXY_PROCESS", None)
+
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(path)],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual("primary", json.loads(result.stdout)["providers"][0]["name"])
+
+    def test_invalid_yaml_error_does_not_echo_source_or_secret(self) -> None:
+        marker = "sk-synthetic-leak-marker"
+        path = self.write_config(f'providers:\n  primary:\n    value: "{marker}\n')
+
+        with self.assertRaisesRegex(ValueError, r"config\.yaml is not valid YAML") as context:
+            config_schema.load_yaml_text(path.read_text(encoding="utf-8"), path)
+
+        self.assertNotIn(marker, str(context.exception))
+
+    def test_load_rejects_exponential_alias_expansion_without_leaking_source(self) -> None:
+        marker = "sk-alias-bomb-leak-marker"
+        aliases = ", ".join(["*previous"] * 10)
+        layers = ["seed: &previous [safe]"]
+        for index in range(6):
+            anchor = f"layer_{index}"
+            layers.append(f"{anchor}: &{anchor} [{aliases}]")
+            aliases = ", ".join([f"*{anchor}"] * 10)
+        layers.append(f'secret: "{marker}"')
+        path = self.write_config("\n".join(layers))
+
+        with self.assertRaisesRegex(
+            ValueError, r"config\.yaml exceeds safe YAML structure limits"
+        ) as context:
+            config_schema.load_yaml_text(path.read_text(encoding="utf-8"), path)
+
+        self.assertNotIn(marker, str(context.exception))
+
+    def test_load_rejects_alias_expansion_that_exceeds_depth_limit(self) -> None:
+        layers = ["level_0: &level_0 safe"]
+        for index in range(1, config_schema.YAML_MAX_NESTING_DEPTH + 1):
+            layers.append(f"level_{index}: &level_{index} [*level_{index - 1}]")
+        path = self.write_config("\n".join(layers))
+
+        with self.assertRaisesRegex(ValueError, "safe YAML structure limits"):
+            config_schema.load_yaml_text(path.read_text(encoding="utf-8"), path)
+
+    def test_loaded_yaml_structure_has_independent_hard_limit(self) -> None:
+        original_limit = config_schema.YAML_MAX_FINAL_STRUCTURE_NODES
+        self.addCleanup(
+            setattr,
+            config_schema,
+            "YAML_MAX_FINAL_STRUCTURE_NODES",
+            original_limit,
+        )
+        config_schema.YAML_MAX_FINAL_STRUCTURE_NODES = 2
+        path = self.write_config("model_list: []\n")
+
+        with self.assertRaisesRegex(ValueError, "safe YAML structure limits"):
+            config_schema.load_yaml_text(path.read_text(encoding="utf-8"), path)
 
     def test_load_uses_explicit_api_key_label(self) -> None:
         path = self.write_config(
@@ -45,10 +143,41 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
 
-        provider = config_editor.load_config(path)["providers"][0]
+        provider = config_load.load_config(path)["providers"][0]
 
         self.assertEqual(["renamed"], [key["name"] for key in provider["api_keys"]])
         self.assertEqual("renamed", provider["models"][0]["api_key_name"])
+
+    def test_load_names_an_inline_model_key_when_provider_has_no_keys(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              experimental_provider:
+                api_base: "https://example.com/v1"
+            model_list:
+              - model_name: Experimental Chat
+                litellm_params:
+                  model: openai/experimental-chat
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-inline"
+                model_info:
+                  id: "0000000a"
+                  provider: experimental_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+            """
+        )
+
+        provider = config_load.load_config(path)["providers"][0]
+
+        self.assertEqual(
+            [{"name": "Experimental-Chat", "value": "sk-inline"}],
+            provider["api_keys"],
+        )
+        self.assertEqual(
+            "Experimental-Chat",
+            provider["models"][0]["api_key_name"],
+        )
 
     def test_load_accepts_current_disabled_models_companion_file(self) -> None:
         path = self.write_config(
@@ -82,13 +211,73 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        provider = config_editor.load_config(path)["providers"][0]
+        provider = config_load.load_config(path)["providers"][0]
 
         self.assertEqual(1, len(provider["models"]))
         self.assertFalse(provider["models"][0]["enabled"])
         self.assertEqual(
             ["openai/chat"],
             provider["models"][0]["supported_upstream_url_surfaces"],
+        )
+
+    def test_provider_toggle_preserves_each_model_switch_across_save(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              primary:
+                api_base: "https://example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "replace-me"
+            model_list:
+              - model_name: enabled-chat
+                litellm_params:
+                  model: openai/enabled-chat
+                  api_base: "https://example.test/v1"
+                  api_key: "replace-me"
+                model_info:
+                  id: "00000041"
+                  provider: primary
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+              - model_name: disabled-chat
+                litellm_params:
+                  model: openai/disabled-chat
+                  api_base: "https://example.test/v1"
+                  api_key: "replace-me"
+                model_info:
+                  id: "00000042"
+                  provider: primary
+                  x-litellm-menu-model-enabled: false
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+            """
+        )
+        providers = config_load.load_config(path)["providers"]
+        providers[0]["enabled"] = False
+
+        config_api.save_config(providers, path)
+        disabled_entries = config_schema._load_yaml(
+            path.with_name("config.disabled-models.yaml")
+        )["disabled_model_list"]
+        saved_states = {
+            entry["model_name"]: entry["model_info"]["x-litellm-menu-model-enabled"]
+            for entry in disabled_entries
+        }
+        self.assertEqual(
+            {"enabled-chat": True, "disabled-chat": False},
+            saved_states,
+        )
+
+        reloaded = config_load.load_config(path)["providers"][0]
+        self.assertFalse(reloaded["enabled"])
+        self.assertEqual(
+            {model["model_name"]: model["model_enabled"] for model in reloaded["models"]},
+            {"enabled-chat": True, "disabled-chat": False},
+        )
+        self.assertEqual(
+            {model["model_name"]: model["enabled"] for model in reloaded["models"]},
+            {"enabled-chat": True, "disabled-chat": False},
         )
 
     def test_load_rejects_disabled_models_embedded_in_main_config(self) -> None:
@@ -100,7 +289,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "config.disabled-models.yaml"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_save_round_trip_preserves_renamed_primary_api_key_label(self) -> None:
         path = self.write_config(
@@ -124,13 +313,13 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces: [openai/responses]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         provider = payload["providers"][0]
         provider["api_keys"][0]["name"] = "renamed"
         provider["models"][0]["api_key_name"] = "renamed"
 
-        config_editor.save_config(payload["providers"], path)
-        reloaded = config_editor.load_config(path)["providers"][0]
+        config_api.save_config(payload["providers"], path)
+        reloaded = config_load.load_config(path)["providers"][0]
 
         self.assertEqual(["renamed"], [key["name"] for key in reloaded["api_keys"]])
         self.assertEqual("renamed", reloaded["models"][0]["api_key_name"])
@@ -173,10 +362,10 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             router_settings: {}
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
 
-        result = config_editor.save_config(payload["providers"], path)
-        saved = config_editor._load_yaml(path)
+        result = config_api.save_config(payload["providers"], path)
+        saved = config_schema._load_yaml(path)
 
         self.assertEqual(2, result["providers"])
         self.assertEqual({"primary", "backup"}, set(saved["providers"]))
@@ -225,13 +414,13 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             router_settings: {}
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         remaining = [
             provider for provider in payload["providers"] if provider["name"] != "primary"
         ]
 
-        result = config_editor.save_config(remaining, path, payload["revision"])
-        saved = config_editor._load_yaml(path)
+        result = config_api.save_config(remaining, path, payload["revision"])
+        saved = config_schema._load_yaml(path)
 
         self.assertEqual(1, result["providers"])
         self.assertEqual({"backup"}, set(saved["providers"]))
@@ -263,17 +452,17 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
               public_model_groups: [default-chat]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
 
-        result = config_editor.save_config([], path, payload["revision"])
-        saved = config_editor._load_yaml(path)
+        result = config_api.save_config([], path, payload["revision"])
+        saved = config_schema._load_yaml(path)
 
         self.assertEqual(0, result["providers"])
         self.assertEqual({}, saved["providers"])
         self.assertEqual([], saved["model_list"])
         self.assertEqual([], saved["litellm_settings"]["public_model_groups"])
 
-    def test_save_drops_legacy_supports_vision_model_info(self) -> None:
+    def test_load_rejects_removed_supports_vision_flag(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -291,20 +480,13 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000003"
                   provider: provider_alpha
+                  supports_vision: true
                   upstream_url_surface: openai/responses
                   supported_upstream_url_surfaces: [openai/responses]
             """
         )
-        payload = config_editor.load_config(path)
-        model = payload["providers"][0]["models"][0]
-        model["model_info_extra"]["supports_vision"] = True
-
-        config_editor.save_config(payload["providers"], path)
-        reloaded_model = config_editor.load_config(path)["providers"][0]["models"][0]
-        saved_model_info = config_editor._load_yaml(path)["model_list"][0]["model_info"]
-
-        self.assertNotIn("supports_vision", saved_model_info)
-        self.assertNotIn("supports_vision", reloaded_model["model_info_extra"])
+        with self.assertRaisesRegex(ValueError, "supports_vision"):
+            config_load.load_config(path)
 
     def test_load_rejects_removed_supports_image_generation_flag(self) -> None:
         path = self.write_config(
@@ -329,7 +511,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "unsupported supports_image_generation"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_save_writes_upstream_url_surface_as_first_class_model_info(self) -> None:
         path = self.write_config(
@@ -353,13 +535,13 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces: [openai/responses]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         model = payload["providers"][0]["models"][0]
         model["upstream_url_surface"] = "openai/chat"
         model["supported_upstream_url_surfaces"] = ["openai/chat", "anthropic"]
 
-        config_editor.save_config(payload["providers"], path)
-        reloaded_model = config_editor.load_config(path)["providers"][0]["models"][0]
+        config_api.save_config(payload["providers"], path)
+        reloaded_model = config_load.load_config(path)["providers"][0]["models"][0]
 
         self.assertEqual("openai/chat", reloaded_model["upstream_url_surface"])
         self.assertEqual(
@@ -398,15 +580,15 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
 
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         model = payload["providers"][0]["models"][0]
         self.assertEqual(
             ["openai/responses", "anthropic", "openai/chat"],
             model["model_info_extra"]["x-litellm-menu-upstream-url-surface-order"],
         )
 
-        config_editor.save_config(payload["providers"], path)
-        saved_model_info = config_editor._load_yaml(path)["model_list"][0]["model_info"]
+        config_api.save_config(payload["providers"], path)
+        saved_model_info = config_schema._load_yaml(path)["model_list"][0]["model_info"]
         self.assertEqual(
             ["openai/responses", "anthropic", "openai/chat"],
             saved_model_info["x-litellm-menu-upstream-url-surface-order"],
@@ -416,7 +598,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             saved_model_info["supported_upstream_url_surfaces"],
         )
 
-    def test_legacy_disabled_api_key_is_reenabled_and_flag_is_removed(self) -> None:
+    def test_load_rejects_removed_api_key_enabled_flag(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -440,15 +622,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
 
-        payload = config_editor.load_config(path)
-        provider = payload["providers"][0]
-        self.assertTrue(provider["api_keys"][0]["enabled"])
-        self.assertTrue(provider["models"][0]["enabled"])
-
-        config_editor.save_config(payload["providers"], path)
-        saved = config_editor._load_yaml(path)
-        saved_key = saved["providers"]["primary"]["api_keys"][0]
-        self.assertNotIn("enabled", saved_key)
+        with self.assertRaisesRegex(ValueError, "uses unsupported enabled"):
+            config_load.load_config(path)
 
     def test_load_rejects_removed_context_metadata(self) -> None:
         path = self.write_config(
@@ -474,7 +649,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
         with self.assertRaisesRegex(ValueError, "unsupported max_input_tokens"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_load_rejects_removed_responses_endpoint_flag(self) -> None:
         path = self.write_config(
@@ -499,7 +674,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "unsupported supports_responses_endpoint"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_supported_url_surfaces_define_primary_without_legacy_flags(self) -> None:
         path = self.write_config(
@@ -526,7 +701,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
 
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         model = payload["providers"][0]["models"][0]
 
         self.assertEqual("openai/chat", model["upstream_url_surface"])
@@ -535,8 +710,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             model["supported_upstream_url_surfaces"],
         )
 
-        config_editor.save_config(payload["providers"], path)
-        saved = config_editor._load_yaml(path)["model_list"][0]["model_info"]
+        config_api.save_config(payload["providers"], path)
+        saved = config_schema._load_yaml(path)["model_list"][0]["model_info"]
         self.assertEqual("openai/chat", saved["upstream_url_surface"])
         self.assertEqual(
             ["openai/chat", "openai/responses"],
@@ -569,13 +744,13 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
 
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         model = payload["providers"][0]["models"][0]
         self.assertEqual("gpt-compatible", model["model_name"])
         self.assertEqual("openai/vendor/glm-compatible", model["litellm_model"])
 
-        config_editor.save_config(payload["providers"], path)
-        saved = config_editor._load_yaml(path)
+        config_api.save_config(payload["providers"], path)
+        saved = config_schema._load_yaml(path)
         entry = saved["model_list"][0]
 
         self.assertEqual("gpt-compatible", entry["model_name"])
@@ -611,7 +786,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "must equal the first"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_save_generates_random_deployment_token_and_explicit_route_key(self) -> None:
         path = self.write_config(
@@ -625,7 +800,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             model_list: []
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         provider = payload["providers"][0]
         provider["models"].append({
             "enabled": True,
@@ -649,11 +824,11 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             "model_info_extra": {},
         })
 
-        config_editor.save_config(payload["providers"], path)
-        reloaded_model = config_editor.load_config(path)["providers"][0]["models"][0]
+        config_api.save_config(payload["providers"], path)
+        reloaded_model = config_load.load_config(path)["providers"][0]["models"][0]
 
         self.assertRegex(reloaded_model["deployment_id"], r"^[0-9a-f]{8}$")
-        saved = config_editor._load_yaml(path)["model_list"][0]
+        saved = config_schema._load_yaml(path)["model_list"][0]
         self.assertEqual(
             "model=balanced-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=r-plus / order=2",
             saved["model_info"]["route_key"],
@@ -695,11 +870,11 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces: [openai/responses]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
 
-        config_editor.save_config(payload["providers"], path)
+        config_api.save_config(payload["providers"], path)
 
-        saved = config_editor._load_yaml(path)["model_list"]
+        saved = config_schema._load_yaml(path)["model_list"]
         self.assertEqual(
             ["00000007", "00000008"],
             [entry["model_info"]["id"] for entry in saved],
@@ -746,11 +921,11 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces: [openai/responses]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
 
-        config_editor.save_config(payload["providers"], path)
+        config_api.save_config(payload["providers"], path)
 
-        saved = config_editor._load_yaml(path)["model_list"]
+        saved = config_schema._load_yaml(path)["model_list"]
         route_keys = [entry["model_info"]["route_key"] for entry in saved]
         self.assertEqual(
             [
@@ -783,11 +958,11 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces: [anthropic]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
 
-        config_editor.save_config(payload["providers"], path)
+        config_api.save_config(payload["providers"], path)
 
-        saved = config_editor._load_yaml(path)
+        saved = config_schema._load_yaml(path)
         self.assertEqual(
             saved["providers"]["endpoint_provider"]["api_base"],
             "https://example.com/v1/messages",
@@ -819,11 +994,11 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces: [anthropic]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
 
-        config_editor.save_config(payload["providers"], path)
+        config_api.save_config(payload["providers"], path)
 
-        saved = config_editor._load_yaml(path)
+        saved = config_schema._load_yaml(path)
         self.assertEqual(
             saved["providers"]["endpoint_provider"]["api_base"],
             "https://example.com/messages",
@@ -851,11 +1026,11 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces: [openai/responses]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
 
-        config_editor.save_config(payload["providers"], path)
+        config_api.save_config(payload["providers"], path)
 
-        saved = config_editor._load_yaml(path)
+        saved = config_schema._load_yaml(path)
         self.assertEqual(
             saved["providers"]["endpoint_provider"]["api_base"],
             "https://example.com/v1",
@@ -873,7 +1048,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             model_list: []
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         provider = payload["providers"][0]
         base_model = {
             "enabled": True,
@@ -900,8 +1075,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         second_model["order"] = "2"
         provider["models"].extend([dict(base_model), second_model])
 
-        config_editor.save_config(payload["providers"], path)
-        models = config_editor.load_config(path)["providers"][0]["models"]
+        config_api.save_config(payload["providers"], path)
+        models = config_load.load_config(path)["providers"][0]["models"]
 
         deployment_ids = [model["deployment_id"] for model in models]
         self.assertEqual(2, len(set(deployment_ids)))
@@ -943,13 +1118,13 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
 
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         models = payload["providers"][0]["models"]
 
         self.assertEqual(["1", "1"], [model["order"] for model in models])
 
-        config_editor.save_config(payload["providers"], path)
-        saved = config_editor._load_yaml(path)["model_list"]
+        config_api.save_config(payload["providers"], path)
+        saved = config_schema._load_yaml(path)["model_list"]
         self.assertEqual([1, 1], [entry["litellm_params"]["order"] for entry in saved])
         self.assertEqual(
             [
@@ -958,6 +1133,95 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             ],
             [entry["model_info"]["route_key"] for entry in saved],
         )
+
+    def test_negative_and_fractional_orders_round_trip_as_numbers(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              compat_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: default-chat
+                litellm_params:
+                  model: openai/negative
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                  order: -2.5
+                model_info:
+                  id: "0000000b"
+                  provider: compat_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+              - model_name: default-chat
+                litellm_params:
+                  model: openai/fractional
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                  order: 0.25
+                model_info:
+                  id: "0000000c"
+                  provider: compat_provider
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+            """
+        )
+
+        payload = config_load.load_config(path)
+        models = payload["providers"][0]["models"]
+        self.assertEqual(["-2.5", "0.25"], [model["order"] for model in models])
+
+        config_api.save_config(payload["providers"], path)
+        saved = config_schema._load_yaml(path)["model_list"]
+        self.assertEqual([-2.5, 0.25], [entry["litellm_params"]["order"] for entry in saved])
+        self.assertEqual(
+            [
+                "model=default-chat / provider=compat_provider / upstream=openai/negative / host=example.com / key=default / order=-2.5",
+                "model=default-chat / provider=compat_provider / upstream=openai/fractional / host=example.com / key=default / order=0.25",
+            ],
+            [entry["model_info"]["route_key"] for entry in saved],
+        )
+
+    def test_non_numeric_order_is_rejected(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              compat_provider:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list: []
+            """
+        )
+        payload = config_load.load_config(path)
+        model = {
+            "enabled": True,
+            "model_enabled": True,
+            "provider": "compat_provider",
+            "model_name": "default-chat",
+            "litellm_model": "openai/default-chat",
+            "api_base": "https://example.com/v1",
+            "api_key": "sk-test",
+            "api_key_name": "default",
+            "order": "first",
+            "ssl_verify": "",
+            "ssl_verify_present": False,
+            "deployment_id": "",
+            "supports_responses_image_generation_tool": False,
+            "supports_responses_image_generation_tool_present": False,
+            "upstream_url_surface": "openai/responses",
+            "supported_upstream_url_surfaces": ["openai/responses"],
+            "entry_extra": {},
+            "litellm_extra": {},
+            "model_info_extra": {},
+        }
+        payload["providers"][0]["models"].append(model)
+
+        with self.assertRaisesRegex(ValueError, "Invalid route order"):
+            config_api.save_config(payload["providers"], path)
 
     def test_load_rejects_unsupported_semantic_deployment_id(self) -> None:
         path = self.write_config(
@@ -981,7 +1245,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "model_info.id"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_load_rejects_provider_scalar_api_key(self) -> None:
         path = self.write_config(
@@ -995,7 +1259,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "unsupported scalar api_key"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_load_rejects_unsupported_upstream_api_mode(self) -> None:
         path = self.write_config(
@@ -1020,7 +1284,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "unsupported upstream_api_mode"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_load_rejects_unsupported_callbacks(self) -> None:
         path = self.write_config(
@@ -1040,7 +1304,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "unsupported callback"):
-            config_editor.load_config(path)
+            config_load.load_config(path)
 
     def test_example_config_uses_current_schema(self) -> None:
         example = ROOT / "config.example.yaml"
@@ -1050,11 +1314,11 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertNotIn("disabled_api_keys", text)
         self.assertNotIn("upstream_api_mode", text)
         self.assertNotIn("supported_upstream_api_modes", text)
-        self.assertGreater(len(config_editor.load_config(example)["providers"]), 0)
+        self.assertGreater(len(config_load.load_config(example)["providers"]), 0)
 
     def test_example_config_starts_with_one_deletable_provider(self) -> None:
         example = ROOT / "config.example.yaml"
-        payload = config_editor.load_config(example)
+        payload = config_load.load_config(example)
 
         self.assertEqual(["default"], [provider["name"] for provider in payload["providers"]])
         self.assertEqual(1, len(payload["providers"][0]["models"]))
@@ -1083,7 +1347,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   supported_upstream_url_surfaces: [openai/responses]
             """
         )
-        payload = config_editor.load_config(path)
+        payload = config_load.load_config(path)
         path.write_text(
             textwrap.dedent(
                 """
@@ -1102,7 +1366,147 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "changed on disk"):
-            config_editor.save_config(payload["providers"], path, payload["revision"])
+            config_api.save_config(payload["providers"], path, payload["revision"])
+
+    def test_save_restricts_active_and_backup_configuration_permissions(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              primary:
+                api_base: "https://example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "synthetic-secret"
+            model_list: []
+            """
+        )
+        path.chmod(0o644)
+        payload = config_load.load_config(path)
+
+        result = config_api.save_config(payload["providers"], path, payload["revision"])
+
+        self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(Path(result["backup"]).stat().st_mode))
+
+    def test_save_uses_imported_document_as_the_complete_base(self) -> None:
+        target = self.write_config(
+            """
+            providers:
+              local:
+                api_base: "https://local.example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-local"
+            model_list:
+              - model_name: local-chat
+                litellm_params:
+                  model: openai/local-chat
+                  api_base: "https://local.example.test/v1"
+                  api_key: "sk-local"
+                model_info:
+                  id: "00000061"
+                  provider: local
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+            general_settings:
+              master_key: sk-local-litellm
+              ui: true
+              source: local
+            router_settings:
+              routing_strategy: local-only
+            """
+        )
+        source_dir = target.parent / "import-source"
+        source_dir.mkdir()
+        source = source_dir / "config.yaml"
+        source.write_text(
+            textwrap.dedent(
+                """
+                providers:
+                  imported:
+                    api_base: "https://imported.example.test/v1"
+                    api_keys:
+                      - name: default
+                        value: "sk-imported"
+                model_list:
+                  - model_name: imported-chat
+                    litellm_params:
+                      model: openai/imported-chat
+                      api_base: "https://imported.example.test/v1"
+                      api_key: "sk-imported"
+                    model_info:
+                      id: "00000062"
+                      provider: imported
+                      upstream_url_surface: openai/responses
+                      supported_upstream_url_surfaces: [openai/responses]
+                general_settings:
+                  master_key: sk-local-litellm
+                  ui: false
+                  source: imported
+                router_settings:
+                  routing_strategy: imported-priority
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        imported = config_load.load_config(source)
+        target_payload = config_load.load_config(target)
+
+        result = config_api.save_config(
+            imported["providers"],
+            target,
+            target_payload["revision"],
+            imported["document"],
+        )
+        saved = config_schema._load_yaml(target)
+
+        self.assertEqual("imported-priority", saved["router_settings"]["routing_strategy"])
+        self.assertEqual("imported", saved["general_settings"]["source"])
+        self.assertFalse(saved["general_settings"]["ui"])
+        self.assertEqual({"imported"}, set(saved["providers"]))
+        self.assertEqual(result["document"]["config"], target.read_text(encoding="utf-8"))
+
+    def test_imported_document_cannot_bypass_target_revision_check(self) -> None:
+        target = self.write_config(
+            """
+            providers:
+              target:
+                api_base: "https://target.example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-target"
+            model_list: []
+            """
+        )
+        source = target.with_name("source.yaml")
+        source.write_text(
+            textwrap.dedent(
+                """
+                providers:
+                  source:
+                    api_base: "https://source.example.test/v1"
+                    api_keys:
+                      - name: default
+                        value: "sk-source"
+                model_list: []
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        imported = config_load.load_config(source)
+        target_payload = config_load.load_config(target)
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\nrouter_settings: {}\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "changed on disk"):
+            config_api.save_config(
+                imported["providers"],
+                target,
+                target_payload["revision"],
+                imported["document"],
+            )
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ func readPayload() -> RuntimeSettingsPayload {
 }
 
 func makeController(_ payload: RuntimeSettingsPayload) -> RuntimeSettingsDialogController {
+    _ = NSApplication.shared
     let controller = RuntimeSettingsDialogController(settings: payload.settings)
     controller.window.contentView?.layoutSubtreeIfNeeded()
     return controller
@@ -72,6 +73,40 @@ func layoutAudit(_ payload: RuntimeSettingsPayload, width: CGFloat) {
     emitJSON(report)
 }
 
+func windowMetricsAudit(_ payload: RuntimeSettingsPayload) {
+    let controller = makeController(payload)
+    controller.window.setContentSize(NSSize(width: 1080, height: 620))
+    guard let root = controller.window.contentView,
+          let scrollView = descendants(of: root).compactMap({ $0 as? NSScrollView }).first,
+          let documentView = scrollView.documentView,
+          let formStack = documentView.subviews.compactMap({ $0 as? NSStackView }).first,
+          let firstItem = payload.settings.first else {
+        fail("Runtime Settings window metrics require a populated form.")
+    }
+
+    root.layoutSubtreeIfNeeded()
+    scrollView.layoutSubtreeIfNeeded()
+    documentView.layoutSubtreeIfNeeded()
+    formStack.layoutSubtreeIfNeeded()
+    root.layoutSubtreeIfNeeded()
+
+    let help = identifiedView("RuntimeSettingsHelp.\(firstItem.key)", below: documentView)
+    let headings: [[String: Double]] = controller.formCategorySections.map { section in
+        frameReport(section.heading, in: documentView)
+    }
+    emitJSON([
+        "content_width": Double(controller.window.contentRect(forFrameRect: controller.window.frame).width),
+        "minimum_width": Double(controller.window.minSize.width),
+        "maximum_width": Double(controller.window.maxSize.width),
+        "category_columns": controller.formCategoryColumnCounts,
+        "clip_width": Double(scrollView.contentView.bounds.width),
+        "document_width": Double(documentView.bounds.width),
+        "stack_width": Double(formStack.convert(formStack.bounds, to: documentView).width),
+        "help_width": Double(help.convert(help.bounds, to: documentView).width),
+        "headings": headings,
+    ])
+}
+
 func frameReport(_ view: NSView, in documentView: NSView) -> [String: Double] {
     let rect = view.convert(view.bounds, to: documentView)
     return [
@@ -81,6 +116,8 @@ func frameReport(_ view: NSView, in documentView: NSView) -> [String: Double] {
         "height": Double(rect.height),
         "min_x": Double(rect.minX),
         "max_x": Double(rect.maxX),
+        "min_y": Double(rect.minY),
+        "max_y": Double(rect.maxY),
         "mid_y": Double(rect.midY),
     ]
 }
@@ -96,7 +133,11 @@ func identifiedView(_ identifier: String, below root: NSView) -> NSView {
 
 func alignmentAudit(_ payload: RuntimeSettingsPayload, width: CGFloat) {
     let controller = makeController(payload)
+    controller.window.makeKeyAndOrderFront(nil)
     controller.window.setContentSize(NSSize(width: width, height: 620))
+    controller.refreshCategoryLayoutsIfNeeded(force: true)
+    controller.window.contentView?.layoutSubtreeIfNeeded()
+    controller.window.layoutIfNeeded()
     guard let root = controller.window.contentView else {
         fail("Runtime Settings window has no content view.")
     }
@@ -125,9 +166,20 @@ func alignmentAudit(_ payload: RuntimeSettingsPayload, width: CGFloat) {
         guard let control = controller.fields[item.key] else {
             fail("Runtime Settings control is missing for: \(item.key)")
         }
+        let sectionIndex = controller.formCategorySections.firstIndex { section in
+            section.rows.contains { $0 === row }
+        } ?? -1
+        let rowIndex = sectionIndex >= 0
+            ? controller.formCategorySections[sectionIndex].rows.firstIndex { $0 === row } ?? -1
+            : -1
+        let columnIndex = sectionIndex >= 0 && rowIndex >= 0
+            ? controller.formCategorySections[sectionIndex].arrangedRowColumnIndices[rowIndex]
+            : -1
 
         return [
             "key": item.key,
+            "section_index": sectionIndex,
+            "column_index": columnIndex,
             "row": frameReport(row, in: documentView),
             "input_row": frameReport(inputRow, in: documentView),
             "label": frameReport(label, in: documentView),
@@ -139,10 +191,35 @@ func alignmentAudit(_ payload: RuntimeSettingsPayload, width: CGFloat) {
         ]
     }
 
+    let headings: [[String: Double]] = controller.formCategorySections.map { section in
+        frameReport(section.heading, in: documentView)
+    }
+    let sections: [[String: Any]] = controller.formCategorySections.map { section in
+        [
+            "category": section.category,
+            "body": frameReport(section.body, in: documentView),
+            "columns": section.columns.map { column in
+                [
+                    "frame": frameReport(column, in: documentView),
+                    "arranged": column.arrangedSubviews.map { view in
+                        [
+                            "identifier": view.identifier?.rawValue ?? "",
+                            "frame": frameReport(view, in: documentView),
+                        ]
+                    },
+                ]
+            },
+            "rows": section.rows.map { frameReport($0, in: documentView) },
+        ]
+    }
+
     emitJSON([
         "requested_width": Double(width),
+        "category_columns": controller.formCategoryColumnCounts,
         "document": frameReport(documentView, in: documentView),
         "form_stack": frameReport(formStack, in: documentView),
+        "headings": headings,
+        "sections": sections,
         "entries": entries,
     ])
 }
@@ -218,13 +295,53 @@ func validationAudit(_ payload: RuntimeSettingsPayload, encodedValues: String) {
     ])
 }
 
+func modalSaveAudit(_ payload: RuntimeSettingsPayload) {
+    guard let firstItem = payload.settings.first else {
+        fail("Runtime Settings modal save audit requires a populated form.")
+    }
+    var controller: RuntimeSettingsDialogController!
+    controller = RuntimeSettingsDialogController(
+        settings: payload.settings,
+        saveHandler: { _, completion in
+            DispatchQueue.global(qos: .userInitiated).async {
+                completion(true, "Runtime settings saved and applied.")
+                performOnMainRunLoop {
+                    if let sheet = controller.window.attachedSheet {
+                        controller.window.endSheet(sheet, returnCode: .alertFirstButtonReturn)
+                    }
+                }
+            }
+        }
+    )
+    controller.setValue("7199", for: firstItem)
+    controller.refreshDirtyState()
+    RunLoop.main.perform(inModes: [.modalPanel]) {
+        controller.applyAction(nil)
+    }
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
+        performOnMainRunLoop {
+            controller.stopModal(with: .cancel)
+        }
+    }
+    let result = controller.runModal()
+    emitJSON([
+        "saved": result != nil,
+        "save_in_flight": controller.saveInFlight,
+    ])
+}
+
 let arguments = CommandLine.arguments
 guard arguments.count >= 2 else {
-    fail("usage: runtime-settings-dialog-harness {layout WIDTH|alignment WIDTH|controls|secret|validate BASE64_JSON_VALUES}")
+    fail("usage: runtime-settings-dialog-harness {window-metrics|layout WIDTH|alignment WIDTH|controls|secret|validate BASE64_JSON_VALUES|modal-save}")
 }
 
 let payload = readPayload()
 switch arguments[1] {
+case "window-metrics":
+    guard arguments.count == 2 else {
+        fail("window-metrics does not accept additional arguments.")
+    }
+    windowMetricsAudit(payload)
 case "layout":
     guard arguments.count == 3, let width = Double(arguments[2]), width >= 760 else {
         fail("layout requires a window width of at least 760.")
@@ -250,6 +367,11 @@ case "validate":
         fail("validate requires base64-encoded JSON setting values.")
     }
     validationAudit(payload, encodedValues: arguments[2])
+case "modal-save":
+    guard arguments.count == 2 else {
+        fail("modal-save does not accept additional arguments.")
+    }
+    modalSaveAudit(payload)
 default:
     fail("Unknown harness command: \(arguments[1])")
 }

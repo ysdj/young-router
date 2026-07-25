@@ -33,7 +33,6 @@ class ControlLiteLLMVersionTests(unittest.TestCase):
             env.pop(key, None)
         env.update(
             {
-                "LITELLM_ALLOW_CHECKOUT_SERVICE": "1",
                 "LITELLM_RUNTIME_ROOT": str(temp / "user-runtime"),
                 "LITELLM_TEMPLATE_ROOT": str(ROOT),
                 "LITELLM_BUNDLED_RUNTIME_DIR": str(bundled),
@@ -117,7 +116,6 @@ class ControlLiteLLMVersionTests(unittest.TestCase):
             env = os.environ.copy()
             env.update(
                 {
-                    "LITELLM_ALLOW_CHECKOUT_SERVICE": "1",
                     "LITELLM_RUNTIME_ROOT": str(runtime),
                     "LITELLM_TEMPLATE_ROOT": str(ROOT),
                     "LITELLM_VENV_DIR": str(venv),
@@ -125,7 +123,6 @@ class ControlLiteLLMVersionTests(unittest.TestCase):
                     "LITELLM_BIN": str(bin_dir / "litellm"),
                     "LITELLM_UV_BIN": str(uv),
                     "LITELLM_PORT": "49321",
-                    "LITELLM_LAUNCH_AGENT_LABEL": "menu.litellm.service.version-test",
                     "LITELLM_APP_LAUNCH_AGENT_LABEL": "menu.litellm.menu-login.version-test",
                     "LITELLM_CONFIG_WATCH_LABEL": "menu.litellm.config-watch.version-test",
                 }
@@ -154,18 +151,30 @@ class ControlLiteLLMVersionTests(unittest.TestCase):
 
         self.assertIn("LITELLM_VERSION", app_script)
         self.assertIn('! -d "$ROOT/mac_menu/Sources"', app_script)
+        self.assertIn('plutil -extract CFBundleIdentifier raw "$INFO"', app_script)
+        self.assertIn('tell application id \\"$bundle_identifier\\" to quit', app_script)
+        self.assertIn("refusing to force-kill", app_script)
+        self.assertIn("current app binary with a new process identity", app_script)
         self.assertIn("LITELLM_VERSION", build_script)
+        self.assertIn("refusing to replace its bundle in place", build_script)
+        self.assertIn("configuration_package.py", app_script)
+        self.assertIn("configuration_package.py", build_script)
         self.assertIn('-file-prefix-map "$ROOT=."', build_script)
         self.assertIn('-debug-prefix-map "$ROOT=."', build_script)
         self.assertIn('LITELLM_MACOS_DEPLOYMENT_TARGET:-13.0', build_script)
         self.assertEqual(build_script.count('-target "$SWIFT_TARGET"'), 2)
         self.assertEqual(build_script.count("verify_deployment_target"), 3)
-        self.assertIn('"litellm==$LITELLM_VERSION"', package_script)
-        self.assertIn("runtime-requirements.txt", package_script)
+        self.assertIn('"litellm[proxy]==$LITELLM_VERSION"', package_script)
+        self.assertNotIn("runtime-requirements.txt", package_script)
+        self.assertIn('Pillow \\\n    PyYAML \\\n    ddgs', package_script)
         self.assertIn("LITELLM_RELEASE_RUNTIME_SOURCE", package_script)
         self.assertIn("$VERSION-$BUILD_NUMBER-macos-$ARCH.tar.zst", package_script)
         self.assertIn('"$APP_RES/config_editor.py" --config "$CONFIG_EDITOR_RUNTIME/config.yaml" load', package_script)
         self.assertIn("assert result[\"providers\"] == 0", package_script)
+        cask = (ROOT / "Casks" / "litellm-menu.rb").read_text(encoding="utf-8")
+        self.assertNotIn('binary "LiteLLM Menu.app/Contents/Resources/App/codex-litellm"', cask)
+        self.assertIn('"menu.litellm.menu-login"', cask)
+        self.assertIn('"menu.litellm.config-watch"', cask)
 
     def test_config_editor_prefers_the_bundled_release_runtime(self) -> None:
         source = (ROOT / "mac_menu" / "Sources" / "ModelConfigEditorPersistence.swift").read_text(
@@ -185,8 +194,11 @@ class ControlLiteLLMVersionTests(unittest.TestCase):
         self.assertIn('let statusItemAutosaveName = "menu.litellm.menu.status-item"', source)
         self.assertIn("statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)", source)
         self.assertIn("statusItem.autosaveName = statusItemAutosaveName", source)
-        self.assertIn('string: "LL"', source)
+        self.assertIn('button.title = "LL"', source)
+        self.assertIn("renderStatusButton(.empty)", source)
         self.assertIn("button.image = nil", source)
+        self.assertNotIn('"LL !"', source)
+        self.assertNotIn('"LL ?"', source)
         self.assertIn('appendStatusItemDiagnostic(stage: "one-second")', source)
 
 

@@ -69,6 +69,25 @@ def _responses_custom_tool_item_id(value: Any, *, output: bool = False) -> Any:
     return f"{expected_prefix}{suffix}"
 
 
+def _responses_function_tool_item_id(value: Any, *, output: bool = False) -> Any:
+    if not isinstance(value, str) or not value:
+        return value
+    expected_prefix = "fco_" if output else "fc_"
+    if value.startswith(expected_prefix):
+        return value
+    known_prefixes = (
+        ("ctco_", "fco_", "ctc_", "fc_")
+        if output
+        else ("ctc_", "fc_", "ctco_", "fco_")
+    )
+    suffix = value
+    for prefix in known_prefixes:
+        if value.startswith(prefix):
+            suffix = value[len(prefix) :]
+            break
+    return f"{expected_prefix}{suffix}"
+
+
 def _normalize_responses_custom_tool_input_item_ids(
     value: Any,
 ) -> tuple[Any, dict[str, Any]]:
@@ -81,13 +100,24 @@ def _normalize_responses_custom_tool_input_item_ids(
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
-        if item_type not in {"custom_tool_call", "custom_tool_call_output"}:
+        if item_type not in {
+            "custom_tool_call",
+            "custom_tool_call_output",
+            "function_call",
+            "function_call_output",
+        }:
             continue
         item_id = item.get("id")
-        expected_id = _responses_custom_tool_item_id(
-            item_id,
-            output=item_type == "custom_tool_call_output",
-        )
+        if item_type.startswith("custom_tool_"):
+            expected_id = _responses_custom_tool_item_id(
+                item_id,
+                output=item_type == "custom_tool_call_output",
+            )
+        else:
+            expected_id = _responses_function_tool_item_id(
+                item_id,
+                output=item_type == "function_call_output",
+            )
         if expected_id == item_id:
             continue
         item["id"] = expected_id

@@ -5,16 +5,15 @@ extension AppDelegate {
         MenuState(
             serviceState: serviceState,
             autoStartState: .disabled,
-            routeTraceEnabled: false,
             routeRecoverySummary: "0 recovering / 0 cooldown",
+            routeRecovery: .empty,
             webdavSyncEnabled: false,
-            webdavLastStatus: WebDAVLastStatus(),
-            codexConfigState: CodexConfigState(configuredForLiteLLM: false, preSwitchReapplyAvailable: false)
+            webdavLastStatus: WebDAVLastStatus()
         )
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        guard !busy else { return }
+        guard !busy, !terminationCleanupInFlight else { return }
         refreshStatusForMenuOpen()
     }
 
@@ -28,7 +27,9 @@ extension AppDelegate {
             guard let self else { return }
             let state = self.currentMenuState(timeoutSeconds: self.statusRefreshTimeout)
             DispatchQueue.main.async {
-                guard !self.busy, generation == self.statusRefreshGeneration else { return }
+                guard !self.busy,
+                      !self.terminationCleanupInFlight,
+                      generation == self.statusRefreshGeneration else { return }
                 self.statusRefreshInFlight = false
                 self.renderState(state)
             }
@@ -36,7 +37,7 @@ extension AppDelegate {
     }
 
     func updateStatus() {
-        guard !busy, !statusRefreshInFlight else { return }
+        guard !busy, !statusRefreshInFlight, !terminationCleanupInFlight else { return }
         statusRefreshInFlight = true
         statusRefreshGeneration += 1
         let generation = statusRefreshGeneration
@@ -44,7 +45,9 @@ extension AppDelegate {
             guard let self else { return }
             let state = self.currentMenuState(timeoutSeconds: self.statusRefreshTimeout)
             DispatchQueue.main.async {
-                guard !self.busy, generation == self.statusRefreshGeneration else { return }
+                guard !self.busy,
+                      !self.terminationCleanupInFlight,
+                      generation == self.statusRefreshGeneration else { return }
                 self.statusRefreshInFlight = false
                 self.renderState(state)
             }
@@ -113,14 +116,80 @@ extension AppDelegate {
     }
 
     func routeRecoveryStatusTitle(_ summary: String) -> String {
-        let text = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = routeRecoveryDisplayText(summary).trimmingCharacters(in: .whitespacesAndNewlines)
         return "Recovery: \(text.isEmpty ? "0 recovering / 0 cooldown" : text)"
+    }
+
+    func routeRecoveryDisplayText(_ text: String) -> String {
+        text.replacingOccurrences(
+            of: "billing",
+            with: "credit",
+            options: .caseInsensitive
+        )
+    }
+
+    func routeRecoveryStatusTooltip(_ status: RouteRecoveryStatus) -> String {
+        guard let current = status.current else {
+            if status.cooldown > 0 {
+                return "\(status.cooldown) route deployment(s) are cooling down before they can be retried."
+            }
+            return "No active recovery polling."
+        }
+        let displayTitle = routeRecoveryDisplayText(current.title)
+        var lines = [displayTitle]
+        if !current.detail.isEmpty {
+            lines.append(routeRecoveryDisplayText(current.detail))
+        }
+        let kind = routeRecoveryKindLabel(current.kind)
+        if !kind.isEmpty {
+            lines.append("Cause: \(kind)")
+        }
+        let likelyStuck = current.activity == "overdue" || status.overdue > 0
+        let heartbeatUnavailable = current.heartbeatAgeSeconds == nil
+            || current.activity.localizedCaseInsensitiveContains("unavailable")
+        if likelyStuck {
+            lines.append("Verdict: no fresh heartbeat; recovery may be stuck.")
+        } else if heartbeatUnavailable {
+            lines.append("Verdict: heartbeat unavailable; recovery progress is unknown.")
+        } else {
+            lines.append("Verdict: heartbeat is fresh; recovery is still working.")
+        }
+        lines.append("State: \(routeRecoveryDisplayText(current.status))")
+        if let attempt = current.attempt {
+            lines.append("Attempt: \(attempt)")
+        }
+        if let heartbeatAge = current.heartbeatAgeSeconds {
+            let age = Int(heartbeatAge.rounded())
+            lines.append(age > 45 ? "Heartbeat is stale (\(age)s)." : "Heartbeat: \(age)s ago.")
+        }
+        if current.status == "retry scheduled", let cooldown = current.cooldownRemainingSeconds {
+            lines.append("Next cooldown check: \(Int(cooldown.rounded(.up)))s.")
+        }
+        if status.overdue > 0 {
+            lines.append("\(status.overdue) recovery item(s) need attention.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    func routeRecoveryKindLabel(_ kind: String) -> String {
+        switch kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "billing": return "Credit or quota"
+        case "auth": return "Authentication"
+        case "network": return "Network"
+        case "rate_limit": return "Rate limit"
+        case "timeout": return "Timeout"
+        case "upstream": return "Upstream service"
+        case "routing": return "Routing"
+        case "": return ""
+        default: return kind == "unknown" ? "" : kind
+        }
     }
 
     func startServiceOnLaunch() {
         beginServiceStart(
             logMessage: "application launched; starting LiteLLM service",
-            failureTitle: "LiteLLM service start failed"
+            failureTitle: "LiteLLM service start failed",
+            showFailureAlert: !isHeadlessIsolatedTest
         )
     }
 
@@ -129,20 +198,22 @@ extension AppDelegate {
     }
 
     func beginServiceStart(logMessage: String, failureTitle: String, showFailureAlert: Bool) {
+        guard !terminationCleanupInFlight else { return }
         serviceShouldBeRunning = true
         guard !serviceStartInFlight else { return }
         serviceStartInFlight = true
-        lastStoppedRecoveryAttempt = Date()
+        lastServiceRecoveryAttempt = Date()
         statusRefreshGeneration += 1
         statusRefreshInFlight = false
         renderState(initialMenuState(serviceState: .starting))
         appendLog(logMessage)
         lifecycleQueue.async { [weak self] in
             guard let self else { return }
-            let result = self.control("start")
+            let result = self.lifecycleControl("start")
             let state = self.initialMenuState(serviceState: result.0 == 0 ? .running : .unhealthy)
             DispatchQueue.main.async {
                 self.serviceStartInFlight = false
+                guard !self.terminationCleanupInFlight else { return }
                 self.statusRefreshGeneration += 1
                 self.statusRefreshInFlight = false
                 self.renderState(state)
@@ -159,10 +230,13 @@ extension AppDelegate {
     }
 
     func ensureConfigWatchEnabled() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        guard !terminationCleanupInFlight else { return }
+        configWatchQueue.async { [weak self] in
             guard let self else { return }
-            let result = self.control("config-watch-ensure", logCommand: false)
+            guard !self.terminationCleanupInFlight else { return }
+            let result = self.control("config-watch-ensure", logCommand: false, timeoutSeconds: 5)
             DispatchQueue.main.async {
+                guard !self.terminationCleanupInFlight else { return }
                 if result.0 != 0 {
                     self.appendLog("config watch ensure failed: \(result.1)")
                 }
@@ -173,19 +247,7 @@ extension AppDelegate {
 
     func renderState(_ state: MenuState) {
         let serviceState = displayedServiceState(state.serviceState)
-        let previousServiceState = lastRenderedServiceState
-        lastRenderedServiceState = serviceState
-        let starting = serviceState.isTransitional
-        let canRecover = serviceState.canRecover
         statusMenuItem.title = serviceState.title
-
-        startMenuItem.isHidden = canRecover || starting
-        stopMenuItem.isHidden = !canRecover
-        restartServiceMenuItem.isHidden = !canRecover
-
-        startMenuItem.isEnabled = !canRecover && !starting
-        stopMenuItem.isEnabled = canRecover
-        restartServiceMenuItem.isEnabled = canRecover
 
         autoStartMenuItem.isEnabled = true
         switch state.autoStartState {
@@ -200,9 +262,6 @@ extension AppDelegate {
             autoStartMenuItem.state = .off
         }
 
-        routeTraceStartupMenuItem.isEnabled = true
-        routeTraceStartupMenuItem.state = state.routeTraceEnabled ? .on : .off
-
         webdavStatusMenuItem.title = webDAVStatusTitle(status: state.webdavLastStatus)
         webdavStatusMenuItem.toolTip = state.webdavLastStatus.output
         webdavStatusMenuItem.isEnabled = false
@@ -211,29 +270,13 @@ extension AppDelegate {
         webdavConfigureMenuItem.isEnabled = true
 
         routeRecoveryStatusMenuItem.title = routeRecoveryStatusTitle(state.routeRecoverySummary)
-        routeRecoveryStatusMenuItem.isEnabled = false
-        routeRecoveryDetailsMenuItem.isEnabled = true
+        routeRecoveryStatusMenuItem.toolTip = routeRecoveryStatusTooltip(state.routeRecovery)
+        routeRecoveryStatusMenuItem.isHidden = false
+        routeRecoveryStatusMenuItem.isEnabled = true
+        renderStatusButton(state.routeRecovery)
 
-        codexLocalMenuItem.isEnabled = !state.codexConfigState.configuredForLiteLLM
-        codexPreSwitchReapplyMenuItem.isEnabled = state.codexConfigState.configuredForLiteLLM
-            && state.codexConfigState.preSwitchReapplyAvailable
+        codexConfigurationMenuItem.isEnabled = true
 
         logsMenuItem.isEnabled = true
-
-        scheduleStoppedRecheckIfNeeded(previousState: previousServiceState, currentState: serviceState)
-    }
-
-    func scheduleStoppedRecheckIfNeeded(previousState: ServiceState?, currentState: ServiceState) {
-        guard currentState == .stopped else { return }
-        guard previousState == .running || previousState == .starting || previousState == .unhealthy else { return }
-        guard !busy, !stoppedRecheckPending else { return }
-
-        stoppedRecheckPending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self else { return }
-            self.stoppedRecheckPending = false
-            guard !self.busy else { return }
-            self.updateStatus()
-        }
     }
 }

@@ -45,7 +45,9 @@ These instructions apply to the entire `litellm-menu` repository.
 
 - For Codex/Responses tool regressions, final proof requires a fresh
   `codex exec` through the Menu-configured local proxy; `resume`, UI `continue`,
-  unit tests, and hand-written HTTP probes are not substitutes.
+  unit tests, and hand-written HTTP probes are not substitutes. Use an isolated
+  temporary `CODEX_HOME` for the check unless the task explicitly tests the
+  user's persistent configuration.
 - The CLI must execute real command and namespace/MCP tools, and sanitized
   trace must confirm the tool types survived routing without duplicate calls.
 - `No connected db` from an ad-hoc CLI usually means the local endpoint or
@@ -72,8 +74,10 @@ These instructions apply to the entire `litellm-menu` repository.
   otherwise recovery can retry the same failing deployment indefinitely.
 - Keep ordinary first-event, compaction first-event, post-first-event idle, and
   total recovery limits independently configurable and exposed consistently in
-  Runtime Settings. Compaction recovery may use the full recovery window, while
-  ordinary turns retain their bounded retry window.
+  Runtime Settings. All Responses recovery uses the configured total recovery
+  window. If every eligible deployment is cooling down, keep the same stream
+  alive with heartbeats, do not probe during cooldown, and retry only after a
+  deployment becomes eligible again.
 - A compaction/recovery fix is not complete until the installed launcher can
   resume a representative large local task, finish compaction, and proceed to a
   normal response or tool call. Keep the task id, provider, host, request ids,
@@ -82,6 +86,7 @@ These instructions apply to the entire `litellm-menu` repository.
 ## Native UI Screenshots
 
 - Computer Use can inspect LiteLLM Menu when a normal editor or settings `NSWindow` is open. A menu-bar-only process exposes only `NSStatusItem` / `NSMenu`; `get_app_state` may time out in that state even when the app is healthy. Retry once by bundle id (`menu.litellm.menu`), then open the target window before treating the timeout as an app defect. Do not add a persistent or hidden window solely to satisfy screenshot tooling.
+- **Computer Use status-item limitation and exact route (verified):** `menu.litellm.menu` is an `LSUIElement`, so its status item does not expose a normal accessibility window; `get_app_state` can time out even while the app and service are healthy. Do not infer an `LL` coordinate from another app's screenshot. Instead run `/usr/bin/open 'litellm-menu://open/codex-settings'` (or replace the final route with `providers-models`, `runtime-settings`, or `logs?tab=service`), then target the real bundle with Computer Use. After the normal `NSWindow` appears, call `get_app_state({app: "menu.litellm.menu"})` (retry once with `/Applications/LiteLLM Menu.app`) and inspect its returned tree/screenshot. The URL handler accepts only these fixed local routes and does not apply configuration. If a build predates the URL handler, record the transport limitation and separately verify app PID/service health; do not invent a coordinate workaround.
 - Never use a real configuration window for public screenshots. Run an isolated, ad-hoc-signed preview `.app` with a synthetic `config.yaml` containing only reserved example hosts, neutral provider/model names, and replace-me keys.
 - For a Computer Use capture, open the target normal window, address the app by name or full `.app` path, call `get_app_state`, and copy the returned single-window `screenshot.url`. A temporary preview should have a stable unique bundle id and be launched as a signed `.app`; an unregistered raw executable is not a reliable target.
 - Capture only the intended window. `/usr/sbin/screencapture -x -l <window-number> <output.png>` is an acceptable fallback when the capturing process already has Screen Recording permission, but an ad-hoc preview app may not. Do not capture the desktop, menu bar, other apps, logs, or real credentials. For multi-state documentation images, capture each window state separately and compose those sanitized window images afterward.
@@ -108,6 +113,32 @@ These instructions apply to the entire `litellm-menu` repository.
 - Re-run the sensitive-string scan against `git diff --cached` after staging and again against the committed range before pushing. A successful test run does not replace this privacy gate; do not upload while any unexplained match remains.
 - For public remotes, verify author and committer metadata before committing and use the intended public or noreply identity instead of a private email address.
 
-## Detailed Runbooks
+## Behavior Rules
 
-Read `docs/agent-runbooks.md` before changing routing, Codex/Responses client tools or streaming, web search bridge, vision bridge, image generation fallback, macOS lifecycle, WebDAV sync, or release packaging.
+- Preserve LiteLLM-native routing: source `config.yaml` defines providers,
+  deployments, keys, and order; staged runtime config is the only live route
+  source. Keep request-local exclusions, cooldowns, and learned limits separate
+  from user configuration.
+- Responses streams preserve emitted text, IDs, tool order, explicit choices,
+  and terminal errors. Use native tools first; bridge once only for a clear
+  schema incompatibility, never to mask auth, quota, network, timeout, or policy
+  failures. Diagnose recovery from protocol events and classified failures.
+- Preserve complete Codex compaction tool pairs and protected instructions.
+  Keep web search, vision, image, and tool bridges generic and metadata-driven.
+- The native menu app owns lifecycle; config watch validates and stages changes
+  but does not silently restart the service.
+- Preserve the normal ad-hoc signing and quarantine-removal installation path
+  for builds without a Developer ID. Do not replace it with Developer ID-only
+  assumptions.
+- Codex configuration belongs in user-level `CODEX_HOME/config.toml` and its
+  selected credential store. The menu may update it only after an explicit user
+  selection of a configured LiteLLM model; preserve unrelated settings and
+  credentials. Do not retain a menu action that copies a launcher command.
+- Import external provider/model configuration only from an explicit selected
+  file or the current `CODEX_HOME`; never scan home directories or third-party
+  application data. Validate before staging an editor draft; require Apply or
+  Save before writing. Packages may contain credentials: use mode `0600`, do
+  not log values, and keep public examples synthetic.
+- Before release changes, test, build and verify the default installed app and
+  its ad-hoc signature, then scan changed public files for secrets and private
+  data.

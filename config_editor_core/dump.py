@@ -1,65 +1,33 @@
 from __future__ import annotations
 
-from .schema import *
-from .load import *
+import hashlib
+import math
+import os
+import pathlib
+import re
+import secrets
+import tempfile
+from typing import Any
 from urllib.parse import urlparse
 
+import yaml
 
-_KNOWN_API_ENDPOINT_SUFFIXES = (
-    ("v1", "chat", "completions"),
-    ("v1", "chat", "completion"),
-    ("v1", "images", "generations"),
-    ("v1", "images", "generation"),
-    ("v1", "completions"),
-    ("v1", "completion"),
-    ("v1", "complete"),
-    ("v1", "responses"),
-    ("v1", "response"),
-    ("v1", "messages"),
-    ("v1", "message"),
-    ("v1", "models"),
-    ("v1", "model"),
-    ("v1", "chat"),
-    ("v1", "images"),
-    ("chat", "completions"),
-    ("chat", "completion"),
-    ("images", "generations"),
-    ("images", "generation"),
-    ("completions",),
-    ("completion",),
-    ("complete",),
-    ("responses",),
-    ("response",),
-    ("messages",),
-    ("message",),
-    ("models",),
-    ("model",),
-    ("chat",),
-    ("images",),
+from litellm_menu.api_base import normalize_configured_api_base
+
+from .schema import (
+    DEFAULT_API_KEY_NAME,
+    MENU_API_KEY_NAME_KEY,
+    MENU_MODEL_ENABLED_KEY,
+    MENU_ROUTE_KEY,
+    RANDOM_DEPLOYMENT_ID_RE,
+    SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
+    UPSTREAM_URL_SURFACE_KEY,
+    _as_dict,
+    _as_list,
+    _bool_value,
+    _string_value,
+    _upstream_url_surfaces,
 )
-
-
-def _normalize_configured_api_base(value: Any) -> str:
-    text = str(value or "").strip().rstrip("/")
-    if not text:
-        return ""
-    parsed = urlparse(text)
-    if not parsed.scheme or not parsed.netloc:
-        if "://" in text:
-            return text
-        parsed = urlparse(f"https://{text}")
-    if not parsed.scheme or not parsed.netloc:
-        return text
-    parts = [part for part in parsed.path.split("/") if part]
-    lowered = [part.lower() for part in parts]
-    for suffix in _KNOWN_API_ENDPOINT_SUFFIXES:
-        if len(lowered) >= len(suffix) and tuple(lowered[-len(suffix) :]) == suffix:
-            break
-    else:
-        if not parts or parts[-1].lower() != "v1":
-            parts.append("v1")
-    path = f"/{'/'.join(parts)}" if parts else ""
-    return parsed._replace(path=path, params="", query="", fragment="").geturl().rstrip("/")
 
 def _parse_scalar(text: str) -> Any:
     stripped = text.strip()
@@ -69,6 +37,18 @@ def _parse_scalar(text: str) -> Any:
         return yaml.safe_load(stripped)
     except Exception:
         return stripped
+
+
+def _numeric_order(value: Any) -> int | float:
+    text = str(value).strip()
+    if not text:
+        return 1
+    parsed = _parse_scalar(text)
+    if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+        raise ValueError(f"Invalid route order: {text}")
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        raise ValueError(f"Invalid route order: {text}")
+    return parsed
 
 
 def _set_if_text(target: dict[str, Any], key: str, value: Any) -> None:
@@ -195,7 +175,6 @@ def _normalized_api_keys(provider: dict[str, Any]) -> list[dict[str, Any]]:
         keys.append({
             "name": key_name,
             "value": key_value,
-            "enabled": True,
         })
         seen_names.add(key_name)
 
@@ -240,7 +219,7 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
         lines.append(f"  {name}: &{provider_anchor}")
         if not _bool_value(provider.get("enabled"), True):
             lines.append("    enabled: false")
-        api_base = _normalize_configured_api_base(provider.get("api_base", ""))
+        api_base = normalize_configured_api_base(provider.get("api_base", ""))
         if api_base:
             lines.append(f"    api_base: {_anchor_scalar(api_base, base_anchor)}")
         if keys:
@@ -279,10 +258,9 @@ def _entry_from_editor(
     entry = dict(_as_dict(model.get("entry_extra")))
     params = dict(_as_dict(model.get("litellm_extra")))
     model_info = dict(_as_dict(model.get("model_info_extra")))
-    model_info.pop("supports_vision", None)
     _set_if_text(entry, "model_name", model_name)
     _set_if_text(params, "model", litellm_model)
-    api_base = _normalize_configured_api_base(provider.get("api_base", ""))
+    api_base = normalize_configured_api_base(provider.get("api_base", ""))
     key_name = str(model.get("api_key_name", "")).strip()
     if not key_name:
         model_api_key = str(model.get("api_key", "")).strip()
@@ -298,9 +276,7 @@ def _entry_from_editor(
     if api_key:
         params["api_key"] = {"__alias__": _provider_key_anchor(provider_name, api_key_name)} if use_provider_aliases else api_key
 
-    order = _parse_scalar(str(model.get("order", "")).strip())
-    if order is None:
-        order = 1
+    order = _numeric_order(model.get("order", ""))
     params["order"] = order
 
     deployment_id = str(model.get("deployment_id", "")).strip().lower()
@@ -325,8 +301,10 @@ def _entry_from_editor(
     )
     if api_key_name:
         model_info[MENU_API_KEY_NAME_KEY] = api_key_name
-    if not model_enabled:
-        model_info[MENU_MODEL_ENABLED_KEY] = False
+    # Keep the model's own switch explicit even when the provider disables the
+    # effective route. Re-enabling a provider must restore each prior model
+    # state instead of treating every companion-file entry as model-disabled.
+    model_info[MENU_MODEL_ENABLED_KEY] = model_enabled
     supports_responses_image_tool = bool(
         model.get("supports_responses_image_generation_tool", False)
     )
@@ -508,11 +486,13 @@ def _unique_model_groups(active_entries: list[dict[str, Any]], existing_groups: 
 def _write_atomic(path: pathlib.Path, text: str) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as tmp:
             tmp.write(text.rstrip() + "\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
         os.replace(tmp_name, path)
+        os.chmod(path, 0o600)
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
-
-__all__ = [name for name in globals() if not name.startswith("__")]

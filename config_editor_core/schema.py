@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
-import datetime as _dt
 import hashlib
 import json
 import os
 import pathlib
 import re
-import shutil
 import sys
-import tempfile
-import secrets
 from typing import Any
 
 try:
@@ -19,9 +14,6 @@ try:
 except Exception as exc:  # pragma: no cover - exercised by menu error path
     print(f"PyYAML is required to edit config.yaml: {exc}", file=sys.stderr)
     sys.exit(1)
-
-
-ROOT = pathlib.Path(__file__).resolve().parent
 
 
 def _default_config_yaml() -> pathlib.Path:
@@ -49,6 +41,120 @@ UPSTREAM_URL_SURFACE_KEY = "upstream_url_surface"
 SUPPORTED_UPSTREAM_URL_SURFACES_KEY = "supported_upstream_url_surfaces"
 UPSTREAM_URL_SURFACES = {"openai/chat", "openai/responses", "anthropic"}
 CURRENT_HOOK_CALLBACK = "litellm_menu.callbacks.image_generation_routing_hook"
+YAML_MAX_EXPANDED_NODES = 100_000
+YAML_MAX_NESTING_DEPTH = 100
+YAML_MAX_FINAL_STRUCTURE_NODES = 100_000
+YAML_MAX_FINAL_SCALAR_BYTES = 8 * 1024 * 1024
+
+
+class _YamlStructureLimitExceeded(Exception):
+    pass
+
+
+def _checked_yaml_total(current: int, increment: int, limit: int) -> int:
+    if increment > limit - current:
+        raise _YamlStructureLimitExceeded
+    return current + increment
+
+
+def _validate_yaml_event_limits(text: str) -> None:
+    anchors: dict[str, tuple[int, int]] = {}
+    frames: list[dict[str, Any]] = []
+    document_cost = 0
+
+    def add_node(cost: int, depth: int) -> None:
+        nonlocal document_cost
+        if depth > YAML_MAX_NESTING_DEPTH:
+            raise _YamlStructureLimitExceeded
+        if frames:
+            frame = frames[-1]
+            frame["cost"] = _checked_yaml_total(
+                frame["cost"], cost, YAML_MAX_EXPANDED_NODES
+            )
+            frame["child_depth"] = max(frame["child_depth"], depth)
+        else:
+            document_cost = _checked_yaml_total(
+                document_cost, cost, YAML_MAX_EXPANDED_NODES
+            )
+
+    for event in yaml.parse(text):
+        if isinstance(event, (yaml.events.MappingStartEvent, yaml.events.SequenceStartEvent)):
+            if len(frames) + 1 > YAML_MAX_NESTING_DEPTH:
+                raise _YamlStructureLimitExceeded
+            frames.append({"anchor": event.anchor, "cost": 1, "child_depth": 0})
+            continue
+
+        if isinstance(event, yaml.events.ScalarEvent):
+            add_node(1, 1)
+            if event.anchor:
+                anchors[event.anchor] = (1, 1)
+            continue
+
+        if isinstance(event, yaml.events.AliasEvent):
+            target = anchors.get(event.anchor)
+            if target is None:
+                # Recursive aliases point at an anchor that is still being built.
+                raise _YamlStructureLimitExceeded
+            add_node(*target)
+            continue
+
+        if isinstance(event, (yaml.events.MappingEndEvent, yaml.events.SequenceEndEvent)):
+            if not frames:
+                raise _YamlStructureLimitExceeded
+            frame = frames.pop()
+            depth = 1 + frame["child_depth"]
+            if depth > YAML_MAX_NESTING_DEPTH:
+                raise _YamlStructureLimitExceeded
+            anchor = frame["anchor"]
+            if anchor:
+                anchors[anchor] = (frame["cost"], depth)
+            add_node(frame["cost"], depth)
+
+
+def _validate_loaded_yaml_limits(data: Any) -> None:
+    node_count = 0
+    scalar_bytes = 0
+    active_containers: set[int] = set()
+
+    def visit(value: Any, depth: int) -> None:
+        nonlocal node_count, scalar_bytes
+        if depth > YAML_MAX_NESTING_DEPTH:
+            raise _YamlStructureLimitExceeded
+        node_count = _checked_yaml_total(
+            node_count, 1, YAML_MAX_FINAL_STRUCTURE_NODES
+        )
+
+        if isinstance(value, str):
+            scalar_bytes = _checked_yaml_total(
+                scalar_bytes,
+                len(value.encode("utf-8")),
+                YAML_MAX_FINAL_SCALAR_BYTES,
+            )
+            return
+        if isinstance(value, bytes):
+            scalar_bytes = _checked_yaml_total(
+                scalar_bytes, len(value), YAML_MAX_FINAL_SCALAR_BYTES
+            )
+            return
+
+        if isinstance(value, dict):
+            children = (item for pair in value.items() for item in pair)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            children = iter(value)
+        else:
+            return
+
+        identity = id(value)
+        if identity in active_containers:
+            raise _YamlStructureLimitExceeded
+        active_containers.add(identity)
+        try:
+            for child in children:
+                visit(child, depth + 1)
+        finally:
+            active_containers.remove(identity)
+
+    visit(data, 1)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -188,6 +294,11 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                     f"{path.name} provider {provider_name} api_keys[{index}] uses unsupported api_key; "
                     "use value"
                 )
+            if "enabled" in key:
+                raise ValueError(
+                    f"{path.name} provider {provider_name} api_keys[{index}] uses unsupported enabled; "
+                    "remove unused API keys instead"
+                )
             if not _string_value(key.get("value")):
                 raise ValueError(
                     f"{path.name} provider {provider_name} api_keys[{index}] needs value"
@@ -210,6 +321,7 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 "supported_upstream_api_modes",
                 "supports_responses_endpoint",
                 "supports_image_generation",
+                "supports_vision",
                 "max_input_tokens",
                 "context_metadata_source",
                 "context_metadata_model_id",
@@ -252,12 +364,30 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 )
 
 
-def _load_yaml(path: pathlib.Path) -> dict[str, Any]:
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+def safe_load_yaml_text(text: str, source_name: str) -> Any:
+    """Load YAML with bounded aliases and structure, without schema validation."""
+
+    try:
+        _validate_yaml_event_limits(text)
+        data = yaml.safe_load(text)
+        _validate_loaded_yaml_limits(data)
+    except _YamlStructureLimitExceeded:
+        raise ValueError(f"{source_name} exceeds safe YAML structure limits") from None
+    except yaml.YAMLError:
+        raise ValueError(f"{source_name} is not valid YAML") from None
+    return data
+
+
+def load_yaml_text(text: str, path: pathlib.Path) -> dict[str, Any]:
+    data = safe_load_yaml_text(text, path.name)
     if not isinstance(data, dict):
         raise ValueError(f"{path.name} must be a YAML mapping")
     _validate_current_schema(data, path)
     return data
+
+
+def _load_yaml(path: pathlib.Path) -> dict[str, Any]:
+    return load_yaml_text(path.read_text(encoding="utf-8"), path)
 
 
 def _disabled_models_path(config_path: pathlib.Path) -> pathlib.Path:
@@ -286,7 +416,5 @@ def _assert_expected_revision(path: pathlib.Path, expected_revision: Any) -> Non
     if expected_revision != _config_revision(path):
         raise ValueError(
             "config.yaml changed on disk since this editor window loaded. "
-            "Close and reopen Edit Models Config, then apply your changes again."
+            "Close and reopen Providers & Models, then apply your changes again."
         )
-
-__all__ = [name for name in globals() if not name.startswith("__")]

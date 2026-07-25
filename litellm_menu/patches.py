@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 
 from . import api_base as _api_base_module
+from . import codex_fast_tier as _codex_fast_tier_module
 from . import image_generation as _image_generation_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
@@ -112,6 +113,26 @@ def _browser_compatible_headers_retry_entry(
     if excluded_ids:
         entry["_excluded_deployment_ids"] = excluded_ids
     return entry
+
+
+def _trace_codex_fast_tier_injected(request_kwargs: dict) -> None:
+    requested_tier = _codex_fast_tier_module._codex_fast_default_service_tier(
+        request_kwargs
+    )
+    if requested_tier is None:
+        return
+    _trace_module._route_trace(
+        "codex_fast_default_service_tier_injected",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
+        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
+        codex_fast_default_injected=True,
+        service_tier=requested_tier,
+        requested_service_tier=requested_tier,
+        source="codex_config_fast_default",
+    )
 
 
 
@@ -623,10 +644,8 @@ def _install_order_peer_failover_patch() -> None:
                     exception=_routing_module._trace_exception(e),
                 )
                 return await run_async_fallback(*args, **peer_kwargs)
-        if (
-            _routing_module._is_priority_deployment_failover_error(e)
-            and not _routing_module._should_retry_same_deployment_before_fallback(e)
-        ):
+        if _routing_module._is_priority_deployment_failover_error(e):
+            _routing_module._mark_same_deployment_retry_exhausted(e)
             _routing_module._mark_exception_for_deployment_failover(e, kwargs)
         _routing_module._sync_failed_deployment_exclusions(kwargs, e)
         if disable_fallbacks is not True:
@@ -744,6 +763,7 @@ def _install_generic_deployment_failover_patch() -> None:
             metadata["responses_custom_tool_item_ids_normalized"] = normalized_input_stats
             kwargs["litellm_metadata"] = metadata
         for update_request in (
+            _codex_fast_tier_module._with_codex_fast_default_service_tier,
             _image_generation_module._with_codex_tool_runtime_recovery_hints,
             _image_generation_module._with_empty_tool_controls_removed,
             _image_generation_module._with_codex_compaction_controls,
@@ -754,10 +774,12 @@ def _install_generic_deployment_failover_patch() -> None:
             updated_kwargs = update_request(kwargs)
             if updated_kwargs is not None:
                 kwargs = updated_kwargs
+                if update_request is _codex_fast_tier_module._with_codex_fast_default_service_tier:
+                    _trace_codex_fast_tier_injected(kwargs)
         target_order = kwargs.get("_target_order")
         excluded_deployment_ids = kwargs.get("_excluded_deployment_ids")
         external_web_search_internal = _request_is_external_web_search_internal_call(kwargs)
-        max_retries = 0 if external_web_search_internal else _routing_module._stream_route_exhaustion_retries()
+        max_retries = 0 if external_web_search_internal else _routing_module._same_deployment_retries()
         retry_delay_seconds = _routing_module._stream_route_exhaustion_retry_delay_seconds()
         retry_attempt = 0
         _trace_module._route_trace(
@@ -809,11 +831,6 @@ def _install_generic_deployment_failover_patch() -> None:
                     continue
                 if _routing_module._is_priority_deployment_failover_error(exc):
                     _routing_module._mark_exception_for_deployment_failover(exc, kwargs)
-                _routing_module._sync_failed_deployment_exclusions(
-                    kwargs,
-                    exc,
-                    deployment_id=_responses_execution_module._failed_deployment_id(exc),
-                )
                 _trace_module._route_trace(
                     "generic_fallback_helper_error",
                     request_id=_routing_module._trace_request_id(kwargs),
@@ -896,12 +913,18 @@ def _install_generic_deployment_failover_patch() -> None:
                         or excluded_deployment_ids,
                     )
                     continue
+                # The explicit retry loop has now consumed the selected
+                # route's budget (including the default zero extra attempts).
+                # Do this before asking for an ordered peer/next-hop entry.
+                _routing_module._mark_same_deployment_retry_exhausted(exc)
+                _routing_module._sync_failed_deployment_exclusions(
+                    kwargs,
+                    exc,
+                    deployment_id=_responses_execution_module._failed_deployment_id(exc),
+                )
                 decision_kwargs = _responses_execution_module._request_kwargs_with_model_group(model, kwargs)
                 order_fallback_entry = None
-                if (
-                    not external_web_search_internal
-                    and not _routing_module._is_sanitized_upstream_route_failure_error(exc)
-                ):
+                if not external_web_search_internal:
                     order_fallback_entry = _responses_execution_module._ordered_deployment_fallback_entry(
                         self,
                         exc,
@@ -958,6 +981,10 @@ def _install_generic_deployment_failover_patch() -> None:
                         exception=_routing_module._trace_exception(exc),
                     )
                     recovery_stream_kwargs = _responses_execution_module._request_kwargs_with_model_group(model, kwargs)
+                    recovery_stream_kwargs = recovery_stream_kwargs.copy()
+                    recovery_stream_kwargs[
+                        "_route_recovery_ignore_local_constraints"
+                    ] = True
                     return _routing_module._route_recovery_stream_response(recovery_stream_kwargs, exc)
                 if (
                     _routing_module._is_route_recovery_poll_payload(decision_kwargs)
@@ -985,6 +1012,14 @@ def _install_generic_deployment_failover_patch() -> None:
                     )
                     failed_stream_kwargs = _responses_execution_module._request_kwargs_with_model_group(model, kwargs)
                     return _routing_module._failed_responses_stream_response(failed_stream_kwargs, exc)
+                if (
+                    kwargs.get("stream") is True
+                    and "input" in kwargs
+                    and _routing_module._recovery_max_seconds_for_request(kwargs) <= 0
+                    and _routing_module._is_route_recovery_poll_error(exc)
+                ):
+                    failed_stream_kwargs = _responses_execution_module._request_kwargs_with_model_group(model, kwargs)
+                    return _routing_module._failed_responses_stream_response(failed_stream_kwargs, exc)
                 if _routing_module._should_sanitize_final_upstream_route_error(exc):
                     _routing_module._raise_sanitized_upstream_route_failure(model, exc, kwargs)
                 raise
@@ -992,6 +1027,68 @@ def _install_generic_deployment_failover_patch() -> None:
     setattr(patched_generic_helper, _GENERIC_HELPER_PATCH_ATTR, True)
     setattr(patched_generic_helper, "_original_helper", original_helper)
     Router._ageneric_api_call_with_fallbacks_helper = patched_generic_helper
+
+
+def _install_same_deployment_retry_policy_patch() -> None:
+    """Keep LiteLLM's own retry loop aligned with the Menu's next-hop budget."""
+    try:
+        from litellm.router import Router
+    except Exception:
+        return
+
+    original_update_kwargs = getattr(Router, "_update_kwargs_before_fallbacks", None)
+    if original_update_kwargs is not None and not getattr(
+        original_update_kwargs,
+        "_litellm_menu_same_deployment_retry_policy_patch",
+        False,
+    ):
+
+        def patched_update_kwargs(
+            self: Any,
+            model: str,
+            kwargs: dict,
+            metadata_variable_name: Optional[str] = "metadata",
+        ) -> Any:
+            result = original_update_kwargs(
+                self,
+                model,
+                kwargs,
+                metadata_variable_name=metadata_variable_name,
+            )
+            # LiteLLM's per-router retry policy must not consume attempts
+            # invisibly. The Menu's explicit loop owns this budget.
+            kwargs["num_retries"] = 0
+            return result
+
+        setattr(
+            patched_update_kwargs,
+            "_litellm_menu_same_deployment_retry_policy_patch",
+            True,
+        )
+        setattr(patched_update_kwargs, "_original_update_kwargs", original_update_kwargs)
+        Router._update_kwargs_before_fallbacks = patched_update_kwargs
+
+    original_retry_policy = getattr(Router, "get_num_retries_from_retry_policy", None)
+    if original_retry_policy is not None and not getattr(
+        original_retry_policy,
+        "_litellm_menu_same_deployment_retry_policy_patch",
+        False,
+    ):
+
+        def patched_retry_policy(
+            self: Any,
+            exception: Exception,
+            model_group: Optional[str] = None,
+        ) -> int:
+            return 0
+
+        setattr(
+            patched_retry_policy,
+            "_litellm_menu_same_deployment_retry_policy_patch",
+            True,
+        )
+        setattr(patched_retry_policy, "_original_retry_policy", original_retry_policy)
+        Router.get_num_retries_from_retry_policy = patched_retry_policy
 
 
 def _install_responses_completion_stream_patch() -> None:
@@ -1236,5 +1333,6 @@ def install_all() -> None:
     _install_selected_deployment_marker_patch()
     _install_order_peer_failover_patch()
     _install_generic_deployment_failover_patch()
+    _install_same_deployment_retry_policy_patch()
     _install_responses_completion_stream_patch()
     _install_responses_tool_search_bridge_patch()

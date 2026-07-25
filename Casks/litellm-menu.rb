@@ -17,5 +17,9 @@ cask "litellm-menu" do
                    args: ["-dr", "com.apple.quarantine", "#{appdir}/LiteLLM Menu.app"]
   end
 
-  uninstall quit: "menu.litellm.menu"
+  uninstall launchctl: [
+              "menu.litellm.config-watch",
+              "menu.litellm.menu-login",
+            ],
+            quit:      "menu.litellm.menu"
 end

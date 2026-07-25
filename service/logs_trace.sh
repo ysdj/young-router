@@ -1,36 +1,4 @@
 # shellcheck shell=bash
-route_trace_enable() {
-  local tmp
-  mkdir -p "$RUNTIME_DIR"
-  tmp="$(mktemp "$RUNTIME_DIR/route-trace.enabled.XXXXXX")"
-  printf '1\n' > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$ROUTE_TRACE_STATE_FILE"
-  echo "Route trace enabled for the running service and future starts"
-}
-
-route_trace_disable() {
-  local tmp
-  mkdir -p "$RUNTIME_DIR"
-  tmp="$(mktemp "$RUNTIME_DIR/route-trace.disabled.XXXXXX")"
-  {
-    printf '0\n'
-    printf 'disabled_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  } > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$ROUTE_TRACE_STATE_FILE"
-  echo "Route trace disabled for the running service and future starts"
-}
-
-route_trace_status() {
-  if [[ "$(route_trace_state_value)" == "1" ]]; then
-    echo "enabled"
-    exit 0
-  fi
-  echo "disabled"
-  exit 1
-}
-
 recent_requests_log() {
   local formatter_python
   rotate_log_if_needed "$RECENT_REQUESTS_LOG"
@@ -283,13 +251,10 @@ EOF
   cat <<EOF
 
 Route trace:
-  state: $(route_trace_state_value)
-  state file: $ROUTE_TRACE_STATE_FILE
-  route trace viewer: View Route Trace Log
+  state: always enabled
+  route trace viewer: View Logs > Route Trace
 
 Launch agents:
-  session service plist: $SESSION_LAUNCH_AGENT_PLIST
-  login service plist: $AUTOSTART_LAUNCH_AGENT_PLIST
   login menu app plist: $APP_LAUNCH_AGENT_PLIST
   config watch plist: $CONFIG_WATCH_PLIST
 
@@ -325,37 +290,4 @@ No litellm_route_trace lines found in the scanned native service log window.
 Enable Route Trace, run a request, and open this log again.
 EOF
   fi
-}
-
-route_trace_html() {
-  rotate_log_if_needed "$LOG_FILE"
-  local scan_lines max_requests
-  scan_lines="$ROUTE_TRACE_SCAN_LINES"
-  max_requests="$ROUTE_TRACE_MAX_REQUESTS"
-  ensure_python_tools || return 1
-  if [[ ! -f "$LOG_FILE" ]]; then
-    echo "No service log file yet: $LOG_FILE" >&2
-    return 1
-  fi
-  tail -n "$scan_lines" "$LOG_FILE" | "$PYTHON" "$TEMPLATE_ROOT/route_trace_report.py" \
-    --scan-lines "$scan_lines" \
-    --trace-state-file "$ROUTE_TRACE_STATE_FILE" \
-    --trace-state-status "$(route_trace_state_value)" \
-    --max-requests "$max_requests"
-}
-
-route_recovery_html() {
-  ensure_python_tools || return 1
-  "$PYTHON" "$TEMPLATE_ROOT/route_recovery_report.py" \
-    --recovery-state-file "$ROUTE_RECOVERY_STATE_FILE" \
-    --cooldown-state-file "$DEPLOYMENT_COOLDOWN_FILE" \
-    --recent-requests-log "$RECENT_REQUESTS_LOG"
-}
-
-route_recovery_summary() {
-  ensure_python_tools || return 1
-  "$PYTHON" "$TEMPLATE_ROOT/route_recovery_report.py" \
-    --summary \
-    --recovery-state-file "$ROUTE_RECOVERY_STATE_FILE" \
-    --cooldown-state-file "$DEPLOYMENT_COOLDOWN_FILE"
 }
