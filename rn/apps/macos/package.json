@@ -1,0 +1,32 @@
+{
+  "name": "@litellm-menu/macos",
+  "version": "0.0.0",
+  "private": true,
+  "description": "LiteLLM Menu React Native macOS host.",
+  "dependencies": {
+    "@babel/runtime": "7.29.7",
+    "react": "19.2.3",
+    "react-native-macos": "link:../../vendor/react-native-macos-0.85/packages/react-native"
+  },
+  "codegenConfig": {
+    "name": "LiteLLMMacControls",
+    "type": "components",
+    "jsSrcsDir": "../../packages/shared/src/ui/macos",
+    "ios": {
+      "componentProvider": {
+        "LiteLLMAppKitButton": "LiteLLMAppKitButtonComponentView",
+        "LiteLLMAppKitCheckbox": "LiteLLMAppKitCheckboxComponentView",
+        "LiteLLMAppKitPicker": "LiteLLMAppKitPickerComponentView",
+        "LiteLLMAppKitSegmentedControl": "LiteLLMAppKitSegmentedControlComponentView",
+        "LiteLLMAppKitTextField": "LiteLLMAppKitTextFieldComponentView",
+        "LiteLLMAppKitSwitch": "LiteLLMAppKitSwitchComponentView",
+        "LiteLLMAppKitSelectableRow": "LiteLLMAppKitSelectableRowComponentView",
+        "LiteLLMAppKitTable": "LiteLLMAppKitTableComponentView",
+        "LiteLLMAppKitTextEditor": "LiteLLMAppKitTextEditorComponentView",
+        "LiteLLMAppKitSecureTextEditor": "LiteLLMAppKitSecureTextEditorComponentView",
+        "LiteLLMAppKitSecureTextInput": "LiteLLMAppKitSecureTextInputComponentView",
+        "LiteLLMAppKitSplitView": "LiteLLMAppKitSplitViewComponentView"
+      }
+    }
+  }
+}

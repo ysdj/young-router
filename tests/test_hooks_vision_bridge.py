@@ -4,6 +4,18 @@ from hook_test_utils import *
 
 
 class HookVisionBridgeTests(HookTestCase):
+    def test_local_helper_uses_portable_core_path_and_explicit_override(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env("LITELLM_MENU_CORE_ROOT", "/tmp/synthetic-core")
+        self.set_env("LITELLM_MENU_VISION_HELPER", None)
+        self.assertEqual(
+            hooks._vision_helper_source(),
+            Path("/tmp/synthetic-core/bin/vision_ocr"),
+        )
+
+        self.set_env("LITELLM_MENU_VISION_HELPER", "/tmp/synthetic-helper")
+        self.assertEqual(hooks._vision_helper_source(), Path("/tmp/synthetic-helper"))
+
     async def test_local_backend_reads_data_url_without_api(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env("LITELLM_MENU_VISION_BRIDGE_BACKEND", "local")

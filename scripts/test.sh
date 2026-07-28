@@ -3,12 +3,21 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Keep the shared desktop UI contract in the same gate as the Python Core.
+# This check is intentionally dependency-free: CI and checkout-only test runs
+# should still catch route/protocol drift before installing the RN toolchain.
+if command -v node >/dev/null 2>&1 && [[ -f rn/scripts/check-contract.mjs ]]; then
+  node rn/scripts/check-contract.mjs
+fi
+
 TEST_COMMAND=()
 if [[ -n "${LITELLM_TEST_PYTHON:-}" ]]; then
   TEST_COMMAND=("$LITELLM_TEST_PYTHON")
-elif [[ -x "${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/App/runtime/bin/python}" ]] \
-  && "${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/App/runtime/bin/python}" -c 'import yaml, litellm' >/dev/null 2>&1; then
-  TEST_COMMAND=("${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/App/runtime/bin/python}")
+  # Keep focused Core and integration tests on the selected runtime too.
+  export PYTHON="$LITELLM_TEST_PYTHON"
+elif [[ -x "${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/Core/runtime/bin/python}" ]] \
+  && "${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/Core/runtime/bin/python}" -c 'import yaml, litellm' >/dev/null 2>&1; then
+  TEST_COMMAND=("${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/Core/runtime/bin/python}")
 elif command -v uv >/dev/null 2>&1; then
   TEST_COMMAND=(
     uv run --python 3.12

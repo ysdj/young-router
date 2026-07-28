@@ -1,0 +1,9 @@
+# Keep Windows project sources byte-stable across macOS, Linux, and Windows.
+rn/NuGet.config text eol=lf
+rn/apps/windows/windows/** text eol=lf
+rn/apps/windows/windows/**/*.png binary
+rn/apps/windows/windows/**/*.ico binary
+rn/apps/windows/windows/**/*.rc binary
+
+# The RN Windows generator owns this output, including its emitted spacing.
+rn/apps/windows/windows/LiteLLMMenu/codegen/** whitespace=-trailing-space

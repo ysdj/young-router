@@ -1,0 +1,8 @@
+node_modules/
+Pods/
+build/
+DerivedData/
+*.xcuserstate
+*.user
+*.suo
+*.vsix

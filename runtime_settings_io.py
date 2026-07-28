@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
-import ast
 import math
 from dataclasses import dataclass
 from pathlib import Path
 import re
 
+from litellm_menu.core.runtime_settings_schema import runtime_settings_metadata
+
 
 MAX_PACKAGE_BYTES = 16 * 1024 * 1024
 RETAIN_EXISTING_VALUE = "__LITELLM_MENU_RETAIN_EXISTING__"
+RETIRED_PERSISTED_SETTINGS = frozenset(
+    {
+        "LITELLM_CONFIG_WATCH_INTERVAL",
+        "LITELLM_CONFIG_WATCH_SETTLE_INTERVAL",
+    }
+)
 
 
 class PackageError(ValueError):
@@ -27,46 +34,15 @@ class RuntimeSettingSpec:
     options: tuple[str, ...]
 
 
-def _source_path() -> Path:
-    return Path(__file__).resolve().parent / "service" / "runtime_settings.sh"
-
-
-def _configure_source_path() -> Path:
-    return Path(__file__).resolve().parent / "service" / "runtime_settings_configure.sh"
-
-
-def _literal_specs(source: Path, end_marker: str) -> list[object]:
-    try:
-        text = source.read_text(encoding="utf-8")
-        body = text.split("SPECS = [", 1)[1].split(end_marker, 1)[0]
-        result = ast.literal_eval("[" + body + "]")
-    except (IndexError, OSError, SyntaxError, ValueError) as exc:
-        raise PackageError("Runtime Settings schema is unavailable.") from exc
-    if not isinstance(result, list):
-        raise PackageError("Runtime Settings schema is unavailable.")
-    return result
-
-
 def load_specs() -> dict[str, RuntimeSettingSpec]:
-    """Read the one authoritative display/save schema from the service files."""
-
-    displayed = _literal_specs(_source_path(), "]\n\n\ndef read_configured")
-    configurable = _literal_specs(_configure_source_path(), "]\nSPEC_BY_KEY")
-    configured_by_key: dict[str, tuple[object, ...]] = {}
-    for item in configurable:
-        if not isinstance(item, tuple) or len(item) != 5 or not isinstance(item[0], str):
-            raise PackageError("Runtime Settings schema is unavailable.")
-        configured_by_key[item[0]] = item
+    """Build the validation schema from bundled Core-owned Python data."""
 
     specs: dict[str, RuntimeSettingSpec] = {}
-    for item in displayed:
+    for item in runtime_settings_metadata():
         if not isinstance(item, dict):
             raise PackageError("Runtime Settings schema is unavailable.")
         key = item.get("key")
         if not isinstance(key, str) or key in specs:
-            raise PackageError("Runtime Settings schema is unavailable.")
-        configured = configured_by_key.get(key)
-        if configured is None:
             raise PackageError("Runtime Settings schema is unavailable.")
         kind = item.get("kind")
         default = item.get("default")
@@ -75,10 +51,6 @@ def load_specs() -> dict[str, RuntimeSettingSpec]:
         if (
             not isinstance(kind, str)
             or not isinstance(default, str)
-            or kind != configured[1]
-            or default != str(configured[2])
-            or minimum != configured[3]
-            or maximum != configured[4]
         ):
             raise PackageError("Runtime Settings schema is unavailable.")
         options = item.get("options", [])
@@ -92,8 +64,6 @@ def load_specs() -> dict[str, RuntimeSettingSpec]:
             maximum=maximum,
             options=tuple(options),
         )
-    if set(specs) != set(configured_by_key):
-        raise PackageError("Runtime Settings schema is unavailable.")
     return specs
 
 
@@ -219,8 +189,8 @@ def _read_limited_utf8(path: Path, label: str, *, missing_is_empty: bool = False
         raise PackageError(f"{label} must be UTF-8.") from exc
 
 
-def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict[str, str]:
-    """Read a complete effective settings snapshot for the Runtime Settings UI."""
+def _read_persisted_values(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict[str, str]:
+    """Read stored settings while tolerating retired local keys."""
 
     source = _read_limited_utf8(path, "Runtime settings file", missing_is_empty=True)
     raw_values: dict[str, str] = {}
@@ -233,9 +203,18 @@ def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict
         key, raw = stripped.split("=", 1)
         key = key.strip()
         raw = raw.strip()
+        if key in RETIRED_PERSISTED_SETTINGS:
+            continue
         if key not in specs or key in raw_values:
             raise PackageError(f"Runtime settings file has invalid content at line {line_number}.")
         raw_values[key] = raw
+    return raw_values
+
+
+def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict[str, str]:
+    """Read a complete effective settings snapshot for the Runtime Settings UI."""
+
+    raw_values = _read_persisted_values(path, specs)
 
     values = {key: _default_payload_value(spec) for key, spec in specs.items()}
     for key, raw in raw_values.items():
@@ -252,3 +231,15 @@ def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict
         else:
             values[key] = normalize_payload_value(spec, raw)
     return validate_values(values, specs)
+
+
+def read_configured_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict[str, str]:
+    """Return validated persisted values without retired keys."""
+
+    raw_values = _read_persisted_values(path, specs)
+    effective = read_settings_file(path, specs)
+    configured: dict[str, str] = {}
+    for key, raw in raw_values.items():
+        spec = specs[key]
+        configured[key] = raw if spec.kind == "mb" else effective[key]
+    return configured

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import plistlib
 import re
@@ -12,7 +13,6 @@ from pathlib import Path
 
 
 VERSION_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
-PLIST_BUDDY = Path("/usr/libexec/PlistBuddy")
 
 
 @dataclass(frozen=True)
@@ -20,7 +20,9 @@ class VersionPaths:
     root: Path
     version_file: Path
     build_file: Path
-    info_plist: Path
+    rn_macos_info_plist: Path
+    rn_macos_project: Path
+    windows_manifests: tuple[Path, ...]
     cask_file: Path
 
     @classmethod
@@ -30,7 +32,40 @@ class VersionPaths:
             root=root,
             version_file=root / "VERSION",
             build_file=root / "BUILD_NUMBER",
-            info_plist=root / "mac_menu" / "Info.plist",
+            rn_macos_info_plist=(
+                root
+                / "rn"
+                / "apps"
+                / "macos"
+                / "macos"
+                / "LiteLLMMenu-macOS"
+                / "Info.plist"
+            ),
+            rn_macos_project=(
+                root
+                / "rn"
+                / "apps"
+                / "macos"
+                / "macos"
+                / "LiteLLMMenu.xcodeproj"
+                / "project.pbxproj"
+            ),
+            windows_manifests=(
+                root
+                / "rn"
+                / "apps"
+                / "windows"
+                / "windows"
+                / "LiteLLMMenu"
+                / "Package.appxmanifest",
+                root
+                / "rn"
+                / "apps"
+                / "windows"
+                / "windows"
+                / "LiteLLMMenu.Package"
+                / "Package.appxmanifest",
+            ),
             cask_file=root / "Casks" / "litellm-menu.rb",
         )
 
@@ -77,12 +112,12 @@ def write_text_if_changed(path: Path, value: str) -> bool:
 
 
 def sync_info_plist(paths: VersionPaths, plist_path: Path | None = None) -> bool:
-    plist_path = plist_path or paths.info_plist
+    plist_path = plist_path or paths.rn_macos_info_plist
     version = format_version(read_version(paths))
     build_number = str(read_build_number(paths))
 
-    with plist_path.open("rb") as handle:
-        info = plistlib.load(handle)
+    raw = plist_path.read_bytes()
+    info = plistlib.loads(raw)
 
     changed = False
     if info.get("CFBundleShortVersionString") != version:
@@ -93,23 +128,86 @@ def sync_info_plist(paths: VersionPaths, plist_path: Path | None = None) -> bool
         changed = True
 
     if changed:
-        if PLIST_BUDDY.exists():
-            subprocess.run(
-                [str(PLIST_BUDDY), "-c", f"Set :CFBundleShortVersionString {version}", str(plist_path)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                [str(PLIST_BUDDY), "-c", f"Set :CFBundleVersion {build_number}", str(plist_path)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        if raw.lstrip().startswith(b"<?xml"):
+            text = raw.decode("utf-8")
+            for key, value in (
+                ("CFBundleShortVersionString", version),
+                ("CFBundleVersion", build_number),
+            ):
+                text, count = re.subn(
+                    rf"(<key>{key}</key>\s*<string>)[^<]*(</string>)",
+                    rf"\g<1>{value}\2",
+                    text,
+                    count=1,
+                )
+                if count != 1:
+                    raise ValueError(f"missing {key} in Info.plist: {plist_path}")
+            plist_path.write_bytes(text.encode("utf-8"))
         else:
-            with plist_path.open("wb") as handle:
-                plistlib.dump(info, handle, sort_keys=False)
+            plist_path.write_bytes(plistlib.dumps(info, fmt=plistlib.FMT_BINARY, sort_keys=False))
     return changed
+
+
+def sync_xcode_project(paths: VersionPaths) -> bool:
+    project_path = paths.rn_macos_project
+    if not project_path.exists():
+        return False
+
+    version = format_version(read_version(paths))
+    build_number = str(read_build_number(paths))
+    text = project_path.read_text(encoding="utf-8")
+    updated = re.sub(
+        r"^(\s*)CURRENT_PROJECT_VERSION = [^;]+;",
+        rf"\g<1>CURRENT_PROJECT_VERSION = {build_number};",
+        text,
+        flags=re.MULTILINE,
+    )
+    if re.search(r"^\s*MARKETING_VERSION = ", updated, flags=re.MULTILINE):
+        updated = re.sub(
+            r"^(\s*)MARKETING_VERSION = [^;]+;",
+            rf"\g<1>MARKETING_VERSION = {version};",
+            updated,
+            flags=re.MULTILINE,
+        )
+    else:
+        updated = re.sub(
+            r"^(\s*)(CURRENT_PROJECT_VERSION = [^;]+;)$",
+            rf"\1\2\n\1MARKETING_VERSION = {version};",
+            updated,
+            flags=re.MULTILINE,
+        )
+    if updated == text:
+        return False
+    project_path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def windows_package_version(paths: VersionPaths) -> str:
+    version = (*read_version(paths), read_build_number(paths))
+    if any(part > 65535 for part in version):
+        raise ValueError("Windows package version components must not exceed 65535")
+    return ".".join(str(part) for part in version)
+
+
+def sync_windows_manifest(paths: VersionPaths, manifest_path: Path) -> bool:
+    if not manifest_path.exists():
+        return False
+    version = windows_package_version(paths)
+    original = manifest_path.read_bytes()
+    has_bom = original.startswith(codecs.BOM_UTF8)
+    text = original.decode("utf-8-sig")
+    updated, count = re.subn(
+        r'(<Identity\b(?:(?!/>)[\s\S])*?\bVersion=")[^"]+("\s*/>)',
+        rf"\g<1>{version}\2",
+        text,
+        count=1,
+    )
+    if count != 1:
+        raise ValueError(f"missing Identity Version in Windows manifest: {manifest_path}")
+    if updated == text:
+        return False
+    manifest_path.write_bytes((codecs.BOM_UTF8 if has_bom else b"") + updated.encode("utf-8"))
+    return True
 
 
 def sync_cask(paths: VersionPaths) -> bool:
@@ -131,10 +229,19 @@ def sync_cask(paths: VersionPaths) -> bool:
 
 
 def sync_metadata(paths: VersionPaths, plist_path: Path | None = None) -> bool:
-    changed = sync_info_plist(paths, plist_path=plist_path)
-    if plist_path is None or plist_path == paths.info_plist:
-        changed = sync_cask(paths) or changed
-    return changed
+    if plist_path is not None:
+        return sync_info_plist(paths, plist_path=plist_path)
+
+    if any(path.exists() for path in paths.windows_manifests):
+        windows_package_version(paths)
+
+    changed = False
+    if paths.rn_macos_info_plist.exists():
+        changed = sync_info_plist(paths, plist_path=paths.rn_macos_info_plist) or changed
+    changed = sync_xcode_project(paths) or changed
+    for manifest_path in paths.windows_manifests:
+        changed = sync_windows_manifest(paths, manifest_path) or changed
+    return sync_cask(paths) or changed
 
 
 def bump_patch(paths: VersionPaths) -> tuple[str, int]:
@@ -142,6 +249,8 @@ def bump_patch(paths: VersionPaths) -> tuple[str, int]:
     build_number = read_build_number(paths)
     next_version = (major, minor, patch + 1)
     next_build = build_number + 1
+    if any(part > 65535 for part in (*next_version, next_build)):
+        raise ValueError("Windows package version components must not exceed 65535")
 
     write_text_if_changed(paths.version_file, f"{format_version(next_version)}\n")
     write_text_if_changed(paths.build_file, f"{next_build}\n")
@@ -153,10 +262,15 @@ def stage_version_files(paths: VersionPaths) -> None:
     files = [
         paths.version_file.relative_to(paths.root),
         paths.build_file.relative_to(paths.root),
-        paths.info_plist.relative_to(paths.root),
     ]
-    if paths.cask_file.exists():
-        files.append(paths.cask_file.relative_to(paths.root))
+    for path in (
+        paths.cask_file,
+        paths.rn_macos_info_plist,
+        paths.rn_macos_project,
+        *paths.windows_manifests,
+    ):
+        if path.exists():
+            files.append(path.relative_to(paths.root))
     subprocess.run(["git", "add", "--", *map(str, files)], cwd=paths.root, check=True)
 
 
@@ -184,7 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
     bump_parser = subparsers.add_parser("bump", help="increment patch version and build number")
     bump_parser.add_argument("--stage", action="store_true", help="stage version files with git add")
 
-    sync_parser = subparsers.add_parser("sync", help="sync Info.plist from VERSION and BUILD_NUMBER")
+    sync_parser = subparsers.add_parser("sync", help="sync platform metadata from VERSION and BUILD_NUMBER")
     sync_parser.add_argument("--stage", action="store_true", help="stage version files with git add")
     sync_parser.add_argument("--plist", type=Path, help="Info.plist path to update")
 

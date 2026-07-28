@@ -1,0 +1,41 @@
+ENV['RCT_USE_RN_DEP'] = '0'
+ENV['RCT_USE_PREBUILT_RNCORE'] = '0'
+ENV['RCT_BUILD_HERMES_FROM_SOURCE'] = 'true'
+ENV['RCT_HERMES_V1_ENABLED'] = '1'
+ENV['RCT_NEW_ARCH_ENABLED'] = '1'
+require 'json'
+
+# The 0.85 merge branch has the newer JSI Hermes interface, while its source
+# tag still points at .0.2. Use the matching official .0.6 source revision.
+react_native_macos_lock = JSON.parse(File.read(File.expand_path("../../../vendor/react-native-macos-0.85.json", __dir__)))
+ENV['HERMES_COMMIT'] = react_native_macos_lock.fetch('hermes').fetch('sourceCommit')
+
+react_native_macos_path = File.expand_path("../../../vendor/react-native-macos-0.85/packages/react-native", __dir__)
+react_native_macos_relative_path = "../../../vendor/react-native-macos-0.85/packages/react-native"
+app_path = File.expand_path("..", __dir__)
+
+require File.join(react_native_macos_path, "scripts/react_native_pods")
+
+prepare_react_native_project!
+
+target 'LiteLLMMenu-macOS' do
+  platform :macos, '14.0'
+  use_native_modules!
+
+  use_react_native!(
+    :path => react_native_macos_path,
+    :hermes_enabled => true,
+    :fabric_enabled => true,
+    :app_path => app_path,
+    :config_file_dir => app_path
+  )
+
+  post_install do |installer|
+    react_native_post_install(installer, react_native_macos_relative_path)
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |config|
+        config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '14.0'
+      end
+    end
+  end
+end

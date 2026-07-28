@@ -146,9 +146,25 @@ def save_config(
         next_disabled_text = next_disabled_text.rstrip() + "\n"
 
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup = path.with_name(f"{path.name}.bak-{stamp}")
-    shutil.copy2(path, backup)
-    os.chmod(backup, 0o600)
+    backup: pathlib.Path | None = None
+    if path.exists():
+        backup = path.with_name(f"{path.name}.bak-{stamp}")
+        shutil.copy2(path, backup)
+        os.chmod(backup, 0o600)
+    else:
+        # A first-run editor starts from a validated in-memory empty document.
+        # Create only after the complete candidate above has validated and the
+        # missing-file revision has been checked, using the same atomic 0600
+        # writer as ordinary saves.
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # `_assert_expected_revision` above observed a missing file. Refuse a
+        # concurrent creator (including a symlink) instead of overwriting a
+        # configuration that appeared while the candidate was validating.
+        if path.exists() or path.is_symlink():
+            raise ValueError(
+                "config.yaml changed on disk since this editor window loaded. "
+                "Close and reopen Providers & Models, then apply your changes again."
+            )
     _write_atomic(path, next_text)
 
     disabled_path = _disabled_models_path(path)
@@ -171,7 +187,7 @@ def save_config(
         "providers": provider_count,
         "active": len(active_entries),
         "disabled": len(disabled_entries),
-        "backup": str(backup),
+        "backup": str(backup) if backup is not None else "",
         "disabled_path": str(disabled_path) if disabled_entries else "",
         "disabled_backup": disabled_backup,
         "revision": _config_revision(path),

@@ -1,0 +1,34 @@
+{
+  "name": "@litellm-menu/rn-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared React Native UI and native shells for LiteLLM Menu.",
+  "packageManager": "pnpm@11.10.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "bootstrap:rnmacos": "node scripts/bootstrap-rnmacos-085.mjs",
+    "verify:rnmacos": "node scripts/verify-rnmacos-085.mjs",
+    "codegen:windows": "react-native-windows-codegen --files packages/shared/src/ui/windows/*NativeComponent.ts --componentsWindows --libraryName LiteLLMMenu --namespace winrt::LiteLLMMenu::Codegen --outputDirectory apps/windows/windows/LiteLLMMenu/codegen",
+    "codegen:windows:check": "pnpm run codegen:windows --test",
+    "typecheck": "tsc --noEmit",
+    "contract-check": "node scripts/check-contract.mjs",
+    "test": "node scripts/check-contract.test.mjs",
+    "build": "pnpm run test && pnpm run contract-check && pnpm run typecheck && pnpm run codegen:windows:check",
+    "build:macos": "./scripts/build-macos.sh",
+    "build:windows": "pwsh ./scripts/build-windows.ps1"
+  },
+  "dependencies": {
+    "react": "19.2.3",
+    "react-native": "0.85.3",
+    "react-native-windows": "0.85.0-preview.1"
+  },
+  "devDependencies": {
+    "@react-native-windows/codegen": "0.85.0-preview.1",
+    "@react-native/babel-preset": "0.85.3",
+    "@react-native/metro-config": "0.85.3",
+    "@types/react": "19.2.3",
+    "typescript": "5.7.2"
+  }
+}

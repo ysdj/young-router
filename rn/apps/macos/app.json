@@ -1,0 +1,5 @@
+{
+  "name": "LiteLLMMenu",
+  "displayName": "LiteLLM Menu",
+  "platforms": ["macos", "windows"]
+}

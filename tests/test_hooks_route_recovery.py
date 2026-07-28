@@ -141,21 +141,71 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertTrue(hooks._is_route_recovery_poll_error(exc))
         self.assertTrue(hooks._should_return_route_recovery_stream(exc, request_data))
 
-    def test_route_recovery_polls_on_upstream_balance_error(self) -> None:
+    def test_route_recovery_polls_on_upstream_insufficient_user_quota(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
         class BalanceError(Exception):
             status_code = 403
 
-        exc = BalanceError("insufficient account balance")
+        exc = BalanceError(
+            'upstream rejected the request: {"code":"insufficient_user_quota"}'
+        )
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Continue."}],
             "stream": True,
         }
 
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
         self.assertTrue(hooks._is_route_recovery_poll_error(exc))
         self.assertTrue(hooks._should_return_route_recovery_stream(exc, request_data))
+        self.assertFalse(hooks._should_return_failed_responses_stream(exc, request_data))
+
+    async def test_generic_helper_returns_recovery_stream_for_insufficient_user_quota(
+        self,
+    ) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "60")
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        class BalanceError(Exception):
+            status_code = 403
+
+        async def original_generic_function(**kwargs):
+            raise BalanceError(
+                'upstream rejected the request: {"code":"insufficient_user_quota"}'
+            )
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            input=[{"role": "user", "content": "Continue."}],
+            stream=True,
+            model_info={"id": "only-route", "order": 1},
+        )
+
+        self.assertTrue(hooks._is_route_recovery_stream_response(response))
+        self.assertFalse(hooks._is_failed_responses_stream_response(response))
 
     def test_route_recovery_does_not_poll_on_context_size_error(self) -> None:
         hooks, _proxy_server = load_hook_module()

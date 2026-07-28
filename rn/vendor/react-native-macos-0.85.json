@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/microsoft/react-native-macos.git",
+  "ref": "0.85-merge",
+  "commit": "dcd3d60324c220393aae7729bb538235f3c70416",
+  "vendorDirectory": "vendor/react-native-macos-0.85",
+  "reactNativeDirectory": "packages/react-native",
+  "virtualizedListsDirectory": "packages/virtualized-lists",
+  "yarnRelease": ".yarn/releases/yarn-4.12.0.cjs",
+  "yarnVersion": "4.12.0",
+  "sourceVersion": "1000.0.0",
+  "hermes": {
+    "compilerVersion": "250829098.0.6",
+    "legacyTag": "hermes-v0.14.0",
+    "v1Tag": "hermes-v250829098.0.2",
+    "sourceTag": "hermes-v250829098.0.6",
+    "sourceCommit": "80149b7543d024f6e170434df7e0fd8de8f94aef",
+    "windowsCompilerVersion": "250829098.0.10",
+    "requiredBuildEnvironment": {
+      "RCT_USE_RN_DEP": "0",
+      "RCT_USE_PREBUILT_RNCORE": "0",
+      "RCT_BUILD_HERMES_FROM_SOURCE": "true",
+      "RCT_HERMES_V1_ENABLED": "1"
+    }
+  }
+}

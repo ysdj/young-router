@@ -13,11 +13,11 @@ __pycache__/
 .DS_Store
 .pytest_cache/
 .venv/
+node_modules/
+rn/vendor/react-native-macos-0.85/
 .playwright-cli/
 artifacts/
-docs/thread-watch/
 LiteLLM Menu.app/
-mac_menu/.build/
 .litellm-menu/
 menu.litellm.proxy.runtime.plist
 *audit*.png

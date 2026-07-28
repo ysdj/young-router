@@ -1,0 +1,6 @@
+{
+  "name": "@litellm-menu/shared",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared LiteLLM Menu React Native UI and IPC client."
+}

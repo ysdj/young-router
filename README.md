@@ -1,22 +1,25 @@
 # LiteLLM Menu
 
-LiteLLM Menu is a native macOS menu bar application that runs and manages a local [LiteLLM](https://github.com/BerriAI/litellm) proxy service. It consolidates multi-provider model routing, deployment fallback, Responses API compatibility, vision bridging, web search bridging, image generation tool adaptation, and selectable Codex configuration into a single app-owned local endpoint.
+LiteLLM Menu is a native macOS and Windows desktop application that runs and manages a local [LiteLLM](https://github.com/BerriAI/litellm) proxy service. It consolidates multi-provider model routing, deployment fallback, Responses API compatibility, vision bridging, web search bridging, image generation tool adaptation, and selectable Codex configuration into a single app-owned local endpoint.
 
-![LiteLLM Menu Providers and Routes views showing multiple example models, protocol probing, and deployment order](docs/images/model-editor.png)
+The desktop UI is delivered through the shared React Native workspace in
+[`rn/`](./rn/): React/TypeScript owns routes, components, interaction and
+i18n; `litellm_menu/core/` owns the single staged state source and versioned
+local IPC; AppKit and WinUI 3 provide only native leaves.
 
 ---
 
 ## Features
 
-### Native Menu Bar App
+### Native Desktop Hosts
 
-LiteLLM Menu runs as a macOS status bar application written in Swift. The menu app automatically starts and monitors its local LiteLLM proxy while it is open, and shuts that proxy down before it exits. No Docker container, database, or system Python installation is required. Homebrew releases include a self-contained Python runtime and LiteLLM dependencies, so first launch does not download or compile packages. Source builds retain a bundled `uv` fallback for development.
+LiteLLM Menu uses one shared React/TypeScript UI with an AppKit status item and native macOS controls, plus a WinUI 3 window, native controls, and Windows tray. The app automatically starts and monitors its local LiteLLM proxy while it is open, and shuts that proxy down before it exits. No Docker container, database, virtual environment, or system Python installation is required. Release builds include a self-contained Python runtime, Python Core, and pinned LiteLLM dependencies.
 
 The native menu is grouped by task:
 
 - **App** — control launch at login; the owned LiteLLM service is kept running while the app is open.
 - **Configuration** — open **Providers & Models...**, **Codex Settings...**, or **Runtime Settings...**; import or export a configuration package; and inspect live billing.
-- **Diagnostics** — record or inspect route traces, inspect recovery state and recent requests, open service or config-watch logs, and configure WebDAV sync.
+- **Diagnostics** — record or inspect route traces, inspect recovery state and recent requests, open service logs, and configure WebDAV sync.
 
 The status item remains a neutral `LL` at all times. During route recovery, its hover text and the clickable recovery row in the menu show the current step, classified cause, attempt, heartbeat age, and whether recovery is still progressing or may be stuck.
 
@@ -58,9 +61,9 @@ When a request contains image input and the selected route fails with a vision-u
 
 The bridge operates in three modes:
 
-- **`auto`** (default) — tries a configured OpenAI-compatible vision endpoint first, then falls back to the bundled local Vision OCR helper.
+- **`auto`** (default) — tries a configured OpenAI-compatible vision endpoint first, then falls back to the bundled local Vision OCR helper in the portable Core.
 - **`api`** — uses only the configured vision endpoint.
-- **`local`** — uses only the bundled `vision_ocr` binary, which leverages macOS Vision framework for OCR text recognition and rectangle detection to produce layout summaries.
+- **`local`** — uses only the bundled `Core/bin/vision_ocr` binary, which leverages macOS Vision framework for OCR text recognition and rectangle detection to produce layout summaries. Development hosts may override it with `LITELLM_MENU_VISION_HELPER`.
 
 The bridge does not switch the user's model group to an unrelated chat route. It removes image parts from the original request, appends the visual context as text, and retries the same route.
 
@@ -105,9 +108,9 @@ Route trace logging records deployment selection, fallback decisions, surface br
 
 A recent requests log stores routing and status metadata in JSONL format. Prompt bodies, message content, authorization headers, and API keys are not stored.
 
-### Config Watch and Validation
+### Configuration Validation
 
-A launchd-backed config watcher monitors `config.yaml` for changes. On detection, it validates the config and stages the validated config to `.litellm-runtime/config.yaml`; use the explicit Apply action to activate it. The watcher does not silently restart the service on every file write. The runtime service always starts from the staged runtime config, not the editable source config.
+The Core validates the editable configuration and stages the validated result to `.litellm-runtime/config.yaml`; use the explicit Apply action to activate it. The runtime service always starts from staged configuration, not directly from the editable source file.
 
 ---
 
@@ -117,7 +120,8 @@ A launchd-backed config watcher monitors `config.yaml` for changes. On detection
 
 - macOS 13.0 or later
 - Apple silicon Mac for the prebuilt Homebrew Cask
-- Xcode Command Line Tools when building from source (`xcode-select --install`)
+- Xcode, CocoaPods, Node.js 22 or later, and pnpm 11 when building the macOS host
+- Windows App SDK and Visual Studio's C++ desktop workload when building the Windows host
 - [uv](https://docs.astral.sh/uv/) when building from source (or set `LITELLM_UV_BIN` to a custom path)
 
 ### Homebrew (Recommended)
@@ -139,25 +143,35 @@ Clone the repository and build the app bundle:
 ```bash
 git clone https://github.com/ysdj/litellm-menu.git
 cd litellm-menu
-./mac_menu/build.sh
+cd rn
+pnpm run bootstrap:rnmacos
+pnpm install --frozen-lockfile
+LITELLM_MENU_MACOS_OUTPUT="$PWD/../artifacts/LiteLLM Menu.app" pnpm run build:macos
 ```
 
-The built app is placed at `/Applications/LiteLLM Menu.app` by default. To use a custom install path:
+The desktop dependency line is pinned to React Native `0.85.3`, React Native
+Windows `0.85.0-preview.1`, and an exact official `react-native-macos`
+`0.85-merge` source commit. `build:macos` verifies that source checkout and its
+separate Hermes toolchain before invoking CocoaPods/Xcode.
+
+The output is a signed React Native app with its relocatable Core runtime. Building does not replace the installed application. Launch the explicit artifact after reviewing it:
 
 ```bash
-LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
+open "$PWD/../artifacts/LiteLLM Menu.app"
 ```
 
-Launch the app:
+On Windows, run the equivalent host build from a Developer PowerShell:
 
-```bash
-./app.sh open
+```powershell
+cd rn
+pnpm install --frozen-lockfile
+pnpm run build:windows
 ```
 
 ### First Launch
 
 1. Open LiteLLM Menu from the menu bar icon (the "LL" status item).
-2. The Homebrew app starts the local LiteLLM proxy from its bundled runtime. A source-built app bootstraps its development runtime with `uv` when needed.
+2. The application starts the local LiteLLM proxy and Python Core from its bundled runtime.
 3. Click **Providers & Models...** to configure providers, API keys, models, and deployment order.
 4. Click **Apply Config** to stage and activate the configuration.
 5. To use Codex through LiteLLM, open **Codex Settings...**, choose a LiteLLM deployment in **Connection & model**, and choose **Apply**. The change is staged first, then updates only the user-level Codex `config.toml` / `auth.json` fields you selected while preserving unrelated values and the model group's LiteLLM route order.
@@ -236,28 +250,17 @@ Use **Import / Export Config...** to choose the direction in one compact native 
 
 ---
 
-## CLI Usage
+## Deep Links
 
-The `app.sh` script provides app-level control:
-
-```bash
-./app.sh open      # Launch or focus the menu app (builds if needed)
-./app.sh restart   # Refuse disruptive restart by default; protect active requests
-./app.sh restart --disruptive   # Rebuild, quit, and relaunch during a maintenance window
-./app.sh close     # Quit the app and stop its owned service
-./app.sh version   # Print app version
-```
-
-Use the bundled `service.sh` for read-only status, validation, and diagnostics. App lifecycle is controlled through `app.sh`; the menu has no manual service stop or restart action.
+Both native hosts accept fixed `litellm-menu://open/<route>` links. For example, macOS can open settings without relying on status-item automation:
 
 ```bash
-"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" status
-"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" validate
-"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" logs-summary
-"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" route-trace
+open "litellm-menu://open/providers-models"
+open "litellm-menu://open/codex-settings"
+open "litellm-menu://open/logs?tab=service"
 ```
 
-Use **Codex Settings...** in the menu to select a configured LiteLLM provider/model deployment and to manage the rest of the user-level Codex configuration.
+Deep links only navigate to allowlisted local routes. They cannot carry configuration values or trigger Apply.
 
 ---
 
@@ -277,17 +280,20 @@ For targeted tests:
 
 ### Building the App
 
-After changing Swift sources, Python service code, service scripts, or bundled resources:
+Install the pinned shared dependencies and run the contract/type checks:
 
 ```bash
-./mac_menu/build.sh
+cd rn
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm run build:macos
 ```
 
-For installed app behavior verification, the complete path is: build the app, restart the real menu-owned service, then verify on the normal local service.
+Create the formal macOS release archive from the same RN path with `./scripts/package-release.sh`. It verifies the app signature and proves the bundled Core runtime still works after relocation before producing the archive. Windows builds use `pnpm run build:windows` on a Windows host.
 
 ### Version Management
 
-`VERSION`, `BUILD_NUMBER`, `mac_menu/Info.plist`, and `Casks/litellm-menu.rb` are kept in sync through `scripts/version.py`.
+`VERSION`, `BUILD_NUMBER`, the RN macOS plist/Xcode project, both Windows manifests, and `Casks/litellm-menu.rb` are kept in sync through `scripts/version.py`.
 
 LiteLLM uses a two-stage version policy. Development explicitly advances `LITELLM_VERSION` to the latest stable PyPI release that provides a universal wheel with `./scripts/update-litellm.sh`; releases without a macOS-compatible binary are skipped so app startup never compiles LiteLLM from source. `./scripts/update-litellm.sh --check` fails when the compatible lock is stale. Built and released apps copy that lock and install exactly `litellm[proxy]==<locked version>`, so a release never changes SDK versions merely because a user starts or restarts the service later. After advancing the lock, rebuild, restart, and run the full test suite before release.
 
@@ -301,15 +307,15 @@ MIT License. See [LICENSE](LICENSE).
 
 # LiteLLM Menu（中文）
 
-LiteLLM Menu 是一个原生 macOS 菜单栏应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、视觉桥接、网页搜索桥接、图像生成工具适配，以及可选择模型的 Codex 配置整合到一个由应用管理的本地端点中。
+LiteLLM Menu 是一个 macOS 与 Windows 原生桌面应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、视觉桥接、网页搜索桥接、图像生成工具适配，以及可选择模型的 Codex 配置整合到一个由应用管理的本地端点中。
 
 ---
 
 ## 功能特性
 
-### 原生菜单栏应用
+### 双平台原生宿主
 
-LiteLLM Menu 以 Swift 编写，作为 macOS 状态栏应用运行。应用打开时会自动启动并监控其本地 LiteLLM 代理，退出前会关闭该代理。无需 Docker 容器、数据库或系统 Python 安装。Homebrew 发布包已内置独立 Python 运行时与 LiteLLM 依赖，首次启动无需下载或编译软件包；源码构建仍保留内置 `uv` 作为开发兜底。
+LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原生控件，以及 WinUI 3 窗口、Windows 原生控件和托盘组成。应用打开时会自动启动并监控本地 LiteLLM 代理，退出前关闭所辖服务。无需 Docker、数据库、虚拟环境或系统 Python；发布包内置独立 Python 运行时、Python Core 和锁定版本的 LiteLLM 依赖。
 
 原生菜单按任务分为三组：
 
@@ -357,9 +363,9 @@ LiteLLM Menu 以 Swift 编写，作为 macOS 状态栏应用运行。应用打�
 
 桥接器有三种模式：
 
-- **`auto`**（默认）— 先尝试已配置的 OpenAI 兼容视觉端点，失败后回退到内置本地 Vision OCR 辅助工具。
+- **`auto`**（默认）— 先尝试已配置的 OpenAI 兼容视觉端点，失败后回退到可迁移 Core 中的内置本地 Vision OCR 辅助工具。
 - **`api`** — 仅使用已配置的视觉端点。
-- **`local`** — 仅使用内置 `vision_ocr` 二进制工具，该工具利用 macOS Vision 框架进行 OCR 文本识别和矩形检测，生成布局摘要。
+- **`local`** — 仅使用内置 `Core/bin/vision_ocr` 二进制工具，该工具利用 macOS Vision 框架进行 OCR 文本识别和矩形检测，生成布局摘要。开发宿主可用 `LITELLM_MENU_VISION_HELPER` 覆盖该路径。
 
 桥接器不会将用户的模型组切换到无关的聊天路由。它移除原始请求中的图像部分，以文本形式附加视觉上下文，并重试同一路由。
 
@@ -404,9 +410,9 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 
 最近请求日志以 JSONL 格式存储路由和状态元数据。不存储提示词正文、消息内容、授权头和 API 密钥。
 
-### 配置监听与验证
+### 配置验证
 
-由 launchd 支持的配置监听器监控 `config.yaml` 的变更。检测到变更后，验证配置并将验证通过的配置暂存到 `.litellm-runtime/config.yaml`；需通过显式的 Apply 操作激活。监听器不会在每次文件写入时静默重启服务。运行时服务始终从暂存的运行时配置启动，而非可编辑的源配置。
+Python Core 验证可编辑配置，并将验证通过的结果暂存到 `.litellm-runtime/config.yaml`；需通过显式的 Apply 操作激活。运行时服务始终从暂存配置启动，而非直接使用可编辑的源文件。
 
 ---
 
@@ -416,7 +422,8 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 
 - macOS 13.0 或更高版本
 - 预构建 Homebrew Cask 目前要求 Apple silicon Mac
-- 源码构建需要 Xcode Command Line Tools（`xcode-select --install`）
+- 构建 macOS 宿主需要 Xcode、CocoaPods、Node.js 22 或以上和 pnpm 11
+- 构建 Windows 宿主需要 Windows App SDK 和 Visual Studio C++ 桌面工作负载
 - 源码构建需要 [uv](https://docs.astral.sh/uv/)（也可设置 `LITELLM_UV_BIN` 指向自定义路径）
 
 ### Homebrew 安装（推荐）
@@ -438,25 +445,35 @@ Homebrew 会下载预构建应用及其内置运行时。打开后直接启动�
 ```bash
 git clone https://github.com/ysdj/litellm-menu.git
 cd litellm-menu
-./mac_menu/build.sh
+cd rn
+pnpm run bootstrap:rnmacos
+pnpm install --frozen-lockfile
+LITELLM_MENU_MACOS_OUTPUT="$PWD/../artifacts/LiteLLM Menu.app" pnpm run build:macos
 ```
 
-构建的应用默认放置于 `/Applications/LiteLLM Menu.app`。使用自定义安装路径：
+桌面依赖线固定为 React Native `0.85.3`、React Native Windows
+`0.85.0-preview.1` 和官方 `react-native-macos` `0.85-merge` 的精确源码
+commit。`build:macos` 会在调用 CocoaPods/Xcode 前校验该源码及其独立 Hermes
+工具链。
+
+输出是带可迁移 Core runtime 的已签名 RN 应用；构建不会替换已安装应用。检查产物后可显式启动：
 
 ```bash
-LITELLM_APP_PATH="/your/path/LiteLLM Menu.app" ./mac_menu/build.sh
+open "$PWD/../artifacts/LiteLLM Menu.app"
 ```
 
-启动应用：
+Windows 请从 Developer PowerShell 执行：
 
-```bash
-./app.sh open
+```powershell
+cd rn
+pnpm install --frozen-lockfile
+pnpm run build:windows
 ```
 
 ### 首次启动
 
 1. 从菜单栏图标（"LL" 状态项）打开 LiteLLM Menu。
-2. Homebrew 应用直接从内置运行时启动本地 LiteLLM 代理；源码构建仅在需要时使用 `uv` 引导开发运行时。
+2. 应用从内置运行时启动本地 LiteLLM 代理和 Python Core。
 3. 点击 **Providers & Models...** 配置供应商、API 密钥、模型和部署顺序。
 4. 点击 **Apply Config** 暂存并激活配置。
 5. 如需让 Codex 通过 LiteLLM 运行，点击 **Codex Settings...**，在 **Connection & model** 中选择一个已配置的 provider/model 部署，然后点击 **Apply**。
@@ -535,28 +552,17 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 
 ---
 
-## 命令行使用
+## 深链
 
-`app.sh` 脚本提供应用级控制：
-
-```bash
-./app.sh open      # 启动或聚焦菜单应用（需要时构建）
-./app.sh restart   # 默认拒绝有中断风险的重启，保护正在进行的请求
-./app.sh restart --disruptive   # 维护窗口内重新构建、退出并重新启动应用
-./app.sh close     # 退出应用并停止其所辖服务
-./app.sh version   # 输出应用版本
-```
-
-内置的 `service.sh` 用于只读状态、校验和诊断。应用生命周期通过 `app.sh` 控制；菜单不提供手动停止或重启服务的操作。
+两个原生宿主都接受固定的 `litellm-menu://open/<route>` 深链。例如在 macOS 打开设置：
 
 ```bash
-"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" status
-"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" validate
-"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" logs-summary
-"/Applications/LiteLLM Menu.app/Contents/Resources/App/service.sh" route-trace
+open "litellm-menu://open/providers-models"
+open "litellm-menu://open/codex-settings"
+open "litellm-menu://open/logs?tab=service"
 ```
 
-请在菜单中使用 **Codex Settings...** 选择已配置的 LiteLLM provider/model 部署，并管理用户级 Codex 配置。
+深链只能导航到允许的本地页面，不能携带配置值或触发 Apply。
 
 ---
 
@@ -576,17 +582,20 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 
 ### 构建应用
 
-修改 Swift 源码、Python 服务代码、服务脚本或内置资源后：
+安装锁定依赖并执行契约、类型和 macOS 宿主构建：
 
 ```bash
-./mac_menu/build.sh
+cd rn
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm run build:macos
 ```
 
-验证已安装应用行为的完整路径：构建应用、重启实际的菜单所辖服务、然后在正常的本地服务上验证。
+正式 macOS 发布包使用同一 RN 路径执行 `./scripts/package-release.sh`。脚本验证签名，并在归档前迁移测试内置 Core runtime。Windows 在 Windows 主机运行 `pnpm run build:windows`。
 
 ### 版本管理
 
-`VERSION`、`BUILD_NUMBER`、`mac_menu/Info.plist` 和 `Casks/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
+`VERSION`、`BUILD_NUMBER`、RN macOS plist/Xcode 工程、两个 Windows manifest 和 `Casks/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
 
 LiteLLM 采用两阶段版本策略。开发时用 `./scripts/update-litellm.sh` 显式把 `LITELLM_VERSION` 推进到提供通用 wheel 的 PyPI 最新稳定版；缺少 macOS 兼容二进制包的版本会被跳过，避免应用启动时现场编译 LiteLLM。`./scripts/update-litellm.sh --check` 会在兼容版本锁落后时失败。构建和发布的应用会复制这个锁，并精确安装 `litellm[proxy]==<锁定版本>`，因此用户以后启动或重启服务时不会意外漂移 SDK 版本。更新版本锁后，发布前必须重新构建、重启并运行全套测试。
 

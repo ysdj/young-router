@@ -234,8 +234,15 @@ def _load_local_reference(reference: str) -> Optional[tuple[bytes, str]]:
 
 
 def _vision_helper_source() -> pathlib.Path:
-    app_bundle = os.environ.get("LITELLM_APP_PATH") or os.environ.get("APP_BUNDLE_PATH") or "/Applications/LiteLLM Menu.app"
-    return pathlib.Path(app_bundle) / "Contents" / "Resources" / "App" / "bin" / "vision_ocr"
+    override = os.environ.get("LITELLM_MENU_VISION_HELPER", "").strip()
+    if override:
+        return pathlib.Path(override).expanduser()
+
+    core_root = os.environ.get("LITELLM_MENU_CORE_ROOT", "").strip()
+    if core_root:
+        return pathlib.Path(core_root).expanduser() / "bin" / "vision_ocr"
+
+    return pathlib.Path(__file__).resolve().parents[1] / "bin" / "vision_ocr"
 
 
 def _ensure_local_asset(reference: str) -> Optional[str]:

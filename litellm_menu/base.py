@@ -520,7 +520,9 @@ _UPSTREAM_BALANCE_ERROR_MARKERS = (
     "out of credits",
     "quota exceeded",
     "insufficient_quota",
+    "insufficient_user_quota",
     "insufficient quota",
+    "额度不足",
     "余额不足",
 )
 _UPSTREAM_TEMPORARY_ERROR_MARKERS = (

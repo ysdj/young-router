@@ -1026,6 +1026,8 @@ def _apply_provider_auth_mode(
         auth_command = item["auth_command"]
         if auth_command is None:
             text = _remove_provider_auth(text, path)
+        elif isinstance(auth_command, str):
+            text = _apply_provider_auth_command(text, path, provider_id, auth_command)
         else:
             command_data = _require_mapping(auth_command, "provider auth_command")
             if not isinstance(command_data.get("command"), str) or not command_data["command"].strip():
@@ -1122,7 +1124,13 @@ def _apply_provider_patch(text: str, value: object) -> str:
         # selector must win so changing modes cannot accidentally recreate an
         # invalid combination after its cleanup pass.
         if "auth_mode" in item and not retain_bearer:
-            text = _apply_provider_auth_mode(text, path, provider_id, item["auth_mode"], item)
+            mode_item = dict(item)
+            # A string command has already been normalized above. Passing it
+            # through the older nested-auth branch a second time rejects the
+            # exact row returned by structured_config.
+            if isinstance(mode_item.get("auth_command"), str):
+                mode_item.pop("auth_command", None)
+            text = _apply_provider_auth_mode(text, path, provider_id, item["auth_mode"], mode_item)
         elif "auth_command" not in item and "auth_command_detail" in item:
             text = _apply_provider_auth_mode(text, path, provider_id, "command", item)
     return text

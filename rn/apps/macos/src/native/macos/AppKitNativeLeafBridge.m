@@ -1,0 +1,28 @@
+#if __has_include(<React/RCTBridgeModule.h>)
+#import <React/RCTBridgeModule.h>
+#import <React/RCTEventEmitter.h>
+
+@interface RCT_EXTERN_MODULE(LiteLLMNativeLeaf, RCTEventEmitter)
+RCT_EXTERN_METHOD(openWindow:(NSString *)route)
+RCT_EXTERN_METHOD(closeWindow:(NSString *)route)
+RCT_EXTERN_METHOD(focusWindow:(NSString *)route)
+RCT_EXTERN_METHOD(setWindowContentSize:(nonnull NSNumber *)width height:(nonnull NSNumber *)height resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(setMenuBarStatus:(NSString *)title running:(BOOL)running)
+RCT_EXTERN_METHOD(setMenuBarActions:(NSArray *)actions)
+RCT_EXTERN_METHOD(setTrayStatus:(NSString *)title running:(BOOL)running)
+RCT_EXTERN_METHOD(setTrayActions:(NSArray *)actions)
+RCT_EXTERN_METHOD(openFilePicker:(NSString *)purpose resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(saveFilePicker:(NSString *)purpose resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(showConfirmation:(NSString *)title message:(NSString *)message confirmLabel:(NSString *)confirmLabel resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(chooseModelsToAdd:(NSArray *)models providerName:(NSString *)providerName keyName:(NSString *)keyName resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(setShortcuts:(NSDictionary *)shortcuts)
+RCT_EXTERN_METHOD(setLocalization:(NSDictionary *)strings)
+RCT_EXTERN_METHOD(editSecureDocument:(NSString *)editorToken language:(NSString *)language title:(NSString *)title resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(editSecret:(NSString *)domain field:(NSString *)field target:(NSString *)target title:(NSString *)title allowClear:(BOOL)allowClear resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(clearSecret:(NSString *)domain field:(NSString *)field target:(NSString *)target resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD(systemLocale)
+RCT_EXTERN_METHOD(setLaunchAtLogin:(BOOL)enabled resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(showVersion)
+RCT_EXTERN_METHOD(quit)
+@end
+#endif

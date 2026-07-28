@@ -12,9 +12,26 @@ permissions:
 jobs:
   macos:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: rn/pnpm-lock.yaml
+
+      - name: Bootstrap pinned react-native-macos 0.85 source
+        working-directory: rn
+        run: node scripts/bootstrap-rnmacos-085.mjs
+
+      - name: Install React Native dependencies
+        working-directory: rn
+        run: pnpm install --frozen-lockfile
 
       - name: Install test dependencies
         run: |
@@ -27,13 +44,34 @@ jobs:
           LITELLM_TEST_PYTHON: ${{ runner.temp }}/litellm-menu-ci/bin/python
         run: ./scripts/test.sh
 
-      - name: Type-check Swift sources
+      - name: Check shared React Native contract
+        run: ./scripts/check-rn.sh
+
+      - name: Build React Native macOS host
+        env:
+          LITELLM_MENU_MACOS_OUTPUT: ${{ runner.temp }}/LiteLLM Menu.app
+        working-directory: rn
+        run: pnpm run build:macos
+
+      - name: Verify React Native macOS bundle
+        env:
+          APP: ${{ runner.temp }}/LiteLLM Menu.app
         run: |
-          swiftc \
-            -typecheck \
-            -target "$(uname -m)-apple-macosx13.0" \
-            mac_menu/Sources/*.swift \
-            -framework Cocoa
+          test -x "$APP/Contents/MacOS/LiteLLMMenu"
+          test -x "$APP/Contents/Resources/Core/runtime/bin/python"
+          test -x "$APP/Contents/Resources/Core/runtime/bin/litellm"
+          test -f "$APP/Contents/Resources/Core/sitecustomize.py"
+          plutil -lint "$APP/Contents/Info.plist"
+          test "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" = "$(tr -d '[:space:]' < VERSION)"
+          test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" = "$(tr -d '[:space:]' < BUILD_NUMBER)"
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$APP/Contents/Resources/Core" \
+            "$APP/Contents/Resources/Core/runtime/bin/python" -c \
+            'import litellm.proxy.proxy_server, litellm_menu.core'
+          PYTHONDONTWRITEBYTECODE=1 LITELLM_MENU_PROXY_PROCESS=1 \
+            PYTHONPATH="$APP/Contents/Resources/Core" \
+            "$APP/Contents/Resources/Core/runtime/bin/python" -c \
+            'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("litellm_menu.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "LiteLLMMenuHook"'
+          codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Validate scripts and metadata
         shell: bash
@@ -58,16 +96,58 @@ jobs:
           ruby -c Casks/litellm-menu.rb
           brew style Casks/litellm-menu.rb
 
+          "$RUNNER_TEMP/litellm-menu-ci/bin/python" scripts/version.py sync
+          git diff --exit-code -- \
+            VERSION BUILD_NUMBER Casks/litellm-menu.rb \
+            rn/apps/macos/macos/LiteLLMMenu-macOS/Info.plist \
+            rn/apps/macos/macos/LiteLLMMenu.xcodeproj/project.pbxproj \
+            rn/apps/windows/windows/LiteLLMMenu/Package.appxmanifest \
+            rn/apps/windows/windows/LiteLLMMenu.Package/Package.appxmanifest
+
           while IFS= read -r -d '' file; do
             [[ -f "$file" ]] || continue
             plutil -lint "$file"
           done < <(git ls-files -z '*.plist')
 
-      - name: Build and verify temporary app bundle
-        env:
-          LITELLM_APP_PATH: ${{ runner.temp }}/LiteLLM Menu.app
-        run: |
-          ./mac_menu/build.sh
-          test -x "$LITELLM_APP_PATH/Contents/MacOS/LiteLLMMenu"
-          plutil -lint "$LITELLM_APP_PATH/Contents/Info.plist"
-          codesign --verify --deep --strict --verbose=2 "$LITELLM_APP_PATH"
+  rn-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: rn/pnpm-lock.yaml
+      - name: Install shared UI dependencies
+        working-directory: rn
+        run: pnpm install --filter @litellm-menu/rn-app --frozen-lockfile
+      - name: Check shared RN contract
+        run: ./scripts/check-rn.sh
+
+  windows-rn:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: rn/pnpm-lock.yaml
+      - uses: astral-sh/setup-uv@v5
+      - name: Install shared UI dependencies
+        working-directory: rn
+        run: pnpm install --filter @litellm-menu/rn-app --frozen-lockfile
+      - name: Check shared RN contract and types
+        working-directory: rn
+        run: pnpm run build
+      - name: Build React Native Windows host
+        working-directory: rn
+        run: pnpm run build:windows
