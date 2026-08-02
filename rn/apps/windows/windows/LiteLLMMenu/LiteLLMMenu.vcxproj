@@ -18,6 +18,10 @@
     <ReactNativeWindowsDir Condition="'$(ReactNativeWindowsDir)' == ''">$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), 'node_modules\react-native-windows\package.json'))\node_modules\react-native-windows\</ReactNativeWindowsDir>
     <BundleCliCommand>pnpm exec react-native bundle</BundleCliCommand>
   </PropertyGroup>
+  <PropertyGroup>
+    <!-- The WinUI 3 host consumes the WebView2 WinRT projection directly. -->
+    <WebView2UseWinRT>true</WebView2UseWinRT>
+  </PropertyGroup>
   <Import Project="$(ReactNativeWindowsDir)\PropertySheets\External\Microsoft.ReactNative.WindowsSdk.Default.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <ItemGroup Label="ProjectConfigurations">
@@ -66,6 +70,7 @@
   </ImportGroup>
   <ImportGroup Label="ReactNativeWindowsPropertySheets">
     <Import Project="$(ReactNativeWindowsDir)\PropertySheets\External\Microsoft.ReactNative.Composition.CppApp.props" />
+    <Import Project="$(ReactNativeWindowsDir)\PropertySheets\WebView2.props" />
   </ImportGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -112,6 +117,7 @@
     <ClInclude Include="..\..\src\native\windows\CoreIPCModule.h" />
     <ClInclude Include="..\..\src\native\windows\WinUI3NativeLeaf.h" />
     <ClInclude Include="..\..\src\native\windows\WinUI3NativeLeafModule.h" />
+    <ClInclude Include="..\..\src\native\windows\WindowsRelayLogin.h" />
     <ClInclude Include="..\..\src\native\windows\WinUIControls.h" />
   </ItemGroup>
   <ItemGroup>
@@ -121,6 +127,7 @@
     <ClCompile Include="..\..\src\native\windows\CoreIPCModule.cpp" />
     <ClCompile Include="..\..\src\native\windows\WinUI3NativeLeaf.cpp" />
     <ClCompile Include="..\..\src\native\windows\WinUI3NativeLeafModule.cpp" />
+    <ClCompile Include="..\..\src\native\windows\WindowsRelayLogin.cpp" />
     <ClCompile Include="..\..\src\native\windows\WinUIControls.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
@@ -143,6 +150,7 @@
     <Import Project="$(ReactNativeWindowsDir)\PropertySheets\External\Microsoft.ReactNative.Composition.CppApp.targets" Condition="Exists('$(ReactNativeWindowsDir)\PropertySheets\External\Microsoft.ReactNative.Composition.CppApp.targets')" />
   </ImportGroup>
   <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="$(WebView2PackageVersion)" />
   </ItemGroup>
   <Target Name="EnsureReactNativeWindowsTargets" BeforeTargets="PrepareForBuild">
     <PropertyGroup>

@@ -57,6 +57,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
   return {
     endpoint,
     snapshot: async (): Promise<CoreSnapshot> => (await call("snapshot", {})).snapshot,
+    logs: async (tab, revision) => call("logs", revision === undefined ? { tab } : { tab, revision }),
     editor: async (domain, document): Promise<IpcResults["editor"]> => call("editor", { domain, document }),
     dispatch: async (action: DispatchAction, revision?: number): Promise<{ revision: number }> => call("dispatch", revision === undefined ? { action } : { action, revision }),
     subscribe: (listener: (event: IpcEvent) => void, topics?: string[]): (() => void) => {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from . import image_generation as _image_generation_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import responses_tools as _responses_tools_module
 
@@ -83,7 +84,7 @@ def _request_has_litellm_web_search_bridge(request_kwargs: Optional[dict]) -> bo
 
 def _request_is_external_web_search_synthesis(request_kwargs: Optional[dict]) -> bool:
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key) or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key) or {}
         if metadata.get("external_web_search_synthesis") is True:
             return True
     return False
@@ -93,7 +94,7 @@ def _request_suppresses_external_web_search_post_call(
     request_kwargs: Optional[dict],
 ) -> bool:
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key) or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key) or {}
         if metadata.get(_WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY) is True:
             return True
     return False
@@ -111,7 +112,7 @@ def _request_is_unmarked_internal_web_search_bridge_post_call(
     if _request_should_intercept_external_web_search(request_kwargs):
         return False
     return (
-        _image_generation_module._request_is_responses_api(request_kwargs)
+        _responses_request_module._request_is_responses_api(request_kwargs)
         or _responses_surfaces_module._request_uses_responses_endpoint(request_kwargs)
     )
 
@@ -121,7 +122,7 @@ def _with_external_web_search_post_call_suppressed(
 ) -> dict[str, Any]:
     suppressed_kwargs = request_kwargs.copy()
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key) or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key) or {}
         suppressed_metadata = metadata.copy()
         suppressed_metadata[_WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY] = True
         suppressed_kwargs[key] = suppressed_metadata
@@ -133,7 +134,7 @@ def _request_should_intercept_external_web_search(request_kwargs: Optional[dict]
         return False
     if not isinstance(request_kwargs, dict):
         return False
-    metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     return bool(
         metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
         or metadata.get(_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY) is True
@@ -159,7 +160,7 @@ def _request_should_consume_litellm_web_search_function_call(
     ):
         return False
     return (
-        _image_generation_module._request_is_responses_api(request_kwargs)
+        _responses_request_module._request_is_responses_api(request_kwargs)
         or _responses_surfaces_module._request_uses_responses_endpoint(request_kwargs)
     )
 

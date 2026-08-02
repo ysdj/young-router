@@ -30,6 +30,17 @@ SECRET_KEY_MARKERS = (
     "secret",
     "token",
 )
+NON_SECRET_TOKEN_COUNTER_KEYS = frozenset(
+    {
+        "cached_tokens",
+        "completion_tokens",
+        "input_tokens",
+        "output_tokens",
+        "prompt_tokens",
+        "reasoning_tokens",
+        "total_tokens",
+    }
+)
 PATH_KEY_MARKERS = ("path", "directory", "dirname", "filename", "file", "cwd", "root")
 SENSITIVE_QUERY_MARKERS = ("key", "token", "secret", "password", "passwd", "credential", "auth")
 
@@ -63,6 +74,13 @@ def redact(value: object, *, known_secrets: Sequence[str] = (), _key: object = "
     callers can safely mutate the result without changing Core state.
     """
 
+    normalized_key = _key_text(_key)
+    if (
+        normalized_key in NON_SECRET_TOKEN_COUNTER_KEYS
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    ):
+        return copy.deepcopy(value)
     if is_secret_key(_key):
         if value in (None, "", False):
             return value
@@ -184,6 +202,7 @@ def safe_exception_message(error: BaseException, *, known_secrets: Sequence[str]
 
 
 __all__ = [
+    "NON_SECRET_TOKEN_COUNTER_KEYS",
     "PATH_KEY_MARKERS",
     "REDACTED",
     "SECRET_KEY_MARKERS",

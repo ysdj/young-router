@@ -489,18 +489,8 @@ class HookStreamingFailoverTests(HookTestCase):
         )
         self.assertFalse(payload["parallel_tool_calls"])
 
-    async def test_context_fallback_emulates_auto_truncation_on_same_deployment(self) -> None:
+    async def test_context_fallback_preserves_history_on_same_deployment(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        previous_budget = (
-            hooks._RESPONSES_CONTEXT_TRUNCATION_FALLBACK_HISTORY_TEXT_CHARS
-        )
-        hooks._RESPONSES_CONTEXT_TRUNCATION_FALLBACK_HISTORY_TEXT_CHARS = 800
-        self.addCleanup(
-            setattr,
-            hooks,
-            "_RESPONSES_CONTEXT_TRUNCATION_FALLBACK_HISTORY_TEXT_CHARS",
-            previous_budget,
-        )
         calls = []
         original_input = [
             {
@@ -581,34 +571,10 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(calls[1]["truncation"], "auto")
         self.assertEqual(calls[1]["model"], "configured-upstream-model")
         self.assertEqual(calls[1]["model_info"]["id"], "same-deployment")
-        retry_ids = [item.get("id") for item in calls[1]["input"]]
-        self.assertEqual(
-            retry_ids,
-            [
-                "developer-keep",
-                "assistant-recent",
-                "recent-call",
-                "recent-output",
-                "latest-user",
-            ],
-        )
-        self.assertNotIn("old-call", retry_ids)
-        self.assertNotIn("old-output", retry_ids)
-        self.assertEqual(
-            [item["id"] for item in original_input],
-            [
-                "developer-keep",
-                "old-call",
-                "old-output",
-                "assistant-recent",
-                "recent-call",
-                "recent-output",
-                "latest-user",
-            ],
-        )
+        self.assertIs(calls[1]["input"], original_input)
         self.assertNotIn("_excluded_deployment_ids", calls[1])
 
-    def test_context_fallback_uses_upstream_token_counts_for_retry_budget(self) -> None:
+    def test_context_fallback_with_token_counts_preserves_history(self) -> None:
         hooks, _proxy_server = load_hook_module()
         exc = RuntimeError(
             "This model's maximum context length is 100,000 tokens, "
@@ -639,13 +605,9 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertIsNotNone(retry)
         assert retry is not None
         self.assertEqual(retry["truncation"], "auto")
-        self.assertLess(
-            hooks._compaction_text_length(retry["input"]),
-            50_000,
-        )
-        self.assertEqual(retry["input"][-1]["content"], "latest request")
+        self.assertIs(retry["input"], request["input"])
 
-    def test_context_fallback_honors_explicit_auto_by_emulating_it(self) -> None:
+    def test_context_fallback_honors_explicit_auto_without_rewriting_history(self) -> None:
         hooks, _proxy_server = load_hook_module()
         exc = RuntimeError(
             "context_length_exceeded: input exceeds the context window"
@@ -673,10 +635,7 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertIsNotNone(retry)
         assert retry is not None
         self.assertEqual(retry["truncation"], "auto")
-        self.assertEqual(
-            retry["input"],
-            [{"type": "message", "role": "user", "content": "latest request"}],
-        )
+        self.assertIs(retry["input"], request["input"])
 
     async def test_generic_response_wrapper_retries_context_error_with_native_truncation(self) -> None:
         hooks, _proxy_server = load_hook_module()

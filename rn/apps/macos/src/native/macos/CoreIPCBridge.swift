@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Private native client for the Python Core. Only versioned response/event
@@ -17,9 +18,19 @@ import Foundation
         let present: Bool
     }
 
+    struct SecretReadCapability {
+        let token: String
+        let present: Bool
+    }
+
     struct EditorStageResult {
         let revision: Int
         let replacementToken: String
+    }
+
+    private struct EditorIdentity {
+        let domain: String
+        let document: String
     }
 
     private struct Endpoint {
@@ -37,6 +48,7 @@ import Foundation
     }
 
     private let lock = NSLock()
+    private static let relayLoginTimeout: TimeInterval = 60
     private var endpoint: Endpoint?
     private var sessionToken: String?
     private var sessionExpiresAt: Date?
@@ -49,8 +61,18 @@ import Foundation
     private var pollCancelled = false
     private var stopping = false
     private var generation = 0
+    private var editorIdentities: [String: EditorIdentity] = [:]
+    private var editorIdentityOrder: [String] = []
 
     private override init() { super.init() }
+
+    /// Start the authenticated Core session while the React bundle is loading.
+    /// Service lifecycle remains owned by the shared React startup path.
+    public func warm() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = try? self.ensureSession()
+        }
+    }
 
     func setEventHandler(_ handler: ((String) -> Void)?) {
         lock.lock()
@@ -72,6 +94,9 @@ import Foundation
                       let text = String(data: body, encoding: .utf8) else {
                     _ = self.resetCore(expectedGeneration: requestGeneration)
                     throw BridgeError.invalidResponse
+                }
+                if metadata.method == "editor" {
+                    self.rememberEditorCapability(requestData: data, responseData: body)
                 }
                 self.startPollingIfSubscription(in: text, request: request, method: metadata.method, generation: requestGeneration)
                 if restarted && metadata.method != "subscribe" { self.scheduleSubscriptionRecovery() }
@@ -124,7 +149,7 @@ import Foundation
     /// Exchanges an AppKit panel URL for a one-time opaque Core token. The
     /// filesystem path never reaches React or a normal error string.
     func registerFileCapability(_ url: URL, purpose: String) -> String? {
-        guard ["import", "export", "claude-profile"].contains(purpose) else { return nil }
+        guard ["import", "export"].contains(purpose) else { return nil }
         do {
             let body = try JSONSerialization.data(withJSONObject: ["purpose": purpose, "path": url.path], options: [])
             let (data, response, _, restarted) = try performCoreRequest(route: "host/file-capability", method: "POST", body: body)
@@ -138,6 +163,126 @@ import Foundation
         } catch {
             return nil
         }
+    }
+
+    struct RelayLoginResult {
+        let revision: Int
+        let username: String
+    }
+
+    struct RelaySessionRestoreResult {
+        let revision: Int
+        let loginStatus: String
+        let username: String
+    }
+
+    /// Sends browser credentials only over the authenticated native/Core host
+    /// route. The returned value is deliberately limited to public metadata.
+    func acceptRelayLogin(
+        accountID: String,
+        type: String,
+        label: String,
+        origin: String,
+        username: String,
+        cookie: String?,
+        accessToken: String?,
+        refreshToken: String?
+    ) throws -> RelayLoginResult {
+        var payload: [String: Any] = [
+            "account_id": accountID,
+            "type": type,
+            "label": label,
+            "origin": origin,
+            "username": username,
+        ]
+        if let cookie, !cookie.isEmpty { payload["cookie"] = cookie }
+        if let accessToken, !accessToken.isEmpty { payload["access_token"] = accessToken }
+        if let refreshToken, !refreshToken.isEmpty { payload["refresh_token"] = refreshToken }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              body.count <= 96 * 1024 else { throw BridgeError.invalidResponse }
+        let (data, response, _, restarted) = try performCoreRequest(
+            route: "host/relay/login",
+            method: "POST",
+            body: body,
+            timeoutInterval: Self.relayLoginTimeout
+        )
+        if restarted { scheduleSubscriptionRecovery() }
+        guard response.statusCode == 200,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == Set(["protocol_version", "revision", "login_status", "username"]),
+              object["protocol_version"] as? Int == 1,
+              object["login_status"] as? String == "signed_in",
+              let revision = object["revision"] as? NSNumber,
+              revision.doubleValue.rounded(.towardZero) == revision.doubleValue,
+              revision.intValue >= 0,
+              let safeUsername = object["username"] as? String,
+              !safeUsername.isEmpty,
+              safeUsername.utf8.count <= 320 else { throw BridgeError.invalidResponse }
+        return RelayLoginResult(revision: revision.intValue, username: safeUsername)
+    }
+
+    /// Reattaches an already verified native credential-store session after a
+    /// Core restart. This route intentionally does not fetch relay API keys
+    /// or touch the staged provider/model configuration.
+    func restoreRelaySession(
+        accountID: String,
+        type: String,
+        label: String,
+        origin: String,
+        loginStatus: String,
+        username: String? = nil,
+        cookie: String? = nil,
+        accessToken: String? = nil,
+        refreshToken: String? = nil
+    ) throws -> RelaySessionRestoreResult {
+        guard ["signed_in", "signed_out", "expired"].contains(loginStatus),
+              accountID.utf8.count <= 96,
+              type == "newapi" || type == "sub2api",
+              !label.isEmpty, label.utf8.count <= 160,
+              !origin.isEmpty, origin.utf8.count <= 2_048,
+              (username?.utf8.count ?? 0) <= 320,
+              (cookie?.utf8.count ?? 0) <= 32_768,
+              (accessToken?.utf8.count ?? 0) <= 32_768,
+              (refreshToken?.utf8.count ?? 0) <= 32_768,
+              loginStatus != "signed_in" || (!(username?.isEmpty ?? true) && (!(cookie?.isEmpty ?? true) || !(accessToken?.isEmpty ?? true))),
+              loginStatus == "signed_in" || ((cookie?.isEmpty ?? true) && (accessToken?.isEmpty ?? true) && (refreshToken?.isEmpty ?? true)) else {
+            throw BridgeError.invalidResponse
+        }
+        var payload: [String: Any] = [
+            "account_id": accountID,
+            "type": type,
+            "label": label,
+            "origin": origin,
+            "login_status": loginStatus,
+        ]
+        if let username, !username.isEmpty { payload["username"] = username }
+        if let cookie, !cookie.isEmpty { payload["cookie"] = cookie }
+        if let accessToken, !accessToken.isEmpty { payload["access_token"] = accessToken }
+        if let refreshToken, !refreshToken.isEmpty { payload["refresh_token"] = refreshToken }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              body.count <= 96 * 1024 else { throw BridgeError.invalidResponse }
+        let (data, response, _, restarted) = try performCoreRequest(
+            route: "host/relay/restore",
+            method: "POST",
+            body: body
+        )
+        if restarted { scheduleSubscriptionRecovery() }
+        guard response.statusCode == 200,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == Set(["protocol_version", "revision", "login_status", "username"]),
+              object["protocol_version"] as? Int == 1,
+              let restoredStatus = object["login_status"] as? String,
+              ["signed_in", "signed_out", "expired"].contains(restoredStatus),
+              let revision = object["revision"] as? NSNumber,
+              revision.doubleValue.rounded(.towardZero) == revision.doubleValue,
+              revision.intValue >= 0,
+              let safeUsername = object["username"] as? String,
+              safeUsername.utf8.count <= 320 else { throw BridgeError.invalidResponse }
+        return RelaySessionRestoreResult(
+            revision: revision.intValue,
+            loginStatus: restoredStatus,
+            username: safeUsername
+        )
     }
 
     /// Reads an opaque editor capability and returns raw text only to the
@@ -204,6 +349,45 @@ import Foundation
         return EditorStageResult(revision: revision.intValue, replacementToken: replacementToken)
     }
 
+    /// Reissues an expired editor capability without exposing its identity or
+    /// document text to React. The trusted read is part of the handshake: Core
+    /// requires it before the replacement capability may stage native text.
+    @objc(refreshEditorDocument:completion:)
+    public func refreshEditorDocumentAsync(
+        _ editorToken: String,
+        completion: @escaping (String?, String?, String?) -> Void
+    ) {
+        guard let identity = editorIdentity(for: editorToken) else {
+            DispatchQueue.main.async { completion(nil, nil, "refresh_failed") }
+            return
+        }
+        call(method: "editor", params: ["domain": identity.domain, "document": identity.document]) { result in
+            switch result {
+            case .failure:
+                DispatchQueue.main.async { completion(nil, nil, "refresh_failed") }
+            case .success(let payload):
+                guard Set(payload.keys) == Set(["domain", "document", "editor_token", "revision"]),
+                      payload["domain"] as? String == identity.domain,
+                      payload["document"] as? String == identity.document,
+                      let replacementToken = payload["editor_token"] as? String,
+                      !replacementToken.isEmpty,
+                      replacementToken.utf8.count <= 256 else {
+                    DispatchQueue.main.async { completion(nil, nil, "refresh_failed") }
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let text = try self.readEditorDocument(replacementToken)
+                        self.replaceEditorCapability(editorToken, with: replacementToken, identity: identity)
+                        DispatchQueue.main.async { completion(replacementToken, text, nil) }
+                    } catch {
+                        DispatchQueue.main.async { completion(nil, nil, "refresh_failed") }
+                    }
+                }
+            }
+        }
+    }
+
     /// Objective-C++ component views use these asynchronous wrappers so raw
     /// editor text stays inside the native host and never crosses the RN bridge.
     @objc(readEditorDocument:completion:)
@@ -230,6 +414,7 @@ import Foundation
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let result = try self.stageEditorDocument(editorToken, text: text)
+                self.rotateEditorCapability(editorToken, to: result.replacementToken)
                 DispatchQueue.main.async {
                     completion(NSNumber(value: result.revision), result.replacementToken, nil)
                 }
@@ -306,6 +491,110 @@ import Foundation
         return SecretStageResult(revision: revision.intValue, present: present)
     }
 
+    /// Obtains a short-lived, read-once token for a provider API key. This
+    /// route is intentionally narrower than secret staging: it never accepts
+    /// another domain or secret field, and the token stays in the native host.
+    @nonobjc func createSecretReadCapability(
+        domain: String,
+        field: String,
+        target: String
+    ) throws -> SecretReadCapability {
+        guard domain == "providers_models",
+              field == "api_key",
+              !target.isEmpty,
+              target.utf8.count <= 256,
+              let body = try? JSONSerialization.data(
+                  withJSONObject: ["domain": domain, "field": field, "target": target],
+                  options: []
+              ) else { throw BridgeError.invalidResponse }
+        let (data, response, requestGeneration, restarted) = try performCoreRequest(
+            route: "host/secret/read-capability",
+            method: "POST",
+            body: body
+        )
+        if restarted { scheduleSubscriptionRecovery() }
+        guard response.statusCode == 200,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == Set(["protocol_version", "secret_read_token", "revision", "present"]),
+              object["protocol_version"] as? Int == 1,
+              let token = object["secret_read_token"] as? String,
+              !token.isEmpty,
+              token.utf8.count <= 256,
+              let revision = object["revision"] as? NSNumber,
+              revision.doubleValue.rounded(.towardZero) == revision.doubleValue,
+              revision.intValue >= 0,
+              let present = object["present"] as? Bool else {
+            if response.statusCode >= 500 { _ = resetCore(expectedGeneration: requestGeneration) }
+            throw BridgeError.invalidResponse
+        }
+        return SecretReadCapability(token: token, present: present)
+    }
+
+    /// Returns the raw API key to native code only. The read capability is
+    /// consumed by Core before it serves this response and must never cross
+    /// the React Native bridge.
+    @nonobjc func readSecret(_ secretReadToken: String) throws -> String {
+        guard !secretReadToken.isEmpty,
+              secretReadToken.utf8.count <= 256,
+              let body = try? JSONSerialization.data(
+                  withJSONObject: ["secret_read_token": secretReadToken],
+                  options: []
+              ) else { throw BridgeError.invalidResponse }
+        let (data, response, requestGeneration, restarted) = try performCoreRequest(
+            route: "host/secret/read",
+            method: "POST",
+            body: body
+        )
+        if restarted { scheduleSubscriptionRecovery() }
+        guard response.statusCode == 200,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == Set(["protocol_version", "value"]),
+              object["protocol_version"] as? Int == 1,
+              let value = object["value"] as? String,
+              value.utf8.count <= 16_384,
+              !value.contains("\u{0000}"),
+              !value.contains("\r"),
+              !value.contains("\n") else {
+            if response.statusCode >= 500 { _ = resetCore(expectedGeneration: requestGeneration) }
+            throw BridgeError.invalidResponse
+        }
+        return value
+    }
+
+    /// Reads a provider API key through the complete native-only handshake.
+    /// The opaque read token exists only on this stack frame and is consumed
+    /// before the plaintext response is returned.
+    @nonobjc func readProviderAPIKey(_ target: String) throws -> String {
+        let capability = try createSecretReadCapability(
+            domain: "providers_models",
+            field: "api_key",
+            target: target
+        )
+        return try readSecret(capability.token)
+    }
+
+    /// Objective-C++ Fabric leaves cannot invoke an ``@nonobjc`` Swift
+    /// method. Keep this completion native-only: the supplied value must not
+    /// be forwarded through the React Native module or component event.
+    @objc(readProviderAPIKeyForTarget:completion:)
+    public func readProviderAPIKeyForTarget(
+        _ target: String,
+        completion: @escaping (NSString?, NSString?) -> Void
+    ) {
+        guard !target.isEmpty, target.utf8.count <= 256 else {
+            DispatchQueue.main.async { completion(nil, "read_failed") }
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let value = try self.readProviderAPIKey(target)
+                DispatchQueue.main.async { completion(value as NSString, nil) }
+            } catch {
+                DispatchQueue.main.async { completion(nil, "read_failed") }
+            }
+        }
+    }
+
     /// A password Fabric leaf invokes this directly.  The secret travels only
     /// from NSSecureTextField to the authenticated host/Core route; React sees
     /// the completion's presence/revision/error metadata and never the value.
@@ -348,7 +637,8 @@ import Foundation
         lock.unlock()
 
         // The authenticated host route owns the managed LiteLLM lifecycle.
-        // Give it a bounded chance to stop the service before Core is reaped.
+        // A replacement app deliberately stops the old proxy before the new
+        // bundle starts, so the new Core can claim the configured port.
         if let shutdownEndpoint, let shutdownToken {
             _ = try? performRequest(
                 endpoint: shutdownEndpoint,
@@ -356,7 +646,7 @@ import Foundation
                 method: "POST",
                 body: Data("{}".utf8),
                 token: shutdownToken,
-                timeoutInterval: 5
+                timeoutInterval: 1
             )
         }
 
@@ -374,16 +664,27 @@ import Foundation
         coreDirectory = nil
         lock.unlock()
 
-        if process?.isRunning == true { process?.terminate() }
-        if let directory { try? FileManager.default.removeItem(at: directory) }
+        stopCoreProcess(process, directory: directory)
     }
 
-    private func performCoreRequest(route: String, method: String, body: Data?) throws -> (Data, HTTPURLResponse, Int, Bool) {
+    private func performCoreRequest(
+        route: String,
+        method: String,
+        body: Data?,
+        timeoutInterval: TimeInterval = 30
+    ) throws -> (Data, HTTPURLResponse, Int, Bool) {
         var requestGeneration: Int?
         do {
             let (endpoint, token, generation, restarted) = try ensureSession()
             requestGeneration = generation
-            let (data, response) = try performRequest(endpoint: endpoint, route: route, method: method, body: body, token: token)
+            let (data, response) = try performRequest(
+                endpoint: endpoint,
+                route: route,
+                method: method,
+                body: body,
+                token: token,
+                timeoutInterval: timeoutInterval
+            )
             if response.statusCode == 401 || response.statusCode == 403 {
                 throw BridgeError.authentication
             }
@@ -399,6 +700,28 @@ import Foundation
         }
     }
 
+    private func exchangeSession(endpoint: Endpoint, credential: String) throws -> (token: String, expiresAt: Date) {
+        let (body, response) = try performRequest(
+            endpoint: endpoint,
+            route: "hello",
+            method: "POST",
+            body: Data(),
+            token: credential
+        )
+        guard response.statusCode == 200,
+              response.value(forHTTPHeaderField: "X-LiteLLM-Core-Session")?.isEmpty == false,
+              let session = response.value(forHTTPHeaderField: "X-LiteLLM-Core-Session"),
+              let envelope = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+              envelope["protocol_version"] as? Int == 1,
+              envelope["ok"] as? Bool == true,
+              let sessionObject = envelope["session"] as? [String: Any],
+              let expiresIn = sessionObject["expires_in"] as? NSNumber,
+              expiresIn.doubleValue > 0 else {
+            throw BridgeError.authentication
+        }
+        return (session, Date().addingTimeInterval(expiresIn.doubleValue))
+    }
+
     private func ensureSession() throws -> (Endpoint, String, Int, Bool) {
         lock.lock()
         defer { lock.unlock() }
@@ -407,38 +730,31 @@ import Foundation
            sessionExpiresAt.timeIntervalSinceNow > 15 {
             return (endpoint, sessionToken, generation, false)
         }
+        if let endpoint, let sessionToken,
+           let renewed = try? exchangeSession(endpoint: endpoint, credential: sessionToken) {
+            self.sessionToken = renewed.token
+            self.sessionExpiresAt = renewed.expiresAt
+            return (endpoint, renewed.token, generation, false)
+        }
 
         let shouldRecoverSubscription = subscriptionRequest != nil
         pollCancelled = true
         subscriptionID = nil
         let (staleProcess, staleDirectory) = discardCoreLocked()
-        if staleProcess?.isRunning == true { staleProcess?.terminate() }
-        if let staleDirectory { try? FileManager.default.removeItem(at: staleDirectory) }
+        stopCoreProcess(staleProcess, directory: staleDirectory)
         generation += 1
         let sessionGeneration = generation
         do {
             let endpoint = try startCoreLocked()
-            let (body, response) = try performRequest(endpoint: endpoint, route: "hello", method: "POST", body: Data(), token: endpoint.bootstrapToken)
-            guard response.statusCode == 200,
-                  response.value(forHTTPHeaderField: "X-LiteLLM-Core-Session")?.isEmpty == false,
-                  let session = response.value(forHTTPHeaderField: "X-LiteLLM-Core-Session"),
-                  let envelope = try JSONSerialization.jsonObject(with: body) as? [String: Any],
-                  envelope["protocol_version"] as? Int == 1,
-                  envelope["ok"] as? Bool == true,
-                  let sessionObject = envelope["session"] as? [String: Any],
-                  let expiresIn = sessionObject["expires_in"] as? NSNumber,
-                  expiresIn.doubleValue > 0 else {
-                throw BridgeError.authentication
-            }
+            let session = try exchangeSession(endpoint: endpoint, credential: endpoint.bootstrapToken)
             self.endpoint = endpoint
-            self.sessionToken = session
-            self.sessionExpiresAt = Date().addingTimeInterval(expiresIn.doubleValue)
+            self.sessionToken = session.token
+            self.sessionExpiresAt = session.expiresAt
             self.pollCancelled = false
-            return (endpoint, session, sessionGeneration, shouldRecoverSubscription)
+            return (endpoint, session.token, sessionGeneration, shouldRecoverSubscription)
         } catch {
             let (failedProcess, failedDirectory) = discardCoreLocked()
-            if failedProcess?.isRunning == true { failedProcess?.terminate() }
-            if let failedDirectory { try? FileManager.default.removeItem(at: failedDirectory) }
+            stopCoreProcess(failedProcess, directory: failedDirectory)
             throw error
         }
     }
@@ -462,9 +778,21 @@ import Foundation
             throw BridgeError.unavailable
         }
         process.executableURL = URL(fileURLWithPath: python)
-        process.arguments = ["-m", "litellm_menu.core", "--endpoint-file", endpointFile.path]
+        let arguments = [
+            "-m",
+            "litellm_menu.core",
+            "--endpoint-file",
+            endpointFile.path,
+            "--parent-pid",
+            String(ProcessInfo.processInfo.processIdentifier),
+        ]
+        process.arguments = arguments
 
-        var childEnvironment = environment
+        var childEnvironment = previewProfileEnvironment(from: environment)
+        // An explicitly isolated Preview must never fall back to the user's
+        // production configuration, assistant state, or LiteLLM service.
+        // The profile is embedded only in a distinct preview bundle, so it
+        // remains effective when the app is launched through Finder or `open`.
         if let coreRoot {
             let rootPath = coreRoot.path
             let current = childEnvironment["PYTHONPATH"]
@@ -493,9 +821,52 @@ import Foundation
             }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        if process.isRunning { process.terminate() }
-        try? fileManager.removeItem(at: directory)
+        stopCoreProcess(process, directory: directory)
         throw BridgeError.unavailable
+    }
+
+    private func previewProfileEnvironment(from inherited: [String: String]) -> [String: String] {
+        guard Bundle.main.bundleIdentifier != "menu.litellm.menu",
+              let rawRoot = Bundle.main.object(forInfoDictionaryKey: "LiteLLMMenuPreviewProfileRoot") as? String,
+              rawRoot.hasPrefix("/") else {
+            return inherited
+        }
+
+        let root = URL(fileURLWithPath: rawRoot, isDirectory: true).standardizedFileURL
+        let runtime = root.appendingPathComponent(".litellm-runtime", isDirectory: true)
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let codex = home.appendingPathComponent(".codex", isDirectory: true)
+        let claude = home.appendingPathComponent(".claude", isDirectory: true)
+        var environment = inherited
+        environment["HOME"] = home.path
+        environment["LITELLM_RUNTIME_ROOT"] = root.path
+        environment["LITELLM_MENU_HOME"] = root.path
+        environment["LITELLM_CONFIG_FILE"] = root.appendingPathComponent("config.yaml").path
+        environment["LITELLM_RUNTIME_CONFIG"] = runtime.appendingPathComponent("config.yaml").path
+        environment["LITELLM_MENU_RUNTIME_SETTINGS_FILE"] = root.appendingPathComponent("runtime-settings.env").path
+        if let rawPort = Bundle.main.object(forInfoDictionaryKey: "LiteLLMMenuPreviewPort") as? String,
+           let port = Int(rawPort),
+           (1...65_535).contains(port) {
+            environment["LITELLM_PORT"] = String(port)
+        }
+        environment["CODEX_HOME"] = codex.path
+        environment["CLAUDE_CONFIG_DIR"] = claude.path
+        environment["CLAUDE_SETTINGS_PATH"] = claude.appendingPathComponent("settings.json").path
+        environment["LITELLM_MENU_LANGUAGE_FILE"] = root.appendingPathComponent("language.json").path
+        environment["LITELLM_WEBDAV_SYNC_SETTINGS"] = root.appendingPathComponent("webdav-sync.json").path
+        environment["LITELLM_WEBDAV_SYNC_ENABLED_FILE"] = runtime.appendingPathComponent("webdav-sync.enabled").path
+        environment["LITELLM_WEBDAV_SYNC_STATUS_FILE"] = runtime.appendingPathComponent("webdav-sync-status.json").path
+        environment["LITELLM_WEBDAV_SYNC_STATE"] = runtime.appendingPathComponent("webdav-sync-state.json").path
+        environment["LITELLM_STATE_FILE"] = root.appendingPathComponent(".litellm-runtime-state").path
+        environment["LITELLM_NATIVE_PID_FILE"] = runtime.appendingPathComponent("litellm.pid").path
+        environment["LITELLM_NATIVE_OWNER_FILE"] = runtime.appendingPathComponent("litellm.owner").path
+        environment["LITELLM_AUTOSTART_STATE_FILE"] = runtime.appendingPathComponent("autostart.enabled").path
+        environment["LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE"] = runtime.appendingPathComponent("route-recovery-state.json").path
+        environment["LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE"] = runtime.appendingPathComponent("deployment-cooldowns.json").path
+        environment["LITELLM_MENU_SEARCH_STATE_FILE"] = runtime.appendingPathComponent("web-search-references.json").path
+        environment["LITELLM_RUNTIME_DIR"] = runtime.path
+        environment["LITELLM_RECENT_REQUESTS_LOG"] = root.appendingPathComponent("recent-requests.jsonl").path
+        return environment
     }
 
     private func resolveCoreRoot(environment: [String: String]) -> URL? {
@@ -612,6 +983,51 @@ import Foundation
         return (requestID, method)
     }
 
+    private func rememberEditorCapability(requestData: Data, responseData: Data) {
+        guard let request = try? JSONSerialization.jsonObject(with: requestData) as? [String: Any],
+              let params = request["params"] as? [String: Any],
+              let domain = params["domain"] as? String,
+              let document = params["document"] as? String,
+              (domain == "codex" && ["config", "auth"].contains(document)) ||
+                  (domain == "claude" && document == "settings"),
+              let response = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+              response["ok"] as? Bool == true,
+              let result = response["result"] as? [String: Any],
+              result["domain"] as? String == domain,
+              result["document"] as? String == document,
+              let token = result["editor_token"] as? String,
+              !token.isEmpty,
+              token.utf8.count <= 256 else { return }
+        replaceEditorCapability(nil, with: token, identity: EditorIdentity(domain: domain, document: document))
+    }
+
+    private func editorIdentity(for token: String) -> EditorIdentity? {
+        lock.lock()
+        defer { lock.unlock() }
+        return editorIdentities[token]
+    }
+
+    private func rotateEditorCapability(_ oldToken: String, to newToken: String) {
+        guard let identity = editorIdentity(for: oldToken) else { return }
+        replaceEditorCapability(oldToken, with: newToken, identity: identity)
+    }
+
+    private func replaceEditorCapability(_ oldToken: String?, with newToken: String, identity: EditorIdentity) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let oldToken {
+            editorIdentities.removeValue(forKey: oldToken)
+            editorIdentityOrder.removeAll { $0 == oldToken }
+        }
+        editorIdentities[newToken] = identity
+        editorIdentityOrder.removeAll { $0 == newToken }
+        editorIdentityOrder.append(newToken)
+        while editorIdentityOrder.count > 128 {
+            let expired = editorIdentityOrder.removeFirst()
+            editorIdentities.removeValue(forKey: expired)
+        }
+    }
+
     private func isValidResponseEnvelope(_ data: Data, requestID: String) -> Bool {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               object["protocol_version"] as? Int == 1,
@@ -672,9 +1088,27 @@ import Foundation
         generation += 1
         let (process, directory) = discardCoreLocked()
         lock.unlock()
-        if process?.isRunning == true { process?.terminate() }
-        if let directory { try? FileManager.default.removeItem(at: directory) }
+        stopCoreProcess(process, directory: directory)
         return true
+    }
+
+    private func stopCoreProcess(_ process: Process?, directory: URL?) {
+        guard let process else {
+            if let directory { try? FileManager.default.removeItem(at: directory) }
+            return
+        }
+        if process.isRunning {
+            process.terminate()
+            let deadline = Date().addingTimeInterval(1)
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        process.waitUntilExit()
+        if let directory { try? FileManager.default.removeItem(at: directory) }
     }
 
     @discardableResult

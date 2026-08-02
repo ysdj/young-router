@@ -49,6 +49,26 @@ class WebDAVSyncBundleTests(unittest.TestCase):
         )
         return path
 
+    def test_recorded_command_writes_a_private_status_file_for_success_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status_path = Path(temp_dir) / "webdav-sync-status.json"
+            args = type("Args", (), {"command": "probe", "status": status_path})()
+
+            with patch("webdav.commands.command_probe", return_value=0):
+                self.assertEqual(0, webdav_commands._run_recorded_command(args))
+            success = json.loads(status_path.read_text(encoding="utf-8"))
+
+            with patch("webdav.commands.command_probe", side_effect=webdav_core.SyncError("failed")):
+                with self.assertRaises(webdav_core.SyncError):
+                    webdav_commands._run_recorded_command(args)
+            failure = json.loads(status_path.read_text(encoding="utf-8"))
+
+            self.assertEqual("probe", success["action"])
+            self.assertTrue(success["ok"])
+            self.assertEqual("probe", failure["action"])
+            self.assertFalse(failure["ok"])
+            self.assertEqual(0o600, status_path.stat().st_mode & 0o777)
+
     def test_json_bundle_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

@@ -155,6 +155,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                 "type": "response.output_text.delta",
                 "output_index": 9,
                 "item_id": "msg_seq",
+                "content_index": 0,
                 "sequence_number": 77,
                 "delta": "stub",
             }
@@ -162,6 +163,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                 "type": "response.output_text.annotation.added",
                 "output_index": 9,
                 "item_id": "msg_seq",
+                "content_index": 0,
                 "sequence_number": 78,
                 "annotation": {
                     "type": "url_citation",
@@ -240,6 +242,91 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             web_events[2]["sequence_number"],
             78,
         )
+        delta_index = next(
+            index
+            for index, chunk in enumerate(chunks)
+            if chunk.get("type") == "response.output_text.delta"
+        )
+        self.assertEqual(
+            [chunk.get("type") for chunk in chunks[delta_index - 2 : delta_index + 1]],
+            [
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+            ],
+        )
+        self.assertEqual(chunks[delta_index - 2]["item"]["id"], "msg_seq")
+        self.assertEqual(chunks[delta_index - 2]["item"]["type"], "message")
+        self.assertEqual(chunks[delta_index - 1]["item_id"], "msg_seq")
+        self.assertEqual(chunks[delta_index]["delta"], "stub")
+        sequence_numbers = [
+            chunk["sequence_number"]
+            for chunk in chunks
+            if isinstance(chunk.get("sequence_number"), int)
+        ]
+        self.assertEqual(sequence_numbers, sorted(set(sequence_numbers)))
+
+    async def test_hidden_provider_search_preserves_existing_message_lifecycle(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def upstream():
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "tco_existing-0", "type": "reasoning"},
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "id": "msg_existing",
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }
+            yield {
+                "type": "response.content_part.added",
+                "item_id": "msg_existing",
+                "output_index": 1,
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                },
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg_existing",
+                "output_index": 1,
+                "content_index": 0,
+                "delta": "visible",
+            }
+
+        chunks = [
+            hooks._jsonable(chunk)
+            async for chunk in hooks._adapt_provider_hidden_web_search_stream(
+                upstream(),
+                {"tools": [{"type": "web_search"}]},
+            )
+        ]
+        message_starts = [
+            chunk
+            for chunk in chunks
+            if chunk.get("type") == "response.output_item.added"
+            and chunk.get("item", {}).get("type") == "message"
+        ]
+        content_starts = [
+            chunk
+            for chunk in chunks
+            if chunk.get("type") == "response.content_part.added"
+        ]
+        self.assertEqual(len(message_starts), 1)
+        self.assertEqual(len(content_starts), 1)
+        self.assertEqual(message_starts[0]["item"]["id"], "msg_existing")
+        self.assertEqual(content_starts[0]["item_id"], "msg_existing")
 
     async def test_hidden_provider_search_with_answer_never_runs_local_bridge(self) -> None:
         hooks, _ = load_hook_module()
@@ -520,6 +607,8 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             stream=False,
             tools=[{"type": "web_search"}],
             tool_choice="auto",
+            use_chat_completions_api=True,
+            _litellm_menu_upstream_url_surface="openai/chat",
             model_info={
                 "id": "chatroute",
                 "provider": "provider_chat",

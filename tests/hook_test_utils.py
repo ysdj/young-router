@@ -20,14 +20,18 @@ HOOK_PATH = ROOT / "litellm_menu" / "callbacks.py"
 HOOK_MODULE_NAMES = (
     "base",
     "api_base",
+    "request_context",
     "codex_fast_tier",
     "trace",
+    "log_rotation",
     "state",
     "routing",
     "responses_tools",
     "responses_surfaces",
     "responses_web_search_bridge",
     "responses_output",
+    "image_inputs",
+    "responses_request",
     "responses_execution",
     "responses_bridge",
     "patches",
@@ -84,9 +88,13 @@ def load_hook_module():
         "litellm.responses.litellm_completion_transformation.transformation",
     ]:
         sys.modules.pop(name, None)
-    for name in list(sys.modules):
-        if name == "litellm_menu" or name.startswith("litellm_menu."):
-            sys.modules.pop(name, None)
+    # Reload only the hook package modules.  Clearing every ``litellm_menu``
+    # module also evicts Core/domain modules imported by neighboring tests,
+    # leaving their class identities split across two module instances and
+    # making later mocks target a different operations module.
+    hook_module_names = {"litellm_menu.callbacks", *(f"litellm_menu.{name}" for name in HOOK_MODULE_NAMES)}
+    for name in hook_module_names:
+        sys.modules.pop(name, None)
 
     litellm = types.ModuleType("litellm")
 

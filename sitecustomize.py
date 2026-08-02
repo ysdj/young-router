@@ -1,14 +1,118 @@
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
+from datetime import datetime, timezone
 import os
+import sys
+import threading
 import urllib.request
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+
+
+def _bounded_writer(stream: Any, text: str) -> int:
+    from litellm_menu.log_rotation import write_bounded_stream
+
+    return write_bounded_stream(stream, text)
 
 
 _IMAGE_EDIT_USAGE_PATCH_ATTR = "_openai_image_edit_usage_patch"
 _CONFIG_CALLBACK_IMPORT_PATCH_ATTR = "_litellm_menu_config_callback_import_patch"
 _SYSTEM_PROXY_LOOKUP_PATCH_ATTR = "_litellm_menu_system_proxy_lookup_patch"
+_CONFIG_CALLBACK_ORIGINAL_ATTR = "_litellm_menu_config_callback_import_original"
+_OPTIONAL_DATABASE_ERROR_PATCH_ATTR = "_litellm_menu_optional_database_error_patch"
+_TIMESTAMPED_OUTPUT_ATTR = "_litellm_menu_timestamped_output"
+
+
+class _TimestampedOutputState:
+    def __init__(self) -> None:
+        self.at_line_start = True
+        self.lock = threading.RLock()
+
+
+class _TimestampedOutput:
+    """Prefix each proxy console line while preserving the wrapped stream API."""
+
+    def __init__(self, stream: Any, state: _TimestampedOutputState) -> None:
+        self._stream = stream
+        self._state = state
+        setattr(self, _TIMESTAMPED_OUTPUT_ATTR, True)
+
+    def write(self, value: str) -> int:
+        if not isinstance(value, str) or not value:
+            return self._stream.write(value)
+        rendered: list[str] = []
+        with self._state.lock:
+            for segment in value.splitlines(keepends=True):
+                is_line_break = segment in {"\n", "\r", "\r\n"}
+                if self._state.at_line_start and not is_line_break:
+                    stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                    rendered.append(f"[{stamp}] ")
+                rendered.append(segment)
+                self._state.at_line_start = segment.endswith(("\n", "\r"))
+            _bounded_writer(self._stream, "".join(rendered))
+        return len(value)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _install_timestamped_proxy_output() -> None:
+    if os.environ.get("LITELLM_MENU_TIMESTAMP_OUTPUT") != "1":
+        return
+    if getattr(sys.stdout, _TIMESTAMPED_OUTPUT_ATTR, False):
+        return
+    state = _TimestampedOutputState()
+    sys.stdout = _TimestampedOutput(sys.stdout, state)
+    sys.stderr = _TimestampedOutput(sys.stderr, state)
+
+
+class _PostImportPatchLoader:
+    def __init__(self, loader: Any, patch: Callable[[Any], None]) -> None:
+        self._loader = loader
+        self._patch = patch
+
+    def create_module(self, spec: Any) -> Any:
+        creator = getattr(self._loader, "create_module", None)
+        return creator(spec) if callable(creator) else None
+
+    def exec_module(self, module: Any) -> None:
+        execute = getattr(self._loader, "exec_module", None)
+        if not callable(execute):
+            raise ImportError("LiteLLM patch target has no module loader")
+        execute(module)
+        self._patch(module)
+
+
+class _PostImportPatchFinder:
+    def __init__(self, module_name: str, patch: Callable[[Any], None]) -> None:
+        self._module_name = module_name
+        self._patch = patch
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        if fullname != self._module_name:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec is None or spec.loader is None:
+            return None
+        spec.loader = _PostImportPatchLoader(spec.loader, self._patch)
+        try:
+            sys.meta_path.remove(self)
+        except ValueError:
+            pass
+        return spec
+
+
+def _patch_after_import(module_name: str, patch: Callable[[Any], None]) -> None:
+    module = sys.modules.get(module_name)
+    if module is not None:
+        patch(module)
+        return
+    sys.meta_path.insert(0, _PostImportPatchFinder(module_name, patch))
 
 
 def _int_or_none(value: Any) -> Optional[int]:
@@ -75,13 +179,7 @@ def _normalize_image_response_usage(response_json: Any) -> Any:
     return normalized_response
 
 
-def _install_litellm_openai_image_edit_usage_patch() -> None:
-    try:
-        from litellm.llms.openai.image_edit import transformation
-        from litellm.utils import ImageResponse
-    except Exception:
-        return
-
+def _patch_litellm_openai_image_edit_usage(transformation: Any) -> None:
     config_cls = getattr(transformation, "OpenAIImageEditConfig", None)
     if config_cls is None:
         return
@@ -105,6 +203,8 @@ def _install_litellm_openai_image_edit_usage_patch() -> None:
             )
 
         normalized_response_json = _normalize_image_response_usage(raw_response_json)
+        from litellm.utils import ImageResponse
+
         return ImageResponse(**normalized_response_json)
 
     setattr(patched_transform_image_edit_response, _IMAGE_EDIT_USAGE_PATCH_ATTR, True)
@@ -112,14 +212,9 @@ def _install_litellm_openai_image_edit_usage_patch() -> None:
     config_cls.transform_image_edit_response = patched_transform_image_edit_response
 
 
-def _install_litellm_config_callback_import_patch() -> None:
-    try:
-        from litellm.proxy.types_utils import utils
-    except Exception:
-        return
-
+def _patch_litellm_config_callback_import(utils: Any) -> None:
     original = getattr(utils, "get_instance_fn", None)
-    if original is None or getattr(original, _CONFIG_CALLBACK_IMPORT_PATCH_ATTR, False):
+    if not callable(original) or getattr(original, _CONFIG_CALLBACK_IMPORT_PATCH_ATTR, False):
         return
 
     def patched_get_instance_fn(
@@ -153,16 +248,69 @@ def _install_litellm_config_callback_import_patch() -> None:
 
     setattr(patched_get_instance_fn, _CONFIG_CALLBACK_IMPORT_PATCH_ATTR, True)
     setattr(patched_get_instance_fn, "_original", original)
+    setattr(patched_get_instance_fn, _CONFIG_CALLBACK_ORIGINAL_ATTR, original)
     utils.get_instance_fn = patched_get_instance_fn
 
-    try:
-        callback_utils_module = importlib.import_module(
-            "litellm.proxy.common_utils.callback_utils"
-        )
-    except Exception:
-        return
-    if getattr(callback_utils_module, "get_instance_fn", None) is original:
+    callback_utils_module = sys.modules.get("litellm.proxy.common_utils.callback_utils")
+    if callback_utils_module is not None and getattr(callback_utils_module, "get_instance_fn", None) is original:
         callback_utils_module.get_instance_fn = patched_get_instance_fn
+
+
+def _patch_litellm_callback_utils(callback_utils_module: Any) -> None:
+    utils = sys.modules.get("litellm.proxy.types_utils.utils")
+    patched = getattr(utils, "get_instance_fn", None) if utils is not None else None
+    original = getattr(patched, _CONFIG_CALLBACK_ORIGINAL_ATTR, None)
+    if original is not None and getattr(callback_utils_module, "get_instance_fn", None) is original:
+        callback_utils_module.get_instance_fn = patched
+
+
+def _patch_litellm_optional_database_error_handler(exception_handler_module: Any) -> None:
+    handler = getattr(exception_handler_module, "PrismaDBExceptionHandler", None)
+    original = getattr(handler, "is_database_service_unavailable_error", None)
+    if not callable(original) or getattr(original, _OPTIONAL_DATABASE_ERROR_PATCH_ATTR, False):
+        return
+
+    def patched_is_database_service_unavailable_error(error: Exception) -> bool:
+        try:
+            return bool(original(error))
+        except ModuleNotFoundError as missing:
+            # LiteLLM imports optional Prisma/OTel modules while classifying
+            # every authentication exception. This bundle does not ship its
+            # database backend, so a plain missing-key error must remain a
+            # normal 401 instead of becoming an unhandled 500.
+            name = missing.name or ""
+            if name == "prisma" or name == "opentelemetry" or name.startswith("opentelemetry."):
+                return False
+            raise
+
+    setattr(patched_is_database_service_unavailable_error, _OPTIONAL_DATABASE_ERROR_PATCH_ATTR, True)
+    setattr(patched_is_database_service_unavailable_error, "_original", original)
+    handler.is_database_service_unavailable_error = staticmethod(patched_is_database_service_unavailable_error)
+
+
+def _install_litellm_openai_image_edit_usage_patch() -> None:
+    _patch_after_import(
+        "litellm.llms.openai.image_edit.transformation",
+        _patch_litellm_openai_image_edit_usage,
+    )
+
+
+def _install_litellm_config_callback_import_patch() -> None:
+    _patch_after_import(
+        "litellm.proxy.types_utils.utils",
+        _patch_litellm_config_callback_import,
+    )
+    _patch_after_import(
+        "litellm.proxy.common_utils.callback_utils",
+        _patch_litellm_callback_utils,
+    )
+
+
+def _install_litellm_optional_database_error_patch() -> None:
+    _patch_after_import(
+        "litellm.proxy.db.exception_handler",
+        _patch_litellm_optional_database_error_handler,
+    )
 
 
 def _install_system_proxy_lookup_patch() -> None:
@@ -193,5 +341,7 @@ def _install_system_proxy_lookup_patch() -> None:
 
 _install_system_proxy_lookup_patch()
 if os.environ.get("LITELLM_MENU_PROXY_PROCESS") == "1":
+    _install_timestamped_proxy_output()
     _install_litellm_config_callback_import_patch()
+    _install_litellm_optional_database_error_patch()
     _install_litellm_openai_image_edit_usage_patch()

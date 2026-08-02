@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from . import computer_facade as _computer_facade_module
 from . import image_generation as _image_generation_module
+from . import image_inputs as _image_inputs_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
 from . import responses_tools as _responses_tools_module
@@ -209,7 +212,7 @@ def _usage_bound_jsonable(value: Any, *, depth: int = 0) -> Any:
 
 
 def _explicit_route_model_group(request_data: Optional[dict]) -> Optional[str]:
-    route_key = _image_generation_module._request_model_info(request_data).get(
+    route_key = _request_context_module._request_model_info(request_data).get(
         "route_key"
     )
     if not isinstance(route_key, str) or not route_key.strip():
@@ -224,16 +227,16 @@ def _explicit_route_model_group(request_data: Optional[dict]) -> Optional[str]:
 def _codex_request_input_token_upper_bound(
     request_data: Optional[dict],
 ) -> Optional[int]:
-    if not _image_generation_module._request_has_codex_client_evidence(request_data):
+    if not _responses_request_module._request_has_codex_client_evidence(request_data):
         return None
-    if not _image_generation_module._request_has_responses_shape(request_data):
+    if not _responses_request_module._request_has_responses_shape(request_data):
         return None
     request_data = request_data or {}
     if "input" not in request_data:
         return None
     if request_data.get("previous_response_id"):
         return None
-    if _image_generation_module._request_has_image_input(request_data):
+    if _image_inputs_module._request_has_image_input(request_data):
         return None
     payload: dict[str, Any] = {}
     for key in (
@@ -496,6 +499,14 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
         or "concurrency" in lowered
     ):
         status_code = 429
+    elif status_code is None and (
+        error_type == "invalid_request_error"
+        or error_code == "invalid_request_error"
+        or error_code == "thinking_signature_invalid"
+        or "encrypted function output content could not be decrypted or decoded"
+        in lowered
+    ):
+        status_code = 400
 
     exception = RuntimeError(text)
     if status_code is not None:
@@ -553,18 +564,34 @@ def _responses_stream_chunk_is_completed(chunk: Any) -> bool:
     )
 
 
-def _responses_completed_chunk_has_usable_output(chunk: Any) -> bool:
+def _responses_completed_chunk_has_usable_output(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> bool:
     if not _responses_stream_chunk_is_completed(chunk):
         return False
     dumped = _stream_chunk_dump(chunk)
     response = dumped.get("response")
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        return isinstance(response, dict) and _codex_compaction_output_is_valid(
+            response.get("output")
+        )
     if isinstance(response, dict):
-        return not _image_generation_module._response_is_effectively_empty(response)
+        if not _responses_output_module._response_is_effectively_empty(response):
+            return True
+        return False
     return _stream_chunk_has_visible_output(dumped)
 
 
-def _responses_completed_chunk_is_empty(chunk: Any) -> bool:
-    return _responses_stream_chunk_is_completed(chunk) and not _responses_completed_chunk_has_usable_output(chunk)
+def _responses_completed_chunk_is_empty(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> bool:
+    return _responses_stream_chunk_is_completed(
+        chunk
+    ) and not _responses_completed_chunk_has_usable_output(chunk, request_data)
 
 
 def _responses_stream_chunk_is_incomplete_terminal(chunk: Any) -> bool:
@@ -655,7 +682,7 @@ def _responses_output_limit_incomplete_as_completed_chunk(
     response = event.get("response")
     if not isinstance(response, dict):
         return None
-    if _image_generation_module._response_is_effectively_empty(response):
+    if _responses_output_module._response_is_effectively_empty(response):
         return None
 
     completed_event = copy.deepcopy(event)
@@ -689,7 +716,7 @@ def _responses_output_limit_terminal_state_as_completed_chunk(
     if reason not in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS:
         return None
     completed_response = completion_state.completed_payload(request_data)
-    if _image_generation_module._response_is_effectively_empty(completed_response):
+    if _responses_output_module._response_is_effectively_empty(completed_response):
         return None
     completed_event = {"type": "response.completed", "response": completed_response}
     _normalize_response_completed_event_usage(completed_event)
@@ -1082,6 +1109,7 @@ def _responses_incomplete_stream_exception(
 ) -> Exception:
     terminal_chunk = buffer[-1] if buffer else None
     terminal_summary = _responses_incomplete_terminal_summary(terminal_chunk)
+    terminal_exception = _stream_chunk_error_exception(terminal_chunk)
     terminal_error_text = " ".join(
         str(terminal_summary.get(key) or "").strip()
         for key in ("error_code", "error_type", "error_message", "error_detail")
@@ -1097,8 +1125,15 @@ def _responses_incomplete_stream_exception(
     except Exception:
         pass
     try:
+        terminal_status = (
+            _routing_module._exception_status_code(terminal_exception)
+            if terminal_exception is not None
+            else None
+        )
         exception.status_code = (  # type: ignore[attr-defined]
-            400 if _routing_module._is_context_size_error(exception) else 502
+            terminal_status
+            if terminal_status is not None
+            else 400 if _routing_module._is_context_size_error(exception) else 502
         )
     except Exception:
         pass
@@ -1122,6 +1157,12 @@ def _responses_incomplete_terminal_summary(chunk: Any) -> dict[str, Any]:
     response = dumped.get("response") if isinstance(dumped, dict) else None
     response = response if isinstance(response, dict) else {}
     error = response.get("error")
+    if not isinstance(error, dict) and isinstance(dumped, dict):
+        top_level_error = dumped.get("error")
+        if isinstance(top_level_error, dict):
+            error = top_level_error
+        elif dumped.get("type") == "error":
+            error = dumped
     error = error if isinstance(error, dict) else {}
     incomplete_details = response.get("incomplete_details")
     incomplete_details = (
@@ -1188,9 +1229,9 @@ def _response_has_tool_call_activity(response: Any) -> bool:
 
 
 def _stream_chunk_has_visible_text_output(chunk: Any) -> bool:
-    if not _image_generation_module._response_text(chunk):
+    if not _responses_output_module._response_text(chunk):
         return False
-    types = [item_type.lower() for item_type in _image_generation_module._response_types(chunk)]
+    types = [item_type.lower() for item_type in _responses_output_module._response_types(chunk)]
     if not any("reasoning" in item_type for item_type in types):
         return True
     return any("output_text" in item_type for item_type in types)
@@ -1213,7 +1254,7 @@ def _response_item_is_web_search_call(item: Any) -> bool:
     return _responses_web_search_bridge_module._is_litellm_web_search_call_item(json_item)
 
 
-def _response_item_has_encrypted_codex_compaction(item: Any) -> bool:
+def _response_item_is_codex_compaction(item: Any) -> bool:
     """Recognize both canonical and server-reference compaction item names."""
     json_item = _jsonable(item)
     if not isinstance(json_item, dict):
@@ -1222,13 +1263,32 @@ def _response_item_has_encrypted_codex_compaction(item: Any) -> bool:
         json_item,
         "type",
     )
-    if item_type not in {"compaction", "compaction_summary"}:
+    return item_type in {"compaction", "compaction_summary"}
+
+
+def _response_item_has_encrypted_codex_compaction(item: Any) -> bool:
+    if not _response_item_is_codex_compaction(item):
+        return False
+    json_item = _jsonable(item)
+    if not isinstance(json_item, dict):
         return False
     encrypted_content = _responses_web_search_bridge_module._response_item_get(
         json_item,
         "encrypted_content",
     )
     return isinstance(encrypted_content, str) and bool(encrypted_content)
+
+
+def _codex_compaction_output_is_valid(output: Any) -> bool:
+    """Return whether output has exactly one encrypted item Codex can resume from."""
+    if not isinstance(output, list):
+        return False
+    compaction_items = [
+        item for item in output if _response_item_is_codex_compaction(item)
+    ]
+    return len(compaction_items) == 1 and _response_item_has_encrypted_codex_compaction(
+        compaction_items[0]
+    )
 
 
 def _response_item_has_assistant_text(item: Any) -> bool:
@@ -1238,7 +1298,7 @@ def _response_item_has_assistant_text(item: Any) -> bool:
     item_type = _responses_web_search_bridge_module._response_item_get(json_item, "type")
     if _stream_output_item_is_tool_call(item_type):
         return False
-    return bool(_image_generation_module._response_text(json_item).strip())
+    return bool(_responses_output_module._response_text(json_item).strip())
 
 
 def _responses_completed_chunk_is_web_search_only(chunk: Any) -> bool:
@@ -1254,9 +1314,20 @@ def _responses_completed_chunk_is_web_search_only(chunk: Any) -> bool:
     return all(_response_item_is_web_search_call(item) for item in output)
 
 
-def _responses_completed_chunk_has_route_recovery_output(chunk: Any) -> bool:
+def _responses_completed_chunk_has_route_recovery_output(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> bool:
     if not _responses_stream_chunk_is_completed(chunk):
         return False
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        dumped = _stream_chunk_dump(chunk)
+        response = dumped.get("response")
+        return isinstance(response, dict) and _codex_compaction_output_is_valid(
+            response.get("output")
+        )
     dumped = _stream_chunk_dump(chunk)
     response = dumped.get("response")
     if not isinstance(response, dict):
@@ -1269,11 +1340,23 @@ def _responses_completed_chunk_has_route_recovery_output(chunk: Any) -> bool:
             return True
         if all(_response_item_is_web_search_call(item) for item in output):
             return False
-    return not _image_generation_module._response_is_effectively_empty(response)
+    return not _responses_output_module._response_is_effectively_empty(response)
 
 
-def _stream_chunk_has_deliverable_route_recovery_output(chunk: Any) -> bool:
+def _stream_chunk_has_deliverable_route_recovery_output(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> bool:
     dumped = _stream_chunk_dump(chunk)
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        if _responses_stream_chunk_is_completed(dumped):
+            return _responses_completed_chunk_has_route_recovery_output(
+                dumped,
+                request_data,
+            )
+        return False
     if _stream_chunk_type(dumped) in {"response.output_item.added", "response.output_item.done"}:
         item = dumped.get("item")
         if _response_item_is_web_search_call(item):
@@ -1285,7 +1368,7 @@ def _stream_chunk_has_deliverable_route_recovery_output(chunk: Any) -> bool:
         return False
     if _stream_chunk_has_visible_output(chunk):
         return True
-    if _responses_completed_chunk_has_route_recovery_output(dumped):
+    if _responses_completed_chunk_has_route_recovery_output(dumped, request_data):
         return True
     if _responses_stream_chunk_is_incomplete_terminal(dumped):
         return True
@@ -1307,7 +1390,7 @@ def _stream_chunk_is_assistant_text_without_tool_activity(chunk: Any) -> bool:
         item_type = _responses_web_search_bridge_module._response_item_get(item, "type")
         if _stream_output_item_is_tool_call(item_type):
             return False
-        return bool(_image_generation_module._response_text(item).strip())
+        return bool(_responses_output_module._response_text(item).strip())
     return False
 
 
@@ -1535,7 +1618,7 @@ async def _stream_with_idle_timeout(
         if not visible_output_seen:
             visible_output_seen = _stream_chunk_has_visible_output(chunk) or (
                 _request_is_responses_stream(request_data)
-                and _responses_completed_chunk_has_usable_output(chunk)
+                and _responses_completed_chunk_has_usable_output(chunk, request_data)
             )
         yield chunk
 
@@ -1571,7 +1654,7 @@ async def _stream_with_selected_deployment_box(
 
 
 def _request_is_responses_stream(request_data: Optional[dict]) -> bool:
-    return _image_generation_module._request_is_responses_api(request_data) or "input" in (request_data or {})
+    return _responses_request_module._request_is_responses_api(request_data) or "input" in (request_data or {})
 
 
 def _streaming_error_fallback_method_name(request_data: Optional[dict]) -> Optional[str]:
@@ -1617,7 +1700,7 @@ def _build_streaming_error_fallback_payload(
 ) -> Optional[dict]:
     if (
         not allow_repeated_attempt
-        and _image_generation_module._request_already_attempted_streaming_error_fallback(request_data)
+        and _responses_request_module._request_already_attempted_streaming_error_fallback(request_data)
     ):
         return None
 
@@ -1678,7 +1761,7 @@ def _build_streaming_error_fallback_payload(
         if value is not None:
             payload[key] = value
 
-    litellm_metadata = _image_generation_module._request_metadata_dict(request_data, "litellm_metadata") or {}
+    litellm_metadata = _request_context_module._request_metadata_dict(request_data, "litellm_metadata") or {}
     external_web_search_payload = bool(
         litellm_metadata.get("external_web_search_continuation") is True
         or litellm_metadata.get("external_web_search_synthesis") is True
@@ -1735,11 +1818,11 @@ def _build_streaming_error_fallback_payload(
     if method_name == "acompletion" and "messages" not in payload:
         return None
 
-    metadata = _image_generation_module._request_metadata_dict(request_data, "metadata")
+    metadata = _request_context_module._request_metadata_dict(request_data, "metadata")
     merged_litellm_metadata = litellm_metadata.copy()
     if metadata is not None:
         merged_litellm_metadata.update(metadata)
-        if _image_generation_module._request_allows_upstream_metadata(request_data):
+        if _responses_request_module._request_allows_upstream_metadata(request_data):
             payload["metadata"] = metadata.copy()
     for trace_key in ("request_id", "litellm_call_id", "call_id"):
         trace_value = request_data.get(trace_key)
@@ -1750,18 +1833,18 @@ def _build_streaming_error_fallback_payload(
     payload["stream"] = True
     if method_name == "aresponses":
         payload.setdefault("call_type", "aresponses")
-    runtime_recovery_payload = (
-        _image_generation_module._with_codex_tool_runtime_recovery_hints(payload)
+    descendant_cleanup_payload = (
+        _responses_request_module._with_codex_descendant_cleanup_instruction(payload)
     )
-    if runtime_recovery_payload is not None:
-        payload = runtime_recovery_payload
-    compaction_payload = _image_generation_module._with_codex_compaction_controls(payload)
+    if descendant_cleanup_payload is not None:
+        payload = descendant_cleanup_payload
+    compaction_payload = _responses_request_module._with_codex_compaction_controls(payload)
     if compaction_payload is not None:
         payload = compaction_payload
-    extra_body_payload = _image_generation_module._with_responses_native_extra_body(payload)
+    extra_body_payload = _responses_request_module._with_responses_native_extra_body(payload)
     if extra_body_payload is not None:
         payload = extra_body_payload
-    header_payload = _image_generation_module._with_codex_compaction_headers_from_source(
+    header_payload = _responses_request_module._with_codex_compaction_headers_from_source(
         payload,
         request_data,
     )
@@ -1783,7 +1866,7 @@ def _apply_streaming_error_fallback_constraints(
     )
     if route_recovery_poll and forced_target_order is not None:
         payload["_target_order"] = forced_target_order
-        excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_data)
+        excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_data)
         if excluded_ids:
             payload["_excluded_deployment_ids"] = sorted(excluded_ids)
         else:
@@ -1813,7 +1896,7 @@ def _apply_streaming_error_fallback_constraints(
             order = _routing_module._order_from_route_key(section.get("route_key"))
             if order is not None:
                 return order
-        model_info = _image_generation_module._request_model_info(request_data)
+        model_info = _request_context_module._request_model_info(request_data)
         if "order" in model_info:
             order = _routing_module._coerce_order(model_info.get("order"))
             if order is not None:
@@ -1821,7 +1904,7 @@ def _apply_streaming_error_fallback_constraints(
         return _routing_module._order_from_route_key(model_info.get("route_key"))
 
     no_deployments_available = _routing_module._is_no_deployments_available_error(exception)
-    target_order = _image_generation_module._request_target_order(request_data)
+    target_order = _responses_request_module._request_target_order(request_data)
     failed_order = _responses_execution_module._failed_deployment_order(exception)
     if target_order is None and failed_order is not None and not no_deployments_available:
         target_order = failed_order
@@ -1830,7 +1913,7 @@ def _apply_streaming_error_fallback_constraints(
     if target_order is not None:
         payload["_target_order"] = target_order
 
-    excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_data)
+    excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_data)
     retry_same_deployment = _routing_module._should_retry_same_deployment_before_fallback(exception)
     failed_id = _responses_execution_module._failed_deployment_id(exception)
     if failed_id is None and not no_deployments_available and not retry_same_deployment:
@@ -1853,7 +1936,7 @@ async def _streaming_error_fallback_response(
         return None
     if (
         not allow_repeated_attempt
-        and _image_generation_module._request_already_attempted_streaming_error_fallback(request_data)
+        and _responses_request_module._request_already_attempted_streaming_error_fallback(request_data)
     ):
         return None
     if not (
@@ -1870,7 +1953,7 @@ async def _streaming_error_fallback_response(
         current_surface = _routing_module._request_current_upstream_surface(
             request_data
         ) or _routing_module._deployment_primary_surface(
-            {"model_info": _image_generation_module._request_model_info(request_data)}
+            {"model_info": _request_context_module._request_model_info(request_data)}
         )
         if current_surface:
             attempted_surfaces = _routing_module._request_attempted_upstream_surfaces(
@@ -1902,17 +1985,17 @@ async def _streaming_error_fallback_response(
         return None
     exception_body = getattr(exception, "body", None)
     if route_recovery_poll:
-        litellm_metadata = _image_generation_module._request_metadata_dict(payload, "litellm_metadata") or {}
+        litellm_metadata = _request_context_module._request_metadata_dict(payload, "litellm_metadata") or {}
         updated_metadata = litellm_metadata.copy()
         updated_metadata[_ROUTE_RECOVERY_POLL_METADATA_KEY] = True
         payload["litellm_metadata"] = updated_metadata
     if isinstance(exception_body, dict) and exception_body.get("reason") == "stream_idle_timeout":
-        litellm_metadata = _image_generation_module._request_metadata_dict(payload, "litellm_metadata") or {}
+        litellm_metadata = _request_context_module._request_metadata_dict(payload, "litellm_metadata") or {}
         updated_metadata = litellm_metadata.copy()
         updated_metadata[_STREAM_IDLE_TIMEOUT_METADATA_KEY] = True
         payload["litellm_metadata"] = updated_metadata
     if isinstance(exception_body, dict) and exception_body.get("reason") == "stream_start_timeout":
-        litellm_metadata = _image_generation_module._request_metadata_dict(payload, "litellm_metadata") or {}
+        litellm_metadata = _request_context_module._request_metadata_dict(payload, "litellm_metadata") or {}
         updated_metadata = litellm_metadata.copy()
         updated_metadata[_STREAM_START_TIMEOUT_METADATA_KEY] = True
         payload["litellm_metadata"] = updated_metadata
@@ -1937,7 +2020,7 @@ async def _streaming_error_fallback_response(
         from . import responses_surfaces as _responses_surfaces_module
 
         retry_metadata = (
-            _image_generation_module._request_metadata_dict(
+            _request_context_module._request_metadata_dict(
                 payload, "litellm_metadata"
             )
             or {}
@@ -2118,14 +2201,14 @@ def _reset_route_exhaustion_retry_state(
     preserve_existing_exclusions: bool = False,
     preserve_target_order: bool = False,
 ) -> None:
-    target_order = _image_generation_module._request_target_order(request_data)
+    target_order = _responses_request_module._request_target_order(request_data)
     if target_order is None:
         target_order = _responses_execution_module._failed_deployment_order(exception)
     failed_id = (
         _responses_execution_module._failed_deployment_id(exception)
         or _routing_module._deployment_id_from_request(request_data)
     )
-    existing_excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_data)
+    existing_excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_data)
     if preserve_failed_deployment and failed_id:
         excluded_ids = existing_excluded_ids
         excluded_ids.add(failed_id)
@@ -2165,7 +2248,7 @@ def _configured_deployment_orders(router: Any, request_data: dict) -> list[_Rout
     if not isinstance(model_group, str) or not model_group.strip():
         return []
     try:
-        metadata = _image_generation_module._request_metadata_dict(request_data, "metadata") or {}
+        metadata = _request_context_module._request_metadata_dict(request_data, "metadata") or {}
         team_id = metadata.get("user_api_key_team_id")
         deployments = _routing_module._router_configured_deployments(
             router,
@@ -2177,7 +2260,7 @@ def _configured_deployment_orders(router: Any, request_data: dict) -> list[_Rout
     orders = {
         order
         for order in (
-            _image_generation_module._deployment_order(deployment)
+            _responses_request_module._deployment_order(deployment)
             for deployment in list(deployments or [])
         )
         if order is not None
@@ -2205,7 +2288,7 @@ def _route_recovery_exhausted_order(
 ) -> Optional[_RouteOrder]:
     order = _responses_execution_module._failed_deployment_order(exception)
     if order is None:
-        order = _image_generation_module._request_target_order(request_data)
+        order = _responses_request_module._request_target_order(request_data)
     if order is None:
         order = _routing_module._deployment_order_from_request(request_data)
     return order
@@ -2445,6 +2528,8 @@ async def _stream_route_recovery_poll_attempt(
 
             if started_delivery:
                 yield _responses_stream_chunk_for_delivery(chunk)
+                if _responses_stream_chunk_is_completed(chunk):
+                    return
                 continue
 
             buffered_chunks.append(chunk)
@@ -2457,7 +2542,10 @@ async def _stream_route_recovery_poll_attempt(
             )
             if terminal_exception is not None:
                 raise terminal_exception
-            if not _stream_chunk_has_deliverable_route_recovery_output(chunk):
+            if not _stream_chunk_has_deliverable_route_recovery_output(
+                chunk,
+                request_data,
+            ):
                 continue
 
             completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
@@ -2479,6 +2567,8 @@ async def _stream_route_recovery_poll_attempt(
             for buffered_chunk in buffered_chunks:
                 yield _responses_stream_chunk_for_delivery(buffered_chunk)
             buffered_chunks.clear()
+            if _responses_stream_chunk_is_completed(chunk):
+                return
     except Exception as exc:
         completed_compat = _codex_compaction_done_item_completed_compat(
             completion_state,
@@ -2523,7 +2613,7 @@ def _without_failed_codex_compaction_prompt_cache_key(
     attempt, then remove only the cache hint during shared route recovery.  The
     compaction history and complete Responses Lite tool catalog stay untouched.
     """
-    if not _image_generation_module._request_has_structured_codex_compaction(
+    if not _responses_request_module._request_has_structured_codex_compaction(
         request_data
     ):
         return None
@@ -2608,7 +2698,7 @@ def _external_web_search_recovery_payload_for_blocked_original(
 def _is_external_web_search_synthesis_recovery_payload(
     request_data: Optional[dict],
 ) -> bool:
-    metadata = _image_generation_module._request_metadata_dict(
+    metadata = _request_context_module._request_metadata_dict(
         request_data,
         "litellm_metadata",
     ) or {}
@@ -2635,7 +2725,7 @@ def _external_web_search_non_stream_synthesis_payload(
     payload["stream"] = False
     payload.pop("stream_options", None)
     payload.pop("stream_timeout", None)
-    litellm_metadata = _image_generation_module._request_metadata_dict(
+    litellm_metadata = _request_context_module._request_metadata_dict(
         payload,
         "litellm_metadata",
     ) or {}
@@ -2646,7 +2736,7 @@ def _external_web_search_non_stream_synthesis_payload(
         request_data.get(_ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY)
     )
     if target_order is None:
-        target_order = _image_generation_module._request_target_order(request_data)
+        target_order = _responses_request_module._request_target_order(request_data)
     if target_order is None:
         for section_name in ("litellm_params", "model_info"):
             section = request_data.get(section_name)
@@ -2962,7 +3052,7 @@ async def _stream_route_recovery_poll(
                     started_at_monotonic=started_at_monotonic,
                     max_poll_seconds=max_poll_seconds,
                     poll_interval_seconds=delay_seconds,
-                    target_order=_image_generation_module._request_target_order(request_data),
+                    target_order=_responses_request_module._request_target_order(request_data),
                     cooldown_until=cooldown_until,
                     cooldown_deployments=cooldown_wait["cooldown_deployments"],
                 )
@@ -3065,7 +3155,7 @@ async def _stream_route_recovery_poll(
             forced_target_order = None
             if refresh_after_exhausted_poll:
                 previous_excluded_ids = sorted(
-                    _image_generation_module._request_excluded_deployment_ids(request_data),
+                    _responses_request_module._request_excluded_deployment_ids(request_data),
                 )
                 try:
                     from litellm.proxy.proxy_server import llm_router
@@ -3108,7 +3198,7 @@ async def _stream_route_recovery_poll(
 
             target_order = forced_target_order
             if target_order is None:
-                target_order = _image_generation_module._request_target_order(request_data)
+                target_order = _responses_request_module._request_target_order(request_data)
             new_recovery_state_key = _route_recovery_state_upsert(
                 request_data,
                 last_exception,
@@ -3274,7 +3364,7 @@ async def _stream_route_recovery_poll(
                 started_at_monotonic=started_at_monotonic,
                 max_poll_seconds=max_poll_seconds,
                 poll_interval_seconds=delay_seconds,
-                target_order=_image_generation_module._request_target_order(request_data),
+                target_order=_responses_request_module._request_target_order(request_data),
             )
             if new_recovery_state_key and new_recovery_state_key != recovery_state_key:
                 _route_recovery_state_remove(recovery_state_key)
@@ -3306,7 +3396,7 @@ def _route_recovery_poll_cooldown_wait(
     if not isinstance(model_group, str) or not model_group.strip():
         return None
     try:
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_data, "metadata"
         ) or {}
         deployments = _routing_module._router_configured_deployments(
@@ -3330,7 +3420,7 @@ def _route_recovery_poll_cooldown_wait(
         # An active explicit target/order is a real request constraint. Do not
         # hold an unrelated group route open merely because it is cooling.
         constraints = request_data
-    constrained = _image_generation_module._with_retry_target_constraints(
+    constrained = _responses_request_module._with_retry_target_constraints(
         deployments,
         constraints,
     )
@@ -3415,12 +3505,12 @@ def _build_forced_image_generation_payload(request_data: dict, *, stream: bool) 
         return None
 
     attempts = _image_generation_module._with_incremented_image_generation_tool_fallback_attempts(request_data)
-    litellm_metadata = _image_generation_module._request_metadata_dict(request_data, "litellm_metadata") or {}
-    metadata = _image_generation_module._request_metadata_dict(request_data, "metadata")
+    litellm_metadata = _request_context_module._request_metadata_dict(request_data, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(request_data, "metadata")
     merged_litellm_metadata = litellm_metadata.copy()
     if metadata is not None:
         merged_litellm_metadata.update(metadata)
-        if _image_generation_module._request_allows_upstream_metadata(request_data):
+        if _responses_request_module._request_allows_upstream_metadata(request_data):
             payload["metadata"] = metadata.copy()
     merged_litellm_metadata[_STREAM_FALLBACK_METADATA_KEY] = True
     merged_litellm_metadata[_IMAGE_GENERATION_TOOL_FALLBACK_ATTEMPTS_METADATA_KEY] = attempts
@@ -3455,7 +3545,7 @@ async def _stream_forced_image_generation_payload(payload: dict) -> AsyncIterato
                 yield buffered_chunk
             buffer = []
             continue
-        chunk_text = _image_generation_module._response_text(chunk)
+        chunk_text = _responses_output_module._response_text(chunk)
         if chunk_text:
             text = f"{text}\n{chunk_text}" if text else chunk_text
             if _image_generation_module._response_is_image_generation_unavailable_refusal({"output_text": text}):
@@ -3479,7 +3569,8 @@ async def _yield_original_stream(
     is_responses_stream = _request_is_responses_stream(request_data)
     for chunk in buffer:
         visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk) or (
-            is_responses_stream and _responses_completed_chunk_has_usable_output(chunk)
+            is_responses_stream
+            and _responses_completed_chunk_has_usable_output(chunk, request_data)
         )
         yield chunk
     async for chunk in _stream_with_idle_timeout(
@@ -3503,20 +3594,16 @@ def _responses_non_streaming_response_has_usable_output(
 ) -> bool:
     payload = _jsonable(response)
     if not isinstance(payload, dict):
-        return not _image_generation_module._response_is_effectively_empty(response)
-    if (
-        _stream_chunk_has_visible_output(payload)
-        or _image_generation_module._payload_has_tool_activity(payload)
-    ):
-        return True
-    if _image_generation_module._request_has_structured_codex_compaction(
+        return not _responses_output_module._response_is_effectively_empty(response)
+    if _responses_request_module._request_has_structured_codex_compaction(
         request_data
     ):
-        output = payload.get("output")
-        if isinstance(output, list) and any(
-            _response_item_has_encrypted_codex_compaction(item) for item in output
-        ):
-            return True
+        return _codex_compaction_output_is_valid(payload.get("output"))
+    if (
+        _stream_chunk_has_visible_output(payload)
+        or _responses_output_module._payload_has_tool_activity(payload)
+    ):
+        return True
     return False
 
 
@@ -3525,7 +3612,7 @@ def _completed_response_payload(response: Any, request_data: Optional[dict]) -> 
     if not isinstance(payload, dict):
         payload = {}
     output = payload.get("output")
-    text = _image_generation_module._response_text(payload) or _image_generation_module._response_text(response)
+    text = _responses_output_module._response_text(payload) or _responses_output_module._response_text(response)
     if not isinstance(output, list) or not output:
         if text.strip():
             message_id = f"msg_completed_{time.time_ns()}"
@@ -3751,7 +3838,7 @@ def _codex_compaction_done_item_completed_compat(
     path is deliberately limited to structured Codex compaction and to items
     observed in ``output_item.done`` (never merely ``output_item.added``).
     """
-    if not _image_generation_module._request_has_structured_codex_compaction(
+    if not _responses_request_module._request_has_structured_codex_compaction(
         request_data
     ):
         return None
@@ -3769,11 +3856,10 @@ def _codex_compaction_done_item_completed_compat(
         return None
 
     completed_output_items = completion_state.output_by_index
-    has_encrypted_compaction = any(
-        _response_item_has_encrypted_codex_compaction(item)
-        for item in completed_output_items.values()
-    )
-    if not has_encrypted_compaction:
+    completed_items = [
+        item for _index, item in sorted(completed_output_items.items())
+    ]
+    if not _codex_compaction_output_is_valid(completed_items):
         return None
 
     completed_event = _synthesized_completed_response_event(
@@ -3879,6 +3965,105 @@ async def _non_streaming_response_as_stream(
     yield response
 
 
+async def _yield_validated_structured_codex_compaction_stream(
+    buffer: List[Any],
+    response: Any,
+    request_data: dict,
+    *,
+    stream_started_at: Optional[float] = None,
+) -> AsyncIterator[Any]:
+    """Buffer a remote compaction until its required encrypted result is final."""
+    events: List[Any] = []
+    completion_state = _ResponsesStreamCompletionState(request_data)
+    raw_tool_call_text_filter = _responses_web_search_bridge_module._RawToolCallTextFilter()
+
+    def remember(chunk: Any) -> bool:
+        sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
+            chunk
+        )
+        if sanitized_chunk is None:
+            return False
+        sanitized_chunk = _responses_web_search_bridge_module._sanitize_raw_tool_call_text_stream_chunk(
+            sanitized_chunk,
+            raw_tool_call_text_filter,
+        )
+        if sanitized_chunk is None:
+            return False
+        chunk_exception = _stream_chunk_priority_error_exception(sanitized_chunk)
+        if chunk_exception is not None:
+            raise chunk_exception
+        events.append(sanitized_chunk)
+        completion_state.remember(sanitized_chunk)
+        if _responses_stream_chunk_is_incomplete_terminal(sanitized_chunk):
+            raise _responses_incomplete_stream_exception(
+                "terminal response event before response.completed",
+                buffer=events,
+                request_data=request_data,
+            )
+        if not _responses_stream_chunk_is_completed(sanitized_chunk):
+            return False
+        if not _responses_completed_chunk_has_usable_output(
+            sanitized_chunk,
+            request_data,
+        ):
+            raise _responses_incomplete_stream_exception(
+                "structured Codex compaction completed without exactly one encrypted compaction item",
+                buffer=events,
+                request_data=request_data,
+            )
+        return True
+
+    for chunk in buffer:
+        if remember(chunk):
+            for event in events:
+                yield _responses_stream_chunk_for_delivery(event)
+            await _close_async_iterator_safely(response)
+            return
+
+    try:
+        async for chunk in _stream_with_idle_timeout(
+            response,
+            request_data,
+            stream_started_at=stream_started_at,
+            initial_chunk_count=len(buffer),
+        ):
+            if remember(chunk):
+                for event in events:
+                    yield _responses_stream_chunk_for_delivery(event)
+                await _close_async_iterator_safely(response)
+                return
+    except Exception as exception:
+        completed_compat = _codex_compaction_done_item_completed_compat(
+            completion_state,
+            request_data,
+            reason="stream_error_after_completed_compaction_item",
+            exception=exception,
+        )
+        if completed_compat is None:
+            raise
+        for event in events:
+            yield _responses_stream_chunk_for_delivery(event)
+        yield completed_compat
+        await _close_async_iterator_safely(response)
+        return
+
+    completed_compat = _codex_compaction_done_item_completed_compat(
+        completion_state,
+        request_data,
+        reason="clean_eof_after_completed_compaction_item",
+    )
+    if completed_compat is not None:
+        for event in events:
+            yield _responses_stream_chunk_for_delivery(event)
+        yield completed_compat
+        return
+    raise _responses_incomplete_stream_exception(
+        "stream ended before response.completed",
+        buffer=events,
+        request_data=request_data,
+    )
+
+
 async def _yield_guarded_original_stream(
     buffer: List[Any],
     response: Any,
@@ -3896,6 +4081,18 @@ async def _yield_guarded_original_stream(
             request_data,
             stream_started_at=stream_started_at,
             saw_visible_output=saw_visible_output,
+        ):
+            yield chunk
+        return
+
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        async for chunk in _yield_validated_structured_codex_compaction_stream(
+            buffer,
+            response,
+            request_data,
+            stream_started_at=stream_started_at,
         ):
             yield chunk
         return
@@ -4075,7 +4272,7 @@ async def _yield_guarded_original_stream(
         for item in completed_output_items.values():
             if _stream_output_item_is_tool_call(_responses_web_search_bridge_module._response_item_get(item, "type")):
                 continue
-            if _image_generation_module._response_text(item).strip():
+            if _responses_output_module._response_text(item).strip():
                 return True
         return False
 
@@ -4095,7 +4292,7 @@ async def _yield_guarded_original_stream(
             _responses_web_search_bridge_module._response_item_get(json_item, "type")
         ):
             return False
-        return bool(_image_generation_module._response_text(json_item).strip())
+        return bool(_responses_output_module._response_text(json_item).strip())
 
     def web_search_activity_key_from_item(item: Any, output_index: Any = None) -> Optional[str]:
         json_item = _jsonable(item)
@@ -4223,7 +4420,7 @@ async def _yield_guarded_original_stream(
             request_data,
         ):
             return True
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_data,
             "litellm_metadata",
         ) or {}
@@ -4380,7 +4577,7 @@ async def _yield_guarded_original_stream(
         for item in output:
             if not isinstance(item, dict) or item.get("type") != "message":
                 continue
-            if _image_generation_module._response_text(item).strip():
+            if _responses_output_module._response_text(item).strip():
                 messages.append(item)
         return messages
 
@@ -4729,10 +4926,13 @@ async def _yield_guarded_original_stream(
             chunk = completed_compat_chunk
             remember(chunk)
         if _responses_stream_chunk_is_completed(chunk):
-            if _responses_completed_chunk_is_empty(chunk) and not visible_output_seen:
+            if _responses_completed_chunk_is_empty(chunk, request_data) and not visible_output_seen:
                 break
             saw_responses_completed = True
-            visible_output_seen = visible_output_seen or _responses_completed_chunk_has_usable_output(chunk)
+            visible_output_seen = visible_output_seen or _responses_completed_chunk_has_usable_output(
+                chunk,
+                request_data,
+            )
             for synthetic_chunk in _synthesized_missing_completed_tool_events(
                 chunk,
                 seen_output_item_ids,
@@ -4847,7 +5047,7 @@ async def _yield_guarded_original_stream(
                 chunk = completed_compat_chunk
                 remember(chunk)
             if _responses_stream_chunk_is_completed(chunk):
-                if _responses_completed_chunk_is_empty(chunk) and not visible_output_seen:
+                if _responses_completed_chunk_is_empty(chunk, request_data) and not visible_output_seen:
                     break
                 saw_responses_completed = True
                 for synthetic_chunk in _synthesized_missing_completed_tool_events(
@@ -5010,7 +5210,7 @@ async def _yield_streaming_error_fallback_or_raise(
     exception: Exception,
 ) -> AsyncIterator[Any]:
     is_responses_stream = _request_is_responses_stream(request_data)
-    litellm_metadata = _image_generation_module._request_metadata_dict(
+    litellm_metadata = _request_context_module._request_metadata_dict(
         request_data,
         "litellm_metadata",
     ) or {}
@@ -5119,7 +5319,10 @@ async def _yield_streaming_error_fallback_or_raise(
         async for chunk in _stream_streaming_error_fallback(request_data, exception):
             if is_responses_stream and not fallback_started_delivery:
                 chunk_has_visible_output = _stream_chunk_has_visible_output(chunk)
-                chunk_is_completed = _responses_completed_chunk_has_usable_output(chunk)
+                chunk_is_completed = _responses_completed_chunk_has_usable_output(
+                    chunk,
+                    request_data,
+                )
                 chunk_is_incomplete_terminal = _responses_stream_chunk_is_incomplete_terminal(chunk)
                 if not (
                     chunk_has_visible_output
@@ -5142,7 +5345,7 @@ async def _yield_streaming_error_fallback_or_raise(
                 fallback_delivered_terminal_or_visible = (
                     fallback_delivered_terminal_or_visible
                     or _stream_chunk_has_visible_output(chunk)
-                    or _responses_completed_chunk_has_usable_output(chunk)
+                    or _responses_completed_chunk_has_usable_output(chunk, request_data)
                     or _responses_stream_chunk_is_incomplete_terminal(chunk)
                 )
             yielded_fallback = True
@@ -5252,7 +5455,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
     response: Any,
     request_data: dict,
 ) -> AsyncIterator[Any]:
-    if not _image_generation_module._response_is_async_iterable(response):
+    if not _responses_output_module._response_is_async_iterable(response):
         try:
             async for chunk in _non_streaming_response_as_stream(response, request_data):
                 yield chunk
@@ -5270,6 +5473,30 @@ async def _yield_start_buffered_stream_with_error_fallback(
     if _routing_module._is_failed_responses_stream_response(response):
         async for chunk in response:
             yield chunk
+        return
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        stream_started_at = time.monotonic()
+        try:
+            async for chunk in _yield_validated_structured_codex_compaction_stream(
+                [],
+                response,
+                request_data,
+                stream_started_at=stream_started_at,
+            ):
+                yield chunk
+        except Exception as exception:
+            if _routing_module._is_priority_deployment_failover_error(exception):
+                _routing_module._mark_exception_for_deployment_failover(
+                    exception,
+                    request_data,
+                )
+            async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
+                request_data,
+                exception,
+            ):
+                yield fallback_chunk
         return
 
     buffer: List[Any] = []
@@ -5360,10 +5587,13 @@ async def _yield_start_buffered_stream_with_error_fallback(
             )
             if is_responses_stream:
                 if _responses_stream_chunk_is_completed(chunk):
-                    if _responses_completed_chunk_is_empty(chunk) and not saw_visible_output:
+                    if _responses_completed_chunk_is_empty(chunk, request_data) and not saw_visible_output:
                         break
                     saw_responses_completed = True
-                    saw_visible_output = saw_visible_output or _responses_completed_chunk_has_usable_output(chunk)
+                    saw_visible_output = saw_visible_output or _responses_completed_chunk_has_usable_output(
+                        chunk,
+                        request_data,
+                    )
                 elif _responses_stream_chunk_is_incomplete_terminal(chunk):
                     completed_compat_chunk = (
                         _responses_output_limit_terminal_state_as_completed_chunk(

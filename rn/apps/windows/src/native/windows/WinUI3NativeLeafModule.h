@@ -20,11 +20,16 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(OpenFilePicker, L"openFilePicker");
   REACT_METHOD(SaveFilePicker, L"saveFilePicker");
   REACT_METHOD(ShowConfirmation, L"showConfirmation");
+  REACT_METHOD(ShowActionMenu, L"showActionMenu");
   REACT_METHOD(ChooseModelsToAdd, L"chooseModelsToAdd");
   REACT_METHOD(EditSecureDocument, L"editSecureDocument");
   REACT_METHOD(SetLocalization, L"setLocalization");
   REACT_METHOD(EditSecret, L"editSecret");
   REACT_METHOD(ClearSecret, L"clearSecret");
+  REACT_METHOD(RelayLogin, L"relayLogin");
+  REACT_METHOD(RestoreRelaySession, L"restoreRelaySession");
+  REACT_METHOD(ClearRelayCredentials, L"clearRelayCredentials");
+  REACT_METHOD(ClearRelayPassword, L"clearRelayPassword");
   REACT_SYNC_METHOD(SystemLocale, L"systemLocale");
   REACT_METHOD(SetLaunchAtLogin, L"setLaunchAtLogin");
   REACT_METHOD(ShowVersion, L"showVersion");
@@ -45,12 +50,17 @@ struct WinUI3NativeLeafModule {
   void SetTrayStatus(std::wstring const& title, bool running) noexcept;
   void SetTrayActions(winrt::Microsoft::ReactNative::JSValueArray const& actions) noexcept;
   void OpenFilePicker(std::string const& purpose, winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept;
-  void SaveFilePicker(std::string const& purpose, winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept;
+  void SaveFilePicker(std::wstring const& suggested_name, winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept;
   void ShowConfirmation(
       std::wstring const& title,
       std::wstring const& message,
       std::wstring const& confirm_label,
       winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept;
+  void ShowActionMenu(
+      std::wstring const& title,
+      std::vector<std::wstring> const& items,
+      winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept;
   void ChooseModelsToAdd(
       std::vector<std::string> const& models,
       std::wstring const& provider_name,
@@ -74,6 +84,18 @@ struct WinUI3NativeLeafModule {
       std::string const& field,
       std::optional<std::string> const& target,
       winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
+  void RelayLogin(
+      winrt::Microsoft::ReactNative::JSValueObject const& options,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
+  void RestoreRelaySession(
+      winrt::Microsoft::ReactNative::JSValueObject const& options,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
+  void ClearRelayCredentials(
+      std::string const& account_id,
+      winrt::Microsoft::ReactNative::ReactPromise<void> const& promise) noexcept;
+  void ClearRelayPassword(
+      std::string const& account_id,
+      winrt::Microsoft::ReactNative::ReactPromise<void> const& promise) noexcept;
   std::string SystemLocale() noexcept;
   void SetLaunchAtLogin(bool enabled, winrt::Microsoft::ReactNative::ReactPromise<bool> promise) noexcept;
   void ShowVersion() noexcept;

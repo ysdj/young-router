@@ -126,6 +126,260 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertEqual(chunks[-1]["type"], "response.completed")
         self.assertEqual(chunks[-1]["response"]["output"][0]["type"], "compaction")
 
+    async def test_structured_compaction_completed_item_is_not_treated_as_empty(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "compaction_trigger", "id": "compact-now"}],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-encrypted-completed",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "cmp-encrypted-completed",
+                        "type": "compaction",
+                        "encrypted_content": "encrypted-summary",
+                    }
+                ],
+            },
+        }
+
+        self.assertFalse(
+            hooks._responses_completed_chunk_has_usable_output(
+                completed,
+                {"input": [{"role": "user", "content": "ordinary request"}]},
+            )
+        )
+        self.assertTrue(
+            hooks._responses_completed_chunk_has_usable_output(completed, request_data)
+        )
+        self.assertFalse(
+            hooks._responses_completed_chunk_has_usable_output(
+                {
+                    "type": "response.completed",
+                    "output": completed["response"]["output"],
+                },
+                request_data,
+            )
+        )
+        retained_and_compacted = copy.deepcopy(completed)
+        retained_and_compacted["response"]["output"].insert(
+            0,
+            {
+                "id": "msg-retained",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "retained"}],
+            },
+        )
+        self.assertTrue(
+            hooks._responses_completed_chunk_has_usable_output(
+                retained_and_compacted,
+                request_data,
+            )
+        )
+        duplicate_compaction = copy.deepcopy(completed)
+        duplicate_compaction["response"]["output"].append(
+            {
+                "id": "cmp-duplicate",
+                "type": "compaction",
+                "encrypted_content": "encrypted-duplicate-summary",
+            }
+        )
+        self.assertFalse(
+            hooks._responses_completed_chunk_has_usable_output(
+                duplicate_compaction,
+                request_data,
+            )
+        )
+        duplicate_malformed_compaction = copy.deepcopy(completed)
+        duplicate_malformed_compaction["response"]["output"].append(
+            {"id": "cmp-malformed", "type": "compaction"}
+        )
+        self.assertFalse(
+            hooks._responses_completed_chunk_has_usable_output(
+                duplicate_malformed_compaction,
+                request_data,
+            )
+        )
+
+        async def original_stream():
+            yield {
+                "type": "response.created",
+                "response": {
+                    "id": "resp-encrypted-completed",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }
+            yield completed
+
+        class UnexpectedRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("completed compaction response must not be retried")
+
+        proxy_server.llm_router = UnexpectedRouter()
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[-1], completed)
+
+    async def test_structured_compaction_retries_one_message_false_success(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        async def original_stream():
+            message_item = {
+                "id": "msg-false-success",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "summary text"}
+                ],
+            }
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-false-success", "status": "in_progress"},
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": message_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-false-success",
+                    "status": "completed",
+                    "output": [message_item],
+                },
+            }
+
+        async def recovered_stream():
+            compaction_item = {
+                "id": "cmp-recovered",
+                "type": "compaction",
+                "encrypted_content": "encrypted-recovered-summary",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-recovered",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("resp-false-success", json.dumps(chunks))
+        self.assertNotIn("msg-false-success", json.dumps(chunks))
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(chunks[-1]["response"]["output"], [
+            {
+                "id": "cmp-recovered",
+                "type": "compaction",
+                "encrypted_content": "encrypted-recovered-summary",
+            }
+        ])
+
+    async def test_structured_compaction_route_recovery_buffers_message_false_success(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "compaction_trigger", "id": "compact-now"}],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        false_success_item = {
+            "id": "msg-route-false-success",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "summary text"}],
+        }
+
+        async def recovery_stream():
+            yield {"type": "response.output_text.delta", "delta": "summary text"}
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": false_success_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-route-false-success",
+                    "status": "completed",
+                    "output": [false_success_item],
+                },
+            }
+
+        async def recovery_round(*_args, **_kwargs):
+            async for chunk in recovery_stream():
+                yield chunk
+
+        hooks._stream_streaming_error_fallback_round = recovery_round
+        exception = RuntimeError("retry structured compaction")
+        exception.status_code = 502
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._stream_route_recovery_poll_attempt(
+                request_data,
+                exception,
+                attempt=1,
+            )
+        ]
+
+        self.assertEqual(chunks, [])
+
     async def test_route_recovery_accepts_compaction_done_item_at_clean_eof(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
@@ -301,8 +555,24 @@ class HookStreamingCompactionTests(HookTestCase):
             yield {"type": "response.created", "response": {"id": "resp-original"}}
 
         async def fallback_stream():
-            yield {"type": "response.output_text.delta", "delta": "compact ok"}
-            yield {"type": "response.completed", "response": {"id": "resp-fallback"}}
+            compaction_item = {
+                "id": "cmp-native-shape",
+                "type": "compaction",
+                "encrypted_content": "encrypted-native-shape",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-fallback",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
 
         class FakeRouter:
             async def aresponses(self, **payload):
@@ -410,8 +680,24 @@ class HookStreamingCompactionTests(HookTestCase):
             yield {"type": "response.created", "response": {"id": "resp-fallback"}}
 
         async def recovered_stream():
-            yield {"type": "response.output_text.delta", "delta": "compact recovered"}
-            yield {"type": "response.completed", "response": {"id": "resp-recovered"}}
+            compaction_item = {
+                "id": "cmp-route-recovered",
+                "type": "compaction",
+                "encrypted_content": "encrypted-route-recovered",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-recovered",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
 
         class FakeRouter:
             async def aresponses(self, **payload):

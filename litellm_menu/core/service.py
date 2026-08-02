@@ -26,7 +26,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
-from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, read_bytes, read_json
+from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
 from .protocol import PROTOCOL_VERSION, ProtocolError, make_event
 from .security import REDACTED, redact, safe_exception_message, safe_error_message
 
@@ -35,12 +35,15 @@ CORE_METADATA_VERSION = 1
 STATE_FILE_NAME = "core-state.json"
 PACKAGE_FORMAT = "litellm-menu-core-package"
 PACKAGE_VERSION = 1
+DOMAIN_FILE_FORMAT = "litellm-menu-domain-settings"
+DOMAIN_FILE_VERSION = 1
 SUBSCRIPTION_QUEUE_LIMIT = 32
 
 _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("providers_models", "api_key"): True,
     ("codex", "api_key"): False,
     ("claude", "deployment_token"): False,
+    ("claude", "auto_memory_directory"): False,
     ("runtime", "setting"): True,
     ("webdav", "password"): False,
 }
@@ -56,6 +59,8 @@ _DOMAIN_ALIASES = {
     "runtime_settings": "runtime",
     "webdav-settings": "webdav",
     "webdav_settings": "webdav",
+    "relay-accounts": "relay_accounts",
+    "relay_accounts": "relay_accounts",
     "language": "language",
     "logs": "logs",
 }
@@ -338,7 +343,7 @@ def _adapter_persistence_paths(adapter: DomainAdapter) -> tuple[Path, ...]:
     if delegate is not None:
         adapter = delegate
     paths: list[Path] = []
-    for attribute in ("config_path", "runtime_config_path", "settings_path", "preference_path", "enabled_path"):
+    for attribute in ("config_path", "runtime_config_path", "settings_path", "preference_path", "enabled_path", "status_path"):
         value = getattr(adapter, attribute, None)
         if isinstance(value, (str, Path)):
             paths.append(Path(value).expanduser())
@@ -353,6 +358,13 @@ def _adapter_persistence_paths(adapter: DomainAdapter) -> tuple[Path, ...]:
         home = Path(home_value).expanduser() if isinstance(home_value, (str, Path)) else Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
         paths.extend((home / "config.toml", home / "auth.json"))
     return tuple(dict.fromkeys(paths))
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve(strict=False) == right.resolve(strict=False)
+    except OSError:
+        return False
 
 
 def _checkpoint_files(paths: Iterable[Path]) -> tuple[_FileCheckpoint, ...]:
@@ -397,6 +409,7 @@ class RecoverableDomain:
         self.name = _canonical_domain(name)
         self._factory = factory
         self._delegate: DomainAdapter | None = None
+        self._recovery_candidate: DomainAdapter | None = None
         self.revision = 0
 
     def snapshot(self) -> Mapping[str, Any]:
@@ -428,13 +441,49 @@ class RecoverableDomain:
         return self._require_delegate().apply(payload)
 
     def reload(self) -> Mapping[str, Any] | None:
+        if self._delegate is not None:
+            return self._delegate.reload()
         try:
-            delegate = self._factory()
+            delegate = self._recovery_candidate or self._factory()
         except Exception:
             raise CoreError("domain_unavailable", "Settings could not be loaded") from None
+        self._recovery_candidate = None
         self._delegate = delegate
         self.revision += 1
         return delegate.snapshot()
+
+    def external_disk_state(self) -> Mapping[str, bool]:
+        """Probe a failed source so a valid external repair recovers itself."""
+
+        if self._delegate is not None:
+            detector = getattr(self._delegate, "external_disk_state", None)
+            return detector() if callable(detector) else {"changed": False, "exists": True}
+        if self._recovery_candidate is None:
+            try:
+                self._recovery_candidate = self._factory()
+            except Exception:
+                return {"changed": False, "exists": True}
+        return {"changed": True, "exists": True}
+
+    def external_disk_identity(self) -> str:
+        if self._delegate is not None:
+            getter = getattr(self._delegate, "external_disk_identity", None)
+            if callable(getter):
+                return str(getter())
+            return "recoverable-loaded"
+        if self._recovery_candidate is not None:
+            getter = getattr(self._recovery_candidate, "external_disk_identity", None)
+            if callable(getter):
+                return str(getter())
+            return "recoverable-ready"
+        return "recoverable-unavailable"
+
+    def __getattr__(self, name: str) -> Any:
+        """Expose trusted delegate capabilities after automatic recovery."""
+
+        if name.startswith("_") or self._delegate is None:
+            raise AttributeError(name)
+        return getattr(self._delegate, name)
 
 
 class MemoryDomain:
@@ -536,8 +585,17 @@ class CoreStore:
         self._revision = 0
         self._service: dict[str, Any] = {"state": "unknown"}
         self._last_actions: dict[str, dict[str, Any]] = {}
+        self._disk: dict[str, dict[str, Any]] = {}
+        self._disk_identities: dict[str, str | None] = {}
         self._logs: dict[str, dict[str, Any]] = {
-            tab: {"tab": tab, "available": False, "paused": False, "line_count": 0}
+            tab: {
+                "tab": tab,
+                "available": False,
+                "paused": False,
+                "line_count": 0,
+                "filter": "",
+                "limit": 0,
+            }
             for tab in LOG_TABS
         }
         if self._metadata_store is not None:
@@ -569,12 +627,10 @@ class CoreStore:
 
         adapters: list[DomainAdapter] = []
         try:
-            from .domains.legacy import (
-                CodexSettingsDomain,
-                ProvidersModelsDomain,
-                RuntimeSettingsDomain,
-                WebDAVSettingsDomain,
-            )
+            from .domains.codex import CodexSettingsDomain
+            from .domains.providers_models import ProvidersModelsDomain
+            from .domains.runtime import RuntimeSettingsDomain
+            from .domains.webdav import WebDAVSettingsDomain
 
             legacy_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
                 ("providers_models", lambda: ProvidersModelsDomain(config_path)),
@@ -617,7 +673,13 @@ class CoreStore:
             from .domains.logs import LogsDomain
 
             adapters = [adapter for adapter in adapters if getattr(adapter, "name", "") != "logs"]
-            adapters.append(LogsDomain(runtime_root, config_path=config_path))
+            adapters.append(
+                LogsDomain(
+                    runtime_root,
+                    config_path=config_path,
+                    runtime_settings_path=runtime_settings_path,
+                )
+            )
         except Exception:
             # A log directory can be unavailable during early startup; retain
             # the neutral summary adapter so the rest of the UI still opens.
@@ -632,6 +694,12 @@ class CoreStore:
                 adapters.append(RecoverableDomain("language", language_factory))
         except Exception:
             adapters.append(UnavailableDomain("language"))
+        try:
+            from .domains.relay_accounts import RelayAccountsDomain
+
+            adapters.append(RelayAccountsDomain(runtime_root))
+        except Exception:
+            adapters.append(UnavailableDomain("relay_accounts"))
         try:
             from .operations import CoreServiceController
 
@@ -717,6 +785,8 @@ class CoreStore:
                 "base_revision": self._revision,
                 "validation": {"valid": True, "issues": []},
             }
+            self._disk[name] = {"changed": False, "generation": 0, "keep_draft": False}
+            self._disk_identities[name] = self._external_disk_identity(adapter)
         return name
 
     def unregister_domain(self, domain: str) -> None:
@@ -725,6 +795,8 @@ class CoreStore:
             self._domains.pop(name, None)
             self._baselines.pop(name, None)
             self._drafts.pop(name, None)
+            self._disk.pop(name, None)
+            self._disk_identities.pop(name, None)
 
     def _adapter_snapshot(self, name: str) -> object:
         adapter = self._domains.get(name)
@@ -755,7 +827,8 @@ class CoreStore:
             raise CoreError("state_unavailable", safe_exception_message(exc)) from None
 
     def _emit(self) -> None:
-        event = make_event("snapshot", self._revision, self.snapshot())
+        snapshot = self.snapshot()
+        event = make_event("snapshot", snapshot["revision"], snapshot)
         callbacks = tuple(self._subscribers.values())
         for callback in callbacks:
             try:
@@ -779,6 +852,7 @@ class CoreStore:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            self._refresh_external_disk_state()
             domain_states = {name: self._adapter_snapshot(name) for name in self._domains}
             providers = self._providers_summary(domain_states)
             webdav = self._webdav_summary(domain_states)
@@ -790,6 +864,7 @@ class CoreStore:
                 "service": copy.deepcopy(_safe_public(self._service)),
                 "providers_models": providers,
                 "drafts": copy.deepcopy(self._drafts),
+                "disk": copy.deepcopy(self._disk),
                 "webdav": webdav,
                 "logs": logs,
                 "language": language,
@@ -799,6 +874,73 @@ class CoreStore:
                 # Claude, runtime, and future domains without another reducer.
                 "domains": copy.deepcopy(domain_states),
             }
+
+    def log_view(self, tab: str, known_revision: int | None = None) -> dict[str, Any]:
+        """Load one requested log tab without inflating global snapshots."""
+
+        with self._lock:
+            adapter = self._domains.get("logs")
+            view = getattr(adapter, "view", None) if adapter is not None else None
+            if not callable(view):
+                raise CoreError("logs_unavailable", "Logs are unavailable")
+            try:
+                result = view(tab, known_revision)
+            except CoreError:
+                raise
+            except Exception as exc:
+                raise CoreError("logs_unavailable", safe_exception_message(exc)) from None
+            safe_result = _safe_public(result)
+            if not isinstance(safe_result, Mapping):
+                raise CoreError("logs_unavailable", "Logs are unavailable")
+            return dict(safe_result)
+
+    def _refresh_external_disk_state(self) -> None:
+        """Auto-reload clean drafts and expose only sanitized conflict state."""
+
+        for name, adapter in self._domains.items():
+            detector = getattr(adapter, "external_disk_state", None)
+            if not callable(detector):
+                continue
+            record = self._disk.setdefault(name, {"changed": False, "generation": 0, "keep_draft": False})
+            try:
+                state = detector()
+            except Exception:
+                continue
+            changed = bool(state.get("changed")) if isinstance(state, Mapping) else False
+            identity = self._external_disk_identity(adapter)
+            identity_changed = identity is not None and identity != self._disk_identities.get(name)
+            if changed and (not record.get("changed") or identity_changed):
+                record["generation"] = int(record.get("generation", 0)) + 1
+                record["keep_draft"] = False
+            if identity is not None:
+                self._disk_identities[name] = identity
+            if changed and not self._drafts.get(name, {}).get("dirty"):
+                try:
+                    adapter.reload()
+                    self._baselines[name] = copy.deepcopy(self._adapter_snapshot(name))
+                    self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
+                    self._revision += 1
+                    changed = False
+                except Exception:
+                    pass
+            record["changed"] = changed
+            if not changed:
+                record["keep_draft"] = False
+
+    @staticmethod
+    def _external_disk_identity(adapter: DomainAdapter) -> str | None:
+        """Read a bounded opaque identity that is never included in snapshots."""
+
+        getter = getattr(adapter, "external_disk_identity", None)
+        if not callable(getter):
+            return None
+        try:
+            identity = getter()
+        except Exception:
+            return None
+        if not isinstance(identity, str) or not identity or len(identity) > 256:
+            return None
+        return identity
 
     def _editor_adapter(self, domain: str, document: str) -> tuple[str, DomainAdapter]:
         name = _canonical_domain(domain)
@@ -896,6 +1038,80 @@ class CoreStore:
                 "present": present,
             }
 
+    def trusted_secret_descriptor(self, domain: str, field: str, target: object | None = None) -> dict[str, Any]:
+        """Describe the sole native-readable provider API-key slot.
+
+        This is deliberately narrower than ``secret_descriptor``.  Other
+        secrets may be staged by native controls, but no other secret is
+        eligible for a plaintext read-back capability. The descriptor follows
+        the staged provider draft, while native controls only request it when
+        a selected target changes.
+        """
+
+        with self._lock:
+            name = _canonical_domain(domain)
+            field_name = field.strip() if isinstance(field, str) else ""
+            if (name, field_name) != ("providers_models", "api_key"):
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            if not isinstance(target, str) or not target or len(target.encode("utf-8")) > 256:
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            adapter = self._domains.get(name)
+            reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
+            if not callable(reader):
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            try:
+                value = reader(field_name, target)
+            except Exception:
+                raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
+            if (
+                not isinstance(value, str)
+                or len(value.encode("utf-8")) > 16_384
+                or any(character in value for character in "\x00\r\n")
+            ):
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            return {
+                "domain": name,
+                "field": field_name,
+                "target": target,
+                "revision": self._revision,
+                "present": bool(value.strip()),
+            }
+
+    def trusted_secret_value(
+        self,
+        domain: str,
+        field: str,
+        target: object | None,
+        *,
+        revision: int,
+    ) -> str:
+        """Read one provider API key only through an authenticated native path.
+
+        Callers must hold a session-bound, one-time capability issued by the
+        IPC server.  The value is intentionally absent from snapshots and the
+        ordinary versioned React IPC contract.
+        """
+
+        with self._lock:
+            self._check_revision(revision)
+            descriptor = self.trusted_secret_descriptor(domain, field, target)
+            name = str(descriptor["domain"])
+            adapter = self._domains.get(name)
+            reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
+            if not callable(reader):
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            try:
+                value = reader(str(descriptor["field"]), descriptor["target"])
+            except Exception:
+                raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
+            if (
+                not isinstance(value, str)
+                or len(value.encode("utf-8")) > 16_384
+                or any(character in value for character in "\x00\r\n")
+            ):
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            return value
+
     def stage_secret(
         self,
         domain: str,
@@ -938,6 +1154,300 @@ class CoreStore:
             self._persist_metadata()
             self._emit()
             return {"revision": self._revision, "present": present}
+
+    def import_relay_resources(
+        self,
+        account_id: object,
+        resource_ids: object,
+        *,
+        revision: int,
+    ) -> dict[str, Any]:
+        """Stage only the API resources explicitly selected by the user."""
+
+        with self._lock:
+            self._check_revision(revision)
+            relay = self._domains.get("relay_accounts")
+            providers = self._domains.get("providers_models")
+            importer = getattr(relay, "import_resources", None) if relay is not None else None
+            if not isinstance(account_id, str) or not account_id or not callable(importer) or providers is None:
+                raise CoreError("relay_import_failed", "Relay account is unavailable")
+            provider_checkpoint = _checkpoint_adapter(providers, error_code="relay_import_failed")
+            try:
+                result = importer(account_id, resource_ids, providers)
+            except Exception as exc:
+                try:
+                    _restore_adapter(providers, provider_checkpoint)
+                except Exception:
+                    raise CoreError("relay_import_failed", "Provider/model import could not be rolled back") from None
+                raise CoreError("relay_import_failed", safe_exception_message(exc)) from None
+            self._revision += 1
+            self._mark_domain(
+                "providers_models",
+                dirty=True,
+                base_revision=self._drafts.get("providers_models", {}).get("base_revision", self._revision),
+            )
+            self._last_actions["relay_accounts"] = {
+                "resources_ready": True,
+                "account_id": account_id,
+                "resource_count": int(result.get("resource_count", 0)) if isinstance(result, Mapping) else 0,
+                "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
+            }
+            self._persist_metadata()
+            self._emit()
+            return {
+                "revision": self._revision,
+                "imported": True,
+                "resource_count": int(result.get("resource_count", 0)) if isinstance(result, Mapping) else 0,
+                "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
+            }
+
+    def accept_relay_login(
+        self,
+        *,
+        account_id: object,
+        account_type: object,
+        label: object,
+        origin: object,
+        username: object,
+        cookie: object = "",
+        access_token: object = "",
+        refresh_token: object = "",
+    ) -> dict[str, Any]:
+        """Accept one native browser session and expose only public account state."""
+
+        known_secrets = tuple(
+            value for value in (cookie, access_token, refresh_token) if isinstance(value, str) and value
+        )
+        with self._lock:
+            relay = self._domains.get("relay_accounts")
+            accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
+            relay_checkpoint = getattr(relay, "transaction_checkpoint", None) if relay is not None else None
+            relay_restore = getattr(relay, "restore_transaction", None) if relay is not None else None
+            if (
+                not callable(accepter)
+                or not callable(relay_checkpoint)
+                or not callable(relay_restore)
+            ):
+                raise CoreError("relay_login_failed", "Relay account is unavailable")
+            relay_state = relay_checkpoint()
+            core_checkpoint = {
+                "revision": self._revision,
+                "drafts": copy.deepcopy(self._drafts),
+                "last_actions": copy.deepcopy(self._last_actions),
+                "baselines": copy.deepcopy(self._baselines),
+            }
+            persistence_paths = list(_adapter_persistence_paths(relay))
+            storage_path = getattr(relay, "storage_path", None)
+            if isinstance(storage_path, (str, Path)):
+                persistence_paths.append(Path(storage_path).expanduser())
+            if self._metadata_store is not None:
+                persistence_paths.append(self._metadata_store.path)
+            try:
+                file_checkpoints = _checkpoint_files(persistence_paths)
+            except CoreError:
+                raise CoreError("relay_login_failed", "Relay login could not be prepared") from None
+            try:
+                current = self._adapter_snapshot("relay_accounts")
+                accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
+                matching = next(
+                    (item for item in accounts if isinstance(item, Mapping) and item.get("id") == account_id),
+                    None,
+                )
+                if not isinstance(matching, Mapping):
+                    raise CoreError("relay_login_failed", "Relay account is unavailable")
+                if (
+                    matching.get("type") != account_type
+                    or matching.get("label") != label
+                    or matching.get("origin") != origin
+                ):
+                    raise CoreError("relay_login_failed", "Relay account does not match the saved site")
+                public = accepter(
+                    str(account_id),
+                    username=str(username),
+                    cookie=str(cookie) if isinstance(cookie, str) else "",
+                    access_token=str(access_token) if isinstance(access_token, str) else "",
+                    refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
+                )
+                # Login is the durable browser-session boundary. Resource
+                # discovery is a separate explicit action so a station API
+                # outage cannot change the result of a successful sign-in.
+                self._revision += 1
+                self._baselines["relay_accounts"] = copy.deepcopy(self._adapter_snapshot("relay_accounts"))
+                self._mark_domain(
+                    "relay_accounts",
+                    dirty=False,
+                    validation={"valid": True, "issues": []},
+                    base_revision=self._revision,
+                )
+                self._last_actions["relay_accounts"] = {
+                    "logged_in": True,
+                    "account_id": str(account_id),
+                    "resources_ready": False,
+                    "resource_count": 0,
+                }
+                self._persist_metadata()
+            except CoreError:
+                try:
+                    _restore_files(file_checkpoints)
+                    relay_restore(relay_state)
+                finally:
+                    self._revision = int(core_checkpoint["revision"])
+                    self._drafts = core_checkpoint["drafts"]
+                    self._last_actions = core_checkpoint["last_actions"]
+                    self._baselines = core_checkpoint["baselines"]
+                raise
+            except Exception as exc:
+                rollback_failed = False
+                try:
+                    _restore_files(file_checkpoints)
+                    relay_restore(relay_state)
+                except Exception:
+                    rollback_failed = True
+                self._revision = int(core_checkpoint["revision"])
+                self._drafts = core_checkpoint["drafts"]
+                self._last_actions = core_checkpoint["last_actions"]
+                self._baselines = core_checkpoint["baselines"]
+                if rollback_failed:
+                    raise CoreError("relay_login_failed", "Relay login could not be rolled back") from None
+                raise CoreError(
+                    "relay_login_failed",
+                    safe_exception_message(exc, known_secrets=known_secrets),
+                ) from None
+            self._emit()
+            return {
+                "revision": self._revision,
+                "login_status": "signed_in",
+                "username": str(public.get("username", username)),
+            }
+
+    def refresh_relay_resources(
+        self,
+        account_id: object,
+        *,
+        revision: int,
+    ) -> dict[str, Any]:
+        """Refresh selectable relay API metadata without staging providers."""
+
+        with self._lock:
+            self._check_revision(revision)
+            relay = self._domains.get("relay_accounts")
+            refresher = getattr(relay, "refresh_resources", None) if relay is not None else None
+            if not isinstance(account_id, str) or not account_id or not callable(refresher):
+                raise CoreError("relay_resources_failed", "Relay account is unavailable")
+            try:
+                result = refresher(account_id)
+            except Exception as exc:
+                raise CoreError("relay_resources_failed", safe_exception_message(exc)) from None
+            resources = result.get("resources", []) if isinstance(result, Mapping) else []
+            resource_status = result.get("resource_status", "unavailable") if isinstance(result, Mapping) else "unavailable"
+            resource_count = len(resources) if isinstance(resources, list) else 0
+            self._revision += 1
+            self._baselines["relay_accounts"] = copy.deepcopy(self._adapter_snapshot("relay_accounts"))
+            self._mark_domain(
+                "relay_accounts",
+                dirty=False,
+                validation={"valid": True, "issues": []},
+                base_revision=self._revision,
+            )
+            self._last_actions["relay_accounts"] = {
+                "resources_ready": resource_status == "ready",
+                "account_id": account_id,
+                "resource_status": resource_status,
+                "resource_count": resource_count,
+            }
+            self._persist_metadata()
+            self._emit()
+            return {
+                "revision": self._revision,
+                "account_id": account_id,
+                "resource_status": resource_status,
+                "resource_count": resource_count,
+            }
+
+    def restore_relay_session(
+        self,
+        *,
+        account_id: object,
+        account_type: object,
+        label: object,
+        origin: object,
+        login_status: object,
+        username: object = "",
+        cookie: object = "",
+        access_token: object = "",
+        refresh_token: object = "",
+    ) -> dict[str, Any]:
+        """Restore or update one locally validated native relay session.
+
+        Unlike :meth:`accept_relay_login`, this never fetches API keys or
+        modifies the provider/model draft. It is used after a Core restart to
+        repopulate the process-local relay session from the per-account native
+        credential store, or to persist an explicit expired/signed-out result.
+        """
+
+        known_secrets = tuple(
+            value for value in (cookie, access_token, refresh_token) if isinstance(value, str) and value
+        )
+        with self._lock:
+            relay = self._domains.get("relay_accounts")
+            accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
+            status_setter = getattr(relay, "set_login_status", None) if relay is not None else None
+            if not callable(accepter) or not callable(status_setter):
+                raise CoreError("relay_restore_failed", "Relay account is unavailable")
+            current = self._adapter_snapshot("relay_accounts")
+            accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
+            matching = next(
+                (item for item in accounts if isinstance(item, Mapping) and item.get("id") == account_id),
+                None,
+            )
+            if not isinstance(matching, Mapping):
+                raise CoreError("relay_restore_failed", "Relay account is unavailable")
+            if (
+                matching.get("type") != account_type
+                or matching.get("label") != label
+                or matching.get("origin") != origin
+            ):
+                raise CoreError("relay_restore_failed", "Relay account does not match the saved site")
+            try:
+                if login_status == "signed_in":
+                    public = accepter(
+                        str(account_id),
+                        username=str(username),
+                        cookie=str(cookie) if isinstance(cookie, str) else "",
+                        access_token=str(access_token) if isinstance(access_token, str) else "",
+                        refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
+                    )
+                elif login_status in {"signed_out", "expired"}:
+                    public = status_setter(str(account_id), str(login_status))
+                else:
+                    raise CoreError("relay_restore_failed", "Relay login status is invalid")
+                self._revision += 1
+                self._baselines["relay_accounts"] = copy.deepcopy(self._adapter_snapshot("relay_accounts"))
+                self._mark_domain(
+                    "relay_accounts",
+                    dirty=False,
+                    validation={"valid": True, "issues": []},
+                    base_revision=self._revision,
+                )
+                self._last_actions["relay_accounts"] = {
+                    "session_restored": login_status == "signed_in",
+                    "account_id": str(account_id),
+                    "login_status": str(public.get("login_status", login_status)),
+                }
+                self._persist_metadata()
+            except CoreError:
+                raise
+            except Exception as exc:
+                raise CoreError(
+                    "relay_restore_failed",
+                    safe_exception_message(exc, known_secrets=known_secrets),
+                ) from None
+            self._emit()
+            return {
+                "revision": self._revision,
+                "login_status": str(public.get("login_status", login_status)),
+                "username": str(public.get("username", "")),
+            }
 
     @staticmethod
     def _providers_summary(states: Mapping[str, object]) -> dict[str, Any]:
@@ -1039,7 +1549,7 @@ class CoreStore:
         }
 
     def _logs_summary(self, states: Mapping[str, object]) -> dict[str, dict[str, Any]]:
-        """Expose one bounded, redacted log view in both snapshot locations."""
+        """Expose only lightweight log state in global snapshots."""
 
         result = copy.deepcopy(self._logs)
         value = states.get("logs", {})
@@ -1052,9 +1562,6 @@ class CoreStore:
             raw = tabs.get(tab)
             if not isinstance(raw, Mapping):
                 continue
-            records = raw.get("records", [])
-            if not isinstance(records, Sequence) or isinstance(records, (str, bytes, bytearray)):
-                records = []
             limit = raw.get("limit", SUBSCRIPTION_QUEUE_LIMIT)
             if type(limit) is not int or limit < 1:
                 limit = SUBSCRIPTION_QUEUE_LIMIT
@@ -1062,8 +1569,9 @@ class CoreStore:
                 "tab": tab,
                 "available": bool(raw.get("available")),
                 "paused": bool(raw.get("paused")),
-                "line_count": max(0, int(raw.get("line_count", len(records))) if isinstance(raw.get("line_count", len(records)), int) else len(records)),
-                "records": _safe_public(list(records)[:limit]),
+                "line_count": max(0, raw.get("line_count", 0))
+                if type(raw.get("line_count", 0)) is int
+                else 0,
                 "filter": str(raw.get("filter", ""))[:256],
                 "limit": limit,
             }
@@ -1123,6 +1631,7 @@ class CoreStore:
             self.reject_plaintext_secret_action(data)
         with self._lock:
             self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
+            previous_revision = self._revision
             action_type = data.get("type", data.get("action"))
             if not isinstance(action_type, str) or not action_type.strip():
                 raise CoreError("invalid_action", "A Core action is required")
@@ -1136,14 +1645,6 @@ class CoreStore:
                     raise DomainNotFound(name)
                 before = copy.deepcopy(self._baselines.get(name))
                 payload = data.get("payload")
-                # File panel URLs belong to the native host/Core boundary.
-                # Claude profile attachment is explicit, but React receives
-                # only an opaque capability rather than a user path.
-                if name == "claude" and action_type in {"attach_profile", "attachProfile"} and isinstance(payload, Mapping):
-                    file_token = payload.get("file_token", payload.get("fileToken"))
-                    if file_token is not None:
-                        selected_path = self.file_capabilities.resolve(file_token, "claude-profile")
-                        payload = {"path": str(selected_path)}
                 if name == "providers_models" and action_type.replace("-", "_").replace(".", "_") in {
                     "providers_import_selected",
                     "provider_import_selected",
@@ -1153,6 +1654,28 @@ class CoreStore:
                     if file_token is not None:
                         selected_path = self.file_capabilities.resolve(file_token, "import")
                         payload = {"path": str(selected_path)}
+                normalized_action = action_type.replace("-", "_").replace(".", "_")
+                if name == "relay_accounts" and normalized_action in {
+                    "resources_import",
+                    "relay_resources_import",
+                    "account_resources_import",
+                }:
+                    resource_data = _as_mapping(payload)
+                    return self.import_relay_resources(
+                        resource_data.get("id", resource_data.get("account_id")),
+                        resource_data.get("resource_ids"),
+                        revision=self._revision,
+                    )
+                if name == "relay_accounts" and normalized_action in {
+                    "resources_refresh",
+                    "relay_resources_refresh",
+                    "account_resources_refresh",
+                }:
+                    resource_data = _as_mapping(payload)
+                    return self.refresh_relay_resources(
+                        resource_data.get("id", resource_data.get("account_id")),
+                        revision=self._revision,
+                    )
                 try:
                     result = adapter.dispatch(action_type, payload)
                 except ConfirmationNeeded:
@@ -1179,7 +1702,8 @@ class CoreStore:
                     ),
                 )
                 self._persist_metadata()
-            self._emit()
+            if self._revision != previous_revision:
+                self._emit()
             return {"revision": self._revision}
 
     def reject_plaintext_secret_action(self, action: Mapping[str, Any]) -> None:
@@ -1208,6 +1732,8 @@ class CoreStore:
             forbidden = {
                 "env",
                 "desktop_profile",
+                "auto_memory_directory",
+                "autoMemoryDirectory",
                 "token",
                 "auth_token",
                 "anthropic_auth_token",
@@ -1216,16 +1742,6 @@ class CoreStore:
             }
             if normalized in {"set_raw", "setraw"}:
                 raise CoreError("secret_requires_native", "Use the native secure editor for this document")
-            if normalized in {"attach_profile", "attachprofile"}:
-                if not isinstance(payload, Mapping):
-                    raise CoreError("native_capability_required", "Use the native file picker for this profile")
-                allowed = {"file_token", "fileToken"}
-                if set(payload).difference(allowed):
-                    raise CoreError("native_capability_required", "Use the native file picker for this profile")
-                file_token = payload.get("file_token", payload.get("fileToken"))
-                if not isinstance(file_token, str) or not file_token:
-                    raise CoreError("native_capability_required", "Use the native file picker for this profile")
-                return
         elif name == "webdav":
             forbidden = {"password"}
             if normalized in {"clear_password", "clearpassword"}:
@@ -1249,6 +1765,7 @@ class CoreStore:
 
     def _dispatch_service(self, action: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         operation = action.removeprefix("service.")
+        previous_service = copy.deepcopy(self._service)
         handler = self._service_handlers.get(operation)
         if handler is not None:
             try:
@@ -1267,8 +1784,12 @@ class CoreStore:
                 self._service["state"] = state
         if isinstance(payload.get("detail"), str):
             self._service["detail"] = safe_error_message(payload["detail"])
-        self._revision += 1
-        self._persist_metadata()
+        # Health polling is deliberately frequent.  A probe which projects the
+        # same public status is not a state transition, so do not make every
+        # settings surface redraw just to carry an identical service snapshot.
+        if self._service != previous_service:
+            self._revision += 1
+            self._persist_metadata()
         return dict(self._service)
 
     def _set_service_from_result(self, result: Mapping[str, Any], *, increment: bool) -> None:
@@ -1285,6 +1806,9 @@ class CoreStore:
         pid = result.get("pid")
         if type(pid) is int and pid > 0:
             service["pid"] = pid
+        port = result.get("port")
+        if state == "running" and type(port) is int and 1 <= port <= 65535:
+            service["port"] = port
         self._service = service
         if increment:
             self._revision += 1
@@ -1324,6 +1848,10 @@ class CoreStore:
         confirmation: str | Sequence[str] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
+            # Refresh before accepting the caller revision or taking rollback
+            # snapshots. A clean draft may reload here and advance revision;
+            # a dirty draft records a conflict without touching the file.
+            self._refresh_external_disk_state()
             self._check_revision(revision)
             if domain is not None and domains is not None:
                 raise CoreError("invalid_domain", "Choose either one domain or a domain list")
@@ -1342,24 +1870,47 @@ class CoreStore:
                     raise DomainNotFound(name)
                 adapters[name] = adapter
 
+            confirm_codes: list[str] = []
+            if isinstance(confirmation, str):
+                confirm_codes = [confirmation]
+            elif isinstance(confirmation, Sequence) and not isinstance(confirmation, (bytes, bytearray, str)):
+                confirm_codes = [str(item) for item in confirmation]
+            overwrite_codes = {
+                f"overwrite_external_{name}"
+                for name in names
+                if self._disk.get(name, {}).get("changed")
+            }
+            missing_overwrite = sorted(overwrite_codes.difference(confirm_codes))
+            if missing_overwrite:
+                # No persistence checkpoint or rollback is needed: nothing in
+                # this Apply attempt has written to disk. In particular, never
+                # restore an older checkpoint over the newly detected file.
+                raise ConfirmationNeeded(missing_overwrite)
+
             adapter_checkpoints = {name: _checkpoint_adapter(adapter, error_code="apply_failed") for name, adapter in adapters.items()}
             core_checkpoint = {
                 "revision": self._revision,
                 "drafts": copy.deepcopy(self._drafts),
                 "last_actions": copy.deepcopy(self._last_actions),
                 "baselines": copy.deepcopy(self._baselines),
+                "disk": copy.deepcopy(self._disk),
+                "disk_identities": copy.deepcopy(self._disk_identities),
             }
             persistence_paths = [path for adapter in adapters.values() for path in _adapter_persistence_paths(adapter)]
             if self._metadata_store is not None:
                 persistence_paths.append(self._metadata_store.path)
             file_checkpoints = _checkpoint_files(persistence_paths)
             applied: list[str] = []
-            confirm_codes: list[str] = []
-            if isinstance(confirmation, str):
-                confirm_codes = [confirmation]
-            elif isinstance(confirmation, Sequence) and not isinstance(confirmation, (bytes, bytearray, str)):
-                confirm_codes = [str(item) for item in confirmation]
             try:
+                for name in names:
+                    if f"overwrite_external_{name}" not in overwrite_codes:
+                        continue
+                    rebase = getattr(adapters[name], "rebase_external_disk", None)
+                    if not callable(rebase):
+                        raise CoreError("apply_failed", "Settings changed on disk; choose the disk version")
+                    rebase()
+                    self._disk[name]["changed"] = False
+                    self._disk[name]["keep_draft"] = True
                 # Validation is complete before any persistence boundary is
                 # crossed, so a bad later section cannot partially apply an
                 # earlier one.
@@ -1388,6 +1939,11 @@ class CoreStore:
                     else:
                         adapter.apply(payload)
                     self._baselines[name] = copy.deepcopy(self._adapter_snapshot(name))
+                    self._disk[name] = {
+                        "changed": False,
+                        "generation": int(self._disk.get(name, {}).get("generation", 0)),
+                        "keep_draft": False,
+                    }
                     self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
                     applied.append(name)
                 self._revision += 1
@@ -1404,6 +1960,8 @@ class CoreStore:
                 self._drafts = core_checkpoint["drafts"]
                 self._last_actions = core_checkpoint["last_actions"]
                 self._baselines = core_checkpoint["baselines"]
+                self._disk = core_checkpoint["disk"]
+                self._disk_identities = core_checkpoint["disk_identities"]
                 if rollback_failed:
                     raise CoreError("apply_failed", "Settings could not be rolled back") from None
                 codes = getattr(exc, "codes", None)
@@ -1429,6 +1987,11 @@ class CoreStore:
                     raise CoreError("reload_failed", safe_exception_message(exc)) from None
                 self._baselines[name] = copy.deepcopy(self._adapter_snapshot(name))
                 self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
+                self._disk[name] = {
+                    "changed": False,
+                    "generation": int(self._disk.get(name, {}).get("generation", 0)),
+                    "keep_draft": False,
+                }
             self._revision += 1
             self._persist_metadata()
             self._emit()
@@ -1452,16 +2015,62 @@ class CoreStore:
                 result = {}
             result.setdefault("ok", False)
             result.setdefault("protocols", [])
+            if name == "webdav":
+                handler = self._service_handlers.get("status")
+                if handler is not None:
+                    try:
+                        service_result = handler("status")
+                    except Exception:
+                        service_result = None
+                    if isinstance(service_result, Mapping):
+                        self._set_service_from_result(service_result, increment=False)
             return result
 
     def export(self, sections: Sequence[str], *, destination_token: str | None = None) -> dict[str, Any]:
         if isinstance(sections, (str, bytes, bytearray)) or not isinstance(sections, Sequence) or not sections:
             raise CoreError("invalid_sections", "Choose at least one configuration section")
         names = [_canonical_domain(section) for section in sections]
+        if destination_token is not None and len(names) == 1 and names[0] in {"providers_models", "runtime"}:
+            path = self.file_capabilities.resolve(destination_token, "export")
+            name = names[0]
+            try:
+                adapter = self._domains.get(name)
+                if adapter is None:
+                    raise DomainNotFound(name)
+                if any(_same_path(path, source) for source in _adapter_persistence_paths(adapter)):
+                    raise CoreError("export_failed", "Choose a file outside the active settings files")
+                method = getattr(adapter, "export", None)
+                if not callable(method):
+                    raise CoreError("export_failed", "The selected settings cannot be exported")
+                parameters = inspect.signature(method).parameters
+                exported = method(include_sensitive=True) if "include_sensitive" in parameters else method()
+                if not isinstance(exported, Mapping):
+                    raise CoreError("export_failed", "The selected settings cannot be exported")
+                settings = copy.deepcopy(dict(exported))
+                settings.pop("domain", None)
+                atomic_write_json(
+                    path,
+                    {
+                        "format": DOMAIN_FILE_FORMAT,
+                        "version": DOMAIN_FILE_VERSION,
+                        "domain": name,
+                        "settings": settings,
+                    },
+                )
+            except CoreError:
+                raise
+            except Exception as exc:
+                raise CoreError("export_failed", safe_exception_message(exc)) from None
+            return {
+                "revision": self._revision,
+                "section_count": 1,
+                "sections": names,
+            }
         if destination_token is not None and set(names).issubset({"providers_models", "runtime"}):
             path = self.file_capabilities.resolve(destination_token, "export")
             try:
-                from .domains.legacy import ProvidersModelsDomain, RuntimeSettingsDomain
+                from .domains.providers_models import ProvidersModelsDomain
+                from .domains.runtime import RuntimeSettingsDomain
                 from .operations import ConfigurationPackageAdapter
 
                 provider = self._domains.get("providers_models")
@@ -1548,7 +2157,45 @@ class CoreStore:
                 runtime = self._domains.get("runtime")
                 config_path = getattr(provider, "config_path", None)
                 settings_path = getattr(runtime, "settings_path", None)
-                if config_path is not None and settings_path is not None:
+                requested = None if sections is None else [_canonical_domain(section) for section in sections]
+                try:
+                    selected_json: dict[str, Any] | None = read_json(path)
+                except PersistenceError:
+                    selected_json = None
+                if selected_json is not None and selected_json.get("format") == DOMAIN_FILE_FORMAT:
+                    if set(selected_json) != {"format", "version", "domain", "settings"}:
+                        raise CoreError("invalid_package", "Settings file has an unsupported shape")
+                    name = _canonical_domain(selected_json.get("domain"))
+                    if (
+                        selected_json.get("version") != DOMAIN_FILE_VERSION
+                        or name not in {"providers_models", "runtime"}
+                        or not isinstance(selected_json.get("settings"), Mapping)
+                    ):
+                        raise CoreError("invalid_package", "Settings file version is unsupported")
+                    if requested is not None and requested != [name]:
+                        raise CoreError("invalid_package", "Settings file does not contain the selected section")
+                    package = {
+                        "format": PACKAGE_FORMAT,
+                        "version": PACKAGE_VERSION,
+                        "sections": {name: copy.deepcopy(dict(selected_json["settings"]))},
+                    }
+                elif selected_json is not None and selected_json.get("format") == PACKAGE_FORMAT:
+                    package = selected_json
+                elif requested == ["providers_models"]:
+                    import external_provider_import
+
+                    imported = external_provider_import.import_explicit(path)
+                    providers = imported.get("providers") if isinstance(imported, Mapping) else None
+                    if not isinstance(providers, list):
+                        raise CoreError("invalid_package", "Provider configuration could not be imported")
+                    package = {
+                        "format": PACKAGE_FORMAT,
+                        "version": PACKAGE_VERSION,
+                        "sections": {"providers_models": {"providers": copy.deepcopy(providers)}},
+                    }
+                elif requested == ["runtime"]:
+                    raise CoreError("invalid_package", "Runtime settings import requires a Runtime Settings JSON file")
+                elif config_path is not None and settings_path is not None:
                     adapter = ConfigurationPackageAdapter(
                         config_path=Path(config_path),
                         settings_path=Path(settings_path),
@@ -1561,7 +2208,7 @@ class CoreStore:
                         "sections": package_sections,
                     }
                 else:
-                    package = read_json(path)
+                    package = selected_json if selected_json is not None else read_json(path)
             except (PersistenceError, ValueError) as exc:
                 raise CoreError("invalid_package", safe_exception_message(exc)) from None
             except Exception as exc:
@@ -1636,7 +2283,14 @@ class CoreStore:
     def import_(self, **kwargs: Any) -> dict[str, Any]:
         return self.import_package(**kwargs)
 
-    def set_service_status(self, state: str, *, detail: str | None = None, pid: int | None = None) -> dict[str, Any]:
+    def set_service_status(
+        self,
+        state: str,
+        *,
+        detail: str | None = None,
+        pid: int | None = None,
+        port: int | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             if state not in SERVICE_STATES:
                 raise CoreError("invalid_service_state", "Service state is invalid")
@@ -1645,6 +2299,8 @@ class CoreStore:
                 self._service["detail"] = safe_error_message(detail)
             if type(pid) is int and pid > 0:
                 self._service["pid"] = pid
+            if state == "running" and type(port) is int and 1 <= port <= 65535:
+                self._service["port"] = port
             self._revision += 1
             self._persist_metadata()
             self._emit()

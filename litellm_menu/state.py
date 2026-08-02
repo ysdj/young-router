@@ -1,16 +1,14 @@
 from __future__ import annotations
 
 from . import trace as _trace_module
+from .log_rotation import MIN_LOG_MAX_BYTES, append_bounded_log, log_max_bytes
 
 
 from .base import (
     Any,
     Optional,
     _DEPLOYMENT_COOLDOWN_FILE_ENV,
-    _RECENT_REQUESTS_DEFAULT_MAX_BYTES,
     _RECENT_REQUESTS_LOG_ENV,
-    _RECENT_REQUESTS_MAX_BYTES_ENV,
-    _RECENT_REQUESTS_MIN_MAX_BYTES,
     _ROUTE_RECOVERY_STATE_FILE_ENV,
     datetime,
     fcntl,
@@ -108,78 +106,7 @@ def _utc_now_iso() -> str:
 
 
 def _recent_requests_max_bytes() -> int:
-    value = os.getenv(_RECENT_REQUESTS_MAX_BYTES_ENV, "").strip()
-    if not value:
-        return _RECENT_REQUESTS_DEFAULT_MAX_BYTES
-    try:
-        parsed = int(value)
-    except ValueError:
-        return _RECENT_REQUESTS_DEFAULT_MAX_BYTES
-    return max(parsed, _RECENT_REQUESTS_MIN_MAX_BYTES)
-
-
-def _rotate_recent_requests_log_if_needed(path: str) -> None:
-    max_bytes = _recent_requests_max_bytes()
-    backup_path = f"{path}.1"
-    backup_temp_path = f"{backup_path}.rotate.tmp"
-    try:
-        if os.path.getsize(backup_path) > max_bytes:
-            with open(backup_path, "rb") as source:
-                try:
-                    source.seek(-max_bytes, os.SEEK_END)
-                except OSError:
-                    source.seek(0)
-                tail = source.read(max_bytes)
-            with open(backup_temp_path, "wb") as target:
-                target.write(tail)
-            try:
-                os.chmod(backup_temp_path, 0o600)
-            except OSError:
-                pass
-            os.replace(backup_temp_path, backup_path)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        try:
-            os.unlink(backup_temp_path)
-        except OSError:
-            pass
-
-    try:
-        if os.path.getsize(path) <= max_bytes:
-            return
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
-
-    temp_path = f"{path}.rotate.tmp"
-    try:
-        with open(path, "rb") as source:
-            try:
-                source.seek(-max_bytes, os.SEEK_END)
-            except OSError:
-                source.seek(0)
-            tail = source.read(max_bytes)
-        with open(temp_path, "wb") as target:
-            target.write(tail)
-        try:
-            os.chmod(temp_path, 0o600)
-        except OSError:
-            pass
-        os.replace(temp_path, backup_path)
-        with open(path, "wb") as current:
-            current.write(tail)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    except OSError:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        pass
+    return log_max_bytes()
 
 
 def _append_recent_request(record: dict[str, Any]) -> None:
@@ -187,22 +114,10 @@ def _append_recent_request(record: dict[str, Any]) -> None:
     if not path:
         return
     try:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        _rotate_recent_requests_log_if_needed(path)
         line = (
             json.dumps(record, ensure_ascii=False, sort_keys=True, default=str) + "\n"
         ).encode("utf-8")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.write(fd, line)
-        finally:
-            os.close(fd)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        append_bounded_log(path, line, maximum_bytes=_recent_requests_max_bytes())
     except Exception:
         pass
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import stat
 import subprocess
@@ -12,7 +13,7 @@ import unittest
 from unittest import mock
 
 from litellm_menu.core import CoreStore
-from litellm_menu.core.domains.legacy import ProvidersModelsDomain, RuntimeSettingsDomain
+from litellm_menu.core.domains.legacy import ProvidersModelsDomain, RuntimeSettingsDomain, WebDAVSettingsDomain
 from litellm_menu.core.operations import CoreServiceController
 
 
@@ -28,6 +29,25 @@ model_list: []
 
 
 class CoreOperationsTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX process states are unavailable on Windows")
+    def test_process_alive_rejects_zombies(self) -> None:
+        zombie = subprocess.CompletedProcess(
+            ["ps", "-o", "stat=", "-p", "4811"],
+            returncode=0,
+            stdout="Z+\n",
+            stderr="",
+        )
+        sleeping = subprocess.CompletedProcess(
+            ["ps", "-o", "stat=", "-p", "4811"],
+            returncode=0,
+            stdout="S+\n",
+            stderr="",
+        )
+        with mock.patch("litellm_menu.core.operations.subprocess.run", return_value=zombie):
+            self.assertFalse(CoreServiceController._process_alive(4811))
+        with mock.patch("litellm_menu.core.operations.subprocess.run", return_value=sleeping):
+            self.assertTrue(CoreServiceController._process_alive(4811))
+
     def test_windows_batch_launcher_uses_the_bundled_python(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(
@@ -54,6 +74,56 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertIn("from litellm import run_server", command[2])
             self.assertNotIn(controller.litellm_bin, command)
 
+    def test_macos_uses_configured_uvicorn_workers_without_gunicorn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            process = mock.Mock(pid=4813)
+            process.poll.return_value = None
+            with mock.patch("litellm_menu.core.operations.os.name", "posix"), mock.patch(
+                "litellm_menu.core.operations.sys.platform", "darwin"
+            ), mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(
+                controller,
+                "_runtime_env",
+                return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "16"},
+            ), mock.patch.object(controller, "_write_state"), mock.patch.object(
+                controller, "_write_owner_record"
+            ), mock.patch.object(controller, "_health", return_value=True), mock.patch(
+                "litellm_menu.core.operations.atomic_write_text"
+            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                controller.start()
+
+            command = popen.call_args.args[0]
+            workers_index = command.index("--num_workers")
+            self.assertEqual("16", command[workers_index + 1])
+            self.assertNotIn("--run_gunicorn", command)
+
+    def test_macos_defaults_to_sixteen_uvicorn_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            process = mock.Mock(pid=4815)
+            process.poll.return_value = None
+            with mock.patch("litellm_menu.core.operations.os.name", "posix"), mock.patch(
+                "litellm_menu.core.operations.sys.platform", "darwin"
+            ), mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(
+                controller,
+                "_runtime_env",
+                return_value={"LITELLM_PORT": "4000"},
+            ), mock.patch.object(controller, "_write_state"), mock.patch.object(
+                controller, "_write_owner_record"
+            ), mock.patch.object(controller, "_health", return_value=True), mock.patch(
+                "litellm_menu.core.operations.atomic_write_text"
+            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                controller.start()
+
+            command = popen.call_args.args[0]
+            workers_index = command.index("--num_workers")
+            self.assertEqual("16", command[workers_index + 1])
+            self.assertNotIn("--run_gunicorn", command)
+
     def test_service_dispatch_projects_real_status_and_autostart(self) -> None:
         calls: list[str] = []
 
@@ -62,6 +132,7 @@ class CoreOperationsTests(unittest.TestCase):
             return {
                 "state": "running",
                 "pid": 123,
+                "port": 49173,
                 "auto_start_state": "enabled",
                 "route_recovery": {"recovering": 1},
             }
@@ -72,8 +143,63 @@ class CoreOperationsTests(unittest.TestCase):
 
         self.assertEqual(["health"], calls)
         self.assertEqual("running", service["state"])
+        self.assertEqual(49173, service["port"])
         self.assertEqual("enabled", service["auto_start_state"])
         self.assertEqual(1, service["route_recovery"]["recovering"])
+
+    def test_recovery_summary_counts_only_live_recoveries_and_cooldowns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.recovery.parent.mkdir(parents=True)
+            now = datetime.now(timezone.utc)
+            controller.paths.recovery.write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "live": {"heartbeat_at": (now - timedelta(seconds=5)).isoformat()},
+                            "stale": {"heartbeat_at": (now - timedelta(minutes=5)).isoformat()},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            controller.paths.cooldowns.write_text(
+                json.dumps(
+                    {
+                        "cooldowns": {
+                            "active": {"cooldown_until": now.timestamp() + 60},
+                            "expired": {"cooldown_until": now.timestamp() - 60},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = controller._recovery_summary()
+
+            self.assertEqual(1, summary["recovering"])
+            self.assertEqual(1, summary["cooldown"])
+
+    def test_unchanged_service_health_does_not_publish_a_new_revision(self) -> None:
+        status = {
+            "state": "running",
+            "pid": 123,
+            "port": 49173,
+            "auto_start_state": "enabled",
+            "route_recovery": {"recovering": 0},
+        }
+        core = CoreStore(service_handlers={"health": lambda _operation: dict(status)})
+
+        core.dispatch({"type": "service.health"})
+        revision = core.revision
+        events: list[dict[str, object]] = []
+        unsubscribe = core.subscribe(events.append)
+        self.addCleanup(unsubscribe)
+
+        core.dispatch({"type": "service.health"})
+
+        self.assertEqual(revision, core.revision)
+        self.assertEqual([], events)
 
     def test_controller_status_and_autostart_use_private_runtime_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -87,6 +213,92 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(0o600, controller.paths.autostart.stat().st_mode & 0o777)
             controller.autostart_disable()
             self.assertEqual("disabled", controller.autostart_status())
+
+    def test_controller_status_exposes_the_configured_port_only_while_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runtime-settings.env").write_text("LITELLM_PORT=49173\n", encoding="utf-8")
+            controller = CoreServiceController(root)
+
+            with mock.patch.object(controller, "_pid", return_value=1234), mock.patch.object(
+                controller, "_health", return_value=True
+            ):
+                running = controller.status()
+            self.assertEqual("running", running["state"])
+            self.assertEqual(49173, running["port"])
+
+            with mock.patch.object(controller, "_pid", return_value=None), mock.patch.object(
+                controller, "_health", return_value=False
+            ):
+                stopped = controller.status()
+            self.assertEqual("stopped", stopped["state"])
+            self.assertNotIn("port", stopped)
+
+            with mock.patch.object(controller, "_pid", return_value=None), mock.patch.object(
+                controller, "_health", return_value=True
+            ):
+                unknown = controller.status()
+            self.assertEqual("unknown", unknown["state"])
+            self.assertNotIn("port", unknown)
+
+    def test_controller_projects_the_latest_webdav_result_without_overwriting_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.webdav_enabled.parent.mkdir(parents=True, exist_ok=True)
+            controller.paths.webdav_enabled.write_text("1\n", encoding="utf-8")
+            controller.paths.webdav_sync_state.write_text(
+                json.dumps({"updated_at": "2026-07-29T04:42:00Z", "action": "sync"}),
+                encoding="utf-8",
+            )
+            controller.paths.webdav_status.write_text(
+                json.dumps({"checked_at": "2026-07-29T04:43:00Z", "action": "probe", "ok": False}),
+                encoding="utf-8",
+            )
+
+            summary = controller._webdav_summary()
+
+            self.assertEqual(
+                {"enabled": True, "ok": False, "checked_at": "2026-07-29T04:43:00Z", "action": "probe"},
+                summary,
+            )
+
+    def test_controller_uses_the_successful_baseline_only_when_no_status_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.webdav_sync_state.parent.mkdir(parents=True, exist_ok=True)
+            controller.paths.webdav_sync_state.write_text(
+                json.dumps({"updated_at": "2026-07-29T04:42:00Z", "action": "sync"}),
+                encoding="utf-8",
+            )
+
+            summary = controller._webdav_summary()
+
+            self.assertEqual(
+                {"enabled": False, "ok": True, "checked_at": "2026-07-29T04:42:00Z", "action": "sync"},
+                summary,
+            )
+
+    def test_webdav_probe_refreshes_the_service_menu_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_path = root / ".litellm-runtime" / "webdav-sync-status.json"
+            domain = WebDAVSettingsDomain(root / "webdav.json", enabled_path=root / "enabled", status_path=status_path)
+            domain.dispatch("patch", {"url": "https://example.test/webdav/", "remote_name": "config.json"})
+            controller = CoreServiceController(root)
+            core = CoreStore(
+                domains=[domain],
+                service_handlers={"status": lambda _operation: {"state": "stopped", "webdav": controller._webdav_summary()}},
+            )
+
+            with mock.patch("webdav.core.WebDAVClient.head", return_value=(200, {})), mock.patch(
+                "webdav.core.WebDAVClient.try_mkcol"
+            ):
+                core.probe(domain="webdav")
+
+            menu_webdav = core.snapshot()["service"]["webdav"]
+            self.assertTrue(menu_webdav["ok"])
+            self.assertEqual("probe", menu_webdav["action"])
+            self.assertIsInstance(menu_webdav["checked_at"], str)
 
     def test_controller_uses_validated_saved_runtime_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -119,9 +331,33 @@ class CoreOperationsTests(unittest.TestCase):
             core_root = Path(__file__).resolve().parents[1]
 
             self.assertEqual("1", environment["LITELLM_MENU_PROXY_PROCESS"])
+            self.assertEqual("1", environment["LITELLM_MENU_TIMESTAMP_OUTPUT"])
+            self.assertEqual(str(Path(directory) / "menu-server.log"), environment["LITELLM_MENU_SERVICE_LOG"])
+            self.assertEqual(str(Path(directory) / "recent-requests.jsonl"), environment["LITELLM_RECENT_REQUESTS_LOG"])
             self.assertEqual(str(core_root), environment["LITELLM_TEMPLATE_ROOT"])
             self.assertEqual(str(core_root), environment["PYTHONPATH"].split(os.pathsep)[0])
             self.assertTrue((core_root / "sitecustomize.py").is_file())
+
+    def test_service_start_appends_proxy_output_to_service_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            process = mock.Mock(pid=4814)
+            process.poll.return_value = None
+            with mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(
+                controller, "_runtime_env", return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "1"}
+            ), mock.patch.object(controller, "_write_state"), mock.patch.object(
+                controller, "_write_owner_record"
+            ), mock.patch.object(controller, "_health", return_value=True), mock.patch(
+                "litellm_menu.core.operations.atomic_write_text"
+            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                controller.start()
+
+            service_log = Path(directory) / "menu-server.log"
+            self.assertTrue(service_log.exists())
+            self.assertIs(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
+            self.assertEqual(str(service_log), popen.call_args.kwargs["stdout"].name)
 
     def test_relocated_core_resolves_the_owned_callback_from_pythonpath(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -302,6 +538,67 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(["providers_models", "runtime"], imported["draft_domains"])
             self.assertFalse(imported["preview"]["providers_models"]["will_replace_draft"])
             self.assertFalse(imported["preview"]["runtime"]["will_replace_draft"])
+
+    def test_single_domain_files_are_json_and_provider_yaml_remains_importable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            settings = root / "runtime-settings.env"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            settings.write_text("LITELLM_PORT=4100\n", encoding="utf-8")
+            core = CoreStore(domains=[ProvidersModelsDomain(config), RuntimeSettingsDomain(settings)])
+
+            provider_json = root / "providers.json"
+            result = core.export(
+                ["providers_models"],
+                destination_token=core.file_capabilities.register(provider_json, "export"),
+            )
+            payload = json.loads(provider_json.read_text(encoding="utf-8"))
+            self.assertEqual("litellm-menu-domain-settings", payload["format"])
+            self.assertEqual("providers_models", payload["domain"])
+            self.assertEqual(1, result["section_count"])
+            self.assertNotIn("replace-me-secret", json.dumps(result))
+            self.assertIn("replace-me-secret", json.dumps(payload))
+            imported = core.import_package(
+                source_token=core.file_capabilities.register(provider_json, "import"),
+                sections=["providers_models"],
+                revision=core.revision,
+            )
+            self.assertEqual(["providers_models"], imported["draft_domains"])
+
+            runtime_json = root / "runtime.json"
+            core.export(
+                ["runtime"],
+                destination_token=core.file_capabilities.register(runtime_json, "export"),
+            )
+            runtime_payload = json.loads(runtime_json.read_text(encoding="utf-8"))
+            self.assertEqual("runtime", runtime_payload["domain"])
+            self.assertEqual("4100", runtime_payload["settings"]["values"]["LITELLM_PORT"])
+            core.import_package(
+                source_token=core.file_capabilities.register(runtime_json, "import"),
+                sections=["runtime"],
+                revision=core.revision,
+            )
+
+            yaml_import = core.import_package(
+                source_token=core.file_capabilities.register(config, "import"),
+                sections=["providers_models"],
+                revision=core.revision,
+            )
+            self.assertEqual(["providers_models"], yaml_import["draft_domains"])
+
+    def test_single_domain_export_cannot_replace_the_active_settings_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            core = CoreStore(domains=[ProvidersModelsDomain(config)])
+
+            with self.assertRaisesRegex(Exception, "outside the active settings files"):
+                core.export(
+                    ["providers_models"],
+                    destination_token=core.file_capabilities.register(config, "export"),
+                )
 
 
 if __name__ == "__main__":

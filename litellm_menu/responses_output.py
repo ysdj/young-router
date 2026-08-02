@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from . import image_generation as _image_generation_module
 from . import responses_tools as _responses_tools_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
@@ -17,6 +16,144 @@ from .base import (
     copy,
     json,
 )
+
+
+def _is_non_empty_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return value is not None
+
+
+def _payload_has_tool_activity(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, list):
+        return any(_payload_has_tool_activity(item) for item in value)
+    if isinstance(value, dict):
+        item_type = value.get("type")
+        if isinstance(item_type, str) and (
+            item_type.endswith("_call")
+            or item_type in {"function_call", "tool_call", "custom_tool_call"}
+        ):
+            return True
+        tool_calls = value.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return True
+        function_call = value.get("function_call")
+        if _is_non_empty_value(function_call):
+            return True
+        if (
+            isinstance(value.get("name"), str)
+            and value.get("name").strip()
+            and ("arguments" in value or "call_id" in value)
+        ):
+            return True
+        return any(_payload_has_tool_activity(item) for item in value.values())
+    if hasattr(value, "model_dump"):
+        try:
+            return _payload_has_tool_activity(value.model_dump())
+        except Exception:
+            return False
+    return False
+
+
+def _payload_has_visible_text(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return any(_payload_has_visible_text(item) for item in value)
+    if isinstance(value, dict):
+        for key in ("output_text", "text", "content", "delta"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return True
+            if isinstance(text, list) and _payload_has_visible_text(text):
+                return True
+        for key in ("output", "choices", "message", "messages", "item", "response", "data"):
+            item = value.get(key)
+            if isinstance(item, (dict, list)) and _payload_has_visible_text(item):
+                return True
+        return False
+    if hasattr(value, "model_dump"):
+        try:
+            return _payload_has_visible_text(value.model_dump())
+        except Exception:
+            return False
+    return False
+
+
+def _response_has_usable_output(response: Any) -> bool:
+    return _payload_has_visible_text(response) or _payload_has_tool_activity(response)
+
+
+def _response_is_effectively_empty(response: Any) -> bool:
+    return not _response_has_usable_output(response)
+
+
+def _response_types(response: Any) -> List[str]:
+    found: List[str] = []
+
+    def walk(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if isinstance(value, dict):
+            item_type = value.get("type")
+            if isinstance(item_type, str):
+                found.append(item_type)
+            for item in value.values():
+                walk(item)
+            return
+        if hasattr(value, "model_dump"):
+            try:
+                walk(value.model_dump())
+            except Exception:
+                return
+
+    walk(response)
+    return found
+
+
+def _response_text(response: Any) -> str:
+    chunks: List[str] = []
+
+    def walk(value: Any) -> None:
+        if value is None or isinstance(value, str):
+            return
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if isinstance(value, dict):
+            for key in ("output_text", "text", "content", "delta"):
+                text = value.get(key)
+                if isinstance(text, str):
+                    chunks.append(text)
+            for item in value.values():
+                walk(item)
+            return
+        if hasattr(value, "model_dump"):
+            try:
+                walk(value.model_dump())
+            except Exception:
+                return
+
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str):
+        chunks.append(output_text)
+    walk(response)
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def _response_is_async_iterable(response: Any) -> bool:
+    return callable(getattr(response, "__aiter__", None))
 
 
 def _responses_tool_search_call_from_function_call(item: Any) -> Any:
@@ -67,68 +204,6 @@ def _responses_custom_tool_item_id(value: Any, *, output: bool = False) -> Any:
     replaced_prefix = "fco_" if output else "fc_"
     suffix = value[len(replaced_prefix) :] if value.startswith(replaced_prefix) else value
     return f"{expected_prefix}{suffix}"
-
-
-def _responses_function_tool_item_id(value: Any, *, output: bool = False) -> Any:
-    if not isinstance(value, str) or not value:
-        return value
-    expected_prefix = "fco_" if output else "fc_"
-    if value.startswith(expected_prefix):
-        return value
-    known_prefixes = (
-        ("ctco_", "fco_", "ctc_", "fc_")
-        if output
-        else ("ctc_", "fc_", "ctco_", "fco_")
-    )
-    suffix = value
-    for prefix in known_prefixes:
-        if value.startswith(prefix):
-            suffix = value[len(prefix) :]
-            break
-    return f"{expected_prefix}{suffix}"
-
-
-def _normalize_responses_custom_tool_input_item_ids(
-    value: Any,
-) -> tuple[Any, dict[str, Any]]:
-    if not isinstance(value, list):
-        return value, {"changed": False, "normalized_item_ids": 0}
-
-    normalized = copy.deepcopy(value)
-    normalized_item_ids = 0
-    for item in normalized:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        if item_type not in {
-            "custom_tool_call",
-            "custom_tool_call_output",
-            "function_call",
-            "function_call_output",
-        }:
-            continue
-        item_id = item.get("id")
-        if item_type.startswith("custom_tool_"):
-            expected_id = _responses_custom_tool_item_id(
-                item_id,
-                output=item_type == "custom_tool_call_output",
-            )
-        else:
-            expected_id = _responses_function_tool_item_id(
-                item_id,
-                output=item_type == "function_call_output",
-            )
-        if expected_id == item_id:
-            continue
-        item["id"] = expected_id
-        normalized_item_ids += 1
-
-    if normalized_item_ids == 0:
-        return value, {"changed": False, "normalized_item_ids": 0}
-    return normalized, {
-        "changed": True,
-        "normalized_item_ids": normalized_item_ids,
-    }
 
 
 def _responses_namespace_tool_map_from_tools(value: Any) -> dict[str, str]:
@@ -525,7 +600,7 @@ def _strip_empty_message_items_when_structured_output_present(response: Any) -> 
     for item in output:
         if (
             _responses_web_search_bridge_module._response_item_get(item, "type") == "message"
-            and not _image_generation_module._payload_has_visible_text(item)
+            and not _payload_has_visible_text(item)
         ):
             changed = True
             continue
@@ -548,7 +623,7 @@ def _streaming_completion_message(response: Any) -> Any:
 
 def _streaming_completion_should_skip_empty_message_events(response: Any) -> bool:
     message = _streaming_completion_message(response)
-    if message is None or _image_generation_module._payload_has_visible_text(message):
+    if message is None or _payload_has_visible_text(message):
         return False
 
     message_payload = _streaming_module._jsonable(message)

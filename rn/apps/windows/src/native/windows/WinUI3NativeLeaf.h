@@ -27,6 +27,17 @@ struct NativeSecretEditResult {
   std::wstring value;
 };
 
+struct NativeMenuAnchor {
+  double x = 0;
+  double y = 0;
+  double width = 0;
+  double height = 0;
+};
+
+// Convert a content size expressed in 96-DPI DIPs to the physical outer-frame
+// size required by AppWindow::Resize for a particular native window.
+POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height);
+
 class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
  public:
   static std::shared_ptr<WinUI3NativeLeaf> Shared();
@@ -51,6 +62,7 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       std::wstring_view title,
       std::wstring_view message,
       std::wstring_view confirm_label);
+  std::optional<size_t> ShowActionMenu(std::wstring_view title, std::vector<std::wstring> const& items, NativeMenuAnchor anchor);
   std::optional<std::vector<std::wstring>> ChooseModelsToAdd(
       std::vector<std::wstring> models,
       std::wstring provider_name,

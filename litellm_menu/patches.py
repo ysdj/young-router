@@ -4,7 +4,8 @@ from contextvars import ContextVar
 
 from . import api_base as _api_base_module
 from . import codex_fast_tier as _codex_fast_tier_module
-from . import image_generation as _image_generation_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
@@ -88,10 +89,10 @@ def _install_anthropic_unversioned_endpoint_patch() -> None:
 def _browser_compatible_headers_retry_kwargs(
     request_kwargs: dict,
 ) -> Optional[dict]:
-    retry_kwargs = _image_generation_module._with_browser_compatible_headers_retry(request_kwargs)
+    retry_kwargs = _responses_request_module._with_browser_compatible_headers_retry(request_kwargs)
     if retry_kwargs is None:
         return None
-    header_kwargs = _image_generation_module._with_browser_compatible_headers(retry_kwargs)
+    header_kwargs = _responses_request_module._with_browser_compatible_headers(retry_kwargs)
     return header_kwargs or retry_kwargs
 
 
@@ -109,7 +110,7 @@ def _browser_compatible_headers_retry_entry(
         target_order = _responses_execution_module._failed_deployment_order(exception)
     if target_order is not None:
         entry["_target_order"] = target_order
-    excluded_ids = sorted(_image_generation_module._request_excluded_deployment_ids(request_kwargs))
+    excluded_ids = sorted(_responses_request_module._request_excluded_deployment_ids(request_kwargs))
     if excluded_ids:
         entry["_excluded_deployment_ids"] = excluded_ids
     return entry
@@ -176,7 +177,7 @@ def _request_local_verified_fallback_deployment(
     if not verified_ids or not isinstance(model, str) or not model.strip():
         return None
     request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
-    metadata = _image_generation_module._request_metadata_dict(
+    metadata = _request_context_module._request_metadata_dict(
         request_kwargs,
         "metadata",
     ) or {}
@@ -193,7 +194,7 @@ def _request_local_verified_fallback_deployment(
     if target_order is not None:
         constraints["_target_order"] = target_order
     constraints[_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY] = sorted(verified_ids)
-    candidates = _image_generation_module._with_retry_target_constraints(
+    candidates = _responses_request_module._with_retry_target_constraints(
         list(configured or []),
         constraints,
     )
@@ -244,14 +245,14 @@ def _install_routing_constraint_patch() -> None:
                 constrained = [
                     deployment
                     for deployment in constrained
-                    if _image_generation_module._deployment_id(deployment) not in excluded_ids
+                    if _responses_request_module._deployment_id(deployment) not in excluded_ids
                 ]
             verified_ids = _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.get()
             if verified_ids:
                 constrained = [
                     deployment
                     for deployment in constrained
-                    if _image_generation_module._deployment_id(deployment)
+                    if _responses_request_module._deployment_id(deployment)
                     in verified_ids
                 ]
             target_deployment_id = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.get()
@@ -259,7 +260,7 @@ def _install_routing_constraint_patch() -> None:
                 constrained = [
                     deployment
                     for deployment in constrained
-                    if _image_generation_module._deployment_id(deployment)
+                    if _responses_request_module._deployment_id(deployment)
                     == target_deployment_id
                 ]
             constrained, _cooldown_deployments, _cooldown_filtered = (
@@ -291,11 +292,11 @@ def _install_routing_constraint_patch() -> None:
                 kwargs,
                 positional_index=4,
             )
-            excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
-            verified_ids = _image_generation_module._request_verified_fallback_deployment_ids(
+            excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_kwargs)
+            verified_ids = _responses_request_module._request_verified_fallback_deployment_ids(
                 request_kwargs
             )
-            target_order = _image_generation_module._request_target_order(request_kwargs)
+            target_order = _responses_request_module._request_target_order(request_kwargs)
             excluded_token = _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids or None)
             verified_token = _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.set(
                 verified_ids or None
@@ -365,11 +366,11 @@ def _install_routing_constraint_patch() -> None:
             kwargs,
             positional_index=1,
         )
-        excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
-        verified_ids = _image_generation_module._request_verified_fallback_deployment_ids(
+        excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_kwargs)
+        verified_ids = _responses_request_module._request_verified_fallback_deployment_ids(
             request_kwargs
         )
-        target_order = _image_generation_module._request_target_order(request_kwargs)
+        target_order = _responses_request_module._request_target_order(request_kwargs)
         excluded_token = _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids or None)
         verified_token = _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.set(
             verified_ids or None
@@ -449,19 +450,19 @@ def _install_selected_deployment_marker_patch() -> None:
             surface = _routing_module._request_surface_for_deployment(kwargs, deployment)
             if not surface:
                 _routing_module._remember_selected_deployment(deployment)
-                force_browser_headers = _image_generation_module._request_forces_browser_compatible_headers(kwargs)
+                force_browser_headers = _responses_request_module._request_forces_browser_compatible_headers(kwargs)
                 result = original_update_kwargs_with_deployment(
                     self, deployment, kwargs, function_name=function_name
                 )
                 _routing_module._remember_selected_deployment_for_request(kwargs, deployment)
                 if force_browser_headers:
                     kwargs[_BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY] = True
-                browser_kwargs = _image_generation_module._with_browser_compatible_headers(kwargs)
+                browser_kwargs = _responses_request_module._with_browser_compatible_headers(kwargs)
                 if browser_kwargs is not None:
                     kwargs.clear()
                     kwargs.update(browser_kwargs)
                 return result
-            deployment_id = _image_generation_module._deployment_id(deployment)
+            deployment_id = _responses_request_module._deployment_id(deployment)
             attempted_surfaces = (
                 _routing_module._request_attempted_upstream_surfaces(kwargs)
                 if deployment_id
@@ -481,7 +482,7 @@ def _install_selected_deployment_marker_patch() -> None:
                 deployment,
                 surface=surface,
             )
-            force_browser_headers = _image_generation_module._request_forces_browser_compatible_headers(kwargs)
+            force_browser_headers = _responses_request_module._request_forces_browser_compatible_headers(kwargs)
             _trace_module._route_trace(
                 "selected_deployment",
                 request_id=_routing_module._trace_request_id(kwargs),
@@ -494,8 +495,8 @@ def _install_selected_deployment_marker_patch() -> None:
                     call_type=function_name,
                     method_name=function_name,
                 ),
-                target_order=_image_generation_module._request_target_order(kwargs),
-                excluded_deployment_ids=sorted(_image_generation_module._request_excluded_deployment_ids(kwargs)),
+                target_order=_responses_request_module._request_target_order(kwargs),
+                excluded_deployment_ids=sorted(_responses_request_module._request_excluded_deployment_ids(kwargs)),
             )
             result = original_update_kwargs_with_deployment(
                 self,
@@ -512,7 +513,7 @@ def _install_selected_deployment_marker_patch() -> None:
             if force_browser_headers:
                 kwargs[_BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY] = True
 
-            from .image_generation import _with_browser_compatible_headers
+            from .responses_request import _with_browser_compatible_headers
 
             browser_kwargs = _with_browser_compatible_headers(kwargs)
             if browser_kwargs is not None:
@@ -750,26 +751,13 @@ def _install_generic_deployment_failover_patch() -> None:
         original_generic_function: Any,
         **kwargs: Any,
     ) -> Any:
-        normalized_input, normalized_input_stats = (
-            _responses_output_module._normalize_responses_custom_tool_input_item_ids(
-                kwargs.get("input")
-            )
-        )
-        if normalized_input_stats.get("changed"):
-            kwargs = kwargs.copy()
-            kwargs["input"] = normalized_input
-            metadata = kwargs.get("litellm_metadata")
-            metadata = metadata.copy() if isinstance(metadata, dict) else {}
-            metadata["responses_custom_tool_item_ids_normalized"] = normalized_input_stats
-            kwargs["litellm_metadata"] = metadata
         for update_request in (
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
-            _image_generation_module._with_codex_tool_runtime_recovery_hints,
-            _image_generation_module._with_empty_tool_controls_removed,
-            _image_generation_module._with_codex_compaction_controls,
-            _image_generation_module._with_codex_compaction_input_bounded,
-            _image_generation_module._with_responses_native_extra_body,
-            _image_generation_module._with_codex_compaction_headers,
+            _responses_request_module._with_codex_descendant_cleanup_instruction,
+            _responses_request_module._with_empty_tool_controls_removed,
+            _responses_request_module._with_codex_compaction_controls,
+            _responses_request_module._with_responses_native_extra_body,
+            _responses_request_module._with_codex_compaction_headers,
         ):
             updated_kwargs = update_request(kwargs)
             if updated_kwargs is not None:

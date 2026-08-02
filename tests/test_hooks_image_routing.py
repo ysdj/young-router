@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+import ast
+
 from hook_test_utils import *
 
 
 class HookImageRoutingTests(HookTestCase):
+    def test_image_generation_module_contains_only_imggen_behavior(self) -> None:
+        tree = ast.parse((ROOT / "litellm_menu" / "image_generation.py").read_text(encoding="utf-8"))
+        definitions = [
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+
+        self.assertTrue(definitions)
+        self.assertTrue(all("image_generation" in name for name in definitions), definitions)
+
     async def test_responses_api_image_generation_tool_does_not_use_static_capability_filter(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
@@ -323,8 +336,204 @@ class HookImageRoutingTests(HookTestCase):
         )
         self.assertLessEqual(
             hooks._image_data_url_size(modified["input"][0]["content"][1]["image_url"]),
-            hooks._INLINE_IMAGE_SINGLE_BUDGET_BYTES,
+            hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
         )
+
+    def test_with_bounded_image_inputs_enforces_each_multi_image_target(self) -> None:
+        hooks, _ = load_hook_module()
+
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        data_urls = []
+        for _ in range(2):
+            image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=95)
+            data_urls.append(
+                "data:image/jpeg;base64,"
+                + base64.b64encode(buffer.getvalue()).decode("ascii")
+            )
+        request_kwargs = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": data_url}
+                        for data_url in data_urls
+                    ],
+                }
+            ]
+        }
+
+        modified = hooks._with_bounded_image_inputs(request_kwargs)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        bounded_urls = [
+            item["image_url"] for item in modified["input"][0]["content"]
+        ]
+        self.assertTrue(all(url.startswith("data:image/jpeg;base64,") for url in bounded_urls))
+        self.assertTrue(
+            all(
+                hooks._image_data_url_size(url)
+                <= hooks._INLINE_IMAGE_MANY_TARGET_BYTES
+                for url in bounded_urls
+            )
+        )
+        self.assertLessEqual(
+            sum(hooks._image_data_url_size(url) for url in bounded_urls),
+            hooks._INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES,
+        )
+
+    def test_with_bounded_image_inputs_compresses_one_large_image_among_small_images(self) -> None:
+        hooks, _ = load_hook_module()
+
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        def data_url(size: tuple[int, int], quality: int) -> str:
+            image = Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality)
+            return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+        large = data_url((1000, 1000), 95)
+        small = data_url((120, 120), 90)
+        self.assertGreater(hooks._image_data_url_size(large), hooks._INLINE_IMAGE_MANY_TARGET_BYTES)
+        self.assertLessEqual(hooks._image_data_url_size(small), hooks._INLINE_IMAGE_MANY_TARGET_BYTES)
+
+        request_kwargs = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": large},
+                        {"type": "input_image", "image_url": small},
+                    ],
+                }
+            ]
+        }
+
+        modified = hooks._with_bounded_image_inputs(request_kwargs)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        bounded = modified["input"][0]["content"]
+        self.assertLessEqual(
+            hooks._image_data_url_size(bounded[0]["image_url"]),
+            hooks._INLINE_IMAGE_MANY_TARGET_BYTES,
+        )
+        self.assertEqual(bounded[1]["image_url"], small)
+
+    def test_with_bounded_image_inputs_limits_total_for_many_images(self) -> None:
+        hooks, _ = load_hook_module()
+
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        original_urls = []
+        for _ in range(12):
+            image = Image.frombytes("RGB", (900, 900), os.urandom(900 * 900 * 3))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=95)
+            original_urls.append(
+                "data:image/jpeg;base64,"
+                + base64.b64encode(buffer.getvalue()).decode("ascii")
+            )
+        request_kwargs = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": url}
+                        for url in original_urls
+                    ],
+                }
+            ]
+        }
+
+        modified = hooks._with_bounded_image_inputs(request_kwargs)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        bounded_urls = [
+            item["image_url"] for item in modified["input"][0]["content"]
+        ]
+        per_image_target = hooks._INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES // len(
+            original_urls
+        )
+        self.assertTrue(
+            all(hooks._image_data_url_size(url) <= per_image_target for url in bounded_urls)
+        )
+        self.assertLessEqual(
+            sum(hooks._image_data_url_size(url) for url in bounded_urls),
+            hooks._INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES,
+        )
+
+    def test_with_bounded_image_inputs_reencodes_truncated_oversized_jpeg(self) -> None:
+        hooks, _ = load_hook_module()
+
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        truncated = buffer.getvalue()[:-2]
+        self.assertFalse(truncated.endswith(b"\xff\xd9"))
+        original_data_url = (
+            "data:image/jpeg;base64," + base64.b64encode(truncated).decode("ascii")
+        )
+        request_kwargs = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": original_data_url},
+                    ],
+                }
+            ]
+        }
+
+        modified = hooks._with_bounded_image_inputs(request_kwargs)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        bounded_url = modified["input"][0]["content"][0]["image_url"]
+        bounded = base64.b64decode(bounded_url.split(",", 1)[1])
+        self.assertTrue(bounded.startswith(b"\xff\xd8"))
+        self.assertTrue(bounded.endswith(b"\xff\xd9"))
+        self.assertLessEqual(len(bounded), hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES)
+
+    def test_with_bounded_image_inputs_rejects_uncompressible_oversized_data(self) -> None:
+        hooks, _ = load_hook_module()
+        oversized = "data:image/jpeg;base64," + ("A" * 1_300_000)
+        request_kwargs = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": oversized},
+                    ],
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(ValueError, "could not be compressed"):
+            hooks._with_bounded_image_inputs(request_kwargs)
 
     async def test_plain_text_request_does_not_retry(self) -> None:
         hooks, proxy_server = load_hook_module()

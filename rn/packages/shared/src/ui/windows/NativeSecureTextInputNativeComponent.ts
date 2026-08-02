@@ -7,9 +7,9 @@ import type {
 } from "react-native/Libraries/Types/CodegenTypes";
 
 /**
- * This leaf intentionally has no password prop or password-change event.
- * PasswordBox text stays inside the Windows host and is sent directly to Core
- * with a one-time secret capability.
+ * This leaf intentionally has no text prop or text-change event. The native
+ * editor stays inside the Windows host and is sent directly to Core with a
+ * one-time secret capability. plainText changes only native rendering.
  */
 type SecretStateEvent = Readonly<{
   revision: Int32;
@@ -25,6 +25,8 @@ export interface NativeSecureTextInputProps extends ViewProps {
   target: string;
   label: string;
   placeholder?: string;
+  plainText?: WithDefault<boolean, false>;
+  autoCommit?: WithDefault<boolean, false>;
   disabled?: WithDefault<boolean, false>;
   commitRequest?: WithDefault<Int32, 0>;
   resetRequest?: WithDefault<Int32, 0>;

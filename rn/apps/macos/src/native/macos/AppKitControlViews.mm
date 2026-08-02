@@ -322,10 +322,13 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 {
   const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitButtonProps>(_props);
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitButtonProps>(props);
+  const BOOL titleChanged = oldViewProps.title != newViewProps.title;
+  const BOOL linkChanged = oldViewProps.link != newViewProps.link;
+  const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
   BOOL link = newViewProps.link;
   BOOL useCompactControl = newViewProps.compact && !link;
 
-  if (oldViewProps.title != newViewProps.title) {
+  if (titleChanged) {
     NSString *title = StringFromStdString(newViewProps.title);
     _button.title = title;
     if (newViewProps.toolTip.empty()) {
@@ -344,10 +347,10 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
   if (oldViewProps.disabled != newViewProps.disabled) {
     _button.enabled = !newViewProps.disabled;
   }
-  if (oldViewProps.link != newViewProps.link ||
+  if (linkChanged ||
       oldViewProps.primary != newViewProps.primary ||
       oldViewProps.destructive != newViewProps.destructive ||
-      oldViewProps.compact != newViewProps.compact) {
+      compactChanged) {
     _button.bezelStyle = link ? NSBezelStyleInline : NSBezelStyleRounded;
     _button.keyEquivalent = !link && newViewProps.primary ? @"\r" : @"";
     _button.hasDestructiveAction = !link && newViewProps.destructive;
@@ -357,12 +360,14 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
         : [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:_button.controlSize]];
     ((LiteLLMNavigationLinkButton *)_button).linkMode = link;
   }
-  if (!link && oldViewProps.link != newViewProps.link) {
+  if (!link && linkChanged) {
     _button.contentTintColor = nil;
     _button.title = StringFromStdString(newViewProps.title);
   }
 
-  [_host setNeedsLayout:YES];
+  if (titleChanged || linkChanged || compactChanged) {
+    [_host setNeedsLayout:YES];
+  }
   [super updateProps:props oldProps:oldProps];
 }
 
@@ -423,7 +428,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls(void)
 {
   const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitCheckboxProps>(_props);
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitCheckboxProps>(props);
-  if (oldViewProps.label != newViewProps.label) {
+  const BOOL labelChanged = oldViewProps.label != newViewProps.label;
+  const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
+  if (labelChanged) {
     NSString *label = StringFromStdString(newViewProps.label);
     _checkbox.title = label;
     _checkbox.accessibilityLabel = label;
@@ -435,12 +442,17 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls(void)
   if (oldViewProps.disabled != newViewProps.disabled) {
     _checkbox.enabled = !newViewProps.disabled;
   }
-  if (oldViewProps.compact != newViewProps.compact) {
+  if (compactChanged) {
     _checkbox.controlSize = newViewProps.compact ? NSControlSizeSmall : NSControlSizeRegular;
     _checkbox.font = [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:_checkbox.controlSize]];
   }
   _synchronizing = NO;
-  [_host setNeedsLayout:YES];
+  // A checked value or enabled state does not alter intrinsic geometry.  Do
+  // not request a host layout while AppKit is handling a user click: that
+  // needless pass is visible as a control flash on dense provider screens.
+  if (labelChanged || compactChanged) {
+    [_host setNeedsLayout:YES];
+  }
   [super updateProps:props oldProps:oldProps];
 }
 
@@ -450,8 +462,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls(void)
     const BOOL value = _checkbox.state == NSControlStateValueOn;
     LiteLLMAppKitCheckboxEventEmitter::OnValueChange event{static_cast<bool>(value)};
     std::static_pointer_cast<const LiteLLMAppKitCheckboxEventEmitter>(_eventEmitter)->onValueChange(event);
-    const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitCheckboxProps>(_props);
-    _checkbox.state = viewProps.value ? NSControlStateValueOn : NSControlStateValueOff;
   }
 }
 
@@ -506,13 +516,16 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCheckboxCls(void)
 {
   const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitPickerProps>(_props);
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitPickerProps>(props);
-  if (oldViewProps.labels != newViewProps.labels) {
+  const BOOL labelsChanged = oldViewProps.labels != newViewProps.labels;
+  const BOOL selectedChanged = oldViewProps.selectedValue != newViewProps.selectedValue;
+  const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
+  if (labelsChanged) {
     [_picker removeAllItems];
     for (const auto &label : newViewProps.labels) {
       [_picker addItemWithTitle:StringFromStdString(label)];
     }
   }
-  if (oldViewProps.labels != newViewProps.labels || oldViewProps.selectedValue != newViewProps.selectedValue) {
+  if (labelsChanged || selectedChanged) {
     const NSInteger selectedIndex = SegmentIndex(newViewProps.labels, newViewProps.selectedValue);
     if (selectedIndex >= 0) {
       [_picker selectItemAtIndex:selectedIndex];
@@ -523,11 +536,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCheckboxCls(void)
   if (oldViewProps.disabled != newViewProps.disabled) {
     _picker.enabled = !newViewProps.disabled;
   }
-  if (oldViewProps.compact != newViewProps.compact) {
+  if (compactChanged) {
     _picker.controlSize = newViewProps.compact ? NSControlSizeSmall : NSControlSizeRegular;
     _picker.font = [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:_picker.controlSize]];
   }
-  [_host setNeedsLayout:YES];
+  if (labelsChanged || compactChanged) {
+    [_host setNeedsLayout:YES];
+  }
   [super updateProps:props oldProps:oldProps];
 }
 
@@ -540,8 +555,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCheckboxCls(void)
   }
   LiteLLMAppKitPickerEventEmitter::OnChange event{static_cast<int>(index), viewProps.labels[static_cast<size_t>(index)]};
   std::static_pointer_cast<const LiteLLMAppKitPickerEventEmitter>(_eventEmitter)->onChange(event);
-  const NSInteger controlledIndex = SegmentIndex(viewProps.labels, viewProps.selectedValue);
-  controlledIndex >= 0 ? [_picker selectItemAtIndex:controlledIndex] : [_picker selectItem:nil];
 }
 
 @end
@@ -593,25 +606,30 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPickerCls(void)
 {
   const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitSegmentedControlProps>(_props);
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitSegmentedControlProps>(props);
+  const BOOL labelsChanged = oldViewProps.labels != newViewProps.labels;
+  const BOOL selectedChanged = oldViewProps.selectedValue != newViewProps.selectedValue;
+  const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
 
-  if (oldViewProps.labels != newViewProps.labels) {
+  if (labelsChanged) {
     _control.segmentCount = newViewProps.labels.size();
     for (NSUInteger index = 0; index < newViewProps.labels.size(); index++) {
       [_control setLabel:StringFromStdString(newViewProps.labels[index]) forSegment:index];
     }
   }
-  if (oldViewProps.labels != newViewProps.labels || oldViewProps.selectedValue != newViewProps.selectedValue) {
+  if (labelsChanged || selectedChanged) {
     _control.selectedSegment = SegmentIndex(newViewProps.labels, newViewProps.selectedValue);
   }
   if (oldViewProps.disabled != newViewProps.disabled) {
     _control.enabled = !newViewProps.disabled;
   }
-  if (oldViewProps.compact != newViewProps.compact) {
+  if (compactChanged) {
     _control.controlSize = newViewProps.compact ? NSControlSizeSmall : NSControlSizeRegular;
     _control.font = [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:_control.controlSize]];
   }
 
-  [_host setNeedsLayout:YES];
+  if (labelsChanged || compactChanged) {
+    [_host setNeedsLayout:YES];
+  }
   [super updateProps:props oldProps:oldProps];
 }
 
@@ -625,7 +643,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPickerCls(void)
   LiteLLMAppKitSegmentedControlEventEmitter::OnChange event{
     static_cast<int>(index), viewProps.labels[static_cast<size_t>(index)]};
   std::static_pointer_cast<const LiteLLMAppKitSegmentedControlEventEmitter>(_eventEmitter)->onChange(event);
-  _control.selectedSegment = SegmentIndex(viewProps.labels, viewProps.selectedValue);
 }
 
 @end
@@ -658,6 +675,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
 - (void)layout
 {
   [super layout];
+  // Multiline editors own the full allocated rectangle. AppKit single-line
+  // fields keep their intrinsic bezel height and are centered in the shared
+  // 30pt row so the text baseline and focus ring stay visually centered.
   LayoutAppKitControlInBounds(
       _activeControl,
       self.bounds,
@@ -734,35 +754,77 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
 
 - (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps
 {
+  const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitTextFieldProps>(_props);
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitTextFieldProps>(props);
 
   const BOOL isMultiline = newViewProps.multiline;
   NSView *activeControl = isMultiline ? _scrollView : (newViewProps.secureTextEntry ? _secureField : _field);
-  if (_host.activeControl != activeControl) {
+  const BOOL activeControlChanged = _host.activeControl != activeControl;
+  if (activeControlChanged) {
     _host.activeControl = activeControl;
   }
 
+  // Fabric also calls updateProps for event-emitter and layout changes.  Do
+  // not write an older controlled value back into an active AppKit editor on
+  // those updates: doing so redraws the field and disturbs its insertion
+  // point while the user is typing.
+  const BOOL shouldSynchronizeText = activeControlChanged || oldViewProps.value != newViewProps.value;
+  const BOOL shouldUpdatePlaceholder = activeControlChanged || oldViewProps.placeholder != newViewProps.placeholder;
+  const BOOL shouldUpdateDisabled = activeControlChanged || oldViewProps.disabled != newViewProps.disabled;
   NSString *value = StringFromStdString(newViewProps.value);
   NSString *placeholder = StringFromStdString(newViewProps.placeholder);
   _synchronizing = YES;
   if (isMultiline) {
-    if (![_multilineField.string isEqualToString:value]) {
+    if (shouldSynchronizeText && ![_multilineField.string isEqualToString:value]) {
       _multilineField.string = value;
     }
-    _multilineField.editable = !newViewProps.disabled;
-    _multilineField.selectable = !newViewProps.disabled;
+    if (shouldUpdateDisabled) {
+      _multilineField.editable = !newViewProps.disabled;
+      _multilineField.selectable = !newViewProps.disabled;
+    }
   } else {
     NSTextField *activeField = newViewProps.secureTextEntry ? _secureField : _field;
-    if (![activeField.stringValue isEqualToString:value]) {
+    if (shouldSynchronizeText && ![activeField.stringValue isEqualToString:value]) {
       activeField.stringValue = value;
     }
-    activeField.placeholderString = placeholder;
-    activeField.enabled = !newViewProps.disabled;
+    if (shouldUpdatePlaceholder) {
+      activeField.placeholderString = placeholder;
+    }
+    if (shouldUpdateDisabled) {
+      activeField.enabled = !newViewProps.disabled;
+    }
   }
   _synchronizing = NO;
 
-  [_host setNeedsLayout:YES];
+  if (activeControlChanged || shouldUpdatePlaceholder || shouldUpdateDisabled) {
+    [_host setNeedsLayout:YES];
+  }
   [super updateProps:props oldProps:oldProps];
+}
+
+- (void)prepareForRecycle
+{
+  [super prepareForRecycle];
+  _synchronizing = YES;
+  _field.stringValue = @"";
+  _secureField.stringValue = @"";
+  _multilineField.string = @"";
+  _synchronizing = NO;
+  _field.placeholderString = nil;
+  _secureField.placeholderString = nil;
+  _field.enabled = YES;
+  _secureField.enabled = YES;
+  _multilineField.editable = YES;
+  _multilineField.selectable = YES;
+  _host.activeControl = _field;
+}
+
+- (void)invalidate
+{
+  _field.delegate = nil;
+  _secureField.delegate = nil;
+  _multilineField.delegate = nil;
+  [super invalidate];
 }
 
 - (void)controlTextDidChange:(NSNotification *)notification
@@ -879,7 +941,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
     _switch.enabled = !newViewProps.disabled;
   }
   _synchronizing = NO;
-  [_host setNeedsLayout:YES];
   [super updateProps:props oldProps:oldProps];
 }
 
@@ -889,8 +950,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
     const BOOL value = _switch.state == NSControlStateValueOn;
     LiteLLMAppKitSwitchEventEmitter::OnValueChange event{static_cast<bool>(value)};
     std::static_pointer_cast<const LiteLLMAppKitSwitchEventEmitter>(_eventEmitter)->onValueChange(event);
-    const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitSwitchProps>(_props);
-    _switch.state = viewProps.value ? NSControlStateValueOn : NSControlStateValueOff;
   }
 }
 
@@ -975,12 +1034,14 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 }
 
 @interface LiteLLMAppKitTableComponentView () <NSTableViewDataSource, NSTableViewDelegate, RCTLiteLLMAppKitTableViewProtocol>
+- (void)updateScrollerVisibility;
 @end
 
 @implementation LiteLLMAppKitTableComponentView {
   NSScrollView *_scrollView;
   NSTableView *_tableView;
   BOOL _synchronizingSelection;
+  std::string _dataSignature;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -997,6 +1058,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     _tableView = [[NSTableView alloc] initWithFrame:NSZeroRect];
     _tableView.delegate = self;
     _tableView.dataSource = self;
+    _tableView.target = self;
+    _tableView.doubleAction = @selector(handleDoubleClick:);
     _tableView.allowsMultipleSelection = NO;
     _tableView.allowsEmptySelection = YES;
     _tableView.allowsColumnReordering = NO;
@@ -1010,8 +1073,14 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     _scrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
     _scrollView.autohidesScrollers = YES;
     _scrollView.borderType = NSBezelBorder;
-    _scrollView.hasHorizontalScroller = YES;
-    _scrollView.hasVerticalScroller = YES;
+    // Table columns are deliberately clipped and truncated rather than
+    // horizontally scrolled. A horizontal track looks like an empty gutter
+    // in the fixed-width provider pane; vertical scrolling is enabled only
+    // when the rows actually exceed the viewport.
+    _scrollView.hasHorizontalScroller = NO;
+    _scrollView.hasVerticalScroller = NO;
+    _scrollView.horizontalScrollElasticity = NSScrollElasticityNone;
+    _scrollView.verticalScrollElasticity = NSScrollElasticityAutomatic;
     _scrollView.documentView = _tableView;
     self.contentView = _scrollView;
   }
@@ -1024,11 +1093,25 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(props);
   const bool columnsChanged = oldViewProps.columnLabels != newViewProps.columnLabels ||
       oldViewProps.columnWidths != newViewProps.columnWidths;
-  const bool dataChanged = columnsChanged || oldViewProps.rowKeys != newViewProps.rowKeys ||
-      oldViewProps.cells != newViewProps.cells;
+  const bool compactChanged = oldViewProps.compact != newViewProps.compact;
+  std::string nextDataSignature;
+  nextDataSignature.reserve(newViewProps.rowKeys.size() * 24 + newViewProps.cells.size() * 32);
+  for (const auto &key : newViewProps.rowKeys) {
+    nextDataSignature.append(key).append("\x1f");
+  }
+  for (const auto &cell : newViewProps.cells) {
+    nextDataSignature.append(cell).append("\x1f");
+  }
+  for (const auto &key : newViewProps.disabledRowKeys) {
+    nextDataSignature.append("disabled:").append(key).append("\x1f");
+  }
+  const bool dataChanged = columnsChanged || compactChanged || nextDataSignature != _dataSignature;
 
   if (oldViewProps.alternatingRows != newViewProps.alternatingRows) {
     _tableView.usesAlternatingRowBackgroundColors = newViewProps.alternatingRows;
+  }
+  if (compactChanged) {
+    _tableView.rowHeight = newViewProps.compact ? 22 : 28;
   }
 
   [super updateProps:props oldProps:oldProps];
@@ -1045,7 +1128,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       const CGFloat width = index < newViewProps.columnWidths.size() && newViewProps.columnWidths[index] > 0
           ? static_cast<CGFloat>(newViewProps.columnWidths[index])
           : 160;
-      column.minWidth = 48;
+      // NSTableViewLastColumnOnlyAutoresizingStyle lets the final column
+      // absorb a bordered clip view and a visible vertical scroller.  This
+      // keeps fixed-width provider/model tables inside the viewport.
+      column.minWidth = index + 1 == newViewProps.columnLabels.size() ? 1 : 48;
       column.width = width;
       [_tableView addTableColumn:column];
     }
@@ -1053,16 +1139,61 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
   if (dataChanged) {
     [_tableView reloadData];
+    _dataSignature = std::move(nextDataSignature);
+  }
+
+  [self updateScrollerVisibility];
+  if (newViewProps.followBottom && dataChanged) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (self->_tableView.numberOfRows > 0) {
+        [self->_tableView scrollRowToVisible:self->_tableView.numberOfRows - 1];
+      }
+    });
   }
 
   const NSInteger selectedIndex = SegmentIndex(newViewProps.rowKeys, newViewProps.selectedKey);
+  const BOOL selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey;
   if (selectedIndex >= 0) {
-    [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:selectedIndex] byExtendingSelection:NO];
-    [_tableView scrollRowToVisible:selectedIndex];
-  } else {
+    if (selectionChanged || _tableView.selectedRow != selectedIndex) {
+      [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:selectedIndex] byExtendingSelection:NO];
+    }
+    if (selectionChanged) {
+      [_tableView scrollRowToVisible:selectedIndex];
+    }
+  } else if (_tableView.selectedRow >= 0) {
     [_tableView deselectAll:nil];
   }
   _synchronizingSelection = NO;
+}
+
+- (void)layout
+{
+  [super layout];
+  [self updateScrollerVisibility];
+}
+
+- (void)updateScrollerVisibility
+{
+  NSClipView *clipView = _scrollView.contentView;
+  const CGFloat viewportHeight = NSHeight(clipView.bounds);
+  if (!(viewportHeight > 0)) {
+    return;
+  }
+
+  const CGFloat rowsHeight = _tableView.rowHeight * _tableView.numberOfRows;
+  const BOOL needsVerticalScroller = rowsHeight > viewportHeight + 0.5;
+  if (_scrollView.hasVerticalScroller != needsVerticalScroller) {
+    _scrollView.hasVerticalScroller = needsVerticalScroller;
+    [_scrollView tile];
+  }
+
+  const NSRect visibleBounds = _scrollView.contentView.bounds;
+  const NSSize documentSize = NSMakeSize(
+      NSWidth(visibleBounds),
+      MAX(NSHeight(visibleBounds), rowsHeight));
+  if (!NSEqualSizes(_tableView.frame.size, documentSize)) {
+    _tableView.frame = NSMakeRect(0, 0, documentSize.width, documentSize.height);
+  }
 }
 
 - (NSInteger)numberOfRowsInTableView:(__unused NSTableView *)tableView
@@ -1103,6 +1234,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   NSTextField *label = cell.textField;
   label.stringValue = value;
+  const bool disabled = std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), viewProps.rowKeys[static_cast<size_t>(row)]) != viewProps.disabledRowKeys.end();
+  label.textColor = disabled ? NSColor.secondaryLabelColor : NSColor.labelColor;
   label.toolTip = value;
   label.accessibilityLabel = value;
   cell.toolTip = value;
@@ -1123,6 +1256,21 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
       viewProps.rowKeys[static_cast<size_t>(selectedRow)], static_cast<int>(selectedRow)};
   std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
+}
+
+- (void)handleDoubleClick:(__unused id)sender
+{
+  if (!_eventEmitter) {
+    return;
+  }
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  const NSInteger row = _tableView.clickedRow;
+  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size()) {
+    return;
+  }
+  LiteLLMAppKitTableEventEmitter::OnRowDoublePress event{
+      viewProps.rowKeys[static_cast<size_t>(row)], static_cast<int>(row)};
+  std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onRowDoublePress(event);
 }
 
 - (NSView *)accessibilityElement
@@ -1173,7 +1321,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTableCls(void)
     _textView.textContainer.containerSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
 
     _scrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
-    _scrollView.autohidesScrollers = NO;
+    _scrollView.autohidesScrollers = YES;
     _scrollView.borderType = NSBezelBorder;
     _scrollView.hasVerticalScroller = YES;
     _scrollView.documentView = _textView;
@@ -1270,6 +1418,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextEditorCls(void)
   NSUInteger _lifecycleGeneration;
   NSUInteger _debounceGeneration;
   NSUInteger _editGeneration;
+  BOOL _loadRecoveryAttempted;
+  BOOL _stageRecoveryAttempted;
   NSInteger _lastRevision;
   NSString *_lastStatus;
   NSString *_lastError;
@@ -1348,6 +1498,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextEditorCls(void)
   _lifecycleGeneration += 1;
   _debounceGeneration += 1;
   _editGeneration = 0;
+  _loadRecoveryAttempted = NO;
+  _stageRecoveryAttempted = NO;
   _stageInFlight = NO;
   _stageQueued = NO;
   _lastRevision = 0;
@@ -1373,9 +1525,37 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextEditorCls(void)
       return;
     }
     if (error.length > 0 || text == nil) {
+      [strongSelf recoverInitialLoadForGeneration:generation failedToken:requestedToken];
+      return;
+    }
+    strongSelf->_synchronizingText = YES;
+    strongSelf->_textView.string = text;
+    strongSelf->_synchronizingText = NO;
+    strongSelf->_textView.editable = YES;
+    [strongSelf emitRevision:0 status:@"ready" error:@""];
+  }];
+}
+
+- (void)recoverInitialLoadForGeneration:(NSUInteger)generation failedToken:(NSString *)failedToken
+{
+  if (generation != _lifecycleGeneration || _loadRecoveryAttempted ||
+      ![failedToken isEqualToString:_editorToken]) {
+    [self emitRevision:0 status:@"error" error:@"read_failed"];
+    return;
+  }
+  _loadRecoveryAttempted = YES;
+  __weak LiteLLMAppKitSecureTextEditorComponentView *weakSelf = self;
+  [CoreIPCBridge.shared refreshEditorDocument:failedToken completion:^(NSString *_Nullable replacementToken, NSString *_Nullable text, NSString *_Nullable error) {
+    LiteLLMAppKitSecureTextEditorComponentView *strongSelf = weakSelf;
+    if (strongSelf == nil || generation != strongSelf->_lifecycleGeneration ||
+        ![failedToken isEqualToString:strongSelf->_editorToken]) {
+      return;
+    }
+    if (error.length > 0 || replacementToken.length == 0 || text == nil) {
       [strongSelf emitRevision:0 status:@"error" error:@"read_failed"];
       return;
     }
+    strongSelf->_editorToken = [replacementToken copy];
     strongSelf->_synchronizingText = YES;
     strongSelf->_textView.string = text;
     strongSelf->_synchronizingText = NO;
@@ -1390,6 +1570,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextEditorCls(void)
     return;
   }
   _editGeneration += 1;
+  _stageRecoveryAttempted = NO;
   [self emitRevision:_lastRevision status:@"dirty" error:@""];
   [self scheduleStageAfter:0.35];
 }
@@ -1438,8 +1619,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextEditorCls(void)
     strongSelf->_stageQueued = NO;
     if (error.length > 0 || revision == nil || replacementToken.length == 0 ||
         replacementToken.length > 256) {
-      strongSelf->_textView.editable = NO;
-      [strongSelf emitRevision:strongSelf->_lastRevision status:@"error" error:@"stage_failed"];
+      [strongSelf recoverStageForGeneration:generation failedToken:stagedToken];
       return;
     }
 
@@ -1453,6 +1633,35 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextEditorCls(void)
     } else {
       [strongSelf emitRevision:strongSelf->_lastRevision status:@"saved" error:@""];
     }
+  }];
+}
+
+- (void)recoverStageForGeneration:(NSUInteger)generation failedToken:(NSString *)failedToken
+{
+  if (generation != _lifecycleGeneration || _stageRecoveryAttempted ||
+      ![failedToken isEqualToString:_editorToken]) {
+    _textView.editable = YES;
+    [self emitRevision:_lastRevision status:@"error" error:@"stage_failed"];
+    return;
+  }
+  _stageRecoveryAttempted = YES;
+  _stageInFlight = YES;
+  [self emitRevision:_lastRevision status:@"saving" error:@""];
+  __weak LiteLLMAppKitSecureTextEditorComponentView *weakSelf = self;
+  [CoreIPCBridge.shared refreshEditorDocument:failedToken completion:^(NSString *_Nullable replacementToken, __unused NSString *_Nullable diskText, NSString *_Nullable error) {
+    LiteLLMAppKitSecureTextEditorComponentView *strongSelf = weakSelf;
+    if (strongSelf == nil || generation != strongSelf->_lifecycleGeneration ||
+        ![failedToken isEqualToString:strongSelf->_editorToken]) {
+      return;
+    }
+    strongSelf->_stageInFlight = NO;
+    if (error.length > 0 || replacementToken.length == 0) {
+      strongSelf->_textView.editable = YES;
+      [strongSelf emitRevision:strongSelf->_lastRevision status:@"error" error:@"stage_failed"];
+      return;
+    }
+    strongSelf->_editorToken = [replacementToken copy];
+    [strongSelf stageCurrentTextForGeneration:generation];
   }];
 }
 
@@ -1478,6 +1687,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextEditorCls(void)
   _stageInFlight = NO;
   _stageQueued = NO;
   _lastRevision = 0;
+  _loadRecoveryAttempted = NO;
+  _stageRecoveryAttempted = NO;
   _lastStatus = nil;
   _lastError = nil;
   _synchronizingText = YES;
@@ -1510,10 +1721,14 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
 }
 
 @interface LiteLLMAppKitSecureTextInputComponentView () <NSTextFieldDelegate, RCTLiteLLMAppKitSecureTextInputViewProtocol>
+- (NSTextField *)activeField;
+- (void)stageCurrentSecretForRequest:(NSInteger)commitRequest;
+- (void)loadProviderAPIKeyForTarget:(NSString *)target generation:(NSUInteger)generation;
 @end
 
 @implementation LiteLLMAppKitSecureTextInputComponentView {
   NSSecureTextField *_field;
+  NSTextField *_plainField;
   LiteLLMAppKitControlHostView *_host;
   NSString *_domain;
   NSString *_secretField;
@@ -1527,6 +1742,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
   NSString *_lastError;
   NSUInteger _generation;
   BOOL _stageInFlight;
+  BOOL _autoCommit;
+  BOOL _secretDirty;
+  BOOL _synchronizingField;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -1540,10 +1758,33 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitSecureTextInputProps>();
     _props = defaultProps;
     _field = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
+    _field.delegate = self;
+    _field.target = self;
+    _field.action = @selector(submitSecret:);
     _field.bezelStyle = NSTextFieldRoundedBezel;
     _field.font = [NSFont systemFontOfSize:13];
     _field.maximumNumberOfLines = 1;
+    _field.usesSingleLineMode = YES;
+    _field.lineBreakMode = NSLineBreakByTruncatingTail;
+    NSTextFieldCell *fieldCell = (NSTextFieldCell *)_field.cell;
+    fieldCell.wraps = NO;
+    fieldCell.scrollable = YES;
+    _plainField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    _plainField.delegate = self;
+    _plainField.target = self;
+    _plainField.action = @selector(submitSecret:);
+    _plainField.bezelStyle = NSTextFieldRoundedBezel;
+    _plainField.font = [NSFont systemFontOfSize:13];
+    _plainField.maximumNumberOfLines = 1;
+    _plainField.usesSingleLineMode = YES;
+    _plainField.lineBreakMode = NSLineBreakByTruncatingTail;
+    NSTextFieldCell *plainFieldCell = (NSTextFieldCell *)_plainField.cell;
+    plainFieldCell.wraps = NO;
+    plainFieldCell.scrollable = YES;
     _host = [[LiteLLMAppKitControlHostView alloc] initWithFrame:NSZeroRect];
+    // Match ordinary text fields: preserve the native bezel height and center
+    // it inside the shared 30pt form row.
+    _host.fillsHeight = NO;
     _host.control = _field;
     self.contentView = _host;
     _domain = @"";
@@ -1564,34 +1805,54 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
   NSString *field = StringFromStdString(newViewProps.field);
   NSString *target = StringFromStdString(newViewProps.target);
   NSString *label = StringFromStdString(newViewProps.label);
+  NSTextField *activeField = newViewProps.plainText ? _plainField : _field;
+  NSTextField *inactiveField = newViewProps.plainText ? _field : _plainField;
+  if (_host.control != activeField) {
+    _host.control = activeField;
+  }
   BOOL identityChanged = ![_domain isEqualToString:domain] || ![_secretField isEqualToString:field] ||
       ![_target isEqualToString:target];
   if (identityChanged) {
     _generation += 1;
     _stageInFlight = NO;
+    _secretDirty = NO;
     _domain = domain;
     _secretField = field;
     _target = target;
+    _synchronizingField = YES;
     _field.stringValue = @"";
+    _plainField.stringValue = @"";
+    _synchronizingField = NO;
     _lastRevision = 0;
     _lastPresent = NO;
     _lastStatus = @"ready";
     _lastError = @"";
   }
+  _autoCommit = newViewProps.autoCommit;
   _label = label;
-  _field.placeholderString = StringFromStdString(newViewProps.placeholder);
-  _field.accessibilityLabel = label;
-  _field.enabled = !newViewProps.disabled && !_stageInFlight;
+  activeField.placeholderString = StringFromStdString(newViewProps.placeholder);
+  activeField.accessibilityLabel = label;
+  activeField.enabled = !newViewProps.disabled && !_stageInFlight;
+  inactiveField.enabled = NO;
 
   if (newViewProps.resetRequest != oldViewProps.resetRequest &&
       newViewProps.resetRequest != _lastResetRequest) {
     _lastResetRequest = newViewProps.resetRequest;
+    _synchronizingField = YES;
     _field.stringValue = @"";
+    _plainField.stringValue = @"";
+    _synchronizingField = NO;
+    _secretDirty = NO;
     if (!_stageInFlight) [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
   }
   if (newViewProps.commitRequest != oldViewProps.commitRequest &&
       newViewProps.commitRequest != _lastCommitRequest) {
     [self stageCurrentSecretForRequest:newViewProps.commitRequest];
+  }
+  if (identityChanged && newViewProps.plainText && newViewProps.autoCommit &&
+      [domain isEqualToString:@"providers_models"] && [field isEqualToString:@"api_key"] &&
+      target.length > 0) {
+    [self loadProviderAPIKeyForTarget:target generation:_generation];
   }
   [_host setNeedsLayout:YES];
   [super updateProps:props oldProps:oldProps];
@@ -1608,28 +1869,40 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
 - (void)stageCurrentSecretForRequest:(NSInteger)commitRequest
 {
   if (_stageInFlight) return;
-  NSString *value = [_field.stringValue copy];
-  if (value.length == 0) {
+  NSString *value = [[self activeField].stringValue copy];
+  const BOOL allowEmptyValue = _autoCommit && [_domain isEqualToString:@"providers_models"] &&
+      [_secretField isEqualToString:@"api_key"];
+  if (value.length == 0 && !allowEmptyValue) {
     _lastCommitRequest = MAX(_lastCommitRequest, commitRequest);
     [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
     return;
   }
   if (_domain.length == 0 || _secretField.length == 0 || value.length > 16 * 1024) {
+    _synchronizingField = YES;
     _field.stringValue = @"";
+    _plainField.stringValue = @"";
+    _synchronizingField = NO;
     _lastCommitRequest = MAX(_lastCommitRequest, commitRequest);
     [self emitRevision:_lastRevision present:_lastPresent status:@"error" error:@"invalid_secret" commitRequest:_lastCommitRequest];
     return;
   }
 
   _stageInFlight = YES;
-  _field.enabled = NO;
+  [self activeField].enabled = NO;
   _lastCommitRequest = MAX(_lastCommitRequest, commitRequest);
   const NSUInteger generation = _generation;
   NSString *domain = [_domain copy];
   NSString *field = [_secretField copy];
   NSString *target = [_target copy];
   NSString *secret = value;
-  _field.stringValue = @"";
+  const BOOL preservePlainText = [_host.control isEqual:_plainField];
+  if (!preservePlainText) {
+    _synchronizingField = YES;
+    _field.stringValue = @"";
+    _plainField.stringValue = @"";
+    _synchronizingField = NO;
+  }
+  _secretDirty = NO;
   [self emitRevision:_lastRevision present:_lastPresent status:@"saving" error:@"" commitRequest:_lastCommitRequest];
   __weak LiteLLMAppKitSecureTextInputComponentView *weakSelf = self;
   [CoreIPCBridge.shared stageSecretForDomain:domain
@@ -1640,13 +1913,51 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
     LiteLLMAppKitSecureTextInputComponentView *strongSelf = weakSelf;
     if (strongSelf == nil || generation != strongSelf->_generation) return;
     strongSelf->_stageInFlight = NO;
-    strongSelf->_field.enabled = !(std::static_pointer_cast<const LiteLLMAppKitSecureTextInputProps>(strongSelf->_props)->disabled);
+    [strongSelf activeField].enabled = !(std::static_pointer_cast<const LiteLLMAppKitSecureTextInputProps>(strongSelf->_props)->disabled);
     if (error.length > 0 || revision == nil || present == nil) {
+      strongSelf->_secretDirty = preservePlainText;
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"stage_failed" commitRequest:strongSelf->_lastCommitRequest];
       return;
     }
     [strongSelf emitRevision:revision.integerValue present:present.boolValue status:@"saved" error:@"" commitRequest:strongSelf->_lastCommitRequest];
   }];
+}
+
+- (void)loadProviderAPIKeyForTarget:(NSString *)target generation:(NSUInteger)generation
+{
+  __weak LiteLLMAppKitSecureTextInputComponentView *weakSelf = self;
+  [CoreIPCBridge.shared readProviderAPIKeyForTarget:target completion:^(NSString *_Nullable value, NSString *_Nullable error) {
+    LiteLLMAppKitSecureTextInputComponentView *strongSelf = weakSelf;
+    if (strongSelf == nil || generation != strongSelf->_generation ||
+        ![strongSelf->_host.control isEqual:strongSelf->_plainField]) return;
+    if (error.length > 0 || value == nil) {
+      [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"read_failed" commitRequest:strongSelf->_lastCommitRequest];
+      return;
+    }
+    strongSelf->_synchronizingField = YES;
+    strongSelf->_plainField.stringValue = value;
+    strongSelf->_synchronizingField = NO;
+    strongSelf->_secretDirty = NO;
+  }];
+}
+
+- (void)submitSecret:(__unused id)sender
+{
+  if (!_autoCommit || !_secretDirty) return;
+  [self stageCurrentSecretForRequest:_lastCommitRequest + 1];
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification
+{
+  if (_synchronizingField || notification.object != [self activeField]) return;
+  _secretDirty = YES;
+  [self emitRevision:_lastRevision present:_lastPresent status:@"dirty" error:@"" commitRequest:_lastCommitRequest];
+}
+
+- (void)controlTextDidEndEditing:(NSNotification *)notification
+{
+  if (_synchronizingField || notification.object != [self activeField] || !_autoCommit || !_secretDirty) return;
+  [self stageCurrentSecretForRequest:_lastCommitRequest + 1];
 }
 
 - (void)emitRevision:(NSInteger)revision present:(BOOL)present status:(NSString *)status error:(NSString *)error commitRequest:(NSInteger)commitRequest
@@ -1669,6 +1980,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
   _generation += 1;
   _stageInFlight = NO;
   _field.stringValue = @"";
+  _plainField.stringValue = @"";
   _domain = @"";
   _secretField = @"";
   _target = @"";
@@ -1680,12 +1992,18 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
 {
   _generation += 1;
   _field.stringValue = @"";
+  _plainField.stringValue = @"";
   [super invalidate];
+}
+
+- (NSTextField *)activeField
+{
+  return [_host.control isKindOfClass:NSTextField.class] ? (NSTextField *)_host.control : _field;
 }
 
 - (NSView *)accessibilityElement
 {
-  return _field;
+  return [self activeField];
 }
 
 @end

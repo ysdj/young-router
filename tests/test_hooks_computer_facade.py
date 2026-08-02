@@ -4,6 +4,23 @@ from hook_test_utils import *
 
 
 class HookComputerFacadeTests(HookTestCase):
+    async def test_removed_cua_backend_fails_closed_without_being_selectable(self) -> None:
+        self.set_env("LITELLM_MENU_COMPUTER_FACADE_BACKEND", "cua")
+        hooks, _ = load_hook_module()
+
+        self.assertEqual(hooks._computer_facade_backend(), "cua")
+        self.assertNotIn("cua", hooks._COMPUTER_FACADE_BACKENDS)
+        self.assertNotIn(
+            "cua",
+            hooks._computer_facade_executor_registry({}),
+        )
+        self.assertIsNone(
+            hooks._computer_facade_select_executor(
+                hooks.HostedToolPlan(hosted_computer=True),
+                {},
+            )
+        )
+
     async def test_generic_response_wrapper_lets_native_hosted_computer_succeed(self) -> None:
         hooks, _ = load_hook_module()
         calls = []

@@ -14,7 +14,9 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-from . import image_generation as _image_generation_module
+from . import image_inputs as _image_inputs_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import trace as _trace_module
 
 from .base import (
@@ -127,7 +129,7 @@ def _local_format() -> str:
 
 def _request_already_attempted(request_kwargs: Optional[dict]) -> bool:
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if metadata is not None and metadata.get(_VISION_BRIDGE_ATTEMPTED_METADATA_KEY) is True:
             return True
     return False
@@ -167,7 +169,7 @@ def should_attempt_vision_bridge(exception: Exception, request_kwargs: Optional[
     return (
         _bridge_backend() != _VISION_BRIDGE_BACKEND_OFF
         and isinstance(request_kwargs, dict)
-        and _image_generation_module._request_has_image_input(request_kwargs)
+        and _image_inputs_module._request_has_image_input(request_kwargs)
         and not _request_already_attempted(request_kwargs)
         and _looks_like_vision_unsupported_error(exception)
     )
@@ -401,7 +403,7 @@ def _copy_request_kwargs_for_bridge(value: Any) -> Any:
 
 
 async def bridged_request_kwargs(request_kwargs: dict) -> Optional[dict]:
-    references = sorted(_image_generation_module._request_image_references(request_kwargs))
+    references = sorted(_image_inputs_module._request_image_references(request_kwargs))
     if not references:
         return None
     descriptions: list[tuple[int, str]] = []
@@ -411,7 +413,7 @@ async def bridged_request_kwargs(request_kwargs: dict) -> Optional[dict]:
     bridged_kwargs = _copy_request_kwargs_for_bridge(request_kwargs)
     _mark_attempted(bridged_kwargs)
     visual_context = _visual_context_block(descriptions)
-    if _image_generation_module._request_is_responses_api(bridged_kwargs) or "input" in bridged_kwargs:
+    if _responses_request_module._request_is_responses_api(bridged_kwargs) or "input" in bridged_kwargs:
         _append_responses_visual_context(bridged_kwargs, visual_context)
     else:
         _append_chat_visual_context(bridged_kwargs, visual_context)

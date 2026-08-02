@@ -55,6 +55,7 @@ using winrt::Microsoft::UI::Xaml::Controls::ScrollViewer;
 using winrt::Microsoft::UI::Xaml::Controls::StackPanel;
 using winrt::Microsoft::UI::Xaml::Controls::TextBox;
 using winrt::Microsoft::UI::Xaml::Controls::TextBlock;
+using winrt::Microsoft::UI::Xaml::Controls::ToolTipService;
 using winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::Thumb;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::ToggleButton;
@@ -96,6 +97,10 @@ SolidColorBrush SelectionBrush() {
 
 SolidColorBrush AlternatingRowBrush() {
   return ThemeBrush(L"SubtleFillColorTransparentBrush", winrt::Windows::UI::Color{20, 128, 128, 128});
+}
+
+SolidColorBrush SecondaryTextBrush() {
+  return ThemeBrush(L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115});
 }
 
 ScrollViewer FindTextEditorScrollViewer(
@@ -406,7 +411,7 @@ struct CheckboxComponentView final
     island_view.Connect(island_.ContentIsland());
     default_padding_ = checkbox_.Padding();
     default_min_height_ = checkbox_.MinHeight();
-    ApplyProps();
+    ApplyProps(nullptr);
   }
 
   void UpdateProps(
@@ -414,23 +419,28 @@ struct CheckboxComponentView final
       winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICheckboxProps> const& props,
       winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICheckboxProps> const& old_props) noexcept override {
     winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICheckbox<CheckboxComponentView>::UpdateProps(view, props, old_props);
-    ApplyProps();
+    ApplyProps(old_props);
   }
 
  private:
-  void ApplyProps() noexcept {
+  void ApplyProps(
+      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICheckboxProps> const& old_props) noexcept {
     if (!checkbox_ || !Props()) return;
     auto const& props = *Props();
+    const bool value_changed = !old_props || old_props->value != props.value;
+    const bool disabled_changed = !old_props || old_props->disabled != props.disabled;
+    const bool label_changed = !old_props || old_props->label != props.label;
+    const bool compact_changed = !old_props || old_props->compact != props.compact;
     syncing_ = true;
-    checkbox_.Content(winrt::box_value(ToHString(props.label)));
-    checkbox_.IsChecked(props.value.value_or(false));
+    if (label_changed) checkbox_.Content(winrt::box_value(ToHString(props.label)));
+    if (value_changed) checkbox_.IsChecked(props.value.value_or(false));
     syncing_ = false;
-    checkbox_.IsEnabled(Enabled(props.disabled));
-    if (props.compact.value_or(false)) {
+    if (disabled_changed) checkbox_.IsEnabled(Enabled(props.disabled));
+    if (compact_changed && props.compact.value_or(false)) {
       checkbox_.Padding(winrt::Microsoft::UI::Xaml::Thickness{4, 1, 4, 1});
       checkbox_.MinHeight(24.0);
       compact_applied_ = true;
-    } else if (compact_applied_) {
+    } else if (compact_changed && compact_applied_) {
       checkbox_.Padding(default_padding_);
       checkbox_.MinHeight(default_min_height_);
       compact_applied_ = false;
@@ -461,6 +471,13 @@ struct TableComponentView final
     list_ = ListView{};
     list_.SelectionMode(ListViewSelectionMode::Single);
     list_.HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+    // Tables deliberately clip/truncate fixed columns rather than reserving a
+    // bottom scrollbar. Keep the native vertical track automatic so it only
+    // appears when rows exceed the visible pane.
+    ScrollViewer::SetHorizontalScrollBarVisibility(
+        list_, winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled);
+    ScrollViewer::SetVerticalScrollBarVisibility(
+        list_, winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
     list_.SelectionChanged([this](auto const&, auto const&) {
       if (syncing_ || !Props()) return;
       const auto index = list_.SelectedIndex();
@@ -470,6 +487,17 @@ struct TableComponentView final
         args.index = index;
         args.key = Props()->rowKeys[static_cast<size_t>(index)];
         emitter->onSelectionChange(std::move(args));
+      }
+    });
+    list_.DoubleTapped([this](auto const&, auto const&) {
+      if (!Props()) return;
+      const auto index = list_.SelectedIndex();
+      if (index < 0 || index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
+      if (auto emitter = EventEmitter()) {
+        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter::OnRowDoublePress args;
+        args.index = index;
+        args.key = Props()->rowKeys[static_cast<size_t>(index)];
+        emitter->onRowDoublePress(std::move(args));
       }
     });
 
@@ -504,44 +532,69 @@ struct TableComponentView final
     if (!root_ || !Props()) return;
     auto const& props = *Props();
     const auto column_count = props.columnLabels.size();
+    const bool columns_changed = !has_applied_ || column_labels_ != props.columnLabels || column_widths_ != props.columnWidths || compact_ != props.compact;
+    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != props.disabledRowKeys || compact_ != props.compact;
+    const bool selection_changed = !has_applied_ || selected_key_ != props.selectedKey;
     syncing_ = true;
 
-    header_.Children().Clear();
-    AddColumns(header_, props.columnWidths, column_count);
-    for (size_t column_index = 0; column_index < column_count; ++column_index) {
-      auto label = TextBlock{};
-      label.Text(ToHString(props.columnLabels[column_index]));
-      label.Margin({8, 5, 8, 5});
-      label.FontSize(12);
-      Grid::SetColumn(label, static_cast<int32_t>(column_index));
-      header_.Children().Append(label);
+    if (columns_changed) {
+      header_.Children().Clear();
+      AddColumns(header_, props.columnWidths, column_count);
+      for (size_t column_index = 0; column_index < column_count; ++column_index) {
+        auto label = TextBlock{};
+        label.Text(ToHString(props.columnLabels[column_index]));
+        const double vertical_margin = props.compact.value_or(false) ? 2.0 : 5.0;
+        label.Margin({8, vertical_margin, 8, vertical_margin});
+        label.FontSize(12);
+        Grid::SetColumn(label, static_cast<int32_t>(column_index));
+        header_.Children().Append(label);
+      }
     }
 
-    list_.Items().Clear();
-    int32_t selected_index = -1;
-    for (size_t row_index = 0; row_index < props.rowKeys.size(); ++row_index) {
-      auto row = Grid{};
-      if (props.alternatingRows.value_or(false) && row_index % 2 == 1) {
-        row.Background(AlternatingRowBrush());
-      } else {
-        row.Background(nullptr);
-      }
-      AddColumns(row, props.columnWidths, column_count);
-      for (size_t column_index = 0; column_index < column_count; ++column_index) {
-        const auto cell_index = row_index * column_count + column_index;
-        auto cell = TextBlock{};
-        cell.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
-        cell.Margin({8, 5, 8, 5});
-        cell.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-        Grid::SetColumn(cell, static_cast<int32_t>(column_index));
-        row.Children().Append(cell);
-      }
-      list_.Items().Append(row);
-      if (props.rowKeys[row_index] == props.selectedKey) {
-        selected_index = static_cast<int32_t>(row_index);
+    if (rows_changed) {
+      list_.Items().Clear();
+      for (size_t row_index = 0; row_index < props.rowKeys.size(); ++row_index) {
+        auto row = Grid{};
+        row.MinHeight(props.compact.value_or(false) ? 22.0 : 28.0);
+        const bool disabled = std::find(props.disabledRowKeys.begin(), props.disabledRowKeys.end(), props.rowKeys[row_index]) != props.disabledRowKeys.end();
+        if (props.alternatingRows.value_or(false) && row_index % 2 == 1) {
+          row.Background(AlternatingRowBrush());
+        } else {
+          row.Background(nullptr);
+        }
+        AddColumns(row, props.columnWidths, column_count);
+        for (size_t column_index = 0; column_index < column_count; ++column_index) {
+          const auto cell_index = row_index * column_count + column_index;
+          auto cell = TextBlock{};
+          cell.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
+          if (!cell.Text().empty()) ToolTipService::SetToolTip(cell, winrt::box_value(cell.Text()));
+          const double vertical_margin = props.compact.value_or(false) ? 2.0 : 5.0;
+          cell.Margin({8, vertical_margin, 8, vertical_margin});
+          cell.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+          if (disabled) cell.Foreground(SecondaryTextBrush());
+          Grid::SetColumn(cell, static_cast<int32_t>(column_index));
+          row.Children().Append(cell);
+        }
+        list_.Items().Append(row);
       }
     }
-    list_.SelectedIndex(selected_index);
+
+    int32_t selected_index = -1;
+    auto selected = std::find(props.rowKeys.begin(), props.rowKeys.end(), props.selectedKey);
+    if (selected != props.rowKeys.end()) selected_index = static_cast<int32_t>(std::distance(props.rowKeys.begin(), selected));
+    if (selection_changed || rows_changed || list_.SelectedIndex() != selected_index) list_.SelectedIndex(selected_index);
+    column_labels_ = props.columnLabels;
+    column_widths_ = props.columnWidths;
+    row_keys_ = props.rowKeys;
+    cells_ = props.cells;
+    selected_key_ = props.selectedKey;
+    alternating_rows_ = props.alternatingRows;
+    compact_ = props.compact;
+    disabled_row_keys_ = props.disabledRowKeys;
+    if (props.followBottom.value_or(false) && rows_changed && !props.rowKeys.empty()) {
+      list_.ScrollIntoView(list_.Items().GetAt(static_cast<uint32_t>(props.rowKeys.size() - 1)));
+    }
+    has_applied_ = true;
     syncing_ = false;
   }
 
@@ -550,6 +603,15 @@ struct TableComponentView final
   Grid root_{nullptr};
   Grid header_{nullptr};
   ListView list_{nullptr};
+  bool has_applied_ = false;
+  std::vector<std::string> column_labels_;
+  std::vector<float> column_widths_;
+  std::vector<std::string> row_keys_;
+  std::vector<std::string> cells_;
+  std::string selected_key_;
+  std::optional<bool> alternating_rows_;
+  std::optional<bool> compact_;
+  std::vector<std::string> disabled_row_keys_;
 };
 
 struct TextEditorComponentView final
@@ -749,7 +811,6 @@ struct SecureTextEditorComponentView final
       });
       island_.Content(editor_);
       island_view.Connect(island_.ContentIsland());
-      ApplyProps(nullptr);
     } catch (...) {
       EmitState(kSecureEditorInitialRevision, "error", "initialize_failed");
     }
@@ -862,6 +923,8 @@ struct SecureTextEditorComponentView final
     lifecycle_->edit_serial.store(0, std::memory_order_release);
     lifecycle_->staging.store(false, std::memory_order_release);
     lifecycle_->terminal.store(false, std::memory_order_release);
+    load_recovery_attempted_ = false;
+    stage_recovery_attempted_ = false;
     active_editor_token_ = props.editorToken;
     loaded_document_.reset();
     last_revision_ = 0;
@@ -912,15 +975,59 @@ struct SecureTextEditorComponentView final
   void FinishRead(uint64_t generation, std::optional<std::string> text) noexcept {
     if (!IsCurrent(lifecycle_, generation)) return;
     if (!text) {
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(true);
-      EmitState(kSecureEditorInitialRevision, "error", "read_failed");
+      RecoverInitialRead(generation, active_editor_token_);
       return;
     }
     loaded_document_ = std::move(text);
     last_revision_ = 0;
     if (!PresentLoadedDocument()) return;
     EmitState(kSecureEditorInitialRevision, "ready", "");
+  }
+
+  void RecoverInitialRead(uint64_t generation, std::string const& failed_token) noexcept {
+    if (!IsCurrent(lifecycle_, generation) || load_recovery_attempted_ ||
+        failed_token != active_editor_token_) {
+      lifecycle_->terminal.store(true, std::memory_order_release);
+      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(true);
+      EmitState(kSecureEditorInitialRevision, "error", "read_failed");
+      return;
+    }
+    load_recovery_attempted_ = true;
+    auto lifecycle = lifecycle_;
+    auto dispatcher = dispatcher_;
+    auto weak_self = get_weak();
+    try {
+      std::thread([lifecycle, dispatcher, weak_self, generation, failed_token] {
+        auto refreshed = LiteLLMMenu::CoreIPCBridge::Shared().RefreshEditorDocument(failed_token);
+        if (!lifecycle->alive.load(std::memory_order_acquire) ||
+            lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
+          return;
+        }
+        dispatcher.TryEnqueue([lifecycle, weak_self, generation, failed_token, refreshed = std::move(refreshed)]() mutable {
+          if (!lifecycle->alive.load(std::memory_order_acquire) ||
+              lifecycle->generation.load(std::memory_order_acquire) != generation) {
+            return;
+          }
+          if (auto self = weak_self.get()) {
+            if (!refreshed || failed_token != self->active_editor_token_) {
+              self->lifecycle_->terminal.store(true, std::memory_order_release);
+              if (self->lifecycle_->attached.load(std::memory_order_acquire)) self->editor_.IsReadOnly(true);
+              self->EmitState(kSecureEditorInitialRevision, "error", "read_failed");
+              return;
+            }
+            self->active_editor_token_ = std::move(refreshed->editor_token);
+            self->loaded_document_ = std::move(refreshed->text);
+            self->last_revision_ = 0;
+            if (!self->PresentLoadedDocument()) return;
+            self->EmitState(kSecureEditorInitialRevision, "ready", "");
+          }
+        });
+      }).detach();
+    } catch (...) {
+      lifecycle_->terminal.store(true, std::memory_order_release);
+      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(true);
+      EmitState(kSecureEditorInitialRevision, "error", "read_failed");
+    }
   }
 
   void ScheduleStage() noexcept {
@@ -930,6 +1037,10 @@ struct SecureTextEditorComponentView final
       return;
     }
     const auto generation = lifecycle_->generation.load(std::memory_order_acquire);
+    // A successful recovery belongs to the previous edit burst. Allow one
+    // bounded capability refresh for each new user edit burst, while still
+    // preventing an endlessly failing stage from spinning.
+    stage_recovery_attempted_ = false;
     lifecycle_->edit_serial.fetch_add(1, std::memory_order_acq_rel);
     const auto serial = lifecycle_->debounce_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
     EmitState(last_revision_, "dirty", "");
@@ -956,8 +1067,8 @@ struct SecureTextEditorComponentView final
         });
       }).detach();
     } catch (...) {
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      editor_.IsReadOnly(true);
+      lifecycle_->terminal.store(false, std::memory_order_release);
+      editor_.IsReadOnly(false);
       EmitState(last_revision_, "error", "stage_failed");
     }
   }
@@ -1026,8 +1137,8 @@ struct SecureTextEditorComponentView final
       }).detach();
     } catch (...) {
       lifecycle_->staging.store(false, std::memory_order_release);
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      editor_.IsReadOnly(true);
+      lifecycle_->terminal.store(false, std::memory_order_release);
+      editor_.IsReadOnly(false);
       EmitState(last_revision_, "error", "stage_failed");
     }
   }
@@ -1042,9 +1153,7 @@ struct SecureTextEditorComponentView final
         result->revision > std::numeric_limits<int32_t>::max() ||
         std::floor(result->revision) != result->revision || result->editor_token.empty() ||
         result->editor_token.size() > 256) {
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(true);
-      EmitState(last_revision_, "error", "stage_failed");
+      RecoverStage(generation, active_editor_token_);
       return;
     }
     // Core rotates the capability after each stage. Keep the replacement token
@@ -1057,6 +1166,60 @@ struct SecureTextEditorComponentView final
       BeginStage(generation);
     } else {
       EmitState(last_revision_, "saved", "");
+    }
+  }
+
+  void RecoverStage(uint64_t generation, std::string const& failed_token) noexcept {
+    if (!IsCurrent(lifecycle_, generation) || stage_recovery_attempted_ ||
+        failed_token != active_editor_token_) {
+      lifecycle_->terminal.store(false, std::memory_order_release);
+      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(false);
+      EmitState(last_revision_, "error", "stage_failed");
+      return;
+    }
+    stage_recovery_attempted_ = true;
+    lifecycle_->staging.store(true, std::memory_order_release);
+    EmitState(last_revision_, "saving", "");
+    auto lifecycle = lifecycle_;
+    auto dispatcher = dispatcher_;
+    auto weak_self = get_weak();
+    try {
+      std::thread([lifecycle, dispatcher, weak_self, generation, failed_token] {
+        auto refreshed = LiteLLMMenu::CoreIPCBridge::Shared().RefreshEditorDocument(failed_token);
+        if (!lifecycle->alive.load(std::memory_order_acquire) ||
+            lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
+          return;
+        }
+        dispatcher.TryEnqueue([lifecycle, weak_self, generation, failed_token, refreshed = std::move(refreshed)]() mutable {
+          if (!lifecycle->alive.load(std::memory_order_acquire) ||
+              lifecycle->generation.load(std::memory_order_acquire) != generation) {
+            return;
+          }
+          if (auto self = weak_self.get()) {
+            self->lifecycle_->staging.store(false, std::memory_order_release);
+            if (!refreshed || failed_token != self->active_editor_token_) {
+              self->lifecycle_->terminal.store(false, std::memory_order_release);
+              if (self->lifecycle_->attached.load(std::memory_order_acquire)) self->editor_.IsReadOnly(false);
+              self->EmitState(self->last_revision_, "error", "stage_failed");
+              return;
+            }
+            // The Core read above only authorizes the fresh capability. Do not
+            // assign its disk text: the TextBox is the native owner of edits
+            // made while the prior capability expired.
+            self->active_editor_token_ = std::move(refreshed->editor_token);
+            if (!self->lifecycle_->attached.load(std::memory_order_acquire)) {
+              self->EmitState(self->last_revision_, "dirty", "");
+              return;
+            }
+            self->BeginStage(generation);
+          }
+        });
+      }).detach();
+    } catch (...) {
+      lifecycle_->staging.store(false, std::memory_order_release);
+      lifecycle_->terminal.store(false, std::memory_order_release);
+      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(false);
+      EmitState(last_revision_, "error", "stage_failed");
     }
   }
 
@@ -1085,6 +1248,8 @@ struct SecureTextEditorComponentView final
   TextBox editor_{nullptr};
   std::string active_editor_token_;
   std::optional<std::string> loaded_document_;
+  bool load_recovery_attempted_ = false;
+  bool stage_recovery_attempted_ = false;
   int32_t last_revision_ = 0;
   std::string last_status_;
   std::string last_error_;
@@ -1164,6 +1329,12 @@ struct TextInputComponentView final
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     text_box_ = TextBox{};
+    // React Native owns the outer field height.  Keep the native editor's
+    // content box centered with enough vertical room for the shared 13pt
+    // font instead of inheriting template padding that can clip the glyphs.
+    text_box_.MinHeight(30.0);
+    text_box_.Padding(winrt::Microsoft::UI::Xaml::Thickness{8, 0, 8, 0});
+    text_box_.VerticalContentAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
     text_box_.TextChanged([this](auto const&, auto const&) {
       if (syncing_) return;
       if (auto emitter = EventEmitter()) {
@@ -1188,7 +1359,7 @@ struct TextInputComponentView final
     });
     island_.Content(text_box_);
     island_view.Connect(island_.ContentIsland());
-    ApplyProps();
+    ApplyProps(nullptr);
   }
 
   void UpdateProps(
@@ -1196,25 +1367,47 @@ struct TextInputComponentView final
       winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputProps> const& props,
       winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept override {
     winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView>::UpdateProps(view, props, old_props);
-    ApplyProps();
+    ApplyProps(old_props);
   }
 
  private:
-  void ApplyProps() noexcept {
+  void ApplyProps(
+      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept {
     if (!text_box_ || !Props()) return;
     auto const& props = *Props();
-    syncing_ = true;
+    // Ignore unrelated Fabric commits while an editor has locally accepted
+    // text.  Reapplying a stale controlled value on every prop update causes
+    // a visible flash and moves the caret under active typing.
+    const bool text_changed = !old_props || old_props->value != props.value;
+    const bool placeholder_changed = !old_props || old_props->placeholder != props.placeholder;
+    const bool multiline_changed = !old_props || old_props->multiline != props.multiline;
+    const bool keyboard_type_changed = !old_props || old_props->keyboardType != props.keyboardType;
+    const bool secure_text_changed = !old_props || old_props->secureTextEntry != props.secureTextEntry;
+    const bool disabled_changed = !old_props || old_props->disabled != props.disabled;
     auto const value = ToHString(props.value.value_or(""));
-    if (text_box_.Text() != value) text_box_.Text(value);
-    syncing_ = false;
-    text_box_.PlaceholderText(ToHString(props.placeholder.value_or("")));
-    text_box_.AcceptsReturn(props.multiline.value_or(false));
-    text_box_.TextWrapping(props.multiline.value_or(false)
-        ? winrt::Microsoft::UI::Xaml::TextWrapping::Wrap
-        : winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-    ApplyKeyboardType(text_box_, props.keyboardType);
-    text_box_.PasswordChar(props.secureTextEntry.value_or(false) ? L'\x25cf' : L'\0');
-    text_box_.IsEnabled(Enabled(props.disabled));
+    if (text_changed && text_box_.Text() != value) {
+      syncing_ = true;
+      text_box_.Text(value);
+      syncing_ = false;
+    }
+    if (placeholder_changed) {
+      text_box_.PlaceholderText(ToHString(props.placeholder.value_or("")));
+    }
+    if (multiline_changed) {
+      text_box_.AcceptsReturn(props.multiline.value_or(false));
+      text_box_.TextWrapping(props.multiline.value_or(false)
+          ? winrt::Microsoft::UI::Xaml::TextWrapping::Wrap
+          : winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
+    }
+    if (keyboard_type_changed) {
+      ApplyKeyboardType(text_box_, props.keyboardType);
+    }
+    if (secure_text_changed) {
+      text_box_.PasswordChar(props.secureTextEntry.value_or(false) ? L'\x25cf' : L'\0');
+    }
+    if (disabled_changed) {
+      text_box_.IsEnabled(Enabled(props.disabled));
+    }
   }
 
   bool syncing_ = false;
@@ -1236,6 +1429,12 @@ struct SecureTextInputComponentView final
       if (password_box_ && password_changed_token_.value != 0) {
         password_box_.PasswordChanged(password_changed_token_);
       }
+      if (password_box_ && lost_focus_token_.value != 0) {
+        password_box_.LostFocus(lost_focus_token_);
+      }
+      if (password_box_ && key_down_token_.value != 0) {
+        password_box_.KeyDown(key_down_token_);
+      }
     } catch (...) {
     }
   }
@@ -1244,12 +1443,26 @@ struct SecureTextInputComponentView final
     try {
       island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
       password_box_ = PasswordBox{};
+      // Keep secret fields visually and typographically identical to regular
+      // inputs. PasswordBox otherwise inherits template padding that differs
+      // from TextBox and can make a 13pt value look vertically clipped.
+      password_box_.MinHeight(30.0);
+      password_box_.Padding(winrt::Microsoft::UI::Xaml::Thickness{8, 0, 8, 0});
+      password_box_.VerticalContentAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
       password_box_.MaxLength(16 * 1024);
       dispatcher_ = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
       auto weak_self = get_weak();
       password_changed_token_ = password_box_.PasswordChanged([weak_self](auto const&, auto const&) {
         if (auto self = weak_self.get()) self->MarkDirty();
       });
+      lost_focus_token_ = password_box_.LostFocus([weak_self](auto const&, auto const&) {
+        if (auto self = weak_self.get()) self->StageOnBlur();
+      });
+      key_down_token_ = password_box_.KeyDown(
+          [weak_self](auto const&, winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args) {
+            if (args.Key() != winrt::Windows::System::VirtualKey::Enter) return;
+            if (auto self = weak_self.get()) self->StageOnSubmit();
+          });
       island_.Content(password_box_);
       island_view.Connect(island_.ContentIsland());
       ApplyProps(nullptr);
@@ -1281,56 +1494,115 @@ struct SecureTextInputComponentView final
         lifecycle_->generation.load(std::memory_order_acquire) == generation;
   }
 
+  bool IsPlainTextProviderKey(
+      winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps const& props) const noexcept {
+    return props.plainText.value_or(false) && props.autoCommit.value_or(false) &&
+        props.domain == "providers_models" && props.field == "api_key" && !props.target.empty();
+  }
+
+  bool IsPlainTextProviderKey() const noexcept {
+    if (!Props()) return false;
+    return IsPlainTextProviderKey(*Props());
+  }
+
+  void SetPassword(winrt::hstring const& value) noexcept {
+    if (!password_box_) return;
+    syncing_ = true;
+    password_box_.Password(value);
+    syncing_ = false;
+  }
+
   void ApplyProps(
       winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps> const& old_props) noexcept {
     if (!password_box_ || !Props()) return;
     auto const& props = *Props();
     const bool identity_changed = !old_props || old_props->domain != props.domain ||
         old_props->field != props.field || old_props->target != props.target;
-    if (identity_changed) {
+    const bool plain_key_mode_changed = !old_props ||
+        old_props->plainText != props.plainText || old_props->autoCommit != props.autoCommit;
+    const bool reset_identity = identity_changed || plain_key_mode_changed;
+    const bool should_load_plaintext_provider_key = reset_identity && IsPlainTextProviderKey(props);
+    const bool placeholder_changed = !old_props || old_props->placeholder != props.placeholder;
+    const bool plain_text_changed = !old_props || old_props->plainText != props.plainText;
+    const bool label_changed = !old_props || old_props->label != props.label;
+    const bool disabled_changed = !old_props || old_props->disabled != props.disabled;
+    if (reset_identity) {
       lifecycle_->generation.fetch_add(1, std::memory_order_acq_rel);
       lifecycle_->staging.store(false, std::memory_order_release);
+      loading_ = false;
       active_domain_ = props.domain;
       active_field_ = props.field;
       active_target_ = props.target;
-      syncing_ = true;
-      password_box_.Password(L"");
-      syncing_ = false;
+      SetPassword(winrt::hstring{});
+      dirty_ = false;
       last_revision_ = 0;
       last_present_ = false;
       last_status_ = "ready";
       last_error_.clear();
     }
-    password_box_.PlaceholderText(ToHString(props.placeholder.value_or("")));
-    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(password_box_, ToHString(props.label));
-    password_box_.IsEnabled(Enabled(props.disabled) && !lifecycle_->staging.load(std::memory_order_acquire));
+    if (placeholder_changed) {
+      password_box_.PlaceholderText(ToHString(props.placeholder.value_or("")));
+    }
+    if (plain_text_changed) {
+      password_box_.PasswordRevealMode(props.plainText.value_or(false)
+          ? winrt::Microsoft::UI::Xaml::Controls::PasswordRevealMode::Visible
+          : winrt::Microsoft::UI::Xaml::Controls::PasswordRevealMode::Hidden);
+    }
+    if (label_changed) {
+      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(password_box_, ToHString(props.label));
+    }
+    if (disabled_changed || reset_identity) {
+      password_box_.IsEnabled(
+          Enabled(props.disabled) && !lifecycle_->staging.load(std::memory_order_acquire) && !loading_);
+    }
     const int32_t reset_request = props.resetRequest.value_or(0);
     if ((!old_props || old_props->resetRequest != props.resetRequest) && reset_request != last_reset_request_) {
       last_reset_request_ = reset_request;
-      syncing_ = true;
-      password_box_.Password(L"");
-      syncing_ = false;
+      SetPassword(winrt::hstring{});
+      dirty_ = false;
       if (!lifecycle_->staging.load(std::memory_order_acquire)) {
         EmitState(last_revision_, last_present_, "ready", "", last_commit_request_);
       }
     }
     const int32_t commit_request = props.commitRequest.value_or(0);
     if ((!old_props || old_props->commitRequest != props.commitRequest) && commit_request != last_commit_request_) {
-      StageForRequest(commit_request);
+      StageForRequest(commit_request, false);
+    }
+    if (should_load_plaintext_provider_key) {
+      LoadProviderApiKey();
     }
   }
 
   void MarkDirty() noexcept {
     if (syncing_ || !lifecycle_ || lifecycle_->staging.load(std::memory_order_acquire)) return;
     try {
-      if (password_box_.Password().empty()) return;
+      if (password_box_.Password().empty() && !IsPlainTextProviderKey()) return;
+      dirty_ = true;
       EmitState(last_revision_, last_present_, "dirty", "", last_commit_request_);
     } catch (...) {
       EmitState(last_revision_, last_present_, "error", "invalid_secret", last_commit_request_);
     }
   }
 
-  void StageForRequest(int32_t requested_commit) noexcept {
+  void StageOnBlur() noexcept {
+    if (!IsPlainTextProviderKey() || !dirty_) return;
+    StageForRequest(NextAutoCommitRequest(), true);
+  }
+
+  void StageOnSubmit() noexcept {
+    if (!IsPlainTextProviderKey() || !dirty_) return;
+    StageForRequest(NextAutoCommitRequest(), true);
+  }
+
+  int32_t NextAutoCommitRequest() noexcept {
+    next_auto_commit_request_ = std::max(next_auto_commit_request_, last_commit_request_);
+    if (next_auto_commit_request_ < std::numeric_limits<int32_t>::max()) {
+      ++next_auto_commit_request_;
+    }
+    return next_auto_commit_request_;
+  }
+
+  void StageForRequest(int32_t requested_commit, bool allow_empty) noexcept {
     if (!Props() || !password_box_ || lifecycle_->staging.load(std::memory_order_acquire)) return;
     std::wstring password;
     try {
@@ -1339,15 +1611,14 @@ struct SecureTextInputComponentView final
       EmitState(last_revision_, last_present_, "error", "invalid_secret", last_commit_request_);
       return;
     }
-    if (password.empty()) {
+    if (password.empty() && !allow_empty) {
       last_commit_request_ = std::max(last_commit_request_, requested_commit);
       EmitState(last_revision_, last_present_, "ready", "", last_commit_request_);
       return;
     }
     if (active_domain_.empty() || active_field_.empty()) {
-      syncing_ = true;
-      password_box_.Password(L"");
-      syncing_ = false;
+      SetPassword(winrt::hstring{});
+      if (IsPlainTextProviderKey()) dirty_ = true;
       last_commit_request_ = std::max(last_commit_request_, requested_commit);
       EmitState(last_revision_, last_present_, "error", "invalid_secret", last_commit_request_);
       return;
@@ -1358,17 +1629,20 @@ struct SecureTextInputComponentView final
     } catch (...) {
       secret.reset();
     }
-    syncing_ = true;
-    password_box_.Password(L"");
-    syncing_ = false;
+    const bool preserve_input = IsPlainTextProviderKey();
+    if (!preserve_input) {
+      SetPassword(winrt::hstring{});
+    }
     if (!secret || secret->size() > 16 * 1024) {
       last_commit_request_ = std::max(last_commit_request_, requested_commit);
+      if (IsPlainTextProviderKey()) dirty_ = true;
       EmitState(last_revision_, last_present_, "error", "invalid_secret", last_commit_request_);
       return;
     }
     bool expected = false;
     if (!lifecycle_->staging.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     password_box_.IsEnabled(false);
+    dirty_ = false;
     last_commit_request_ = std::max(last_commit_request_, requested_commit);
     const auto generation = lifecycle_->generation.load(std::memory_order_acquire);
     const bool disabled = Props()->disabled.value_or(false);
@@ -1398,6 +1672,7 @@ struct SecureTextInputComponentView final
     } catch (...) {
       lifecycle_->staging.store(false, std::memory_order_release);
       password_box_.IsEnabled(!disabled);
+      if (IsPlainTextProviderKey()) dirty_ = true;
       EmitState(last_revision_, last_present_, "error", "stage_failed", last_commit_request_);
     }
   }
@@ -1412,9 +1687,58 @@ struct SecureTextInputComponentView final
     if (!result || result->revision < 0 || result->revision > std::numeric_limits<int32_t>::max() ||
         std::floor(result->revision) != result->revision) {
       EmitState(last_revision_, last_present_, "error", "stage_failed", last_commit_request_);
+      if (IsPlainTextProviderKey()) dirty_ = true;
       return;
     }
     EmitState(static_cast<int32_t>(result->revision), result->present, "saved", "", last_commit_request_);
+  }
+
+  void LoadProviderApiKey() noexcept {
+    if (!IsPlainTextProviderKey() || !lifecycle_ || !dispatcher_) return;
+    const auto generation = lifecycle_->generation.load(std::memory_order_acquire);
+    const bool disabled = Props()->disabled.value_or(false);
+    const auto target = active_target_;
+    auto lifecycle = lifecycle_;
+    auto dispatcher = dispatcher_;
+    auto weak_self = get_weak();
+    loading_ = true;
+    password_box_.IsEnabled(false);
+    try {
+      std::thread([lifecycle, dispatcher, weak_self, generation, disabled, target] {
+        auto value = LiteLLMMenu::CoreIPCBridge::Shared().ReadProviderAPIKey(target);
+        if (!lifecycle->alive.load(std::memory_order_acquire) ||
+            lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
+          return;
+        }
+        dispatcher.TryEnqueue([lifecycle, weak_self, generation, disabled, value = std::move(value)]() mutable {
+          if (!lifecycle->alive.load(std::memory_order_acquire) ||
+              lifecycle->generation.load(std::memory_order_acquire) != generation) {
+            return;
+          }
+          if (auto self = weak_self.get()) self->FinishProviderApiKeyLoad(generation, disabled, std::move(value));
+        });
+      }).detach();
+    } catch (...) {
+      loading_ = false;
+      password_box_.IsEnabled(!disabled);
+      EmitState(last_revision_, last_present_, "error", "read_failed", last_commit_request_);
+    }
+  }
+
+  void FinishProviderApiKeyLoad(
+      uint64_t generation,
+      bool disabled,
+      std::optional<std::string> value) noexcept {
+    if (!Current(generation) || !IsPlainTextProviderKey()) return;
+    loading_ = false;
+    SetPassword(value ? ToHString(*value) : winrt::hstring{});
+    dirty_ = false;
+    password_box_.IsEnabled(!disabled);
+    if (!value) {
+      EmitState(last_revision_, false, "error", "read_failed", last_commit_request_);
+      return;
+    }
+    EmitState(last_revision_, !value->empty(), "ready", "", last_commit_request_);
   }
 
   void EmitState(int32_t revision, bool present, std::string status, std::string error, int32_t commit_request) noexcept {
@@ -1438,6 +1762,8 @@ struct SecureTextInputComponentView final
   }
 
   bool syncing_ = false;
+  bool dirty_ = false;
+  bool loading_ = false;
   std::shared_ptr<SecureInputLifecycle> lifecycle_{std::make_shared<SecureInputLifecycle>()};
   winrt::Microsoft::UI::Dispatching::DispatcherQueue dispatcher_{nullptr};
   winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
@@ -1450,8 +1776,11 @@ struct SecureTextInputComponentView final
   std::string last_status_;
   std::string last_error_;
   int32_t last_commit_request_ = 0;
+  int32_t next_auto_commit_request_ = 0;
   int32_t last_reset_request_ = 0;
   winrt::event_token password_changed_token_{};
+  winrt::event_token lost_focus_token_{};
+  winrt::event_token key_down_token_{};
 };
 
 struct SwitchComponentView final
@@ -1472,7 +1801,7 @@ struct SwitchComponentView final
     });
     island_.Content(toggle_);
     island_view.Connect(island_.ContentIsland());
-    ApplyProps();
+    ApplyProps(nullptr);
   }
 
   void UpdateProps(
@@ -1480,16 +1809,22 @@ struct SwitchComponentView final
       winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISwitchProps> const& props,
       winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISwitchProps> const& old_props) noexcept override {
     winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISwitch<SwitchComponentView>::UpdateProps(view, props, old_props);
-    ApplyProps();
+    ApplyProps(old_props);
   }
 
  private:
-  void ApplyProps() noexcept {
+  void ApplyProps(
+      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISwitchProps> const& old_props) noexcept {
     if (!toggle_ || !Props()) return;
-    syncing_ = true;
-    toggle_.IsOn(Props()->value.value_or(false));
-    syncing_ = false;
-    toggle_.IsEnabled(Enabled(Props()->disabled));
+    auto const& props = *Props();
+    const bool value_changed = !old_props || old_props->value != props.value;
+    const bool disabled_changed = !old_props || old_props->disabled != props.disabled;
+    if (value_changed) {
+      syncing_ = true;
+      toggle_.IsOn(props.value.value_or(false));
+      syncing_ = false;
+    }
+    if (disabled_changed) toggle_.IsEnabled(Enabled(props.disabled));
   }
 
   bool syncing_ = false;
@@ -1507,7 +1842,11 @@ struct SelectableRowComponentView final
     content_ = StackPanel{};
     content_.Spacing(2);
     title_ = TextBlock{};
+    title_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
+    title_.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
     detail_ = TextBlock{};
+    detail_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
+    detail_.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
     detail_.Opacity(0.68);
     detail_.FontSize(11);
     content_.Children().Append(title_);

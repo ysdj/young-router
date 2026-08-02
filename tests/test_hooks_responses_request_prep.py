@@ -4,7 +4,602 @@ from hook_test_utils import *
 
 
 class HookResponsesRequestPrepTests(HookTestCase):
-    def test_codex_stale_wait_output_gets_fresh_exec_recovery_hint(self) -> None:
+    @staticmethod
+    def _codex_collaboration_request() -> dict:
+        return {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "stream": True,
+            "instructions": "Keep the requested implementation complete and tested.",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "tools": [
+                                {"type": "function", "name": "list_agents"},
+                                {"type": "function", "name": "interrupt_agent"},
+                                {"type": "function", "name": "spawn_agent"},
+                            ],
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Implement the change."},
+            ],
+            "tools": [],
+        }
+
+    def test_codex_descendant_cleanup_instruction_is_enabled_by_default(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        instructions = modified["instructions"]
+        self.assertIn("wait for it and incorporate its result", instructions)
+        self.assertIn("take ownership or reassign that work", instructions)
+        self.assertIn("never drop required work", instructions)
+        self.assertIn("code, file, test, or other work required", instructions)
+        self.assertIn("deepest-first", instructions)
+        self.assertIn("call list_agents again", instructions)
+        self.assertIn("never a sibling or ancestor", instructions)
+        self.assertIn("root agent owns the entire tree", instructions)
+        self.assertIn("Every assistant response without a real tool call terminates", instructions)
+        self.assertIn("progress-only response would terminate the turn", instructions)
+        self.assertIn("invalidates every earlier list_agents snapshot", instructions)
+        self.assertIn("Visible answer text alone is not evidence", instructions)
+        self.assertEqual(
+            original["instructions"],
+            "Keep the requested implementation complete and tested.",
+        )
+
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(modified)
+        )
+
+    def test_codex_descendant_cleanup_instruction_can_be_disabled(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._CODEX_DESCENDANT_CLEANUP_ENV, "0")
+
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(
+                self._codex_collaboration_request()
+            )
+        )
+
+    def test_codex_descendant_cleanup_requires_management_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        request["input"][0]["tools"][0]["tools"] = [
+            {"type": "function", "name": "spawn_agent"},
+        ]
+
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(request)
+        )
+
+    def test_codex_descendant_cleanup_ignores_compaction_and_non_codex(self) -> None:
+        hooks, _ = load_hook_module()
+        compaction = self._codex_collaboration_request()
+        compaction["input"].append({"type": "compaction_trigger"})
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(compaction)
+        )
+
+        non_codex = self._codex_collaboration_request()
+        non_codex.pop("client_metadata")
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(non_codex)
+        )
+
+    async def test_pre_call_injects_codex_descendant_cleanup_instruction(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+
+        modified = await hook.async_pre_call_deployment_hook(
+            self._codex_collaboration_request(),
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertIn(
+            hooks._CODEX_DESCENDANT_CLEANUP_MARKER,
+            modified["instructions"],
+        )
+
+    @staticmethod
+    def _as_root_collaboration_request(request: dict) -> dict:
+        request["input"].insert(
+            1,
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "You are `/root`, the primary agent in a team of agents.",
+                    }
+                ],
+            },
+        )
+        request["tool_choice"] = "auto"
+        return request
+
+    @staticmethod
+    def _append_collaboration_call(
+        request: dict,
+        *,
+        call_id: str,
+        name: str,
+        arguments: str,
+        output: str,
+    ) -> None:
+        request["input"].extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "namespace": "collaboration",
+                    "arguments": arguments,
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                },
+            ]
+        )
+
+    def test_codex_root_with_active_descendant_must_make_a_tool_call(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments='{"path_prefix":"/root"}',
+            output=json.dumps(
+                {
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {
+                            "agent_name": "/root/audit",
+                            "agent_status": "running",
+                        },
+                    ]
+                }
+            ),
+        )
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
+            "active_descendants",
+        )
+
+    def test_codex_root_without_snapshot_must_list_before_completion(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
+            "snapshot_missing",
+        )
+
+    def test_codex_root_clean_snapshot_allows_tool_free_completion(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments="{}",
+            output=json.dumps(
+                {
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {
+                            "agent_name": "/root/audit",
+                            "agent_status": {"completed": "done"},
+                        },
+                    ]
+                }
+            ),
+        )
+
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(request)
+        )
+        self.assertEqual(request["tool_choice"], "auto")
+
+    def test_codex_root_lifecycle_call_invalidates_clean_snapshot(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments='{"path_prefix":"/root"}',
+            output=json.dumps(
+                {"agents": [{"agent_name": "/root", "agent_status": "running"}]}
+            ),
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-followup",
+            name="followup_task",
+            arguments='{"target":"/root/audit","message":"finish"}',
+            output="",
+        )
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
+            "snapshot_invalidated",
+        )
+
+    def test_codex_root_full_snapshot_after_followup_releases_barrier(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        self._append_collaboration_call(
+            request,
+            call_id="call-followup",
+            name="followup_task",
+            arguments='{"target":"/root/audit","message":"finish"}',
+            output="",
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments='{"path_prefix":"/root"}',
+            output=json.dumps(
+                {
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {
+                            "agent_name": "/root/audit",
+                            "agent_status": "completed",
+                        },
+                    ]
+                }
+            ),
+        )
+
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(request)
+        )
+        self.assertEqual(request["tool_choice"], "auto")
+
+    def test_codex_root_narrow_snapshot_does_not_release_barrier(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        self._append_collaboration_call(
+            request,
+            call_id="call-spawn",
+            name="spawn_agent",
+            arguments='{"task_name":"audit","message":"check"}',
+            output='{"agent_name":"/root/audit"}',
+        )
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments='{"path_prefix":"/root/audit"}',
+            output=json.dumps(
+                {
+                    "agents": [
+                        {
+                            "agent_name": "/root/audit",
+                            "agent_status": "completed",
+                        }
+                    ]
+                }
+            ),
+        )
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+
+    def test_codex_root_snapshot_called_before_parallel_followup_stays_invalid(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        request["input"].extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call-list",
+                    "name": "list_agents",
+                    "namespace": "collaboration",
+                    "arguments": '{"path_prefix":"/root"}',
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-followup",
+                    "name": "followup_task",
+                    "namespace": "collaboration",
+                    "arguments": '{"target":"/root/audit","message":"finish"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-list",
+                    "output": json.dumps(
+                        {
+                            "agents": [
+                                {"agent_name": "/root", "agent_status": "running"}
+                            ]
+                        }
+                    ),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-followup",
+                    "output": "",
+                },
+            ]
+        )
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
+            "snapshot_invalidated",
+        )
+
+    def test_codex_root_snapshot_called_after_parallel_followup_stays_invalid(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        request["input"].extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call-followup",
+                    "name": "followup_task",
+                    "namespace": "collaboration",
+                    "arguments": '{"target":"/root/audit","message":"finish"}',
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-list",
+                    "name": "list_agents",
+                    "namespace": "collaboration",
+                    "arguments": '{"path_prefix":"/root"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-followup",
+                    "output": "",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-list",
+                    "output": json.dumps(
+                        {
+                            "agents": [
+                                {"agent_name": "/root", "agent_status": "running"}
+                            ]
+                        }
+                    ),
+                },
+            ]
+        )
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
+            "snapshot_invalidated",
+        )
+
+    def test_codex_root_progress_text_does_not_split_parallel_batch(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        request["input"].extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call-followup",
+                    "name": "followup_task",
+                    "namespace": "collaboration",
+                    "arguments": '{"target":"/root/audit","message":"finish"}',
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "Checking descendants.",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-list",
+                    "name": "list_agents",
+                    "namespace": "collaboration",
+                    "arguments": '{}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-followup",
+                    "output": "",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-list",
+                    "output": json.dumps(
+                        {"agents": [{"agent_name": "/root", "agent_status": "running"}]}
+                    ),
+                },
+            ]
+        )
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
+            "snapshot_invalidated",
+        )
+
+    def test_codex_root_later_same_turn_snapshot_releases_barrier(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        turn_metadata = {"turn_id": "turn-parallel"}
+        request["input"].extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call-followup",
+                    "name": "followup_task",
+                    "namespace": "collaboration",
+                    "arguments": '{"target":"/root/audit","message":"finish"}',
+                    "internal_chat_message_metadata_passthrough": turn_metadata,
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-followup",
+                    "output": "",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-list",
+                    "name": "list_agents",
+                    "namespace": "collaboration",
+                    "arguments": "{}",
+                    "internal_chat_message_metadata_passthrough": turn_metadata,
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-list",
+                    "output": json.dumps(
+                        {"agents": [{"agent_name": "/root", "agent_status": "running"}]}
+                    ),
+                },
+            ]
+        )
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNone(modified)
+        self.assertEqual(request["tool_choice"], "auto")
+
+    def test_codex_subagent_is_not_subject_to_root_completion_barrier(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        request["input"].insert(
+            1,
+            {
+                "role": "developer",
+                "content": "You are `/root/audit`, a subagent.",
+            },
+        )
+        request["tool_choice"] = "auto"
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments="{}",
+            output=json.dumps(
+                {
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {
+                            "agent_name": "/root/audit",
+                            "agent_status": "running",
+                        },
+                    ]
+                }
+            ),
+        )
+
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(request)
+        )
+        self.assertEqual(request["tool_choice"], "auto")
+
+    def test_codex_subagent_inheriting_root_history_is_not_root(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["instructions"] = hooks._CODEX_DESCENDANT_CLEANUP_INSTRUCTION
+        request["input"].insert(
+            2,
+            {
+                "role": "developer",
+                "content": (
+                    "You are an agent in a team of agents collaborating to "
+                    "complete a task."
+                ),
+            },
+        )
+
+        self.assertFalse(hooks._codex_request_is_root_agent(request))
+        self.assertIsNone(
+            hooks._with_codex_descendant_cleanup_instruction(request)
+        )
+        self.assertEqual(request["tool_choice"], "auto")
+
+    async def test_pre_call_preserves_stale_wait_output(self) -> None:
         hooks, _ = load_hook_module()
         original = {
             "call_type": "aresponses",
@@ -40,28 +635,22 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "parallel_tool_calls": False,
         }
 
-        modified = hooks._with_codex_tool_runtime_recovery_hints(original)
+        hook = hooks.LiteLLMMenuHook()
+        modified = await hook.async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        output = modified["input"][-1]["output"]
-        self.assertIn("Start a fresh exec call", output)
-        self.assertIn("exec tool itself remains available", output)
+        self.assertEqual(modified["input"][-1], original["input"][-1])
         self.assertEqual(
-            [tool["name"] for tool in modified["input"][0]["tools"]],
+            [tool["name"] for tool in modified["tools"]],
             ["exec", "wait", "request_user_input"],
         )
-        self.assertEqual(
-            original["input"][-1]["output"],
-            "Script error: exec cell expired-cell not found",
-        )
-        stats = modified["litellm_metadata"][
-            hooks._CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY
-        ]
-        self.assertEqual(stats["stale_wait_outputs_hinted"], 1)
-        self.assertEqual(stats["unavailable_request_user_input_outputs_hinted"], 0)
+        self.assertNotIn("additional_tools", json.dumps(modified["input"]))
 
-    async def test_pre_call_removes_proven_unavailable_request_user_input_only(self) -> None:
+    async def test_pre_call_preserves_unavailable_request_user_input_history(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         original = {
@@ -107,19 +696,12 @@ class HookResponsesRequestPrepTests(HookTestCase):
         assert modified is not None
         self.assertEqual(
             [tool["name"] for tool in modified["tools"]],
-            ["exec", "wait"],
+            ["exec", "wait", "request_user_input"],
         )
         self.assertNotIn("additional_tools", json.dumps(modified["input"]))
-        output = modified["input"][-1]["output"]
-        self.assertIn("only to request_user_input", output)
-        self.assertIn("custom exec tool remains available", output)
+        self.assertEqual(modified["input"][-1], original["input"][-1])
         self.assertEqual(modified["tool_choice"], "auto")
         self.assertFalse(modified["parallel_tool_calls"])
-        stats = modified["litellm_metadata"][
-            hooks._CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY
-        ]
-        self.assertEqual(stats["unavailable_request_user_input_outputs_hinted"], 1)
-        self.assertEqual(stats["removed_request_user_input_tools"], 1)
         self.assertEqual(
             [tool["name"] for tool in original["input"][0]["tools"]],
             ["exec", "wait", "request_user_input"],
@@ -380,431 +962,20 @@ class HookResponsesRequestPrepTests(HookTestCase):
         if modified is not None:
             self.assertNotIn("extra_body", modified)
 
-    def test_structured_codex_compaction_is_bounded_without_changing_protocol_shape(self) -> None:
+    async def test_pre_call_deployment_hook_preserves_codex_compaction_history_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()
-        first_output = "alpha-" + ("a" * 125000) + "-omega"
-        second_output = "start-" + ("b" * 125000) + "-finish"
-        original = {
-            "call_type": "aresponses",
-            "model": "default-chat",
-            "stream": True,
-            "prompt_cache_key": "thread-test-0002",
-            "client_metadata": {
-                "thread_id": "thread-test-0002",
-                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
-            },
-            "input": [
-                {"type": "message", "role": "user", "content": "continue"},
-                {
-                    "type": "function_call",
-                    "call_id": "call_keep",
-                    "name": "exec_command",
-                    "arguments": "{}",
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_keep",
-                    "output": first_output,
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_second",
-                    "output": second_output,
-                },
-                {"type": "compaction_trigger", "id": "compact_keep"},
-            ],
-            "tools": [{"type": "function", "name": "exec_command"}],
-            "tool_choice": "auto",
-            "parallel_tool_calls": True,
-            "reasoning": {"effort": "xhigh"},
-        }
-
-        modified = hooks._with_codex_compaction_input_bounded(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertIsNot(modified, original)
-        self.assertEqual(len(modified["input"]), len(original["input"]))
-        self.assertEqual(modified["input"][1], original["input"][1])
-        self.assertEqual(modified["input"][2]["call_id"], "call_keep")
-        self.assertEqual(modified["input"][3]["call_id"], "call_second")
-        self.assertEqual(
-            modified["input"][4],
-            {"type": "compaction_trigger", "id": "compact_keep"},
-        )
-        self.assertEqual(modified["tools"], original["tools"])
-        self.assertEqual(modified["tool_choice"], "auto")
-        self.assertTrue(modified["parallel_tool_calls"])
-        self.assertEqual(modified["reasoning"], {"effort": "xhigh"})
-        self.assertEqual(
-            len(modified["input"][2]["output"]),
-            hooks._CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS,
-        )
-        self.assertIn("original_chars=", modified["input"][2]["output"])
-        self.assertTrue(modified["input"][2]["output"].startswith("alpha-"))
-        self.assertTrue(modified["input"][2]["output"].endswith("-omega"))
-        self.assertEqual(original["input"][2]["output"], first_output)
-
-    def test_structured_codex_compaction_bounds_custom_tool_output_content_only(self) -> None:
-        hooks, _ = load_hook_module()
-        first_output = [
-            {"type": "input_text", "text": "Script completed\n"},
-            {
-                "type": "input_text",
-                "text": "alpha-" + ("a" * 125000) + "-omega",
-            },
-        ]
-        second_output = [
-            {"type": "input_text", "text": "Script completed\n"},
-            {
-                "type": "input_text",
-                "text": "start-" + ("b" * 125000) + "-finish",
-            },
-        ]
-        original = {
-            "call_type": "aresponses",
-            "model": "default-chat",
-            "stream": True,
-            "client_metadata": {
-                "thread_id": "thread-test-custom",
-                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
-            },
-            "input": [
-                {"type": "message", "role": "user", "content": "continue"},
-                {
-                    "type": "custom_tool_call",
-                    "id": "ctc_keep",
-                    "call_id": "call_keep",
-                    "name": "exec",
-                    "input": "const result = await tools.exec_command({});",
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call_keep",
-                    "output": first_output,
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call_second",
-                    "output": second_output,
-                },
-                {"type": "compaction_trigger", "id": "compact_custom"},
-            ],
-        }
-
-        modified = hooks._with_codex_compaction_input_bounded(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(modified["input"][1], original["input"][1])
-        self.assertEqual(modified["input"][2]["type"], "custom_tool_call_output")
-        self.assertEqual(modified["input"][2]["call_id"], "call_keep")
-        self.assertIsInstance(modified["input"][2]["output"], list)
-        self.assertEqual(
-            [part["type"] for part in modified["input"][2]["output"]],
-            ["input_text", "input_text"],
-        )
-        compacted_text = "".join(
-            part["text"] for part in modified["input"][2]["output"]
-        )
-        self.assertLessEqual(
-            len(compacted_text),
-            hooks._CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS,
-        )
-        self.assertIn("original_chars=", compacted_text)
-        self.assertTrue(compacted_text.startswith("Script completed\nalpha-"))
-        self.assertTrue(compacted_text.endswith("-omega"))
-        self.assertEqual(original["input"][2]["output"], first_output)
-        self.assertEqual(modified["input"][-1], original["input"][-1])
-
-    def test_structured_codex_compaction_omits_only_already_observed_tool_images(self) -> None:
-        hooks, _ = load_hook_module()
-        old_image = "data:image/png;base64," + ("a" * 200_000)
-        recent_image = "data:image/png;base64," + ("b" * 200_000)
-        original = {
-            "call_type": "aresponses",
-            "stream": True,
-            "client_metadata": {
-                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
-            },
-            "input": [
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call_old",
-                    "output": [
-                        {"type": "input_text", "text": "old screenshot"},
-                        {"type": "input_image", "image_url": old_image},
-                    ],
-                },
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "I inspected it."}],
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call_recent",
-                    "output": [
-                        {"type": "input_text", "text": "new screenshot"},
-                        {"type": "input_image", "image_url": recent_image},
-                    ],
-                },
-                {"type": "compaction_trigger"},
-            ],
-        }
-
-        modified = hooks._with_codex_compaction_input_bounded(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(modified["input"][0]["call_id"], "call_old")
-        self.assertEqual(modified["input"][0]["output"][0], original["input"][0]["output"][0])
-        self.assertEqual(modified["input"][0]["output"][1]["type"], "input_text")
-        self.assertIn(
-            "historical inline image",
-            modified["input"][0]["output"][1]["text"],
-        )
-        self.assertEqual(modified["input"][2], original["input"][2])
-        self.assertEqual(original["input"][0]["output"][1]["image_url"], old_image)
-
-    def test_structured_codex_compaction_omits_old_message_image_before_compaction_summary(self) -> None:
-        hooks, _ = load_hook_module()
-        old_image = "data:image/png;base64," + ("a" * 200_000)
-        recent_image = "data:image/png;base64," + ("b" * 200_000)
+        hook = hooks.LiteLLMMenuHook()
         previous_compaction = {
             "type": "compaction",
             "id": "compaction_previous",
-            "encrypted_content": "opaque-encrypted-summary",
+            "encrypted_content": "opaque-encrypted-compaction",
         }
-        original = {
-            "call_type": "aresponses",
-            "stream": True,
-            "client_metadata": {
-                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
-            },
-            "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "old screenshot"},
-                        {"type": "input_image", "image_url": old_image},
-                    ],
-                },
-                previous_compaction,
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "new screenshot"},
-                        {"type": "input_image", "image_url": recent_image},
-                    ],
-                },
-                {"type": "compaction_trigger"},
-            ],
+        encrypted_agent_message = {
+            "type": "agent_message",
+            "id": "agent_previous",
+            "content": [{"type": "output_text", "text": "results consumed"}],
+            "encrypted_content": "opaque-encrypted-agent-message",
         }
-
-        modified = hooks._with_codex_compaction_input_bounded(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(modified["input"][0]["content"][0], original["input"][0]["content"][0])
-        self.assertEqual(modified["input"][0]["content"][1]["type"], "input_text")
-        self.assertIn(
-            "compaction summary",
-            modified["input"][0]["content"][1]["text"],
-        )
-        self.assertEqual(modified["input"][1], previous_compaction)
-        self.assertEqual(
-            modified["input"][1]["encrypted_content"],
-            "opaque-encrypted-summary",
-        )
-        self.assertEqual(modified["input"][2], original["input"][2])
-        self.assertEqual(original["input"][0]["content"][1]["image_url"], old_image)
-
-    def test_structured_codex_compaction_bounds_large_text_history_to_safe_budget(self) -> None:
-        hooks, _ = load_hook_module()
-        original = {
-            "call_type": "aresponses",
-            "stream": True,
-            "client_metadata": {
-                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
-            },
-            "input": [
-                {
-                    "type": "message",
-                    "role": "developer",
-                    "content": "d" * 40_000,
-                },
-                *[
-                    {
-                        "type": "custom_tool_call_output",
-                        "call_id": f"call_{index}",
-                        "output": "x" * 20_000,
-                    }
-                    for index in range(20)
-                ],
-                {"type": "compaction_trigger"},
-            ],
-        }
-
-        modified = hooks._with_codex_compaction_input_bounded(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertLessEqual(
-            hooks._compaction_text_length(modified["input"]),
-            hooks._CODEX_COMPACTION_HISTORY_TEXT_CHARS,
-        )
-        self.assertEqual(modified["input"][-1], original["input"][-1])
-
-    def test_structured_codex_compaction_bounds_item_count_without_orphaning_calls(self) -> None:
-        hooks, _ = load_hook_module()
-        previous_compaction = {
-            "type": "compaction",
-            "id": "compaction_previous",
-            "encrypted_content": "opaque-encrypted-summary",
-        }
-        original = {
-            "call_type": "aresponses",
-            "stream": True,
-            "client_metadata": {
-                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
-            },
-            "input": [
-                {"type": "additional_tools", "role": "developer", "tools": []},
-                {"type": "message", "role": "developer", "content": "rules"},
-                previous_compaction,
-                *[
-                    item
-                    for index in range(200)
-                    for item in (
-                        {
-                            "type": "custom_tool_call",
-                            "call_id": f"call_{index}",
-                            "name": "exec",
-                            "input": "{}",
-                        },
-                        {
-                            "type": "custom_tool_call_output",
-                            "call_id": f"call_{index}",
-                            "output": "ok",
-                        },
-                    )
-                ],
-                {"type": "compaction_trigger", "id": "compact-now"},
-            ],
-        }
-
-        modified = hooks._with_codex_compaction_input_bounded(original)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertLessEqual(
-            len(modified["input"]),
-            hooks._CODEX_COMPACTION_HISTORY_MAX_ITEMS,
-        )
-        self.assertEqual(modified["input"][:3], original["input"][:3])
-        self.assertEqual(modified["input"][-1], original["input"][-1])
-        calls = {
-            item["call_id"]
-            for item in modified["input"]
-            if item.get("type") == "custom_tool_call"
-        }
-        outputs = {
-            item["call_id"]
-            for item in modified["input"]
-            if item.get("type") == "custom_tool_call_output"
-        }
-        self.assertEqual(calls, outputs)
-        self.assertIn("call_199", calls)
-        self.assertNotIn("call_0", calls)
-        self.assertEqual(
-            previous_compaction["encrypted_content"],
-            "opaque-encrypted-summary",
-        )
-
-    def test_structured_codex_compaction_leaves_small_request_untouched(self) -> None:
-        hooks, _ = load_hook_module()
-        original = {
-            "call_type": "aresponses",
-            "client_metadata": {
-                "thread_id": "thread-test-0002",
-                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
-            },
-            "input": [
-                {"type": "message", "role": "user", "content": "continue"},
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_small",
-                    "output": "x" * (hooks._CODEX_TOOL_OUTPUT_COMPACT_ITEM_CHARS + 200),
-                },
-                {"type": "compaction_trigger"},
-            ],
-        }
-
-        self.assertIsNone(hooks._with_codex_compaction_input_bounded(original))
-
-    def test_codex_compaction_bounding_ignores_non_codex_request(self) -> None:
-        hooks, _ = load_hook_module()
-        original = {
-            "call_type": "aresponses",
-            "input": [
-                {"type": "message", "role": "user", "content": "continue"},
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_large",
-                    "output": "x" * (hooks._CODEX_TOOL_OUTPUT_COMPACT_TOTAL_CHARS + 50_000),
-                },
-            ],
-        }
-
-        self.assertIsNone(hooks._with_codex_compaction_input_bounded(original))
-
-    async def test_pre_call_deployment_hook_keeps_ordinary_codex_turn_byte_for_byte(self) -> None:
-        hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
-        original = {
-            "call_type": "aresponses",
-            "model": "default-chat",
-            "client_metadata": {
-                "thread_id": "thread-test-0002",
-                "x-codex-turn-metadata": '{"request_kind":"turn"}',
-            },
-            "input": [
-                {"type": "message", "role": "user", "content": "continue"},
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_a",
-                    "output": "a" * 125000,
-                },
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_b",
-                    "output": "b" * 125000,
-                },
-            ],
-        }
-
-        modified = await hook.async_pre_call_deployment_hook(original, call_type="aresponses")
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertIn("extra_body", modified)
-        self.assertEqual(
-            modified["extra_body"]["client_metadata"],
-            original["client_metadata"],
-        )
-        self.assertEqual(
-            modified["input"][1]["output"],
-            original["input"][1]["output"],
-        )
-        self.assertEqual(modified["input"][1]["call_id"], "call_a")
-        self.assertEqual(modified["input"][2]["call_id"], "call_b")
-
-    async def test_pre_call_deployment_hook_bounds_structured_compaction_before_upstream(self) -> None:
-        hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
         original = {
             "call_type": "aresponses",
             "model": "default-chat",
@@ -825,6 +996,8 @@ class HookResponsesRequestPrepTests(HookTestCase):
                     "call_id": "call_keep",
                     "output": "x" * 600_000,
                 },
+                previous_compaction,
+                encrypted_agent_message,
                 {"type": "compaction_trigger", "id": "trigger_keep"},
             ],
         }
@@ -836,20 +1009,247 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual([item["type"] for item in modified["input"]], [
-            "message",
-            "custom_tool_call_output",
-            "compaction_trigger",
-        ])
-        self.assertEqual(modified["input"][0]["id"], "msg_keep")
-        self.assertEqual(modified["input"][1]["id"], "out_keep")
-        self.assertEqual(modified["input"][1]["call_id"], "call_keep")
-        self.assertEqual(modified["input"][2], original["input"][2])
-        self.assertLessEqual(
-            hooks._compaction_text_length(modified["input"]),
-            hooks._CODEX_COMPACTION_HISTORY_TEXT_CHARS,
+        self.assertEqual(modified["input"], original["input"])
+        self.assertEqual(
+            modified["input"][2]["encrypted_content"],
+            "opaque-encrypted-compaction",
         )
-        self.assertEqual(original["input"][1]["output"], "x" * 600_000)
+        self.assertEqual(
+            modified["input"][3]["encrypted_content"],
+            "opaque-encrypted-agent-message",
+        )
+        self.assertEqual(modified["input"][1]["output"], "x" * 600_000)
+
+    async def test_pre_call_deployment_hook_keeps_ordinary_codex_turn_byte_for_byte(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "client_metadata": {
+                "thread_id": "thread-test-0002",
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_a",
+                    "output": "a" * 600_000,
+                },
+                {
+                    "type": "agent_message",
+                    "id": "agent_previous",
+                    "encrypted_content": "opaque-encrypted-agent-message",
+                },
+            ],
+        }
+
+        modified = await hook.async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["input"], original["input"])
+
+    async def test_pre_call_deployment_hook_restores_plaintext_agent_message_content(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        encrypted_value = "gAAAAABvalidopaqueagentmessage"
+        plaintext_value = "补充一项对抗边界：同一轮并行工具调用不能提前放行。"
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "agent_message",
+                    "id": "agent_encrypted",
+                    "content": [
+                        {"type": "input_text", "text": "Sender: /root/audit"},
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": encrypted_value,
+                        },
+                    ],
+                },
+                {
+                    "type": "agent_message",
+                    "id": "agent_plaintext",
+                    "content": [
+                        {"type": "input_text", "text": "Sender: /root/audit"},
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": plaintext_value,
+                        },
+                    ],
+                },
+            ],
+        }
+
+        modified = await hook.async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            modified["input"][0]["content"][1],
+            original["input"][0]["content"][1],
+        )
+        self.assertEqual(
+            modified["input"][1]["content"][1],
+            {"type": "input_text", "text": plaintext_value},
+        )
+        self.assertEqual(
+            original["input"][1]["content"][1],
+            {
+                "type": "encrypted_content",
+                "encrypted_content": plaintext_value,
+            },
+        )
+
+    async def test_pre_call_deployment_hook_preserves_image_before_encrypted_history(self) -> None:
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        original_data_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        previous_compaction = {
+            "type": "compaction",
+            "id": "compaction_previous",
+            "encrypted_content": "opaque-encrypted-compaction",
+        }
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "client_metadata": {
+                "thread_id": "thread-image-compaction",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                previous_compaction,
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_image",
+                    "output": [
+                        {"type": "input_text", "text": "screenshot"},
+                        {"type": "input_image", "image_url": original_data_url},
+                    ],
+                },
+                {
+                    "type": "agent_message",
+                    "id": "agent_previous",
+                    "encrypted_content": "opaque-encrypted-agent-message",
+                },
+                {"type": "compaction_trigger", "id": "trigger_keep"},
+            ],
+        }
+
+        modified = await hook.async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["input"][0], previous_compaction)
+        self.assertEqual(modified["input"][1]["output"][0], original["input"][1]["output"][0])
+        self.assertEqual(
+            modified["input"][1]["output"][1]["image_url"],
+            original_data_url,
+        )
+        self.assertEqual(modified["input"][2], original["input"][2])
+        self.assertEqual(modified["input"][3], original["input"][3])
+        self.assertEqual(
+            original["input"][1]["output"][1]["image_url"],
+            original_data_url,
+        )
+
+    async def test_pre_call_deployment_hook_compresses_image_after_encrypted_history(self) -> None:
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        original_data_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        previous_compaction = {
+            "type": "compaction",
+            "id": "compaction_previous",
+            "encrypted_content": "opaque-encrypted-compaction",
+        }
+        encrypted_agent_message = {
+            "type": "agent_message",
+            "id": "agent_previous",
+            "encrypted_content": "opaque-encrypted-agent-message",
+        }
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "client_metadata": {
+                "thread_id": "thread-image-compaction",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                previous_compaction,
+                encrypted_agent_message,
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_image",
+                    "output": [
+                        {"type": "input_text", "text": "screenshot"},
+                        {"type": "input_image", "image_url": original_data_url},
+                    ],
+                },
+                {"type": "compaction_trigger", "id": "trigger_keep"},
+            ],
+        }
+
+        modified = await hook.async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["input"][0], previous_compaction)
+        self.assertEqual(modified["input"][1], encrypted_agent_message)
+        bounded_image = modified["input"][2]["output"][1]
+        self.assertEqual(bounded_image["type"], "input_image")
+        self.assertTrue(bounded_image["image_url"].startswith("data:image/"))
+        self.assertLess(
+            hooks._image_data_url_size(bounded_image["image_url"]),
+            hooks._image_data_url_size(original_data_url),
+        )
+        self.assertLessEqual(
+            hooks._image_data_url_size(bounded_image["image_url"]),
+            hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
+        )
+        self.assertEqual(
+            original["input"][2]["output"][1]["image_url"],
+            original_data_url,
+        )
 
     async def test_pre_call_deployment_hook_ignores_other_api_bases(self) -> None:
         hooks, _ = load_hook_module()

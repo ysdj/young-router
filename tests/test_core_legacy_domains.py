@@ -180,7 +180,38 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
             self.assertEqual(["default"], provider["api_key_names"])
             self.assertEqual("default", provider["models"][0]["api_key_name"])
+            self.assertEqual(
+                [{"name": "default", "configured": True, "model_count": 1}],
+                provider["key_states"],
+            )
             self.assertNotIn("replace-me-secret", json.dumps(snapshot))
+
+    def test_model_api_key_configured_requires_the_selected_named_key_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            domain.dispatch("provider.key_add", {"provider_id": "primary", "name": "secondary"})
+            empty = domain.dispatch(
+                "model.patch",
+                {"provider_id": "primary", "model_id": "00000071", "changes": {"api_key_name": "secondary", "api_key": ""}},
+            )
+            empty_model = empty["providers"][0]["models"][0]
+            self.assertIs(empty_model["api_key_configured"], False)
+            self.assertEqual(False, empty["providers"][0]["key_states"][1]["configured"])
+
+            domain.stage_secret("api_key", "primary\x1fsecondary", "replace-me-secondary-secret")
+            configured = domain.snapshot()
+            configured_model = configured["providers"][0]["models"][0]
+            self.assertIs(configured_model["api_key_configured"], True)
+            self.assertEqual(True, configured["providers"][0]["key_states"][1]["configured"])
+
+            domain.dispatch(
+                "model.patch",
+                {"provider_id": "primary", "model_id": "00000071", "changes": {"api_key_name": "missing", "api_key": ""}},
+            )
+            missing_model = domain.snapshot()["providers"][0]["models"][0]
+            self.assertIs(missing_model["api_key_configured"], False)
 
     def test_apply_refuses_an_external_disk_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -614,6 +645,82 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_model_probe_checks_responses_chat_and_balance_in_one_action(self) -> None:
+        requests: list[tuple[str, str, str]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                requests.append(
+                    (
+                        self.path,
+                        self.headers.get("Authorization", self.headers.get("x-api-key", "")),
+                        str(payload.get("model", "")),
+                    )
+                )
+                body = json.dumps(
+                    {"id": "response-1", "output": []}
+                    if self.path == "/v1/responses"
+                    else {"choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = PROVIDER_CONFIG.replace("https://example.test/v1", f"http://127.0.0.1:{port}/v1")
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(config).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                billing = {
+                    "status": "ok",
+                    "detail": "Billing data is available.",
+                    "source": "synthetic-v1-usage",
+                    "balance": {"kind": "balance", "value": 12.5, "unit": "USD"},
+                    "usage": {"used": 3.0, "limit": 20.0, "unit": "USD"},
+                    "multiplier": {"status": "ok", "value": 1.25},
+                }
+                with mock.patch("provider_billing.probe_account", return_value=billing) as balance_probe:
+                    result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+                model = domain.snapshot()["providers"][0]["models"][0]
+
+            self.assertTrue(result["available"])
+            self.assertEqual("openai/responses", result["recommended_surface"])
+            self.assertEqual(["openai/responses", "openai/chat"], result["protocols"])
+            self.assertTrue(model["probe"]["available"])
+            self.assertTrue(model["probe"]["surfaces"]["openai/responses"]["available"])
+            self.assertEqual("balance", model["billing"]["balance"]["kind"])
+            self.assertEqual(12.5, model["billing"]["balance"]["value"])
+            balance_probe.assert_called_once_with(
+                f"http://127.0.0.1:{port}/v1",
+                "replace-me-secret",
+                timeout=5.0,
+            )
+            self.assertEqual(
+                [
+                    ("/v1/chat/completions", "Bearer replace-me-secret", "default-chat"),
+                    ("/v1/responses", "Bearer replace-me-secret", "default-chat"),
+                ],
+                sorted(requests),
+            )
+            self.assertNotIn("replace-me-secret", json.dumps(result))
+            self.assertNotIn("replace-me-secret", json.dumps(model))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
 
 class CodexSettingsDomainTests(unittest.TestCase):
     def test_sync_and_apply_preserve_unknown_toml_and_auth_fields(self) -> None:
@@ -827,7 +934,8 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
     def test_probe_uses_existing_webdav_client_without_echoing_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            domain = WebDAVSettingsDomain(root / "webdav.json", enabled_path=root / "enabled")
+            status = root / "webdav-sync-status.json"
+            domain = WebDAVSettingsDomain(root / "webdav.json", enabled_path=root / "enabled", status_path=status)
             domain.dispatch("patch", {"url": "https://example.test/webdav/", "remote_name": "config.json"})
             with mock.patch("webdav.core.WebDAVClient.head", return_value=(200, {})), mock.patch(
                 "webdav.core.WebDAVClient.try_mkcol"
@@ -835,6 +943,10 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
                 result = domain.probe()
 
             self.assertEqual({"ok": True, "protocols": ["webdav"], "detail": "WebDAV probe succeeded"}, result)
+            recorded = json.loads(status.read_text(encoding="utf-8"))
+            self.assertEqual("probe", recorded["action"])
+            self.assertTrue(recorded["ok"])
+            self.assertEqual(0o600, stat.S_IMODE(status.stat().st_mode))
 
 
 if __name__ == "__main__":

@@ -231,7 +231,7 @@ class HookPatchTests(HookTestCase):
         self.assertIsNone(getattr(error, "failed_deployment_order", None))
         self.assertEqual(error.num_retries, 0)
 
-    async def test_generic_helper_repairs_custom_tool_item_ids_before_routing(self) -> None:
+    async def test_generic_helper_preserves_historical_tool_item_ids(self) -> None:
         hooks, _ = load_hook_module()
         router_module = types.ModuleType("litellm.router")
 
@@ -286,18 +286,13 @@ class HookPatchTests(HookTestCase):
             input=original_input,
         )
 
-        self.assertEqual(response["input"][0]["id"], "ctc_exec")
+        self.assertIs(response["input"], original_input)
+        self.assertEqual(response["input"][0]["id"], "fc_exec")
         self.assertEqual(response["input"][1]["id"], "ctco_exec")
-        self.assertEqual(response["input"][2]["id"], "fc_item_function")
-        self.assertEqual(response["input"][3]["id"], "fco_item_function_output")
+        self.assertEqual(response["input"][2]["id"], "item_function")
+        self.assertEqual(response["input"][3]["id"], "item_function_output")
         self.assertEqual(response["input"][2]["call_id"], "call_function")
         self.assertEqual(response["input"][3]["call_id"], "call_function")
-        self.assertEqual(original_input[0]["id"], "fc_exec")
-        self.assertEqual(original_input[2]["id"], "item_function")
-        self.assertEqual(
-            response["litellm_metadata"]["responses_custom_tool_item_ids_normalized"],
-            {"changed": True, "normalized_item_ids": 3},
-        )
 
     async def test_generic_helper_patch_retries_image_unsupported_with_vision_bridge(self) -> None:
         hooks, _ = load_hook_module()

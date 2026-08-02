@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from unittest import mock
 
 from litellm_menu.core import (
     CoreIPCClient,
@@ -22,17 +23,87 @@ from litellm_menu.core import (
     encode_message,
     load_protocol_schema,
 )
+from litellm_menu.core import __main__ as core_main
 from litellm_menu.core.protocol import validate_method_result
 from litellm_menu.core.persistence import AtomicJSONStore, PersistenceError
 from litellm_menu.core.security import REDACT_TEXT, redact, safe_error_message
 
 
 class CoreProtocolTests(unittest.TestCase):
+    def test_core_parent_watchdog_stops_after_direct_parent_changes(self) -> None:
+        stop = threading.Event()
+        with mock.patch.object(core_main.os, "getppid", side_effect=[4321, 9876]):
+            core_main._watch_parent(4321, stop, poll_interval=0)
+
+        self.assertTrue(stop.is_set())
+
+    def test_core_parent_watchdog_uses_a_process_handle_on_windows(self) -> None:
+        stop = threading.Event()
+        with (
+            mock.patch.object(core_main.os, "name", "nt"),
+            mock.patch.object(core_main, "_watch_windows_parent") as watch_windows_parent,
+        ):
+            core_main._watch_parent(4321, stop, poll_interval=0.5)
+
+        watch_windows_parent.assert_called_once_with(4321, stop, poll_interval=0.5)
+
+    def test_core_parent_pid_must_be_positive(self) -> None:
+        parser = core_main.build_parser()
+        self.assertEqual(4321, parser.parse_args(["--parent-pid", "4321"]).parent_pid)
+        with self.assertRaises(core_main.argparse.ArgumentTypeError):
+            core_main._positive_pid("0")
+
+    def test_core_rejects_a_stale_parent_before_initialization(self) -> None:
+        with (
+            mock.patch.object(core_main.os, "name", "posix"),
+            mock.patch.object(core_main.os, "getppid", return_value=9876),
+            mock.patch.object(core_main.CoreStore, "with_default_domains") as create_core,
+        ):
+            self.assertEqual(0, core_main.run(["--parent-pid", "4321"]))
+
+        create_core.assert_not_called()
+
+    def test_core_parent_watchdog_runs_ordered_shutdown(self) -> None:
+        events: list[str] = []
+        server_started = threading.Event()
+
+        class FakeCore:
+            def shutdown(self) -> None:
+                events.append("core.shutdown")
+
+        class FakeServer:
+            def __init__(self, _core: object, *, address: str, port: int) -> None:
+                self.address = address
+                self.port = port
+
+            def start(self) -> None:
+                events.append("server.start")
+                server_started.set()
+
+            def stop(self) -> None:
+                events.append("server.stop")
+
+        def direct_parent() -> int:
+            if threading.current_thread().name == "litellm-core-parent-watchdog":
+                self.assertTrue(server_started.wait(1.0))
+                return 9876
+            return 4321
+
+        with (
+            mock.patch.object(core_main.os, "getppid", side_effect=direct_parent),
+            mock.patch.object(core_main.CoreStore, "with_default_domains", return_value=FakeCore()),
+            mock.patch.object(core_main, "CoreIPCServer", FakeServer),
+            mock.patch.object(core_main.signal, "signal"),
+        ):
+            self.assertEqual(0, core_main.run(["--parent-pid", "4321"]))
+
+        self.assertEqual(["server.start", "core.shutdown", "server.stop"], events)
+
     def test_shared_schema_matches_python_and_typescript_method_contract(self) -> None:
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])
         self.assertEqual(
-            ["snapshot", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import"],
+            ["snapshot", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import"],
             schema["methods"],
         )
         typescript = (
@@ -70,6 +141,7 @@ class CoreProtocolTests(unittest.TestCase):
     def test_runtime_enforces_every_method_params_schema(self) -> None:
         valid = {
             "snapshot": {},
+            "logs": {"tab": "requests"},
             "editor": {"domain": "codex", "document": "config"},
             "dispatch": {"action": {"type": "set", "domain": "language", "payload": {}}},
             "subscribe": {"topics": ["snapshot"]},
@@ -82,6 +154,7 @@ class CoreProtocolTests(unittest.TestCase):
         }
         invalid = {
             "snapshot": {"stale": True},
+            "logs": {"tab": "unknown"},
             "editor": {"domain": "runtime", "document": "config"},
             "dispatch": {"action": {"type": "", "unexpected": True}},
             "subscribe": {"topics": ["topic"] * 33},
@@ -109,6 +182,7 @@ class CoreProtocolTests(unittest.TestCase):
     def test_runtime_enforces_every_method_result_schema(self) -> None:
         valid = {
             "snapshot": {"snapshot": {}},
+            "logs": {"changed": True, "revision": 1, "log": {"tab": "requests", "available": False, "paused": False, "line_count": 0, "records": [], "filter": "", "limit": 10000}},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0},
             "dispatch": {"revision": 0},
             "subscribe": {"subscription_id": "subscription"},
@@ -121,6 +195,7 @@ class CoreProtocolTests(unittest.TestCase):
         }
         invalid = {
             "snapshot": {"snapshot": []},
+            "logs": {"changed": "yes", "revision": 1, "log": None},
             "editor": {"domain": "runtime", "document": "config", "editor_token": "token", "revision": 0},
             "dispatch": {"revision": -1},
             "subscribe": {"subscription_id": 1},
@@ -589,6 +664,34 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                 "second", core.snapshot()["domains"]["claude"]["settings"]["model"]
             )
 
+    def test_editor_capability_can_be_reacquired_after_core_capability_loss(self) -> None:
+        """Native recovery must read a replacement token before staging its draft."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+
+            core = CoreStore(domains=[ClaudeSettingsDomain(Path(directory) / "settings.json")])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            original = client.call("editor", {"domain": "claude", "document": "settings"})
+            client.read_editor(original["editor_token"])
+            with server._lock:
+                server._editor_capabilities.clear()
+            with self.assertRaises(Exception):
+                client.read_editor(original["editor_token"])
+
+            replacement = client.call("editor", {"domain": "claude", "document": "settings"})
+            self.assertNotEqual(original["editor_token"], replacement["editor_token"])
+            # The read handshake authorizes a native host to stage the text it
+            # kept in memory; the recovered disk content must not overwrite it.
+            client.read_editor(replacement["editor_token"])
+            client.stage_editor(replacement["editor_token"], '{"model":"recovered"}\n')
+            self.assertEqual("recovered", core.snapshot()["domains"]["claude"]["settings"]["model"])
+
     def test_codex_raw_editors_remain_valid_when_the_sibling_document_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             from litellm_menu.core.domains.legacy import CodexSettingsDomain
@@ -632,8 +735,6 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            profile = root / "profile.json"
-            profile.write_text('{"profile": "synthetic"}\n', encoding="utf-8")
             core = CoreStore(domains=[ClaudeSettingsDomain(root / "settings.json")])
             server = CoreIPCServer(core)
             endpoint = server.start()
@@ -646,25 +747,50 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                     "dispatch",
                     {"action": {"domain": "claude", "type": "patch", "payload": {"env": {"ANTHROPIC_AUTH_TOKEN": "synthetic-token"}}}},
                 )
-            with self.assertRaisesRegex(Exception, "native file picker"):
-                client.call(
-                    "dispatch",
-                    {"action": {"domain": "claude", "type": "attach_profile", "payload": {"path": str(profile)}}},
-                )
-
-            profile_token = client.register_file_capability(str(profile), "claude-profile")
-            client.call(
-                "dispatch",
-                {"action": {"domain": "claude", "type": "attach_profile", "payload": {"file_token": profile_token}}},
-            )
             secret = server.register_secret_capability(
                 "claude", "deployment_token", None, session_token=client._session_token
             )
             server.stage_secret_capability(secret["secret_token"], "synthetic-token", session_token=client._session_token)
 
+            with self.assertRaisesRegex(Exception, "native secure input"):
+                client.call(
+                    "dispatch",
+                    {"action": {"domain": "claude", "type": "patch", "payload": {"autoMemoryDirectory": "~/synthetic-memory"}}},
+                )
+            memory = server.register_secret_capability(
+                "claude", "auto_memory_directory", None, session_token=client._session_token
+            )
+            server.stage_secret_capability(memory["secret_token"], "~/synthetic-memory", session_token=client._session_token)
+
             snapshot = json.dumps(core.snapshot())
             self.assertNotIn("synthetic-token", snapshot)
-            self.assertTrue(core.snapshot()["domains"]["claude"]["settings"]["desktop_profile_attached"])
+            self.assertNotIn("~/synthetic-memory", snapshot)
+            self.assertTrue(core.snapshot()["domains"]["claude"]["settings"]["token_configured"])
+            self.assertTrue(core.snapshot()["domains"]["claude"]["settings"]["autoMemoryDirectoryConfigured"])
+
+    def test_claude_snapshot_hides_command_and_permission_rule_text_but_trusted_editor_keeps_it(self) -> None:
+        from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "permissions": {"allow": ["Read(/private/ipc-synthetic-path/**)"]},
+                        "sandbox": {"excludedCommands": ["tool --token=ipc-synthetic-token"]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            core = CoreStore(domains=[ClaudeSettingsDomain(path)])
+
+            public_snapshot = json.dumps(core.snapshot())
+            self.assertNotIn("/private/ipc-synthetic-path", public_snapshot)
+            self.assertNotIn("ipc-synthetic-token", public_snapshot)
+            raw = core.trusted_editor_text("claude", "settings", revision=core.revision)
+            self.assertIn("/private/ipc-synthetic-path", raw)
+            self.assertIn("ipc-synthetic-token", raw)
 
     def test_secret_capability_is_allowlisted_session_bound_and_one_time(self) -> None:
         class SecretDomain(MemoryDomain):
@@ -758,6 +884,187 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertTrue(response["present"])
             self.assertNotIn("synthetic-secret", body.decode("utf-8"))
 
+    def test_provider_api_key_read_capability_is_native_only_session_bound_and_one_time(self) -> None:
+        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+
+        api_key = "test-provider-api-key"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "providers:",
+                        "  test-provider:",
+                        '    api_base: "https://example.test/v1"',
+                        "    api_keys:",
+                        "      - name: default",
+                        f'        value: "{api_key}"',
+                        "model_list: []",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            core = CoreStore(domains=[ProvidersModelsDomain(path)])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            public_snapshot = client.call("snapshot")
+            self.assertNotIn(api_key, json.dumps(public_snapshot))
+            self.assertNotIn(api_key, json.dumps(core.snapshot()))
+
+            session = client._session_token
+            capability = server.register_secret_read_capability(
+                "providers_models", "api_key", "test-provider", session_token=session
+            )
+            self.assertTrue(capability["present"])
+            self.assertNotIn(api_key, json.dumps(capability))
+            with self.assertRaises(Exception):
+                server.read_secret_capability(
+                    capability["secret_read_token"], session_token="another-session"
+                )
+
+            status, body, _headers = client._http(
+                "/v1/host/secret/read",
+                payload=encode_message({"secret_read_token": capability["secret_read_token"]}),
+                token=session,
+            )
+            self.assertEqual(200, status)
+            self.assertEqual(
+                {"protocol_version": 1, "value": api_key},
+                decode_message(body),
+            )
+            with self.assertRaises(Exception):
+                server.read_secret_capability(
+                    capability["secret_read_token"], session_token=session
+                )
+            with self.assertRaises(Exception):
+                server.register_secret_read_capability(
+                    "codex", "api_key", "test-provider", session_token=session
+                )
+            with self.assertRaises(Exception):
+                client.call(
+                    "dispatch",
+                    {
+                        "action": {
+                            "domain": "providers_models",
+                            "type": "provider.patch",
+                            "payload": {"provider_id": "test-provider", "api_key": api_key},
+                        }
+                    },
+                )
+
+    def test_provider_api_key_read_capability_rejects_stale_revision_and_invalid_http_shape(self) -> None:
+        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "providers:",
+                        "  test-provider:",
+                        '    api_base: "https://example.test/v1"',
+                        "    api_keys:",
+                        "      - name: default",
+                        '        value: "test-provider-api-key"',
+                        "model_list: []",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            core = CoreStore(domains=[ProvidersModelsDomain(path)])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+            client.call("snapshot")
+            session = client._session_token
+
+            status, body, _headers = client._http(
+                "/v1/host/secret/read-capability",
+                payload=encode_message(
+                    {"domain": "providers_models", "field": "api_key"}
+                ),
+                token=session,
+            )
+            self.assertEqual(400, status)
+            self.assertNotIn("test-provider-api-key", body.decode("utf-8"))
+
+            capability = server.register_secret_read_capability(
+                "providers_models", "api_key", "test-provider", session_token=session
+            )
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.patch",
+                    "payload": {
+                        "provider_id": "test-provider",
+                        "changes": {"api_base": "https://changed.example.test/v1"},
+                    },
+                }
+            )
+            with self.assertRaises(Exception):
+                server.read_secret_capability(
+                    capability["secret_read_token"], session_token=session
+                )
+            with self.assertRaises(Exception):
+                server.read_secret_capability(
+                    capability["secret_read_token"], session_token=session
+                )
+
+    def test_provider_api_key_read_capability_uses_the_current_staged_draft(self) -> None:
+        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+
+        original_key = "test-provider-api-key"
+        draft_key = "test-unsaved-draft-key"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "providers:",
+                        "  test-provider:",
+                        '    api_base: "https://example.test/v1"',
+                        "    api_keys:",
+                        "      - name: default",
+                        f'        value: "{original_key}"',
+                        "model_list: []",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            core = CoreStore(domains=[ProvidersModelsDomain(path)])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+            client.call("snapshot")
+            session = client._session_token
+
+            writer = server.register_secret_capability(
+                "providers_models", "api_key", "test-provider", session_token=session
+            )
+            server.stage_secret_capability(
+                writer["secret_token"], draft_key, session_token=session
+            )
+            reader = server.register_secret_read_capability(
+                "providers_models", "api_key", "test-provider", session_token=session
+            )
+            self.assertEqual(
+                draft_key,
+                server.read_secret_capability(reader["secret_read_token"], session_token=session),
+            )
+            self.assertNotIn(original_key, json.dumps(core.snapshot()))
+            self.assertNotIn(draft_key, json.dumps(core.snapshot()))
+
 
 class CoreIPCTests(unittest.TestCase):
     def test_invalid_core_result_becomes_a_safe_failure_response(self) -> None:
@@ -849,6 +1156,42 @@ class CoreIPCTests(unittest.TestCase):
             second.call("snapshot")
         client.close()
         second.close()
+
+    def test_loopback_server_renews_a_valid_session_without_restarting_core(self) -> None:
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        endpoint = server.start()
+        self.addCleanup(server.stop)
+        client = CoreIPCClient(endpoint, server.bootstrap_token)
+        self.addCleanup(client.close)
+
+        self.assertEqual("system", client.call("snapshot")["snapshot"]["language"])
+        session = client._session_token
+        with server._lock:
+            server._sessions[session].expires_at = time.monotonic() + 0.01
+
+        # The native host's quiet event poll is authenticated activity. It
+        # must keep its Core session alive instead of later forcing a Core
+        # replacement while the LiteLLM proxy is serving remote streams.
+        status, _body, _headers = client._http(
+            "/v1/events?subscription_id=missing&timeout=0",
+            token=session,
+        )
+        self.assertEqual(200, status)
+        with server._lock:
+            self.assertGreater(server._sessions[session].expires_at, time.monotonic() + 60)
+
+        client.renew_session()
+
+        self.assertEqual(session, client._session_token)
+        self.assertTrue(server._valid_session(session))
+        self.assertEqual("system", client.call("snapshot")["snapshot"]["language"])
+        with server._lock:
+            server._sessions[session].expires_at = time.monotonic() - 1
+
+        request = {"protocol_version": 1, "request_id": "expired-session", "method": "snapshot", "params": {}}
+        status, _body, _headers = client._http("/v1", payload=encode_message(request), token=session)
+        self.assertEqual(401, status)
 
     def test_subscribe_receives_versioned_snapshot_event(self) -> None:
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])

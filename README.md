@@ -7,6 +7,9 @@ The desktop UI is delivered through the shared React Native workspace in
 i18n; `litellm_menu/core/` owns the single staged state source and versioned
 local IPC; AppKit and WinUI 3 provide only native leaves.
 
+See [Architecture / 架构](./docs/ARCHITECTURE.md) for directory ownership,
+dependency rules, and the staged cleanup plan.
+
 ---
 
 ## Features
@@ -18,7 +21,7 @@ LiteLLM Menu uses one shared React/TypeScript UI with an AppKit status item and 
 The native menu is grouped by task:
 
 - **App** — control launch at login; the owned LiteLLM service is kept running while the app is open.
-- **Configuration** — open **Providers & Models...**, **Codex Settings...**, or **Runtime Settings...**; import or export a configuration package; and inspect live billing.
+- **Configuration** — open **Providers & Models...**, **Codex / Claude Settings...**, or **Runtime Settings...**. Providers can import current Codex/Claude settings, a file, or a signed-in New API/Sub2API relay account; provider and runtime files are imported/exported in their owning screen.
 - **Diagnostics** — record or inspect route traces, inspect recovery state and recent requests, open service logs, and configure WebDAV sync.
 
 The status item remains a neutral `LL` at all times. During route recovery, its hover text and the clickable recovery row in the menu show the current step, classified cause, attempt, heartbeat age, and whether recovery is still progressing or may be stuck.
@@ -80,9 +83,9 @@ The bridge exposes focused search queries and source URLs to the model. Query pl
 
 ### Computer Facade
 
-The computer facade adapts hosted `computer-use` tool requests for routes that do not natively support the computer tool. Supported backends:
+The computer facade adapts hosted `computer-use` tool requests for routes that do not natively support the computer tool. `playwright` is the standalone local browser backend; `browser`, `chrome`, and `mcp` require a matching injected client bridge. Supported backends:
 
-- `auto` (default), `browser`, `chrome`, `playwright`, `mcp`, `cua`, `mock`
+- `auto` (default), `browser`, `chrome`, `playwright`, `mcp`, `mock`
 
 The facade intercepts computer action calls, routes them to the configured backend, and returns observations. Action denylists, max steps, trace logging, and screenshot tracing are configurable through environment variables and runtime settings.
 
@@ -154,7 +157,7 @@ Windows `0.85.0-preview.1`, and an exact official `react-native-macos`
 `0.85-merge` source commit. `build:macos` verifies that source checkout and its
 separate Hermes toolchain before invoking CocoaPods/Xcode.
 
-The output is a signed React Native app with its relocatable Core runtime. Building does not replace the installed application. Launch the explicit artifact after reviewing it:
+The output is a signed React Native app with its relocatable Core runtime. Use an isolated output for a preview and never overwrite or launch over a user-owned installation during routine verification. Launch an explicit artifact only after reviewing it:
 
 ```bash
 open "$PWD/../artifacts/LiteLLM Menu.app"
@@ -232,6 +235,7 @@ Adjustable through the menu without editing config files:
 |---|---|---|
 | Stall timeout | `LITELLM_MENU_STALL_TIMEOUT_SECONDS` | 120 |
 | Request timeout | `LITELLM_MENU_REQUEST_TIMEOUT_SECONDS` | 7200 |
+| Codex parent completion barrier | `LITELLM_MENU_CODEX_DESCENDANT_CLEANUP` | 1 (on) |
 | Deployment cooldown failures | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
 | Deployment cooldown seconds | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
 | Web search max results | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 8 |
@@ -244,9 +248,9 @@ Adjustable through the menu without editing config files:
 | Computer facade max steps | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
 | Route recovery interval | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
 
-### Configuration Packages
+### Configuration Files
 
-Use **Import / Export Config...** to choose the direction in one compact native panel. Export lets you select **Runtime Settings**, **Providers & Models**, or both. Packages are JSON files with restrictive `0600` permissions and can contain credentials. Import validates the selected package first: provider and route data becomes an editor draft, and runtime values are staged in the settings window. Nothing is written until the normal **Apply** or **Save** confirmation.
+Provider/model import and export live in **Providers & Models**; runtime import and export live in **Runtime Settings**. Each export is a single-domain JSON file with restrictive `0600` permissions and may contain credentials. Import validates the selected file and replaces only that screen's draft. Nothing is written until the normal **Apply** or **Save & Apply** confirmation.
 
 ---
 
@@ -268,28 +272,22 @@ Deep links only navigate to allowlisted local routes. They cannot carry configur
 
 ### Running Tests
 
-```bash
-./scripts/test.sh
-```
-
-For targeted tests:
-
-```bash
-./scripts/test.sh test_hooks_routing
-```
+Run focused TypeScript and Python behavior checks for the code you changed.
+Invoke the relevant unittest modules directly with the project's configured
+runtime; do not require a release build or packaging script for a scoped
+change.
 
 ### Building the App
 
-Install the pinned shared dependencies and run the contract/type checks:
+Install the pinned shared dependencies and run the focused type check:
 
 ```bash
 cd rn
 pnpm install --frozen-lockfile
-pnpm run build
-pnpm run build:macos
+pnpm exec tsc --noEmit
 ```
 
-Create the formal macOS release archive from the same RN path with `./scripts/package-release.sh`. It verifies the app signature and proves the bundled Core runtime still works after relocation before producing the archive. Windows builds use `pnpm run build:windows` on a Windows host.
+Build a macOS preview or release only when explicitly needed, with an isolated output path. Windows builds use `pnpm run build:windows` on a Windows host.
 
 ### Version Management
 
@@ -320,7 +318,7 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 原生菜单按任务分为三组：
 
 - **App** — 控制登录时自动启动；应用打开期间会保持其所辖 LiteLLM 服务运行。
-- **Configuration** — 打开 **Providers & Models...**、**Codex Settings...** 或 **Runtime Settings...**，导入或导出配置包，并查看实时计费信息。
+- **Configuration** — 打开 **Providers & Models...**、**Codex / Claude Settings...** 或 **Runtime Settings...**。供应商页可从当前 Codex/Claude 设置、文件或已登录的 New API/Sub2API 中转站账号导入；供应商和运行时文件分别在各自页面导入或导出。
 - **Diagnostics** — 记录或查看路由追踪，检查恢复状态与最近请求，打开服务或配置监听日志，以及配置 WebDAV 同步。
 
 状态项始终保持中性的 `LL`，不会用颜色或符号表达异常。发生路由恢复时，悬停文字和菜单中的可点击恢复状态行会显示当前步骤、分类原因、尝试次数、心跳时间，以及恢复仍在推进还是可能卡住。
@@ -382,9 +380,9 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 
 ### Computer Facade
 
-Computer facade 为不支持原生 computer 工具的路由适配托管的 `computer-use` 工具请求。支持的后端：
+Computer facade 为不支持原生 computer 工具的路由适配托管的 `computer-use` 工具请求。`playwright` 是独立的本地浏览器后端；`browser`、`chrome` 和 `mcp` 需要注入匹配的客户端桥接。支持的后端：
 
-- `auto`（默认）、`browser`、`chrome`、`playwright`、`mcp`、`cua`、`mock`
+- `auto`（默认）、`browser`、`chrome`、`playwright`、`mcp`、`mock`
 
 Facade 拦截 computer 动作调用，路由到已配置的后端，并返回观察结果。动作拒绝列表、最大步数、追踪日志和截图追踪可通过环境变量和运行时设置配置。
 
@@ -456,7 +454,7 @@ LITELLM_MENU_MACOS_OUTPUT="$PWD/../artifacts/LiteLLM Menu.app" pnpm run build:ma
 commit。`build:macos` 会在调用 CocoaPods/Xcode 前校验该源码及其独立 Hermes
 工具链。
 
-输出是带可迁移 Core runtime 的已签名 RN 应用；构建不会替换已安装应用。检查产物后可显式启动：
+输出是带可迁移 Core runtime 的已签名 RN 应用。预览必须使用隔离输出，日常验证不得覆盖或替换用户正在使用的安装；检查产物后才可显式启动：
 
 ```bash
 open "$PWD/../artifacts/LiteLLM Menu.app"
@@ -534,6 +532,7 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 |---|---|---|
 | 停滞超时 | `LITELLM_MENU_STALL_TIMEOUT_SECONDS` | 120 |
 | 请求超时 | `LITELLM_MENU_REQUEST_TIMEOUT_SECONDS` | 7200 |
+| Codex 父线程完成屏障 | `LITELLM_MENU_CODEX_DESCENDANT_CLEANUP` | 1（开启） |
 | 部署冷却失败次数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
 | 部署冷却秒数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
 | 网页搜索最大结果数 | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 8 |
@@ -546,9 +545,9 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 | 浏览器计费回退 | `LITELLM_BROWSER_BILLING` | 0（关闭） |
 | 路由恢复间隔 | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
 
-### 配置包
+### 配置文件
 
-菜单直接提供 **Import Configuration...** 与 **Export Configuration...**；导出时可选择 **Runtime Settings**、**Providers & Models** 或两者。配置包为 JSON 文件，权限为 `0600`，可能包含凭据。导入会先校验：provider 与路由只替换编辑器草稿，运行时值只暂存到设置窗口；只有在正常点击 **Apply** 或 **Save** 后才会写入配置。
+供应商/模型的导入与导出位于 **Providers & Models**，运行时的导入与导出位于 **Runtime Settings**。每次导出只生成对应分区的 JSON 文件，权限为 `0600`，其中可能包含凭据。导入会先校验且只替换当前页面的草稿；只有点击正常的 **Apply** 或 **Save & Apply** 后才会写入配置。
 
 ---
 
@@ -570,28 +569,20 @@ open "litellm-menu://open/logs?tab=service"
 
 ### 运行测试
 
-```bash
-./scripts/test.sh
-```
-
-指定测试：
-
-```bash
-./scripts/test.sh test_hooks_routing
-```
+针对改动运行聚焦的 TypeScript 与 Python 行为检查。用项目配置的运行时直接执行
+对应 unittest 模块；不要把发布构建或打包脚本作为小范围改动的必要条件。
 
 ### 构建应用
 
-安装锁定依赖并执行契约、类型和 macOS 宿主构建：
+安装锁定依赖并执行聚焦的类型检查：
 
 ```bash
 cd rn
 pnpm install --frozen-lockfile
-pnpm run build
-pnpm run build:macos
+pnpm exec tsc --noEmit
 ```
 
-正式 macOS 发布包使用同一 RN 路径执行 `./scripts/package-release.sh`。脚本验证签名，并在归档前迁移测试内置 Core runtime。Windows 在 Windows 主机运行 `pnpm run build:windows`。
+仅在明确需要预览或发布时构建 macOS，且必须使用隔离输出路径。Windows 在 Windows 主机运行 `pnpm run build:windows`。
 
 ### 版本管理
 

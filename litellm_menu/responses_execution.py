@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from . import computer_facade as _computer_facade_module
 from . import image_generation as _image_generation_module
+from . import responses_output as _responses_output_module
+from . import image_inputs as _image_inputs_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
@@ -95,13 +99,13 @@ def _chat_bridge_stream_payload(
         "stream_options": {"include_usage": True},
     }
 
-    max_completion_tokens = _image_generation_module._positive_int_value(
+    max_completion_tokens = _request_context_module._positive_int_value(
         bridge_kwargs.get("max_completion_tokens")
     )
     if max_completion_tokens is not None:
         payload["max_completion_tokens"] = max_completion_tokens
     else:
-        max_output_tokens = _image_generation_module._positive_int_value(
+        max_output_tokens = _request_context_module._positive_int_value(
             bridge_kwargs.get("max_output_tokens")
         )
         if max_output_tokens is not None:
@@ -270,7 +274,7 @@ async def _responses_chat_bridge_direct_stream_response(
         ),
     )
     chat_response = await acompletion(**payload)
-    if _image_generation_module._response_is_async_iterable(chat_response):
+    if _responses_output_module._response_is_async_iterable(chat_response):
         return _responses_chat_bridge_text_stream_from_chat_stream(
             chat_response,
             bridge_kwargs,
@@ -312,7 +316,7 @@ async def _execute_responses_chat_bridge_call(
     start_event: str,
     error_event: str,
 ) -> Any:
-    bridge_metadata = _image_generation_module._request_metadata_dict(
+    bridge_metadata = _request_context_module._request_metadata_dict(
         bridge_kwargs,
         "litellm_metadata",
     ) or {}
@@ -320,7 +324,7 @@ async def _execute_responses_chat_bridge_call(
         bridge_kwargs = _responses_web_search_bridge_module._external_web_search_low_reasoning_kwargs(
             bridge_kwargs
         )
-        bridge_metadata = _image_generation_module._request_metadata_dict(
+        bridge_metadata = _request_context_module._request_metadata_dict(
             bridge_kwargs,
             "litellm_metadata",
         ) or {}
@@ -371,7 +375,7 @@ async def _execute_responses_chat_bridge_call(
         return response
 
     async def execute_once(active_bridge_kwargs: dict) -> Any:
-        active_bridge_metadata = _image_generation_module._request_metadata_dict(
+        active_bridge_metadata = _request_context_module._request_metadata_dict(
             active_bridge_kwargs,
             "litellm_metadata",
         ) or {}
@@ -396,7 +400,7 @@ async def _execute_responses_chat_bridge_call(
             response = original_function(**upstream_kwargs)
             if inspect.isawaitable(response):
                 response = await response
-        response = _image_generation_module._sanitize_response_echoed_request_images_for_delivery(
+        response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
             response,
             active_bridge_kwargs,
         )
@@ -417,7 +421,7 @@ async def _execute_responses_chat_bridge_call(
             if not isinstance(response_payload, dict):
                 response_payload = _computer_facade_module._hosted_tool_unsupported_response(
                     active_bridge_kwargs,
-                    _image_generation_module._response_text(response),
+                    _responses_output_module._response_text(response),
                 )
             return _computer_facade_module._external_web_search_bridge_stream(response_payload)
         if (
@@ -440,7 +444,7 @@ async def _execute_responses_chat_bridge_call(
     try:
         return await execute_once(bridge_kwargs)
     except Exception as bridge_exc:
-        xhigh_retry_kwargs = _image_generation_module._xhigh_reasoning_compat_retry_kwargs(
+        xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(
             bridge_exc,
             bridge_kwargs,
         )
@@ -492,19 +496,19 @@ async def _postprocess_generic_bridge_response(
     request_kwargs: dict,
     original_function: Any,
 ) -> Any:
-    response = _image_generation_module._sanitize_response_echoed_request_images_for_delivery(
+    response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
         response,
         request_kwargs,
     )
     if not _tools_module._request_should_intercept_external_web_search(request_kwargs):
         return response
 
-    bridge_metadata = _image_generation_module._request_metadata_dict(
+    bridge_metadata = _request_context_module._request_metadata_dict(
         request_kwargs,
         "litellm_metadata",
     ) or {}
     if request_kwargs.get("stream") is True:
-        if _image_generation_module._response_is_async_iterable(response):
+        if _responses_output_module._response_is_async_iterable(response):
             return response
         if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
             return _computer_facade_module._resolve_litellm_web_search_function_calls_stream_rounds(
@@ -516,7 +520,7 @@ async def _postprocess_generic_bridge_response(
         if not isinstance(response_payload, dict):
             response_payload = _computer_facade_module._hosted_tool_unsupported_response(
                 request_kwargs,
-                _image_generation_module._response_text(response),
+                _responses_output_module._response_text(response),
             )
         return _computer_facade_module._external_web_search_bridge_stream(response_payload)
 
@@ -536,7 +540,7 @@ async def _execute_responses_context_truncation_fallback(
 ) -> Optional[tuple[Any, dict]]:
     """Replay the selected native Responses call once with truncation=auto."""
     retry_kwargs = (
-        _image_generation_module._responses_context_truncation_fallback_kwargs(
+        _responses_request_module._responses_context_truncation_fallback_kwargs(
             exception,
             request_kwargs,
         )
@@ -545,7 +549,7 @@ async def _execute_responses_context_truncation_fallback(
         return None
     try:
         response = original_function(**retry_kwargs)
-        response = await _image_generation_module._await_streaming_fallback_candidate_response(
+        response = await _responses_request_module._await_streaming_fallback_candidate_response(
             response,
             retry_kwargs,
             outer_request_kwargs,
@@ -650,9 +654,9 @@ def _with_responses_context_truncation_fallback_stream(
     """Hold pre-answer events so a context error can retry the same call."""
     if request_kwargs.get("stream") is not True:
         return response
-    if not _image_generation_module._response_is_async_iterable(response):
+    if not _responses_output_module._response_is_async_iterable(response):
         return response
-    if not _image_generation_module._request_can_attempt_responses_context_truncation_fallback(
+    if not _responses_request_module._request_can_attempt_responses_context_truncation_fallback(
         request_kwargs
     ):
         return response
@@ -677,7 +681,7 @@ def _with_responses_context_truncation_fallback_stream(
             if fallback is None:
                 raise exception
             fallback_response, _fallback_kwargs = fallback
-            if _image_generation_module._response_is_async_iterable(
+            if _responses_output_module._response_is_async_iterable(
                 fallback_response
             ):
                 fallback_visible_output = False
@@ -857,7 +861,7 @@ async def _execute_responses_external_web_search_bridge_call(
     bridge_kwargs = _responses_web_search_bridge_module._external_web_search_low_reasoning_kwargs(
         bridge_kwargs
     )
-    bridge_metadata = _image_generation_module._request_metadata_dict(
+    bridge_metadata = _request_context_module._request_metadata_dict(
         bridge_kwargs,
         "litellm_metadata",
     ) or {}
@@ -887,7 +891,7 @@ async def _execute_responses_external_web_search_bridge_call(
         response = original_function(
             **_tools_module._with_external_web_search_post_call_suppressed(active_bridge_kwargs)
         )
-        response = await _image_generation_module._await_streaming_fallback_candidate_response(
+        response = await _responses_request_module._await_streaming_fallback_candidate_response(
             response,
             active_bridge_kwargs,
             outer_request_kwargs,
@@ -904,7 +908,7 @@ async def _execute_responses_external_web_search_bridge_call(
     except Exception as exc:
         original_exc = exc
         active_retry_kwargs = bridge_kwargs
-        xhigh_retry_kwargs = _image_generation_module._xhigh_reasoning_compat_retry_kwargs(exc, bridge_kwargs)
+        xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(exc, bridge_kwargs)
         if xhigh_retry_kwargs is not None:
             try:
                 return await execute_once(xhigh_retry_kwargs)
@@ -983,7 +987,7 @@ async def _execute_responses_function_tool_bridge_call(
     original_request_kwargs: Optional[dict] = None,
     outer_request_kwargs: Optional[dict] = None,
 ) -> Any:
-    bridge_metadata = _image_generation_module._request_metadata_dict(
+    bridge_metadata = _request_context_module._request_metadata_dict(
         bridge_kwargs,
         "litellm_metadata",
     ) or {}
@@ -991,7 +995,7 @@ async def _execute_responses_function_tool_bridge_call(
         bridge_kwargs = _responses_web_search_bridge_module._external_web_search_low_reasoning_kwargs(
             bridge_kwargs
         )
-    bridge_metadata = _image_generation_module._request_metadata_dict(
+    bridge_metadata = _request_context_module._request_metadata_dict(
         bridge_kwargs,
         "litellm_metadata",
     ) or {}
@@ -1027,7 +1031,7 @@ async def _execute_responses_function_tool_bridge_call(
         response = original_function(
             **_tools_module._with_external_web_search_post_call_suppressed(active_bridge_kwargs)
         )
-        response = await _image_generation_module._await_streaming_fallback_candidate_response(
+        response = await _responses_request_module._await_streaming_fallback_candidate_response(
             response,
             active_bridge_kwargs,
             outer_request_kwargs,
@@ -1043,7 +1047,7 @@ async def _execute_responses_function_tool_bridge_call(
         return await execute_once(bridge_kwargs)
     except Exception as exc:
         original_exc = exc
-        xhigh_retry_kwargs = _image_generation_module._xhigh_reasoning_compat_retry_kwargs(exc, bridge_kwargs)
+        xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(exc, bridge_kwargs)
         if xhigh_retry_kwargs is not None:
             try:
                 return await execute_once(xhigh_retry_kwargs)
@@ -1108,12 +1112,11 @@ def _wrap_generic_function_for_deployment_failover(
 
     async def wrapped_generic_function(**kwargs: Any) -> Any:
         for update_request in (
-            _image_generation_module._with_codex_tool_runtime_recovery_hints,
-            _image_generation_module._with_empty_tool_controls_removed,
-            _image_generation_module._with_codex_compaction_controls,
-            _image_generation_module._with_codex_compaction_input_bounded,
-            _image_generation_module._with_responses_native_extra_body,
-            _image_generation_module._with_codex_compaction_headers,
+            _responses_request_module._with_codex_descendant_cleanup_instruction,
+            _responses_request_module._with_empty_tool_controls_removed,
+            _responses_request_module._with_codex_compaction_controls,
+            _responses_request_module._with_responses_native_extra_body,
+            _responses_request_module._with_codex_compaction_headers,
         ):
             updated_kwargs = update_request(kwargs)
             if updated_kwargs is not None:
@@ -1230,7 +1233,7 @@ def _wrap_generic_function_for_deployment_failover(
                 )
         try:
             response = original_function(**kwargs)
-            response = await _image_generation_module._await_streaming_fallback_candidate_response(
+            response = await _responses_request_module._await_streaming_fallback_candidate_response(
                 response,
                 kwargs,
                 outer_request_kwargs,
@@ -1312,15 +1315,15 @@ def _wrap_generic_function_for_deployment_failover(
                 outer_request_kwargs,
             )
             if facade_response is not None:
-                return _image_generation_module._sanitize_response_echoed_request_images_for_delivery(
+                return _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
                     facade_response,
                     kwargs,
                 )
-            xhigh_retry_kwargs = _image_generation_module._xhigh_reasoning_compat_retry_kwargs(exc, kwargs)
+            xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(exc, kwargs)
             if xhigh_retry_kwargs is not None:
                 try:
                     response = original_function(**xhigh_retry_kwargs)
-                    response = await _image_generation_module._await_streaming_fallback_candidate_response(
+                    response = await _responses_request_module._await_streaming_fallback_candidate_response(
                         response,
                         xhigh_retry_kwargs,
                         outer_request_kwargs,
@@ -1439,7 +1442,7 @@ def _request_model_group(request_kwargs: Optional[dict]) -> Optional[str]:
     if isinstance(model, str) and model.strip():
         return model
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if not metadata:
             continue
         model_group = metadata.get("model_group")
@@ -1450,7 +1453,7 @@ def _request_model_group(request_kwargs: Optional[dict]) -> Optional[str]:
 
 def _request_metadata_model_group(request_kwargs: Optional[dict]) -> Optional[str]:
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if not metadata:
             continue
         for model_key in (
@@ -1467,7 +1470,7 @@ def _request_metadata_model_group(request_kwargs: Optional[dict]) -> Optional[st
 def _request_selected_deployment_model_group(
     request_kwargs: Optional[dict],
 ) -> Optional[str]:
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     for model_key in ("model_group", "model_name"):
         model_group = model_info.get(model_key)
         if isinstance(model_group, str) and model_group.strip():
@@ -1515,7 +1518,7 @@ def _remember_request_model_group_before_deployment_update(
     )
     if not isinstance(model_group, str) or not model_group.strip():
         return
-    litellm_metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    litellm_metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     if litellm_metadata.get(_RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY):
         return
     updated_metadata = litellm_metadata.copy()
@@ -1524,7 +1527,7 @@ def _remember_request_model_group_before_deployment_update(
 
 
 def _external_web_search_router_model_group(request_kwargs: Optional[dict]) -> Optional[str]:
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     model = model_info.get("model")
     if isinstance(model, str) and model.strip():
         return model
@@ -1556,7 +1559,7 @@ def _external_web_search_router_model_group(request_kwargs: Optional[dict]) -> O
 
 
 def _request_selected_route_upstream_model(request_kwargs: Optional[dict]) -> Optional[str]:
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     model = model_info.get("model")
     if isinstance(model, str) and model.strip():
         return model.strip()
@@ -1662,12 +1665,12 @@ def _ordered_deployment_fallback_entry(
     failed_route_key = _failed_deployment_route_key(exception)
     failed_order = _failed_deployment_order(exception)
     if failed_order is None and _routing_module._is_no_deployments_available_error(exception):
-        failed_order = _image_generation_module._request_target_order(request_kwargs)
+        failed_order = _responses_request_module._request_target_order(request_kwargs)
     model_group = _request_model_group(request_kwargs)
     if failed_order is None or model_group is None:
         return None
 
-    excluded_ids = _image_generation_module._request_excluded_deployment_ids(request_kwargs)
+    excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_kwargs)
     no_deployments_available = _routing_module._is_no_deployments_available_error(
         exception
     )
@@ -1744,7 +1747,7 @@ def _ordered_deployment_fallback_entry(
         excluded_ids.add(failed_id)
 
     try:
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, "metadata") or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, "metadata") or {}
         team_id = metadata.get("user_api_key_team_id")
         all_deployments = _routing_module._router_configured_deployments(
             router,
@@ -1774,13 +1777,13 @@ def _ordered_deployment_fallback_entry(
     available_deployments = [
         deployment
         for deployment in cooldown_candidates
-        if _image_generation_module._deployment_id(deployment) not in excluded_ids
+        if _responses_request_module._deployment_id(deployment) not in excluded_ids
     ]
     peer_deployments = (
         [
             deployment
             for deployment in available_deployments
-            if _image_generation_module._deployment_order(deployment) == failed_order
+            if _responses_request_module._deployment_order(deployment) == failed_order
         ]
         if failed_id is not None
         else []
@@ -1789,7 +1792,7 @@ def _ordered_deployment_fallback_entry(
         peer_deployment_ids = [
             deployment_id
             for deployment_id in (
-                _image_generation_module._deployment_id(deployment)
+                _responses_request_module._deployment_id(deployment)
                 for deployment in peer_deployments
             )
             if deployment_id
@@ -1816,7 +1819,7 @@ def _ordered_deployment_fallback_entry(
     available_orders = sorted(
         {
             order
-            for order in (_image_generation_module._deployment_order(deployment) for deployment in available_deployments)
+            for order in (_responses_request_module._deployment_order(deployment) for deployment in available_deployments)
             if order is not None
         }
     )
@@ -1850,12 +1853,12 @@ def _ordered_deployment_fallback_entry(
     next_deployments = [
         deployment
         for deployment in available_deployments
-        if _image_generation_module._deployment_order(deployment) == next_order
+        if _responses_request_module._deployment_order(deployment) == next_order
     ]
     next_deployment_ids = [
         deployment_id
         for deployment_id in (
-            _image_generation_module._deployment_id(deployment)
+            _responses_request_module._deployment_id(deployment)
             for deployment in next_deployments
         )
         if deployment_id

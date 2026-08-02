@@ -245,7 +245,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "export NODE_BINARY=node\n${PROJECT_DIR}/../../../vendor/react-native-macos-0.85/packages/react-native/scripts/react-native-xcode.sh\n";
+			shellScript = "export NODE_BINARY=node\n# Metro cache entries are content-addressed; keep them between local Release builds.\nexport CLI_PATH=\"${PROJECT_DIR}/../../../scripts/bundle-macos.mjs\"\n${PROJECT_DIR}/../../../vendor/react-native-macos-0.85/packages/react-native/scripts/react-native-xcode.sh\n";
 		};
 		39B798D8437C38BCD7A25E3F /* [CP] Copy Pods Resources */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -367,6 +367,7 @@
 					"-ObjC",
 					"-lc++",
 				);
+				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = menu.litellm.menu;
 				PRODUCT_NAME = LiteLLMMenu;
 				SDKROOT = macosx;

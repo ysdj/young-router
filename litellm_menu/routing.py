@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from . import image_generation as _image_generation_module
+from . import responses_output as _responses_output_module
+from . import image_inputs as _image_inputs_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import api_base as _api_base_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
@@ -344,7 +347,7 @@ def _request_metadata_positive_float(
     if not isinstance(request_data, dict):
         return None
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_data,
             metadata_key,
         )
@@ -365,7 +368,7 @@ def _stream_start_timeout_seconds_for_request(request_data: Optional[dict]) -> f
         return override
     stream_start_timeout = _stream_start_timeout_seconds()
     request_timeout = _request_timeout_seconds()
-    if _image_generation_module._request_has_structured_codex_compaction(
+    if _responses_request_module._request_has_structured_codex_compaction(
         request_data
     ):
         compaction_timeout = _codex_compaction_stream_start_timeout_seconds()
@@ -575,7 +578,7 @@ def _prune_external_web_search_started_requests(now: Optional[float] = None) -> 
 
 def _mark_external_web_search_started_for_request(request_kwargs: Optional[dict]) -> None:
     if isinstance(request_kwargs, dict):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
         if metadata.get(_WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY) is not True:
             updated_metadata = metadata.copy()
             updated_metadata[_WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY] = True
@@ -592,7 +595,7 @@ def _mark_external_web_search_started_for_request(request_kwargs: Optional[dict]
 def _request_has_started_external_web_search(request_kwargs: Optional[dict]) -> bool:
     if isinstance(request_kwargs, dict):
         for metadata_key in ("litellm_metadata", "metadata"):
-            metadata = _image_generation_module._request_metadata_dict(request_kwargs, metadata_key) or {}
+            metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key) or {}
             if metadata.get(_WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY) is True:
                 return True
     key = _external_web_search_started_request_key(request_kwargs)
@@ -608,7 +611,7 @@ def _should_block_external_web_search_original_recovery(request_kwargs: Optional
     if not _request_has_started_external_web_search(request_kwargs):
         return False
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, metadata_key) or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key) or {}
         search_results = metadata.get("external_web_search_search_results")
         has_search_results = isinstance(search_results, str) and bool(search_results.strip())
         has_completed_actions = bool(metadata.get("external_web_search_completed_actions"))
@@ -634,7 +637,7 @@ def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
     configured_max_seconds = (
         override if override is not None else _recovery_max_seconds()
     )
-    if _image_generation_module._request_has_structured_codex_compaction(
+    if _responses_request_module._request_has_structured_codex_compaction(
         request_data
     ):
         return configured_max_seconds
@@ -653,7 +656,7 @@ def _is_route_recovery_poll_payload(request_kwargs: Optional[dict]) -> bool:
     if not isinstance(request_kwargs, dict):
         return False
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_kwargs,
             metadata_key,
         )
@@ -907,7 +910,7 @@ def _usage_summary(response_obj: Any, request_kwargs: dict[str, Any]) -> dict[st
 
 def _response_type_summary(response_obj: Any) -> List[str]:
     seen: List[str] = []
-    for item_type in _image_generation_module._response_types(response_obj):
+    for item_type in _responses_output_module._response_types(response_obj):
         if item_type not in seen:
             seen.append(item_type)
         if len(seen) >= 12:
@@ -988,8 +991,8 @@ def _request_log_record(
     request_kwargs = request_kwargs or {}
     litellm_params = _as_dict(request_kwargs.get("litellm_params"))
     standard = _as_dict(request_kwargs.get("standard_logging_object"))
-    model_info = _image_generation_module._request_model_info(request_kwargs)
-    api_base = _image_generation_module._request_api_base(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    api_base = _responses_request_module._request_api_base(request_kwargs)
     response_cost = _safe_float(
         _first_not_none(request_kwargs.get("response_cost"), standard.get("response_cost"))
     )
@@ -1031,13 +1034,12 @@ def _request_log_record(
         "call_type": _state_module._safe_log_text(request_kwargs.get("call_type"), limit=80),
         "model_group": _state_module._safe_log_text(_responses_execution_module._request_model_group(request_kwargs), limit=160),
         "deployment_id": _state_module._safe_log_text(_deployment_id_from_request(request_kwargs), limit=180),
-        "deployment_token": _state_module._safe_log_text(_deployment_id_from_request(request_kwargs), limit=180),
         "route_key": route_key,
         "deployment_order": _deployment_order_from_request(request_kwargs),
         "provider": _state_module._safe_log_text(provider, limit=120),
         "api_key_name": api_key_name,
         "upstream_model": _state_module._safe_log_text(upstream_model, limit=180),
-        "api_base_host": _state_module._safe_log_text(_image_generation_module._api_base_host(api_base), limit=180),
+        "api_base_host": _state_module._safe_log_text(_responses_request_module._api_base_host(api_base), limit=180),
         "request_id": _state_module._safe_log_text(_trace_request_id(request_kwargs), limit=180),
         "session": _trace_session_context(request_kwargs),
         "tool_types": tools_summary["types"],
@@ -1049,7 +1051,7 @@ def _request_log_record(
         "tool_choice": _state_module._safe_log_text(request_kwargs.get("tool_choice"), limit=120),
         "has_web_search_tool": tools_summary["has_web_search_tool"],
         "has_image_generation_tool": tools_summary["has_image_generation_tool"],
-        "has_image_input": _image_generation_module._request_has_image_input(request_kwargs),
+        "has_image_input": _image_inputs_module._request_has_image_input(request_kwargs),
         "cache_hit": request_kwargs.get("cache_hit"),
         "response_cost": response_cost,
         "usage": _usage_summary(response_obj, request_kwargs),
@@ -1098,7 +1100,7 @@ def _deployment_route_key(
         f"provider={str(provider or 'unknown-provider').strip() or 'unknown-provider'}",
         f"upstream={str(model or 'unknown-model').strip() or 'unknown-model'}",
     ])
-    host = _image_generation_module._api_base_host(str(api_base or "").strip())
+    host = _responses_request_module._api_base_host(str(api_base or "").strip())
     if host:
         parts.append(f"host={host}")
     key_name = str(api_key_name or "").strip()
@@ -1135,7 +1137,7 @@ def _deployment_route_key_from_deployment(deployment: Any) -> Optional[str]:
         model=litellm_params.get("model") or model_info.get("model"),
         api_base=api_base,
         api_key_name=model_info.get("api_key_name"),
-        order=_image_generation_module._deployment_order(deployment),
+        order=_responses_request_module._deployment_order(deployment),
     )
 
 
@@ -1188,7 +1190,7 @@ def _deployment_cooldown_keys_for_request(
     )
     surface = _deployment_cooldown_surface(request_kwargs)
     if not surface:
-        model_info = _image_generation_module._request_model_info(request_kwargs)
+        model_info = _request_context_module._request_model_info(request_kwargs)
         raw_surfaces = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
         surfaces = []
         if isinstance(raw_surfaces, list):
@@ -1212,7 +1214,7 @@ def _deployment_cooldown_key_from_request(request_kwargs: Optional[dict]) -> Opt
 
 def _deployment_cooldown_key_from_deployment(deployment: Any) -> Optional[str]:
     return _deployment_cooldown_key(
-        deployment_id=_image_generation_module._deployment_id(deployment),
+        deployment_id=_responses_request_module._deployment_id(deployment),
         route_key=_deployment_route_key_from_deployment(deployment),
     )
 
@@ -1227,7 +1229,7 @@ def _deployment_cooldown_keys_from_request(request_kwargs: Optional[dict]) -> li
 
 def _deployment_cooldown_keys_from_deployment(deployment: Any) -> list[str]:
     return _deployment_cooldown_keys(
-        deployment_id=_image_generation_module._deployment_id(deployment),
+        deployment_id=_responses_request_module._deployment_id(deployment),
         route_key=_deployment_route_key_from_deployment(deployment),
     )
 
@@ -1237,7 +1239,7 @@ def _deployment_cooldown_keys_from_deployment_for_request(
     request_kwargs: Optional[dict],
 ) -> list[str]:
     return _deployment_cooldown_keys_for_request(
-        deployment_id=_image_generation_module._deployment_id(deployment),
+        deployment_id=_responses_request_module._deployment_id(deployment),
         route_key=_deployment_route_key_from_deployment(deployment),
         request_kwargs=request_kwargs,
     )
@@ -1320,7 +1322,7 @@ def _request_current_upstream_surface(request_kwargs: Optional[dict]) -> str:
     if surface:
         return surface
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_kwargs, metadata_key
         )
         if not isinstance(metadata, dict):
@@ -1338,7 +1340,7 @@ def _request_attempted_upstream_surfaces(request_kwargs: Optional[dict]) -> list
         return []
     raw_values: Any = request_kwargs.get(_ATTEMPTED_UPSTREAM_URL_SURFACES_KEY)
     if raw_values is None:
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_kwargs, "litellm_metadata"
         ) or {}
         raw_values = metadata.get(_ATTEMPTED_UPSTREAM_URL_SURFACES_KEY)
@@ -1357,7 +1359,7 @@ def _request_surface_deployment_id(request_kwargs: Optional[dict]) -> Optional[s
         return None
     value = request_kwargs.get(_UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY)
     if not isinstance(value, str) or not value.strip():
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_kwargs, "litellm_metadata"
         ) or {}
         value = metadata.get(_UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY)
@@ -1376,7 +1378,7 @@ def _set_request_surface_state(
     if not surface:
         return
     request_kwargs[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
-    metadata = _image_generation_module._request_metadata_dict(
+    metadata = _request_context_module._request_metadata_dict(
         request_kwargs, "litellm_metadata"
     ) or {}
     updated_metadata = metadata.copy()
@@ -1406,7 +1408,7 @@ def _clear_request_surface_target(request_kwargs: Optional[dict]) -> None:
     if not isinstance(request_kwargs, dict):
         return
     request_kwargs.pop(_SURFACE_TARGET_DEPLOYMENT_ID_KEY, None)
-    metadata = _image_generation_module._request_metadata_dict(
+    metadata = _request_context_module._request_metadata_dict(
         request_kwargs, "litellm_metadata"
     )
     if isinstance(metadata, dict) and _SURFACE_TARGET_DEPLOYMENT_ID_KEY in metadata:
@@ -1422,7 +1424,7 @@ def _request_surface_target_deployment_id(
         return None
     value = request_kwargs.get(_SURFACE_TARGET_DEPLOYMENT_ID_KEY)
     if not isinstance(value, str) or not value.strip():
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_kwargs, "litellm_metadata"
         ) or {}
         value = metadata.get(_SURFACE_TARGET_DEPLOYMENT_ID_KEY)
@@ -1520,7 +1522,7 @@ def _request_surface_for_deployment(
     request_kwargs: Optional[dict],
     deployment: Any,
 ) -> str:
-    deployment_id = _image_generation_module._deployment_id(deployment)
+    deployment_id = _responses_request_module._deployment_id(deployment)
     state_deployment_id = _request_surface_deployment_id(request_kwargs)
     target_deployment_id = _request_surface_target_deployment_id(request_kwargs)
     requested = _request_current_upstream_surface(request_kwargs)
@@ -1606,7 +1608,7 @@ def _next_upstream_surface_for_failed_deployment(
         (
             candidate
             for candidate in deployments
-            if _image_generation_module._deployment_id(candidate) == failed_id
+            if _responses_request_module._deployment_id(candidate) == failed_id
         ),
         None,
     )
@@ -1680,9 +1682,9 @@ def _request_should_prefer_responses_surface(request_kwargs: Optional[dict]) -> 
         return False
     if request_kwargs.get("use_chat_completions_api") is True:
         return False
-    if not _image_generation_module._request_is_responses_api(request_kwargs):
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
         return False
-    if _image_generation_module._request_has_codex_client_evidence(request_kwargs):
+    if _responses_request_module._request_has_codex_client_evidence(request_kwargs):
         return True
     return _request_has_responses_structured_tools(request_kwargs)
 
@@ -1811,7 +1813,7 @@ def _apply_selected_deployment_marker_to_request(
             merged_litellm_params.update(selected_litellm_params)
             request_kwargs["litellm_params"] = merged_litellm_params
 
-    litellm_metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    litellm_metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     updated_metadata = litellm_metadata.copy()
     updated_metadata["model_info"] = selected_model_info
     api_base = selected_litellm_params.get("api_base")
@@ -2257,7 +2259,7 @@ def _should_retry_with_browser_compatible_headers(
 ) -> bool:
     return (
         _is_cloudflare_browser_signature_block_error(exception)
-        and not _image_generation_module._request_forces_browser_compatible_headers(request_kwargs)
+        and not _responses_request_module._request_forces_browser_compatible_headers(request_kwargs)
     )
 
 
@@ -2503,12 +2505,12 @@ def _is_context_size_error(exception: Exception) -> bool:
 
 
 def _deployment_id_from_request(request_kwargs: Optional[dict]) -> Optional[str]:
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     deployment_id = model_info.get("id")
     if isinstance(deployment_id, str) and deployment_id.strip():
         return deployment_id
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, metadata_key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key)
         if not metadata:
             continue
         nested_model_info = metadata.get("model_info")
@@ -2521,9 +2523,9 @@ def _deployment_id_from_request(request_kwargs: Optional[dict]) -> Optional[str]
 
 def _deployment_route_key_from_request(request_kwargs: Optional[dict]) -> Optional[str]:
     request_kwargs = request_kwargs or {}
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     route_key = model_info.get("route_key")
-    api_base = _image_generation_module._request_api_base(request_kwargs)
+    api_base = _responses_request_module._request_api_base(request_kwargs)
     if not api_base and isinstance(route_key, str) and route_key.strip():
         return route_key
     litellm_params = _as_dict(request_kwargs.get("litellm_params"))
@@ -2603,7 +2605,7 @@ def _deployment_order_from_request(request_kwargs: Optional[dict]) -> Optional[_
         if order is not None:
             return order
         saw_invalid_order = True
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     has_deployment_context = has_deployment_context or any(
         model_info.get(key) is not None
         for key in ("id", "provider", "api_key_name", "model", "api_base")
@@ -2620,7 +2622,7 @@ def _deployment_order_from_request(request_kwargs: Optional[dict]) -> Optional[_
     if target_order is not None:
         return target_order
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, metadata_key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key)
         if not metadata:
             continue
         nested_model_info = metadata.get("model_info")
@@ -2658,7 +2660,7 @@ def _request_allows_failed_deployment_order(request_kwargs: Optional[dict]) -> b
         return True
     if isinstance(model_info, dict) and _order_from_route_key(model_info.get("route_key")) is not None:
         return True
-    request_model_info = _image_generation_module._request_model_info(request_kwargs)
+    request_model_info = _request_context_module._request_model_info(request_kwargs)
     if isinstance(request_model_info, dict) and "order" in request_model_info:
         return True
     if isinstance(request_model_info, dict) and _order_from_route_key(request_model_info.get("route_key")) is not None:
@@ -2721,7 +2723,7 @@ def _mark_exception_for_deployment_failover(
             request_kwargs, exception, deployment_id=deployment_id
         )
     elif deployment_surface and should_sync_exclusions and isinstance(request_kwargs, dict):
-        existing_exclusions = _image_generation_module._request_excluded_deployment_ids(
+        existing_exclusions = _responses_request_module._request_excluded_deployment_ids(
             request_kwargs
         )
         if existing_exclusions:
@@ -2740,7 +2742,6 @@ def _mark_exception_for_deployment_failover(
         session=_trace_session_context(request_kwargs),
         model_group=_responses_execution_module._request_model_group(request_kwargs),
         deployment_id=deployment_id,
-        deployment_token=deployment_id,
         route_key=route_key,
         deployment_order=deployment_order,
         request=_trace_module._trace_request_summary(request_kwargs),
@@ -2776,9 +2777,9 @@ def _sync_failed_deployment_exclusions(
     excluded_ids = set(_CURRENT_EXCLUDED_DEPLOYMENT_IDS.get() or ())
     excluded_ids.update(_exception_excluded_deployment_ids(exception))
     if isinstance(request_kwargs, dict):
-        excluded_ids.update(_image_generation_module._request_excluded_deployment_ids(request_kwargs))
+        excluded_ids.update(_responses_request_module._request_excluded_deployment_ids(request_kwargs))
     failed_id = deployment_id or _responses_execution_module._failed_deployment_id(exception)
-    request_model_info = _image_generation_module._request_model_info(request_kwargs)
+    request_model_info = _request_context_module._request_model_info(request_kwargs)
     supported_surfaces = []
     raw_supported_surfaces = request_model_info.get(
         _SUPPORTED_UPSTREAM_URL_SURFACES_KEY
@@ -3250,8 +3251,8 @@ def _is_constrained_no_deployments_error(
     if not isinstance(request_kwargs, dict):
         return False
     return (
-        _image_generation_module._request_target_order(request_kwargs) is not None
-        and bool(_image_generation_module._request_excluded_deployment_ids(request_kwargs))
+        _responses_request_module._request_target_order(request_kwargs) is not None
+        and bool(_responses_request_module._request_excluded_deployment_ids(request_kwargs))
     )
 
 
@@ -3261,7 +3262,7 @@ def _mark_no_deployments_for_order_exhaustion(
 ) -> None:
     if not _is_no_deployments_available_error(exception):
         return
-    target_order = _image_generation_module._request_target_order(request_kwargs)
+    target_order = _responses_request_module._request_target_order(request_kwargs)
     if target_order is None:
         return
     if _responses_execution_module._failed_deployment_order(exception) is None:
@@ -3563,8 +3564,8 @@ def _is_responses_endpoint_not_found_error(
     outer_request_kwargs: Optional[dict],
 ) -> bool:
     if not (
-        _image_generation_module._request_is_responses_api(request_kwargs)
-        or _image_generation_module._request_is_responses_api(outer_request_kwargs)
+        _responses_request_module._request_is_responses_api(request_kwargs)
+        or _responses_request_module._request_is_responses_api(outer_request_kwargs)
     ):
         return False
     if _exception_status_code(exception) != 404:

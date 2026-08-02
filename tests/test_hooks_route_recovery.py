@@ -6,6 +6,56 @@ from hook_test_utils import *
 
 
 class HookRouteRecoveryTests(HookTestCase):
+    def test_top_level_responses_error_preserves_invalid_request_and_stops_polling(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        terminal = {
+            "type": "error",
+            "code": "invalid_request_error",
+            "message": "Invalid compaction input item id.",
+        }
+
+        exc = hooks._responses_incomplete_stream_exception(
+            "stream ended before response.completed",
+            buffer=[
+                {"type": "response.created", "response": {"id": "resp-invalid"}},
+                terminal,
+            ],
+            request_data={"model": "default-chat", "stream": True},
+        )
+
+        self.assertEqual(exc.status_code, 400)
+        self.assertEqual(
+            exc.body["terminal_event"]["error_code"],
+            "invalid_request_error",
+        )
+        self.assertIn("Invalid compaction input item id", str(exc))
+        self.assertFalse(hooks._is_route_recovery_poll_error(exc))
+
+    def test_thinking_signature_invalid_stops_route_recovery(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        terminal = {
+            "type": "error",
+            "code": "thinking_signature_invalid",
+            "message": "Encrypted function output content could not be decrypted or decoded.",
+        }
+
+        exc = hooks._responses_incomplete_stream_exception(
+            "stream ended before response.completed",
+            buffer=[
+                {"type": "response.created", "response": {"id": "resp-invalid"}},
+                terminal,
+            ],
+            request_data={"model": "default-chat", "stream": True},
+        )
+
+        self.assertEqual(exc.status_code, 400)
+        self.assertEqual(
+            exc.body["terminal_event"]["error_code"],
+            "thinking_signature_invalid",
+        )
+        self.assertIn("could not be decrypted or decoded", str(exc))
+        self.assertFalse(hooks._is_route_recovery_poll_error(exc))
+
     def test_recovery_state_records_diagnostic_and_keepalive_only_touches_local_state(self) -> None:
         hooks, _proxy_server = load_hook_module()
         streaming_module = sys.modules["litellm_menu.streaming"]

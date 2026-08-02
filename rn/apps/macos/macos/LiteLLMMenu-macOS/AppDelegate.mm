@@ -11,11 +11,30 @@
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
 {
   self.moduleName = @"LiteLLMMenu";
-  self.initialProps = @{};
+  self.initialProps = @{ @"isPrimaryHost": @YES, @"isWindowManagerHost": @YES };
+  [CoreIPCBridge.shared warm];
 #if __has_include(<ReactAppDependencyProvider/RCTAppDependencyProvider.h>)
   self.dependencyProvider = [RCTAppDependencyProvider new];
 #endif
   [super applicationDidFinishLaunching:notification];
+  RCTRootViewFactory *rootViewFactory = self.rootViewFactory;
+  [AppKitNativeLeaf.shared setRouteWindowFactory:^NSWindow *(NSString *route) {
+    NSDictionary *props = @{
+      @"isPrimaryHost": @NO,
+      @"initialRoute": route,
+    };
+    NSView *rootView = (NSView *)[rootViewFactory viewWithModuleName:@"LiteLLMMenu" initialProperties:props];
+    rootView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSViewController *controller = [NSViewController new];
+    controller.view = rootView;
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1052, 600)
+                                                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
+    window.contentViewController = controller;
+    [window center];
+    return window;
+  }];
   [AppKitNativeLeaf.shared hideHostWindowAtLaunch:self.window];
   [AppKitNativeLeaf.shared setShortcuts:@{@"openMenu": @"Cmd+,", @"closeWindow": @"Esc", @"reload": @"Cmd+R"}];
 }
@@ -36,7 +55,7 @@
       continue;
     }
     NSString *route = [[url path] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
-    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"configuration-package", @"webdav-settings", @"logs"]];
+    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"relay-accounts", @"webdav-settings", @"logs"]];
     if (![routes containsObject:route]) {
       continue;
     }

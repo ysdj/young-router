@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from . import external_web_search as _external_web_search_module
-from . import image_generation as _image_generation_module
+from . import responses_output as _responses_output_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_tools as _responses_tools_module
 from . import routing as _routing_module
@@ -711,6 +713,8 @@ class _ProviderHiddenWebSearchStreamAdapter:
         self._next_output_index = 0
         self._sequence_number = 0
         self._completed_item_ids: set[str] = set()
+        self._started_message_ids: set[str] = set()
+        self._started_content_parts: set[tuple[str, int]] = set()
 
     @property
     def active(self) -> bool:
@@ -731,6 +735,27 @@ class _ProviderHiddenWebSearchStreamAdapter:
     def _next_sequence_number(self) -> int:
         self._sequence_number += 1
         return self._sequence_number
+
+    def _forward_event(
+        self,
+        chunk: Any,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        changed = payload is not None
+        if payload is None:
+            payload = _streaming_module._stream_chunk_dump(chunk)
+        if not isinstance(payload, dict) or not payload:
+            return chunk
+        sequence_number = payload.get("sequence_number")
+        if isinstance(sequence_number, int) and sequence_number < self._sequence_number:
+            payload = copy.deepcopy(payload)
+            payload["sequence_number"] = self._next_sequence_number()
+            changed = True
+        if not changed:
+            return chunk
+        if isinstance(chunk, _JSONStreamEvent):
+            return _streaming_module._json_stream_event(payload)
+        return payload
 
     def _item_events(self, item_id: str, output_index: int) -> list[Any]:
         item = self._search_items[item_id]
@@ -819,6 +844,87 @@ class _ProviderHiddenWebSearchStreamAdapter:
             self._completed_item_ids.add(item_id)
         return events
 
+    def _message_start_events(
+        self,
+        chunk: dict[str, Any],
+        *,
+        include_content_part: bool = True,
+    ) -> list[Any]:
+        if not self.active:
+            return []
+        item_id = chunk.get("item_id")
+        output_index = chunk.get("output_index")
+        content_index = chunk.get("content_index")
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or not isinstance(output_index, int)
+            or output_index < 0
+        ):
+            return []
+        if not isinstance(content_index, int) or content_index < 0:
+            content_index = 0
+        self._next_output_index = max(self._next_output_index, output_index + 1)
+        events: list[Any] = []
+        if item_id not in self._started_message_ids:
+            self._started_message_ids.add(item_id)
+            events.append(
+                self._encode(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "id": item_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }
+                )
+            )
+        content_part_key = (item_id, content_index)
+        if (
+            include_content_part
+            and content_part_key not in self._started_content_parts
+        ):
+            self._started_content_parts.add(content_part_key)
+            events.append(
+                self._encode(
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                        },
+                    }
+                )
+            )
+        return events
+
+    def _remember_message_start(self, chunk: dict[str, Any]) -> None:
+        item = chunk.get("item")
+        if _response_item_get(item, "type") != "message":
+            return
+        item_id = _response_item_get(item, "id")
+        if isinstance(item_id, str) and item_id:
+            self._started_message_ids.add(item_id)
+
+    def _remember_content_part_start(self, chunk: dict[str, Any]) -> None:
+        item_id = chunk.get("item_id")
+        content_index = chunk.get("content_index")
+        if (
+            isinstance(item_id, str)
+            and item_id
+            and isinstance(content_index, int)
+            and content_index >= 0
+        ):
+            self._started_content_parts.add((item_id, content_index))
+
     def _completion_response(self, response: Any) -> Any:
         payload = _streaming_module._jsonable(response)
         if not isinstance(payload, dict):
@@ -855,6 +961,23 @@ class _ProviderHiddenWebSearchStreamAdapter:
             # Reasoning deltas/items are provider-private; only the stable item
             # id on an output-item event can identify a search call.
             return events
+        if chunk_type == "response.output_item.added":
+            self._remember_message_start(dumped)
+        if chunk_type == "response.content_part.added":
+            events.extend(
+                self._message_start_events(
+                    dumped,
+                    include_content_part=False,
+                )
+            )
+            self._remember_content_part_start(dumped)
+        if chunk_type in {
+            "response.output_text.delta",
+            "response.output_text.annotation.added",
+            "response.output_text.done",
+            "response.content_part.done",
+        }:
+            events.extend(self._message_start_events(dumped))
         if chunk_type == "response.output_text.annotation.added" and self.active:
             events.extend(self._completed_events())
         if chunk_type == "response.completed":
@@ -874,9 +997,9 @@ class _ProviderHiddenWebSearchStreamAdapter:
             events.extend(self._completed_events())
             clean = copy.deepcopy(dumped)
             clean["response"] = self._completion_response(dumped.get("response"))
-            events.append(_streaming_module._json_stream_event(clean))
+            events.append(self._forward_event(chunk, clean))
             return events
-        events.append(chunk)
+        events.append(self._forward_event(chunk))
         return events
 
     def finalize(self) -> list[Any]:
@@ -2053,7 +2176,7 @@ def _external_web_search_final_answer_without_tool_call(response: Any) -> bool:
         return False
     if _external_web_search_has_completed_assistant_message(response):
         return True
-    text = _image_generation_module._response_text(response)
+    text = _responses_output_module._response_text(response)
     return bool(text.strip()) and not _external_web_search_progress_preamble_reason(text)
 
 
@@ -2077,7 +2200,7 @@ def _external_web_search_completed_assistant_message_items(response: Any) -> lis
         status = item.get("status")
         if isinstance(status, str) and status not in {"completed", ""}:
             continue
-        if _image_generation_module._response_text(item).strip():
+        if _responses_output_module._response_text(item).strip():
             messages.append(item)
     return messages
 
@@ -2436,7 +2559,7 @@ def _external_web_search_synthesis_invalid_reason(response: Any) -> Optional[str
         return "web_search_function_call"
     if _external_web_search_has_completed_assistant_message(response):
         return None
-    text = _image_generation_module._response_text(response)
+    text = _responses_output_module._response_text(response)
     if not text.strip():
         return "empty_synthesis"
     progress_reason = _external_web_search_progress_preamble_reason(text)
@@ -2458,7 +2581,7 @@ def _external_web_search_initial_no_action_invalid_reason(response: Any) -> Opti
         return None
     if _external_web_search_has_completed_assistant_message(response):
         return None
-    text = _image_generation_module._response_text(response)
+    text = _responses_output_module._response_text(response)
     if not text.strip():
         return None
     progress_reason = _external_web_search_progress_preamble_reason(text)
@@ -2490,7 +2613,7 @@ def _external_web_search_raise_if_invalid_initial_no_action_response(
         deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
         route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
         invalid_reason=reason,
-        response_preview=_trace_module._sanitize_trace_text(_image_generation_module._response_text(response)),
+        response_preview=_trace_module._sanitize_trace_text(_responses_output_module._response_text(response)),
     )
     exception = _external_web_search_invalid_synthesis_exception(
         request_kwargs,
@@ -2668,7 +2791,7 @@ def _external_web_search_metadata_original_user_text(
     if not isinstance(request_kwargs, dict):
         return ""
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_kwargs,
             metadata_key,
         ) or {}
@@ -2927,7 +3050,7 @@ def _external_web_search_message_response(
 
 
 def _external_web_search_chat_only_route(request_kwargs: Optional[dict]) -> bool:
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     surface = _routing_module._request_current_upstream_surface(request_kwargs)
     if not surface:
         supported_surfaces = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
@@ -3127,11 +3250,11 @@ def _external_web_search_chat_tool_payload(
     if isinstance(call_kwargs.get("parallel_tool_calls"), bool):
         payload["parallel_tool_calls"] = call_kwargs["parallel_tool_calls"]
 
-    max_completion_tokens = _image_generation_module._positive_int_value(
+    max_completion_tokens = _request_context_module._positive_int_value(
         call_kwargs.get("max_completion_tokens")
     )
     if max_completion_tokens is None:
-        max_completion_tokens = _image_generation_module._positive_int_value(
+        max_completion_tokens = _request_context_module._positive_int_value(
             call_kwargs.get("max_output_tokens")
         )
     if max_completion_tokens is not None:
@@ -3162,7 +3285,7 @@ def _external_web_search_chat_tool_payload(
             payload[key] = copy.deepcopy(value)
 
     if "litellm_metadata" not in payload:
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_kwargs,
             "litellm_metadata",
         )
@@ -3185,11 +3308,11 @@ def _external_web_search_chat_synthesis_payload(
     payload["messages"] = _external_web_search_chat_synthesis_messages(call_kwargs)
     payload["stream"] = False
 
-    max_completion_tokens = _image_generation_module._positive_int_value(
+    max_completion_tokens = _request_context_module._positive_int_value(
         call_kwargs.get("max_completion_tokens")
     )
     if max_completion_tokens is None:
-        max_completion_tokens = _image_generation_module._positive_int_value(
+        max_completion_tokens = _request_context_module._positive_int_value(
             call_kwargs.get("max_output_tokens")
         )
     if max_completion_tokens is not None:
@@ -3214,7 +3337,7 @@ def _external_web_search_chat_synthesis_payload(
             payload[key] = copy.deepcopy(value)
 
     if "litellm_metadata" not in payload:
-        metadata = _image_generation_module._request_metadata_dict(
+        metadata = _request_context_module._request_metadata_dict(
             request_kwargs,
             "litellm_metadata",
         )
@@ -3404,7 +3527,7 @@ async def _external_web_search_chat_tool_response(
 def _external_web_search_completed_actions_metadata(
     request_kwargs: Optional[dict],
 ) -> list[dict[str, str]]:
-    metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     value = metadata.get("external_web_search_completed_actions")
     if not isinstance(value, list):
         return []
@@ -3430,20 +3553,20 @@ def _external_web_search_completed_actions_metadata(
 def _external_web_search_search_results_metadata(
     request_kwargs: Optional[dict],
 ) -> str:
-    metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     value = metadata.get("external_web_search_search_results")
     return value if isinstance(value, str) else ""
 
 
 def _external_web_search_metadata(request_kwargs: Optional[dict]) -> dict[str, Any]:
-    return _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    return _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
 
 
 def _mark_external_web_search_started(request_kwargs: Optional[dict]) -> None:
     _routing_module._mark_external_web_search_started_for_request(request_kwargs)
     if not isinstance(request_kwargs, dict):
         return
-    metadata = _image_generation_module._request_metadata_dict(
+    metadata = _request_context_module._request_metadata_dict(
         request_kwargs,
         "litellm_metadata",
     ) or {}
@@ -3594,7 +3717,7 @@ async def _external_web_search_synthesize_or_fallback(
             queries=queries,
             source_url_count=len(source_urls),
             invalid_reason=reason,
-            response_preview=_trace_module._sanitize_trace_text(_image_generation_module._response_text(synthesized)),
+            response_preview=_trace_module._sanitize_trace_text(_responses_output_module._response_text(synthesized)),
         )
         if reason is None:
             return synthesized
@@ -3654,7 +3777,7 @@ def _external_web_search_continuation_kwargs(
         continuation_kwargs["tool_choice"] = "required"
         continuation_kwargs["max_output_tokens"] = min(
             _EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS,
-            _image_generation_module._positive_int_value(
+            _request_context_module._positive_int_value(
                 continuation_kwargs.get("max_output_tokens")
             )
             or _EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS,
@@ -3664,7 +3787,7 @@ def _external_web_search_continuation_kwargs(
             continuation_kwargs
         )
         if (
-            _image_generation_module._positive_int_value(
+            _request_context_module._positive_int_value(
                 continuation_kwargs.get("max_output_tokens")
             )
             is None
@@ -3673,7 +3796,7 @@ def _external_web_search_continuation_kwargs(
                 _EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS
             )
 
-    metadata = _image_generation_module._request_metadata_dict(continuation_kwargs, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(continuation_kwargs, "litellm_metadata") or {}
     continuation_metadata = metadata.copy()
     original_request = _external_web_search_user_prompt_text(request_kwargs)
     if original_request:
@@ -3805,7 +3928,7 @@ def _external_web_search_set_pending_recovery_request(
     if not isinstance(request_kwargs, dict):
         return
     metadata = (
-        _image_generation_module._request_metadata_dict(
+        _request_context_module._request_metadata_dict(
             request_kwargs,
             "litellm_metadata",
         )
@@ -4068,7 +4191,7 @@ async def _external_web_search_continue_or_synthesize(
                 round=round_number,
                 source_url_count=len(source_urls),
                 response_preview=_trace_module._sanitize_trace_text(
-                    _image_generation_module._response_text(continued)
+                    _responses_output_module._response_text(continued)
                 ),
             )
             retry_kwargs = _external_web_search_prepare_continuation_recovery_request(
@@ -4151,7 +4274,7 @@ async def _external_web_search_continue_or_synthesize(
             route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
             round=round_number,
             queries=queries,
-            response_preview=_trace_module._sanitize_trace_text(_image_generation_module._response_text(continued)),
+            response_preview=_trace_module._sanitize_trace_text(_responses_output_module._response_text(continued)),
             next_queries=_litellm_web_search_queries_for_request(continued, request_kwargs),
             next_actions=_litellm_web_search_actions_for_request(continued, request_kwargs),
         )
@@ -4220,7 +4343,7 @@ async def _external_web_search_finalize_response(
         route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
         queries=queries,
         invalid_reason=reason,
-        response_preview=_trace_module._sanitize_trace_text(_image_generation_module._response_text(response)),
+        response_preview=_trace_module._sanitize_trace_text(_responses_output_module._response_text(response)),
     )
     return await _external_web_search_synthesize_or_fallback(
         request_kwargs=request_kwargs,
@@ -4487,7 +4610,7 @@ def _external_web_search_synthesis_kwargs(
     ):
         synthesis_kwargs.pop(key, None)
 
-    metadata = _image_generation_module._request_metadata_dict(synthesis_kwargs, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(synthesis_kwargs, "litellm_metadata") or {}
     synthesis_metadata = metadata.copy()
     original_request = _external_web_search_user_prompt_text(request_kwargs)
     if original_request:
@@ -4531,7 +4654,7 @@ def _external_web_search_synthesis_kwargs(
     )
     synthesis_kwargs["input"] = synthesis_input
     synthesis_kwargs.pop("messages", None)
-    requested_output_tokens = _image_generation_module._positive_int_value(
+    requested_output_tokens = _request_context_module._positive_int_value(
         synthesis_kwargs.get("max_output_tokens")
     )
     synthesis_kwargs["max_output_tokens"] = max(
@@ -4603,7 +4726,7 @@ def _external_web_search_original_model_group(
     if not isinstance(request_kwargs, dict):
         return None
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, metadata_key) or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key) or {}
         for model_key in (
             _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
             "original_model_group",
@@ -4692,7 +4815,7 @@ def _external_web_search_model_response_invalid_reason(
             and _external_web_search_has_completed_assistant_message(response)
         ):
             return None
-        text = _image_generation_module._response_text(response)
+        text = _responses_output_module._response_text(response)
         if text.strip():
             progress_reason = _external_web_search_progress_preamble_reason(text)
             if progress_reason is not None:
@@ -4740,7 +4863,7 @@ def _external_web_search_origin_was_streaming(request_kwargs: Optional[dict]) ->
     request_kwargs = request_kwargs or {}
     if request_kwargs.get("stream") is True:
         return True
-    metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     return metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY) is True
 
 

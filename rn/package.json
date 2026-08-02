@@ -15,6 +15,7 @@
     "typecheck": "tsc --noEmit",
     "contract-check": "node scripts/check-contract.mjs",
     "test": "node scripts/check-contract.test.mjs",
+    "check:macos": "pnpm run test && pnpm run contract-check && pnpm run typecheck",
     "build": "pnpm run test && pnpm run contract-check && pnpm run typecheck && pnpm run codegen:windows:check",
     "build:macos": "./scripts/build-macos.sh",
     "build:windows": "pwsh ./scripts/build-windows.ps1"

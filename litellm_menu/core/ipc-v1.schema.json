@@ -6,6 +6,7 @@
   "protocol_version": 1,
   "methods": [
     "snapshot",
+    "logs",
     "editor",
     "dispatch",
     "subscribe",
@@ -18,6 +19,7 @@
   ],
   "x-method-contracts": {
     "snapshot": {"params": {"$ref": "#/$defs/emptyParams"}, "result": {"$ref": "#/$defs/snapshotResult"}},
+    "logs": {"params": {"$ref": "#/$defs/logsParams"}, "result": {"$ref": "#/$defs/logsResult"}},
     "editor": {"params": {"$ref": "#/$defs/editorParams"}, "result": {"$ref": "#/$defs/editorResult"}},
     "dispatch": {"params": {"$ref": "#/$defs/dispatchParams"}, "result": {"$ref": "#/$defs/revisionResult"}},
     "subscribe": {"params": {"$ref": "#/$defs/subscribeParams"}, "result": {"$ref": "#/$defs/subscribeResult"}},
@@ -35,11 +37,12 @@
     "properties": {
       "protocol_version": {"const": 1},
       "request_id": {"type": "string", "minLength": 1, "maxLength": 256},
-      "method": {"enum": ["snapshot", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import"]},
+      "method": {"enum": ["snapshot", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import"]},
       "params": {"type": "object"}
     },
     "allOf": [
       {"if": {"properties": {"method": {"const": "snapshot"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/emptyParams"}}}},
+      {"if": {"properties": {"method": {"const": "logs"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/logsParams"}}}},
       {"if": {"properties": {"method": {"const": "editor"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/editorParams"}}}},
       {"if": {"properties": {"method": {"const": "dispatch"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/dispatchParams"}}}},
       {"if": {"properties": {"method": {"const": "subscribe"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/subscribeParams"}}}},
@@ -84,9 +87,11 @@
     }
   },
   "$defs": {
-    "domain": {"enum": ["providers_models", "codex", "claude", "runtime", "webdav", "logs", "language"], "x-typescript-type": "ConfigDomain"},
+    "domain": {"enum": ["providers_models", "codex", "claude", "runtime", "webdav", "logs", "language", "relay_accounts"], "x-typescript-type": "ConfigDomain"},
+    "logTab": {"enum": ["requests", "service", "menu", "route-trace", "recovery", "online-usage"], "x-typescript-type": "LogTab"},
     "revision": {"type": "integer", "minimum": 0},
     "emptyParams": {"type": "object", "additionalProperties": false, "maxProperties": 0, "x-typescript-type": "Record<string, never>"},
+    "logsParams": {"type": "object", "additionalProperties": false, "required": ["tab"], "properties": {"tab": {"$ref": "#/$defs/logTab"}, "revision": {"$ref": "#/$defs/revision"}}},
     "editorParams": {"type": "object", "additionalProperties": false, "required": ["domain", "document"], "properties": {"domain": {"enum": ["codex", "claude"]}, "document": {"enum": ["config", "auth", "settings"]}}},
     "dispatchAction": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "minLength": 1}, "domain": {"$ref": "#/$defs/domain"}, "payload": {"type": "object", "x-typescript-type": "Record<string, unknown>"}}, "additionalProperties": false, "x-typescript-type": "DispatchAction"},
     "dispatchParams": {"type": "object", "additionalProperties": false, "required": ["action"], "properties": {"action": {"$ref": "#/$defs/dispatchAction"}, "revision": {"$ref": "#/$defs/revision"}}},
@@ -101,12 +106,14 @@
     "validationSummary": {"type": "object", "x-typescript-type": "ValidationSummary"},
     "importPreview": {"type": "object", "x-typescript-type": "Partial<Record<ConfigDomain, { available: boolean; will_replace_draft: boolean }>>"},
     "snapshotResult": {"type": "object", "additionalProperties": false, "required": ["snapshot"], "properties": {"snapshot": {"$ref": "#/$defs/coreSnapshot"}}},
+    "logView": {"type": "object", "additionalProperties": false, "required": ["tab", "available", "paused", "line_count", "records", "filter", "limit"], "properties": {"tab": {"$ref": "#/$defs/logTab"}, "available": {"type": "boolean"}, "paused": {"type": "boolean"}, "line_count": {"type": "integer", "minimum": 0}, "records": {"type": "array", "maxItems": 100000, "items": {"type": ["object", "string"]}}, "filter": {"type": "string", "maxLength": 256}, "limit": {"type": "integer", "minimum": 1}}, "x-typescript-type": "LogView"},
+    "logsResult": {"type": "object", "additionalProperties": false, "required": ["changed", "revision", "log"], "properties": {"changed": {"type": "boolean"}, "revision": {"$ref": "#/$defs/revision"}, "log": {"oneOf": [{"$ref": "#/$defs/logView"}, {"type": "null"}]}}},
     "editorResult": {"type": "object", "additionalProperties": false, "required": ["domain", "document", "editor_token", "revision"], "properties": {"domain": {"enum": ["codex", "claude"]}, "document": {"enum": ["config", "auth", "settings"]}, "editor_token": {"type": "string"}, "revision": {"$ref": "#/$defs/revision"}}},
     "revisionResult": {"type": "object", "additionalProperties": false, "required": ["revision"], "properties": {"revision": {"$ref": "#/$defs/revision"}}},
     "subscribeResult": {"type": "object", "additionalProperties": false, "required": ["subscription_id"], "properties": {"subscription_id": {"type": "string"}}},
     "validateResult": {"type": "object", "additionalProperties": false, "required": ["validate"], "properties": {"validate": {"$ref": "#/$defs/validationSummary"}}},
     "applyResult": {"type": "object", "additionalProperties": false, "required": ["revision", "applied"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "applied": {"const": true}, "domains": {"type": "array", "items": {"$ref": "#/$defs/domain"}}}},
-    "probeResult": {"type": "object", "required": ["ok", "protocols"], "properties": {"ok": {"type": "boolean"}, "protocols": {"type": "array", "items": {"type": "string"}}, "detail": {"type": "string"}}},
+    "probeResult": {"type": "object", "required": ["ok", "protocols"], "properties": {"ok": {"type": "boolean"}, "protocols": {"type": "array", "items": {"type": "string"}}, "detail": {"type": "string"}, "available": {"type": "boolean"}, "provider_id": {"type": "string"}, "model_id": {"type": "string"}, "recommended_surface": {"enum": ["openai/responses", "openai/chat", "anthropic", null]}, "surfaces": {"type": "array", "items": {"type": "object", "required": ["surface", "available"], "properties": {"surface": {"type": "string"}, "available": {"type": "boolean"}, "status": {"type": "string"}}}}}},
     "exportResult": {"type": "object", "additionalProperties": false, "required": ["revision", "section_count"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "section_count": {"type": "integer", "minimum": 0}, "sections": {"type": "array", "items": {"$ref": "#/$defs/domain"}}}},
     "importResult": {"type": "object", "additionalProperties": false, "required": ["revision", "draft_domains", "preview"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "draft_domains": {"type": "array", "items": {"$ref": "#/$defs/domain"}}, "preview": {"$ref": "#/$defs/importPreview"}}}
   }

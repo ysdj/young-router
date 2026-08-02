@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -97,6 +98,7 @@ class RuntimePaths:
     autostart: Path
     webdav_enabled: Path
     webdav_status: Path
+    webdav_sync_state: Path
     recovery: Path
     cooldowns: Path
 
@@ -115,6 +117,7 @@ class RuntimePaths:
             autostart=Path(os.environ.get("LITELLM_AUTOSTART_STATE_FILE", runtime / "autostart.enabled")).expanduser(),
             webdav_enabled=Path(os.environ.get("LITELLM_WEBDAV_SYNC_ENABLED_FILE", runtime / "webdav-sync.enabled")).expanduser(),
             webdav_status=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATUS_FILE", runtime / "webdav-sync-status.json")).expanduser(),
+            webdav_sync_state=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATE", runtime / "webdav-sync-state.json")).expanduser(),
             recovery=Path(os.environ.get("LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE", runtime / "route-recovery-state.json")).expanduser(),
             cooldowns=Path(os.environ.get("LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE", runtime / "deployment-cooldowns.json")).expanduser(),
         )
@@ -168,10 +171,22 @@ class CoreServiceController:
             finally:
                 kernel32.CloseHandle(handle)
         try:
-            os.kill(pid, 0)
-        except OSError:
+            environment = os.environ.copy()
+            environment["LC_ALL"] = "C"
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=1.0,
+                check=False,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError):
             return False
-        return True
+        state = result.stdout.strip()
+        return result.returncode == 0 and bool(state) and not state.startswith("Z")
 
     @staticmethod
     def _windows_process_identity(pid: int) -> str | None:
@@ -355,6 +370,11 @@ class CoreServiceController:
         env["LITELLM_RUNTIME_CONFIG"] = str(self.paths.runtime_config)
         env["LITELLM_MENU_RUNTIME_SETTINGS_FILE"] = str(self.paths.settings)
         env["LITELLM_NATIVE_PID_FILE"] = str(self.paths.pid)
+        # Keep request summaries beside the managed configuration for both
+        # Finder-launched and terminal-launched Core processes.  The native
+        # preview path sets this explicitly too; production must not rely on
+        # an inherited shell environment.
+        env["LITELLM_RECENT_REQUESTS_LOG"] = str(self.paths.root / "recent-requests.jsonl")
         # LiteLLM resolves dotted callbacks relative to the staged config
         # before falling back to imports.  ``sitecustomize`` owns that safe,
         # allowlisted fallback for ``litellm_menu.*``; make it available to
@@ -369,6 +389,8 @@ class CoreServiceController:
         env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(python_path))
         env["LITELLM_TEMPLATE_ROOT"] = str(core_root)
         env["LITELLM_MENU_PROXY_PROCESS"] = "1"
+        env["LITELLM_MENU_TIMESTAMP_OUTPUT"] = "1"
+        env["LITELLM_MENU_SERVICE_LOG"] = str(self.paths.root / "menu-server.log")
         return env
 
     def _configured_port(self, env: Mapping[str, str] | None = None) -> int:
@@ -399,9 +421,10 @@ class CoreServiceController:
             return None
         return pid
 
-    def _health(self) -> bool:
+    def _health(self, port: int | None = None) -> bool:
+        target_port = self._configured_port() if port is None else port
         request = urllib.request.Request(
-            f"http://127.0.0.1:{self._configured_port()}/health/liveliness",
+            f"http://127.0.0.1:{target_port}/health/liveliness",
             headers={"Accept": "application/json", "User-Agent": "LiteLLM-Menu-Core/1"},
             method="GET",
         )
@@ -444,7 +467,8 @@ class CoreServiceController:
 
     def status(self) -> dict[str, Any]:
         pid = self._pid()
-        healthy = self._health()
+        port = self._configured_port()
+        healthy = self._health(port)
         if healthy and pid is not None:
             state = "running"
         elif pid is not None:
@@ -464,6 +488,8 @@ class CoreServiceController:
         result: dict[str, Any] = {"state": state, "auto_start_state": self.autostart_status()}
         if pid is not None:
             result["pid"] = pid
+        if state == "running":
+            result["port"] = port
         result["route_recovery"] = self._recovery_summary()
         result["webdav"] = self._webdav_summary()
         return result
@@ -530,19 +556,24 @@ class CoreServiceController:
             "--telemetry",
             "False",
         ]
-        if os.name != "nt":
+        # Gunicorn's forked worker path loses the bundled callback runtime on
+        # macOS; Uvicorn's supervisor retains the configured concurrency.
+        if os.name != "nt" and sys.platform != "darwin":
             command.append("--run_gunicorn")
+        server_log = self.paths.root / "menu-server.log"
+        server_log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=self.paths.root,
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=os.name != "nt",
-                close_fds=True,
-            )
+            with server_log.open("a", encoding="utf-8") as server_log_handle:
+                process = subprocess.Popen(
+                    command,
+                    cwd=self.paths.root,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=server_log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=os.name != "nt",
+                    close_fds=True,
+                )
             self._write_owner_record(process, owner_token)
             atomic_write_text(self.paths.pid, f"{process.pid}\n")
         except (OSError, PersistenceError) as exc:
@@ -640,19 +671,56 @@ class CoreServiceController:
             cooldowns = read_json(self.paths.cooldowns, default={}).get("cooldowns", {})
         except PersistenceError:
             recoveries, cooldowns = {}, {}
-        recovery_count = len(recoveries) if isinstance(recoveries, Mapping) else 0
-        cooldown_count = len(cooldowns) if isinstance(cooldowns, Mapping) else 0
+        now = time.time()
+        recovery_count = 0
+        if isinstance(recoveries, Mapping):
+            for value in recoveries.values():
+                if not isinstance(value, Mapping):
+                    continue
+                heartbeat = value.get("heartbeat_at") or value.get("updated_at")
+                try:
+                    parsed_heartbeat = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+                    if parsed_heartbeat.tzinfo is None:
+                        parsed_heartbeat = parsed_heartbeat.replace(tzinfo=timezone.utc)
+                    heartbeat_at = parsed_heartbeat.timestamp()
+                except (TypeError, ValueError):
+                    continue
+                if now - heartbeat_at <= 45:
+                    recovery_count += 1
+        cooldown_count = 0
+        if isinstance(cooldowns, Mapping):
+            for value in cooldowns.values():
+                if not isinstance(value, Mapping):
+                    continue
+                try:
+                    cooldown_until = float(value.get("cooldown_until") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if cooldown_until > now:
+                    cooldown_count += 1
         return {"summary": f"{recovery_count} recovering / {cooldown_count} cooldown", "recovering": recovery_count, "cooldown": cooldown_count}
 
     def _webdav_summary(self) -> dict[str, Any]:
         try:
-            raw = read_json(self.paths.webdav_status, default={})
+            status = read_json(self.paths.webdav_status, default={})
         except PersistenceError:
-            raw = {}
+            status = {}
+        try:
+            baseline = read_json(self.paths.webdav_sync_state, default={})
+        except PersistenceError:
+            baseline = {}
+        checked_at = status.get("checked_at") if isinstance(status.get("checked_at"), str) else None
+        action = status.get("action") if isinstance(status.get("action"), str) else None
+        ok = status.get("ok") if isinstance(status.get("ok"), bool) else None
+        if checked_at is None:
+            checked_at = baseline.get("updated_at") if isinstance(baseline.get("updated_at"), str) else None
+            action = baseline.get("action") if isinstance(baseline.get("action"), str) else action
+            ok = True if checked_at is not None else ok
         return {
             "enabled": self.paths.webdav_enabled.is_file(),
-            "ok": raw.get("ok") if isinstance(raw.get("ok"), bool) else None,
-            "action": _bounded_text(raw.get("action", ""), limit=80),
+            "ok": ok,
+            "checked_at": _bounded_text(checked_at, limit=40) if checked_at else None,
+            "action": _bounded_text(action, limit=80) if action else None,
         }
 
 

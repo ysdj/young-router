@@ -15,6 +15,14 @@ cleanup() {
 trap cleanup EXIT
 cd "$ROOT"
 
+copy_tree() {
+  local source="$1"
+  local destination="$2"
+  mkdir -p "$destination"
+  # On APFS, -c uses clonefile and falls back to a regular copy across volumes.
+  cp -ac "$source/." "$destination/"
+}
+
 if [[ -z "$DEVELOPER_DIR" && -x /Applications/Xcode-beta.app/Contents/Developer/usr/bin/xcodebuild ]]; then
   DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
 fi
@@ -47,8 +55,6 @@ export RCT_HERMES_V1_ENABLED=1
 node scripts/bootstrap-rnmacos-085.mjs
 node scripts/verify-rnmacos-085.mjs --check-build-env
 
-pnpm run build
-
 if [[ ! -d "$APP_ROOT/macos" ]]; then
   echo "React Native macOS host project is missing at rn/apps/macos/macos." >&2
   exit 2
@@ -58,7 +64,7 @@ command -v pod >/dev/null 2>&1 || {
   echo "CocoaPods is required to build the React Native macOS host." >&2
   exit 3
 }
-for tool in rsync codesign; do
+for tool in rsync codesign strip file; do
   command -v "$tool" >/dev/null 2>&1 || {
     echo "Missing required macOS bundle tool: $tool" >&2
     exit 3
@@ -82,8 +88,24 @@ fi
   echo "Missing required macOS bundle tool: /usr/libexec/PlistBuddy" >&2
   exit 3
 }
-
-pod install --project-directory="$APP_ROOT/macos"
+# These checks only read the shared/macOS JS/TS workspace while CocoaPods
+# prepares the native workspace. Windows codegen remains checked by its build
+# and the cross-platform CI job.
+pnpm run check:macos &
+STATIC_CHECKS_PID=$!
+if [[ "${LITELLM_MENU_REFRESH_PODS:-0}" == "1" \
+  || -n "${CI:-}" \
+  || ! -d "$APP_ROOT/macos/Pods" \
+  || ! -d "$APP_ROOT/macos/LiteLLMMenu.xcworkspace" \
+  || ! -f "$APP_ROOT/macos/Podfile.lock" ]]; then
+  if ! pod install --project-directory="$APP_ROOT/macos"; then
+    wait "$STATIC_CHECKS_PID" || true
+    exit 1
+  fi
+else
+  printf '%s\n' "Reusing CocoaPods workspace (set LITELLM_MENU_REFRESH_PODS=1 after native dependency or codegen changes)."
+fi
+wait "$STATIC_CHECKS_PID"
 RNMACOS_CLI="$ROOT/vendor/react-native-macos-0.85/packages/react-native/cli.js"
 (
   cd "$APP_ROOT"
@@ -133,7 +155,7 @@ if [[ -n "$RUNTIME_SOURCE" ]]; then
     echo "LITELLM_MENU_CORE_RUNTIME_SOURCE must use the portable release-runtime layout, not a virtualenv." >&2
     exit 5
   fi
-  rsync -a --delete "$RUNTIME_SOURCE/" "$CORE/runtime/"
+  copy_tree "$RUNTIME_SOURCE" "$CORE/runtime"
 else
   case "$ARCH" in
     arm64) UV_RUNTIME="cpython-3.12-macos-aarch64-none" ;;
@@ -216,11 +238,63 @@ fi
   echo "The bundled Core runtime does not contain the pinned LiteLLM release lock." >&2
   exit 5
 }
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core, codex_config, config_editor_core, configuration_package, external_provider_import, provider_billing, webdav.core'
+
+# Native wheels carry large local symbol tables that are not needed at runtime.
+# Strip only bundled site-package extensions; the outer app is signed again
+# below after this transformation.
+while IFS= read -r -d '' binary; do
+  case "$(file -b "$binary")" in
+    Mach-O*)
+      strip -x -S "$binary" >/dev/null 2>&1
+      # strip rewrites the Mach-O pages and invalidates the wheel's embedded
+      # signature.  Sign the rewritten extension itself; signing only the
+      # outer app does not make macOS accept these pages when a worker imports
+      # the module later.
+      codesign --force --sign - "$binary" >/dev/null
+      ;;
+  esac
+done < <(find "$CORE/runtime/site-packages" -type f \( -name '*.so' -o -name '*.dylib' \) -print0)
+
+# A full-tree compileall pass adds roughly 100 MB of caches, most of which
+# this app never imports. Remove stale caches before the real startup smoke
+# imports populate only the modules on the active path.
+find "$CORE/litellm_menu" "$CORE/runtime/site-packages" \
+  \( -type d -name __pycache__ -prune -exec rm -rf {} + \) \
+  -o \( -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete \)
+
+# Import the exact proxy startup path as a packaging smoke test. This also
+# verifies the callback fallback in the same environment used by the child.
+# The package already carries LiteLLM's fallback cost map, so this must not
+# wait on a remote catalog refresh during a local build.
+export LITELLM_LOCAL_MODEL_COST_MAP=true
+PYTHONDONTWRITEBYTECODE=0 \
+PYTHONPATH="$CORE:$CORE/runtime/site-packages" \
+LITELLM_MENU_PROXY_PROCESS=1 \
+LITELLM_TEMPLATE_ROOT="$CORE" \
+  "$CORE/runtime/python/bin/python3.12" -c '
+from litellm import run_server
+from litellm.proxy.proxy_server import app
+from litellm.proxy.types_utils.utils import get_instance_fn
+from gunicorn.app.base import BaseApplication
+from uvicorn.workers import UvicornWorker
+
+callback = get_instance_fn(
+    "litellm_menu.callbacks.image_generation_routing_hook",
+    config_file_path="runtime/config.yaml",
+)
+assert app is not None
+assert callback.__class__.__name__ == "LiteLLMMenuHook"
+assert run_server is not None and BaseApplication is not None and UvicornWorker is not None
+'
+[[ -f "$CORE/runtime/site-packages/litellm/__pycache__/__init__.cpython-312.pyc" ]] || {
+  echo "The bundled Core startup bytecode could not be generated." >&2
+  exit 5
+}
+
+PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core, litellm_menu.core.__main__, codex_config, config_editor_core, configuration_package, external_provider_import, provider_billing, webdav.core'
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null
 PORTABLE_SMOKE="$RUNTIME_WORK/portable-core"
-mkdir -p "$PORTABLE_SMOKE"
-rsync -a "$CORE/" "$PORTABLE_SMOKE/"
+copy_tree "$CORE" "$PORTABLE_SMOKE"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PORTABLE_SMOKE" "$PORTABLE_SMOKE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core'
 PYTHONDONTWRITEBYTECODE=1 LITELLM_MENU_PROXY_PROCESS=1 PYTHONPATH="$PORTABLE_SMOKE" \
   "$PORTABLE_SMOKE/runtime/bin/python" -c \
@@ -232,6 +306,41 @@ BUILD_NUMBER="$(tr -d '[:space:]' < "$PROJECT_ROOT/BUILD_NUMBER")"
   || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist" >/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_NUMBER" "$APP/Contents/Info.plist" >/dev/null
+if [[ -n "${LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER:-}" ]]; then
+  PREVIEW_BUNDLE_IDENTIFIER="$LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER"
+  PREVIEW_DISPLAY_NAME="${LITELLM_MENU_MACOS_DISPLAY_NAME:-LiteLLM Menu Preview}"
+  PREVIEW_ROUTE_SCHEME="${LITELLM_MENU_MACOS_ROUTE_SCHEME:-litellm-menu-preview}"
+  PREVIEW_PROFILE_ROOT="${LITELLM_MENU_MACOS_PREVIEW_PROFILE_ROOT:-}"
+  PREVIEW_PORT="${LITELLM_MENU_MACOS_PREVIEW_PORT:-}"
+  [[ "$PREVIEW_BUNDLE_IDENTIFIER" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] \
+    && [[ "$PREVIEW_DISPLAY_NAME" != *$'\n'* ]] \
+    && [[ "$PREVIEW_ROUTE_SCHEME" =~ ^[A-Za-z][A-Za-z0-9.-]*$ ]] || {
+      echo "Invalid macOS preview bundle metadata." >&2
+      exit 6
+    }
+  if [[ -n "$PREVIEW_PROFILE_ROOT" ]]; then
+    [[ "$PREVIEW_BUNDLE_IDENTIFIER" != "menu.litellm.menu" ]] \
+      && [[ "$PREVIEW_PROFILE_ROOT" = /* ]] \
+      && [[ "$PREVIEW_PROFILE_ROOT" != *$'\n'* ]] \
+      && [[ "$PREVIEW_PORT" =~ ^[0-9]+$ ]] \
+      && (( PREVIEW_PORT >= 1 && PREVIEW_PORT <= 65535 )) || {
+        echo "A preview profile root requires a distinct bundle identifier, absolute path, and valid port." >&2
+        exit 6
+      }
+  fi
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $PREVIEW_BUNDLE_IDENTIFIER" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $PREVIEW_DISPLAY_NAME" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleName $PREVIEW_DISPLAY_NAME" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :LiteLLMMenuRouteScheme $PREVIEW_ROUTE_SCHEME" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName $PREVIEW_BUNDLE_IDENTIFIER.routes" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 $PREVIEW_ROUTE_SCHEME" "$APP/Contents/Info.plist"
+  if [[ -n "$PREVIEW_PROFILE_ROOT" ]]; then
+    /usr/libexec/PlistBuddy -c "Delete :LiteLLMMenuPreviewProfileRoot" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c "Add :LiteLLMMenuPreviewProfileRoot string $PREVIEW_PROFILE_ROOT" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Delete :LiteLLMMenuPreviewPort" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c "Add :LiteLLMMenuPreviewPort string $PREVIEW_PORT" "$APP/Contents/Info.plist"
+  fi
+fi
 codesign --force --deep --sign - "$APP" >/dev/null
 codesign --verify --deep --strict --verbose=2 "$APP"
 
@@ -252,7 +361,7 @@ if [[ -n "${LITELLM_MENU_MACOS_OUTPUT:-}" ]]; then
   esac
   STAGED_OUTPUT="$(dirname "$OUTPUT")/.LiteLLMMenu.$$.app"
   rm -rf "$STAGED_OUTPUT"
-  rsync -a "$APP/" "$STAGED_OUTPUT/"
+  copy_tree "$APP" "$STAGED_OUTPUT"
   rm -rf "$OUTPUT"
   mv "$STAGED_OUTPUT" "$OUTPUT"
   APP="$OUTPUT"

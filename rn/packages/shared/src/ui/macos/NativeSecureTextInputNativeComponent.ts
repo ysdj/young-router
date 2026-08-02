@@ -8,8 +8,9 @@ import type {
 
 /**
  * This leaf intentionally has no text prop or text-change event.  The
- * NSSecureTextField owns the password, exchanges a one-time Core capability,
- * and reports only presence/revision/status back to React.
+ * The native field owns the value, exchanges a one-time Core capability, and
+ * reports only presence/revision/status back to React. plainText changes only
+ * native rendering for legacy provider API-key editing.
  */
 type SecretStateEvent = Readonly<{
   revision: Int32;
@@ -25,6 +26,8 @@ export interface NativeSecureTextInputProps extends ViewProps {
   target: string;
   label: string;
   placeholder?: string;
+  plainText?: WithDefault<boolean, false>;
+  autoCommit?: WithDefault<boolean, false>;
   disabled?: WithDefault<boolean, false>;
   commitRequest?: WithDefault<Int32, 0>;
   resetRequest?: WithDefault<Int32, 0>;

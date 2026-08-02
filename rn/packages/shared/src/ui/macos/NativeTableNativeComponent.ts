@@ -8,6 +8,7 @@ import type {
 } from "react-native/Libraries/Types/CodegenTypes";
 
 type SelectionChangeEvent = Readonly<{ key: string; index: Int32 }>;
+type RowDoublePressEvent = Readonly<{ key: string; index: Int32 }>;
 
 export interface NativeTableProps extends ViewProps {
   columnLabels: ReadonlyArray<string>;
@@ -16,7 +17,11 @@ export interface NativeTableProps extends ViewProps {
   cells: ReadonlyArray<string>;
   selectedKey: string;
   alternatingRows?: WithDefault<boolean, false>;
+  compact?: WithDefault<boolean, false>;
+  followBottom?: WithDefault<boolean, false>;
+  disabledRowKeys?: ReadonlyArray<string>;
   onSelectionChange?: DirectEventHandler<SelectionChangeEvent>;
+  onRowDoublePress?: DirectEventHandler<RowDoublePressEvent>;
 }
 
 export default codegenNativeComponent<NativeTableProps>("LiteLLMAppKitTable");

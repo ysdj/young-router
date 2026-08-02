@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from . import image_generation as _image_generation_module
+from . import responses_output as _responses_output_module
+from . import image_inputs as _image_inputs_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_tools as _responses_tools_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
@@ -58,6 +61,10 @@ from .base import (
 
 def _computer_facade_backend() -> str:
     backend = os.getenv(_COMPUTER_FACADE_BACKEND_ENV, "").strip().lower()
+    # Keep the removed value recognizable so an old environment setting fails
+    # closed instead of silently selecting a different executor.
+    if backend == _COMPUTER_FACADE_CUA_BACKEND:
+        return backend
     if backend not in _COMPUTER_FACADE_BACKENDS:
         return _COMPUTER_FACADE_AUTO_BACKEND
     return backend or _COMPUTER_FACADE_AUTO_BACKEND
@@ -106,7 +113,7 @@ def _computer_facade_action_denylist() -> set[str]:
 
 def _request_is_computer_facade_planner(request_kwargs: Optional[dict]) -> bool:
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if metadata and metadata.get(_COMPUTER_FACADE_PLANNER_METADATA_KEY) is True:
             return True
     return False
@@ -161,8 +168,8 @@ def _can_use_computer_facade_after_native_error(
     ) or _request_is_computer_facade_planner(outer_request_kwargs):
         return False
     if not (
-        _image_generation_module._request_is_responses_api(request_kwargs)
-        or _image_generation_module._request_is_responses_api(outer_request_kwargs)
+        _responses_request_module._request_is_responses_api(request_kwargs)
+        or _responses_request_module._request_is_responses_api(outer_request_kwargs)
     ):
         return False
     return plan.hosted_computer
@@ -328,7 +335,7 @@ async def _hosted_web_search_unsupported_stream(
     text = content.get("text") if isinstance(content, dict) else ""
     text = text if isinstance(text, str) else _HOSTED_WEB_SEARCH_UNSUPPORTED_MESSAGE
     if not text.strip():
-        text = _image_generation_module._response_text(response)
+        text = _responses_output_module._response_text(response)
     if not text.strip():
         text = _HOSTED_WEB_SEARCH_UNSUPPORTED_MESSAGE
 
@@ -530,7 +537,7 @@ async def _resolve_litellm_web_search_function_calls_stream(
     actions = _responses_web_search_bridge_module._litellm_web_search_actions_for_request(response, request_kwargs)
     payload = _streaming_module._jsonable(response)
     if not isinstance(payload, dict):
-        payload = _hosted_tool_unsupported_response(request_kwargs, _image_generation_module._response_text(response))
+        payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
     if not actions:
         async for chunk in _external_web_search_bridge_stream(payload):
             yield chunk
@@ -646,13 +653,13 @@ async def _resolve_litellm_web_search_function_calls_stream(
     if not isinstance(synthesized_payload, dict):
         synthesized_payload = _hosted_tool_unsupported_response(
             request_kwargs,
-            _image_generation_module._response_text(synthesized),
+            _responses_output_module._response_text(synthesized),
         )
     output_items = synthesized_payload.get("output")
     if not isinstance(output_items, list):
         output_items = []
     if not output_items:
-        text = _image_generation_module._response_text(synthesized_payload)
+        text = _responses_output_module._response_text(synthesized_payload)
         if text.strip():
             output_items = _hosted_tool_unsupported_response(
                 request_kwargs,
@@ -919,14 +926,14 @@ async def _external_web_search_stream_route_recovery_or_fallback(
                 recovery_request,
             ):
                 return recovered_payload
-            if _image_generation_module._response_text(recovered_payload).strip():
+            if _responses_output_module._response_text(recovered_payload).strip():
                 return recovered_payload
             try:
                 recovered_text = _external_web_search_stream_events_text(events)
             except Exception:
                 recovered_text = ""
             if not recovered_text.strip():
-                recovered_text = _image_generation_module._response_text(events)
+                recovered_text = _responses_output_module._response_text(events)
             if recovered_text.strip():
                 return _hosted_tool_unsupported_response(recovery_request, recovered_text)
 
@@ -942,7 +949,7 @@ def _external_web_search_visible_message_items(items: Any) -> list[dict[str, Any
             continue
         if item.get("type") != "message":
             continue
-        if _image_generation_module._response_text(item).strip():
+        if _responses_output_module._response_text(item).strip():
             visible_items.append(item)
     return visible_items
 
@@ -1039,12 +1046,12 @@ def _external_web_search_output_items_from_response(
 ) -> tuple[dict[str, Any], list[Any]]:
     payload = _streaming_module._jsonable(response)
     if not isinstance(payload, dict):
-        payload = _hosted_tool_unsupported_response(request_kwargs, _image_generation_module._response_text(response))
+        payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
     output_items = payload.get("output")
     if not isinstance(output_items, list):
         output_items = []
     if not output_items:
-        text = _image_generation_module._response_text(response)
+        text = _responses_output_module._response_text(response)
         if text.strip():
             output_items = _hosted_tool_unsupported_response(
                 request_kwargs,
@@ -1060,7 +1067,7 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
 ) -> AsyncIterator[dict[str, Any]]:
     payload = _streaming_module._jsonable(response)
     if not isinstance(payload, dict):
-        payload = _hosted_tool_unsupported_response(request_kwargs, _image_generation_module._response_text(response))
+        payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
     initial_actions = _responses_web_search_bridge_module._litellm_web_search_actions_for_request(response, request_kwargs)
     if not initial_actions:
         _responses_web_search_bridge_module._external_web_search_raise_if_invalid_initial_no_action_response(
@@ -1908,7 +1915,7 @@ def _computer_facade_bridge_callable(
     request_kwargs = request_kwargs or {}
     containers = [request_kwargs]
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if metadata:
             containers.append(metadata)
     for container in containers:
@@ -2205,11 +2212,6 @@ class PlaywrightComputerExecutor(ComputerExecutor):
         }
 
 
-class UnavailableComputerExecutor(ComputerExecutor):
-    def __init__(self, name: str) -> None:
-        self.name = name
-
-
 class MockComputerExecutor(ComputerExecutor):
     name = _COMPUTER_FACADE_MOCK_BACKEND
 
@@ -2219,7 +2221,7 @@ class MockComputerExecutor(ComputerExecutor):
     def is_available(self, plan: HostedToolPlan, request_kwargs: dict) -> bool:
         if _computer_facade_backend() == self.name:
             return True
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
         return metadata.get("computer_facade_allow_auto_mock") is True
 
     async def screenshot(self) -> ComputerObservation:
@@ -2404,7 +2406,7 @@ def _computer_facade_trace_dir() -> Optional[str]:
 
 
 def _computer_facade_store_screenshot(value: str) -> Optional[str]:
-    split = _image_generation_module._split_image_data_url(value)
+    split = _image_inputs_module._split_image_data_url(value)
     if split is None:
         return None
     trace_dir = _computer_facade_trace_dir()
@@ -2555,7 +2557,7 @@ async def _computer_facade_stream(
 def _computer_facade_parse_planner_json(raw: Any) -> tuple[Optional[dict], Optional[str]]:
     if isinstance(raw, dict):
         return raw, None
-    text = _image_generation_module._response_text(raw) if not isinstance(raw, str) else raw
+    text = _responses_output_module._response_text(raw) if not isinstance(raw, str) else raw
     text = str(text or "").strip()
     if not text:
         return None, "planner returned empty output"
@@ -2627,7 +2629,7 @@ async def _computer_facade_call_planner(
     if isinstance(injected, list) and injected:
         raw = injected.pop(0)
         return _computer_facade_parse_planner_json(raw)
-    metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     injected = metadata.get("computer_facade_planner_outputs")
     if isinstance(injected, list) and injected:
         raw = injected.pop(0)
@@ -2646,7 +2648,7 @@ async def _computer_facade_call_planner(
         invalid_reason=invalid_reason,
     )
     model = _computer_facade_planner_model(request_kwargs)
-    planner_metadata = (_image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}).copy()
+    planner_metadata = (_request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}).copy()
     planner_metadata[_COMPUTER_FACADE_PLANNER_METADATA_KEY] = True
     instructions = (
         "You are a computer-use planner. Return exactly one JSON object and no prose. "
@@ -2727,7 +2729,6 @@ def _computer_facade_executor_registry(request_kwargs: dict) -> dict[str, Comput
         _COMPUTER_FACADE_BROWSER_BACKEND: BrowserNamespaceExecutor(request_kwargs),
         _COMPUTER_FACADE_CHROME_BACKEND: ChromeNamespaceExecutor(request_kwargs),
         _COMPUTER_FACADE_PLAYWRIGHT_BACKEND: PlaywrightComputerExecutor(request_kwargs),
-        _COMPUTER_FACADE_CUA_BACKEND: UnavailableComputerExecutor(_COMPUTER_FACADE_CUA_BACKEND),
         _COMPUTER_FACADE_MOCK_BACKEND: MockComputerExecutor(request_kwargs),
     }
 
@@ -2748,7 +2749,6 @@ def _computer_facade_select_executor(
         _COMPUTER_FACADE_BROWSER_BACKEND,
         _COMPUTER_FACADE_CHROME_BACKEND,
         _COMPUTER_FACADE_PLAYWRIGHT_BACKEND,
-        _COMPUTER_FACADE_CUA_BACKEND,
         _COMPUTER_FACADE_MOCK_BACKEND,
     ):
         executor = registry[name]
@@ -2930,9 +2930,9 @@ async def _responses_computer_facade_retry_response(
 ) -> Optional[Any]:
     if not isinstance(request_kwargs, dict):
         return None
-    if _image_generation_module._request_already_attempted_responses_chat_bridge(
+    if _responses_request_module._request_already_attempted_responses_chat_bridge(
         request_kwargs
-    ) or _image_generation_module._request_already_attempted_responses_chat_bridge(outer_request_kwargs):
+    ) or _responses_request_module._request_already_attempted_responses_chat_bridge(outer_request_kwargs):
         return None
     if not _native_hosted_computer_unsupported_error(
         exception,

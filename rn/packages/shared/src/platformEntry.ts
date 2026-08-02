@@ -3,7 +3,7 @@ import { createTranslator } from "./i18n";
 import { createIpcClient } from "./ipc";
 import { createNativeIpcTransport, createNativeLeafBridgeAdapter, type NativeIpcBridge, type NativeLeafBridge } from "./platform/nativeBridge";
 import { registerLiteLLMMenu } from "./bootstrap";
-import type { AppRoute, LogTab, NativeLocalization, NativeMenuAction, ServiceStatus } from "./types";
+import type { AppRoute, LanguagePreference, LogTab, NativeLocalization, NativeMenuAction, NativeMenuAnchor, ServiceStatus } from "./types";
 
 type NativeModule = {
   send?: (request: string) => Promise<string>;
@@ -16,8 +16,9 @@ type NativeModule = {
   setMenuBarActions?: (actions: NativeMenuAction[]) => void;
   setTrayStatus?: (title: string, running: boolean) => void;
   setTrayActions?: (actions: NativeMenuAction[]) => void;
-  openFilePicker?: (purpose: "import" | "claude-profile") => Promise<string | undefined>;
-  saveFilePicker?: (purpose: "export") => Promise<string | undefined>;
+  openFilePicker?: (purpose: "import") => Promise<string | undefined>;
+  saveFilePicker?: (suggestedName: string) => Promise<string | undefined>;
+  showActionMenu?: (title: string, items: string[], anchor: NativeMenuAnchor) => Promise<number | undefined>;
   showConfirmation?: (title: string, message: string, confirmLabel: string) => Promise<boolean>;
   chooseModelsToAdd?: (models: string[], providerName: string, keyName: string) => Promise<string[] | undefined>;
   editSecureDocument?: (editorToken: string, language: "toml" | "json", title: string) => Promise<number | undefined>;
@@ -33,6 +34,31 @@ type NativeModule = {
     field: string,
     target: string | undefined,
   ) => Promise<{ revision: number; present: boolean } | undefined>;
+  relayLogin?: (options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+    username?: string;
+    rememberPassword: boolean;
+  }) => Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
+  openRelayLogs?: (options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+  }) => Promise<void>;
+  restoreRelaySession?: (options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    username?: string;
+  }) => Promise<{ revision: number; loginStatus: "signed_in" | "signed_out" | "expired"; username: string } | undefined>;
+  clearRelayPassword?: (accountId: string) => Promise<void>;
+  clearRelayCredentials?: (accountId: string) => Promise<void>;
   setLocalization?: (strings: NativeLocalization) => void;
   systemLocale?: () => string;
   setLaunchAtLogin?: (enabled: boolean) => Promise<boolean>;
@@ -63,10 +89,18 @@ function call(method: keyof NativeModule, ...args: unknown[]): void {
 let nativeStrings: NativeLocalization | undefined;
 
 function statusTitle(status: ServiceStatus): string {
-  const title = nativeStrings?.appTitle ?? "LiteLLM Menu";
-  return status.state === "running"
-    ? title
-    : `${title} - ${nativeStrings?.serviceUnavailable ?? "service unavailable"}`;
+  const states: Record<ServiceStatus["state"], string | undefined> = {
+    starting: nativeStrings?.serviceStarting,
+    running: nativeStrings?.serviceRunning,
+    unhealthy: nativeStrings?.serviceUnhealthy,
+    stopped: nativeStrings?.serviceStopped,
+    unknown: nativeStrings?.serviceUnknown,
+  };
+  const state = status.state === "running" && typeof status.port === "number" &&
+    Number.isInteger(status.port) && status.port >= 1 && status.port <= 65535
+    ? (nativeStrings?.serviceRunningOnPort ?? "Running (port {port})").replace("{port}", String(status.port))
+    : states[status.state] ?? status.state;
+  return (nativeStrings?.serviceStatus ?? "Status: {status}").replace("{status}", state);
 }
 
 const nativeBridge: NativeLeafBridge = {
@@ -81,12 +115,24 @@ const nativeBridge: NativeLeafBridge = {
   setTrayStatus: (status) => call("setTrayStatus", statusTitle(status), status.state === "running"),
   setTrayActions: (actions) => call("setTrayActions", actions),
   openFilePicker: async (purpose) => leaf.openFilePicker?.(purpose),
-  saveFilePicker: async (purpose) => leaf.saveFilePicker?.(purpose),
+  saveFilePicker: async (suggestedName) => leaf.saveFilePicker?.(suggestedName),
+  showActionMenu: async (title, items, anchor) => leaf.showActionMenu?.(title, items, anchor),
   showConfirmation: async (title, message, confirmLabel) => leaf.showConfirmation?.(title, message, confirmLabel) ?? false,
   chooseModelsToAdd: async (models, providerName, keyName) => leaf.chooseModelsToAdd?.(models, providerName, keyName),
   editSecureDocument: async (editorToken, language, title) => leaf.editSecureDocument?.(editorToken, language, title),
   editSecret: async (domain, field, target, title, allowClear) => leaf.editSecret?.(domain, field, target, title, allowClear),
   clearSecret: async (domain, field, target) => leaf.clearSecret?.(domain, field, target),
+  relayLogin: async (options) => leaf.relayLogin?.(options),
+  openRelayLogs: async (options) => { await leaf.openRelayLogs?.(options); },
+  restoreRelaySession: async (options) => leaf.restoreRelaySession?.(options),
+  clearRelayPassword: async (accountId) => {
+    if (!leaf.clearRelayPassword) throw new Error("The native relay credential store is unavailable.");
+    await leaf.clearRelayPassword(accountId);
+  },
+  clearRelayCredentials: async (accountId) => {
+    if (!leaf.clearRelayCredentials) throw new Error("The native relay credential store is unavailable.");
+    await leaf.clearRelayCredentials(accountId);
+  },
   setLaunchAtLogin: async (enabled) => {
     if (!leaf.setLaunchAtLogin) throw new Error("The native login-item control is unavailable.");
     if (!await leaf.setLaunchAtLogin(enabled)) throw new Error("The system could not update the login item.");
@@ -100,8 +146,8 @@ const nativeBridge: NativeLeafBridge = {
 
 const bootstrapTranslate = createTranslator("system", systemLocale);
 const routeActions: NativeMenuAction[] = [
-  ["providers-models", "menu.providers"], ["codex-settings", "menu.codex"], ["claude-settings", "menu.claude"],
-  ["runtime-settings", "menu.runtime"], ["configuration-package", "menu.configuration"], ["webdav-settings", "menu.webdav"],
+  ["providers-models", "menu.providers"], ["codex-settings", "menu.codex"],
+  ["runtime-settings", "menu.runtime"], ["relay-accounts", "menu.relay"], ["webdav-settings", "menu.webdav"],
   ["logs", "menu.logs"],
 ].map(([route, key]) => ({ id: `open-${route}`, title: bootstrapTranslate(key), enabled: true }));
 
@@ -123,4 +169,4 @@ registerLiteLLMMenu("LiteLLMMenu", {
   },
 });
 
-export const DESKTOP_ROUTES: readonly AppRoute[] = ["home", "providers-models", "codex-settings", "claude-settings", "runtime-settings", "configuration-package", "webdav-settings", "logs"];
+export const DESKTOP_ROUTES: readonly AppRoute[] = ["home", "providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "relay-accounts", "logs"];

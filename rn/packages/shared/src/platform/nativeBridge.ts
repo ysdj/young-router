@@ -8,6 +8,8 @@ import type {
   NativeLeafAdapter,
   NativeLocalization,
   NativeMenuAction,
+  NativeMenuAnchor,
+  LanguagePreference,
   ServiceStatus,
 } from "../types";
 
@@ -25,8 +27,9 @@ export interface NativeLeafBridge {
   setMenuBarActions(actions: NativeMenuAction[]): void;
   setTrayStatus(status: ServiceStatus): void;
   setTrayActions(actions: NativeMenuAction[]): void;
-  openFilePicker(purpose: "import" | "claude-profile"): Promise<string | undefined>;
-  saveFilePicker(purpose: "export"): Promise<string | undefined>;
+  openFilePicker(purpose: "import"): Promise<string | undefined>;
+  saveFilePicker(suggestedName: string): Promise<string | undefined>;
+  showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor): Promise<number | undefined>;
   showConfirmation(title: string, message: string, confirmLabel: string): Promise<boolean>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
   editSecureDocument(editorToken: string, language: "toml" | "json", title: string): Promise<number | undefined>;
@@ -42,6 +45,31 @@ export interface NativeLeafBridge {
     field: string,
     target: string | undefined,
   ): Promise<{ revision: number; present: boolean } | undefined>;
+  relayLogin(options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+    username?: string;
+    rememberPassword: boolean;
+  }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
+  restoreRelaySession(options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    username?: string;
+  }): Promise<{ revision: number; loginStatus: "signed_in" | "signed_out" | "expired"; username: string } | undefined>;
+  openRelayLogs(options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+  }): Promise<void>;
+  clearRelayPassword(accountId: string): Promise<void>;
+  clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
@@ -85,12 +113,18 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
       setActions: (actions) => bridge.setTrayActions(actions),
     },
     openFilePicker: ({ purpose }) => bridge.openFilePicker(purpose),
-    saveFilePicker: ({ purpose }) => bridge.saveFilePicker(purpose),
+    saveFilePicker: ({ suggestedName }) => bridge.saveFilePicker(suggestedName),
+    showActionMenu: ({ title, items, anchor }) => bridge.showActionMenu(title, items, anchor),
     showConfirmation: ({ title, message, confirmLabel }) => bridge.showConfirmation(title, message, confirmLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
     editSecureDocument: ({ editorToken, language, title }) => bridge.editSecureDocument(editorToken, language, title),
     editSecret: ({ domain, field, target, title, allowClear }) => bridge.editSecret(domain, field, target, title, allowClear),
     clearSecret: ({ domain, field, target }) => bridge.clearSecret(domain, field, target),
+    relayLogin: (options) => bridge.relayLogin(options),
+    restoreRelaySession: (options) => bridge.restoreRelaySession(options),
+    openRelayLogs: (options) => bridge.openRelayLogs(options),
+    clearRelayPassword: (accountId) => bridge.clearRelayPassword(accountId),
+    clearRelayCredentials: (accountId) => bridge.clearRelayCredentials(accountId),
     setLaunchAtLogin: (enabled) => bridge.setLaunchAtLogin(enabled),
     setLocalization: (strings) => bridge.setLocalization(strings),
     setShortcuts: (shortcuts) => bridge.setShortcuts(shortcuts),

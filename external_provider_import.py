@@ -1182,6 +1182,17 @@ def import_codex_current() -> dict[str, Any]:
     return _result(_import_codex(pathlib.Path(raw_home).expanduser()), "codex-current")
 
 
+def import_claude_current() -> dict[str, Any]:
+    """Import the current Claude Code settings through the same bounded parser."""
+
+    raw_home = os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude").strip() or "~/.claude"
+    path = pathlib.Path(raw_home).expanduser() / "settings.json"
+    parsed = _parse_input(path)
+    drafts = _Drafts()
+    _add_cc_switch_claude_provider(drafts, "claude", parsed, True)
+    return _result(drafts, "claude-current")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Read an explicit external provider/model configuration into editor JSON."
@@ -1191,14 +1202,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--link-stdin", action="store_true")
     args = parser.parse_args(argv)
     if sum((bool(args.command), bool(args.input), args.link_stdin)) != 1:
-        parser.error("use exactly one of codex-current, --input PATH, or --link-stdin")
-    if args.command and args.command != "codex-current":
-        parser.error("the only command is codex-current")
+        parser.error("use exactly one of codex-current, claude-current, --input PATH, or --link-stdin")
+    if args.command and args.command not in {"codex-current", "claude-current"}:
+        parser.error("the supported commands are codex-current and claude-current")
 
     try:
         result = (
             import_codex_current()
             if args.command == "codex-current"
+            else import_claude_current()
+            if args.command == "claude-current"
             else import_link_stdin()
             if args.link_stdin
             else import_explicit(pathlib.Path(args.input).expanduser())

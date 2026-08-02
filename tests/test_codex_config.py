@@ -200,6 +200,19 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual("openai", parsed["model_provider"])
             self.assertEqual("keep", parsed["personality"])
 
+    def test_structured_features_reads_legacy_alias_without_exposing_duplicate_control(self) -> None:
+        import codex_config
+
+        structured = codex_config.structured_config(
+            {"features": {"unified_exec": True, "fast_mode": False}},
+            {},
+        )
+
+        self.assertTrue(structured["features"]["experimental_use_unified_exec_tool"])
+        self.assertFalse(structured["features"]["fast_mode"])
+        self.assertNotIn("unified_exec", structured["features"])
+        self.assertNotIn("unified_exec", structured["supported_features"])
+
     def test_apply_does_not_rewrite_assignment_text_inside_multiline_strings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from . import computer_facade as _computer_facade_module
-from . import image_generation as _image_generation_module
+from . import responses_output as _responses_output_module
+from . import image_inputs as _image_inputs_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_tools as _responses_tools_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
@@ -211,9 +214,11 @@ def _responses_chat_bridge_retry_kwargs(
 ) -> Optional[dict]:
     if not isinstance(request_kwargs, dict):
         return None
-    if _image_generation_module._request_already_attempted_responses_chat_bridge(
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return None
+    if _responses_request_module._request_already_attempted_responses_chat_bridge(
         request_kwargs
-    ) or _image_generation_module._request_already_attempted_responses_chat_bridge(outer_request_kwargs):
+    ) or _responses_request_module._request_already_attempted_responses_chat_bridge(outer_request_kwargs):
         return None
     if _responses_chat_bridge_retry_reason(
         exception, request_kwargs, outer_request_kwargs
@@ -237,7 +242,7 @@ def _responses_chat_bridge_retry_kwargs(
         return None
 
     retry_kwargs = request_kwargs.copy()
-    litellm_metadata = _image_generation_module._request_metadata_dict(retry_kwargs, "litellm_metadata") or {}
+    litellm_metadata = _request_context_module._request_metadata_dict(retry_kwargs, "litellm_metadata") or {}
     retry_metadata = litellm_metadata.copy()
     retry_metadata[_RESPONSES_CHAT_BRIDGE_METADATA_KEY] = True
     retry_metadata[_RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY] = (
@@ -277,8 +282,8 @@ def _responses_chat_bridge_retry_reason(
         return "responses_endpoint_not_found"
     if (
         (
-            _image_generation_module._request_is_responses_api(request_kwargs)
-            or _image_generation_module._request_is_responses_api(outer_request_kwargs)
+            _responses_request_module._request_is_responses_api(request_kwargs)
+            or _responses_request_module._request_is_responses_api(outer_request_kwargs)
         )
         and _routing_module._is_responses_schema_unsupported_error(exception)
     ):
@@ -288,7 +293,7 @@ def _responses_chat_bridge_retry_reason(
 
 def _request_configured_responses_endpoint_unsupported(request_kwargs: Optional[dict]) -> bool:
     request_kwargs = request_kwargs or {}
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     mode = _routing_module._request_current_upstream_surface(request_kwargs)
     if not mode:
         modes = _normalized_upstream_url_surfaces(
@@ -302,7 +307,7 @@ def _request_configured_responses_endpoint_unsupported(request_kwargs: Optional[
 def _request_has_explicit_surface_metadata(request_kwargs: Optional[dict]) -> bool:
     if not isinstance(request_kwargs, dict):
         return False
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     return any(
         key in model_info
         for key in (
@@ -346,16 +351,16 @@ def _request_has_chat_bridge_mode(
             return True
         if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
             continue
-        model_info = _image_generation_module._request_model_info(request)
+        model_info = _request_context_module._request_model_info(request)
         if model_info and _model_info_has_chat_bridge_mode(model_info):
             return True
     return False
 
 
 def _request_is_direct_openai_route(request_kwargs: Optional[dict]) -> bool:
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     provider = model_info.get("provider")
-    host = _image_generation_module._api_base_host(_image_generation_module._request_api_base(request_kwargs))
+    host = _responses_request_module._api_base_host(_responses_request_module._request_api_base(request_kwargs))
     if host:
         return host == "api.openai.com"
     if isinstance(provider, str) and provider.strip().lower() == "openai":
@@ -368,7 +373,7 @@ def _request_supports_native_responses_hosted_tools(
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
     for request in (request_kwargs, outer_request_kwargs):
-        model_info = _image_generation_module._request_model_info(request)
+        model_info = _request_context_module._request_model_info(request)
         if model_info.get(_SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY) is True:
             return True
         if _request_is_direct_openai_route(request):
@@ -381,7 +386,7 @@ def _request_uses_responses_endpoint(
 ) -> bool:
     if not isinstance(request_kwargs, dict):
         return False
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     mode = _routing_module._request_current_upstream_surface(request_kwargs)
     if not mode:
         modes = _normalized_upstream_url_surfaces(
@@ -394,7 +399,7 @@ def _request_uses_responses_endpoint(
             return True
         if mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
             return False
-    return _image_generation_module._request_is_responses_api(request_kwargs)
+    return _responses_request_module._request_is_responses_api(request_kwargs)
 
 
 def _request_supports_native_responses_web_search(
@@ -418,7 +423,7 @@ def _request_native_responses_web_search_support_decision(
 ) -> Optional[bool]:
     if not isinstance(request_kwargs, dict):
         return None
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     if model_info.get(_SUPPORTS_RESPONSES_WEB_SEARCH_KEY) is True:
         return True
     if model_info.get(_SUPPORTS_WEB_SEARCH_KEY) is True:
@@ -435,7 +440,7 @@ def _request_native_responses_web_search_support_decision(
 def _request_web_search_support_is_unknown(request_kwargs: Optional[dict]) -> bool:
     if not isinstance(request_kwargs, dict):
         return False
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     return (
         model_info.get(_SUPPORTS_RESPONSES_WEB_SEARCH_KEY) is None
         and model_info.get(_SUPPORTS_WEB_SEARCH_KEY) is None
@@ -501,7 +506,7 @@ def _request_responses_client_tool_support(
     outer_request_kwargs: Optional[dict] = None,
 ) -> Optional[bool]:
     for request in (request_kwargs, outer_request_kwargs):
-        model_info = _image_generation_module._request_model_info(request)
+        model_info = _request_context_module._request_model_info(request)
         configured_support = model_info.get(
             _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY
         )
@@ -517,7 +522,7 @@ def _request_supports_responses_function_tools(
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
     for request in (request_kwargs, outer_request_kwargs):
-        model_info = _image_generation_module._request_model_info(request)
+        model_info = _request_context_module._request_model_info(request)
         configured_support = model_info.get(
             _SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY
         )
@@ -542,7 +547,7 @@ def _responses_hosted_web_search_needs_external_bridge(
 
 def _request_has_preemptive_responses_chat_bridge(request_kwargs: Optional[dict]) -> bool:
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if (
             metadata is not None
                 and metadata.get(_RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY) is True
@@ -555,7 +560,7 @@ def _request_has_preemptive_responses_function_tool_bridge(
     request_kwargs: Optional[dict],
 ) -> bool:
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if (
             metadata is not None
             and metadata.get(_RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY)
@@ -571,7 +576,7 @@ def _request_has_responses_function_tool_bridge_attempt(
 ) -> bool:
     for request in (request_kwargs, outer_request_kwargs):
         for key in ("litellm_metadata", "metadata"):
-            metadata = _image_generation_module._request_metadata_dict(request, key)
+            metadata = _request_context_module._request_metadata_dict(request, key)
             if metadata is None:
                 continue
             if metadata.get(_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY) is True:
@@ -587,11 +592,11 @@ def _with_responses_native_client_tool_passthrough(
 ) -> Optional[dict]:
     if not isinstance(request_kwargs, dict):
         return None
-    if not _image_generation_module._request_is_responses_api(request_kwargs):
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
         return None
     if request_kwargs.get("use_chat_completions_api") is True:
         return None
-    if _image_generation_module._request_is_codex_compaction(request_kwargs):
+    if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
     if not _request_uses_responses_endpoint(request_kwargs):
         return None
@@ -658,7 +663,7 @@ def _with_responses_native_client_tool_passthrough(
     modified_kwargs["extra_body"] = extra_body
 
     litellm_metadata = (
-        _image_generation_module._request_metadata_dict(
+        _request_context_module._request_metadata_dict(
             request_kwargs,
             "litellm_metadata",
         )
@@ -694,7 +699,7 @@ def _responses_external_web_search_bridge_kwargs(
 ) -> Optional[dict]:
     if not isinstance(request_kwargs, dict):
         return None
-    if not _image_generation_module._request_is_responses_api(request_kwargs):
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
         return None
     if _tools_module._request_suppresses_external_web_search_post_call(request_kwargs):
         return None
@@ -728,7 +733,7 @@ def _responses_external_web_search_bridge_kwargs(
             bridge_kwargs.get("tool_choice")
         )
 
-    litellm_metadata = _image_generation_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
+    litellm_metadata = _request_context_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
     bridge_metadata = litellm_metadata.copy()
     bridge_metadata[_WEB_SEARCH_EXTERNAL_BRIDGE_KEY] = True
     bridge_metadata["external_web_search_native_bridge"] = True
@@ -787,7 +792,7 @@ def _with_responses_external_web_search_bridge_after_native_error(
     )
     if bridge_kwargs is None:
         return None
-    bridge_metadata = _image_generation_module._request_metadata_dict(
+    bridge_metadata = _request_context_module._request_metadata_dict(
         bridge_kwargs,
         "litellm_metadata",
     ) or {}
@@ -805,7 +810,7 @@ def _responses_external_web_search_bridge_possible(
 ) -> bool:
     if not isinstance(request_kwargs, dict):
         return False
-    if not _image_generation_module._request_is_responses_api(request_kwargs):
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
         return False
     if _tools_module._request_suppresses_external_web_search_post_call(request_kwargs):
         return False
@@ -862,9 +867,11 @@ def _responses_chat_bridge_preemptive_kwargs(
 ) -> Optional[dict]:
     if not isinstance(request_kwargs, dict):
         return None
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return None
     if _request_has_preemptive_responses_chat_bridge(request_kwargs):
         return request_kwargs
-    if _image_generation_module._request_already_attempted_responses_chat_bridge(request_kwargs):
+    if _responses_request_module._request_already_attempted_responses_chat_bridge(request_kwargs):
         return None
 
     outer_for_tool_plan = (
@@ -883,7 +890,7 @@ def _responses_chat_bridge_preemptive_kwargs(
     if reason is None:
         return None
     bridge_kwargs = request_kwargs.copy()
-    litellm_metadata = _image_generation_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
+    litellm_metadata = _request_context_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
     bridge_metadata = litellm_metadata.copy()
     bridge_metadata[_RESPONSES_CHAT_BRIDGE_METADATA_KEY] = True
     bridge_metadata[_RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY] = True
@@ -923,9 +930,9 @@ def _responses_function_tool_bridge_preemptive_reason(
 ) -> Optional[str]:
     if not isinstance(request_kwargs, dict):
         return None
-    if not _image_generation_module._request_is_responses_api(request_kwargs):
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
         return None
-    if _image_generation_module._request_is_codex_compaction(request_kwargs):
+    if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
     outer_for_tool_reason = (
         None
@@ -963,7 +970,7 @@ def _responses_function_tool_bridge_preemptive_kwargs(
 ) -> Optional[dict]:
     if not isinstance(request_kwargs, dict):
         return None
-    if _image_generation_module._request_is_codex_compaction(request_kwargs):
+    if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
     if _request_has_preemptive_responses_function_tool_bridge(request_kwargs):
         return request_kwargs
@@ -983,7 +990,7 @@ def _responses_function_tool_bridge_preemptive_kwargs(
         return None
 
     bridge_kwargs = request_kwargs.copy()
-    litellm_metadata = _image_generation_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
+    litellm_metadata = _request_context_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
     bridge_metadata = litellm_metadata.copy()
     bridge_metadata[_RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY] = True
     bridge_metadata[_RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY] = True
@@ -1139,9 +1146,9 @@ def _responses_function_tool_bridge_retry_kwargs(
 ) -> Optional[dict]:
     if not isinstance(request_kwargs, dict):
         return None
-    if not _image_generation_module._request_is_responses_api(request_kwargs):
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
         return None
-    if _image_generation_module._request_is_codex_compaction(request_kwargs):
+    if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
     if _request_has_responses_function_tool_bridge_attempt(
         request_kwargs,
@@ -1167,7 +1174,7 @@ def _responses_function_tool_bridge_retry_kwargs(
 
     bridge_kwargs = request_kwargs.copy()
     litellm_metadata = (
-        _image_generation_module._request_metadata_dict(
+        _request_context_module._request_metadata_dict(
             bridge_kwargs,
             "litellm_metadata",
         )
@@ -1234,7 +1241,7 @@ def _normalized_upstream_url_surface(value: Any) -> str:
 
 
 def _with_preemptive_responses_chat_bridge(request_kwargs: dict) -> Optional[dict]:
-    if not _image_generation_module._request_is_responses_api(request_kwargs):
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
         return None
     bridge_kwargs = _responses_chat_bridge_preemptive_kwargs(
         request_kwargs,
@@ -1243,7 +1250,7 @@ def _with_preemptive_responses_chat_bridge(request_kwargs: dict) -> Optional[dic
     )
     if bridge_kwargs is None:
         return None
-    bridge_metadata = _image_generation_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
+    bridge_metadata = _request_context_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
     _trace_module._route_trace(
         "responses_chat_bridge_preemptive",
         request_id=_routing_module._trace_request_id(request_kwargs),
@@ -1253,7 +1260,7 @@ def _with_preemptive_responses_chat_bridge(request_kwargs: dict) -> Optional[dic
         route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
         tool_types=_trace_module._trace_tool_types(bridge_kwargs.get("tools")),
         tool_names=_trace_module._trace_tool_names(bridge_kwargs.get("tools")),
-        has_image_input=_image_generation_module._request_has_image_input(request_kwargs),
+        has_image_input=_image_inputs_module._request_has_image_input(request_kwargs),
         external_web_search_bridge=bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY),
         reason=bridge_metadata.get(
             "responses_chat_bridge_preemptive_reason"
@@ -1267,7 +1274,7 @@ def _request_already_attempted_responses_chat_bridge_empty_retry(
 ) -> bool:
     request_kwargs = request_kwargs or {}
     for key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, key)
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, key)
         if (
             metadata is not None
             and metadata.get(_RESPONSES_CHAT_BRIDGE_EMPTY_RETRY_METADATA_KEY) is True
@@ -1296,7 +1303,7 @@ def _responses_chat_bridge_empty_retry_kwargs(
     if _request_already_attempted_responses_chat_bridge_empty_retry(bridge_kwargs):
         return None
     retry_kwargs = bridge_kwargs.copy()
-    litellm_metadata = _image_generation_module._request_metadata_dict(retry_kwargs, "litellm_metadata") or {}
+    litellm_metadata = _request_context_module._request_metadata_dict(retry_kwargs, "litellm_metadata") or {}
     retry_metadata = litellm_metadata.copy()
     retry_metadata[_RESPONSES_CHAT_BRIDGE_EMPTY_RETRY_METADATA_KEY] = True
     retry_kwargs["litellm_metadata"] = retry_metadata
@@ -1306,7 +1313,7 @@ def _responses_chat_bridge_empty_retry_kwargs(
 
 
 def _responses_chat_bridge_empty_success_exception(request_kwargs: dict) -> Exception:
-    model_group = _responses_execution_module._request_model_group(request_kwargs) or _image_generation_module._request_model_for_error(request_kwargs)
+    model_group = _responses_execution_module._request_model_group(request_kwargs) or _request_context_module._request_model_for_error(request_kwargs)
     message = (
         "Responses chat bridge returned an empty assistant response for "
         f"{model_group or 'the requested model'} after retry; treating it as an "
@@ -1361,11 +1368,11 @@ async def _ensure_responses_chat_bridge_non_empty_response(
     bridge_metadata: dict,
     original_function: Any,
 ) -> Any:
-    response = _image_generation_module._sanitize_response_echoed_request_images(response, bridge_kwargs)
+    response = _image_inputs_module._sanitize_response_echoed_request_images(response, bridge_kwargs)
     if (
         _tools_module._request_has_image_generation_tool(bridge_kwargs)
         or not _response_has_empty_check_shape(response)
-        or not _image_generation_module._response_is_effectively_empty(response)
+        or not _responses_output_module._response_is_effectively_empty(response)
     ):
         return response
 
@@ -1383,7 +1390,7 @@ async def _ensure_responses_chat_bridge_non_empty_response(
             retry_response = original_function(**retry_kwargs)
             if inspect.isawaitable(retry_response):
                 retry_response = await retry_response
-            retry_response = _image_generation_module._sanitize_response_echoed_request_images(
+            retry_response = _image_inputs_module._sanitize_response_echoed_request_images(
                 retry_response,
                 retry_kwargs,
             )
@@ -1406,7 +1413,7 @@ async def _ensure_responses_chat_bridge_non_empty_response(
             raise
         if (
             not _response_has_empty_check_shape(retry_response)
-            or not _image_generation_module._response_is_effectively_empty(retry_response)
+            or not _responses_output_module._response_is_effectively_empty(retry_response)
         ):
             _trace_module._route_trace(
                 "responses_chat_bridge_empty_retry_success",
@@ -1415,7 +1422,7 @@ async def _ensure_responses_chat_bridge_non_empty_response(
                 model_group=_responses_execution_module._request_model_group(bridge_kwargs),
                 deployment_id=_routing_module._deployment_id_from_request(bridge_kwargs),
                 route_key=_routing_module._deployment_route_key_from_request(bridge_kwargs),
-                response_types=_image_generation_module._response_types(retry_response),
+                response_types=_responses_output_module._response_types(retry_response),
             )
             return retry_response
         response = retry_response
@@ -1427,6 +1434,6 @@ async def _ensure_responses_chat_bridge_non_empty_response(
         model_group=_responses_execution_module._request_model_group(bridge_kwargs),
         deployment_id=_routing_module._deployment_id_from_request(bridge_kwargs),
         route_key=_routing_module._deployment_route_key_from_request(bridge_kwargs),
-        response_types=_image_generation_module._response_types(response),
+        response_types=_responses_output_module._response_types(response),
     )
     raise _responses_chat_bridge_empty_success_exception(bridge_kwargs)

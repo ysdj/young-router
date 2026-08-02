@@ -1,6 +1,7 @@
 import React from "react";
 import {
   StyleSheet,
+  type HostInstance,
   type NativeSyntheticEvent,
   type StyleProp,
   type TextInputProps,
@@ -50,12 +51,12 @@ type NativePickerProps = {
   style?: StyleProp<ViewStyle>;
 };
 
-export function AppKitButton(props: NativeButtonProps): React.JSX.Element {
-  return <NativeAppKitButton {...props} style={[props.link ? styles.linkButton : styles.button, props.style]} />;
-}
+export const AppKitButton = React.forwardRef<any, NativeButtonProps>(function AppKitButton(props, ref): React.JSX.Element {
+  return <NativeAppKitButton {...props} ref={ref as never} style={[props.link ? styles.linkButton : styles.button, props.style]} />;
+});
 
-export function AppKitSegmentedControl({ labels, selectedValue, disabled, compact, onChange, style }: NativeSegmentedProps): React.JSX.Element {
-  return <NativeAppKitSegmentedControl labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={[styles.segmented, style]} />;
+export function AppKitSegmentedControl({ labels, selectedValue, disabled, compact, onChange, style, ref }: NativeSegmentedProps & { ref?: React.Ref<any> }): React.JSX.Element {
+  return <NativeAppKitSegmentedControl ref={ref as never} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={[styles.segmented, style]} />;
 }
 
 export function AppKitPicker({ labels, selectedValue, disabled, compact, onChange, style }: NativePickerProps): React.JSX.Element {
@@ -78,8 +79,8 @@ export function AppKitSelectableRow({ title, detail, selected, disabled, onPress
   return <NativeAppKitSelectableRow title={title} detail={detail} selected={selected} disabled={disabled} onPress={() => onPress?.()} style={[styles.selectableRow, style]} />;
 }
 
-export function AppKitTable({ columnLabels, columnWidths, rowKeys, cells, selectedKey, onSelectionChange, style }: { columnLabels: string[]; columnWidths: number[]; rowKeys: string[]; cells: string[]; selectedKey: string; onSelectionChange?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  return <NativeAppKitTable columnLabels={columnLabels} columnWidths={columnWidths} rowKeys={rowKeys} cells={cells} selectedKey={selectedKey} onSelectionChange={onSelectionChange} style={[styles.table, style]} />;
+export function AppKitTable({ columnLabels, columnWidths, rowKeys, cells, selectedKey, alternatingRows, compact, followBottom, disabledRowKeys, onSelectionChange, onRowDoublePress, style }: { columnLabels: string[]; columnWidths: number[]; rowKeys: string[]; cells: string[]; selectedKey: string; alternatingRows?: boolean; compact?: boolean; followBottom?: boolean; disabledRowKeys?: string[]; onSelectionChange?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; onRowDoublePress?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <NativeAppKitTable columnLabels={columnLabels} columnWidths={columnWidths} rowKeys={rowKeys} cells={cells} selectedKey={selectedKey} alternatingRows={alternatingRows} compact={compact} followBottom={followBottom} disabledRowKeys={disabledRowKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} style={[styles.table, style]} />;
 }
 
 export function AppKitTextEditor({ value, documentKey, readOnly, wrap, onChangeText, style }: { value: string; documentKey?: string; readOnly?: boolean; wrap?: boolean; onChangeText?: (text: string) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
@@ -104,8 +105,8 @@ export type SecureTextInputState = {
   commitRequest: number;
 };
 
-export function AppKitSecureTextInput({ domain, field, target = "", label, placeholder, disabled, commitRequest, resetRequest, onSecretState, style }: { domain: string; field: string; target?: string; label: string; placeholder?: string; disabled?: boolean; commitRequest?: number; resetRequest?: number; onSecretState?: (event: NativeSyntheticEvent<SecureTextInputState>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  return <NativeAppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={onSecretState} style={[styles.textField, style]} />;
+export function AppKitSecureTextInput({ domain, field, target = "", label, placeholder, plainText = false, autoCommit = false, disabled, commitRequest, resetRequest, onSecretState, style }: { domain: string; field: string; target?: string; label: string; placeholder?: string; plainText?: boolean; autoCommit?: boolean; disabled?: boolean; commitRequest?: number; resetRequest?: number; onSecretState?: (event: NativeSyntheticEvent<SecureTextInputState>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <NativeAppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={onSecretState} style={[styles.textField, style]} />;
 }
 
 export function AppKitSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpen, disabled, onPaneWidthChange, children, style }: { paneWidth: number; minPaneWidth: number; maxPaneWidth: number; paneOpen?: boolean; disabled?: boolean; onPaneWidthChange?: (width: number) => void; children?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
@@ -118,7 +119,7 @@ const styles = StyleSheet.create({
   segmented: { width: 224, height: 28 },
   picker: { minWidth: 160, height: 26 },
   checkbox: { minHeight: 22 },
-  textField: { minHeight: 26 },
+  textField: { minHeight: 30 },
   selectableRow: { minHeight: 44 },
   table: { minHeight: 120 },
   editor: { minHeight: 160 },

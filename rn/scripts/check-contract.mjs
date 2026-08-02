@@ -15,7 +15,7 @@ const ipc = fs.readFileSync(path.join(root, "packages/shared/src/ipc.ts"), "utf8
 const source = ts.createSourceFile(typesPath, types, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 const printer = ts.createPrinter({ removeComments: true });
 
-const requiredRoutes = ["providers-models", "codex-settings", "claude-settings", "runtime-settings", "configuration-package", "webdav-settings", "logs"];
+const requiredRoutes = ["providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "logs"];
 
 function fail(message) {
   throw new Error(message);

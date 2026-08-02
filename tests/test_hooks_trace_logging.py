@@ -372,7 +372,7 @@ class HookTraceLoggingTests(HookTestCase):
             )
             self.assertEqual(record["model_group"], "default-chat")
             self.assertEqual(record["deployment_id"], "deployment-1")
-            self.assertEqual(record["deployment_token"], "deployment-1")
+            self.assertNotIn("deployment_token", record)
             self.assertEqual(
                 record["route_key"],
                 "model=default-chat / provider=provider-a / upstream=openai/gpt-upstream / host=provider.example / order=2",
@@ -543,19 +543,19 @@ class HookTraceLoggingTests(HookTestCase):
         hooks, _ = load_hook_module()
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
-            cap = hooks._RECENT_REQUESTS_MIN_MAX_BYTES
+            cap = hooks.MIN_LOG_MAX_BYTES
             log_path.write_text("a" * (cap + 1024), encoding="utf-8")
             self.set_log_env(log_path)
             self.set_env("LITELLM_MENU_LOG_MAX_BYTES", str(cap))
 
             hooks._append_recent_request({"status": "success", "marker": "latest"})
 
-            self.assertLessEqual(log_path.stat().st_size, cap + 128)
+            self.assertLessEqual(log_path.stat().st_size, 128)
             backup_path = Path(f"{log_path}.1")
             self.assertTrue(backup_path.exists())
             self.assertLessEqual(backup_path.stat().st_size, cap)
-            self.assertEqual(log_path.read_text(encoding="utf-8")[:cap], "a" * cap)
             self.assertIn('"marker": "latest"', log_path.read_text(encoding="utf-8"))
+            self.assertEqual(backup_path.read_text(encoding="utf-8"), "a" * cap)
 
     def test_recent_request_rotation_uses_local_log_cap_key(self) -> None:
         hooks, _ = load_hook_module()
@@ -593,7 +593,7 @@ class HookTraceLoggingTests(HookTestCase):
         record = json.loads(raw_payload)
         self.assertEqual(record["event"], "deployment_failover_marked")
         self.assertRegex(record["timestamp"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-        self.assertEqual(record["deployment_token"], "openai-default-chat-provider_alpha-team-o1")
+        self.assertNotIn("deployment_token", record)
         self.assertEqual(record["route_key"], "provider_alpha / openai/default-chat / key=team / order=1")
         self.assertEqual(
             record["exception"]["failed_deployment_route_key"],

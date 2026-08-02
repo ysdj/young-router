@@ -38,6 +38,7 @@ class SiteCustomizeTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.pop("LITELLM_MENU_PROXY_PROCESS", None)
+        env.pop("LITELLM_MENU_TIMESTAMP_OUTPUT", None)
         env.update(
             {
                 "LITELLM_TEMPLATE_ROOT": str(template),
@@ -192,6 +193,116 @@ class SiteCustomizeTests(unittest.TestCase):
                     print(any(name == "litellm" or name.startswith("litellm.") for name in sys.modules))
                     """
                 ),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "False")
+
+    def test_proxy_sitecustomize_defers_litellm_import(self) -> None:
+        self.require_litellm()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import sys
+
+                    print(any(name == "litellm" or name.startswith("litellm.") for name in sys.modules))
+                    """
+                ),
+                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "False")
+
+    def test_proxy_console_lines_receive_utc_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import sys
+
+                    print("service ready")
+                    print("worker ready", file=sys.stderr)
+                    """
+                ),
+                extra_env={
+                    "LITELLM_MENU_PROXY_PROCESS": "1",
+                    "LITELLM_MENU_TIMESTAMP_OUTPUT": "1",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertRegex(result.stdout, r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] service ready\n$")
+            self.assertRegex(result.stderr, r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] worker ready\n$")
+
+    def test_proxy_console_log_rotates_current_file_and_keeps_previous_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            runtime = temp / "runtime"
+            runtime.mkdir()
+            service_log = temp / "menu-server.log"
+            service_log.write_text("a" * 300_000, encoding="utf-8")
+            env = os.environ.copy()
+            env.update(
+                {
+                    "LITELLM_MENU_PROXY_PROCESS": "1",
+                    "LITELLM_MENU_TIMESTAMP_OUTPUT": "1",
+                    "LITELLM_MENU_LOG_MAX_BYTES": "262144",
+                    "LITELLM_MENU_SERVICE_LOG": str(service_log),
+                    "PYTHONPATH": str(ROOT),
+                }
+            )
+            with service_log.open("a", encoding="utf-8") as output:
+                result = subprocess.run(
+                    [self.python(), "-c", 'print("latest service line")'],
+                    cwd=runtime,
+                    env=env,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("latest service line", service_log.read_text(encoding="utf-8"))
+            self.assertLess(service_log.stat().st_size, 1024)
+            backup = Path(f"{service_log}.1")
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.stat().st_size, 262144)
+
+    def test_proxy_optional_database_driver_does_not_break_auth_error_classification(self) -> None:
+        self.require_litellm()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+                    from sitecustomize import _OPTIONAL_DATABASE_ERROR_PATCH_ATTR
+
+                    classifier = PrismaDBExceptionHandler.is_database_service_unavailable_error
+                    assert getattr(classifier, _OPTIONAL_DATABASE_ERROR_PATCH_ATTR)
+                    print(classifier(Exception("No api key passed in.")))
+                    """
+                ),
+                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)

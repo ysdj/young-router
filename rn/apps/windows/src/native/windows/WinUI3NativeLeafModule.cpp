@@ -1,8 +1,12 @@
 #include "pch.h"
 #include "WinUI3NativeLeafModule.h"
 #include "CoreIPCBridge.h"
+#include "WindowsRelayLogin.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <set>
 #include <shobjidl_core.h>
 #include <winrt/Windows.Globalization.h>
 #include <ReactCoreInjection.h>
@@ -62,14 +66,43 @@ std::map<std::string, std::wstring> NativeStrings(
   return result;
 }
 
-std::optional<std::wstring> ShowPicker(HWND owner, bool save) {
+std::optional<std::wstring> ShowPicker(HWND owner) {
   winrt::com_ptr<IFileDialog> dialog;
-  HRESULT created = CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+  HRESULT created = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
       IID_PPV_ARGS(dialog.put()));
   if (FAILED(created)) return std::nullopt;
   DWORD options = 0;
   if (SUCCEEDED(dialog->GetOptions(&options))) dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-  if (save) dialog->SetFileName(L"litellm-menu-config.json");
+  HRESULT shown = dialog->Show(owner);
+  if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED) || FAILED(shown)) return std::nullopt;
+  IShellItem* item = nullptr;
+  if (FAILED(dialog->GetResult(&item)) || item == nullptr) return std::nullopt;
+  PWSTR path = nullptr;
+  HRESULT name_result = item->GetDisplayName(SIGDN_FILESYSPATH, &path);
+  item->Release();
+  if (FAILED(name_result) || path == nullptr) return std::nullopt;
+  std::wstring result(path);
+  CoTaskMemFree(path);
+  return result.empty() ? std::nullopt : std::optional<std::wstring>(std::move(result));
+}
+
+std::optional<std::wstring> ShowSavePicker(
+    HWND owner,
+    std::wstring const& suggested_name,
+    std::wstring const& json_filter,
+    std::wstring const& all_filter) {
+  if (suggested_name.empty() || suggested_name.size() > 255 ||
+      suggested_name.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) return std::nullopt;
+  winrt::com_ptr<IFileDialog> dialog;
+  HRESULT created = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+      IID_PPV_ARGS(dialog.put()));
+  if (FAILED(created)) return std::nullopt;
+  DWORD options = 0;
+  if (SUCCEEDED(dialog->GetOptions(&options))) dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_OVERWRITEPROMPT);
+  dialog->SetFileName(suggested_name.c_str());
+  COMDLG_FILTERSPEC filters[] = {{json_filter.c_str(), L"*.json"}, {all_filter.c_str(), L"*.*"}};
+  dialog->SetFileTypes(2, filters);
+  dialog->SetDefaultExtension(L"json");
   HRESULT shown = dialog->Show(owner);
   if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED) || FAILED(shown)) return std::nullopt;
   IShellItem* item = nullptr;
@@ -187,7 +220,7 @@ void WinUI3NativeLeafModule::OpenFilePicker(
     auto js_dispatcher = context_.JSDispatcher();
     context_.UIDispatcher().Post([owner, purpose, promise, js_dispatcher] {
       try {
-        auto selected = ShowPicker(owner, false);
+        auto selected = ShowPicker(owner);
         if (!selected) {
           js_dispatcher.Post([promise] { promise.Resolve(std::nullopt); });
           return;
@@ -206,20 +239,25 @@ void WinUI3NativeLeafModule::OpenFilePicker(
 }
 
 void WinUI3NativeLeafModule::SaveFilePicker(
-    std::string const& purpose,
+    std::wstring const& suggested_name,
     winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::string>> const& promise) noexcept {
   try {
     auto owner = HostWindow(context_);
     auto js_dispatcher = context_.JSDispatcher();
-    context_.UIDispatcher().Post([owner, purpose, promise, js_dispatcher] {
+    auto leaf = leaf_;
+    context_.UIDispatcher().Post([owner, suggested_name, promise, js_dispatcher, leaf] {
       try {
-        auto selected = ShowPicker(owner, true);
+        auto selected = ShowSavePicker(
+            owner,
+            suggested_name,
+            leaf->Localized("fileFilterJson", L"JSON files"),
+            leaf->Localized("fileFilterAll", L"All files"));
         if (!selected) {
           js_dispatcher.Post([promise] { promise.Resolve(std::nullopt); });
           return;
         }
-        std::thread([selected = std::move(*selected), purpose, promise, js_dispatcher] {
-          auto token = CoreIPCBridge::Shared().RegisterFileCapability(selected, purpose);
+        std::thread([selected = std::move(*selected), promise, js_dispatcher] {
+          auto token = CoreIPCBridge::Shared().RegisterFileCapability(selected, "export");
           js_dispatcher.Post([promise, token] { promise.Resolve(token); });
         }).detach();
       } catch (...) {
@@ -249,6 +287,43 @@ void WinUI3NativeLeafModule::ShowConfirmation(
     });
   } catch (...) {
     promise.Resolve(false);
+  }
+}
+
+void WinUI3NativeLeafModule::ShowActionMenu(
+    std::wstring const& title,
+    std::vector<std::wstring> const& items,
+    winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept {
+  auto number = [&anchor](char const* key) -> std::optional<double> {
+    auto found = anchor.find(key);
+    if (found == anchor.end()) return std::nullopt;
+    if (auto value = found->second.TryGetDouble()) return *value;
+    if (auto value = found->second.TryGetInt64()) return static_cast<double>(*value);
+    return std::nullopt;
+  };
+  auto x = number("x");
+  auto y = number("y");
+  auto width = number("width");
+  auto height = number("height");
+  if (!x || !y || !width || !height || !std::isfinite(*x) || !std::isfinite(*y) ||
+      !std::isfinite(*width) || !std::isfinite(*height) || *x < 0 || *y < 0 ||
+      *width <= 0 || *height <= 0 || *width > 8192 || *height > 8192) {
+    promise.Resolve(std::nullopt);
+    return;
+  }
+  try {
+    auto leaf = leaf_;
+    auto js_dispatcher = context_.JSDispatcher();
+    LiteLLMMenu::NativeMenuAnchor menu_anchor{*x, *y, *width, *height};
+    context_.UIDispatcher().Post([leaf, title, items, menu_anchor, promise, js_dispatcher] {
+      auto selected = leaf->ShowActionMenu(title, items, menu_anchor);
+      js_dispatcher.Post([promise, selected] {
+        promise.Resolve(selected ? std::optional<double>(static_cast<double>(*selected)) : std::nullopt);
+      });
+    });
+  } catch (...) {
+    promise.Resolve(std::nullopt);
   }
 }
 
@@ -479,6 +554,160 @@ void WinUI3NativeLeafModule::ClearSecret(
     }).detach();
   } catch (...) {
     promise.Resolve(std::nullopt);
+  }
+}
+
+void WinUI3NativeLeafModule::RelayLogin(
+    winrt::Microsoft::ReactNative::JSValueObject const& options,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept {
+  static std::atomic_bool login_active{false};
+  auto field = [&options](char const* name) -> std::optional<std::string> {
+    auto found = options.find(name);
+    if (found == options.end()) return std::nullopt;
+    auto value = found->second.TryGetString();
+    return value ? std::optional<std::string>(*value) : std::nullopt;
+  };
+  auto account_id = field("accountId");
+  auto account_type = field("type");
+  auto label = field("label");
+  auto origin = field("origin");
+  auto language = field("language");
+  auto username = field("username");
+  auto remember_entry = options.find("rememberPassword");
+  std::optional<bool> remember_password;
+  if (remember_entry != options.end()) remember_password = remember_entry->second.TryGetBoolean();
+  static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "language", "username", "rememberPassword"};
+  auto const ui_language = language.value_or("system");
+  if (options.size() > allowed.size() ||
+      std::any_of(options.begin(), options.end(), [&allowed](auto const& entry) { return allowed.find(entry.first) == allowed.end(); }) ||
+      !account_id || !account_type || !label || !origin || !remember_password ||
+      (options.find("language") != options.end() && !language) ||
+      account_id->empty() || account_id->size() > 96 || label->empty() || label->size() > 160 ||
+      origin->empty() || origin->size() > 2048 ||
+      (ui_language != "system" && ui_language != "en" && ui_language != "zh-Hans") ||
+      (username && username->size() > 320)) {
+    promise.Reject("The relay account is invalid.");
+    return;
+  }
+  bool expected = false;
+  if (!login_active.compare_exchange_strong(expected, true)) {
+    promise.Reject("A relay account sign-in is already open.");
+    return;
+  }
+  try {
+  auto owner = HostWindow(context_);
+  auto js_dispatcher = context_.JSDispatcher();
+  WindowsRelayLoginOptions native_options{
+        *account_id, *account_type, *label, *origin, username, *remember_password};
+  native_options.language = ui_language;
+    context_.UIDispatcher().Post([
+        owner, native_options = std::move(native_options), promise, js_dispatcher]() mutable {
+      std::optional<WindowsRelayLoginResult> result;
+      try {
+        result = RunWindowsRelayLogin(owner, native_options);
+      } catch (...) {
+      }
+      login_active.store(false);
+      js_dispatcher.Post([promise, result = std::move(result)]() mutable {
+        if (!result) {
+          promise.Resolve(std::nullopt);
+          return;
+        }
+        winrt::Microsoft::ReactNative::JSValueObject value;
+        value["revision"] = result->revision;
+        value["loginStatus"] = "signed_in";
+        value["username"] = std::move(result->username);
+        promise.Resolve(std::optional<winrt::Microsoft::ReactNative::JSValueObject>(std::move(value)));
+      });
+    });
+  } catch (...) {
+    login_active.store(false);
+    promise.Resolve(std::nullopt);
+  }
+}
+
+void WinUI3NativeLeafModule::RestoreRelaySession(
+    winrt::Microsoft::ReactNative::JSValueObject const& options,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept {
+  auto field = [&options](char const* name) -> std::optional<std::string> {
+    auto found = options.find(name);
+    if (found == options.end()) return std::nullopt;
+    auto value = found->second.TryGetString();
+    return value ? std::optional<std::string>(*value) : std::nullopt;
+  };
+  auto account_id = field("accountId");
+  auto account_type = field("type");
+  auto label = field("label");
+  auto origin = field("origin");
+  auto username = field("username");
+  static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "username"};
+  if (
+      std::any_of(options.begin(), options.end(), [&allowed](auto const& entry) { return allowed.find(entry.first) == allowed.end(); }) ||
+      !account_id || !account_type || !label || !origin ||
+      account_id->empty() || account_id->size() > 96 || label->empty() || label->size() > 160 ||
+      origin->empty() || origin->size() > 2048 || (username && username->size() > 320) ||
+      (options.find("username") != options.end() && !username)) {
+    promise.Reject("The relay account is invalid.");
+    return;
+  }
+  try {
+    auto js_dispatcher = context_.JSDispatcher();
+    WindowsRelayLoginOptions native_options{
+        *account_id, *account_type, *label, *origin, username, false};
+    std::thread([native_options = std::move(native_options), promise, js_dispatcher] () mutable {
+      std::optional<WindowsRelaySessionRestoreResult> result;
+      try {
+        result = RestoreWindowsRelaySession(native_options);
+      } catch (...) {
+      }
+      js_dispatcher.Post([promise, result = std::move(result)]() mutable {
+        if (!result) {
+          promise.Resolve(std::nullopt);
+          return;
+        }
+        winrt::Microsoft::ReactNative::JSValueObject value;
+        value["revision"] = result->revision;
+        value["loginStatus"] = std::move(result->login_status);
+        value["username"] = std::move(result->username);
+        promise.Resolve(std::optional<winrt::Microsoft::ReactNative::JSValueObject>(std::move(value)));
+      });
+    }).detach();
+  } catch (...) {
+    promise.Resolve(std::nullopt);
+  }
+}
+
+void WinUI3NativeLeafModule::ClearRelayCredentials(
+    std::string const& account_id,
+    winrt::Microsoft::ReactNative::ReactPromise<void> const& promise) noexcept {
+  try {
+    auto js_dispatcher = context_.JSDispatcher();
+    std::thread([account_id, promise, js_dispatcher] {
+      auto removed = ClearWindowsRelayCredentials(account_id);
+      js_dispatcher.Post([promise, removed] {
+        if (removed) promise.Resolve();
+        else promise.Reject("The relay credentials could not be removed.");
+      });
+    }).detach();
+  } catch (...) {
+    promise.Reject("The relay credentials could not be removed.");
+  }
+}
+
+void WinUI3NativeLeafModule::ClearRelayPassword(
+    std::string const& account_id,
+    winrt::Microsoft::ReactNative::ReactPromise<void> const& promise) noexcept {
+  try {
+    auto js_dispatcher = context_.JSDispatcher();
+    std::thread([account_id, promise, js_dispatcher] {
+      auto removed = ClearWindowsRelayPassword(account_id);
+      js_dispatcher.Post([promise, removed] {
+        if (removed) promise.Resolve();
+        else promise.Reject("The remembered relay password could not be removed.");
+      });
+    }).detach();
+  } catch (...) {
+    promise.Reject("The remembered relay password could not be removed.");
   }
 }
 

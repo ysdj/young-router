@@ -758,18 +758,31 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
     structured["api_key"] = auth.get("OPENAI_API_KEY") if isinstance(auth.get("OPENAI_API_KEY"), str) else ""
 
     raw_features = _get_mapping(config.get("features"))
+
+    def structured_feature_value(key: str) -> bool | None:
+        value = raw_features.get(key)
+        if isinstance(value, bool):
+            return value
+        # Older drafts can still contain a short UI alias. Read it into the
+        # canonical field, but never expose a second control for that alias.
+        for alias, canonical_key in FEATURE_KEY_ALIASES.items():
+            if canonical_key == key:
+                alias_value = raw_features.get(alias)
+                if isinstance(alias_value, bool):
+                    return alias_value
+        return None
+
     feature_keys = list(SUPPORTED_FEATURE_KEYS)
-    feature_keys.extend(FEATURE_KEY_ALIASES)
     feature_keys.extend(
-        key for key in raw_features if isinstance(key, str) and key not in feature_keys
+        key
+        for key in raw_features
+        if isinstance(key, str) and key not in feature_keys and key not in FEATURE_KEY_ALIASES
     )
     structured["features"] = {
-        key: raw_features.get(FEATURE_KEY_ALIASES.get(key, key))
-        if isinstance(raw_features.get(FEATURE_KEY_ALIASES.get(key, key)), bool)
-        else None
+        key: structured_feature_value(key)
         for key in feature_keys
     }
-    structured["supported_features"] = list(SUPPORTED_FEATURE_KEYS) + list(FEATURE_KEY_ALIASES)
+    structured["supported_features"] = list(SUPPORTED_FEATURE_KEYS)
 
     sandbox = _get_mapping(config.get("sandbox_workspace_write"))
     structured["permissions"] = {

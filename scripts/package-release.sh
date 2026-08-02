@@ -53,6 +53,8 @@ CORE="$APP/Contents/Resources/Core"
 (
   cd "$ROOT/rn"
   LITELLM_MENU_MACOS_OUTPUT="$APP" \
+    LITELLM_MENU_REFRESH_PODS=1 \
+    LITELLM_MENU_RESET_METRO_CACHE=1 \
     LITELLM_UV_BIN="$UV_BIN" \
     pnpm run build:macos
 )
@@ -66,6 +68,9 @@ test -f "$CORE/sitecustomize.py"
 plutil -lint "$APP/Contents/Info.plist"
 test "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" = "$VERSION"
 test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" = "$BUILD_NUMBER"
+# Release verification exercises the bundled fallback catalog, not a mutable
+# remote refresh that can delay or fail an otherwise self-contained package.
+export LITELLM_LOCAL_MODEL_COST_MAP=true
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$CORE" \
   "$CORE/runtime/bin/python" -c \
   'import litellm.proxy.proxy_server, litellm_menu.core, codex_config, config_editor_core, configuration_package, webdav.core'

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 
-from . import image_generation as _image_generation_module
+from . import image_inputs as _image_inputs_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
@@ -13,7 +15,6 @@ from . import tools as _tools_module
 
 from .base import (
     Any,
-    _CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY,
     Dict,
     List,
     Optional,
@@ -568,7 +569,7 @@ def _trace_client_surface(request_kwargs: Optional[dict]) -> str:
         and call_type.lower() in {"image_generation", "aimage_generation"}
     ):
         return "image_generation"
-    if endpoint == "/v1/responses" or _image_generation_module._request_is_responses_api(request_kwargs):
+    if endpoint == "/v1/responses" or _responses_request_module._request_is_responses_api(request_kwargs):
         return "responses"
     if endpoint in {"/v1/chat/completions", "/v1/completions"}:
         return "chat"
@@ -585,12 +586,12 @@ def _trace_effective_upstream_surface(request_kwargs: Optional[dict]) -> str:
         return "image_generation"
     if request_kwargs.get("use_chat_completions_api") is True:
         return "chat"
-    metadata = _image_generation_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
+    metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     if metadata.get(_RESPONSES_CHAT_BRIDGE_METADATA_KEY) is True:
         return "chat"
     if _responses_surfaces_module._request_uses_responses_endpoint(request_kwargs):
         return "responses"
-    model_info = _image_generation_module._request_model_info(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
     surface = model_info.get(_UPSTREAM_URL_SURFACE_KEY)
     if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
         return "responses"
@@ -606,8 +607,8 @@ def _trace_interface_summary(
     method_name: Any = None,
 ) -> dict[str, Any]:
     request_kwargs = request_kwargs or {}
-    model_info = _image_generation_module._request_model_info(request_kwargs)
-    api_base = _image_generation_module._request_api_base(request_kwargs)
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    api_base = _responses_request_module._request_api_base(request_kwargs)
     call_type_value = call_type if call_type is not None else request_kwargs.get("call_type")
     method_value = method_name if method_name is not None else None
     if method_value is None:
@@ -624,9 +625,9 @@ def _trace_interface_summary(
         if method_value is not None
         else None,
         "stream": request_kwargs.get("stream") is True,
-        "is_responses_api": _image_generation_module._request_is_responses_api(request_kwargs),
+        "is_responses_api": _responses_request_module._request_is_responses_api(request_kwargs),
         "use_chat_completions_api": request_kwargs.get("use_chat_completions_api") is True,
-        "api_base_host": _image_generation_module._api_base_host(api_base),
+        "api_base_host": _responses_request_module._api_base_host(api_base),
         "upstream_url_surface": model_info.get(_UPSTREAM_URL_SURFACE_KEY),
         "supported_upstream_url_surfaces": _trace_limited_value(supported_surfaces, limit=120),
         "supports_responses_image_input": model_info.get(_RESPONSES_IMAGE_INPUT_SUPPORT_KEY),
@@ -759,7 +760,7 @@ def _trace_tools_summary(request_kwargs: Optional[dict]) -> dict[str, Any]:
         "has_image_generation_tool": _tools_module._request_has_image_generation_tool(
             effective_request
         ),
-        "has_image_input": _image_generation_module._request_has_image_input(request_kwargs),
+        "has_image_input": _image_inputs_module._request_has_image_input(request_kwargs),
         "has_web_search_options": "web_search_options" in request_kwargs,
     }
 
@@ -767,7 +768,6 @@ def _trace_tools_summary(request_kwargs: Optional[dict]) -> dict[str, Any]:
 def _trace_metadata_flags(request_kwargs: Optional[dict]) -> dict[str, Any]:
     request_kwargs = request_kwargs or {}
     flag_keys = (
-        _CODEX_TOOL_RUNTIME_RECOVERY_METADATA_KEY,
         _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
         _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
         _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
@@ -782,6 +782,7 @@ def _trace_metadata_flags(request_kwargs: Optional[dict]) -> dict[str, Any]:
         _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
         _WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY,
         _XHIGH_REASONING_COMPAT_RETRY_METADATA_KEY,
+        "codex_descendant_cleanup",
         "codex_compaction_optimized",
         "codex_compaction_max_output_tokens",
         "external_web_search_synthesis",
@@ -794,7 +795,7 @@ def _trace_metadata_flags(request_kwargs: Optional[dict]) -> dict[str, Any]:
     )
     flags: dict[str, Any] = {}
     for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _image_generation_module._request_metadata_dict(request_kwargs, metadata_key) or {}
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key) or {}
         for key in flag_keys:
             if key in metadata:
                 flags[key] = _trace_limited_value(metadata.get(key), limit=160)
@@ -814,8 +815,8 @@ def _trace_request_summary(
         "model_group": _responses_execution_module._request_model_group(request_kwargs),
         "deployment_id": _routing_module._deployment_id_from_request(request_kwargs),
         "route_key": _routing_module._deployment_route_key_from_request(request_kwargs),
-        "target_order": _image_generation_module._request_target_order(request_kwargs),
-        "excluded_deployment_ids": sorted(_image_generation_module._request_excluded_deployment_ids(request_kwargs)),
+        "target_order": _responses_request_module._request_target_order(request_kwargs),
+        "excluded_deployment_ids": sorted(_responses_request_module._request_excluded_deployment_ids(request_kwargs)),
         "preview": _trace_request_preview(request_kwargs, messages=messages),
         "input_shape": _trace_responses_input_shape(request_kwargs),
         "interface": _trace_interface_summary(

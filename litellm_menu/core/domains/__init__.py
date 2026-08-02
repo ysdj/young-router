@@ -15,13 +15,11 @@ from .language import (
     create_translator,
     resolve_language,
 )
-from .legacy import (
-    CodexSettingsDomain,
-    LegacyDomainError,
-    ProvidersModelsDomain,
-    RuntimeSettingsDomain,
-    WebDAVSettingsDomain,
-)
+from ._shared import LegacyDomainError
+from .codex import CodexSettingsDomain
+from .providers_models import ProvidersModelsDomain
+from .runtime import RuntimeSettingsDomain
+from .webdav import WebDAVSettingsDomain
 from .logs import LogsDomain, LogsDomainError
 
 __all__ = [

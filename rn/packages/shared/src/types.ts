@@ -2,6 +2,7 @@ export const IPC_PROTOCOL_VERSION = 1 as const;
 
 export type IpcMethod =
   | "snapshot"
+  | "logs"
   | "editor"
   | "dispatch"
   | "subscribe"
@@ -18,8 +19,8 @@ export type AppRoute =
   | "codex-settings"
   | "claude-settings"
   | "runtime-settings"
-  | "configuration-package"
   | "webdav-settings"
+  | "relay-accounts"
   | "logs";
 
 export type LogTab =
@@ -37,7 +38,8 @@ export type ConfigDomain =
   | "runtime"
   | "webdav"
   | "logs"
-  | "language";
+  | "language"
+  | "relay_accounts";
 
 export type LanguagePreference = "system" | "en" | "zh-Hans";
 
@@ -56,13 +58,30 @@ export interface ServiceStatus {
   state: "starting" | "running" | "unhealthy" | "stopped" | "unknown";
   detail?: string;
   pid?: number;
+  port?: number;
   auto_start_state?: "enabled" | "disabled";
+  route_recovery?: {
+    recovering?: number;
+    cooldown?: number;
+  };
+  webdav?: {
+    enabled?: boolean;
+    ok?: boolean | null;
+    checked_at?: string | null;
+    action?: string | null;
+  };
 }
 
 export interface DraftState {
   dirty: boolean;
   base_revision: number;
   validation: ValidationSummary;
+}
+
+export interface DiskState {
+  changed: boolean;
+  generation: number;
+  keep_draft?: boolean;
 }
 
 export interface ValidationSummary {
@@ -96,6 +115,12 @@ export interface ProviderModelSummary {
   order: number | string;
   billing?: string;
   usage?: string;
+  probe?: {
+    available: boolean;
+    recommended_surface?: "openai/responses" | "openai/chat" | "anthropic" | null;
+    checked_at?: string;
+    surfaces?: Record<string, { available: boolean; status?: string }>;
+  };
 }
 
 export interface ProvidersModelsSummary {
@@ -115,9 +140,12 @@ export interface LogSummary {
   available: boolean;
   paused: boolean;
   line_count: number;
-  records: Array<Record<string, unknown> | string>;
   filter: string;
   limit: number;
+}
+
+export interface LogView extends LogSummary {
+  records: Array<Record<string, unknown> | string>;
 }
 
 export interface CoreSnapshot {
@@ -126,6 +154,7 @@ export interface CoreSnapshot {
   service: ServiceStatus;
   providers_models: ProvidersModelsSummary;
   drafts: Partial<Record<ConfigDomain, DraftState>>;
+  disk: Partial<Record<ConfigDomain, DiskState>>;
   webdav: WebDavStatus;
   logs: Record<LogTab, LogSummary>;
   language: LanguagePreference;
@@ -141,6 +170,7 @@ export interface DispatchAction {
 
 export interface IpcParams {
   snapshot: Record<string, never>;
+  logs: { tab: LogTab; revision?: number };
   editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" };
   dispatch: { action: DispatchAction; revision?: number };
   subscribe: { topics?: string[] };
@@ -154,13 +184,23 @@ export interface IpcParams {
 
 export interface IpcResults {
   snapshot: { snapshot: CoreSnapshot };
+  logs: { changed: boolean; revision: number; log: LogView | null };
   editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings"; editor_token: string; revision: number };
   dispatch: { revision: number };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
   apply: { revision: number; applied: true; domains?: ConfigDomain[] };
   reload: { revision: number };
-  probe: { ok: boolean; protocols: string[]; detail?: string };
+  probe: {
+    ok: boolean;
+    protocols: string[];
+    detail?: string;
+    available?: boolean;
+    provider_id?: string;
+    model_id?: string;
+    recommended_surface?: "openai/responses" | "openai/chat" | "anthropic" | null;
+    surfaces?: { surface: string; available: boolean; status?: string }[];
+  };
   export: { revision: number; section_count: number; sections?: ConfigDomain[] };
   import: {
     revision: number;
@@ -206,6 +246,7 @@ export interface IpcTransport {
 export interface IpcClient {
   readonly endpoint?: IpcEndpoint;
   snapshot(): Promise<CoreSnapshot>;
+  logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
   editor(domain: "codex" | "claude", document: "config" | "auth" | "settings"): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<{ revision: number }>;
   subscribe(listener: (event: IpcEvent) => void, topics?: string[]): () => void;
@@ -262,7 +303,19 @@ export type NativeTrayAdapter = NativeTray;
 
 export interface NativeLocalization {
   appTitle: string;
+  autoStart: string;
   serviceUnavailable: string;
+  serviceStatus: string;
+  serviceStarting: string;
+  serviceRunning: string;
+  serviceRunningOnPort: string;
+  serviceUnhealthy: string;
+  serviceStopped: string;
+  serviceUnknown: string;
+  languageMenu: string;
+  languageSystem: string;
+  languageEnglish: string;
+  languageSimplifiedChinese: string;
   cancel: string;
   set: string;
   clear: string;
@@ -279,6 +332,7 @@ export interface NativeLocalization {
   settings: string;
   reload: string;
   closeWindow: string;
+  menuQuit: string;
   version: string;
   build: string;
   ok: string;
@@ -288,17 +342,35 @@ export interface NativeLocalization {
   routeCodexSettings: string;
   routeClaudeSettings: string;
   routeRuntimeSettings: string;
-  routeConfigurationPackage: string;
   routeWebdavSettings: string;
+  routeRelayAccounts: string;
   routeLogs: string;
+  modelChooserTitle: string;
+  modelChooserHeading: string;
+  modelChooserProvider: string;
+  modelChooserKey: string;
+  modelChooserSearch: string;
+  modelChooserAll: string;
+  modelChooserSelectAllVisible: string;
+  modelChooserInvert: string;
+  modelChooserInvertVisible: string;
+  modelChooserAddSelected: string;
+  modelChooserCount: string;
+  modelChooserCountFiltered: string;
+  modelChooserCountSelected: string;
+  modelChooserEmpty: string;
+  modelChooserNoMatches: string;
+  fileFilterJson: string;
+  fileFilterAll: string;
 }
 
 export interface NativeLeafAdapter {
   window: NativeWindow;
   menuBar: NativeMenuBar;
   tray: NativeTray;
-  openFilePicker(options: { purpose: "import" | "claude-profile" }): Promise<string | undefined>;
-  saveFilePicker(options: { purpose: "export" }): Promise<string | undefined>;
+  openFilePicker(options: { purpose: "import" }): Promise<string | undefined>;
+  saveFilePicker(options: { suggestedName: string }): Promise<string | undefined>;
+  showActionMenu(options: { title: string; items: string[]; anchor: NativeMenuAnchor }): Promise<number | undefined>;
   showConfirmation(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
   chooseModelsToAdd(options: {
     models: string[];
@@ -318,7 +390,40 @@ export interface NativeLeafAdapter {
     field: string;
     target?: string;
   }): Promise<{ revision: number; present: boolean } | undefined>;
+  relayLogin(options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+    username?: string;
+    rememberPassword: boolean;
+  }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
+  restoreRelaySession(options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    username?: string;
+  }): Promise<{ revision: number; loginStatus: "signed_in" | "signed_out" | "expired"; username: string } | undefined>;
+  openRelayLogs(options: {
+    accountId: string;
+    type: "newapi" | "sub2api";
+    label: string;
+    origin: string;
+    language: LanguagePreference;
+  }): Promise<void>;
+  clearRelayPassword(accountId: string): Promise<void>;
+  clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
+}
+
+/** The triggering control's window-local rectangle, in React Native DIPs. */
+export interface NativeMenuAnchor {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }

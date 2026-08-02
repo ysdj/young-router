@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from . import image_generation as _image_generation_module
+from . import image_inputs as _image_inputs_module
+from . import responses_output as _responses_output_module
+from . import responses_request as _responses_request_module
+from . import request_context as _request_context_module
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
@@ -81,17 +85,17 @@ class LiteLLMMenuHook(CustomLogger):
         changed = False
         for update_request in (
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
-            _image_generation_module._with_bounded_image_inputs,
-            _image_generation_module._with_internal_litellm_metadata,
-            _image_generation_module._with_codex_tool_runtime_recovery_hints,
-            _image_generation_module._with_empty_tool_controls_removed,
-            _image_generation_module._with_codex_compaction_controls,
-            _image_generation_module._with_codex_compaction_input_bounded,
-            _image_generation_module._with_responses_native_extra_body,
-            _image_generation_module._with_codex_compaction_headers,
-            _image_generation_module._with_stream_request_timeout,
-            _image_generation_module._with_incoming_user_agent_header,
-            _image_generation_module._with_browser_compatible_headers,
+            _responses_request_module._with_plaintext_agent_message_content_restored,
+            _image_inputs_module._with_bounded_image_inputs,
+            _responses_request_module._with_internal_litellm_metadata,
+            _responses_request_module._with_codex_descendant_cleanup_instruction,
+            _responses_request_module._with_empty_tool_controls_removed,
+            _responses_request_module._with_codex_compaction_controls,
+            _responses_request_module._with_responses_native_extra_body,
+            _responses_request_module._with_codex_compaction_headers,
+            _responses_request_module._with_stream_request_timeout,
+            _responses_request_module._with_incoming_user_agent_header,
+            _responses_request_module._with_browser_compatible_headers,
         ):
             updated_kwargs = update_request(modified_kwargs)
             if updated_kwargs is None:
@@ -119,7 +123,7 @@ class LiteLLMMenuHook(CustomLogger):
     ) -> List[dict]:
         try:
             original_deployments = healthy_deployments
-            candidate_deployments = _image_generation_module._with_retry_target_constraints(
+            candidate_deployments = _responses_request_module._with_retry_target_constraints(
                 healthy_deployments,
                 request_kwargs,
             )
@@ -141,13 +145,13 @@ class LiteLLMMenuHook(CustomLogger):
 
             if (
                 not has_image_generation_tool
-                and _image_generation_module._request_has_image_input(request_kwargs)
-                and _image_generation_module._request_is_responses_api(request_kwargs)
+                and _image_inputs_module._request_has_image_input(request_kwargs)
+                and _responses_request_module._request_is_responses_api(request_kwargs)
             ):
                 responses_image_safe = [
                     deployment
                     for deployment in candidate_deployments
-                    if _image_generation_module._deployment_allows_responses_image_input(deployment)
+                    if _image_inputs_module._deployment_allows_responses_image_input(deployment)
                 ]
                 responses_image_input_filtered = bool(responses_image_safe)
                 candidate_deployments = responses_image_safe or candidate_deployments
@@ -157,11 +161,11 @@ class LiteLLMMenuHook(CustomLogger):
                 request_id=_routing_module._trace_request_id(request_kwargs),
                 session=_routing_module._trace_session_context(request_kwargs),
                 model_group=model,
-                target_order=_image_generation_module._request_target_order(request_kwargs),
-                excluded_deployment_ids=sorted(_image_generation_module._request_excluded_deployment_ids(request_kwargs)),
+                target_order=_responses_request_module._request_target_order(request_kwargs),
+                excluded_deployment_ids=sorted(_responses_request_module._request_excluded_deployment_ids(request_kwargs)),
                 has_image_generation_tool=has_image_generation_tool,
                 has_web_search_tool=_tools_module._request_has_web_search_tool(request_kwargs),
-                has_image_input=_image_generation_module._request_has_image_input(request_kwargs),
+                has_image_input=_image_inputs_module._request_has_image_input(request_kwargs),
                 deployment_cooldown_filtered=cooldown_filtered,
                 deployment_cooldown_all_candidates=bool(
                     cooldown_deployments and not after_cooldown
@@ -200,7 +204,7 @@ class LiteLLMMenuHook(CustomLogger):
     ) -> Optional[Any]:
         if request_data.get("stream") is not True:
             _routing_module._record_deployment_success_for_cooldown(request_data)
-        response = _image_generation_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
+        response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
         response = _responses_web_search_bridge_module._sanitize_response_stream_payload(
             response,
             request_data,
@@ -237,7 +241,7 @@ class LiteLLMMenuHook(CustomLogger):
             return response
         if (
             not _image_generation_module._request_forces_image_generation_tool(request_data)
-            and not _image_generation_module._request_already_attempted_streaming_fallback(request_data)
+            and not _responses_request_module._request_already_attempted_streaming_fallback(request_data)
         ):
             fallback_exception = _image_generation_module._image_generation_tool_runtime_fallback_exception()
             _routing_module._mark_exception_for_deployment_failover(fallback_exception, request_data)
@@ -253,7 +257,7 @@ class LiteLLMMenuHook(CustomLogger):
                     raise _image_generation_module._image_generation_tool_runtime_fallback_exception()
         raise litellm.InternalServerError(
             message="upstream returned no usable image_generation result while image_generation was available; trying fallback deployment",
-            model=_image_generation_module._request_model_for_error(request_data),
+            model=_request_context_module._request_model_for_error(request_data),
             llm_provider="",
         )
         return response
@@ -270,10 +274,10 @@ class LiteLLMMenuHook(CustomLogger):
                 request_data,
             )
 
-        response = _image_generation_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
+        response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
         if (
             _tools_module._request_has_web_search_tool(request_data)
-            and _image_generation_module._response_is_async_iterable(response)
+            and _responses_output_module._response_is_async_iterable(response)
         ):
             response = _responses_web_search_bridge_module._adapt_provider_hidden_web_search_stream(
                 response,
@@ -282,7 +286,7 @@ class LiteLLMMenuHook(CustomLogger):
         if (
             not _tools_module._request_has_image_generation_tool(request_data)
             or _image_generation_module._request_forces_image_generation_tool(request_data)
-            or _image_generation_module._request_already_attempted_streaming_fallback(request_data)
+            or _responses_request_module._request_already_attempted_streaming_fallback(request_data)
         ):
             async for chunk in _streaming_module._yield_start_buffered_stream_with_error_fallback(
                 response,
@@ -296,7 +300,7 @@ class LiteLLMMenuHook(CustomLogger):
         should_fallback = False
         should_passthrough = False
 
-        if not _image_generation_module._response_is_async_iterable(response):
+        if not _responses_output_module._response_is_async_iterable(response):
             async for chunk in _streaming_module._non_streaming_response_as_stream(response, request_data):
                 yield deliver_chunk(chunk)
             return
@@ -320,7 +324,7 @@ class LiteLLMMenuHook(CustomLogger):
                     should_passthrough = True
                     break
 
-                chunk_text = _image_generation_module._response_text(chunk)
+                chunk_text = _responses_output_module._response_text(chunk)
                 if chunk_text:
                     text = f"{text}\n{chunk_text}" if text else chunk_text
                     if _image_generation_module._response_is_image_generation_unavailable_refusal({"output_text": text}):

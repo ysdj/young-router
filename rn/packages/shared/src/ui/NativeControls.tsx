@@ -87,6 +87,19 @@ type CheckboxProps = {
   style?: StyleProp<ViewStyle>;
 };
 
+// Fabric lays out an opaque native component before AppKit/WinUI has an
+// opportunity to report the checkbox title's intrinsic size.  Without an
+// explicit minimum, a row-direction parent can therefore allocate only the
+// checkmark square and clip the label.  Keep the sizing policy shared so a
+// translated label is visible on both desktop hosts.
+function nativeCheckboxMinimumWidth(label: string): number {
+  const textWidth = Array.from(label).reduce((width, character) => {
+    if (/\s/u.test(character)) return width + 4;
+    return width + (/[^\u0000-\u024f]/u.test(character) ? 13 : 7.5);
+  }, 0);
+  return Math.ceil(26 + Math.max(24, textWidth));
+}
+
 type PickerProps = {
   labels: string[];
   selectedValue: string;
@@ -111,7 +124,11 @@ type TableProps = {
   rows: TableRow[];
   selectedKey?: string;
   alternatingRows?: boolean;
+  compact?: boolean;
+  followBottom?: boolean;
+  disabledRowKeys?: string[];
   onSelectionChange?: (key: string, index: number) => void;
+  onRowDoublePress?: (key: string, index: number) => void;
   style?: StyleProp<ViewStyle>;
 };
 
@@ -151,6 +168,8 @@ export type SecureTextInputProps = {
   target?: string;
   label: string;
   placeholder?: string;
+  plainText?: boolean;
+  autoCommit?: boolean;
   disabled?: boolean;
   commitRequest?: number;
   resetRequest?: number;
@@ -169,25 +188,35 @@ type SplitViewProps = {
   style?: StyleProp<ViewStyle>;
 };
 
-export function NativeButton(props: ButtonProps): React.JSX.Element {
+const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeButtonWithRef(props, ref): React.JSX.Element {
   const style = [props.link ? styles.linkButton : styles.button, props.style];
   if (Platform.OS === "windows") {
-    return <WinUIButton {...props} onPress={() => props.onPress?.()} style={style} />;
+    return <WinUIButton {...props} ref={ref as never} onPress={() => props.onPress?.()} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitButton {...props} />;
+    return <AppKitButton {...props} ref={ref as never} />;
   }
-  return <Pressable disabled={props.disabled} onPress={props.onPress} style={style} accessibilityRole={props.link ? "link" : "button"}><Text>{props.title}</Text></Pressable>;
+  return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={style} accessibilityRole={props.link ? "link" : "button"}><Text>{props.title}</Text></Pressable>;
+});
+
+// Keep the long-standing function export while allowing desktop callers to
+// pass a native ref for anchored menus. React 19 exposes ref as a prop.
+export function NativeButton(props: ButtonProps & { ref?: React.Ref<any> }): React.JSX.Element {
+  return <NativeButtonWithRef {...props} ref={props.ref} />;
 }
 
-export function NativeSegmentedControl({ labels, selectedValue, disabled, compact, onChange, style }: SegmentedProps): React.JSX.Element {
+const NativeSegmentedControlWithRef = React.forwardRef<any, SegmentedProps>(function NativeSegmentedControlWithRef({ labels, selectedValue, disabled, compact, onChange, style }, ref): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUISegmented labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={(event) => onChange?.({ ...event, nativeEvent: event.nativeEvent })} style={[styles.segmented, style]} />;
+    return <WinUISegmented ref={ref as never} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={(event) => onChange?.({ ...event, nativeEvent: event.nativeEvent })} style={[styles.segmented, style]} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitSegmentedControl labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
+    return <AppKitSegmentedControl ref={ref} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
   }
-  return <Pressable style={[styles.button, style]} disabled={disabled} accessibilityRole="tab"><Text>{labels.join(" / ")} ({selectedValue})</Text></Pressable>;
+  return <Pressable ref={ref as never} style={[styles.button, style]} disabled={disabled} accessibilityRole="tab"><Text>{labels.join(" / ")} ({selectedValue})</Text></Pressable>;
+});
+
+export function NativeSegmentedControl(props: SegmentedProps & { ref?: React.Ref<any> }): React.JSX.Element {
+  return <NativeSegmentedControlWithRef {...props} ref={props.ref} />;
 }
 
 export function NativeTextField({ style, onChangeText, onSubmitEditing, ...props }: TextInputProps): React.JSX.Element {
@@ -221,13 +250,14 @@ export function NativeSelectableRow({ title, detail, selected, disabled, onPress
 }
 
 export function NativeCheckbox({ label, value, disabled, compact, onValueChange, style }: CheckboxProps): React.JSX.Element {
+  const sizedStyle = [{ minWidth: nativeCheckboxMinimumWidth(label) }, style];
   if (Platform.OS === "windows") {
-    return <WinUICheckbox label={label} value={value} disabled={disabled} compact={compact} onValueChange={(event) => onValueChange?.(event.nativeEvent.value)} style={style} />;
+    return <WinUICheckbox label={label} value={value} disabled={disabled} compact={compact} onValueChange={(event) => onValueChange?.(event.nativeEvent.value)} style={sizedStyle} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitCheckbox label={label} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={style} />;
+    return <AppKitCheckbox label={label} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={sizedStyle} />;
   }
-  return <Pressable style={[styles.checkboxFallback, style]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="checkbox" accessibilityState={{ checked: value, disabled }}><Switch value={value} disabled={disabled} pointerEvents="none" /><Text>{label}</Text></Pressable>;
+  return <Pressable style={[styles.checkboxFallback, sizedStyle]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="checkbox" accessibilityState={{ checked: value, disabled }}><Switch value={value} disabled={disabled} pointerEvents="none" /><Text>{label}</Text></Pressable>;
 }
 
 export function NativePicker({ labels, selectedValue, disabled, compact, onChange, style }: PickerProps): React.JSX.Element {
@@ -240,7 +270,8 @@ export function NativePicker({ labels, selectedValue, disabled, compact, onChang
   return <NativeSegmentedControl labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
 }
 
-export function NativeTable({ columns, rows, selectedKey = "", alternatingRows = false, onSelectionChange, style }: TableProps): React.JSX.Element {
+
+export function NativeTable({ columns, rows, selectedKey = "", alternatingRows = false, compact = false, followBottom = false, disabledRowKeys = [], onSelectionChange, onRowDoublePress, style }: TableProps): React.JSX.Element {
   const nativeProps = {
     columnLabels: columns.map((column) => column.label),
     columnWidths: columns.map((column) => column.width),
@@ -248,14 +279,17 @@ export function NativeTable({ columns, rows, selectedKey = "", alternatingRows =
     cells: rows.flatMap((row) => row.cells),
     selectedKey,
     alternatingRows,
+    compact,
+    followBottom,
+    disabledRowKeys,
   };
   if (Platform.OS === "windows") {
-    return <WinUITable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
+    return <WinUITable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitTable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
+    return <AppKitTable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
-  return <View style={[styles.tableFallback, style]}>{rows.map((row, index) => <NativeSelectableRow key={row.key} title={row.cells[0] ?? ""} detail={row.cells.slice(1).join("  ")} selected={row.key === selectedKey} onPress={() => onSelectionChange?.(row.key, index)} />)}</View>;
+  return <View style={[styles.tableFallback, style]}>{rows.map((row, index) => <Pressable key={row.key} onPress={() => onSelectionChange?.(row.key, index)} onLongPress={() => onRowDoublePress?.(row.key, index)}><NativeSelectableRow title={row.cells[0] ?? ""} detail={row.cells.slice(1).join("  ")} selected={row.key === selectedKey} /></Pressable>)}</View>;
 }
 
 export function NativeTextEditor({ value, documentKey, readOnly, wrap = true, onChangeText, style }: TextEditorProps): React.JSX.Element {
@@ -268,25 +302,25 @@ export function NativeTextEditor({ value, documentKey, readOnly, wrap = true, on
   return <TextInput value={value} editable={!readOnly} multiline onChangeText={onChangeText} style={[styles.editorFallback, style]} />;
 }
 
-export function NativeSecureTextEditor({ editorToken, language, onEditorState, style }: SecureTextEditorProps): React.JSX.Element {
+export function NativeSecureTextEditor({ editorToken, language, onEditorState, style, unavailableLabel }: SecureTextEditorProps & { unavailableLabel: string }): React.JSX.Element {
   if (Platform.OS === "windows") {
     return <WinUISecureTextEditor editorToken={editorToken} language={language} onEditorState={(event) => onEditorState?.(event.nativeEvent)} style={[styles.editor, style]} />;
   }
   if (Platform.OS === "macos") {
     return <AppKitSecureTextEditor editorToken={editorToken} language={language} onEditorState={(event) => onEditorState?.(event.nativeEvent)} style={[styles.editor, style]} />;
   }
-  return <View accessibilityLabel="Secure editor unavailable" style={[styles.secureEditorUnavailable, style]}><Text style={styles.secureEditorUnavailableText}>Secure editor unavailable</Text></View>;
+  return <View accessibilityLabel={unavailableLabel} style={[styles.secureEditorUnavailable, style]}><Text style={styles.secureEditorUnavailableText}>{unavailableLabel}</Text></View>;
 }
 
 /** Native password leaves never pass secret text through React. */
-export function NativeSecureTextInput({ domain, field, target = "", label, placeholder, disabled, commitRequest, resetRequest, onSecretState, style }: SecureTextInputProps): React.JSX.Element {
+export function NativeSecureTextInput({ domain, field, target = "", label, placeholder, plainText = false, autoCommit = false, disabled, commitRequest, resetRequest, onSecretState, style }: SecureTextInputProps): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUISecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
+    return <WinUISecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
+    return <AppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
   }
-  return <View accessibilityLabel={`${label} secure input unavailable`} style={style} />;
+  return <View accessibilityLabel={label} style={style} />;
 }
 
 export function NativeSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpen = true, disabled, onPaneWidthChange, children, style }: SplitViewProps): React.JSX.Element {
@@ -313,7 +347,10 @@ const styles = StyleSheet.create({
   selectableTitle: { fontSize: 13 },
   selectableDetail: { fontSize: 11, opacity: 0.65 },
   table: { minHeight: 120 },
-  tableFallback: { minHeight: 120, overflow: "scroll" },
+  // Let the surrounding window provide scrolling when a fallback host needs
+  // it; `overflow: scroll` would force an empty scrollbar gutter on every
+  // table, even when all rows fit.
+  tableFallback: { minHeight: 120 },
   editor: { minHeight: 160 },
   editorFallback: { minHeight: 160, textAlignVertical: "top" },
   secureEditorUnavailable: { minHeight: 160, justifyContent: "center", alignItems: "center" },

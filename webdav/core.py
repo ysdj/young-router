@@ -229,6 +229,13 @@ def default_state_file() -> pathlib.Path:
     return default_root() / ".litellm-runtime" / "webdav-sync-state.json"
 
 
+def default_status_file() -> pathlib.Path:
+    status = os.environ.get("LITELLM_WEBDAV_SYNC_STATUS_FILE", "").strip()
+    if status:
+        return pathlib.Path(status).expanduser()
+    return default_root() / ".litellm-runtime" / "webdav-sync-status.json"
+
+
 def disabled_models_path(config_path: pathlib.Path) -> pathlib.Path:
     return config_path.with_name(f"{config_path.stem}.disabled-models.yaml")
 
@@ -576,6 +583,15 @@ def save_sync_state(path: pathlib.Path, settings: Settings, manifest: dict[str, 
         "remote_url": _redact_url(bundle_url(settings)),
         "remote_name": settings.remote_name,
         "manifest": manifest,
+    }
+    _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
+
+
+def save_sync_status(path: pathlib.Path, action: str, ok: bool) -> None:
+    data = {
+        "action": action,
+        "checked_at": _utc_now(),
+        "ok": bool(ok),
     }
     _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
 

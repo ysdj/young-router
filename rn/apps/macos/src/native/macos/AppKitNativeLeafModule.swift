@@ -98,16 +98,22 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
-    @objc func saveFilePicker(_ purpose: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+    @objc func saveFilePicker(_ suggestedName: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
         DispatchQueue.main.async {
-            let token = self.leaf.chooseExportFile()
-            resolve(token)
+            resolve(self.leaf.chooseExportFile(suggestedName: suggestedName))
         }
     }
 
     @objc func showConfirmation(_ title: String, message: String, confirmLabel: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
         DispatchQueue.main.async {
             resolve(self.leaf.confirm(title: title, message: message, confirmTitle: confirmLabel))
+        }
+    }
+
+    @objc(showActionMenu:items:anchor:resolver:rejecter:)
+    func showActionMenu(_ title: String, items: [String], anchor: [String: NSNumber], resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+        DispatchQueue.main.async {
+            resolve(self.leaf.showActionMenu(title: title, items: items, anchor: anchor))
         }
     }
 
@@ -294,6 +300,155 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 }
             }
         }
+    }
+
+    @objc(relayLogin:resolver:rejecter:)
+    func relayLogin(
+        _ options: [String: Any],
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "rememberPassword"]),
+              let accountID = options["accountId"] as? String,
+              let type = options["type"] as? String,
+              let label = options["label"] as? String,
+              let origin = options["origin"] as? String,
+              let rememberPassword = options["rememberPassword"] as? Bool else {
+            reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+            return
+        }
+        let language: String
+        if let value = options["language"] {
+            guard let suppliedLanguage = value as? String else {
+                reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+                return
+            }
+            language = suppliedLanguage
+        } else {
+            language = "system"
+        }
+        guard ["system", "en", "zh-Hans"].contains(language) else {
+            reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+            return
+        }
+        // WKWebView and its panel are created on AppKit's main thread, while
+        // the React promise is completed asynchronously after the browser
+        // flow finishes or is cancelled.
+        DispatchQueue.main.async {
+            self.leaf.relayLogin(
+                accountID: accountID,
+                type: type,
+                label: label,
+                origin: origin,
+                language: language,
+                username: options["username"] as? String,
+                rememberPassword: rememberPassword
+            ) { result in
+                DispatchQueue.main.async {
+                    guard let result else {
+                        resolve(nil)
+                        return
+                    }
+                    resolve(["revision": result.revision, "loginStatus": "signed_in", "username": result.username])
+                }
+            }
+        }
+    }
+
+    @objc(openRelayLogs:resolver:rejecter:)
+    func openRelayLogs(
+        _ options: [String: Any],
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language"]),
+              let accountID = options["accountId"] as? String,
+              let type = options["type"] as? String,
+              let label = options["label"] as? String,
+              let origin = options["origin"] as? String else {
+            reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+            return
+        }
+        let language = (options["language"] as? String) ?? "system"
+        guard ["system", "en", "zh-Hans"].contains(language) else {
+            reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+            return
+        }
+        DispatchQueue.main.async {
+            self.leaf.openRelayLogs(
+                accountID: accountID,
+                type: type,
+                label: label,
+                origin: origin,
+                language: language
+            ) {
+                DispatchQueue.main.async { resolve(nil) }
+            }
+        }
+    }
+
+    @objc(restoreRelaySession:resolver:rejecter:)
+    func restoreRelaySession(
+        _ options: [String: Any],
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard Set(options.keys).isSubset(of: Set(["accountId", "type", "label", "origin", "username"])),
+              let accountID = options["accountId"] as? String,
+              let type = options["type"] as? String,
+              let label = options["label"] as? String,
+              let origin = options["origin"] as? String,
+              (options["username"] == nil || options["username"] is String),
+              ((options["username"] as? String)?.utf8.count ?? 0) <= 320 else {
+            reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = self.leaf.restoreRelaySession(
+                accountID: accountID,
+                type: type,
+                label: label,
+                origin: origin,
+                username: options["username"] as? String
+            )
+            DispatchQueue.main.async {
+                guard let result else {
+                    resolve(nil)
+                    return
+                }
+                resolve([
+                    "revision": result.revision,
+                    "loginStatus": result.loginStatus,
+                    "username": result.username,
+                ])
+            }
+        }
+    }
+
+    @objc(clearRelayCredentials:resolver:rejecter:)
+    func clearRelayCredentials(
+        _ accountID: String,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard leaf.clearRelayCredentials(accountID: accountID) else {
+            reject("E_NATIVE_RELAY_CLEAR", "The relay credentials could not be removed.", nil)
+            return
+        }
+        resolve(nil)
+    }
+
+    @objc(clearRelayPassword:resolver:rejecter:)
+    func clearRelayPassword(
+        _ accountID: String,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard leaf.clearRelayPassword(accountID: accountID) else {
+            reject("E_NATIVE_RELAY_PASSWORD_CLEAR", "The relay password could not be removed.", nil)
+            return
+        }
+        resolve(nil)
     }
 
     @objc func systemLocale() -> String {

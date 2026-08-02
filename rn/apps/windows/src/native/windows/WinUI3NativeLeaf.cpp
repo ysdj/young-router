@@ -12,6 +12,7 @@
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Microsoft.UI.Interop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
+#include <winrt/Microsoft.UI.Xaml.Automation.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 
 namespace {
@@ -30,10 +31,10 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   // deliberately live at the native window boundary: React owns the shared
   // page, while Win32 owns frame constraints and DPI conversion.
   if (route == L"providers-models") return {1052, 560};
-  if (route == L"codex-settings" || route == L"claude-settings") return {1020, 620};
-  if (route == L"runtime-settings") return {760, 500};
-  if (route == L"configuration-package") return {420, 132};
-  if (route == L"webdav-settings") return {680, 386};
+  if (route == L"relay-accounts") return {760, 500};
+  if (route == L"codex-settings" || route == L"claude-settings") return {1100, 640};
+  if (route == L"runtime-settings") return {800, 520};
+  if (route == L"webdav-settings") return {700, 420};
   if (route == L"logs") return {640, 420};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
@@ -42,10 +43,10 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
 
 ContentSize RouteInitialContentSize(std::wstring_view route) {
   if (route == L"providers-models") return {1052, 600};
-  if (route == L"codex-settings" || route == L"claude-settings") return {1120, 680};
+  if (route == L"relay-accounts") return {920, 620};
+  if (route == L"codex-settings" || route == L"claude-settings") return {1160, 700};
   if (route == L"runtime-settings") return {1080, 620};
-  if (route == L"configuration-package") return {420, 208};
-  if (route == L"webdav-settings") return {680, 386};
+  if (route == L"webdav-settings") return {720, 440};
   if (route == L"logs") return {900, 580};
   return {320, 160};
 }
@@ -143,7 +144,7 @@ std::wstring FoldModelSearchText(std::wstring value) {
 bool RunOwnedModalWindow(
     winrt::Microsoft::UI::Xaml::Window const& dialog,
     HWND owner,
-    winrt::Windows::Graphics::SizeInt32 size,
+    winrt::Windows::Graphics::SizeInt32 content_size_dips,
     bool& finished) {
   HWND dialog_handle = nullptr;
   winrt::check_hresult(dialog.as<::IWindowNative>()->get_WindowHandle(&dialog_handle));
@@ -154,7 +155,9 @@ bool RunOwnedModalWindow(
   }
 
   auto window_id = winrt::Microsoft::UI::GetWindowIdFromWindow(dialog_handle);
-  winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(window_id).Resize(size);
+  const auto frame = LiteLLMMenu::FrameTrackSizeForContentDips(
+      dialog_handle, content_size_dips.Width, content_size_dips.Height);
+  winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(window_id).Resize({frame.x, frame.y});
   dialog.Activate();
 
   MSG message{};
@@ -179,6 +182,15 @@ bool RunOwnedModalWindow(
 }  // namespace
 
 namespace LiteLLMMenu {
+
+POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height) {
+  return FrameTrackSizeForContent(
+      window,
+      {
+          std::max<LONG>(1, width),
+          std::max<LONG>(1, height),
+      });
+}
 
 std::shared_ptr<WinUI3NativeLeaf> WinUI3NativeLeaf::Shared() {
   static auto instance = std::make_shared<WinUI3NativeLeaf>();
@@ -218,7 +230,18 @@ void WinUI3NativeLeaf::SetStatus(std::wstring_view title, bool running) {
 }
 
 void WinUI3NativeLeaf::SetActions(std::vector<NativeMenuAction> const& actions) {
-  actions_ = actions;
+  actions_.clear();
+  actions_.reserve(actions.size());
+  for (auto const& action : actions) {
+    // Codex / Claude share one settings entry and Recovery is a Logs tab.
+    // Ignore retired actions while a shared bundle is being updated.
+    if (action.id != L"open-claude-settings" && action.id != L"open-recovery" &&
+        action.id != L"service-start" && action.id != L"service-stop" &&
+        action.id != L"service-restart" && action.id != L"service-reload" &&
+        action.id != L"service-health") {
+      actions_.push_back(action);
+    }
+  }
 }
 
 void WinUI3NativeLeaf::SetLocalization(std::map<std::string, std::wstring> strings) {
@@ -373,6 +396,39 @@ bool WinUI3NativeLeaf::Confirm(
   return RunOwnedModalWindow(dialog, window_handle_, {440, 220}, finished) && accepted;
 }
 
+std::optional<size_t> WinUI3NativeLeaf::ShowActionMenu(
+    std::wstring_view title,
+    std::vector<std::wstring> const& items,
+    NativeMenuAnchor anchor) {
+  if (!window_handle_ || title.empty() || items.empty() || items.size() > 32) return std::nullopt;
+  if (!std::isfinite(anchor.x) || !std::isfinite(anchor.y) || !std::isfinite(anchor.width) || !std::isfinite(anchor.height) ||
+      anchor.x < 0 || anchor.y < 0 || anchor.width <= 0 || anchor.height <= 0 ||
+      anchor.width > 8192 || anchor.height > 8192) return std::nullopt;
+  RECT client{};
+  if (!GetClientRect(window_handle_, &client) || anchor.x + anchor.width > client.right + 1 || anchor.y + anchor.height > client.bottom + 1) return std::nullopt;
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return std::nullopt;
+  for (size_t index = 0; index < items.size(); ++index) {
+    if (items[index].empty() || items[index].size() > 240) {
+      DestroyMenu(menu);
+      return std::nullopt;
+    }
+    AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(index + 1), items[index].c_str());
+  }
+  // React Native reports window-local DIPs from the top-left. Convert to
+  // physical client pixels and anchor below the button, independent of the
+  // current mouse position.
+  const UINT dpi = std::max<UINT>(GetDpiForWindow(window_handle_), USER_DEFAULT_SCREEN_DPI);
+  POINT point{
+      MulDiv(static_cast<int>(std::lround(anchor.x)), static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI),
+      MulDiv(static_cast<int>(std::lround(anchor.y + anchor.height)), static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI),
+  };
+  ClientToScreen(window_handle_, &point);
+  const UINT selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window_handle_, nullptr);
+  DestroyMenu(menu);
+  return selected > 0 && selected <= items.size() ? std::optional<size_t>(selected - 1) : std::nullopt;
+}
+
 std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
     std::vector<std::wstring> models,
     std::wstring provider_name,
@@ -380,6 +436,14 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   namespace xaml = winrt::Microsoft::UI::Xaml;
   namespace controls = winrt::Microsoft::UI::Xaml::Controls;
 
+  auto format_template = [](std::wstring text, std::wstring_view key, std::wstring_view value) {
+    size_t position = 0;
+    while ((position = text.find(key, position)) != std::wstring::npos) {
+      text.replace(position, key.size(), value);
+      position += value.size();
+    }
+    return text;
+  };
   struct ChooserState {
     std::vector<std::wstring> models;
     std::vector<bool> selected;
@@ -389,6 +453,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
     controls::Button all{nullptr};
     controls::Button invert{nullptr};
     controls::Button add{nullptr};
+    controls::TextBlock empty_state{nullptr};
     xaml::Window dialog{nullptr};
     bool finished = false;
     bool accepted = false;
@@ -399,24 +464,25 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
 
   xaml::Window dialog;
   state->dialog = dialog;
-  dialog.Title(L"Choose Models to Add");
+  dialog.Title(Localized("modelChooserTitle", L"Choose Models to Add"));
 
   controls::StackPanel root;
   root.Spacing(8);
   root.Margin(xaml::Thickness{20, 16, 20, 16});
 
   controls::TextBlock title;
-  title.Text(L"Choose models to add");
+  title.Text(Localized("modelChooserHeading", L"Choose models to add"));
   title.FontSize(16);
   root.Children().Append(title);
 
   controls::TextBlock subtitle;
-  subtitle.Text(L"Provider: " + provider_name + L"    Key: " + key_name);
+  subtitle.Text(Localized("modelChooserProvider", L"Provider") + L": " + provider_name +
+                L"    " + Localized("modelChooserKey", L"Key") + L": " + key_name);
   subtitle.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
   root.Children().Append(subtitle);
 
   controls::TextBox search;
-  search.PlaceholderText(L"Search models");
+  search.PlaceholderText(Localized("modelChooserSearch", L"Search models"));
   root.Children().Append(search);
 
   controls::Grid controls_row;
@@ -428,9 +494,13 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   selection_buttons.Orientation(controls::Orientation::Horizontal);
   selection_buttons.Spacing(8);
   controls::Button all;
-  all.Content(winrt::box_value(L"All"));
+  all.Content(winrt::box_value(Localized("modelChooserAll", L"All")));
+  winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetHelpText(
+      all, Localized("modelChooserSelectAllVisible", L"Select all visible models"));
   controls::Button invert;
-  invert.Content(winrt::box_value(L"Invert"));
+  invert.Content(winrt::box_value(Localized("modelChooserInvert", L"Invert")));
+  winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetHelpText(
+      invert, Localized("modelChooserInvertVisible", L"Invert visible model selection"));
   state->all = all;
   state->invert = invert;
   selection_buttons.Children().Append(all);
@@ -450,7 +520,23 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   list.MinHeight(220);
   list.MaxHeight(480);
   list.Height(420);
-  root.Children().Append(list);
+  list.HorizontalAlignment(xaml::HorizontalAlignment::Stretch);
+  list.VerticalAlignment(xaml::VerticalAlignment::Stretch);
+  controls::Grid list_host;
+  list_host.MinHeight(220);
+  list_host.MaxHeight(480);
+  list_host.Height(420);
+  list_host.Children().Append(list);
+  controls::TextBlock empty_state;
+  empty_state.HorizontalAlignment(xaml::HorizontalAlignment::Center);
+  empty_state.VerticalAlignment(xaml::VerticalAlignment::Center);
+  empty_state.TextAlignment(xaml::TextAlignment::Center);
+  empty_state.TextWrapping(xaml::TextWrapping::Wrap);
+  empty_state.IsHitTestVisible(false);
+  empty_state.Visibility(xaml::Visibility::Collapsed);
+  state->empty_state = empty_state;
+  list_host.Children().Append(empty_state);
+  root.Children().Append(list_host);
 
   controls::StackPanel actions;
   actions.Orientation(controls::Orientation::Horizontal);
@@ -459,7 +545,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   controls::Button cancel;
   cancel.Content(winrt::box_value(winrt::hstring(Localized("cancel", L"Cancel"))));
   controls::Button add;
-  add.Content(winrt::box_value(L"Add Selected"));
+  add.Content(winrt::box_value(Localized("modelChooserAddSelected", L"Add Selected")));
   add.IsEnabled(false);
   state->add = add;
   actions.Children().Append(cancel);
@@ -468,7 +554,12 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   dialog.Content(root);
 
   auto weak_state = std::weak_ptr<ChooserState>(state);
-  auto refresh = [weak_state] {
+  auto const count_template = Localized("modelChooserCount", L"{count} models");
+  auto const filtered_count_template = Localized("modelChooserCountFiltered", L"{visible} of {total} models");
+  auto const selected_count_template = Localized("modelChooserCountSelected", L"{count} selected");
+  auto const empty_label = Localized("modelChooserEmpty", L"No models available");
+  auto const no_matches_label = Localized("modelChooserNoMatches", L"No matching models");
+  auto refresh = [weak_state, format_template, count_template, filtered_count_template, selected_count_template, empty_label, no_matches_label] {
     auto state = weak_state.lock();
     if (!state) return;
     state->list.Items().Clear();
@@ -482,7 +573,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
       item.Content(winrt::box_value(state->models[index]));
       item.IsChecked(state->selected[index]);
       item.HorizontalAlignment(xaml::HorizontalAlignment::Stretch);
-      item.Click([weak_state, index](auto const& sender, auto const&) {
+      item.Click([weak_state, index, format_template, count_template, filtered_count_template, selected_count_template](auto const& sender, auto const&) {
         if (auto current = weak_state.lock(); current && index < current->selected.size()) {
           auto checked = sender.as<controls::CheckBox>().IsChecked();
           current->selected[index] = checked && checked.Value();
@@ -494,9 +585,13 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
           }
           size_t selected_count = static_cast<size_t>(std::count(current->selected.begin(), current->selected.end(), true));
           std::wstring label = query_text.empty()
-              ? std::to_wstring(current->models.size()) + L" models"
-              : std::to_wstring(visible_count) + L" of " + std::to_wstring(current->models.size()) + L" models";
-          if (selected_count > 0) label += L"  |  " + std::to_wstring(selected_count) + L" selected";
+              ? format_template(count_template, L"{count}", std::to_wstring(current->models.size()))
+              : format_template(
+                    format_template(filtered_count_template, L"{visible}", std::to_wstring(visible_count)),
+                    L"{total}", std::to_wstring(current->models.size()));
+          if (selected_count > 0) {
+            label += L"  |  " + format_template(selected_count_template, L"{count}", std::to_wstring(selected_count));
+          }
           current->summary.Text(label);
         }
       });
@@ -506,10 +601,18 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
     state->all.IsEnabled(visible > 0);
     state->invert.IsEnabled(visible > 0);
     state->add.IsEnabled(selected > 0);
+    const auto& empty_message = state->models.empty() ? empty_label : no_matches_label;
+    state->empty_state.Text(empty_message);
+    state->empty_state.Visibility(
+        visible == 0 ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);
     std::wstring label = query.empty()
-        ? std::to_wstring(state->models.size()) + L" models"
-        : std::to_wstring(visible) + L" of " + std::to_wstring(state->models.size()) + L" models";
-    if (selected > 0) label += L"  |  " + std::to_wstring(selected) + L" selected";
+        ? format_template(count_template, L"{count}", std::to_wstring(state->models.size()))
+        : format_template(
+              format_template(filtered_count_template, L"{visible}", std::to_wstring(visible)),
+              L"{total}", std::to_wstring(state->models.size()));
+    if (selected > 0) {
+      label += L"  |  " + format_template(selected_count_template, L"{count}", std::to_wstring(selected));
+    }
     state->summary.Text(label);
   };
 
@@ -742,7 +845,8 @@ std::optional<std::string> WinUI3NativeLeaf::EditNativeText(
     EnableWindow(window_handle_, FALSE);
   }
   auto window_id = winrt::Microsoft::UI::GetWindowIdFromWindow(dialog_handle);
-  winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(window_id).Resize({840, 620});
+  const auto frame = FrameTrackSizeForContentDips(dialog_handle, 840, 620);
+  winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(window_id).Resize({frame.x, frame.y});
   dialog.Activate();
   editor.Focus(xaml::FocusState::Programmatic);
 
@@ -877,41 +981,63 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
   if (window_handle_ == nullptr || actions_.empty()) return;
   HMENU menu = CreatePopupMenu();
   if (!menu) return;
-  HMENU language_menu = nullptr;
-  auto language_root = std::find_if(actions_.begin(), actions_.end(), [](auto const& action) {
-    return action.id == L"language-menu";
-  });
-  if (language_root != actions_.end()) {
-    language_menu = CreatePopupMenu();
+  if (!status_title_.empty()) {
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status_title_.c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   }
+  bool needs_separator = false;
+  auto add_separator = [&menu, &needs_separator]() {
+    if (needs_separator) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    needs_separator = false;
+  };
+  HMENU language_menu = CreatePopupMenu();
   for (size_t index = 0; index < actions_.size(); ++index) {
     auto const& action = actions_[index];
-    if (action.id == L"language-menu") {
-      continue;
-    }
     const bool is_language_choice = action.id == L"set-language-system" ||
         action.id == L"set-language-en" || action.id == L"set-language-zh-Hans";
+    if (action.id == L"language-menu") continue;
     UINT flags = MF_STRING | (action.enabled ? MF_ENABLED : MF_GRAYED);
     if (action.checked) flags |= MF_CHECKED;
-    if (is_language_choice && language_menu != nullptr) {
-      AppendMenuW(language_menu, flags,
-          kTrayMenuFirstCommand + static_cast<UINT>(index), action.title.c_str());
+    if (is_language_choice) {
+      if (language_menu != nullptr) {
+        AppendMenuW(language_menu, flags,
+            kTrayMenuFirstCommand + static_cast<UINT>(index), action.title.c_str());
+      }
       continue;
     }
+    if (action.id == L"open-providers-models" || action.id == L"webdav-status" ||
+        action.id == L"open-webdav-settings" || action.id == L"open-logs" ||
+        action.id == L"show-version") {
+      add_separator();
+    }
+    auto title = action.title;
+    if (action.id == L"open-providers-models" || action.id == L"open-relay-accounts" ||
+        action.id == L"open-runtime-settings" ||
+        action.id == L"open-codex-settings" ||
+        action.id == L"open-webdav-settings") {
+      title += L"…";
+    }
     AppendMenuW(menu, flags,
-        kTrayMenuFirstCommand + static_cast<UINT>(index), action.title.c_str());
+        kTrayMenuFirstCommand + static_cast<UINT>(index), title.c_str());
+    if (action.id == L"toggle-autostart" ||
+        action.id == L"open-webdav-settings" || action.id == L"open-logs") {
+      needs_separator = true;
+    }
   }
-  if (language_menu != nullptr && language_root != actions_.end() && GetMenuItemCount(language_menu) > 0) {
-    UINT flags = MF_POPUP | (language_root->enabled ? MF_ENABLED : MF_GRAYED);
-    AppendMenuW(menu, flags, reinterpret_cast<UINT_PTR>(language_menu), language_root->title.c_str());
+  if (language_menu != nullptr && GetMenuItemCount(language_menu) > 0) {
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    auto label = std::find_if(actions_.begin(), actions_.end(), [](auto const& action) {
+      return action.id == L"language-menu";
+    });
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(language_menu),
+        label == actions_.end() ? L"Language" : label->title.c_str());
   } else if (language_menu != nullptr) {
     DestroyMenu(language_menu);
-    language_menu = nullptr;
   }
-  POINT point{};
-  GetCursorPos(&point);
+  POINT tray_point{};
+  GetCursorPos(&tray_point);
   SetForegroundWindow(window_handle_);
-  TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, point.x, point.y, 0, window_handle_, nullptr);
+  TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, tray_point.x, tray_point.y, 0, window_handle_, nullptr);
   DestroyMenu(menu);
 }
 
@@ -956,11 +1082,12 @@ std::wstring WinUI3NativeLeaf::Localized(std::string const& key, std::wstring_vi
 std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
   if (route == L"home") return Localized("appTitle", L"LiteLLM Menu");
   if (route == L"providers-models") return Localized("routeProvidersModels", L"Providers & Models");
-  if (route == L"codex-settings") return Localized("routeCodexSettings", L"Codex Settings");
-  if (route == L"claude-settings") return Localized("routeClaudeSettings", L"Claude Settings");
+  if (route == L"relay-accounts") return Localized("routeRelayAccounts", L"Relay Accounts");
+  if (route == L"codex-settings" || route == L"claude-settings") {
+    return Localized("routeCodexSettings", L"Codex / Claude Settings");
+  }
   if (route == L"runtime-settings") return Localized("routeRuntimeSettings", L"Runtime Settings");
-  if (route == L"configuration-package") return Localized("routeConfigurationPackage", L"Configuration Package");
-  if (route == L"webdav-settings") return Localized("routeWebdavSettings", L"WebDAV Settings");
+  if (route == L"webdav-settings") return Localized("routeWebdavSettings", L"WebDAV Sync Settings");
   if (route == L"logs") return Localized("routeLogs", L"Logs");
   return Localized("appTitle", L"LiteLLM Menu");
 }

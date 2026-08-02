@@ -42,6 +42,7 @@ jobs:
       - name: Run full test suite
         env:
           LITELLM_TEST_PYTHON: ${{ runner.temp }}/litellm-menu-ci/bin/python
+          LITELLM_MENU_AUTO_BUILD: "0"
         run: ./scripts/test.sh
 
       - name: Check shared React Native contract
@@ -50,6 +51,7 @@ jobs:
       - name: Build React Native macOS host
         env:
           LITELLM_MENU_MACOS_OUTPUT: ${{ runner.temp }}/LiteLLM Menu.app
+          LITELLM_MENU_REFRESH_PODS: "1"
         working-directory: rn
         run: pnpm run build:macos
 

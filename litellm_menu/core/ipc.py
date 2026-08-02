@@ -3,7 +3,8 @@
 The native host starts this server and injects its endpoint into React Native.
 Core binds an ephemeral loopback port by default; no UI code knows or assumes
 the legacy LiteLLM API port.  A short-lived bootstrap credential is accepted
-once at ``/v1/hello`` and exchanged for an in-memory session credential.
+once at ``/v1/hello`` and exchanged for an in-memory session credential. A
+current session can renew itself before it expires without restarting Core.
 
 The transport is intentionally standard-library HTTP/JSON so the same Core
 can be hosted by a macOS AppKit process or a Windows WinUI process without a
@@ -51,6 +52,8 @@ EDITOR_CAPABILITY_TTL_SECONDS = 10 * 60.0
 MAX_EDITOR_CAPABILITIES = 32
 SECRET_CAPABILITY_TTL_SECONDS = 10 * 60.0
 MAX_SECRET_CAPABILITIES = 32
+SECRET_READ_CAPABILITY_TTL_SECONDS = 30.0
+MAX_SECRET_READ_CAPABILITIES = 32
 
 
 class IPCError(RuntimeError):
@@ -122,6 +125,17 @@ class _SecretCapability:
     domain: str
     field: str
     target: str | None
+    revision: int
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class _SecretReadCapability:
+    token: str
+    session_token: str
+    domain: str
+    field: str
+    target: str
     revision: int
     expires_at: float
 
@@ -234,14 +248,57 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
             return
-        if route in {"/v1/host/secret/capability", "/v1/host/secret/stage"}:
+        if route in {"/v1/host/secret/capability", "/v1/host/secret/stage", "/v1/host/relay/login", "/v1/host/relay/restore", "/v1/host/relay/resources", "/v1/host/relay/import"}:
             token = self._authorization()
             if not self._owner._valid_session(token):
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
             try:
                 data = decode_message(self._read_body())
-                if route.endswith("/capability"):
+                if route.endswith("/relay/login"):
+                    allowed = {"account_id", "type", "label", "origin", "username", "cookie", "access_token", "refresh_token"}
+                    required = {"account_id", "type", "label", "origin", "username"}
+                    if not required.issubset(data) or set(data).difference(allowed):
+                        raise CoreError("relay_login_failed", "Relay login result is invalid")
+                    result = self._owner.core.accept_relay_login(
+                        account_id=data.get("account_id"),
+                        account_type=data.get("type"),
+                        label=data.get("label"),
+                        origin=data.get("origin"),
+                        username=data.get("username"),
+                        cookie=data.get("cookie", ""),
+                        access_token=data.get("access_token", ""),
+                        refresh_token=data.get("refresh_token", ""),
+                    )
+                    self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
+                elif route.endswith("/relay/restore"):
+                    allowed = {"account_id", "type", "label", "origin", "login_status", "username", "cookie", "access_token", "refresh_token"}
+                    required = {"account_id", "type", "label", "origin", "login_status"}
+                    if not required.issubset(data) or set(data).difference(allowed):
+                        raise CoreError("relay_restore_failed", "Relay login result is invalid")
+                    result = self._owner.core.restore_relay_session(
+                        account_id=data.get("account_id"),
+                        account_type=data.get("type"),
+                        label=data.get("label"),
+                        origin=data.get("origin"),
+                        login_status=data.get("login_status"),
+                        username=data.get("username", ""),
+                        cookie=data.get("cookie", ""),
+                        access_token=data.get("access_token", ""),
+                        refresh_token=data.get("refresh_token", ""),
+                    )
+                    self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
+                elif route.endswith("/relay/import"):
+                    if set(data) != {"account_id", "resource_ids", "revision"} or not isinstance(data.get("account_id"), str) or not isinstance(data.get("resource_ids"), list) or type(data.get("revision")) is not int:
+                        raise CoreError("relay_import_failed", "Relay account is unavailable")
+                    result = self._owner.core.import_relay_resources(data["account_id"], data["resource_ids"], revision=data["revision"])
+                    self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
+                elif route.endswith("/relay/resources"):
+                    if set(data) != {"account_id", "revision"} or not isinstance(data.get("account_id"), str) or type(data.get("revision")) is not int:
+                        raise CoreError("relay_resources_failed", "Relay account is unavailable")
+                    result = self._owner.core.refresh_relay_resources(data["account_id"], revision=data["revision"])
+                    self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
+                elif route.endswith("/capability"):
                     if not set(data).issubset({"domain", "field", "target", "purpose"}) or not {"domain", "field"}.issubset(data):
                         raise CoreError("invalid_secret", "The requested secret field is unavailable")
                     purpose = data.get("purpose", "settings")
@@ -267,6 +324,35 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                         session_token=token,
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
+            except (CoreError, ProtocolError) as exc:
+                self._send_error(400, code=exc.code, message=exc.message, retryable=exc.code == "revision_conflict")
+            except Exception:
+                self._send_error(400, code="invalid_secret", message="The requested secret field is unavailable")
+            return
+        if route in {"/v1/host/secret/read-capability", "/v1/host/secret/read"}:
+            token = self._authorization()
+            if not self._owner._valid_session(token):
+                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+                return
+            try:
+                data = decode_message(self._read_body())
+                if route.endswith("read-capability"):
+                    if set(data) != {"domain", "field", "target"}:
+                        raise CoreError("invalid_secret", "The requested secret field is unavailable")
+                    capability = self._owner.register_secret_read_capability(
+                        data.get("domain"),
+                        data.get("field"),
+                        data.get("target"),
+                        session_token=token,
+                    )
+                    self._send(200, {"protocol_version": PROTOCOL_VERSION, **capability})
+                else:
+                    if set(data) != {"secret_read_token"}:
+                        raise CoreError("invalid_secret", "The requested secret field is unavailable")
+                    value = self._owner.read_secret_capability(
+                        data.get("secret_read_token"), session_token=token
+                    )
+                    self._send(200, {"protocol_version": PROTOCOL_VERSION, "value": value})
             except (CoreError, ProtocolError) as exc:
                 self._send_error(400, code=exc.code, message=exc.message, retryable=exc.code == "revision_conflict")
             except Exception:
@@ -376,6 +462,7 @@ class CoreIPCServer:
         self._subscriptions: dict[str, _Subscription] = {}
         self._editor_capabilities: dict[str, _EditorCapability] = {}
         self._secret_capabilities: dict[str, _SecretCapability] = {}
+        self._secret_read_capabilities: dict[str, _SecretReadCapability] = {}
         self._lock = threading.RLock()
 
     @property
@@ -512,6 +599,83 @@ class CoreIPCServer:
             revision=capability.revision,
         )
 
+    def register_secret_read_capability(
+        self,
+        domain: object,
+        field: object,
+        target: object,
+        *,
+        session_token: str,
+    ) -> dict[str, Any]:
+        """Issue a short-lived native-only read token for one provider API key."""
+
+        if (
+            not isinstance(domain, str)
+            or not isinstance(field, str)
+            or not isinstance(target, str)
+            or not self._valid_session(session_token)
+        ):
+            raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        descriptor = self.core.trusted_secret_descriptor(domain, field, target)
+        token = secrets.token_urlsafe(32)
+        capability = _SecretReadCapability(
+            token=token,
+            session_token=session_token,
+            domain=str(descriptor["domain"]),
+            field=str(descriptor["field"]),
+            target=str(descriptor["target"]),
+            revision=int(descriptor["revision"]),
+            expires_at=time.monotonic() + SECRET_READ_CAPABILITY_TTL_SECONDS,
+        )
+        with self._lock:
+            now = time.monotonic()
+            self._secret_read_capabilities = {
+                key: item
+                for key, item in self._secret_read_capabilities.items()
+                if item.expires_at >= now and item.session_token in self._sessions
+            }
+            session_items = [
+                item
+                for item in self._secret_read_capabilities.values()
+                if hmac.compare_digest(item.session_token, session_token)
+            ]
+            if len(session_items) >= MAX_SECRET_READ_CAPABILITIES:
+                oldest = min(session_items, key=lambda item: item.expires_at)
+                self._secret_read_capabilities.pop(oldest.token, None)
+            self._secret_read_capabilities[token] = capability
+        return {
+            "secret_read_token": token,
+            "revision": capability.revision,
+            "present": bool(descriptor["present"]),
+        }
+
+    def read_secret_capability(self, token: object, *, session_token: str) -> str:
+        """Consume a session-bound token before exposing its native-only value."""
+
+        if (
+            not isinstance(token, str)
+            or not token
+            or len(token.encode("utf-8")) > 256
+            or not self._valid_session(session_token)
+        ):
+            raise CoreError("invalid_secret", "The requested secret field is unavailable")
+        with self._lock:
+            capability = self._secret_read_capabilities.get(token)
+            if capability is None or capability.expires_at < time.monotonic():
+                self._secret_read_capabilities.pop(token, None)
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            if not hmac.compare_digest(capability.session_token, session_token):
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            # This is a read-once lease. Consuming before Core access also
+            # prevents retries from replaying a key after a stale revision.
+            self._secret_read_capabilities.pop(token, None)
+        return self.core.trusted_secret_value(
+            capability.domain,
+            capability.field,
+            capability.target,
+            revision=capability.revision,
+        )
+
     def _editor_capability(self, token: object, *, session_token: str) -> _EditorCapability:
         if not isinstance(token, str) or not token or len(token.encode("utf-8")) > 256:
             raise CoreError("invalid_editor", "The requested editor is unavailable")
@@ -625,6 +789,7 @@ class CoreIPCServer:
             self._subscriptions.clear()
             self._editor_capabilities.clear()
             self._secret_capabilities.clear()
+            self._secret_read_capabilities.clear()
             self._bootstrap_token = ""
             self._bootstrap_consumed = True
         if unsubscribe is not None:
@@ -647,22 +812,35 @@ class CoreIPCServer:
     def _handle_hello(self, handler: _CoreRequestHandler) -> None:
         token = handler._authorization()
         with self._lock:
-            valid = bool(
+            now = time.monotonic()
+            valid_bootstrap = bool(
                 token
                 and not self._bootstrap_consumed
-                and time.monotonic() <= self._bootstrap_expires_at
+                and now <= self._bootstrap_expires_at
                 and hmac.compare_digest(token, self._bootstrap_token)
             )
-            if valid:
+            session = self._sessions.get(token)
+            valid_session = bool(
+                token
+                and session is not None
+                and session.expires_at >= now
+                and hmac.compare_digest(session.token, token)
+            )
+            if valid_bootstrap:
                 self._bootstrap_consumed = True
                 session_token = secrets.token_urlsafe(32)
                 self._sessions[session_token] = _Session(
                     token=session_token,
-                    expires_at=time.monotonic() + self.session_ttl_seconds,
+                    expires_at=now + self.session_ttl_seconds,
                 )
+            elif valid_session and session is not None:
+                # Keep the credential stable: subscriptions and native-only
+                # editor capabilities are intentionally bound to this session.
+                session.expires_at = now + self.session_ttl_seconds
+                session_token = session.token
             else:
                 session_token = ""
-        if not valid:
+        if not valid_bootstrap and not valid_session:
             handler._send_error(401, code="unauthorized", message="Core IPC authentication failed")
             return
         handler._send(
@@ -689,8 +867,19 @@ class CoreIPCServer:
                     for key, item in self._secret_capabilities.items()
                     if not hmac.compare_digest(item.session_token, token)
                 }
+                self._secret_read_capabilities = {
+                    key: item
+                    for key, item in self._secret_read_capabilities.items()
+                    if not hmac.compare_digest(item.session_token, token)
+                }
                 return False
-            return hmac.compare_digest(session.token, token)
+            if not hmac.compare_digest(session.token, token):
+                return False
+            # Event polling and normal host operations are authenticated
+            # activity. Keep their session alive so a healthy Core is never
+            # reaped solely because its host has been idle in the foreground.
+            session.expires_at = now + self.session_ttl_seconds
+            return True
 
     def _publish(self, event: dict[str, Any]) -> None:
         with self._lock:
@@ -734,6 +923,15 @@ class CoreIPCServer:
             params = request.params
             if request.method == "snapshot":
                 result: Any = {"snapshot": self.core.snapshot()}
+            elif request.method == "logs":
+                tab = params.get("tab")
+                known_revision = params.get("revision")
+                if not isinstance(tab, str):
+                    raise CoreError("logs_unavailable", "Log tab is invalid")
+                result = self.core.log_view(
+                    tab,
+                    known_revision if type(known_revision) is int else None,
+                )
             elif request.method == "editor":
                 domain = params.get("domain")
                 document = params.get("document")
@@ -873,15 +1071,37 @@ class CoreIPCClient:
     def _ensure_session(self) -> None:
         if self._session_token:
             return
+        self._exchange_session(self._bootstrap_token)
+
+    def _exchange_session(self, credential: str) -> None:
         # An empty byte payload forces POST; ``None`` is reserved for GET
         # event polling in ``_http``.
-        status, _body, headers = self._http("/v1/hello", payload=b"", token=self._bootstrap_token)
+        status, body, headers = self._http("/v1/hello", payload=b"", token=credential)
         if status != 200:
             raise IPCError("Core IPC authentication failed")
         session = headers.get("X-LiteLLM-Core-Session", "")
-        if not session:
+        try:
+            envelope = decode_message(body)
+        except ProtocolError:
+            raise IPCError("Core IPC returned an invalid response") from None
+        session_data = envelope.get("session") if isinstance(envelope, Mapping) else None
+        expires_in = session_data.get("expires_in") if isinstance(session_data, Mapping) else None
+        if (
+            not session
+            or set(envelope) != {"protocol_version", "ok", "session"}
+            or envelope.get("protocol_version") != PROTOCOL_VERSION
+            or envelope.get("ok") is not True
+            or type(expires_in) is not int
+            or expires_in <= 0
+        ):
             raise IPCError("Core IPC authentication failed")
         self._session_token = session
+
+    def renew_session(self) -> None:
+        """Renew the current authenticated Core session before it expires."""
+
+        self._ensure_session()
+        self._exchange_session(self._session_token)
 
     def call(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
         self._ensure_session()

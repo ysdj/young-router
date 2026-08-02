@@ -21,10 +21,12 @@ from .core import (
     default_config_yaml,
     default_settings_file,
     default_state_file,
+    default_status_file,
     load_settings,
     manifest_url,
     manifests_match,
     save_settings,
+    save_sync_status,
     save_sync_state,
 )
 from .operations import (
@@ -283,12 +285,31 @@ def command_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_recorded_command(args: argparse.Namespace) -> int:
+    command = str(args.command)
+    handlers = {
+        "probe": command_probe,
+        "push": command_push,
+        "pull": command_pull,
+        "sync": command_sync,
+    }
+    handler = handlers[command]
+    try:
+        result = handler(args)
+    except Exception:
+        save_sync_status(args.status, command, False)
+        raise
+    save_sync_status(args.status, command, result == 0)
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sync LiteLLM Menu config.yaml over WebDAV.")
     parser.add_argument("command", choices=["settings", "configure", "probe", "push", "pull", "sync", "status"])
     parser.add_argument("--config", type=pathlib.Path, default=default_config_yaml())
     parser.add_argument("--settings", type=pathlib.Path, default=default_settings_file())
     parser.add_argument("--state", type=pathlib.Path, default=default_state_file())
+    parser.add_argument("--status", type=pathlib.Path, default=default_status_file())
     parser.add_argument("--stdin-settings", action="store_true")
     return parser
 
@@ -299,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
     args.config = args.config.expanduser()
     args.settings = args.settings.expanduser()
     args.state = args.state.expanduser()
+    args.status = args.status.expanduser()
 
     try:
         if args.command == "settings":
@@ -306,13 +328,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "configure":
             return command_configure(args)
         if args.command == "probe":
-            return command_probe(args)
+            return _run_recorded_command(args)
         if args.command == "push":
-            return command_push(args)
+            return _run_recorded_command(args)
         if args.command == "pull":
-            return command_pull(args)
+            return _run_recorded_command(args)
         if args.command == "sync":
-            return command_sync(args)
+            return _run_recorded_command(args)
         if args.command == "status":
             return command_status(args)
     except SyncError as exc:

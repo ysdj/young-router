@@ -31,7 +31,11 @@ struct LiteLLMWinUITableProps : winrt::implements<LiteLLMWinUITableProps, winrt:
        cells = cloneFromProps->cells;
        selectedKey = cloneFromProps->selectedKey;
        alternatingRows = cloneFromProps->alternatingRows;
-       onSelectionChange = cloneFromProps->onSelectionChange;  
+       compact = cloneFromProps->compact;
+       followBottom = cloneFromProps->followBottom;
+       disabledRowKeys = cloneFromProps->disabledRowKeys;
+       onSelectionChange = cloneFromProps->onSelectionChange;
+       onRowDoublePress = cloneFromProps->onRowDoublePress;  
      }
   }
 
@@ -57,11 +61,32 @@ struct LiteLLMWinUITableProps : winrt::implements<LiteLLMWinUITableProps, winrt:
   REACT_FIELD(alternatingRows)
   std::optional<bool> alternatingRows{};
 
+  REACT_FIELD(compact)
+  std::optional<bool> compact{};
+
+  REACT_FIELD(followBottom)
+  std::optional<bool> followBottom{};
+
+  REACT_FIELD(disabledRowKeys)
+  std::optional<std::vector<std::string>> disabledRowKeys;
+
    // These fields can be used to determine if JS has registered for this event
   REACT_FIELD(onSelectionChange)
   bool onSelectionChange{false};
 
+  REACT_FIELD(onRowDoublePress)
+  bool onRowDoublePress{false};
+
   const winrt::Microsoft::ReactNative::ViewProps ViewProps;
+};
+
+REACT_STRUCT(LiteLLMWinUITableSpec_onRowDoublePress)
+struct LiteLLMWinUITableSpec_onRowDoublePress {
+  REACT_FIELD(key)
+  std::string key;
+
+  REACT_FIELD(index)
+  int32_t index{};
 };
 
 REACT_STRUCT(LiteLLMWinUITableSpec_onSelectionChange)
@@ -78,9 +103,16 @@ struct LiteLLMWinUITableEventEmitter {
       : m_eventEmitter(eventEmitter) {}
 
   using OnSelectionChange = LiteLLMWinUITableSpec_onSelectionChange;
+  using OnRowDoublePress = LiteLLMWinUITableSpec_onRowDoublePress;
 
   void onSelectionChange(OnSelectionChange &&value) const {
     m_eventEmitter.DispatchEvent(L"selectionChange", [value = std::move(value)](const winrt::Microsoft::ReactNative::IJSValueWriter writer) {
+      winrt::Microsoft::ReactNative::WriteValue(writer, value);
+    });
+  }
+
+  void onRowDoublePress(OnRowDoublePress &&value) const {
+    m_eventEmitter.DispatchEvent(L"rowDoublePress", [value = std::move(value)](const winrt::Microsoft::ReactNative::IJSValueWriter writer) {
       winrt::Microsoft::ReactNative::WriteValue(writer, value);
     });
   }

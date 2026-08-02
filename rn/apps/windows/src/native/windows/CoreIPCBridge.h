@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -25,9 +26,33 @@ class CoreIPCBridge {
     bool present = false;
   };
 
+  struct SecretReadCapability {
+    std::string token;
+    bool present = false;
+  };
+
   struct EditorStageResult {
     double revision = 0;
     std::string editor_token;
+  };
+
+  // Raw document text is returned only to a native secure editor.  The
+  // descriptor identity remains native-only as well, so an expired token can
+  // be refreshed without putting either value on the React bridge.
+  struct RefreshedEditorDocument {
+    std::string editor_token;
+    std::string text;
+  };
+
+  struct RelayLoginResult {
+    double revision = 0;
+    std::string username;
+  };
+
+  struct RelaySessionRestoreResult {
+    double revision = 0;
+    std::string login_status;
+    std::string username;
   };
 
   static CoreIPCBridge& Shared();
@@ -39,6 +64,8 @@ class CoreIPCBridge {
   std::optional<EditorStageResult> StageEditorDocumentWithReplacement(
       std::string const& editor_token,
       std::string const& text);
+  std::optional<RefreshedEditorDocument> RefreshEditorDocument(
+      std::string const& editor_token);
   std::optional<SecretCapability> CreateSecretCapability(
       std::string const& domain,
       std::string const& field,
@@ -48,10 +75,40 @@ class CoreIPCBridge {
       std::string const& secret_token,
       std::optional<std::string> const& value,
       bool clear);
+  std::optional<SecretReadCapability> CreateSecretReadCapability(
+      std::string const& domain,
+      std::string const& field,
+      std::string const& target);
+  std::optional<std::string> ReadSecret(std::string const& secret_read_token);
+  std::optional<std::string> ReadProviderAPIKey(std::string const& target);
+  std::optional<RelayLoginResult> AcceptRelayLogin(
+      std::string const& account_id,
+      std::string const& account_type,
+      std::string const& label,
+      std::string const& origin,
+      std::string const& username,
+      std::optional<std::string> const& cookie,
+      std::optional<std::string> const& access_token,
+      std::optional<std::string> const& refresh_token);
+  std::optional<RelaySessionRestoreResult> RestoreRelaySession(
+      std::string const& account_id,
+      std::string const& account_type,
+      std::string const& label,
+      std::string const& origin,
+      std::string const& login_status,
+      std::optional<std::string> const& username,
+      std::optional<std::string> const& cookie,
+      std::optional<std::string> const& access_token,
+      std::optional<std::string> const& refresh_token);
   void SetEventHandler(std::function<void(std::string const&)> handler);
   void Stop();
 
  private:
+  struct EditorIdentity {
+    std::string domain;
+    std::string document;
+  };
+
   struct Endpoint {
     std::wstring address;
     unsigned short port = 0;
@@ -87,7 +144,8 @@ class CoreIPCBridge {
   std::optional<HttpResult> HostRequest(
       std::wstring const& route,
       std::string const& body,
-      bool retry_session = true);
+      bool retry_session = true,
+      int receive_timeout_ms = 30000);
   void StartPollingIfSubscription(std::string const& response_json, unsigned long generation);
   void PollEvents(std::string subscription_id);
   void RecoverSubscription();
@@ -96,6 +154,13 @@ class CoreIPCBridge {
   void InvalidateCoreLocked(bool preserve_subscription);
   void TakeCoreLocked(std::vector<void*>& processes, std::vector<std::wstring>& directories, bool preserve_subscription);
   void JoinRetiredPollThread();
+  void RememberEditorCapability(std::string const& request_json, std::string const& response_json);
+  std::optional<EditorIdentity> EditorIdentityFor(std::string const& editor_token);
+  void ReplaceEditorCapability(
+      std::optional<std::string> const& old_token,
+      std::string const& new_token,
+      EditorIdentity const& identity);
+  void RotateEditorCapability(std::string const& old_token, std::string const& new_token);
   static bool IsSessionFailure(unsigned long status) noexcept;
 
   std::mutex mutex_;
@@ -113,6 +178,8 @@ class CoreIPCBridge {
   std::exception_ptr session_error_;
   unsigned long core_generation_ = 0;
   std::function<void(std::string const&)> event_handler_;
+  std::unordered_map<std::string, EditorIdentity> editor_identities_;
+  std::vector<std::string> editor_identity_order_;
   std::atomic<bool> stopping_{false};
   std::mutex poll_mutex_;
   std::thread poll_thread_;

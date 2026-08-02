@@ -29,6 +29,9 @@ function main() {
   const vendorDirectory = path.resolve(rnRoot, manifest.vendorDirectory);
   const vendorParent = path.dirname(vendorDirectory);
   const yarnRelease = path.join(vendorDirectory, manifest.yarnRelease);
+  const shouldRefreshInstall = Boolean(
+    process.env.CI || process.env.LITELLM_MENU_REFRESH_RN_VENDOR === '1',
+  );
 
   if (!existsSync(vendorDirectory)) {
     mkdirSync(vendorParent, {recursive: true});
@@ -47,8 +50,19 @@ function main() {
     fail(`Pinned Yarn release is missing from ${path.relative(rnRoot, vendorDirectory)}.`);
   }
 
-  run(process.execPath, [yarnRelease, 'install', '--immutable'], vendorDirectory);
-  const result = verifyVendor();
+  let result;
+  if (!shouldRefreshInstall) {
+    try {
+      result = verifyVendor();
+      console.log('Reusing verified react-native-macos vendor dependencies.');
+    } catch {
+      // A partial checkout must be repaired with the pinned immutable install.
+    }
+  }
+  if (!result) {
+    run(process.execPath, [yarnRelease, 'install', '--immutable'], vendorDirectory);
+    result = verifyVendor();
+  }
   console.log(`Bootstrapped react-native-macos 0.85 at ${path.relative(rnRoot, result.packageDirectory)}.`);
   console.log('For macOS CocoaPods/source builds, use: RCT_USE_RN_DEP=0 RCT_USE_PREBUILT_RNCORE=0 RCT_BUILD_HERMES_FROM_SOURCE=true RCT_HERMES_V1_ENABLED=1');
 }
