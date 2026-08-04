@@ -267,29 +267,27 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(persisted, metadata.read_bytes())
             self.assertEqual([], events)
 
-    def test_default_core_starts_the_service_before_exposing_its_snapshot(self) -> None:
+    def test_default_core_exposes_stopped_service_before_starting_the_proxy(self) -> None:
         with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
             controller = controller_type.return_value
             controller.status.return_value = {"state": "stopped"}
-            controller.start.return_value = {
-                "state": "running",
-                "pid": 123,
-                "port": 4000,
-                "auto_start_state": "enabled",
-            }
-            controller.dispatch.return_value = dict(controller.start.return_value)
+            controller.dispatch.return_value = {"state": "stopped"}
 
             core = CoreStore.with_default_domains(runtime_root="/tmp/litellm-menu-core-start")
 
-        controller.start.assert_called_once_with()
-        self.assertEqual("running", core.snapshot()["service"]["state"])
+        controller.start.assert_not_called()
+        self.assertEqual("stopped", core.snapshot()["service"]["state"])
 
-    def test_default_core_rejects_a_non_running_service(self) -> None:
+    def test_default_core_exposes_a_non_running_service_for_diagnostics(self) -> None:
         with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
-            controller_type.return_value.status.return_value = {"state": "unknown"}
+            controller = controller_type.return_value
+            controller.status.return_value = {"state": "unknown"}
+            controller.dispatch.return_value = {"state": "unknown"}
 
-            with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
-                CoreStore.with_default_domains(runtime_root="/tmp/litellm-menu-core-unavailable")
+            core = CoreStore.with_default_domains(runtime_root="/tmp/litellm-menu-core-unavailable")
+
+        controller.start.assert_not_called()
+        self.assertEqual("unknown", core.snapshot()["service"]["state"])
 
     def test_controller_status_and_autostart_use_private_runtime_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

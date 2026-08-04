@@ -729,12 +729,6 @@ class CoreStore:
         )
         service_handlers = {operation: controller.dispatch for operation in operations}
         initial_service = controller.status()
-        if initial_service.get("state") == "stopped":
-            # Core establishes the proxy side of the lifecycle unit; it does
-            # not expose IPC while the configured 4000 service is absent.
-            initial_service = controller.start()
-        if initial_service.get("state") != "running":
-            raise RuntimeError("LiteLLM service is unavailable")
         store = cls(metadata_path=metadata_path, domains=adapters, service_handlers=service_handlers)
         if isinstance(initial_service, Mapping):
             store._set_service_from_result(initial_service, increment=False)

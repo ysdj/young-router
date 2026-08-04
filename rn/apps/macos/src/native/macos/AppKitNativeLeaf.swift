@@ -43,10 +43,28 @@ private enum NativeRelayOriginPolicy {
         contentsOf: Bundle.main.url(forResource: "AppIcon", withExtension: "icns")!
     )!
     private static let statusBarIcon: NSImage = {
-        let image = NSImage(
-            systemSymbolName: "bolt.horizontal.circle.fill",
-            accessibilityDescription: "LiteLLM Menu"
-        )!
+        let image = NSImage(size: NSSize(width: 22, height: 18))
+        image.lockFocus()
+
+        let scale: CGFloat = 1
+        let transform = NSAffineTransform()
+        transform.translateX(by: 22 * (1 - scale) / 2, yBy: 18 * (1 - scale) / 2)
+        transform.scale(by: scale)
+        transform.concat()
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .foregroundColor: NSColor.black,
+        ]
+        ("L" as NSString).draw(
+            at: NSPoint(x: 2.5, y: -1),
+            withAttributes: attributes.merging([.font: NSFont.systemFont(ofSize: 18, weight: .regular)]) { _, new in new }
+        )
+        ("L" as NSString).draw(
+            at: NSPoint(x: 13, y: 2),
+            withAttributes: attributes.merging([.font: NSFont.systemFont(ofSize: 13, weight: .regular)]) { _, new in new }
+        )
+
+        image.unlockFocus()
         image.isTemplate = true
         return image
     }()
@@ -123,7 +141,6 @@ private enum NativeRelayOriginPolicy {
     override init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
-        NSApp.applicationIconImage = Self.applicationIcon
         statusItem.button?.title = ""
         statusItem.button?.image = Self.statusBarIcon
         statusItem.button?.imagePosition = .imageOnly
@@ -1145,6 +1162,7 @@ private enum NativeRelayOriginPolicy {
             return
         }
         NSApp.setActivationPolicy(.regular)
+        NSApp.applicationIconImage = Self.applicationIcon
     }
 
     private func configure(_ window: NSWindow, for route: String, title: String) {

@@ -248,6 +248,20 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NSApplicationMain", source)
         self.assertLess(source.index("LiteLLMMenuAcquireInstanceLock"), source.rindex("NSApplicationMain"))
 
+    def test_macos_starts_the_hidden_primary_host_for_live_menu_state(self) -> None:
+        source = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        launch = source.split("- (void)applicationDidFinishLaunching:", 1)[1].split(
+            "- (void)startReactHostWhenNeeded", 1
+        )[0]
+
+        self.assertIn("self.automaticallyLoadReactNativeWindow = NO;", launch)
+        self.assertIn("[nativeLeaf setReactHostStarter:^{", launch)
+        self.assertIn("[self startReactHostWhenNeeded];", launch)
+        self.assertLess(
+            launch.index("[nativeLeaf setReactHostStarter:^{"),
+            launch.rindex("[self startReactHostWhenNeeded];"),
+        )
+
     def test_core_replacement_waits_for_the_previous_process_to_exit(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
@@ -268,13 +282,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("StopCoreProcess(process.hProcess, directory);", windows)
         self.assertNotIn("WaitForSingleObject(process.hProcess, INFINITE);", windows)
 
-    def test_macos_core_bootstrap_waits_for_the_managed_listener(self) -> None:
+    def test_macos_core_bootstrap_waits_only_for_the_control_endpoint(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         start = mac.split("    private func startCoreLocked() throws -> Endpoint {", 1)[1].split(
             "    private func previewProfileEnvironment", 1
         )[0]
 
-        self.assertIn("private static let coreStartupTimeout: TimeInterval = 65", mac)
+        self.assertIn("private static let coreStartupTimeout: TimeInterval = 10", mac)
         self.assertIn("Date().addingTimeInterval(Self.coreStartupTimeout)", start)
         self.assertIn("guard process.isRunning else { break }", start)
         self.assertIn("stopCoreProcess(process, directory: directory)", start)
@@ -457,14 +471,19 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         ):
             self.assertIn(f'environment["{key}"]', bridge)
 
-    def test_macos_uses_a_native_template_status_bar_icon(self) -> None:
+    def test_macos_uses_a_native_template_double_l_status_bar_icon(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
 
-        self.assertIn('systemSymbolName: "bolt.horizontal.circle.fill"', leaf)
+        self.assertIn("NSImage(size: NSSize(width: 22, height: 18))", leaf)
+        self.assertIn('("L" as NSString).draw(', leaf)
+        self.assertIn("NSFont.systemFont(ofSize: 18, weight: .regular)", leaf)
+        self.assertIn("NSFont.systemFont(ofSize: 13, weight: .regular)", leaf)
+        self.assertIn("NSPoint(x: 2.5, y: -1)", leaf)
+        self.assertIn("NSPoint(x: 13, y: 2)", leaf)
         self.assertIn("image.isTemplate = true", leaf)
         self.assertIn("NSStatusItem.squareLength", leaf)
         self.assertIn("statusItem.button?.image = Self.statusBarIcon", leaf)
-        self.assertNotIn("menuBarMonogram", leaf)
+        self.assertNotIn("systemSymbolName:", leaf)
 
     def test_macos_status_item_is_ready_before_react_and_defers_menu_rebuilds_while_tracking(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -585,6 +604,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('Bundle.main.url(forResource: "AppIcon", withExtension: "icns")!', leaf)
         self.assertIn("NSApp.applicationIconImage = Self.applicationIcon", leaf)
         self.assertIn("NSApp.setActivationPolicy(.regular)", leaf)
+        self.assertLess(
+            leaf.index("NSApp.setActivationPolicy(.regular)"),
+            leaf.index("NSApp.applicationIconImage = Self.applicationIcon"),
+        )
         self.assertIn("window.center()", leaf)
 
     def test_action_menu_is_anchored_to_the_triggering_control_on_both_hosts(self) -> None:

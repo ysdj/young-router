@@ -27,14 +27,16 @@
 #if __has_include(<ReactAppDependencyProvider/RCTAppDependencyProvider.h>)
   self.dependencyProvider = [RCTAppDependencyProvider new];
 #endif
-  // Keep the native fallback menu interactive until a native action needs
-  // React. Hermes starts only on that first action.
+  // Publish the native fallback immediately, then start the hidden primary
+  // React host so localization and the first Core snapshot can populate the
+  // menu without waiting for a user action.
   self.automaticallyLoadReactNativeWindow = NO;
   [super applicationDidFinishLaunching:notification];
   [nativeLeaf hideHostWindowAtLaunch:nil];
   [nativeLeaf setReactHostStarter:^{
     [self startReactHostWhenNeeded];
   }];
+  [self startReactHostWhenNeeded];
 }
 
 - (void)startReactHostWhenNeeded

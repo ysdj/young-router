@@ -50,10 +50,9 @@ import Foundation
     private let stoppingLock = NSLock()
     private static let relayLoginTimeout: TimeInterval = 60
     private static let coreShutdownTimeout: TimeInterval = 4
-    // Core publishes its IPC endpoint only after its managed LiteLLM listener
-    // is healthy.  The controller waits for that listener for at most 60s, so
-    // the native host must not mistake a normal cold start for a failed one.
-    private static let coreStartupTimeout: TimeInterval = 65
+    // Core publishes IPC before starting the managed proxy, so host startup
+    // only waits for the local control endpoint rather than proxy health.
+    private static let coreStartupTimeout: TimeInterval = 10
     private var endpoint: Endpoint?
     private var sessionToken: String?
     private var sessionExpiresAt: Date?
