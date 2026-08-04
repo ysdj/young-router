@@ -171,6 +171,7 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             "type": "message",
             "status": "in_progress",
             "role": "assistant",
+            "phase": "final_answer",
             "content": [],
         },
     }
@@ -204,6 +205,7 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         "type": "message",
         "status": "completed",
         "role": "assistant",
+        "phase": "final_answer",
         "content": [
             {
                 "type": "output_text",

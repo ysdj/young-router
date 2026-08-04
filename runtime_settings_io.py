@@ -16,6 +16,9 @@ RETIRED_PERSISTED_SETTINGS = frozenset(
     {
         "LITELLM_CONFIG_WATCH_INTERVAL",
         "LITELLM_CONFIG_WATCH_SETTLE_INTERVAL",
+        "LITELLM_MENU_WEB_SEARCH_READ_RESULTS",
+        "LITELLM_MENU_BALANCE_REFRESH_MINUTES",
+        "LITELLM_BROWSER_BILLING",
     }
 )
 
@@ -155,14 +158,6 @@ def validate_values(values: object, specs: dict[str, RuntimeSettingSpec]) -> dic
     }
     effective = {key: _default_payload_value(spec) for key, spec in specs.items()}
     effective.update(normalized)
-    if (
-        int(effective["LITELLM_MENU_WEB_SEARCH_READ_RESULTS"])
-        > int(effective["LITELLM_MENU_WEB_SEARCH_MAX_RESULTS"])
-    ):
-        raise PackageError(
-            "LITELLM_MENU_WEB_SEARCH_READ_RESULTS cannot exceed "
-            "LITELLM_MENU_WEB_SEARCH_MAX_RESULTS."
-        )
     return normalized
 
 

@@ -24,7 +24,7 @@ The native menu is grouped by task:
 - **Configuration** — open **Providers & Models...**, **Codex / Claude Settings...**, or **Runtime Settings...**. Providers can import current Codex/Claude settings, a file, or a signed-in New API/Sub2API relay account; provider and runtime files are imported/exported in their owning screen.
 - **Diagnostics** — record or inspect route traces, inspect recovery state and recent requests, open service logs, and configure WebDAV sync.
 
-The status item remains a neutral `LL` at all times. During route recovery, its hover text and the clickable recovery row in the menu show the current step, classified cause, attempt, heartbeat age, and whether recovery is still progressing or may be stuck.
+The status item uses a neutral native template icon. During route recovery, its hover text and the clickable recovery row in the menu show the current step, classified cause, attempt, heartbeat age, and whether recovery is still progressing or may be stuck.
 
 ### Deployment Fallback and Routing
 
@@ -77,7 +77,7 @@ When a Responses API request includes `web_search` tool usage:
 1. **Native hosted search** is attempted first when route metadata indicates support or support is unknown on a Responses-capable route.
 2. **External bridge** activates when the route is chat-only, explicitly lacks hosted web search support, or returns an unsupported hosted-tool error.
 
-The external bridge uses DDGS (DuckDuckGo Search) for query execution and optional Jina Reader for page content excerpts. Search parameters — result count, page read count, read character limit, region, backend list, fetch timeout, max rounds, max queries, max open pages — are configurable through runtime settings.
+The external bridge uses DDGS (DuckDuckGo Search) for query execution and direct retrieval of model-selected source pages. Search parameters — result count, page read character limit, region, backend list, fetch timeout, max rounds, max queries, max open pages — are configurable through runtime settings.
 
 The bridge exposes focused search queries and source URLs to the model. Query planning is model-driven; the bridge does not add request-specific query rewrites.
 
@@ -173,7 +173,7 @@ pnpm run build:windows
 
 ### First Launch
 
-1. Open LiteLLM Menu from the menu bar icon (the "LL" status item).
+1. Open LiteLLM Menu from its menu bar icon.
 2. The application starts the local LiteLLM proxy and Python Core from its bundled runtime.
 3. Click **Providers & Models...** to configure providers, API keys, models, and deployment order.
 4. Click **Apply Config** to stage and activate the configuration.
@@ -197,9 +197,7 @@ The model editor keeps the client-facing public model name separate from the exa
 
 ### Providers & Models Editor
 
-The **Providers** view is a fixed three-column workspace: provider list, model list, and selected deployment details. Provider identity, billing, and model count remain distinct; model billing and independent probe state are visible beside the selected provider. Upstream ID and route order remain in the selected deployment form and the dedicated **Routes** view. Provider and model billing stays visible inline, including the effective multiplier when available. The menu keeps current billing as direct, compact rows with a separate **Refresh Billing** action; hovering a provider row reveals account details. A refresh failure keeps the most recent successful snapshot visible and marks it as stale instead of clearing the values.
-
-Billing always tries the provider's direct endpoint first. **Browser billing fallback** is off by default and can be enabled in **Runtime Settings**. When enabled, a failed direct lookup may use an already-open same-origin `/keys` tab through the page context; it never reads Chrome Profile/Cookie files, creates or switches tabs, focuses or closes a tab, or starts Chrome. Chrome must allow **View > Developer > Allow JavaScript from Apple Events** for this optional path.
+The **Providers** view is a fixed three-column workspace: provider list, model list, and selected deployment details. Selecting a provider always opens its provider settings; selecting a model opens that model. Provider identity and model count remain distinct. Each model has an independent **Probe** action that does not lock the rest of the editor. Its result shows a summary and the sanitized original requests; hover it for the full text. If the available protocol order differs from the current order, confirmation immediately applies it; matching orders do not prompt. New models are probed once after being added. The compact account line always renders balance as unavailable and reads the credential's effective multiplier once when the window opens; it does not request usage or balance endpoints. Upstream ID and route order remain in the selected deployment form and the dedicated **Routes** view.
 
 The **Routes** view groups deployments by public model and shows order, provider/key, upstream ID, and explicit state: **Available**, **Unavailable**, **Uncertain**, **Not probed**, or **Disabled**. Route order controls change only the selected deployment's configured fallback position.
 
@@ -215,7 +213,7 @@ Each deployment's `model_info` supports:
 - `upstream_url_surface` — generated mirror of the first ordered surface.
 - `supports_responses_web_search` / `supports_web_search` — web search capability.
 
-Each model deployment has its own **Probe** action. For text models it checks Responses, Chat Completions, and Anthropic Messages serially and records that model's availability without enabling or disabling the model. Probe recommends exactly one best available protocol: Anthropic for Claude-family model identifiers when available, otherwise Responses before Chat and Anthropic. Saving the recommendation selects only that protocol; additional checked protocols are reserved for explicit user selection. **Upstream API order** is the fallback order from LiteLLM to the deployment endpoint and does not change the client-facing API. Known standalone image models probe only `/v1/images/generations`; an unconfigured model may also test that endpoint only after all three text APIs are definitively unavailable.
+Each model deployment has its own **Probe** action. For text models it checks Responses, Chat Completions, Anthropic Messages, and the credential's effective multiplier. A usable result stages the model as enabled and selects exactly one recommended protocol: Anthropic for Claude-family model identifiers when available, otherwise Responses before Chat and Anthropic. The staged recommendation becomes the protocol fallback only when **Apply** succeeds; additional checked protocols remain an explicit user choice. **Upstream API order** is the fallback order from LiteLLM to the deployment endpoint and does not change the client-facing API. Known standalone image models probe only `/v1/images/generations`; an unconfigured model may also test that endpoint only after all three text APIs are definitively unavailable.
 
 ### Provider and Model Imports
 
@@ -238,12 +236,10 @@ Adjustable through the menu without editing config files:
 | Codex parent completion barrier | `LITELLM_MENU_CODEX_DESCENDANT_CLEANUP` | 1 (on) |
 | Deployment cooldown failures | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
 | Deployment cooldown seconds | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
-| Web search max results | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 8 |
-| Web search read results | `LITELLM_MENU_WEB_SEARCH_READ_RESULTS` | 4 |
-| Web fetch timeout | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 30 |
+| Web search max results | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 5 |
+| Web fetch timeout | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
 | Vision bridge backend | `LITELLM_MENU_VISION_BRIDGE_BACKEND` | auto |
 | Vision bridge model | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
-| Browser billing fallback | `LITELLM_BROWSER_BILLING` | 0 (off) |
 | Computer facade backend | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
 | Computer facade max steps | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
 | Route recovery interval | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
@@ -374,9 +370,9 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 1. **原生托管搜索** — 路由元数据表明支持或支持状态未知时，优先在支持 Responses 的路由上尝试原生托管搜索。
 2. **外部桥接** — 路由仅支持聊天、明确不支持托管网页搜索，或返回不支持托管工具错误时激活。
 
-外部桥接使用 DDGS（DuckDuckGo Search）执行查询，使用可选的 Jina Reader 获取页面内容摘要。搜索参数 — 结果数量、页面读取数量、读取字符限制、区域、后端列表、获取超时、最大轮次、最大查询数、最大打开页面数 — 均可通过运行时设置配置。
+外部桥接使用 DDGS（DuckDuckGo Search）执行查询，并直接读取模型选定的来源页面。默认先用 Yahoo；只有结果不足时才继续用 Bing，因此正常查询保持快速，同时不会因单个后端临时空结果而只给模型一条空白线索。搜索参数 — 结果数量、读取字符限制、区域、后端列表、获取超时、最大轮次、最大查询数、最大打开页面数 — 均可通过运行时设置配置。
 
-桥接器向模型暴露聚焦的搜索查询和来源 URL。查询规划由模型驱动；桥接器不添加特定于请求的查询重写。
+桥接器向模型暴露聚焦的搜索查询和来源 URL。查询规划由模型驱动：模型决定是否直接回答、换词、查看下一页或打开某个来源；默认四个动作轮次让它在多次换词后仍有机会查看刚找到的来源。桥接器不添加特定于请求的查询重写。
 
 ### Computer Facade
 
@@ -494,9 +490,7 @@ pnpm run build:windows
 
 ### Providers & Models 编辑器
 
-**Providers** 视图将 provider 名称、计费信息和模型数量分列显示，并在 **Models** 中展示每个模型部署的计费信息和独立探测状态；上游 ID 与路由顺序保留在右侧部署表单和专用 **Routes** 视图中。Provider 与模型的余额会直接显示；上游提供倍率时，也会同时显示有效计费倍率。菜单中的 **Billing** 子菜单可展开查看 provider 与账户明细，并提供 **Refresh Now**。刷新失败时，界面保留最近一次成功快照并标记为过期，不会清空已有值。
-
-计费刷新始终先调用 provider 的直连接口，因此常规刷新不需要打开 Chrome。浏览器 fallback 默认关闭，可在 **Runtime Settings** 中明确打开；直连没有得到余额时，才会检查已打开的同源 `/keys` 标签，在页面上下文发起请求并返回脱敏 quota、group 和倍率。它不会读取 Chrome 的 Cookie/Profile 文件，不会新建、切换、聚焦或关闭标签，也不会启动未运行的 Chrome。启用 fallback 时，Chrome 需要允许 **View > Developer > Allow JavaScript from Apple Events**；未授权会安全地保留直连结果。
+**Providers** 视图将 provider 名称和模型数量分列显示。点击供应商始终打开其供应商设置，点击模型打开该模型。每个模型的 **探测** 相互独立，不会锁住其余编辑控件；结果显示总结和脱敏后的原始请求，鼠标悬停可查看全文。若可用协议顺序与当前不同，确认后会立即应用；相同时不弹确认。新增模型后会自动探测一次。紧凑账户行中的余额固定显示为不可用；窗口打开时只读取一次当前凭据的有效倍率，不请求用量或余额端点。上游 ID 与路由顺序保留在右侧部署表单和专用 **Routes** 视图中。
 
 **Routes** 视图按公开模型对部署分组，显示顺序、provider/API key、上游 ID 和明确状态：**Available**、**Unavailable**、**Uncertain**、**Not probed** 或 **Disabled**。路由顺序按钮只修改所选部署的配置回退位置。
 
@@ -512,7 +506,7 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 - `upstream_url_surface` — 自动生成的第一项镜像。
 - `supports_responses_web_search` / `supports_web_search` — 网页搜索能力。
 
-每个模型部署都有独立的 **Probe** 操作。文本模型会依次探测 Responses、Chat Completions 和 Anthropic Messages，并只记录该模型的可用性，不会启用、禁用或重写模型。手动探测不会静默改变协议勾选或顺序；当探测出的支持协议与当前选择不同时，编辑器会显示建议，只有明确选择 **Save Supported Protocols** 才修改草稿，选择 **Keep Current Order** 则保持原样。**上游 API 顺序** 指 LiteLLM 到该部署端点的回退顺序，不会改变客户端接口。已知的独立图片模型只探测 `/v1/images/generations`；尚未配置的模型也只会在三个文本 API 都明确不可用后才尝试该端点。
+每个模型部署都有独立的 **Probe** 操作。文本模型会同时探测 Responses、Chat Completions、Anthropic Messages 和当前凭据的有效倍率。探测不会改变模型开关；Claude 系列的可用顺序优先 Anthropic，其余依次为 Responses、Chat、Anthropic。若探测顺序变化，用户确认后会立即写入并应用；相同则保持不变。**上游 API 顺序** 指 LiteLLM 到该部署端点的回退顺序，不会改变客户端接口。上游模型输入和列表只显示原始模型名；系统按首选协议自动写入 `openai/` 或 `anthropic/` 前缀。已知的独立图片模型只探测 `/v1/images/generations`；尚未配置的模型也只会在三个文本 API 都明确不可用后才尝试该端点。
 
 ### Provider 与模型导入
 
@@ -535,14 +529,12 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 | Codex 父线程完成屏障 | `LITELLM_MENU_CODEX_DESCENDANT_CLEANUP` | 1（开启） |
 | 部署冷却失败次数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
 | 部署冷却秒数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
-| 网页搜索最大结果数 | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 8 |
-| 网页搜索读取结果数 | `LITELLM_MENU_WEB_SEARCH_READ_RESULTS` | 4 |
-| 网页获取超时 | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 30 |
+| 网页搜索最大结果数 | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 5 |
+| 网页获取超时 | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
 | 视觉桥接后端 | `LITELLM_MENU_VISION_BRIDGE_BACKEND` | auto |
 | 视觉桥接模型 | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
 | Computer facade 后端 | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
 | Computer facade 最大步数 | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
-| 浏览器计费回退 | `LITELLM_BROWSER_BILLING` | 0（关闭） |
 | 路由恢复间隔 | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
 
 ### 配置文件

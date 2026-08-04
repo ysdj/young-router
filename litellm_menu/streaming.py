@@ -579,9 +579,10 @@ def _responses_completed_chunk_has_usable_output(
             response.get("output")
         )
     if isinstance(response, dict):
-        if not _responses_output_module._response_is_effectively_empty(response):
-            return True
-        return False
+        return bool(
+            _stream_chunk_has_visible_output(response)
+            or _responses_output_module._payload_has_tool_activity(response)
+        )
     return _stream_chunk_has_visible_output(dumped)
 
 
@@ -1071,7 +1072,28 @@ def _synthesized_failed_response_event(
     exception: Exception,
 ) -> _JSONStreamEvent:
     model = _responses_execution_module._request_model_group(request_data) or request_data.get("model") or "unknown"
-    message = "The upstream model route failed before a final assistant response was available."
+    is_structured_compaction = (
+        _responses_request_module._request_has_structured_codex_compaction(
+            request_data
+        )
+    )
+    if is_structured_compaction:
+        status_code = _routing_module._exception_status_code(exception)
+        status_suffix = f" (HTTP {status_code})" if status_code is not None else ""
+        message = (
+            "The upstream model route failed the structured context compaction "
+            f"request{status_suffix}."
+        )
+        error_type = (
+            "invalid_request_error"
+            if _routing_module._is_terminal_responses_stream_failure_error(exception)
+            else "server_error"
+        )
+        error_code = "upstream_compaction_failure"
+    else:
+        message = "The upstream model route failed before a final assistant response was available."
+        error_type = "server_error"
+        error_code = "upstream_route_failure"
     response = {
         "id": f"resp_failed_{os.getpid()}_{time.time_ns()}",
         "object": "response",
@@ -1080,8 +1102,8 @@ def _synthesized_failed_response_event(
         "status": "failed",
         "output": [],
         "error": {
-            "type": "server_error",
-            "code": "upstream_route_failure",
+            "type": error_type,
+            "code": error_code,
             "message": message,
         },
     }
@@ -1623,6 +1645,176 @@ async def _stream_with_idle_timeout(
         yield chunk
 
 
+def _should_emit_codex_responses_initial_sse_keepalive(
+    request_data: Optional[dict],
+) -> bool:
+    return bool(
+        isinstance(request_data, dict)
+        and request_data.get("stream") is True
+        and _responses_request_module._request_is_responses_api(request_data)
+        and _responses_request_module._request_has_codex_client_evidence(request_data)
+        and not _responses_request_module._request_has_structured_codex_compaction(
+            request_data
+        )
+    )
+
+
+def _codex_responses_initial_sse_keepalive() -> _JSONStreamEvent:
+    return _JSONStreamEvent(
+        {
+            "type": "response.metadata",
+            "metadata": {
+                "litellm_menu_keepalive": "initial_wait",
+                "phase": "awaiting_upstream_first_event",
+            },
+        }
+    )
+
+
+def _is_codex_responses_initial_sse_keepalive(chunk: Any) -> bool:
+    dumped = _stream_chunk_dump(chunk)
+    metadata = dumped.get("metadata")
+    return bool(
+        dumped.get("type") == "response.metadata"
+        and isinstance(metadata, dict)
+        and metadata.get("litellm_menu_keepalive") == "initial_wait"
+    )
+
+
+async def _yield_codex_responses_initial_keepalive_stream(
+    response: Any,
+    request_data: dict,
+    *,
+    stream_started_at: Optional[float] = None,
+) -> AsyncIterator[Any]:
+    """Open a Codex Responses SSE stream before a slow upstream first event.
+
+    The pending upstream read is deliberately shielded while the local metadata
+    event opens the downstream SSE response.  The original first-event deadline
+    still applies to that same read, so a keepalive never turns an upstream
+    first-event timeout into an indefinitely live stream.
+    """
+
+    iterator = response.__aiter__()
+    start_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(
+        request_data
+    )
+    deadline = (
+        time.monotonic() + start_timeout_seconds
+        if start_timeout_seconds > 0
+        else None
+    )
+    next_chunk_task: Optional[asyncio.Task[Any]] = asyncio.create_task(
+        iterator.__anext__()
+    )
+    emitted_keepalive = False
+
+    async def cancel_pending_read() -> None:
+        nonlocal next_chunk_task
+        task = next_chunk_task
+        next_chunk_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, StopAsyncIteration):
+            pass
+        except Exception:
+            pass
+
+    try:
+        while True:
+            task = next_chunk_task
+            if task is None:
+                return
+            if task.done():
+                try:
+                    first_chunk = task.result()
+                except StopAsyncIteration:
+                    next_chunk_task = None
+                    return
+                next_chunk_task = None
+                break
+
+            remaining_seconds: Optional[float] = None
+            if deadline is not None:
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    await cancel_pending_read()
+                    raise _stream_start_timeout_exception(
+                        request_data,
+                        start_seconds=start_timeout_seconds,
+                        saw_chunk=False,
+                        buffered_chunks=0,
+                    ) from None
+
+            wait_seconds: Optional[float]
+            if emitted_keepalive:
+                wait_seconds = remaining_seconds
+            else:
+                wait_seconds = _CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS
+                if remaining_seconds is not None:
+                    wait_seconds = min(wait_seconds, remaining_seconds)
+
+            try:
+                if wait_seconds is None:
+                    first_chunk = await asyncio.shield(task)
+                else:
+                    first_chunk = await asyncio.wait_for(
+                        asyncio.shield(task),
+                        timeout=wait_seconds,
+                    )
+            except asyncio.TimeoutError:
+                if task.done():
+                    continue
+                if deadline is not None and time.monotonic() >= deadline:
+                    await cancel_pending_read()
+                    raise _stream_start_timeout_exception(
+                        request_data,
+                        start_seconds=start_timeout_seconds,
+                        saw_chunk=False,
+                        buffered_chunks=0,
+                    ) from None
+                if not emitted_keepalive:
+                    emitted_keepalive = True
+                    yield _codex_responses_initial_sse_keepalive()
+                    continue
+                await cancel_pending_read()
+                raise _stream_start_timeout_exception(
+                    request_data,
+                    start_seconds=start_timeout_seconds,
+                    saw_chunk=False,
+                    buffered_chunks=0,
+                ) from None
+            except StopAsyncIteration:
+                next_chunk_task = None
+                return
+            else:
+                next_chunk_task = None
+                break
+
+        if (
+            _routing_module._FIRST_STREAM_OUTPUT_TIME_KEY not in request_data
+            and _stream_chunk_has_meaningful_delta(first_chunk)
+        ):
+            request_data[_routing_module._FIRST_STREAM_OUTPUT_TIME_KEY] = datetime.now(
+                timezone.utc
+            )
+            _routing_module._record_first_stream_output_time(request_data)
+        yield first_chunk
+        async for chunk in _stream_with_idle_timeout(
+            iterator,
+            request_data,
+            stream_started_at=stream_started_at,
+            initial_chunk_count=1,
+        ):
+            yield chunk
+    finally:
+        await cancel_pending_read()
+
+
 def _stream_chunk_has_meaningful_delta(chunk: Any) -> bool:
     dumped = _stream_chunk_dump(chunk)
     chunk_type = _stream_chunk_type(dumped)
@@ -2130,6 +2322,13 @@ async def _stream_streaming_error_fallback_round(
         if fallback_attempt is None:
             return
         fallback_response, fallback_payload = fallback_attempt
+        if not _responses_output_module._response_is_async_iterable(
+            fallback_response
+        ):
+            fallback_response = _non_streaming_response_as_stream(
+                fallback_response,
+                fallback_payload,
+            )
         guarded_fallback_response = _stream_with_selected_deployment_box(
             fallback_response,
             selected_deployment_box,
@@ -2593,67 +2792,9 @@ async def _stream_route_recovery_poll_attempt(
 def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     if _routing_module._is_upstream_model_not_found_error(exception):
         return False
-    return bool(
-        _routing_module._is_route_recovery_poll_error(exception)
-        or _external_web_search_exception_has_recovery_request(exception)
-        or _routing_module._is_priority_deployment_failover_error(exception)
-        or _routing_module._is_no_deployments_available_error(exception)
-    )
-
-
-def _without_failed_codex_compaction_prompt_cache_key(
-    request_data: Optional[dict],
-    exception: Exception,
-) -> Optional[dict]:
-    """Retry a temporary v2 compaction failure without upstream prompt caching.
-
-    Some Responses-compatible upstreams accept ``prompt_cache_key`` on ordinary
-    turns but emit ``response.failed`` when the same field is present beside a
-    ``compaction_trigger``.  Preserve the native Codex request on its first
-    attempt, then remove only the cache hint during shared route recovery.  The
-    compaction history and complete Responses Lite tool catalog stay untouched.
-    """
-    if not _responses_request_module._request_has_structured_codex_compaction(
-        request_data
-    ):
-        return None
-
-    exception_summary = _routing_module._trace_exception(exception)
-    reason = exception_summary.get("reason")
-    if not (
-        reason in {"upstream-temporary-class", "upstream-temporary-text"}
-        or (isinstance(reason, str) and reason.startswith("upstream-status-5"))
-    ):
-        return None
-
-    assert isinstance(request_data, dict)
-    modified_request = request_data.copy()
-    removed_locations: list[str] = []
-    if "prompt_cache_key" in modified_request:
-        modified_request.pop("prompt_cache_key", None)
-        removed_locations.append("prompt_cache_key")
-
-    extra_body = modified_request.get("extra_body")
-    if isinstance(extra_body, dict) and "prompt_cache_key" in extra_body:
-        updated_extra_body = extra_body.copy()
-        updated_extra_body.pop("prompt_cache_key", None)
-        modified_request["extra_body"] = updated_extra_body
-        removed_locations.append("extra_body.prompt_cache_key")
-
-    if not removed_locations:
-        return None
-
-    _trace_module._route_trace(
-        "codex_compaction_prompt_cache_key_removed",
-        request_id=_routing_module._trace_request_id(request_data),
-        session=_routing_module._trace_session_context(request_data),
-        model_group=_responses_execution_module._request_model_group(request_data),
-        deployment_id=_routing_module._deployment_id_from_request(request_data),
-        route_key=_routing_module._deployment_route_key_from_request(request_data),
-        removed_locations=removed_locations,
-        exception=exception_summary,
-    )
-    return modified_request
+    if _external_web_search_exception_has_recovery_request(exception):
+        return True
+    return _routing_module._is_route_recovery_poll_error(exception)
 
 
 def _external_web_search_exception_has_recovery_request(
@@ -2831,6 +2972,7 @@ async def _external_web_search_non_stream_synthesis_recovery(
 
 _ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS = 15.0
 _ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS = 1.0
+_CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS = 5.0
 
 
 def _route_recovery_sse_keepalive(
@@ -2843,34 +2985,23 @@ def _route_recovery_sse_keepalive(
         _state_module._touch_route_recovery_state(
             _route_recovery_state_key(request_data)
         )
-    response = {
-        "id": f"resp_litellm_keepalive_{os.getpid()}_{time.time_ns()}",
-        "object": "response",
-        "created_at": int(time.time()),
-        "model": _routing_module._first_not_none(
-            (request_data or {}).get("model"),
-            _responses_execution_module._request_model_group(request_data),
-            "unknown",
-        ),
-        "status": "in_progress",
-        "output": [],
-        "metadata": {
-            "litellm_menu_keepalive": "route_recovery",
-            "phase": phase,
-            "attempt": attempt,
-        },
-    }
-    return _JSONStreamEvent({"type": "response.in_progress", "response": response})
+    return _JSONStreamEvent(
+        {
+            "type": "response.metadata",
+            "metadata": {
+                "litellm_menu_keepalive": "route_recovery",
+                "phase": phase,
+                "attempt": attempt,
+            },
+        }
+    )
 
 
 def _is_route_recovery_sse_keepalive(chunk: Any) -> bool:
     dumped = _stream_chunk_dump(chunk)
-    if dumped.get("type") != "response.in_progress":
+    if dumped.get("type") != "response.metadata":
         return False
-    response = dumped.get("response")
-    if not isinstance(response, dict):
-        return False
-    metadata = response.get("metadata")
+    metadata = dumped.get("metadata")
     return (
         isinstance(metadata, dict)
         and metadata.get("litellm_menu_keepalive") == "route_recovery"
@@ -2913,6 +3044,19 @@ async def _stream_route_recovery_poll(
     request_data: dict,
     exception: Exception,
 ) -> AsyncIterator[Any]:
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        _trace_module._route_trace(
+            "codex_compaction_route_recovery_blocked",
+            request_id=_routing_module._trace_request_id(request_data),
+            session=_routing_module._trace_session_context(request_data),
+            model_group=_responses_execution_module._request_model_group(request_data),
+            request=_trace_module._trace_request_summary(request_data),
+            exception=_routing_module._trace_exception(exception),
+        )
+        yield _synthesized_failed_response_event(request_data, exception)
+        return
     recovery_request = _external_web_search_recovery_payload_for_blocked_original(
         request_data,
         exception,
@@ -3115,14 +3259,6 @@ async def _stream_route_recovery_poll(
                         pass
                 waited_for_all_cooldown = False
                 ignore_local_constraints = False
-            cacheless_compaction_request = (
-                _without_failed_codex_compaction_prompt_cache_key(
-                    request_data,
-                    last_exception,
-                )
-            )
-            if cacheless_compaction_request is not None:
-                request_data = cacheless_compaction_request
             now = time.monotonic()
             if attempt > 0 and max_poll_seconds > 0 and now >= deadline:
                 _trace_module._route_trace(
@@ -4117,6 +4253,7 @@ async def _yield_guarded_original_stream(
         request_data,
     )
     custom_tool_item_ids: set[str] = set()
+    completed_custom_tool_input_item_ids: set[str] = set()
     custom_tool_input_delta_tracker = _responses_output_module._CustomToolInputDeltaTracker()
     raw_tool_call_text_filter = _responses_web_search_bridge_module._RawToolCallTextFilter()
 
@@ -4240,6 +4377,15 @@ async def _yield_guarded_original_stream(
             pending_tool_items,
             completed_output_items,
         )
+        dumped = _stream_chunk_dump(chunk)
+        if _stream_chunk_type(dumped) == "response.custom_tool_call_input.done":
+            item_id = dumped.get("item_id") or dumped.get("id")
+            input_text = dumped.get("input")
+            if isinstance(item_id, str) and item_id and isinstance(input_text, str):
+                completed_custom_tool_input_item_ids.add(item_id)
+                for _output_index, item in pending_tool_items.values():
+                    if item_id in _stream_output_item_identity_keys(item):
+                        item["input"] = input_text
         if _responses_stream_chunk_is_completed(chunk):
             _remember_completed_response_output_items(
                 chunk,
@@ -4762,7 +4908,6 @@ async def _yield_guarded_original_stream(
                             _responses_web_search_bridge_module._external_web_search_prepare_continuation_recovery_request(
                                 request_kwargs=request_data,
                                 search_results=search_results,
-                                source_urls=source_urls_for_recovery,
                                 queries=completed_labels,
                                 completed_actions=completed_actions_for_recovery,
                                 round_number=1,
@@ -4827,6 +4972,7 @@ async def _yield_guarded_original_stream(
                 continue
             if item.get("type") == "web_search_call" or _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
                 continue
+            item = _responses_web_search_bridge_module._final_answer_message_item(item)
             final_output.append(item)
             if item.get("type") == "message":
                 index = len(final_output) - 1
@@ -4887,6 +5033,36 @@ async def _yield_guarded_original_stream(
             already_yielded_visible_output=True,
         )
         return completed
+
+    def completed_custom_tool_terminal_events() -> list[_JSONStreamEvent]:
+        if completed_output_has_visible_assistant_text() or synthesized_text().strip():
+            return []
+        if not pending_tool_items:
+            return []
+        for _output_index, item in pending_tool_items.values():
+            if item.get("type") != "custom_tool_call":
+                return []
+            if not any(
+                item_id in completed_custom_tool_input_item_ids
+                for item_id in _stream_output_item_identity_keys(item)
+            ):
+                return []
+        events = _synthesized_pending_tool_completion_events(
+            pending_tool_items,
+            completed_output_items,
+            completion_state.created_response,
+            completion_state.model,
+        )
+        if events:
+            _trace_module._route_trace(
+                "responses_active_stream_synthesized_completed_event",
+                request_id=_routing_module._trace_request_id(request_data),
+                session=_routing_module._trace_session_context(request_data),
+                model_group=_responses_execution_module._request_model_group(request_data),
+                reason="completed custom tool call before terminal response event",
+                already_yielded_visible_output=True,
+            )
+        return events
 
     def failed_terminal_event(reason: str, exception: Optional[Exception] = None) -> _JSONStreamEvent:
         failure = exception or _responses_incomplete_stream_exception(reason, buffer=event_tail)
@@ -4959,6 +5135,12 @@ async def _yield_guarded_original_stream(
                 ):
                     yield recovered_chunk
                 return
+            terminal_events = completed_custom_tool_terminal_events()
+            for synthetic_chunk in terminal_events:
+                remember(synthetic_chunk)
+                yield synthetic_chunk
+            if terminal_events:
+                return
             output_limit_terminal = (
                 _responses_incomplete_terminal_reason(chunk)
                 in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS
@@ -5028,6 +5210,12 @@ async def _yield_guarded_original_stream(
                     ):
                         yield recovered_chunk
                     return
+                terminal_events = completed_custom_tool_terminal_events()
+                for synthetic_chunk in terminal_events:
+                    remember(synthetic_chunk)
+                    yield synthetic_chunk
+                if terminal_events:
+                    return
                 if visible_output_seen and not saw_responses_completed:
                     yield failed_terminal_event("stream error after visible output", chunk_exception)
                     return
@@ -5075,6 +5263,12 @@ async def _yield_guarded_original_stream(
                         "terminal response event after web_search-only output",
                     ):
                         yield recovered_chunk
+                    return
+                terminal_events = completed_custom_tool_terminal_events()
+                for synthetic_chunk in terminal_events:
+                    remember(synthetic_chunk)
+                    yield synthetic_chunk
+                if terminal_events:
                     return
                 output_limit_terminal = (
                     _responses_incomplete_terminal_reason(chunk)
@@ -5125,6 +5319,12 @@ async def _yield_guarded_original_stream(
                 exc,
             ):
                 yield recovered_chunk
+            return
+        terminal_events = completed_custom_tool_terminal_events()
+        for synthetic_chunk in terminal_events:
+            remember(synthetic_chunk)
+            yield synthetic_chunk
+        if terminal_events:
             return
         if visible_output_seen and not saw_responses_completed:
             yield failed_terminal_event("stream error after visible output", exc)
@@ -5513,11 +5713,18 @@ async def _yield_start_buffered_stream_with_error_fallback(
     raw_tool_call_text_filter = _responses_web_search_bridge_module._RawToolCallTextFilter()
 
     try:
-        async for chunk in _stream_with_idle_timeout(
+        stream = _stream_with_idle_timeout(
             response,
             request_data,
             stream_started_at=stream_started_at,
-        ):
+        )
+        if _should_emit_codex_responses_initial_sse_keepalive(request_data):
+            stream = _yield_codex_responses_initial_keepalive_stream(
+                response,
+                request_data,
+                stream_started_at=stream_started_at,
+            )
+        async for chunk in stream:
             sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
             if sanitized_chunk is None:
                 continue
@@ -5528,6 +5735,9 @@ async def _yield_start_buffered_stream_with_error_fallback(
             if sanitized_chunk is None:
                 continue
             chunk = sanitized_chunk
+            if _is_codex_responses_initial_sse_keepalive(chunk):
+                yield chunk
+                continue
             if (
                 not saw_visible_output
                 and _stream_chunk_type(chunk) == "response.output_text.delta"

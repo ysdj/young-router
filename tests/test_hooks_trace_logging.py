@@ -347,6 +347,7 @@ class HookTraceLoggingTests(HookTestCase):
                             "id": "deployment-1",
                             "provider": "provider-a",
                             "order": 2,
+                            "model_group": "public-chat",
                         },
                     },
                 },
@@ -371,11 +372,13 @@ class HookTraceLoggingTests(HookTestCase):
                 "2026-06-09T12:00:00Z",
             )
             self.assertEqual(record["model_group"], "default-chat")
+            self.assertEqual(record["public_model"], "public-chat")
+            self.assertEqual(record["upstream_model"], "openai/gpt-upstream")
             self.assertEqual(record["deployment_id"], "deployment-1")
             self.assertNotIn("deployment_token", record)
             self.assertEqual(
                 record["route_key"],
-                "model=default-chat / provider=provider-a / upstream=openai/gpt-upstream / host=provider.example / order=2",
+                "model=public-chat / provider=provider-a / upstream=openai/gpt-upstream / host=provider.example / order=2",
             )
             self.assertEqual(record["deployment_order"], 2)
             self.assertEqual(record["provider"], "provider-a")
@@ -387,6 +390,32 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertNotIn("SECRETKEYVALUE", raw)
             self.assertNotIn("SECRET_AUTH_VALUE", raw)
             self.assertNotIn("Authorization", raw)
+
+    def test_request_log_uses_router_public_model_after_upstream_rewrite(self) -> None:
+        hooks, _ = load_hook_module()
+
+        record = hooks._request_log_record(
+            "success",
+            {
+                "model": "vendor-chat-tagged",
+                "custom_llm_provider": "provider-a",
+                "litellm_params": {
+                    "model": "openai/vendor-chat-tagged",
+                    "api_base": "https://provider.example/v1",
+                    "metadata": {
+                        "deployment_model_name": "public-chat",
+                        "model_info": {
+                            "id": "deployment-1",
+                            "provider": "provider-a",
+                        },
+                    },
+                },
+            },
+        )
+
+        self.assertEqual("public-chat", record["public_model"])
+        self.assertEqual("openai/vendor-chat-tagged", record["upstream_model"])
+        self.assertTrue(record["route_key"].startswith("model=public-chat /"))
 
     def test_recent_request_timestamp_treats_naive_callback_time_as_local(self) -> None:
         hooks, _ = load_hook_module()

@@ -42,6 +42,19 @@ class SearchEndpointTests(unittest.TestCase):
             ],
         )
 
+    def test_commands_to_actions_keeps_model_selected_result_page(self) -> None:
+        search_endpoint = self._module()
+
+        actions, errors = search_endpoint.commands_to_actions(
+            {"search_query": [{"q": "平顶山今天天气", "page": 2}]}
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            actions,
+            [{"type": "search", "query": "平顶山今天天气", "page": "2"}],
+        )
+
     def test_execute_search_payload_returns_codex_search_response(self) -> None:
         search_endpoint = self._module()
         original = search_endpoint._bridge._external_web_search_run_actions

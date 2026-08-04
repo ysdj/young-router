@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import urllib.error
 import urllib.request
@@ -47,7 +48,7 @@ class ProvidersModelsDomain:
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
-        # Live billing is a transient, read-only projection.  It must never
+        # Live multiplier data is a transient, read-only projection. It must never
         # enter the staged document because ``apply`` writes that document.
         self._billing_overlay: dict[str, dict[str, dict[str, Any]]] = {}
         self._probe_overlay: dict[str, dict[str, dict[str, Any]]] = {}
@@ -96,24 +97,131 @@ class ProvidersModelsDomain:
         return registry[identity]
 
     @staticmethod
+    def _provider_editor_key(provider: Mapping[str, Any], index: int) -> str:
+        name = str(provider.get("name", "")).strip()
+        return name if name else f"#{index}"
+
+    @staticmethod
+    def _model_editor_key(model: Mapping[str, Any], index: int) -> str:
+        deployment_id = str(model.get("deployment_id", "")).strip().lower()
+        return deployment_id if deployment_id else f"#{index}"
+
+    def _editor_id_bindings(self) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+        provider_bindings: dict[str, str] = {}
+        model_bindings: dict[tuple[str, str], str] = {}
+        providers = self._draft.get("providers", [])
+        if not isinstance(providers, list):
+            return provider_bindings, model_bindings
+        for provider_index, provider in enumerate(providers):
+            if not isinstance(provider, Mapping):
+                continue
+            provider_key = self._provider_editor_key(provider, provider_index)
+            provider_bindings[provider_key] = self._editor_id(provider)
+            models = provider.get("models", [])
+            if not isinstance(models, list):
+                continue
+            for model_index, model in enumerate(models):
+                if isinstance(model, Mapping):
+                    model_bindings[(provider_key, self._model_editor_key(model, model_index))] = self._editor_id(model, model=True)
+        return provider_bindings, model_bindings
+
+    def _restore_editor_id_bindings(
+        self,
+        provider_bindings: Mapping[str, str],
+        model_bindings: Mapping[tuple[str, str], str],
+    ) -> None:
+        self._provider_editor_ids.clear()
+        self._model_editor_ids.clear()
+        providers = self._draft.get("providers", [])
+        if not isinstance(providers, list):
+            return
+        for provider_index, provider in enumerate(providers):
+            if not isinstance(provider, Mapping):
+                continue
+            provider_key = self._provider_editor_key(provider, provider_index)
+            provider_id = provider_bindings.get(provider_key)
+            if provider_id is not None:
+                self._provider_editor_ids[id(provider)] = provider_id
+            models = provider.get("models", [])
+            if not isinstance(models, list):
+                continue
+            for model_index, model in enumerate(models):
+                if not isinstance(model, Mapping):
+                    continue
+                model_id = model_bindings.get((provider_key, self._model_editor_key(model, model_index)))
+                if model_id is not None:
+                    self._model_editor_ids[id(model)] = model_id
+
+    def _copy_model_for_edit(self, model: Mapping[str, Any]) -> dict[str, Any]:
+        copied = _copy_mapping(model, "model")
+        self._model_editor_ids[id(copied)] = self._editor_id(model, model=True)
+        return copied
+
+    def _copy_provider_for_edit(self, provider: Mapping[str, Any]) -> dict[str, Any]:
+        copied = _copy_mapping(provider, "provider")
+        self._provider_editor_ids[id(copied)] = self._editor_id(provider)
+        source_models = provider.get("models")
+        copied_models = copied.get("models")
+        if isinstance(source_models, list) and isinstance(copied_models, list):
+            for source_model, copied_model in zip(source_models, copied_models, strict=False):
+                if isinstance(source_model, Mapping) and isinstance(copied_model, Mapping):
+                    self._model_editor_ids[id(copied_model)] = self._editor_id(source_model, model=True)
+        return copied
+
+    def _register_new_provider(self, provider: Mapping[str, Any]) -> None:
+        self._editor_id(provider)
+        models = provider.get("models")
+        if isinstance(models, list):
+            for model in models:
+                if isinstance(model, Mapping):
+                    self._editor_id(model, model=True)
+
+    @staticmethod
     def _billing_model_key(model: Mapping[str, Any]) -> str:
         """Return the same stable model identity used by provider_billing."""
 
         return str(model.get("deployment_id") or model.get("model_name") or "")
 
+    def _probe_model_key(self, model: Mapping[str, Any]) -> str:
+        """Return the editor identity so one model's result never aliases another's."""
+
+        return self._editor_id(model, model=True)
+
+    @staticmethod
+    def _upstream_model_prefix(model: Mapping[str, Any]) -> str:
+        surfaces = model.get("supported_upstream_url_surfaces", [])
+        if not isinstance(surfaces, list):
+            surfaces = []
+        primary = str(model.get("upstream_url_surface", "")).strip()
+        surface = str(surfaces[0]).strip() if surfaces else primary
+        return "anthropic" if surface == "anthropic" else "openai"
+
+    @classmethod
+    def _canonical_upstream_model(cls, value: object, model: Mapping[str, Any]) -> str:
+        name = str(value or "").strip()
+        if not name:
+            return ""
+        if "/" in name:
+            existing_prefix, raw_name = name.split("/", 1)
+            if existing_prefix in {"openai", "anthropic"}:
+                name = raw_name.strip()
+        if not name:
+            return ""
+        prefix = cls._upstream_model_prefix(model)
+        return f"{prefix}/{name}"
+
     @staticmethod
     def _safe_billing_overlay(model: Mapping[str, Any]) -> dict[str, Any]:
-        """Keep only the UI billing fields from an optional remote response."""
+        """Keep only the UI multiplier fields from an optional remote response."""
 
         return {
             "billing": redact(
                 {
                     key: model.get(key)
-                    for key in ("status", "detail", "source", "balance", "group", "mode")
+                    for key in ("status", "detail", "source")
                     if model.get(key) is not None
                 }
             ),
-            "usage": redact(model.get("usage")) if model.get("usage") is not None else None,
             "multiplier": redact(model.get("multiplier")) if model.get("multiplier") is not None else None,
         }
 
@@ -166,9 +274,8 @@ class ProvidersModelsDomain:
                     and key in {"rpm", "tpm", "timeout", "allowed_openai_params", "drop_params", "additional_drop_params"}
                 }
                 live_billing = billing_overlay.get(self._billing_model_key(model), {})
-                live_probe = self._probe_overlay.get(name, {}).get(
-                    self._billing_model_key(model), {}
-                )
+                live_probe = self._probe_overlay.get(name, {}).get(self._probe_model_key(model), {})
+                model_enabled = model.get("model_enabled", model.get("enabled", True)) is not False
                 models.append(
                     {
                         "id": str(model.get("deployment_id") or model.get("model_name") or self._editor_id(model, model=True)),
@@ -177,12 +284,12 @@ class ProvidersModelsDomain:
                         "name": str(model.get("model_name", "")),
                         "display_name": str(model.get("model_name", "")),
                         "litellm_model": str(model.get("litellm_model", "")),
-                        "upstream_model": str(model.get("litellm_model", "")),
+                        "upstream_model": str(model.get("litellm_model", "")).split("/", 1)[-1],
                         "provider": str(model.get("provider", name)),
                         "api_base": REDACT_TEXT(str(model.get("api_base", ""))),
                         "api_key_name": model_key_name,
-                        "enabled": model.get("enabled") is not False,
-                        "model_enabled": model.get("model_enabled") is not False,
+                        "enabled": model_enabled,
+                        "model_enabled": model_enabled,
                         "order": model.get("order", 1),
                         "ssl_verify": str(model.get("ssl_verify", "")),
                         "ssl_verify_present": bool(model.get("ssl_verify_present")),
@@ -197,9 +304,6 @@ class ProvidersModelsDomain:
                         "api_key_configured": model_key,
                         "billing": redact(live_billing.get("billing", model.get("billing")))
                         if live_billing.get("billing", model.get("billing")) is not None
-                        else None,
-                        "usage": redact(live_billing.get("usage", model.get("usage")))
-                        if live_billing.get("usage", model.get("usage")) is not None
                         else None,
                         "multiplier": redact(live_billing.get("multiplier", model.get("multiplier")))
                         if live_billing.get("multiplier", model.get("multiplier")) is not None
@@ -256,6 +360,9 @@ class ProvidersModelsDomain:
             "raw_editor_available": True,
         }
 
+    def draft_state(self) -> object:
+        return copy.deepcopy(self._draft)
+
     def _replace_draft(self, providers: object, document: object | None = None) -> None:
         from config_editor_core.load import load_config_document, normalize_config_document
 
@@ -269,6 +376,10 @@ class ProvidersModelsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Provider/model configuration is invalid") from None
         self._draft = {"providers": copy.deepcopy(providers), "document": copy.deepcopy(normalized)}
+        self._provider_editor_ids.clear()
+        self._model_editor_ids.clear()
+        self._billing_overlay.clear()
+        self._probe_overlay.clear()
 
     def _set_raw(self, data: Mapping[str, Any]) -> None:
         from config_editor_core.load import load_config_document, normalize_config_document
@@ -286,6 +397,10 @@ class ProvidersModelsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Provider/model configuration is invalid") from None
         self._draft = {"providers": copy.deepcopy(loaded["providers"]), "document": copy.deepcopy(loaded["document"])}
+        self._provider_editor_ids.clear()
+        self._model_editor_ids.clear()
+        self._billing_overlay.clear()
+        self._probe_overlay.clear()
 
     def _import_selected(self, data: Mapping[str, Any]) -> None:
         """Stage an explicitly selected external config through its existing parser."""
@@ -333,6 +448,37 @@ class ProvidersModelsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Provider configuration could not be imported") from None
 
+    def _refresh_multiplier(self) -> None:
+        import provider_billing
+
+        payload = provider_billing.collect_billing(self.config_path, timeout=5.0)
+        providers = payload.get("providers", []) if isinstance(payload, Mapping) else []
+        overlay: dict[str, dict[str, dict[str, Any]]] = {}
+        if isinstance(providers, Sequence) and not isinstance(providers, (str, bytes, bytearray)):
+            for provider in providers:
+                if not isinstance(provider, Mapping):
+                    continue
+                provider_name = str(provider.get("name", "")).strip()
+                models = provider.get("models", [])
+                if not provider_name or not isinstance(models, Sequence) or isinstance(models, (str, bytes, bytearray)):
+                    continue
+                by_model: dict[str, dict[str, Any]] = {}
+                for model in models:
+                    if not isinstance(model, Mapping):
+                        continue
+                    identity = str(model.get("deployment_id") or model.get("model") or model.get("name") or "")
+                    if identity:
+                        by_model[identity] = self._safe_billing_overlay(model)
+                if by_model:
+                    overlay[provider_name] = by_model
+        self._billing_overlay = overlay
+        summary = payload.get("summary", {}) if isinstance(payload, Mapping) else {}
+        self._last_operation = {
+            "operation": "multiplier",
+            "available": True,
+            "summary": redact(summary) if isinstance(summary, Mapping) else {},
+        }
+
     def _import_link(self, link: str) -> None:
         try:
             import external_provider_import
@@ -342,51 +488,6 @@ class ProvidersModelsDomain:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "Provider configuration could not be imported") from None
-
-    def _refresh_billing(self) -> None:
-        try:
-            import provider_billing
-
-            payload = provider_billing.collect_billing(self.config_path, timeout=5.0)
-            providers = payload.get("providers", []) if isinstance(payload, Mapping) else []
-            overlay: dict[str, dict[str, dict[str, Any]]] = {}
-            if isinstance(providers, Sequence) and not isinstance(providers, (str, bytes, bytearray)):
-                for provider in providers:
-                    if not isinstance(provider, Mapping):
-                        continue
-                    provider_name = str(provider.get("name", "")).strip()
-                    models = provider.get("models", [])
-                    if not provider_name or not isinstance(models, Sequence) or isinstance(models, (str, bytes, bytearray)):
-                        continue
-                    by_model: dict[str, dict[str, Any]] = {}
-                    for model in models:
-                        if not isinstance(model, Mapping):
-                            continue
-                        identity = str(model.get("deployment_id") or model.get("model") or model.get("name") or "")
-                        if identity:
-                            by_model[identity] = self._safe_billing_overlay(model)
-                    if by_model:
-                        overlay[provider_name] = by_model
-            self._billing_overlay = overlay
-            summary = payload.get("summary", {}) if isinstance(payload, Mapping) else {}
-            safe_summary = redact(summary) if isinstance(summary, Mapping) else {}
-            self._last_operation = {
-                "operation": "billing",
-                "available": True,
-                "summary": safe_summary,
-            }
-        except Exception:
-            # Billing is an optional remote read. Preserve both the editable
-            # draft and any last-known display overlay, and never surface
-            # remote diagnostics or credentials.
-            self._last_operation = {"operation": "billing", "available": False}
-            return
-
-    def is_read_only_action(self, action: str, payload: object | None = None) -> bool:
-        """Tell CoreStore that remote billing refresh does not stage config."""
-
-        del payload
-        return _action_name(action) in {"providers_refresh_billing", "provider_refresh_billing", "refresh_billing"}
 
     @staticmethod
     def _provider_api_base(provider: Mapping[str, Any]) -> str:
@@ -631,16 +732,13 @@ class ProvidersModelsDomain:
         from provider_billing import _billing_http_opener, _service_root
 
         root = _service_root(api_base)
-        if not isinstance(root, str) or not root or not credential or not model_name:
-            return {"surface": surface, "available": False, "status": "invalid_config"}
-
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": "LiteLLM-Menu-Core/1",
         }
         if surface == "anthropic":
-            endpoint = f"{root}/v1/messages"
+            endpoint = f"{root}/v1/messages" if isinstance(root, str) and root else ""
             headers["x-api-key"] = credential
             headers["anthropic-version"] = "2023-06-01"
             payload: dict[str, Any] = {
@@ -649,7 +747,7 @@ class ProvidersModelsDomain:
                 "messages": [{"role": "user", "content": "Reply with OK."}],
             }
         elif surface == "openai/chat":
-            endpoint = f"{root}/v1/chat/completions"
+            endpoint = f"{root}/v1/chat/completions" if isinstance(root, str) and root else ""
             headers["Authorization"] = f"Bearer {credential}"
             payload = {
                 "model": model_name,
@@ -658,7 +756,7 @@ class ProvidersModelsDomain:
                 "messages": [{"role": "user", "content": "Reply with OK."}],
             }
         else:
-            endpoint = f"{root}/v1/responses"
+            endpoint = f"{root}/v1/responses" if isinstance(root, str) and root else ""
             headers["Authorization"] = f"Bearer {credential}"
             payload = {
                 "model": model_name,
@@ -666,6 +764,28 @@ class ProvidersModelsDomain:
                 "stream": False,
                 "input": "Reply with OK.",
             }
+
+        original_request = {
+            "method": "POST",
+            "url": endpoint,
+            "headers": {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                **({"anthropic-version": "2023-06-01"} if surface == "anthropic" else {}),
+            },
+            "body": payload,
+        }
+
+        def result(available: bool, status: str) -> dict[str, Any]:
+            return {
+                "surface": surface,
+                "available": available,
+                "status": status,
+                "original_request": original_request,
+            }
+
+        if not endpoint or not credential or not model_name:
+            return result(False, "invalid_config")
 
         request = urllib.request.Request(
             endpoint,
@@ -693,49 +813,40 @@ class ProvidersModelsDomain:
                 if code == 429
                 else "http_error"
             )
-            return {"surface": surface, "available": False, "status": probe_status}
+            return result(False, probe_status)
         except Exception:
-            return {"surface": surface, "available": False, "status": "network_error"}
+            return result(False, "network_error")
 
         if not isinstance(status, int) or not 200 <= status < 300 or len(body) > cls._MAX_MODEL_PROBE_BYTES:
-            return {"surface": surface, "available": False, "status": "http_error"}
+            return result(False, "http_error")
         try:
             decoded = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             decoded = None
         if not isinstance(decoded, Mapping) or isinstance(decoded.get("error"), Mapping):
-            return {"surface": surface, "available": False, "status": "invalid_response"}
+            return result(False, "invalid_response")
         if surface == "openai/chat":
             usable = isinstance(decoded.get("choices"), list)
         elif surface == "anthropic":
             usable = isinstance(decoded.get("content"), list)
         else:
             usable = any(key in decoded for key in ("id", "output", "output_text"))
-        return {
-            "surface": surface,
-            "available": usable,
-            "status": "ok" if usable else "invalid_response",
-        }
+        return result(usable, "ok" if usable else "invalid_response")
 
     def _probe_model(
         self,
         provider: Mapping[str, Any],
-        provider_index: int,
         model: Mapping[str, Any],
+        *,
+        provider_id: str,
+        model_id: str,
     ) -> dict[str, Any]:
         provider_name = str(provider.get("name", "")).strip()
-        model_key = self._billing_model_key(model)
+        probe_key = model_id
         api_base = self._model_api_base(provider, model)
         _key_name, credential = self._model_credential(provider, model)
         model_name = self._wire_model_name(model)
-        configured = [
-            value
-            for value in model.get("supported_upstream_url_surfaces", [])
-            if isinstance(value, str) and value in {"openai/responses", "openai/chat", "anthropic"}
-        ]
-        surfaces = ["openai/responses", "openai/chat"]
-        if "anthropic" in configured:
-            surfaces.append("anthropic")
+        surfaces = ["openai/responses", "openai/chat", "anthropic"]
 
         with ThreadPoolExecutor(max_workers=len(surfaces) + 1) as executor:
             surface_futures = {
@@ -750,10 +861,17 @@ class ProvidersModelsDomain:
             }
             import provider_billing
 
+            multiplier_target = provider_billing.BillingTarget(
+                provider=provider_name,
+                model=str(model.get("model_name", "")).strip(),
+                upstream_model=str(model.get("litellm_model", "")).strip(),
+                deployment_id=str(model.get("deployment_id", "")).strip(),
+                api_base=api_base,
+                api_key=credential,
+            )
             billing_future = executor.submit(
-                provider_billing.probe_account,
-                api_base,
-                credential,
+                provider_billing.probe_model,
+                multiplier_target,
                 timeout=5.0,
             )
             surface_results = {
@@ -762,49 +880,63 @@ class ProvidersModelsDomain:
             }
             billing = billing_future.result()
 
-        priority = list(dict.fromkeys(["openai/responses", *configured, "openai/chat", "anthropic"]))
-        recommended = next(
-            (
-                surface
-                for surface in priority
-                if surface_results.get(surface, {}).get("available") is True
-            ),
-            None,
+        model_tokens = set(re.split(r"[^a-z0-9]+", f"{model.get('model_name', '')} {model_name}".lower()))
+        priority = (
+            ["anthropic", "openai/responses", "openai/chat"]
+            if "claude" in model_tokens
+            else surfaces
         )
+        recommended_order = [
+            surface
+            for surface in priority
+            if surface_results.get(surface, {}).get("available") is True
+        ]
+        recommended = recommended_order[0] if recommended_order else None
+        unavailable_surfaces = [surface for surface in priority if surface not in recommended_order]
+        summary = {
+            "available_surfaces": recommended_order,
+            "unavailable_surfaces": unavailable_surfaces,
+            "statuses": {
+                surface: str(surface_results.get(surface, {}).get("status", "unavailable"))
+                for surface in priority
+            },
+        }
         checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         probe_overlay = {
             "available": recommended is not None,
             "recommended_surface": recommended,
+            "recommended_order": recommended_order,
+            "summary": summary,
             "checked_at": checked_at,
             "surfaces": {
                 surface: {
                     "available": result.get("available") is True,
                     "status": str(result.get("status", "unavailable")),
+                    "original_request": copy.deepcopy(result.get("original_request", {})),
                 }
                 for surface, result in surface_results.items()
             },
         }
-        self._probe_overlay.setdefault(provider_name, {})[model_key] = probe_overlay
-        if isinstance(billing, Mapping):
-            self._billing_overlay.setdefault(provider_name, {})[model_key] = self._safe_billing_overlay(billing)
-
-        safe_provider_id = self._safe_provider(provider, provider_index)["id"]
         return {
             "ok": recommended is not None,
             "available": recommended is not None,
-            "protocols": [
-                surface
-                for surface, result in surface_results.items()
-                if result.get("available") is True
-            ],
+            "protocols": recommended_order,
             "recommended_surface": recommended,
+            "recommended_order": recommended_order,
+            "summary": summary,
             "detail": "Model probe completed" if recommended is not None else "No usable model API surface was found",
-            "provider_id": safe_provider_id,
-            "model_id": str(model.get("deployment_id") or model.get("model_name") or ""),
+            "provider_id": provider_id,
+            "model_id": model_id,
             "surfaces": [
                 {"surface": surface, **value}
                 for surface, value in probe_overlay["surfaces"].items()
             ],
+            "_overlay": {
+                "provider_name": provider_name,
+                "probe_key": probe_key,
+                "probe": probe_overlay,
+                "billing": self._safe_billing_overlay(billing) if isinstance(billing, Mapping) else None,
+            },
         }
 
     def _provider_index(self, data: Mapping[str, Any]) -> int:
@@ -894,7 +1026,7 @@ class ProvidersModelsDomain:
     def _dispatch_provider_key(self, action: str, data: Mapping[str, Any]) -> None:
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
-        provider = _copy_mapping(providers[provider_index], "provider")
+        provider = self._copy_provider_for_edit(providers[provider_index])
         keys = self._provider_api_keys(provider)
 
         if action == "provider_key_add":
@@ -949,7 +1081,7 @@ class ProvidersModelsDomain:
 
     def _stage_provider_secret(self, provider_index: int, key_name: str | None, value: str) -> None:
         providers = self._draft["providers"]
-        provider = _copy_mapping(providers[provider_index], "provider")
+        provider = self._copy_provider_for_edit(providers[provider_index])
         keys = self._provider_api_keys(provider)
         if key_name is None:
             if keys:
@@ -984,10 +1116,12 @@ class ProvidersModelsDomain:
             if "api_keys" in provider:
                 self._sync_primary_api_key(provider, self._provider_api_keys(provider))
             providers.append(provider)
+            self._register_new_provider(provider)
             return
         if action in {"provider_patch", "patch_provider"}:
             index = self._provider_index(data)
-            provider = _copy_mapping(providers[index], "provider")
+            provider = self._copy_provider_for_edit(providers[index])
+            previous_name = str(provider.get("name", "")).strip()
             changes = self._changes(data, "provider")
             if "endpoint" in changes:
                 changes["api_base"] = changes.pop("endpoint")
@@ -1006,19 +1140,29 @@ class ProvidersModelsDomain:
                 provider["api_keys"] = keys
                 provider["api_key"] = api_key
             provider.update(changes)
+            current_name = str(provider.get("name", "")).strip()
+            if current_name != previous_name:
+                if previous_name in self._probe_overlay:
+                    self._probe_overlay[current_name] = self._probe_overlay.pop(previous_name)
+                if previous_name in self._billing_overlay:
+                    self._billing_overlay[current_name] = self._billing_overlay.pop(previous_name)
             if "api_keys" in changes:
                 self._sync_primary_api_key(provider, self._provider_api_keys(provider))
             providers[index] = provider
             return
         if action in {"provider_clear_key", "clear_provider_key"}:
             index = self._provider_index(data)
-            provider = _copy_mapping(providers[index], "provider")
+            provider = self._copy_provider_for_edit(providers[index])
             provider["api_keys"] = []
             provider["api_key"] = ""
             providers[index] = provider
             return
         if action in {"provider_delete", "delete_provider"}:
-            providers.pop(self._provider_index(data))
+            removed = providers.pop(self._provider_index(data))
+            if isinstance(removed, Mapping):
+                name = str(removed.get("name", "")).strip()
+                self._probe_overlay.pop(name, None)
+                self._billing_overlay.pop(name, None)
             return
         if action in {"provider_move", "move_provider"}:
             source = data.get("from", data.get("source"))
@@ -1031,7 +1175,7 @@ class ProvidersModelsDomain:
     def _dispatch_model(self, action: str, data: Mapping[str, Any]) -> None:
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
-        provider = _copy_mapping(providers[provider_index], "provider")
+        provider = self._copy_provider_for_edit(providers[provider_index])
         models = provider.get("models")
         if not isinstance(models, list):
             models = []
@@ -1042,8 +1186,11 @@ class ProvidersModelsDomain:
             if destination_index == provider_index:
                 return
             model_index = self._model_index(provider, data)
-            model = _copy_mapping(models.pop(model_index), "model")
-            destination_provider = _copy_mapping(providers[destination_index], "provider")
+            model = self._copy_model_for_edit(models.pop(model_index))
+            source_provider_name = str(provider.get("name", "")).strip()
+            probe_key = self._probe_model_key(model)
+            billing_key = self._billing_model_key(model)
+            destination_provider = self._copy_provider_for_edit(providers[destination_index])
             destination_models = destination_provider.get("models")
             if not isinstance(destination_models, list):
                 destination_models = []
@@ -1068,12 +1215,19 @@ class ProvidersModelsDomain:
                 }
             )
             destination_models.append(model)
+            destination_provider_name = str(destination_provider.get("name", "")).strip()
+            source_probe = self._probe_overlay.get(source_provider_name, {}).pop(probe_key, None)
+            if source_probe is not None:
+                self._probe_overlay.setdefault(destination_provider_name, {})[probe_key] = source_probe
+            source_billing = self._billing_overlay.get(source_provider_name, {}).pop(billing_key, None)
+            if source_billing is not None:
+                self._billing_overlay.setdefault(destination_provider_name, {})[billing_key] = source_billing
             providers[provider_index] = provider
             providers[destination_index] = destination_provider
             return
         if action == "model_duplicate":
             model_index = self._model_index(provider, data)
-            model = _copy_mapping(models[model_index], "model")
+            model = self._copy_model_for_edit(models[model_index])
             used_ids: set[str] = set()
             for candidate in providers:
                 if not isinstance(candidate, Mapping):
@@ -1089,6 +1243,7 @@ class ProvidersModelsDomain:
                 deployment_id = uuid.uuid4().hex[:8]
             model["deployment_id"] = deployment_id
             models.insert(model_index + 1, model)
+            self._model_editor_ids[id(model)] = "model-" + uuid.uuid4().hex
             providers[provider_index] = provider
             return
         if action in {"model_add", "add_model"}:
@@ -1098,23 +1253,63 @@ class ProvidersModelsDomain:
                 model["model_name"] = model.pop("name")
             if "upstream_model" in model and "litellm_model" not in model:
                 model["litellm_model"] = model.pop("upstream_model")
+            if "model_enabled" in model:
+                model["enabled"] = model["model_enabled"]
+            elif "enabled" in model:
+                model["model_enabled"] = model["enabled"]
+            if "litellm_model" in model:
+                model["litellm_model"] = self._canonical_upstream_model(model["litellm_model"], model)
+            if not str(model.get("deployment_id", "")).strip():
+                used_ids: set[str] = set()
+                for candidate_provider in providers:
+                    if not isinstance(candidate_provider, Mapping):
+                        continue
+                    candidate_models = candidate_provider.get("models", [])
+                    if not isinstance(candidate_models, list):
+                        continue
+                    for candidate in candidate_models:
+                        if isinstance(candidate, Mapping):
+                            used_ids.add(str(candidate.get("deployment_id", "")).strip().lower())
+                deployment_id = uuid.uuid4().hex[:8]
+                while deployment_id in used_ids:
+                    deployment_id = uuid.uuid4().hex[:8]
+                model["deployment_id"] = deployment_id
             models.append(model)
+            self._editor_id(model, model=True)
         elif action in {"model_patch", "patch_model"}:
             index = self._model_index(provider, data)
-            model = _copy_mapping(models[index], "model")
+            model = self._copy_model_for_edit(models[index])
             changes = self._changes(data, "model")
             if "name" in changes:
                 changes["model_name"] = changes.pop("name")
             if "upstream_model" in changes:
                 changes["litellm_model"] = changes.pop("upstream_model")
+            if "model_enabled" in changes:
+                changes["enabled"] = changes["model_enabled"]
+            elif "enabled" in changes:
+                changes["model_enabled"] = changes["enabled"]
             if isinstance(changes.get("litellm_extra"), Mapping):
                 merged_extra = dict(model.get("litellm_extra", {})) if isinstance(model.get("litellm_extra"), Mapping) else {}
                 merged_extra.update(changes["litellm_extra"])
                 changes["litellm_extra"] = merged_extra
+            previous_model_key = self._billing_model_key(model)
             model.update(changes)
+            if "litellm_model" in changes:
+                model["litellm_model"] = self._canonical_upstream_model(model["litellm_model"], model)
+            if any(key in changes for key in ("upstream_url_surface", "supported_upstream_url_surfaces")):
+                model["litellm_model"] = self._canonical_upstream_model(model.get("litellm_model"), model)
+            current_model_key = self._billing_model_key(model)
+            provider_name = str(provider.get("name", "")).strip()
+            if current_model_key != previous_model_key:
+                if previous_model_key in self._billing_overlay.get(provider_name, {}):
+                    self._billing_overlay[provider_name][current_model_key] = self._billing_overlay[provider_name].pop(previous_model_key)
             models[index] = model
         elif action in {"model_delete", "delete_model"}:
-            models.pop(self._model_index(provider, data))
+            removed = models.pop(self._model_index(provider, data))
+            if isinstance(removed, Mapping):
+                provider_name = str(provider.get("name", "")).strip()
+                self._probe_overlay.get(provider_name, {}).pop(self._probe_model_key(removed), None)
+                self._billing_overlay.get(provider_name, {}).pop(self._billing_model_key(removed), None)
         elif action in {"model_move", "move_model"}:
             source = data.get("from", data.get("source"))
             if type(source) is not int:
@@ -1156,12 +1351,12 @@ class ProvidersModelsDomain:
             provider_index, model_index = matched[deployment_id]
             provider = changed_providers.get(provider_index)
             if provider is None:
-                provider = _copy_mapping(self._draft["providers"][provider_index], "provider")
+                provider = self._copy_provider_for_edit(self._draft["providers"][provider_index])
                 changed_providers[provider_index] = provider
             models = provider.get("models", [])
             if not isinstance(models, list):
                 raise LegacyDomainError("The selected model is unavailable")
-            model = _copy_mapping(models[model_index], "model")
+            model = self._copy_model_for_edit(models[model_index])
             model["order"] = order
             models[model_index] = model
         for provider_index, provider in changed_providers.items():
@@ -1178,8 +1373,8 @@ class ProvidersModelsDomain:
             self._import_codex_current()
         elif name in {"providers_import_claude_current", "provider_import_claude_current", "import_claude_current"}:
             self._import_claude_current()
-        elif name in {"providers_refresh_billing", "provider_refresh_billing", "refresh_billing"}:
-            self._refresh_billing()
+        elif name == "providers_refresh_multiplier":
+            self._refresh_multiplier()
         elif name in {"providers_fetch_models", "provider_fetch_models", "fetch_models"}:
             self._fetch_models(data)
         elif name in {"set", "replace"}:
@@ -1188,7 +1383,11 @@ class ProvidersModelsDomain:
             else:
                 self._replace_draft(data.get("providers", data), data.get("document"))
         elif name in {"reset", "cancel", "reload", "restore_defaults"}:
+            provider_bindings, model_bindings = self._editor_id_bindings()
             self._draft = copy.deepcopy(self._raw)
+            self._restore_editor_id_bindings(provider_bindings, model_bindings)
+            self._billing_overlay.clear()
+            self._probe_overlay.clear()
         elif name in {"routes_reorder_group", "route_reorder_group"}:
             self._reorder_route_group(data)
         elif name.startswith("provider_") or name in {"add_provider", "patch_provider", "delete_provider", "move_provider", "clear_provider_key"}:
@@ -1224,13 +1423,10 @@ class ProvidersModelsDomain:
         return isinstance(value, str) and bool(value.strip())
 
     def trusted_secret_value(self, field: str, target: str | None = None) -> str:
-        """Return one loaded provider API key for the native read capability.
+        """Return the selected staged provider key for the native read lease.
 
-        This method is intentionally not used by the public snapshot or
-        ordinary domain actions. It reads the current staged draft so changing
-        key selection never turns an unapplied provider edit back into the
-        older on-disk value. The native leaf only asks on target changes, not
-        on ordinary snapshot refreshes while the field is being edited.
+        This method has no public caller: snapshots and regular provider
+        actions continue to expose only configured/presence metadata.
         """
 
         if field != "api_key" or not isinstance(target, str):
@@ -1304,6 +1500,8 @@ class ProvidersModelsDomain:
         # parser rather than inventing a second validation implementation.
         if payload is not None:
             before = copy.deepcopy(self._draft)
+            provider_editor_ids = dict(self._provider_editor_ids)
+            model_editor_ids = dict(self._model_editor_ids)
             try:
                 data = _mapping(payload)
                 if "providers" in data or "document" in data:
@@ -1311,6 +1509,8 @@ class ProvidersModelsDomain:
                 result = self._validate()
             finally:
                 self._draft = before
+                self._provider_editor_ids = provider_editor_ids
+                self._model_editor_ids = model_editor_ids
             return result
         return self._validate()
 
@@ -1378,13 +1578,15 @@ class ProvidersModelsDomain:
         return self.snapshot()
 
     def reload(self) -> dict[str, Any]:
+        provider_bindings, model_bindings = self._editor_id_bindings()
         loaded = self._load()
         self._raw = {"providers": copy.deepcopy(loaded["providers"]), "document": copy.deepcopy(loaded["document"])}
         self._draft = copy.deepcopy(self._raw)
         self._disk_revision = copy.deepcopy(loaded["disk_revision"])
         self._exists = bool(loaded["exists"])
-        self._provider_editor_ids.clear()
-        self._model_editor_ids.clear()
+        self._restore_editor_id_bindings(provider_bindings, model_bindings)
+        self._billing_overlay.clear()
+        self._probe_overlay.clear()
         self.revision += 1
         return self.snapshot()
 
@@ -1398,8 +1600,7 @@ class ProvidersModelsDomain:
         self._replace_draft(data.get("providers", []), data.get("document"))
         self.revision += 1
 
-    def probe(self, _payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        result = self._validate()
+    def prepare_probe(self, _payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         protocols: list[str] = []
         for provider in self._draft.get("providers", []):
             if not isinstance(provider, Mapping):
@@ -1409,9 +1610,6 @@ class ProvidersModelsDomain:
                     for protocol in model.get("supported_upstream_url_surfaces", []):
                         if isinstance(protocol, str) and protocol not in protocols:
                             protocols.append(protocol)
-        if not result["valid"]:
-            return {"ok": False, "protocols": protocols, "detail": "Provider/model validation failed"}
-
         data = dict(_payload or {})
         selected = _selected_identifier(data, "provider_id", "provider", "name", "id", "index")
         providers = self._draft.get("providers", [])
@@ -1430,11 +1628,17 @@ class ProvidersModelsDomain:
             models = provider.get("models", [])
             if not isinstance(models, list):
                 raise LegacyDomainError("The selected model is unavailable")
-            return self._probe_model(
-                provider,
-                provider_index,
-                models[self._model_index(provider, data)],
-            )
+            model_index = self._model_index(provider, data)
+            model = models[model_index]
+            if not isinstance(model, Mapping):
+                raise LegacyDomainError("The selected model is unavailable")
+            return {
+                "kind": "model",
+                "provider": copy.deepcopy(dict(provider)),
+                "model": copy.deepcopy(dict(model)),
+                "provider_id": self._editor_id(provider),
+                "model_id": self._editor_id(model, model=True),
+            }
         if selected is not None:
             indices = [self._provider_index(data)]
         else:
@@ -1444,6 +1648,31 @@ class ProvidersModelsDomain:
                 if isinstance(provider, Mapping) and self._provider_api_base(provider)
             ]
         if not indices:
+            return {"kind": "none", "protocols": protocols}
+        return {
+            "kind": "providers",
+            "protocols": protocols,
+            "providers": [
+                {
+                    "provider": copy.deepcopy(dict(providers[index])),
+                    "provider_id": self._editor_id(providers[index]),
+                }
+                for index in indices
+                if isinstance(providers[index], Mapping)
+            ],
+        }
+
+    def perform_probe(self, prepared: Mapping[str, Any]) -> dict[str, Any]:
+        kind = prepared.get("kind")
+        if kind == "model":
+            return self._probe_model(
+                _mapping(prepared.get("provider"), "provider"),
+                _mapping(prepared.get("model"), "model"),
+                provider_id=str(prepared.get("provider_id", "")),
+                model_id=str(prepared.get("model_id", "")),
+            )
+        protocols = [item for item in prepared.get("protocols", []) if isinstance(item, str)]
+        if kind == "none":
             return {
                 "ok": False,
                 "protocols": protocols + [self._MODEL_LIST_PROTOCOL],
@@ -1451,15 +1680,19 @@ class ProvidersModelsDomain:
                 "models": [],
                 "model_count": 0,
             }
-
+        targets = prepared.get("providers", [])
+        if not isinstance(targets, list):
+            raise LegacyDomainError("The selected provider is unavailable")
         probes: list[dict[str, Any]] = []
         all_models: list[str] = []
         seen_models: set[str] = set()
-        for index in indices:
-            provider = providers[index]
+        for target in targets:
+            if not isinstance(target, Mapping):
+                continue
+            provider = target.get("provider")
             if not isinstance(provider, Mapping):
                 continue
-            fetched = self._fetch_provider_models(provider, self._safe_provider(provider, index)["id"])
+            fetched = self._fetch_provider_models(provider, str(target.get("provider_id", "")))
             probes.append(fetched)
             for model in fetched["models"]:
                 if model not in seen_models:
@@ -1478,6 +1711,42 @@ class ProvidersModelsDomain:
             "models": all_models[: self._MAX_MODEL_CANDIDATES],
             "model_count": len(all_models),
         }
+
+    def commit_probe(
+        self,
+        prepared: Mapping[str, Any],
+        value: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        result = dict(value)
+        overlay = result.pop("_overlay", None)
+        if prepared.get("kind") != "model" or not isinstance(overlay, Mapping):
+            return result, False
+        provider_index = self._provider_index({"provider_id": prepared.get("provider_id")})
+        provider = self._draft["providers"][provider_index]
+        if not isinstance(provider, Mapping):
+            raise LegacyDomainError("The selected provider is unavailable")
+        model_index = self._model_index(provider, {"model_id": prepared.get("model_id")})
+        models = provider.get("models", [])
+        if not isinstance(models, list) or not isinstance(models[model_index], Mapping):
+            raise LegacyDomainError("The selected model is unavailable")
+        model = models[model_index]
+        provider_name = str(provider.get("name", "")).strip()
+        probe_key = self._probe_model_key(model)
+        billing_key = self._billing_model_key(model)
+        probe = overlay.get("probe")
+        if not isinstance(probe, Mapping):
+            raise LegacyDomainError("The model probe returned invalid state")
+        self._probe_overlay.setdefault(provider_name, {})[probe_key] = copy.deepcopy(dict(probe))
+        billing = overlay.get("billing")
+        if isinstance(billing, Mapping):
+            self._billing_overlay.setdefault(provider_name, {})[billing_key] = copy.deepcopy(dict(billing))
+        self.revision += 1
+        return result, True
+
+    def probe(self, _payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        prepared = self.prepare_probe(_payload)
+        result, _changed = self.commit_probe(prepared, self.perform_probe(prepared))
+        return result
 
 
 __all__ = ["ProvidersModelsDomain"]

@@ -62,6 +62,10 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       std::wstring_view title,
       std::wstring_view message,
       std::wstring_view confirm_label);
+  void ShowReadOnlyText(
+      std::wstring_view title,
+      std::wstring_view text,
+      std::wstring_view close_label);
   std::optional<size_t> ShowActionMenu(std::wstring_view title, std::vector<std::wstring> const& items, NativeMenuAnchor anchor);
   std::optional<std::vector<std::wstring>> ChooseModelsToAdd(
       std::vector<std::wstring> models,

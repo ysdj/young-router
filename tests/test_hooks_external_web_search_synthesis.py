@@ -6,6 +6,46 @@ from hook_test_utils import *
 
 
 class HookExternalWebSearchSynthesisTests(HookTestCase):
+    def test_direct_page_reader_extracts_html_and_uses_service_user_agent(self) -> None:
+        hooks, _ = load_hook_module()
+        original_urlopen = hooks.urllib.request.urlopen
+        observed = {}
+
+        class Response:
+            headers = {"Content-Type": "text/html; charset=utf-8"}
+
+            def read(self, _size):
+                return b"<html><body><h1>Source title</h1><script>ignore()</script><p>source file text</p></body></html>"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+        def fake_urlopen(request, *, timeout):
+            observed["url"] = request.full_url
+            observed["user_agent"] = request.get_header("User-agent")
+            observed["timeout"] = timeout
+            return Response()
+
+        hooks.urllib.request.urlopen = fake_urlopen
+        self.addCleanup(setattr, hooks.urllib.request, "urlopen", original_urlopen)
+
+        text = hooks._web_page_excerpt(
+            "https://raw.githubusercontent.com/example/project/main/source.py",
+            timeout=12,
+            max_chars=200,
+        )
+
+        self.assertEqual(text, "Source title\nsource file text")
+        self.assertEqual(
+            observed["url"],
+            "https://raw.githubusercontent.com/example/project/main/source.py",
+        )
+        self.assertEqual(observed["user_agent"], "LiteLLM-Menu/1.0")
+        self.assertEqual(observed["timeout"], 12)
+
     def test_external_web_search_sync_has_search_types_in_module_scope(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -19,7 +59,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             def __exit__(self, exc_type, exc, tb):
                 return False
 
-            def text(self, query, max_results=None, region=None, backend=None):
+            def text(self, query, max_results=None, region=None, backend=None, **kwargs):
                 return [
                     {
                         "title": "Signal source",
@@ -40,8 +80,6 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 sys.modules["ddgs"] = previous_ddgs
 
         self.addCleanup(restore_ddgs)
-        self.set_env("LITELLM_MENU_WEB_SEARCH_READ_RESULTS", "0")
-
         text, structured = hooks._ddgs_jina_web_search_sync("sample subject Signal")
 
         self.assertIn("Title: Signal source", text)
@@ -62,13 +100,15 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             def __exit__(self, exc_type, exc, tb):
                 return False
 
-            def text(self, query, max_results=None, region=None, backend=None):
+            def text(self, query, max_results=None, region=None, backend=None, **kwargs):
                 calls.append(
                     {
                         "query": query,
                         "max_results": max_results,
                         "region": region,
                         "backend": backend,
+                        "safesearch": kwargs.get("safesearch"),
+                        "page": kwargs.get("page"),
                     }
                 )
                 if backend == "first":
@@ -113,16 +153,128 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.addCleanup(restore_ddgs)
         self.set_env("LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND", "first,second")
         self.set_env("LITELLM_MENU_WEB_SEARCH_MAX_RESULTS", "3")
-        self.set_env("LITELLM_MENU_WEB_SEARCH_READ_RESULTS", "0")
-
-        text, structured = hooks._ddgs_jina_web_search_sync("query needing breadth")
+        text, structured = hooks._ddgs_jina_web_search_sync(
+            "query needing breadth",
+            page=2,
+        )
 
         self.assertEqual([call["backend"] for call in calls], ["first", "second"])
+        self.assertTrue(all(call["safesearch"] == "off" for call in calls))
+        self.assertTrue(all(call["region"] == "wt-wt" for call in calls))
+        self.assertTrue(all(call["page"] == 2 for call in calls))
         self.assertIn("https://example.test/shared", text)
         self.assertIn("https://example.test/first", text)
         self.assertIn("https://example.test/second", text)
         self.assertEqual(text.count("https://example.test/shared"), 1)
         self.assertIsNone(structured)
+
+    def test_external_web_search_sync_keeps_explicit_results(self) -> None:
+        hooks, _ = load_hook_module()
+
+        class FakeDDGS:
+            def __init__(self, timeout=None):
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def text(self, query, max_results=None, region=None, backend=None, **kwargs):
+                return [
+                    {
+                        "title": "Explicit result",
+                        "href": "https://www.xvideos.example/video",
+                        "body": "adult video",
+                    },
+                    {
+                        "title": "Trusted weather source",
+                        "href": "https://weather.example/pingdingshan",
+                        "body": "Forecast for Pingdingshan.",
+                    },
+                    {
+                        "title": "Another explicit result",
+                        "href": "https://example.test/redirect",
+                        "body": "Watch Pornhub now.",
+                    },
+                ]
+
+        fake_ddgs_module = types.ModuleType("ddgs")
+        fake_ddgs_module.DDGS = FakeDDGS
+        previous_ddgs = sys.modules.get("ddgs")
+        sys.modules["ddgs"] = fake_ddgs_module
+
+        def restore_ddgs() -> None:
+            if previous_ddgs is None:
+                sys.modules.pop("ddgs", None)
+            else:
+                sys.modules["ddgs"] = previous_ddgs
+
+        self.addCleanup(restore_ddgs)
+        self.set_env("LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND", "first")
+
+        text, _ = hooks._ddgs_jina_web_search_sync("Pingdingshan weather")
+
+        self.assertIn("https://weather.example/pingdingshan", text)
+        self.assertIn("xvideos", text.lower())
+        self.assertIn("pornhub", text.lower())
+
+    def test_external_web_search_sync_uses_default_backends_for_legacy_auto_backend(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        class FakeDDGS:
+            def __init__(self, timeout=None):
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def text(self, query, max_results=None, region=None, backend=None, **kwargs):
+                calls.append(
+                    {
+                        "backend": backend,
+                        "region": region,
+                        "safesearch": kwargs.get("safesearch"),
+                    }
+                )
+                return []
+
+        fake_ddgs_module = types.ModuleType("ddgs")
+        fake_ddgs_module.DDGS = FakeDDGS
+        previous_ddgs = sys.modules.get("ddgs")
+        sys.modules["ddgs"] = fake_ddgs_module
+
+        def restore_ddgs() -> None:
+            if previous_ddgs is None:
+                sys.modules.pop("ddgs", None)
+            else:
+                sys.modules["ddgs"] = previous_ddgs
+
+        self.addCleanup(restore_ddgs)
+        self.set_env("LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND", "auto")
+
+        hooks._ddgs_jina_web_search_sync("safe query")
+
+        self.assertEqual(
+            calls,
+            [
+                {"backend": "yahoo", "region": "wt-wt", "safesearch": "off"},
+                {"backend": "bing", "region": "wt-wt", "safesearch": "off"},
+            ],
+        )
+
+    def test_external_web_search_defaults_bound_fast_common_queries(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_MAX_RESULTS_DEFAULT, 5)
+        self.assertEqual(hooks._EXTERNAL_WEB_FETCH_TIMEOUT_DEFAULT, 12.0)
+        self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT, 4)
+        self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_BACKEND_DEFAULT, "yahoo,bing")
 
     async def test_external_web_search_synthesis_failure_raises_for_route_recovery(self) -> None:
         hooks, _ = load_hook_module()
@@ -225,6 +377,570 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         )
 
         self.assertIs(resolved, response)
+
+    async def test_external_web_search_malformed_initial_tool_call_is_rejected(self) -> None:
+        hooks, _ = load_hook_module()
+        response = {
+            "id": "resp_truncated_tool_call",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "arguments": '{"query":"',
+                    "status": "completed",
+                }
+            ],
+        }
+
+        with self.assertRaises(RuntimeError) as context:
+            await hooks._resolve_litellm_web_search_function_calls(
+                response,
+                {
+                    "model": "openai/vendor-chat",
+                    "input": "Use web_search for Sample City weather.",
+                    "tools": [{"type": "web_search"}],
+                },
+                original_function=None,
+            )
+
+        self.assertEqual(getattr(context.exception, "status_code", None), 503)
+        self.assertIn("malformed_web_search_function_call", str(context.exception))
+
+    async def test_external_web_search_chat_tool_retries_one_malformed_call(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class FakeRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(copy.deepcopy(kwargs))
+                arguments = '{"query":"' if len(calls) == 1 else json.dumps(
+                    {"query": "Sample City current weather"}
+                )
+                return {
+                    "id": f"chat_tool_{len(calls)}",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": f"call_{len(calls)}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                }
+
+        proxy_server.llm_router = FakeRouter()
+        call_kwargs = {
+            "model": "openai/vendor-chat",
+            "input": "Use web_search for Sample City weather.",
+            "tools": [hooks._external_web_search_bridge_chat_tool()],
+            "model_info": {
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        }
+
+        response = await hooks._external_web_search_chat_tool_response(
+            call_kwargs,
+            call_kwargs,
+            phase="initial",
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("malformed or truncated", calls[1]["messages"][0]["content"])
+        self.assertEqual(
+            hooks._litellm_web_search_actions_from_response(response),
+            [{"type": "search", "query": "Sample City current weather"}],
+        )
+
+    def test_external_web_search_initial_current_fact_forces_only_first_lookup(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "model": "openai/vendor-chat",
+            "input": "请查上海今天天气。",
+            "tools": [
+                hooks._external_web_search_bridge_chat_tool(),
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object"},
+                },
+            ],
+            "model_info": {
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        }
+
+        initial = hooks._external_web_search_chat_tool_payload(
+            request_kwargs,
+            request_kwargs,
+            phase="initial",
+        )
+        continuation = hooks._external_web_search_chat_tool_payload(
+            request_kwargs,
+            request_kwargs,
+            phase="continuation",
+        )
+
+        self.assertEqual(
+            initial["tool_choice"],
+            {
+                "type": "function",
+                "function": {"name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME},
+            },
+        )
+        self.assertNotIn("tool_choice", continuation)
+
+    def test_external_web_search_initial_current_fact_keeps_kimi_search_optional(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "model": "openai/kimi-k3",
+            "input": "请查上海今天天气。",
+            "reasoning": {"effort": "low"},
+            "tools": [hooks._external_web_search_bridge_chat_tool()],
+            "model_info": {
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        }
+
+        payload = hooks._external_web_search_chat_tool_payload(
+            request_kwargs,
+            request_kwargs,
+            phase="initial",
+        )
+
+        self.assertEqual(payload["tool_choice"], "auto")
+        self.assertEqual(
+            [tool["function"]["name"] for tool in payload["tools"]],
+            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+        )
+        self.assertEqual(payload["max_completion_tokens"], 512)
+        self.assertIn("optional and weak", payload["messages"][0]["content"])
+
+    def test_external_web_search_non_gpt_current_fact_keeps_search_optional(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "model": "openai/kimi-k3",
+            "input": "上海前天天气",
+            "reasoning": {"effort": "low"},
+            "tools": [hooks._external_web_search_bridge_chat_tool()],
+            "model_info": {
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+                "model": "openai/kimi-k3",
+            },
+        }
+
+        payload = hooks._external_web_search_chat_tool_payload(
+            request_kwargs,
+            request_kwargs,
+            phase="initial",
+        )
+
+        self.assertEqual(payload["tool_choice"], "auto")
+        self.assertEqual(payload["max_completion_tokens"], 512)
+        self.assertIn("optional and weak", payload["messages"][0]["content"])
+
+    def test_external_web_search_continuation_slims_codex_deferred_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "model": "openai/vendor-chat",
+            "input": "上海前天天气",
+            "tools": [
+                {"type": "tool_search"},
+                {
+                    "type": "namespace",
+                    "name": "codex_app",
+                    "tools": [{"type": "function", "name": "read_thread"}],
+                },
+            ],
+        }
+
+        continuation_kwargs = hooks._external_web_search_continuation_kwargs(
+            request_kwargs,
+            search_results="Web search results for query: 上海前天天气",
+            queries=["上海前天天气"],
+            completed_actions=[{"type": "search", "query": "上海前天天气"}],
+            round_number=1,
+        )
+
+        self.assertEqual(
+            continuation_kwargs["tools"],
+            [hooks._external_web_search_bridge_chat_tool()],
+        )
+        self.assertEqual(
+            continuation_kwargs["max_output_tokens"],
+            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS,
+        )
+
+    def test_external_web_search_continuation_slims_flattened_codex_tool_search(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "model": "openai/vendor-chat",
+            "input": "上海前天天气",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "tool_search",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object"},
+                },
+            ],
+        }
+
+        self.assertEqual(
+            hooks._external_web_search_continuation_tools(request_kwargs),
+            [hooks._external_web_search_bridge_chat_tool()],
+        )
+
+    async def test_external_web_search_continuation_keeps_active_chat_surface(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+        test_case = self
+
+        class FakeRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(copy.deepcopy(kwargs))
+                selected_box = hooks._CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+                test_case.assertIsInstance(selected_box, dict)
+                selected_box["marker"] = {
+                    "model_info": {
+                        "id": "selected-chat-route",
+                        "model_group": "mapped-chat",
+                        "model": "openai/vendor-chat",
+                    },
+                    "litellm_params": {"model": "openai/vendor-chat"},
+                    "request_params": {},
+                    "_litellm_menu_upstream_url_surface": "openai/chat",
+                }
+                if len(calls) == 1:
+                    return {
+                        "id": "chat_initial",
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_initial",
+                                            "type": "function",
+                                            "function": {
+                                                "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                                                "arguments": json.dumps(
+                                                    {"query": "上海天气 今天"}
+                                                ),
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ],
+                    }
+                return {
+                    "id": "chat_continuation",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "上海天气信息已从检索结果中整理。",
+                            }
+                        }
+                    ],
+                }
+
+        async def original_function(**_kwargs):
+            raise AssertionError("continuation must retain the active chat route")
+
+        proxy_server.llm_router = FakeRouter()
+        active_bridge_request = {
+            "call_type": "aresponses",
+            "model": "mapped-chat",
+            "input": "查询上海今天天气。",
+            "stream": True,
+            "use_chat_completions_api": True,
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "tools": [hooks._external_web_search_bridge_chat_tool()],
+            "litellm_metadata": {
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
+            },
+        }
+
+        initial_call_kwargs = hooks._with_external_web_search_post_call_suppressed(
+            active_bridge_request
+        )
+        initial = await hooks._external_web_search_chat_tool_response(
+            initial_call_kwargs,
+            active_bridge_request,
+            phase="initial",
+        )
+        self.assertEqual(
+            hooks._litellm_web_search_actions_from_response(initial),
+            [{"type": "search", "query": "上海天气 今天"}],
+        )
+        self.assertEqual(
+            active_bridge_request["_litellm_menu_upstream_url_surface"],
+            "openai/chat",
+        )
+        self.assertEqual(
+            active_bridge_request["model_info"]["id"],
+            "selected-chat-route",
+        )
+
+        response = await hooks._external_web_search_continue_or_synthesize(
+            request_kwargs=active_bridge_request,
+            search_results=(
+                "Web search results for query: 上海天气 今天\n"
+                "Title: 上海天气\n"
+                "URL: https://example.test/weather/shanghai\n"
+                "Snippet: 晴，气温信息。"
+            ),
+            queries=["上海天气 今天"],
+            completed_actions=[{"type": "search", "query": "上海天气 今天"}],
+            source_urls=["https://example.test/weather/shanghai"],
+            round_number=1,
+            original_function=original_function,
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["model"], "mapped-chat")
+        self.assertIn(
+            "上海天气信息已从检索结果中整理。",
+            hooks._responses_output_module._response_text(response),
+        )
+
+    async def test_external_web_search_chat_progress_retries_into_custom_tool_call(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class FakeRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(copy.deepcopy(kwargs))
+                if len(calls) == 1:
+                    return {
+                        "id": "chat_plan",
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": (
+                                        "我会用 `$research` 技能来完成这个任务。"
+                                        "先读取技能说明。"
+                                    ),
+                                }
+                            }
+                        ],
+                    }
+                return {
+                    "id": "chat_tool",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_read_skill",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "exec",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "input": (
+                                                        "text(await tools.exec_command({"
+                                                        "cmd: 'sed -n \\\"1,80p\\\" SKILL.md'"
+                                                        "}));"
+                                                    )
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                }
+
+        proxy_server.llm_router = FakeRouter()
+        bridge_tools, _options, _stats = hooks._responses_chat_bridge_sanitize_tools(
+            [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "description": "Run JavaScript in the task runtime.",
+                },
+                hooks._external_web_search_bridge_chat_tool(),
+            ],
+            bridge_web_search=True,
+        )
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "mapped-chat",
+            "input": "Investigate the claim with the required skill.",
+            "stream": True,
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "tools": bridge_tools,
+        }
+
+        response = await hooks._external_web_search_chat_tool_response(
+            hooks._with_external_web_search_post_call_suppressed(request_kwargs),
+            request_kwargs,
+            phase="initial",
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("先读取技能说明", calls[1]["messages"][-2]["content"])
+        self.assertIn("Do not return another status update", calls[1]["messages"][-1]["content"])
+        self.assertEqual(response.get("output_text"), None)
+        self.assertEqual(len(response["output"]), 1)
+        tool_call = response["output"][0]
+        self.assertEqual(tool_call["type"], "custom_tool_call")
+        self.assertEqual(tool_call["name"], "exec")
+        self.assertIn("exec_command", tool_call["input"])
+
+    def test_external_web_search_chat_messages_preserve_tool_history(self) -> None:
+        hooks, _ = load_hook_module()
+
+        messages = hooks._external_web_search_chat_tool_messages(
+            {
+                "input": [
+                    {"role": "user", "content": "Read the skill, then continue."},
+                    {
+                        "type": "function_call",
+                        "id": "call_read",
+                        "call_id": "call_read",
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": "sed -n '1,30p' SKILL.md"}),
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_read",
+                        "output": "Skill instructions were read.",
+                    },
+                    {
+                        "type": "custom_tool_call",
+                        "id": "ctc_apply",
+                        "call_id": "ctc_apply",
+                        "name": "exec",
+                        "input": "text(await tools.apply_patch(patch));",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "ctc_apply",
+                        "output": "Patch applied.",
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(messages[0], {"role": "user", "content": "Read the skill, then continue."})
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(messages[1]["tool_calls"][0]["id"], "call_read")
+        self.assertEqual(messages[1]["tool_calls"][0]["function"]["name"], "exec_command")
+        self.assertEqual(messages[2], {
+            "role": "tool",
+            "tool_call_id": "call_read",
+            "content": "Skill instructions were read.",
+        })
+        self.assertEqual(messages[3]["role"], "assistant")
+        self.assertEqual(messages[3]["tool_calls"][0]["function"]["name"], "exec")
+        self.assertEqual(
+            json.loads(messages[3]["tool_calls"][0]["function"]["arguments"]),
+            {"input": "text(await tools.apply_patch(patch));"},
+        )
+        self.assertEqual(messages[4], {
+            "role": "tool",
+            "tool_call_id": "ctc_apply",
+            "content": "Patch applied.",
+        })
+
+    async def test_external_web_search_chat_tool_replays_tool_history(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class FakeRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(copy.deepcopy(kwargs))
+                return {
+                    "id": "chat_followup",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "The prior tool result is enough to continue.",
+                            }
+                        }
+                    ],
+                }
+
+        proxy_server.llm_router = FakeRouter()
+        request_kwargs = {
+            "model": "openai/vendor-chat",
+            "input": [
+                {"role": "user", "content": "Continue the investigation."},
+                {
+                    "type": "function_call",
+                    "id": "call_read",
+                    "call_id": "call_read",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "sed -n '1,30p' SKILL.md"}),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_read",
+                    "output": "Skill content.",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object"},
+                },
+                hooks._external_web_search_bridge_chat_tool(),
+            ],
+            "model_info": {
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        }
+
+        response = await hooks._external_web_search_chat_tool_response(
+            request_kwargs,
+            request_kwargs,
+            phase="initial",
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["messages"][1]["role"], "assistant")
+        self.assertEqual(calls[0]["messages"][1]["tool_calls"][0]["id"], "call_read")
+        self.assertEqual(calls[0]["messages"][2], {
+            "role": "tool",
+            "tool_call_id": "call_read",
+            "content": "Skill content.",
+        })
+        self.assertIn("prior tool result", hooks._responses_output_module._response_text(response))
 
     async def test_external_web_search_synthesis_recovery_trims_large_metadata_evidence(self) -> None:
         hooks, _ = load_hook_module()
@@ -497,6 +1213,47 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         self.assertEqual(kwargs.get("max_output_tokens"), 2048)
 
+    def test_external_web_search_synthesis_prioritizes_model_opened_page_evidence(self) -> None:
+        hooks, _ = load_hook_module()
+        search_sections = "\n\n".join(
+            [
+                (
+                    "Web search results for query: earlier summary\n"
+                    "Title: Wrapper\n"
+                    "URL: https://example.test/wrapper\n"
+                    f"Snippet: {'old summary. ' * 180}"
+                ),
+                (
+                    "Retrieved page content for URL: https://example.test/source\n\n"
+                    f"Official source: {'verified page text. ' * 180}"
+                ),
+                (
+                    "Page text matches for pattern: page\n"
+                    "URL: https://example.test/source\n\n"
+                    "- The official signature includes page: int = 1."
+                ),
+            ]
+        )
+
+        evidence = hooks._external_web_search_synthesis_evidence(search_sections)
+
+        self.assertIn("The official signature includes page: int = 1.", evidence)
+        self.assertIn("Official source:", evidence)
+        self.assertLess(
+            evidence.index("The official signature includes page: int = 1."),
+            evidence.index("Web search results for query: earlier summary"),
+        )
+
+    def test_external_web_search_synthesis_tells_model_how_to_weigh_opened_evidence(self) -> None:
+        hooks, _ = load_hook_module()
+
+        kwargs = hooks._external_web_search_synthesis_kwargs(
+            {"model": "legacy-chat", "input": "Use web_search."},
+            "Retrieved page content for URL: https://example.test/source\n\nOfficial text.",
+        )
+
+        self.assertIn("opened-page content are stronger evidence", kwargs["instructions"])
+
     async def test_external_web_search_synthesis_trims_page_evidence_for_recovery(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
@@ -598,7 +1355,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertEqual(calls[0].get("reasoning"), {"effort": "low"})
         self.assertEqual(calls[0].get("extra_body", {}).get("reasoning"), {"effort": "low"})
 
-    def test_external_web_search_source_inspection_planner_forces_low_reasoning(self) -> None:
+    def test_external_web_search_continuation_leaves_next_action_to_model(self) -> None:
         hooks, _ = load_hook_module()
 
         kwargs = hooks._external_web_search_continuation_kwargs(
@@ -615,19 +1372,20 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 "URL: https://example.test/source\n"
                 "Snippet: Search-result snippet only."
             ),
-            source_urls=["https://example.test/source"],
             queries=["verify claim"],
             completed_actions=[{"type": "search", "query": "verify claim"}],
             round_number=1,
-            require_source_inspection=True,
         )
 
-        self.assertEqual(kwargs.get("tool_choice"), "required")
-        self.assertEqual(kwargs.get("max_output_tokens"), 512)
+        self.assertEqual(
+            kwargs.get("max_output_tokens"),
+            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS,
+        )
         self.assertEqual(kwargs.get("reasoning"), {"effort": "low"})
         self.assertEqual(kwargs.get("extra_body", {}).get("reasoning"), {"effort": "low"})
         self.assertEqual(kwargs.get("litellm_params", {}).get("reasoning_effort"), "low")
-        self.assertIn("Candidate source URLs", kwargs.get("input", ""))
+        self.assertNotIn("tool_choice", kwargs)
+        self.assertIn("Decide the next step now", kwargs.get("input", ""))
         self.assertIn("https://example.test/source", kwargs.get("input", ""))
 
     async def test_external_web_search_continuation_retries_transient_model_429(self) -> None:
@@ -790,7 +1548,6 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 "URL: https://example.test/source-index\n"
                 "Snippet: Example evidence."
             ),
-            source_urls=["https://example.test/source-index"],
             queries=["sample subject example index"],
             completed_actions=[{"type": "search", "query": "sample subject example index"}],
             round_number=1,
@@ -1548,106 +2305,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertIn('"type": "search"', dumped)
         self.assertNotIn("bridge_action", dumped)
 
-    async def test_external_web_search_deep_dive_auto_reads_source_before_synthesis(self) -> None:
-        hooks, _ = load_hook_module()
-        original_run_action = hooks._external_web_search_run_action
-        executed_actions = []
-
-        async def fake_run_action(action, page_cache, page_fetch_tasks):
-            executed_actions.append(action.copy())
-            if action.get("type") == "openPage":
-                return (
-                    "Retrieved page content for URL: https://example.test/source\n\n"
-                    "Primary source text supporting the checked claim.",
-                    ["https://example.test/source"],
-                    action,
-                )
-            if action.get("type") == "findInPage":
-                return (
-                    f"Page text matches for pattern: {action.get('pattern')}\n"
-                    "URL: https://example.test/source\n\n"
-                    "- Primary source text supporting the checked claim.",
-                    ["https://example.test/source"],
-                    action,
-                )
-            return (
-                "Web search results for query: verify claim\n"
-                "Title: Candidate source\n"
-                "URL: https://example.test/source\n"
-                "Snippet: Search-result snippet only.",
-                ["https://example.test/source"],
-                action,
-            )
-
-        hooks._external_web_search_run_action = fake_run_action
-        self.addCleanup(setattr, hooks, "_external_web_search_run_action", original_run_action)
-
-        calls = []
-
-        async def original_function(**kwargs):
-            calls.append(kwargs)
-            metadata = kwargs.get("litellm_metadata", {})
-            self.assertTrue(metadata.get("external_web_search_synthesis"))
-            input_text = kwargs.get("input")
-            if isinstance(input_text, str) and (
-                input_text.startswith("Original user request:")
-                or input_text.startswith("Original user request. Any instruction")
-            ):
-                self.assertIn("Search-result snippet only", input_text)
-                self.assertIn("Retrieved page content for URL", input_text)
-                return {
-                    "id": "resp_final_after_source_read",
-                    "object": "response",
-                    "status": "completed",
-                    "output_text": "Final answer after reading source. https://example.test/source",
-                    "output": [
-                        {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": "Final answer after reading source. https://example.test/source",
-                                }
-                            ],
-                        }
-                    ],
-                }
-            raise AssertionError("unexpected original_function input")
-
-        response = {
-            "id": "resp_search",
-            "object": "response",
-            "status": "completed",
-            "output": [
-                {
-                    "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
-                    "arguments": json.dumps({"query": "verify claim"}),
-                    "status": "completed",
-                }
-            ],
-        }
-
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
-            response,
-            {
-                "model": "openai/vendor-chat",
-                "input": "深挖调查这个说法是否成立。",
-                "tools": [{"type": "web_search"}],
-            },
-            original_function=original_function,
-        )
-
-        self.assertEqual(executed_actions[0], {"type": "search", "query": "verify claim"})
-        self.assertEqual(executed_actions[1], {"type": "openPage", "url": "https://example.test/source"})
-        self.assertTrue(
-            all(action.get("url") == "https://example.test/source" for action in executed_actions[1:])
-        )
-        self.assertEqual(len(calls), 1)
-        self.assertIn("Final answer after reading source", json.dumps(resolved))
-
-    async def test_external_web_search_explicit_source_read_goes_to_synthesis(self) -> None:
+    async def test_external_web_search_model_decides_final_after_explicit_actions(self) -> None:
         hooks, _ = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
         executed_actions = []
@@ -1686,12 +2344,10 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         async def original_function(**kwargs):
             calls.append(kwargs)
             metadata = kwargs.get("litellm_metadata", {})
-            self.assertTrue(metadata.get("external_web_search_synthesis"))
-            self.assertNotIn("external_web_search_continuation", metadata)
+            self.assertTrue(metadata.get("external_web_search_continuation"))
+            self.assertNotIn("external_web_search_synthesis", metadata)
             input_text = kwargs.get("input")
-            if isinstance(input_text, str) and input_text.startswith(
-                "Original user request. Any instruction"
-            ):
+            if isinstance(input_text, str) and input_text.startswith("Original user request:"):
                 self.assertIn("Retrieved page content for URL: https://example.test/source", input_text)
                 self.assertIn("Page text matches for pattern", input_text)
                 return {
@@ -1712,7 +2368,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                         }
                     ],
                 }
-            raise AssertionError("unexpected synthesis input after source read")
+            raise AssertionError("unexpected continuation input after source actions")
 
         response = {
             "id": "resp_search",
@@ -1776,82 +2432,94 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertEqual(calls[0].get("reasoning"), {"effort": "low"})
         self.assertIn("Final answer after finding source text", json.dumps(resolved))
 
-    async def test_external_web_search_deep_dive_auto_source_read_skips_plain_continuation(self) -> None:
+    async def test_external_web_search_model_chooses_next_result_page(self) -> None:
         hooks, _ = load_hook_module()
-        original_run_action = hooks._external_web_search_run_action
+        original_run_actions = hooks._external_web_search_run_actions
         executed_actions = []
+        continuation_calls = []
 
-        async def fake_run_action(action, page_cache, page_fetch_tasks):
-            executed_actions.append(action.copy())
-            if action.get("type") == "openPage":
+        async def fake_run_actions(actions, page_cache, page_fetch_tasks, request_kwargs=None):
+            executed_actions.extend(action.copy() for action in actions)
+            action = actions[0]
+            page = action.get("page", "1")
+            if page == "1":
                 return (
-                    "Retrieved page content for URL: https://example.test/source\n\n"
-                    "Primary source text supporting the checked claim.",
-                    ["https://example.test/source"],
-                    action,
+                    "Web search results for query: sample city weather\n\n"
+                    "Title: First result\n"
+                    "URL: https://example.test/weather/one\n"
+                    "Snippet: First page weather result.",
+                    ["https://example.test/weather/one"],
+                    [["https://example.test/weather/one"]],
+                    actions,
                 )
-            if action.get("type") == "findInPage":
-                return (
-                    f"Page text matches for pattern: {action.get('pattern')}\n"
-                    "URL: https://example.test/source\n\n"
-                    "- Primary source text supporting the checked claim.",
-                    ["https://example.test/source"],
-                    action,
-                )
+            self.assertEqual(page, "2")
             return (
-                "Web search results for query: verify claim\n"
-                "Title: Candidate source\n"
-                "URL: https://example.test/source\n"
-                "Snippet: Search-result snippet only.",
-                ["https://example.test/source"],
-                action,
+                "Web search results for query: sample city weather\n"
+                "Result page: 2\n\n"
+                "Title: Second-page result\n"
+                "URL: https://example.test/weather/two\n"
+                "Snippet: The requested forecast is here.",
+                ["https://example.test/weather/two"],
+                [["https://example.test/weather/two"]],
+                actions,
             )
 
-        hooks._external_web_search_run_action = fake_run_action
-        self.addCleanup(setattr, hooks, "_external_web_search_run_action", original_run_action)
-
-        calls = []
+        hooks._external_web_search_run_actions = fake_run_actions
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_external_web_search_run_actions",
+            original_run_actions,
+        )
 
         async def original_function(**kwargs):
-            calls.append(kwargs)
-            metadata = kwargs.get("litellm_metadata", {})
-            self.assertTrue(metadata.get("external_web_search_synthesis"))
-            input_text = kwargs.get("input")
-            if isinstance(input_text, str) and (
-                input_text.startswith("Original user request:")
-                or input_text.startswith("Original user request. Any instruction")
-            ):
-                self.assertIn("Search-result snippet only", input_text)
-                self.assertIn("Retrieved page content for URL", input_text)
+            continuation_calls.append(kwargs)
+            if len(continuation_calls) == 1:
+                self.assertIn("First page weather result.", kwargs.get("input", ""))
                 return {
-                    "id": "resp_final_after_source_read",
+                    "id": "resp_page_two",
                     "object": "response",
                     "status": "completed",
-                    "output_text": "Final answer after reading source. https://example.test/source",
                     "output": [
                         {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": "Final answer after reading source. https://example.test/source",
-                                }
-                            ],
+                            "type": "function_call",
+                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "arguments": json.dumps(
+                                {"query": "sample city weather", "page": 2}
+                            ),
+                            "status": "completed",
                         }
                     ],
                 }
-            raise AssertionError("unexpected original_function input")
+            self.assertIn("Result page: 2", kwargs.get("input", ""))
+            return {
+                "id": "resp_page_final",
+                "object": "response",
+                "status": "completed",
+                "output_text": "The second result page has the forecast.",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "The second result page has the forecast.",
+                            }
+                        ],
+                    }
+                ],
+            }
 
         response = {
-            "id": "resp_search",
+            "id": "resp_page_one",
             "object": "response",
             "status": "completed",
             "output": [
                 {
                     "type": "function_call",
                     "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
-                    "arguments": json.dumps({"query": "verify claim"}),
+                    "arguments": json.dumps({"query": "sample city weather"}),
                     "status": "completed",
                 }
             ],
@@ -1861,19 +2529,21 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             response,
             {
                 "model": "openai/vendor-chat",
-                "input": "深挖调查这个说法是否成立。",
+                "input": "Use web_search for the sample city weather.",
                 "tools": [{"type": "web_search"}],
             },
             original_function=original_function,
         )
 
-        self.assertEqual(executed_actions[0], {"type": "search", "query": "verify claim"})
-        self.assertEqual(executed_actions[1], {"type": "openPage", "url": "https://example.test/source"})
-        self.assertTrue(
-            all(action.get("url") == "https://example.test/source" for action in executed_actions[1:])
+        self.assertEqual(
+            executed_actions,
+            [
+                {"type": "search", "query": "sample city weather"},
+                {"type": "search", "query": "sample city weather", "page": "2"},
+            ],
         )
-        self.assertEqual(len(calls), 1)
-        self.assertIn("Final answer after reading source", json.dumps(resolved))
+        self.assertEqual(len(continuation_calls), 2)
+        self.assertIn("second result page", json.dumps(resolved))
 
     async def test_external_web_search_stream_explicit_source_read_before_continuation(self) -> None:
         hooks, _ = load_hook_module()
@@ -2298,7 +2968,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertNotIn("web_search compatibility bridge", dumped)
         self.assertNotIn("could not retrieve usable source results", dumped)
 
-    async def test_external_web_search_failed_search_without_urls_raises_for_recovery(self) -> None:
+    async def test_external_web_search_failed_search_without_urls_leaves_retry_query_to_model(self) -> None:
         hooks, _ = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
         executed_actions = []
@@ -2315,8 +2985,45 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         hooks._external_web_search_run_action = fake_run_action
         self.addCleanup(setattr, hooks, "_external_web_search_run_action", original_run_action)
 
+        continuation_calls = []
+
         async def original_function(**kwargs):
-            raise AssertionError("failed search without URLs should not call continuation")
+            continuation_calls.append(kwargs)
+            if kwargs.get("litellm_metadata", {}).get(
+                "external_web_search_continuation"
+            ):
+                self.assertIn("Search failed for query", kwargs.get("input", ""))
+                return {
+                    "id": "resp_retry_query",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "arguments": json.dumps({"query": "retry query"}),
+                            "status": "completed",
+                        }
+                    ],
+                }
+            return {
+                "id": "resp_retry_final",
+                "object": "response",
+                "status": "completed",
+                "output_text": "The retry still found no source.",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "The retry still found no source.",
+                            }
+                        ],
+                    }
+                ],
+            }
 
         response = {
             "id": "resp_search",
@@ -2332,31 +3039,43 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        with self.assertRaises(Exception) as context:
-            await hooks._resolve_litellm_web_search_function_calls(
-                response,
-                {
-                    "model": "openai/vendor-chat",
-                    "input": "深挖调查这个说法。",
-                    "tools": [{"type": "web_search"}],
-                },
-                original_function=original_function,
-            )
-
-        self.assertEqual(executed_actions, [{"type": "search", "query": "failed query"}])
-        recovery_request = hooks._external_web_search_recovery_request_from_exception(
-            context.exception
+        self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MAX_ROUNDS", "2")
+        result = await hooks._resolve_litellm_web_search_function_calls(
+            response,
+            {
+                "model": "openai/vendor-chat",
+                "input": "深挖调查这个说法。",
+                "tools": [{"type": "web_search"}],
+            },
+            original_function=original_function,
         )
-        self.assertIsInstance(recovery_request, dict)
-        recovery_metadata = recovery_request.get("litellm_metadata", {})
-        self.assertTrue(recovery_metadata.get("external_web_search_continuation"))
-        self.assertIn("Search failed for query", recovery_request.get("input", ""))
 
-    async def test_external_web_search_stream_failed_search_without_urls_recovers_without_failmsg(self) -> None:
+        self.assertEqual(
+            executed_actions,
+            [
+                {"type": "search", "query": "failed query"},
+                {"type": "search", "query": "retry query"},
+            ],
+        )
+        self.assertEqual(len(continuation_calls), 3)
+        self.assertTrue(result.get("output"))
+
+    async def test_external_web_search_stream_failed_search_without_urls_leaves_retry_query_to_model(self) -> None:
         hooks, proxy_server = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
+        executed_actions = []
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
+            executed_actions.append(action.copy())
+            if action.get("query") == "retry query":
+                return (
+                    "Web search results for query: retry query\n\n"
+                    "Title: Retry source\n"
+                    "URL: https://example.test/retry\n"
+                    "Snippet: Recovered source.",
+                    ["https://example.test/retry"],
+                    action,
+                )
             return (
                 "Web search results for query: failed query\n\n"
                 "Search failed for query 'failed query': ConnectError",
@@ -2367,40 +3086,41 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         hooks._external_web_search_run_action = fake_run_action
         self.addCleanup(setattr, hooks, "_external_web_search_run_action", original_run_action)
 
-        recovery_calls = []
-
-        async def recovered_stream():
-            yield {"type": "response.output_text.delta", "delta": "Recovered answer"}
-            yield {
-                "type": "response.completed",
-                "response": {
-                    "id": "resp_recovered",
-                    "object": "response",
-                    "status": "completed",
-                    "output_text": "Recovered answer",
-                    "output": [
-                        {
-                            "id": "msg_recovered",
-                            "type": "message",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [
-                                {"type": "output_text", "text": "Recovered answer"}
-                            ],
-                        }
-                    ],
-                },
-            }
-
-        class FakeRouter:
-            async def aresponses(self, **kwargs):
-                recovery_calls.append(kwargs)
-                return recovered_stream()
-
-        proxy_server.llm_router = FakeRouter()
+        continuation_calls = []
 
         async def original_function(**kwargs):
-            raise AssertionError("failed stream search without URLs should not call continuation")
+            continuation_calls.append(kwargs)
+            if len(continuation_calls) == 1:
+                return {
+                    "id": "resp_retry_query",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "arguments": json.dumps({"query": "retry query"}),
+                            "status": "completed",
+                        }
+                    ],
+                }
+            return {
+                "id": "resp_recovered",
+                "object": "response",
+                "status": "completed",
+                "output_text": "Recovered answer",
+                "output": [
+                    {
+                        "id": "msg_recovered",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "Recovered answer"}
+                        ],
+                    }
+                ],
+            }
 
         response = {
             "id": "resp_search",
@@ -2416,6 +3136,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
+        self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MAX_ROUNDS", "3")
         chunks = [
             jsonable_stream_chunk(chunk)
             async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
@@ -2432,9 +3153,19 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         self.assertEqual(chunks[-1]["type"], "response.completed")
         self.assertEqual(chunks[-1]["response"].get("output_text"), "Recovered answer")
-        self.assertTrue(recovery_calls)
-        recovery_metadata = recovery_calls[-1].get("litellm_metadata", {})
-        self.assertTrue(recovery_metadata.get("external_web_search_continuation"))
+        self.assertEqual(
+            executed_actions,
+            [
+                {"type": "search", "query": "failed query"},
+                {"type": "search", "query": "retry query"},
+            ],
+        )
+        self.assertEqual(len(continuation_calls), 2)
+        self.assertTrue(
+            continuation_calls[0].get("litellm_metadata", {}).get(
+                "external_web_search_continuation"
+            )
+        )
         dumped = json.dumps(chunks, ensure_ascii=False)
         self.assertNotIn("No usable source results", dumped)
         self.assertNotIn("available evidence is insufficient", dumped)
@@ -2511,7 +3242,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
     async def test_external_web_search_run_actions_reads_page_and_finds_text(self) -> None:
         hooks, _ = load_hook_module()
-        original_reader = hooks._external_web_search_module._jina_reader_excerpt
+        original_reader = hooks._external_web_search_module._web_page_excerpt
 
         def fake_reader(url, *, timeout, max_chars):
             self.assertEqual(url, "https://example.test/article")
@@ -2519,11 +3250,11 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             self.assertGreater(max_chars, 0)
             return "Example Domain body with factor A marker."
 
-        hooks._external_web_search_module._jina_reader_excerpt = fake_reader
+        hooks._external_web_search_module._web_page_excerpt = fake_reader
         self.addCleanup(
             setattr,
             hooks._external_web_search_module,
-            "_jina_reader_excerpt",
+            "_web_page_excerpt",
             original_reader,
         )
 
@@ -2560,7 +3291,51 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertIn("Page text matches for pattern: factor A", message)
         self.assertIn("factor A marker", message)
 
-    async def test_external_web_search_deep_dive_runs_auto_source_actions(self) -> None:
+    async def test_external_web_search_find_scans_full_bounded_page(self) -> None:
+        hooks, _ = load_hook_module()
+        original_reader = hooks._external_web_search_module._web_page_excerpt
+        observed_limits = []
+
+        def fake_reader(url, *, timeout, max_chars):
+            self.assertEqual(url, "https://example.test/source.py")
+            self.assertGreater(timeout, 0)
+            observed_limits.append(max_chars)
+            return "imports and helpers\n" + ("x" * 6000) + "\npage: int = 1"
+
+        hooks._external_web_search_module._web_page_excerpt = fake_reader
+        self.addCleanup(
+            setattr,
+            hooks._external_web_search_module,
+            "_web_page_excerpt",
+            original_reader,
+        )
+
+        message, _urls, _by_action, completed = await hooks._external_web_search_run_actions(
+            [
+                {
+                    "type": "findInPage",
+                    "url": "https://example.test/source.py",
+                    "pattern": "page: int = 1",
+                }
+            ],
+            {},
+            {},
+        )
+
+        self.assertEqual(observed_limits, [12000])
+        self.assertEqual(
+            completed,
+            [
+                {
+                    "type": "findInPage",
+                    "url": "https://example.test/source.py",
+                    "pattern": "page: int = 1",
+                }
+            ],
+        )
+        self.assertIn("page: int = 1", message)
+
+    async def test_external_web_search_model_chooses_source_after_full_result_page(self) -> None:
         hooks, _ = load_hook_module()
         original_run_actions = hooks._external_web_search_run_actions
         executed_actions = []
@@ -2572,11 +3347,20 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             if action_type == "search":
                 return (
                     "Web search results for query: sample subject factor A inhibition\n"
+                    "Title: Unrelated result\n"
+                    "URL: https://example.test/unrelated\n"
+                    "Snippet: Not useful.\n\n"
                     "Title: Primary transporter source\n"
                     "URL: https://example.test/sample-subject-factor-a\n"
                     "Snippet: The claim needs source-page inspection.",
-                    ["https://example.test/sample-subject-factor-a"],
-                    [["https://example.test/sample-subject-factor-a"]],
+                    [
+                        "https://example.test/unrelated",
+                        "https://example.test/sample-subject-factor-a",
+                    ],
+                    [[
+                        "https://example.test/unrelated",
+                        "https://example.test/sample-subject-factor-a",
+                    ]],
                     [action],
                 )
             if action_type == "openPage":
@@ -2622,30 +3406,57 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         async def original_function(**kwargs):
             continuation_calls.append(kwargs)
             metadata = kwargs.get("litellm_metadata", {})
-            self.assertTrue(metadata.get("external_web_search_synthesis"))
-            self.assertNotIn("external_web_search_continuation", metadata)
-            self.assertIn("Source page read", kwargs.get("input", ""))
-            return {
-                "id": "resp_post_source_final",
-                "object": "response",
-                "status": "completed",
-                "output_text": "Final after source inspection. https://example.test/sample-subject-factor-a",
-                "output": [
-                    {
-                        "id": "msg_post_source_final",
-                        "type": "message",
+            if metadata.get("external_web_search_continuation"):
+                self.assertIn("https://example.test/unrelated", kwargs.get("input", ""))
+                self.assertIn(
+                    "https://example.test/sample-subject-factor-a",
+                    kwargs.get("input", ""),
+                )
+                continuation_count = sum(
+                    1
+                    for call in continuation_calls
+                    if call.get("litellm_metadata", {}).get(
+                        "external_web_search_continuation"
+                    )
+                )
+                if continuation_count > 1:
+                    return {
+                        "id": "resp_model_final",
+                        "object": "response",
                         "status": "completed",
-                        "role": "assistant",
-                        "content": [
+                        "output_text": "Final after source inspection. https://example.test/sample-subject-factor-a",
+                        "output": [
                             {
-                                "type": "output_text",
-                                "text": "Final after source inspection. https://example.test/sample-subject-factor-a",
-                                "annotations": [],
+                                "id": "msg_model_final",
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Final after source inspection. https://example.test/sample-subject-factor-a",
+                                        "annotations": [],
+                                    }
+                                ],
                             }
                         ],
                     }
-                ],
-            }
+                return {
+                    "id": "resp_model_selected_source",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "arguments": json.dumps(
+                                {"url": "https://example.test/sample-subject-factor-a"}
+                            ),
+                            "status": "completed",
+                        }
+                    ],
+                }
+            self.fail("model should make the final decision after opening the source")
 
         response = {
             "id": "resp_source_search",
@@ -2671,11 +3482,13 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             original_function=original_function,
         )
 
-        self.assertEqual(len(continuation_calls), 1)
-        self.assertEqual(executed_actions[0], {"type": "search", "query": "sample subject factor A inhibition"})
-        self.assertEqual(executed_actions[1], {"type": "openPage", "url": "https://example.test/sample-subject-factor-a"})
-        self.assertTrue(
-            all(action.get("url") == "https://example.test/sample-subject-factor-a" for action in executed_actions[1:])
+        self.assertEqual(len(continuation_calls), 2)
+        self.assertEqual(
+            executed_actions,
+            [
+                {"type": "search", "query": "sample subject factor A inhibition"},
+                {"type": "openPage", "url": "https://example.test/sample-subject-factor-a"},
+            ],
         )
         self.assertIn("Final after source inspection", json.dumps(resolved))
 

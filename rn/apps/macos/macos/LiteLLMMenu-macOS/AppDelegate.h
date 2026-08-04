@@ -4,4 +4,9 @@
 
 @interface AppDelegate : RCTAppDelegate
 
+@property(nonatomic, assign) BOOL liteLLMTerminationInProgress;
+@property(nonatomic, assign) BOOL liteLLMTerminationReady;
+
+- (void)startReactHostWhenNeeded;
+
 @end

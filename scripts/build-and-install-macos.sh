@@ -13,7 +13,7 @@ INSTALL_COMPLETE=0
 RESTART_ARMED=0
 OLD_PIDS=""
 NEW_PIDS=""
-START_TIMEOUT_SECONDS="${LITELLM_MENU_START_TIMEOUT_SECONDS:-40}"
+START_TIMEOUT_SECONDS="${LITELLM_MENU_START_TIMEOUT_SECONDS:-70}"
 STOP_TIMEOUT_SECONDS="${LITELLM_MENU_STOP_TIMEOUT_SECONDS:-20}"
 STOP_GRACE_POLLS=20
 REQUIRED_HEALTH_CHECKS=3
@@ -82,8 +82,7 @@ installed_pids() {
 }
 
 stop_installed_app() {
-  local deadline bundle_pids grace_polls pid state
-  bundle_pids="$(bundle_processes)"
+  local deadline bundle_pids="$1" grace_polls pid state
   [[ -n "$bundle_pids" ]] || return 0
 
   OLD_PIDS="$bundle_pids"
@@ -303,11 +302,14 @@ rm -rf "$INSTALL_STAGE" "$PREVIOUS_APP"
 copy_tree "$STAGED_APP" "$INSTALL_STAGE"
 codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"
 
-# Keep the installed service available during the build, then perform one
-# graceful stop immediately before replacing the verified staged bundle. Arm
-# the EXIT relaunch before any signal so stop and restart cannot be split.
+# Keep the installed service available while the verified replacement takes
+# its place. Running processes retain the old executable after this rename;
+# stopping them only after the new bundle is in place shortens the listener
+# outage to the stop/start interval.
+OLD_PIDS="$(bundle_processes)"
+# Arm the EXIT relaunch before moving the live bundle, so an interrupted swap
+# cannot leave the installed path without an app to launch.
 RESTART_ARMED=1
-stop_installed_app
 if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
   mv "$DESTINATION" "$PREVIOUS_APP"
 fi
@@ -316,6 +318,26 @@ if ! mv "$INSTALL_STAGE" "$DESTINATION"; then
   exit 1
 fi
 INSTALL_STAGE=""
+if ! stop_installed_app "$OLD_PIDS"; then
+  echo "The old LiteLLM Menu app did not stop; restoring the previous bundle." >&2
+  restore_previous_app || {
+    echo "The previous LiteLLM Menu bundle could not be restored." >&2
+    exit 1
+  }
+  exit 1
+fi
+# A Core may have forked its proxy just after the pre-swap snapshot. Capture
+# any remaining process still executing the retired bundle before launching
+# the replacement, so no old listener can survive into the new lifecycle.
+REMAINING_OLD_PIDS="$(bundle_processes)"
+if [[ -n "$REMAINING_OLD_PIDS" ]] && ! stop_installed_app "$REMAINING_OLD_PIDS"; then
+  echo "The old LiteLLM Menu proxy did not stop; restoring the previous bundle." >&2
+  restore_previous_app || {
+    echo "The previous LiteLLM Menu bundle could not be restored." >&2
+    exit 1
+  }
+  exit 1
+fi
 if ! start_installed_app "$OLD_PIDS"; then
   echo "The new LiteLLM Menu app failed readiness checks; restoring the previous bundle." >&2
   restore_previous_app || {

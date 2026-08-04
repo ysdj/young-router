@@ -52,8 +52,15 @@ EDITOR_CAPABILITY_TTL_SECONDS = 10 * 60.0
 MAX_EDITOR_CAPABILITIES = 32
 SECRET_CAPABILITY_TTL_SECONDS = 10 * 60.0
 MAX_SECRET_CAPABILITIES = 32
+# A provider API key may be rendered as plaintext in the native provider
+# editor.  Its read lease is intentionally much shorter than a write lease.
 SECRET_READ_CAPABILITY_TTL_SECONDS = 30.0
 MAX_SECRET_READ_CAPABILITIES = 32
+# ``socketserver.BaseServer.serve_forever`` otherwise checks its shutdown
+# request only every 0.5 seconds. This is the Core's final local teardown
+# step after the managed proxy has stopped, so keep it responsive without
+# changing the proxy's graceful shutdown contract.
+SERVER_SHUTDOWN_POLL_INTERVAL_SECONDS = 0.05
 
 
 class IPCError(RuntimeError):
@@ -607,7 +614,11 @@ class CoreIPCServer:
         *,
         session_token: str,
     ) -> dict[str, Any]:
-        """Issue a short-lived native-only read token for one provider API key."""
+        """Issue a read-once, native-only lease for one provider API key.
+
+        This is deliberately narrower than ordinary secret staging.  The
+        public React IPC schema remains unable to request or receive a secret.
+        """
 
         if (
             not isinstance(domain, str)
@@ -650,7 +661,7 @@ class CoreIPCServer:
         }
 
     def read_secret_capability(self, token: object, *, session_token: str) -> str:
-        """Consume a session-bound token before exposing its native-only value."""
+        """Consume a session-bound provider API-key lease before reading it."""
 
         if (
             not isinstance(token, str)
@@ -666,8 +677,8 @@ class CoreIPCServer:
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
             if not hmac.compare_digest(capability.session_token, session_token):
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            # This is a read-once lease. Consuming before Core access also
-            # prevents retries from replaying a key after a stale revision.
+            # A failure still consumes the lease: native code must request a
+            # fresh capability after a revision change or transport retry.
             self._secret_read_capabilities.pop(token, None)
         return self.core.trusted_secret_value(
             capability.domain,
@@ -775,7 +786,12 @@ class CoreIPCServer:
             self._bootstrap_expires_at = time.monotonic() + self.bootstrap_ttl_seconds
             self._bootstrap_consumed = False
             self._core_unsubscribe = self.core.subscribe(self._publish)
-            self._thread = threading.Thread(target=server.serve_forever, name="litellm-core-ipc", daemon=True)
+            self._thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": SERVER_SHUTDOWN_POLL_INTERVAL_SECONDS},
+                name="litellm-core-ipc",
+                daemon=True,
+            )
             self._thread.start()
             return self.endpoint
 

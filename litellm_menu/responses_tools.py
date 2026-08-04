@@ -25,6 +25,32 @@ from .base import (
 
 
 
+def _responses_chat_bridge_tool_schema(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_responses_chat_bridge_tool_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+
+    sanitized: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "enum" and isinstance(item, list) and not item:
+            continue
+        sanitized[key] = _responses_chat_bridge_tool_schema(item)
+    return sanitized
+
+
+def _responses_chat_bridge_tool_schema_has_empty_enum(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_responses_chat_bridge_tool_schema_has_empty_enum(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    return any(
+        (key == "enum" and isinstance(item, list) and not item)
+        or _responses_chat_bridge_tool_schema_has_empty_enum(item)
+        for key, item in value.items()
+    )
+
+
 def _responses_bridge_function_tool(tool: Any) -> Optional[dict]:
     if not isinstance(tool, dict) or tool.get("type") != "function":
         return None
@@ -44,7 +70,7 @@ def _responses_bridge_function_tool(tool: Any) -> Optional[dict]:
     converted: dict[str, Any] = {
         "type": "function",
         "name": name,
-        "parameters": parameters.copy(),
+        "parameters": _responses_chat_bridge_tool_schema(parameters),
     }
     description = _responses_bridge_tool_description(tool)
     if isinstance(description, str):
@@ -89,7 +115,7 @@ def _responses_bridge_custom_tool(tool: Any) -> Optional[dict]:
     converted: dict[str, Any] = {
         "type": "function",
         "name": name,
-        "parameters": parameters.copy(),
+        "parameters": _responses_chat_bridge_tool_schema(parameters),
         _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY: True,
     }
     description = _responses_bridge_tool_description(tool)
@@ -183,7 +209,7 @@ def _responses_bridge_tool_search_tool(tool: Any) -> Optional[dict]:
         "type": "function",
         "name": _TOOL_SEARCH_BRIDGE_FUNCTION_NAME,
         "description": description,
-        "parameters": parameters.copy(),
+        "parameters": _responses_chat_bridge_tool_schema(parameters),
     }
     if isinstance(tool.get("execution"), str):
         converted["x-litellm-menu-responses-tool-search-execution"] = tool["execution"]
@@ -252,9 +278,10 @@ def _responses_bridge_web_search_tool(tool: Any) -> Optional[dict]:
         "name": _WEB_SEARCH_BRIDGE_FUNCTION_NAME,
         "description": (
             "Use this compatibility web search function for external or current "
-            "information. Provide query for a new lookup. Provide url to read a "
-            "known result page. Provide url plus pattern to find text within a "
-            "known page. Cite source URLs from the returned results. Do not use "
+            "information. One call performs one action: provide query only for a "
+            "new lookup; provide url only to read a known result page; provide "
+            "url plus pattern to find text within that known page. Never put a "
+            "URL in query. Cite source URLs from the returned results. Do not use "
             "this for local machine state such as this Mac's macOS version, local "
             "files, installed apps, shell output, or current environment; use "
             "local tools first."
@@ -264,11 +291,16 @@ def _responses_bridge_web_search_tool(tool: Any) -> Optional[dict]:
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The focused web search query to execute.",
+                    "description": "The focused web search query to execute; never put a URL here.",
+                },
+                "page": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Result page for query; omit for the first page.",
                 },
                 "url": {
                     "type": "string",
-                    "description": "A known source URL to read.",
+                    "description": "A known source URL to read; use this instead of searching for the URL.",
                 },
                 "pattern": {
                     "type": "string",
@@ -647,6 +679,7 @@ def _responses_chat_bridge_sanitize_tools(
 
     changed = (
         sanitized != tools
+        or any(_responses_chat_bridge_tool_schema_has_empty_enum(tool) for tool in tools)
         or bridged_web_search_tools > 0
         or suppressed_tool_search_tools > 0
         or bridged_tool_search_output_tools > 0

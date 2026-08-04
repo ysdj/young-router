@@ -4,8 +4,10 @@ import importlib
 import importlib.machinery
 from datetime import datetime, timezone
 import os
+import signal
 import sys
 import threading
+import time
 import urllib.request
 from typing import Any, Callable, Optional
 
@@ -23,6 +25,7 @@ _SYSTEM_PROXY_LOOKUP_PATCH_ATTR = "_litellm_menu_system_proxy_lookup_patch"
 _CONFIG_CALLBACK_ORIGINAL_ATTR = "_litellm_menu_config_callback_import_original"
 _OPTIONAL_DATABASE_ERROR_PATCH_ATTR = "_litellm_menu_optional_database_error_patch"
 _TIMESTAMPED_OUTPUT_ATTR = "_litellm_menu_timestamped_output"
+_CORE_PARENT_WATCHDOG_ATTR = "_litellm_menu_core_parent_watchdog"
 
 
 class _TimestampedOutputState:
@@ -69,6 +72,48 @@ def _install_timestamped_proxy_output() -> None:
     state = _TimestampedOutputState()
     sys.stdout = _TimestampedOutput(sys.stdout, state)
     sys.stderr = _TimestampedOutput(sys.stderr, state)
+
+
+def _install_core_parent_watchdog() -> None:
+    """Terminate the proxy group when its owning Core disappears.
+
+    This is installed only in the proxy master, whose direct parent is the
+    Core. Worker children inherit the environment but do not meet that parent
+    relationship, so they are terminated by the master process group instead.
+    """
+
+    if os.name == "nt":
+        return
+    try:
+        core_pid = int(os.environ.get("LITELLM_MENU_CORE_PID", ""))
+    except ValueError:
+        return
+    # `start_new_session=True` makes the proxy master its process-group
+    # leader. Workers inherit the environment but are not group leaders, so
+    # only the master may decide to terminate the whole proxy group.
+    if core_pid <= 0 or os.getpid() != os.getpgrp():
+        return
+    if getattr(sys, _CORE_PARENT_WATCHDOG_ATTR, False):
+        return
+    setattr(sys, _CORE_PARENT_WATCHDOG_ATTR, True)
+    process_group = os.getpgrp()
+
+    def watch_parent() -> None:
+        # Core can be killed in the short fork-to-Python-start interval. In
+        # that case the master already has PPID 1: terminate immediately
+        # rather than leaving the configured port orphaned.
+        while os.getppid() == core_pid:
+            time.sleep(0.1)
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except OSError:
+            pass
+
+    threading.Thread(
+        target=watch_parent,
+        name="litellm-proxy-core-watchdog",
+        daemon=True,
+    ).start()
 
 
 class _PostImportPatchLoader:
@@ -341,6 +386,7 @@ def _install_system_proxy_lookup_patch() -> None:
 
 _install_system_proxy_lookup_patch()
 if os.environ.get("LITELLM_MENU_PROXY_PROCESS") == "1":
+    _install_core_parent_watchdog()
     _install_timestamped_proxy_output()
     _install_litellm_config_callback_import_patch()
     _install_litellm_optional_database_error_patch()

@@ -667,7 +667,7 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertNotIn("codex_compaction_max_output_tokens", metadata)
         self.assertEqual(chunks[-1]["type"], "response.completed")
 
-    async def test_structured_codex_compaction_failure_enters_shared_route_recovery_poll(self) -> None:
+    async def test_structured_codex_compaction_failure_stops_after_bounded_fallback(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
@@ -748,7 +748,7 @@ class HookStreamingCompactionTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 1)
         self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
         for call in calls:
@@ -759,10 +759,13 @@ class HookStreamingCompactionTests(HookTestCase):
                 {"type": "custom", "name": "exec"},
             )
             self.assertFalse(call["parallel_tool_calls"])
-        self.assertEqual(chunks[-1]["type"], "response.completed")
-        self.assertEqual(chunks[-1]["response"]["id"], "resp-recovered")
+        self.assertEqual([chunk.get("type") for chunk in chunks], ["response.failed"])
+        self.assertEqual(
+            chunks[-1]["response"]["error"]["code"],
+            "upstream_compaction_failure",
+        )
 
-    def test_structured_compaction_uses_full_recovery_window(self) -> None:
+    def test_structured_compaction_disables_long_recovery_window(self) -> None:
         hooks, _proxy_server = load_hook_module()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "43200")
         ordinary_codex_request = {
@@ -790,11 +793,11 @@ class HookStreamingCompactionTests(HookTestCase):
         )
         self.assertEqual(
             hooks._recovery_max_seconds_for_request(structured_compaction_request),
-            43200.0,
+            0.0,
         )
         error = RuntimeError("temporary upstream rate limit")
         error.status_code = 429
-        self.assertTrue(
+        self.assertFalse(
             hooks._should_return_route_recovery_stream(
                 error,
                 structured_compaction_request,
@@ -856,7 +859,7 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertEqual(chunks[-1]["type"], "response.completed")
         self.assertEqual(chunks[-1]["response"]["id"], "resp-recovered")
 
-    async def test_codex_compaction_temporary_failure_retries_without_prompt_cache_key(self) -> None:
+    async def test_structured_compaction_recovery_does_not_replay_signed_history(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
 
@@ -934,19 +937,7 @@ class HookStreamingCompactionTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("prompt_cache_key", calls[0])
-        self.assertNotIn("prompt_cache_key", calls[0]["extra_body"])
-        self.assertEqual(
-            calls[0]["extra_body"]["client_metadata"]["thread_id"],
-            "thread-compaction-cache-recovery",
-        )
-        self.assertEqual(
-            calls[0]["extra_body"]["client_metadata"]["x-codex-turn-metadata"],
-            '{"request_kind":"compaction"}',
-        )
-        self.assertEqual(calls[0]["input"], original_request["input"])
-        self.assertEqual(calls[0]["input"][0]["tools"], tools)
+        self.assertEqual(calls, [])
         self.assertEqual(
             request_data["prompt_cache_key"],
             "thread-compaction-failing-cache",
@@ -955,14 +946,11 @@ class HookStreamingCompactionTests(HookTestCase):
             request_data["extra_body"]["prompt_cache_key"],
             "thread-compaction-failing-cache",
         )
-        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(request_data["input"], original_request["input"])
+        self.assertEqual(chunks[-1]["type"], "response.failed")
         self.assertEqual(
-            chunks[-1]["response"]["output"][0]["type"],
-            "compaction_summary",
-        )
-        self.assertEqual(
-            chunks[-1]["response"]["output"][0]["encrypted_content"],
-            "opaque-encrypted-summary",
+            chunks[-1]["response"]["error"]["code"],
+            "upstream_compaction_failure",
         )
 
     async def test_codex_compaction_recovery_restores_model_from_metadata(self) -> None:

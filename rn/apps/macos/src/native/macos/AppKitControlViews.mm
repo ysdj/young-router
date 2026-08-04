@@ -11,6 +11,7 @@
 #import <react/renderer/components/LiteLLMMacControls/RCTComponentViewHelpers.h>
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -188,6 +189,65 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 {
   [super layout];
   LayoutAppKitControlInBounds(_control, self.bounds, _fillsHeight);
+}
+
+@end
+
+// NSTableView's data viewport begins below its header, while NSClipView uses a
+// negative Y origin to keep that header visible. Treat that AppKit origin as
+// the locked resting position when all rows fit, and consume wheel events
+// outright while there is no actual row overflow.
+@interface LiteLLMTableScrollView : NSScrollView
+@property(nonatomic) BOOL acceptsVerticalScroll;
+@property(nonatomic) BOOL acceptsHorizontalScroll;
+@end
+
+@implementation LiteLLMTableScrollView
+
+- (void)scrollWheel:(NSEvent *)event
+{
+  if (!_acceptsVerticalScroll && !_acceptsHorizontalScroll) {
+    return;
+  }
+  [super scrollWheel:event];
+}
+
+@end
+
+// Wheel events in the unused part of an NSScrollView's viewport are delivered
+// to its clip view rather than to the document view.  Swallowing the event in
+// just the table therefore still permits the empty lower area to rubber-band.
+// Keep the same overflow contract on that intermediate responder as well.
+@interface LiteLLMTableClipView : NSClipView
+@property(nonatomic) BOOL acceptsVerticalScroll;
+@property(nonatomic) BOOL acceptsHorizontalScroll;
+@end
+
+@implementation LiteLLMTableClipView
+
+- (void)scrollWheel:(NSEvent *)event
+{
+  if (!_acceptsVerticalScroll && !_acceptsHorizontalScroll) {
+    return;
+  }
+  [super scrollWheel:event];
+}
+
+@end
+
+@interface LiteLLMTableView : NSTableView
+@property(nonatomic) BOOL acceptsVerticalScroll;
+@property(nonatomic) BOOL acceptsHorizontalScroll;
+@end
+
+@implementation LiteLLMTableView
+
+- (void)scrollWheel:(NSEvent *)event
+{
+  if (!_acceptsVerticalScroll && !_acceptsHorizontalScroll) {
+    return;
+  }
+  [super scrollWheel:event];
 }
 
 @end
@@ -1035,12 +1095,17 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
 @interface LiteLLMAppKitTableComponentView () <NSTableViewDataSource, NSTableViewDelegate, RCTLiteLLMAppKitTableViewProtocol>
 - (void)updateScrollerVisibility;
+- (void)tableColumnDidResize:(NSNotification *)notification;
 @end
 
 @implementation LiteLLMAppKitTableComponentView {
-  NSScrollView *_scrollView;
-  NSTableView *_tableView;
+  LiteLLMTableScrollView *_scrollView;
+  LiteLLMTableClipView *_clipView;
+  LiteLLMTableView *_tableView;
   BOOL _synchronizingSelection;
+  BOOL _settingColumnWidths;
+  CGFloat _automaticLastColumnFill;
+  std::vector<CGFloat> _requestedColumnWidths;
   std::string _dataSignature;
 }
 
@@ -1055,36 +1120,53 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitTableProps>();
     _props = defaultProps;
 
-    _tableView = [[NSTableView alloc] initWithFrame:NSZeroRect];
+    _tableView = [[LiteLLMTableView alloc] initWithFrame:NSZeroRect];
     _tableView.delegate = self;
     _tableView.dataSource = self;
     _tableView.target = self;
+    _tableView.action = @selector(handleRowClick:);
     _tableView.doubleAction = @selector(handleDoubleClick:);
     _tableView.allowsMultipleSelection = NO;
     _tableView.allowsEmptySelection = YES;
     _tableView.allowsColumnReordering = NO;
-    _tableView.columnAutoresizingStyle = NSTableViewLastColumnOnlyAutoresizingStyle;
+    _tableView.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
     _tableView.focusRingType = NSFocusRingTypeExterior;
     _tableView.intercellSpacing = NSZeroSize;
     _tableView.rowHeight = 28;
     _tableView.selectionHighlightStyle = NSTableViewSelectionHighlightStyleRegular;
     _tableView.usesAlternatingRowBackgroundColors = NO;
 
-    _scrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    _scrollView = [[LiteLLMTableScrollView alloc] initWithFrame:NSZeroRect];
+    _scrollView.scrollerStyle = NSScrollerStyleLegacy;
     _scrollView.autohidesScrollers = YES;
     _scrollView.borderType = NSBezelBorder;
-    // Table columns are deliberately clipped and truncated rather than
-    // horizontally scrolled. A horizontal track looks like an empty gutter
-    // in the fixed-width provider pane; vertical scrolling is enabled only
-    // when the rows actually exceed the viewport.
     _scrollView.hasHorizontalScroller = NO;
     _scrollView.hasVerticalScroller = NO;
     _scrollView.horizontalScrollElasticity = NSScrollElasticityNone;
-    _scrollView.verticalScrollElasticity = NSScrollElasticityAutomatic;
+    _scrollView.verticalScrollElasticity = NSScrollElasticityNone;
+    _scrollView.acceptsVerticalScroll = NO;
+    _scrollView.acceptsHorizontalScroll = NO;
+    _tableView.acceptsVerticalScroll = NO;
+    _tableView.acceptsHorizontalScroll = NO;
+    _clipView = [[LiteLLMTableClipView alloc] initWithFrame:NSZeroRect];
+    _clipView.acceptsVerticalScroll = NO;
+    _clipView.acceptsHorizontalScroll = NO;
+    _scrollView.contentView = _clipView;
     _scrollView.documentView = _tableView;
     self.contentView = _scrollView;
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(tableColumnDidResize:)
+                                                 name:NSTableViewColumnDidResizeNotification
+                                               object:_tableView];
   }
   return self;
+}
+
+- (void)dealloc
+{
+  [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                  name:NSTableViewColumnDidResizeNotification
+                                                object:_tableView];
 }
 
 - (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps
@@ -1105,6 +1187,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   for (const auto &key : newViewProps.disabledRowKeys) {
     nextDataSignature.append("disabled:").append(key).append("\x1f");
   }
+  for (const auto &key : newViewProps.secondaryCellKeys) {
+    nextDataSignature.append("secondary:").append(key).append("\x1f");
+  }
   const bool dataChanged = columnsChanged || compactChanged || nextDataSignature != _dataSignature;
 
   if (oldViewProps.alternatingRows != newViewProps.alternatingRows) {
@@ -1118,9 +1203,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   _synchronizingSelection = YES;
 
   if (columnsChanged) {
+    _settingColumnWidths = YES;
     while (_tableView.tableColumns.count > 0) {
       [_tableView removeTableColumn:_tableView.tableColumns.lastObject];
     }
+    _requestedColumnWidths.clear();
     for (NSUInteger index = 0; index < newViewProps.columnLabels.size(); index++) {
       NSString *identifierValue = [NSString stringWithFormat:@"column-%lu", (unsigned long)index];
       NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:identifierValue];
@@ -1128,13 +1215,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       const CGFloat width = index < newViewProps.columnWidths.size() && newViewProps.columnWidths[index] > 0
           ? static_cast<CGFloat>(newViewProps.columnWidths[index])
           : 160;
-      // NSTableViewLastColumnOnlyAutoresizingStyle lets the final column
-      // absorb a bordered clip view and a visible vertical scroller.  This
-      // keeps fixed-width provider/model tables inside the viewport.
-      column.minWidth = index + 1 == newViewProps.columnLabels.size() ? 1 : 48;
+      column.minWidth = 96;
+      column.maxWidth = CGFLOAT_MAX;
       column.width = width;
       [_tableView addTableColumn:column];
+      _requestedColumnWidths.push_back(MAX(96, width));
     }
+    _settingColumnWidths = NO;
   }
 
   if (dataChanged) {
@@ -1157,7 +1244,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     if (selectionChanged || _tableView.selectedRow != selectedIndex) {
       [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:selectedIndex] byExtendingSelection:NO];
     }
-    if (selectionChanged) {
+    if (selectionChanged && _scrollView.hasVerticalScroller) {
       [_tableView scrollRowToVisible:selectedIndex];
     }
   } else if (_tableView.selectedRow >= 0) {
@@ -1174,26 +1261,93 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
 - (void)updateScrollerVisibility
 {
-  NSClipView *clipView = _scrollView.contentView;
-  const CGFloat viewportHeight = NSHeight(clipView.bounds);
-  if (!(viewportHeight > 0)) {
+  const CGFloat rowsHeight = _tableView.numberOfRows * _tableView.rowHeight;
+  const CGFloat headerHeight = _tableView.headerView == nil ? 0 : NSHeight(_tableView.headerView.frame);
+  const NSUInteger columnCount = _tableView.tableColumns.count;
+  if (columnCount == 0 || _requestedColumnWidths.size() != columnCount ||
+      !(NSHeight(_scrollView.contentView.bounds) > 0)) {
     return;
   }
 
-  const CGFloat rowsHeight = _tableView.rowHeight * _tableView.numberOfRows;
-  const BOOL needsVerticalScroller = rowsHeight > viewportHeight + 0.5;
-  if (_scrollView.hasVerticalScroller != needsVerticalScroller) {
-    _scrollView.hasVerticalScroller = needsVerticalScroller;
-    [_scrollView tile];
+  const auto requestedContentWidth = [&]() {
+    CGFloat width = 0;
+    for (CGFloat columnWidth : _requestedColumnWidths) width += columnWidth;
+    return width;
+  };
+
+  for (NSUInteger index = 0; index < 3; index++) {
+    const NSRect visibleBounds = _scrollView.contentView.bounds;
+    const CGFloat contentWidth = requestedContentWidth();
+    const BOOL needsHorizontalScroller = contentWidth > NSWidth(visibleBounds) + 0.5;
+    if (_scrollView.hasHorizontalScroller != needsHorizontalScroller) {
+      _scrollView.hasHorizontalScroller = needsHorizontalScroller;
+      [_scrollView tile];
+      continue;
+    }
+    const CGFloat dataViewportHeight = MAX(0, NSHeight(_scrollView.contentView.bounds) - headerHeight);
+    const BOOL needsVerticalScroller = rowsHeight > dataViewportHeight;
+    if (_scrollView.hasVerticalScroller != needsVerticalScroller) {
+      _scrollView.hasVerticalScroller = needsVerticalScroller;
+      [_scrollView tile];
+      continue;
+    }
+    break;
   }
 
   const NSRect visibleBounds = _scrollView.contentView.bounds;
+  const CGFloat contentWidth = requestedContentWidth();
+  _automaticLastColumnFill = MAX(0, NSWidth(visibleBounds) - contentWidth);
+  _settingColumnWidths = YES;
+  for (NSUInteger index = 0; index < columnCount; index++) {
+    const CGFloat width = _requestedColumnWidths[index] +
+        (index + 1 == columnCount ? _automaticLastColumnFill : 0);
+    NSTableColumn *column = _tableView.tableColumns[index];
+    if (fabs(column.width - width) > 0.5) column.width = width;
+  }
+  _settingColumnWidths = NO;
+  const CGFloat dataViewportHeight = MAX(0, NSHeight(visibleBounds) - headerHeight);
+  const BOOL needsVerticalScroller = _scrollView.hasVerticalScroller;
+  const BOOL needsHorizontalScroller = _scrollView.hasHorizontalScroller;
+  _scrollView.verticalScrollElasticity = NSScrollElasticityNone;
+  _scrollView.horizontalScrollElasticity = NSScrollElasticityNone;
+  _scrollView.acceptsVerticalScroll = needsVerticalScroller;
+  _scrollView.acceptsHorizontalScroll = needsHorizontalScroller;
+  _clipView.acceptsVerticalScroll = needsVerticalScroller;
+  _clipView.acceptsHorizontalScroll = needsHorizontalScroller;
+  _tableView.acceptsVerticalScroll = needsVerticalScroller;
+  _tableView.acceptsHorizontalScroll = needsHorizontalScroller;
+
   const NSSize documentSize = NSMakeSize(
-      NSWidth(visibleBounds),
-      MAX(NSHeight(visibleBounds), rowsHeight));
+      MAX(NSWidth(visibleBounds), contentWidth),
+      MAX(dataViewportHeight, rowsHeight));
   if (!NSEqualSizes(_tableView.frame.size, documentSize)) {
     _tableView.frame = NSMakeRect(0, 0, documentSize.width, documentSize.height);
   }
+}
+
+- (void)tableColumnDidResize:(NSNotification *)notification
+{
+  if (_settingColumnWidths || notification.object != _tableView ||
+      _requestedColumnWidths.size() != _tableView.tableColumns.count) {
+    return;
+  }
+  const NSUInteger columnCount = _tableView.tableColumns.count;
+  NSUInteger resizedColumn = NSNotFound;
+  for (NSUInteger index = 0; index < columnCount; index++) {
+    const CGFloat expectedWidth = _requestedColumnWidths[index] +
+        (index + 1 == columnCount ? _automaticLastColumnFill : 0);
+    if (std::fabs(_tableView.tableColumns[index].width - expectedWidth) > 0.5) {
+      resizedColumn = index;
+      break;
+    }
+  }
+  if (resizedColumn == NSNotFound) {
+    return;
+  }
+  const CGFloat width = _tableView.tableColumns[resizedColumn].width;
+  _requestedColumnWidths[resizedColumn] = MAX(96, width -
+      (resizedColumn + 1 == columnCount ? _automaticLastColumnFill : 0));
+  [self updateScrollerVisibility];
 }
 
 - (NSInteger)numberOfRowsInTableView:(__unused NSTableView *)tableView
@@ -1209,7 +1363,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
   const NSUInteger columnIndex = [tableView.tableColumns indexOfObject:tableColumn];
   const size_t columnCount = viewProps.columnLabels.size();
-  if (row < 0 || columnIndex == NSNotFound || columnCount == 0) {
+  if (row < 0 ||
+      static_cast<size_t>(row) >= viewProps.rowKeys.size() ||
+      columnIndex == NSNotFound ||
+      static_cast<size_t>(columnIndex) >= columnCount) {
     return nil;
   }
   const size_t cellIndex = static_cast<size_t>(row) * columnCount + static_cast<size_t>(columnIndex);
@@ -1234,8 +1391,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   NSTextField *label = cell.textField;
   label.stringValue = value;
-  const bool disabled = std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), viewProps.rowKeys[static_cast<size_t>(row)]) != viewProps.disabledRowKeys.end();
-  label.textColor = disabled ? NSColor.secondaryLabelColor : NSColor.labelColor;
+  const std::string &rowKey = viewProps.rowKeys[static_cast<size_t>(row)];
+  const bool disabled = std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), rowKey) != viewProps.disabledRowKeys.end();
+  const std::string cellKey = rowKey + "\x1f" + std::to_string(columnIndex);
+  const bool secondary = std::find(viewProps.secondaryCellKeys.begin(), viewProps.secondaryCellKeys.end(), cellKey) != viewProps.secondaryCellKeys.end();
+  label.textColor = disabled || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor;
   label.toolTip = value;
   label.accessibilityLabel = value;
   cell.toolTip = value;
@@ -1255,6 +1415,21 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
       viewProps.rowKeys[static_cast<size_t>(selectedRow)], static_cast<int>(selectedRow)};
+  std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
+}
+
+- (void)handleRowClick:(__unused id)sender
+{
+  if (!_eventEmitter) {
+    return;
+  }
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  const NSInteger row = _tableView.clickedRow;
+  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size()) {
+    return;
+  }
+  LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
+      viewProps.rowKeys[static_cast<size_t>(row)], static_cast<int>(row)};
   std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
 }
 
@@ -1929,7 +2104,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
   [CoreIPCBridge.shared readProviderAPIKeyForTarget:target completion:^(NSString *_Nullable value, NSString *_Nullable error) {
     LiteLLMAppKitSecureTextInputComponentView *strongSelf = weakSelf;
     if (strongSelf == nil || generation != strongSelf->_generation ||
-        ![strongSelf->_host.control isEqual:strongSelf->_plainField]) return;
+        ![strongSelf->_host.control isEqual:strongSelf->_plainField] || strongSelf->_secretDirty) return;
     if (error.length > 0 || value == nil) {
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"read_failed" commitRequest:strongSelf->_lastCommitRequest];
       return;

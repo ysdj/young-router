@@ -630,6 +630,15 @@ def _should_block_external_web_search_original_recovery(request_kwargs: Optional
 
 
 def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        # A compaction request carries the complete signed/encrypted thread
+        # history. Replaying it in the shared long-running recovery poll can
+        # leave Codex stuck in "compacting context" for hours after an
+        # upstream rejection. The normal bounded router fallback still runs;
+        # only the cross-route recovery window is disabled.
+        return 0.0
     override = _request_metadata_positive_float(
         request_data,
         "route_recovery_max_seconds",
@@ -637,10 +646,6 @@ def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
     configured_max_seconds = (
         override if override is not None else _recovery_max_seconds()
     )
-    if _responses_request_module._request_has_structured_codex_compaction(
-        request_data
-    ):
-        return configured_max_seconds
     return configured_max_seconds
 
 
@@ -981,6 +986,27 @@ def _should_suppress_recent_failure_log(
     return _responses_surfaces_module._responses_chat_bridge_retry_kwargs(exception, request_kwargs, None) is not None
 
 
+def _request_public_model(request_kwargs: Optional[dict]) -> Optional[str]:
+    request_kwargs = request_kwargs or {}
+    litellm_params = _as_dict(request_kwargs.get("litellm_params"))
+    for container in (request_kwargs, litellm_params):
+        for metadata_key in ("metadata", "litellm_metadata"):
+            metadata = container.get(metadata_key)
+            if not isinstance(metadata, dict):
+                continue
+            for model_key in ("deployment_model_name", "model_group"):
+                model_name = metadata.get(model_key)
+                if isinstance(model_name, str) and model_name.strip():
+                    return model_name.strip()
+
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    for model_key in ("model_group", "model_name"):
+        model_name = model_info.get(model_key)
+        if isinstance(model_name, str) and model_name.strip():
+            return model_name.strip()
+    return _responses_execution_module._request_model_group(request_kwargs)
+
+
 def _request_log_record(
     status: str,
     request_kwargs: Optional[dict],
@@ -1008,6 +1034,7 @@ def _request_log_record(
         request_kwargs.get("model"),
     )
     api_key_name = _state_module._safe_log_text(model_info.get("api_key_name"), limit=120)
+    public_model = _request_public_model(request_kwargs)
     route_key = _state_module._safe_log_text(
         _deployment_route_key_from_request(request_kwargs),
         limit=260,
@@ -1033,6 +1060,7 @@ def _request_log_record(
         ),
         "call_type": _state_module._safe_log_text(request_kwargs.get("call_type"), limit=80),
         "model_group": _state_module._safe_log_text(_responses_execution_module._request_model_group(request_kwargs), limit=160),
+        "public_model": _state_module._safe_log_text(public_model, limit=160),
         "deployment_id": _state_module._safe_log_text(_deployment_id_from_request(request_kwargs), limit=180),
         "route_key": route_key,
         "deployment_order": _deployment_order_from_request(request_kwargs),
@@ -1816,6 +1844,9 @@ def _apply_selected_deployment_marker_to_request(
     litellm_metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
     updated_metadata = litellm_metadata.copy()
     updated_metadata["model_info"] = selected_model_info
+    deployment_model_name = selected_model_info.get("model_group")
+    if isinstance(deployment_model_name, str) and deployment_model_name.strip():
+        updated_metadata["deployment_model_name"] = deployment_model_name.strip()
     api_base = selected_litellm_params.get("api_base")
     if isinstance(api_base, str) and api_base.strip():
         updated_metadata["api_base"] = api_base
@@ -2304,6 +2335,10 @@ def _is_terminal_prompt_or_policy_error(exception: Exception) -> bool:
             "moderation blocked",
             "unsafe prompt",
             "unsafe content",
+            "considered high risk",
+            "classified as high risk",
+            "high-risk request",
+            "high risk request",
             "not allowed by policy",
             "disallowed content",
             "disallowed prompt",
@@ -2544,11 +2579,7 @@ def _deployment_route_key_from_request(request_kwargs: Optional[dict]) -> Option
         model_info.get("provider"),
         request_kwargs.get("custom_llm_provider"),
     )
-    model_group = _first_not_none(
-        model_info.get("model_group"),
-        model_info.get("model_name"),
-        _responses_execution_module._request_model_group(request_kwargs),
-    )
+    model_group = _request_public_model(request_kwargs)
     model = _first_not_none(
         litellm_params.get("model"),
         model_info.get("model"),
@@ -3582,6 +3613,15 @@ def _is_deployment_compatible_bad_request_error(exception: Exception) -> bool:
     if _is_upstream_gateway_bad_request_error(exception):
         return True
     text = _exception_text(exception)
+    if any(
+        marker in text
+        for marker in (
+            "unknown tool type",
+            "unsupported tool type",
+            "invalid tool type",
+        )
+    ):
+        return False
     if "openaiexception" not in text and "openai exception" not in text:
         return False
     if "bad_response_status_code" in text:

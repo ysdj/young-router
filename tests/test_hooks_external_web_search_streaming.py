@@ -333,7 +333,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertEqual(dumped.count("response.web_search_call.completed"), 2)
         self.assertIn("Final answer after both searches.", dumped)
 
-    async def test_streaming_external_web_search_deep_dive_runs_auto_source_actions(self) -> None:
+    async def test_streaming_external_web_search_model_chooses_source_after_full_result_page(self) -> None:
         hooks, _ = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
         executed_actions = []
@@ -345,10 +345,16 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             if action_type == "search":
                 return (
                     "Web search results for query: sample subject factor A inhibition\n"
+                    "Title: Unrelated result\n"
+                    "URL: https://example.test/unrelated\n"
+                    "Snippet: Not useful.\n\n"
                     "Title: Primary transporter source\n"
                     "URL: https://example.test/sample-subject-factor-a\n"
                     "Snippet: The claim needs source-page inspection.",
-                    ["https://example.test/sample-subject-factor-a"],
+                    [
+                        "https://example.test/unrelated",
+                        "https://example.test/sample-subject-factor-a",
+                    ],
                     action,
                 )
             if action_type == "openPage":
@@ -373,30 +379,57 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         async def original_function(**kwargs):
             continuation_calls.append(copy.deepcopy(kwargs))
             metadata = kwargs.get("litellm_metadata", {})
-            self.assertTrue(metadata.get("external_web_search_synthesis"))
-            self.assertNotIn("external_web_search_continuation", metadata)
-            self.assertIn("Source page read", kwargs.get("input", ""))
-            return {
-                "id": "resp_post_source_final",
-                "object": "response",
-                "status": "completed",
-                "output_text": "Final after source inspection. https://example.test/sample-subject-factor-a",
-                "output": [
-                    {
-                        "id": "msg_post_source_final",
-                        "type": "message",
+            if metadata.get("external_web_search_continuation"):
+                self.assertIn("https://example.test/unrelated", kwargs.get("input", ""))
+                self.assertIn(
+                    "https://example.test/sample-subject-factor-a",
+                    kwargs.get("input", ""),
+                )
+                continuation_count = sum(
+                    1
+                    for call in continuation_calls
+                    if call.get("litellm_metadata", {}).get(
+                        "external_web_search_continuation"
+                    )
+                )
+                if continuation_count > 1:
+                    return {
+                        "id": "resp_model_final",
+                        "object": "response",
                         "status": "completed",
-                        "role": "assistant",
-                        "content": [
+                        "output_text": "Final after source inspection. https://example.test/sample-subject-factor-a",
+                        "output": [
                             {
-                                "type": "output_text",
-                                "text": "Final after source inspection. https://example.test/sample-subject-factor-a",
-                                "annotations": [],
+                                "id": "msg_model_final",
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Final after source inspection. https://example.test/sample-subject-factor-a",
+                                        "annotations": [],
+                                    }
+                                ],
                             }
                         ],
                     }
-                ],
-            }
+                return {
+                    "id": "resp_model_selected_source",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "arguments": json.dumps(
+                                {"url": "https://example.test/sample-subject-factor-a"}
+                            ),
+                            "status": "completed",
+                        }
+                    ],
+                }
+            self.fail("model should make the final decision after opening the source")
 
         response = {
             "id": "resp_source_search",
@@ -426,11 +459,13 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(len(continuation_calls), 1)
-        self.assertEqual(executed_actions[0], {"type": "search", "query": "sample subject factor A inhibition"})
-        self.assertEqual(executed_actions[1], {"type": "openPage", "url": "https://example.test/sample-subject-factor-a"})
-        self.assertTrue(
-            all(action.get("url") == "https://example.test/sample-subject-factor-a" for action in executed_actions[1:])
+        self.assertEqual(len(continuation_calls), 2)
+        self.assertEqual(
+            executed_actions,
+            [
+                {"type": "search", "query": "sample subject factor A inhibition"},
+                {"type": "openPage", "url": "https://example.test/sample-subject-factor-a"},
+            ],
         )
         dumped = json.dumps(chunks)
         self.assertIn("response.web_search_call.completed", dumped)

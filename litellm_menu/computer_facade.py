@@ -958,6 +958,7 @@ def _external_web_search_message_stream_events(
     item: dict[str, Any],
     index: int,
 ) -> list[dict[str, Any]]:
+    item = _responses_web_search_bridge_module._final_answer_message_item(item)
     content_items = item.get("content")
     content = (
         content_items[0]
@@ -1303,124 +1304,14 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
                 forced_synthesis = True
                 break
 
-            if _responses_web_search_bridge_module._external_web_search_search_failed_without_sources(
-                search_results,
-                source_urls,
-                completed_actions,
-            ):
-                raise _responses_web_search_bridge_module._external_web_search_search_failed_without_sources_exception(
-                    request_kwargs,
-                    search_results=search_results,
-                    queries=completed_labels,
-                    completed_actions=completed_actions,
-                    round_number=round_number,
-                )
-
-            auto_source_actions = _responses_web_search_bridge_module._external_web_search_auto_source_inspection_actions(
-                request_kwargs,
-                completed_actions=completed_actions,
-                source_urls=source_urls,
-                search_results=search_results,
-            )
-            if auto_source_actions:
-                auto_events, auto_result = collect_action_events(auto_source_actions)
-                async for event in auto_events:
-                    yield event
-                auto_message = auto_result["message"]
-                auto_source_urls = auto_result["source_urls"]
-                auto_source_urls_by_action = auto_result["source_urls_by_action"]
-                auto_completed_actions = auto_result["completed_actions"]
-                auto_completed_items = auto_result["completed_items"]
-                _trace_module._route_trace(
-                    "external_web_search_bridge_auto_source_actions_executed",
-                    request_id=_routing_module._trace_request_id(request_kwargs),
-                    session=_routing_module._trace_session_context(request_kwargs),
-                    model_group=_responses_execution_module._request_model_group(request_kwargs),
-                    deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-                    route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-                    round=round_number,
-                    actions=_responses_web_search_bridge_module._external_web_search_trace_actions(auto_completed_actions),
-                    source_url_count=len(auto_source_urls),
-                    evidence_chars=len(auto_message or ""),
-                )
-                search_sections.append(auto_message)
-                completed_actions.extend(auto_completed_actions)
-                source_urls_by_action.extend(auto_source_urls_by_action)
-                completed_search_items.extend(auto_completed_items)
-                for url in auto_source_urls:
-                    if url not in source_urls:
-                        source_urls.append(url)
-                search_results = "\n\n".join(
-                    section for section in search_sections if section.strip()
-                )
-                synthesis_task = asyncio.create_task(
-                    _responses_web_search_bridge_module._external_web_search_synthesize_or_fallback(
-                        request_kwargs=request_kwargs,
-                        search_results=search_results,
-                        queries=_responses_web_search_bridge_module._external_web_search_action_labels(completed_actions),
-                        source_urls=source_urls,
-                        original_function=original_function,
-                    )
-                )
-                try:
-                    async for keepalive in _external_web_search_keepalives_until_done(
-                        synthesis_task,
-                        request_kwargs=request_kwargs,
-                        phase="web_search_synthesis",
-                    ):
-                        yield keepalive
-                    final_response = await synthesis_task
-                finally:
-                    if not synthesis_task.done():
-                        synthesis_task.cancel()
-                forced_synthesis = True
-                break
-
-            if (
-                _responses_web_search_bridge_module._external_web_search_request_needs_source_inspection(request_kwargs)
-                and _responses_web_search_bridge_module._external_web_search_has_source_page_action(completed_actions)
-                and any(action.get("type") == "search" for action in completed_actions)
-            ):
-                synthesis_task = asyncio.create_task(
-                    _responses_web_search_bridge_module._external_web_search_synthesize_or_fallback(
-                        request_kwargs=request_kwargs,
-                        search_results=search_results,
-                        queries=completed_labels,
-                        source_urls=source_urls,
-                        original_function=original_function,
-                    )
-                )
-                try:
-                    async for keepalive in _external_web_search_keepalives_until_done(
-                        synthesis_task,
-                        request_kwargs=request_kwargs,
-                        phase="web_search_synthesis",
-                    ):
-                        yield keepalive
-                    final_response = await synthesis_task
-                finally:
-                    if not synthesis_task.done():
-                        synthesis_task.cancel()
-                forced_synthesis = True
-                break
-
-            require_source_inspection = (
-                _responses_web_search_bridge_module._external_web_search_source_read_required_for_continuation(
-                    request_kwargs,
-                    completed_actions,
-                    source_urls,
-                    search_results,
-                )
-            )
             _responses_web_search_bridge_module._external_web_search_prepare_continuation_recovery_request(
                 request_kwargs=request_kwargs,
                 search_results=search_results,
-                source_urls=source_urls,
                 queries=completed_labels,
                 completed_actions=completed_actions,
                 round_number=round_number,
-                require_source_inspection=require_source_inspection,
             )
+
             continuation_task = asyncio.create_task(
                 _responses_web_search_bridge_module._external_web_search_continue_or_synthesize(
                     request_kwargs=request_kwargs,
@@ -1443,69 +1334,6 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
             finally:
                 if not continuation_task.done():
                     continuation_task.cancel()
-            if _responses_web_search_bridge_module._external_web_search_response_has_search_only_actions(
-                current_response,
-                request_kwargs,
-            ):
-                auto_source_actions = _responses_web_search_bridge_module._external_web_search_auto_source_inspection_actions(
-                    request_kwargs,
-                    completed_actions=completed_actions,
-                    source_urls=source_urls,
-                    search_results=search_results,
-                )
-                if auto_source_actions:
-                    auto_events, auto_result = collect_action_events(auto_source_actions)
-                    async for event in auto_events:
-                        yield event
-                    auto_message = auto_result["message"]
-                    auto_source_urls = auto_result["source_urls"]
-                    auto_source_urls_by_action = auto_result["source_urls_by_action"]
-                    auto_completed_actions = auto_result["completed_actions"]
-                    auto_completed_items = auto_result["completed_items"]
-                    _trace_module._route_trace(
-                        "external_web_search_bridge_auto_source_actions_executed",
-                        request_id=_routing_module._trace_request_id(request_kwargs),
-                        session=_routing_module._trace_session_context(request_kwargs),
-                        model_group=_responses_execution_module._request_model_group(request_kwargs),
-                        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-                        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-                        round=round_number,
-                        actions=_responses_web_search_bridge_module._external_web_search_trace_actions(auto_completed_actions),
-                        source_url_count=len(auto_source_urls),
-                        evidence_chars=len(auto_message or ""),
-                    )
-                    search_sections.append(auto_message)
-                    completed_actions.extend(auto_completed_actions)
-                    source_urls_by_action.extend(auto_source_urls_by_action)
-                    completed_search_items.extend(auto_completed_items)
-                    for url in auto_source_urls:
-                        if url not in source_urls:
-                            source_urls.append(url)
-                    search_results = "\n\n".join(
-                        section for section in search_sections if section.strip()
-                    )
-                    synthesis_task = asyncio.create_task(
-                        _responses_web_search_bridge_module._external_web_search_synthesize_or_fallback(
-                            request_kwargs=request_kwargs,
-                            search_results=search_results,
-                            queries=_responses_web_search_bridge_module._external_web_search_action_labels(completed_actions),
-                            source_urls=source_urls,
-                            original_function=original_function,
-                        )
-                    )
-                    try:
-                        async for keepalive in _external_web_search_keepalives_until_done(
-                            synthesis_task,
-                            request_kwargs=request_kwargs,
-                            phase="web_search_synthesis",
-                        ):
-                            yield keepalive
-                        final_response = await synthesis_task
-                    finally:
-                        if not synthesis_task.done():
-                            synthesis_task.cancel()
-                    forced_synthesis = True
-                    break
         except Exception as exc:
             route_recovery_attempted = True
             recovery_task = asyncio.create_task(
@@ -1597,6 +1425,7 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
             continue
         if _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
             continue
+        item = _responses_web_search_bridge_module._final_answer_message_item(item)
         final_output.append(item)
         index = len(final_output) - 1
         if item.get("type") == "message":
@@ -1661,6 +1490,7 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
                     continue
                 if _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
                     continue
+                item = _responses_web_search_bridge_module._final_answer_message_item(item)
                 final_output.append(item)
                 if item.get("type") == "message":
                     index = len(final_output) - 1

@@ -73,6 +73,95 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             },
         )
 
+    def test_external_web_search_bare_url_query_opens_the_page(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertEqual(
+            hooks._litellm_web_search_action_from_call(
+                {
+                    "type": "function_call",
+                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "arguments": json.dumps(
+                        {"query": "https://example.test/weather"}
+                    ),
+                }
+            ),
+            {"type": "openPage", "url": "https://example.test/weather"},
+        )
+        self.assertEqual(
+            hooks._litellm_web_search_action_from_call(
+                {
+                    "type": "function_call",
+                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "arguments": json.dumps(
+                        {
+                            "query": "https://example.test/weather",
+                            "pattern": "最高气温",
+                        }
+                    ),
+                }
+            ),
+            {
+                "type": "findInPage",
+                "url": "https://example.test/weather",
+                "pattern": "最高气温",
+            },
+        )
+
+    def test_external_web_search_url_embedded_in_query_becomes_page_find(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertEqual(
+            hooks._litellm_web_search_action_from_call(
+                {
+                    "type": "function_call",
+                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "arguments": json.dumps(
+                        {
+                            "query": (
+                                "page: int in "
+                                "https://example.test/project/README.md"
+                            )
+                        }
+                    ),
+                }
+            ),
+            {
+                "type": "findInPage",
+                "url": "https://example.test/project/README.md",
+                "pattern": "page: int",
+            },
+        )
+
+    def test_external_web_search_structured_query_keeps_model_selected_result_page(self) -> None:
+        hooks, _ = load_hook_module()
+
+        action = hooks._litellm_web_search_action_from_call(
+            {
+                "type": "function_call",
+                "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                "arguments": json.dumps(
+                    {"query": "平顶山今天天气", "page": 2}
+                ),
+            }
+        )
+
+        self.assertEqual(
+            action,
+            {"type": "search", "query": "平顶山今天天气", "page": "2"},
+        )
+        assert action is not None
+        self.assertNotEqual(
+            hooks._external_web_search_action_key(action),
+            hooks._external_web_search_action_key(
+                {"type": "search", "query": "平顶山今天天气"}
+            ),
+        )
+        self.assertEqual(
+            hooks._external_web_search_action_label(action),
+            "平顶山今天天气 (page 2)",
+        )
+
     def test_external_web_search_ignores_truncated_tool_json_as_search_query(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -1283,7 +1372,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
 
         self.assertEqual(synthesis_kwargs["model"], "legacy-chat")
         self.assertEqual(continuation_kwargs["model"], "legacy-chat")
-        self.assertEqual(continuation_kwargs["max_output_tokens"], 512)
+        self.assertEqual(
+            continuation_kwargs["max_output_tokens"],
+            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS,
+        )
         self.assertTrue(continuation_kwargs["stream"])
         self.assertEqual(
             continuation_kwargs["litellm_params"]["api_base"],
@@ -1345,7 +1437,6 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
                 "URL: https://www.python.org/downloads/\n"
                 "Snippet: Stable release information."
             ),
-            source_urls=["https://www.python.org/downloads/"],
             queries=["latest Python"],
             completed_actions=[{"type": "search", "query": "latest Python"}],
             round_number=1,

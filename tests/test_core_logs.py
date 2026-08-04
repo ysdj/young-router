@@ -104,6 +104,268 @@ class LogsDomainTests(unittest.TestCase):
             self.assertEqual("deployment_selected", tab["records"][0]["event"])
             self.assertEqual("example-provider", tab["records"][0]["provider"])
 
+    def test_route_trace_projects_nested_deployment_into_table_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "selected_deployment",
+                "model_group": "public-chat",
+                "deployment": {
+                    "id": "deployment-a",
+                    "provider": "provider-a",
+                    "model": "openai/upstream-chat",
+                    "order": 0.08,
+                    "api_base": "https://provider.example/v1",
+                },
+                "request": {
+                    "preview": "private request body",
+                    "interface": {
+                        "effective_upstream_surface": "responses",
+                        "requested_endpoint": "/v1/responses",
+                        "stream": True,
+                    },
+                },
+            }
+            (root / "menu-server.log").write_text(
+                f"[2026-08-01T04:10:11Z] litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual("selected_deployment", record["event"])
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("upstream-chat", record["upstream_model"])
+            self.assertEqual("provider-a", record["provider"])
+            self.assertEqual("order=0.08 · protocol=responses · stream=true", record["detail"])
+            self.assertNotIn("request", record)
+            self.assertNotIn("private request body", json.dumps(record))
+
+    def test_route_trace_uses_configured_public_model_for_deployment_only_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.yaml").write_text(
+                """providers:
+  provider-a:
+    api_base: https://provider.example/v1
+    api_keys:
+      - name: key-a
+        value: key-a
+model_list:
+  - model_name: public-chat
+    litellm_params:
+      model: openai/upstream-chat
+      api_base: https://provider.example/v1
+      api_key: key-a
+    model_info:
+      id: abcdef12
+      supported_upstream_url_surfaces:
+        - openai/responses
+      upstream_url_surface: openai/responses
+""",
+                encoding="utf-8",
+            )
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "selected_deployment",
+                "deployment": {
+                    "id": "abcdef12",
+                    "provider": "provider-a",
+                    "model": "openai/upstream-chat",
+                },
+            }
+            (root / "menu-server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("upstream-chat", record["upstream_model"])
+
+    def test_route_trace_projects_failed_route_into_recovery_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "route_recovery_poll_waiting_for_cooldown",
+                "model_group": "public-chat",
+                "exception": {
+                    "failed_deployment_id": "deployment-a",
+                    "failed_deployment_route_key": (
+                        "model=public-chat / provider=provider-a / "
+                        "upstream=openai/upstream-chat"
+                    ),
+                    "reason": "upstream-status-504",
+                },
+            }
+            (root / "menu-server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("upstream-chat", record["upstream_model"])
+            self.assertEqual("provider-a", record["provider"])
+            self.assertEqual("reason=upstream-status-504", record["detail"])
+
+    def test_route_trace_projects_fallback_details_without_request_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "next_order_fallback_available",
+                "model_group": "public-chat",
+                "failed_order": 1,
+                "target_order": 2,
+                "excluded_deployment_ids": ["deployment-a"],
+                "request": {"preview": "private request body"},
+                "candidates": [
+                    {"api_base": "https://provider.example/v1"},
+                    {"api_base": "https://other.example/v1"},
+                ],
+            }
+            (root / "menu-server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual(
+                "failed_order=1 · next_order=2 · candidates=2 · excluded=1",
+                record["detail"],
+            )
+            self.assertNotIn("candidates", record)
+            self.assertNotIn("private request body", json.dumps(record))
+
+    def test_route_trace_projects_failure_details(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {
+                    "timestamp": "2026-08-01T04:10:11Z",
+                    "event": "deployment_failover_marked",
+                    "deployment_order": 0.08,
+                    "exception": {
+                        "failed_deployment_order": 0.08,
+                        "reason": "upstream-compatible-bad-request",
+                        "text": "private upstream response",
+                    },
+                },
+            ]
+            (root / "menu-server.log").write_text(
+                "\n".join(
+                    f"litellm_route_trace {json.dumps(record)}" for record in records
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            trace_records = LogsDomain(root).view("route-trace")["log"]["records"]
+
+            self.assertEqual(
+                "failed_order=0.08 · reason=upstream-compatible-bad-request",
+                trace_records[0]["detail"],
+            )
+            self.assertNotIn("private upstream response", json.dumps(trace_records))
+
+    def test_route_trace_counts_filtered_candidates_without_serializing_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "filter_deployments",
+                "model_group": "public-chat",
+                "after_constraints": [
+                    {"api_base": "https://provider.example/v1"},
+                    {"api_base": "https://other.example/v1"},
+                ],
+            }
+            (root / "menu-server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual("candidates=2", record["detail"])
+            self.assertNotIn("after_constraints", record)
+
+    def test_route_trace_projects_search_synthesis_details_without_response_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {
+                    "event": "external_web_search_bridge_empty_continuation_synthesis",
+                    "round": 2,
+                    "queries": ["private query"],
+                },
+                {
+                    "event": "external_web_search_bridge_synthesis_done",
+                    "queries": ["private query", "another private query"],
+                    "source_url_count": 3,
+                    "response_preview": "private answer",
+                },
+                {
+                    "event": "external_web_search_bridge_synthesis_chat_start",
+                    "request": {"preview": "private request"},
+                },
+                {
+                    "event": "external_web_search_bridge_model_retry",
+                    "phase": "synthesis",
+                    "retry_attempt": 2,
+                    "max_retries": 3,
+                    "retry_delay_seconds": 1.5,
+                    "exception": {"reason": "upstream-network-connectivity"},
+                },
+            ]
+            (root / "menu-server.log").write_text(
+                "\n".join(
+                    f"litellm_route_trace {json.dumps(record)}" for record in records
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("route-trace")["log"]["records"]
+
+            self.assertEqual("round=2 · queries=1", projected[0]["detail"])
+            self.assertEqual("queries=2 · sources=3", projected[1]["detail"])
+            self.assertEqual("phase=synthesis", projected[2]["detail"])
+            self.assertEqual(
+                "phase=synthesis · retry=2 · max_retries=3 · retry_delay=1.5s · reason=upstream-network-connectivity",
+                projected[3]["detail"],
+            )
+            self.assertNotIn("private query", json.dumps(projected))
+            self.assertNotIn("private answer", json.dumps(projected))
+            self.assertNotIn("private request", json.dumps(projected))
+
+    def test_route_trace_projects_fallback_protocol_without_request_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "event": "generic_fallback_helper_start",
+                "request": {
+                    "preview": "private request body",
+                    "interface": {
+                        "client_surface": "responses",
+                        "stream": True,
+                    },
+                },
+            }
+            (root / "menu-server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual("protocol=responses · stream=true", record["detail"])
+            self.assertNotIn("private request body", json.dumps(record))
+
     def test_route_trace_view_stays_below_ipc_message_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -113,8 +375,8 @@ class LogsDomainTests(unittest.TestCase):
                     {
                         "timestamp": "2026-08-01T04:10:11Z",
                         "event": "deployment_selected",
-                        "request_preview": "x" * 1800,
-                        "selected_candidates": [{"id": f"deployment-{index}", "healthy": True}],
+                        "model_group": f"public-{index}",
+                        "detail": "x" * 1800,
                     }
                 )
                 for index in range(3000)
@@ -125,7 +387,8 @@ class LogsDomainTests(unittest.TestCase):
             encoded = json.dumps(view, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
             self.assertLessEqual(len(encoded), MAX_VIEW_BYTES)
-            self.assertEqual("deployment-2999", view["log"]["records"][-1]["selected_candidates"][0]["id"])
+            self.assertEqual("public-2999", view["log"]["records"][-1]["public_model"])
+            self.assertLessEqual(len(view["log"]["records"][-1].get("detail", "")), 260)
 
     def test_request_log_projects_the_credential_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -136,6 +399,7 @@ class LogsDomainTests(unittest.TestCase):
                         "ts": "2026-08-01T04:10:11Z",
                         "status": "ok",
                         "model_group": "default-chat",
+                        "public_model": "public-chat",
                         "provider": "provider-a",
                         "api_key_name": "credential-a",
                     }
@@ -147,6 +411,60 @@ class LogsDomainTests(unittest.TestCase):
             record = LogsDomain(root).view("requests")["log"]["records"][0]
 
             self.assertEqual("credential-a", record["api_key_name"])
+            self.assertEqual("public-chat", record["public_model"])
+
+    def test_request_log_derives_legacy_public_model_from_route_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recent-requests.jsonl").write_text(
+                json.dumps(
+                    {
+                        "model_group": "upstream-chat",
+                        "upstream_model": "openai/upstream-chat",
+                        "route_key": "model=public-chat / provider=provider-a / upstream=openai/upstream-chat",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("requests")["log"]["records"][0]
+
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("openai/upstream-chat", record["upstream_model"])
+
+    def test_request_log_corrects_upstream_name_using_deployment_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.yaml").write_text(
+                """model_list:
+  - model_name: public-chat
+    litellm_params:
+      model: openai/vendor-chat-tagged
+    model_info:
+      id: abc12345
+      upstream_url_surface: openai/chat
+      supported_upstream_url_surfaces: [openai/chat]
+""",
+                encoding="utf-8",
+            )
+            (root / "recent-requests.jsonl").write_text(
+                json.dumps(
+                    {
+                        "deployment_id": "abc12345",
+                        "public_model": "vendor-chat-tagged",
+                        "upstream_model": "openai/vendor-chat-tagged",
+                        "route_key": "model=vendor-chat-tagged / provider=provider-a / upstream=openai/vendor-chat-tagged",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("requests")["log"]["records"][0]
+
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("openai/vendor-chat-tagged", record["upstream_model"])
 
     def test_request_log_preserves_token_counts_and_safe_failure_cause(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -212,9 +530,30 @@ class LogsDomainTests(unittest.TestCase):
             self.assertEqual(100, tab["limit"])
             self.assertEqual(100, tab["line_count"])
 
-    def test_recovery_log_expands_the_multiline_state_document(self) -> None:
+    def test_recovery_log_projects_route_identity_from_state_and_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "config.yaml").write_text(
+                """providers:
+  provider-a:
+    api_base: https://provider.example/v1
+    api_keys:
+      - name: key-a
+        value: example-key
+model_list:
+  - model_name: public-chat
+    litellm_params:
+      model: openai/upstream-chat
+      api_base: https://provider.example/v1
+      api_key: example-key
+    model_info:
+      id: abcdef12
+      supported_upstream_url_surfaces:
+        - openai/responses
+      upstream_url_surface: openai/responses
+""",
+                encoding="utf-8",
+            )
             state = root / ".litellm-runtime" / "route-recovery-state.json"
             state.parent.mkdir()
             state.write_text(
@@ -226,7 +565,17 @@ class LogsDomainTests(unittest.TestCase):
                                 "key": "route-a",
                                 "status": "polling",
                                 "updated_at": "2026-08-01T04:10:11Z",
-                                "model_group": "default-chat",
+                                "model_group": "upstream-chat",
+                                "request": {
+                                    "deployment_id": "abcdef12",
+                                    "route_key": (
+                                        "model=public-chat / provider=provider-a / "
+                                        "upstream=openai/upstream-chat / key=key-a"
+                                    ),
+                                },
+                                "attempt": 2,
+                                "attempt_timeout_seconds": 120,
+                                "diagnostic": {"kind": "timeout"},
                             }
                         },
                     },
@@ -237,10 +586,56 @@ class LogsDomainTests(unittest.TestCase):
             )
 
             tab = LogsDomain(root).view("recovery")["log"]
+            record = tab["records"][0]
 
             self.assertEqual(1, tab["line_count"])
-            self.assertEqual("polling", tab["records"][0]["status"])
-            self.assertEqual("default-chat", tab["records"][0]["model_group"])
+            self.assertEqual("polling", record["status"])
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("upstream-chat", record["upstream_model"])
+            self.assertEqual("provider-a", record["provider"])
+            self.assertEqual("key-a", record["api_key_name"])
+            self.assertEqual("attempt=2 · timeout=120s · reason=timeout", record["detail"])
+            self.assertNotIn("request", record)
+            self.assertNotIn("diagnostic", record)
+
+    def test_recovery_log_uses_a_cooling_candidate_when_no_route_was_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".litellm-runtime" / "route-recovery-state.json"
+            state.parent.mkdir()
+            state.write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "request-a": {
+                                "updated_at": "2026-08-04T04:16:09Z",
+                                "status": "waiting",
+                                "model_group": "public-chat",
+                                "cooldown_deployments": [
+                                    {
+                                        "id": "deployment-a",
+                                        "provider": "provider-a",
+                                        "model": "openai/upstream-chat",
+                                        "api_key_name": "key-a",
+                                        "route_key": (
+                                            "model=public-chat / provider=provider-a / "
+                                            "upstream=openai/upstream-chat / key=key-a"
+                                        ),
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("recovery")["log"]["records"][0]
+
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("upstream-chat", record["upstream_model"])
+            self.assertEqual("provider-a", record["provider"])
+            self.assertEqual("key-a", record["api_key_name"])
 
     def test_pause_filter_clear_and_resume_are_view_operations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

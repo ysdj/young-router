@@ -1303,6 +1303,9 @@ class ClaudeSettingsDomain:
     def snapshot(self) -> dict[str, Any]:
         return {"domain": self.name, "revision": self._revision, "settings": self._safe_projection(self._draft)}
 
+    def draft_state(self) -> object:
+        return copy.deepcopy(self._draft)
+
     def raw_text(self, *, include_sensitive: bool = False) -> str:
         """Return editor text only when explicitly requested by a trusted UI."""
 

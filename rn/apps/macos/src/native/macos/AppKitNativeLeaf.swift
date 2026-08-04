@@ -29,12 +29,27 @@ private enum NativeRelayOriginPolicy {
         let title: String
         let enabled: Bool
         let checked: Bool
+
+        func matches(_ other: MenuAction) -> Bool {
+            id == other.id && title == other.title && enabled == other.enabled && checked == other.checked
+        }
     }
 
     private static let unconstrainedWindowSize = NSSize(
         width: CGFloat.greatestFiniteMagnitude,
         height: CGFloat.greatestFiniteMagnitude
     )
+    private static let applicationIcon = NSImage(
+        contentsOf: Bundle.main.url(forResource: "AppIcon", withExtension: "icns")!
+    )!
+    private static let statusBarIcon: NSImage = {
+        let image = NSImage(
+            systemSymbolName: "bolt.horizontal.circle.fill",
+            accessibilityDescription: "LiteLLM Menu"
+        )!
+        image.isTemplate = true
+        return image
+    }()
 
     // Keep the menu-bar shell anchored to the pre-RN AppKit app. The strings
     // are stable action IDs (plus the two presentation markers), not labels.
@@ -71,13 +86,17 @@ private enum NativeRelayOriginPolicy {
     }
     private let statusItem: NSStatusItem
     private weak var hostWindow: NSWindow?
-    private var routeWindowFactory: ((String) -> NSWindow?)?
+    private var routeWindowFactory: ((String, String?, NSWindow?) -> NSWindow?)?
+    private var reactHostStarter: (() -> Void)?
     private var routeWindows: [String: NSWindow] = [:]
     private var approvedCloseRoutes: Set<String> = []
     // Retain the browser flow across the asynchronous React Native promise.
     private var activeRelayLoginController: NativeRelayLoginController?
     private var statusTitle = "LiteLLM Menu"
+    private var statusRunning = false
     private var menuActions: [MenuAction] = []
+    private var menuTracking = false
+    private var menuNeedsRefresh = false
     private var pendingActions: [String] = []
     private var strings: [String: String] = [
         "appTitle": "LiteLLM Menu", "autoStart": "Auto Start at Login", "serviceUnavailable": "service unavailable",
@@ -101,28 +120,32 @@ private enum NativeRelayOriginPolicy {
         "modelChooserCountFiltered": "{visible} of {total} models", "modelChooserCountSelected": "{count} selected",
         "modelChooserEmpty": "No models available", "modelChooserNoMatches": "No matching models",
     ]
-    private var menuBarMonogram: String {
-        Bundle.main.bundleIdentifier == "menu.litellm.menu.preview" ? "LL·P" : "LL"
-    }
-
     override init() {
-        statusItem = NSStatusBar.system.statusItem(withLength: 32)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
-        statusItem.button?.title = menuBarMonogram
-        statusItem.button?.image = nil
-        statusItem.button?.imagePosition = .noImage
+        NSApp.applicationIconImage = Self.applicationIcon
+        statusItem.button?.title = ""
+        statusItem.button?.image = Self.statusBarIcon
+        statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.setAccessibilityLabel(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "LiteLLM Menu")
         statusItem.menu = makeMenu()
     }
 
-    public func setRouteWindowFactory(_ factory: @escaping (String) -> NSWindow?) {
+    public func setRouteWindowFactory(_ factory: @escaping (String, String?, NSWindow?) -> NSWindow?) {
         routeWindowFactory = factory
     }
 
+    public func setReactHostStarter(_ starter: @escaping () -> Void) {
+        reactHostStarter = starter
+    }
+
     func setStatus(title: String, running: Bool) {
+        guard title != statusTitle || running != statusRunning else { return }
         statusTitle = title
-        statusItem.length = menuBarMonogram == "LL·P" ? 42 : 32
-        statusItem.button?.title = menuBarMonogram
+        statusRunning = running
+        statusItem.length = NSStatusItem.squareLength
+        statusItem.button?.title = ""
+        statusItem.button?.image = Self.statusBarIcon
         statusItem.button?.toolTip = running
             ? localized("appTitle", fallback: "LiteLLM Menu")
             : "\(localized("appTitle", fallback: "LiteLLM Menu")) — \(localized("serviceUnavailable", fallback: "service unavailable"))"
@@ -136,7 +159,7 @@ private enum NativeRelayOriginPolicy {
         for (key, value) in values where !value.isEmpty { strings[key] = value }
         ensureSystemEditMenu(updateExisting: true)
         updateApplicationMenuTitles()
-        statusItem.menu = makeMenu(actions: menuActions)
+        refreshStatusMenu()
         for (route, window) in routeWindows {
             if let title = routeWindowTitle(route) {
                 // Snapshot-driven localization can run as often as live log
@@ -148,7 +171,7 @@ private enum NativeRelayOriginPolicy {
     }
 
     func setMenuActions(_ actions: [[String: Any]]) {
-        menuActions = actions.compactMap { action -> MenuAction? in
+        let nextActions = actions.compactMap { action -> MenuAction? in
             guard let id = action["id"] as? String,
                   let title = action["title"] as? String,
                   !id.isEmpty,
@@ -163,11 +186,15 @@ private enum NativeRelayOriginPolicy {
                 checked: action["checked"] as? Bool ?? false
             )
         }
-        statusItem.menu = makeMenu(actions: menuActions)
+        guard nextActions.count != menuActions.count || zip(nextActions, menuActions).contains(where: { !$0.matches($1) }) else {
+            return
+        }
+        menuActions = nextActions
+        refreshStatusMenu()
         installLanguageMenuIfAvailable()
     }
 
-    func open(route: String, title: String) {
+    func open(route: String, title: String, initialLogTab: String? = nil) {
         // The legacy app was menu-bar first. "home" exists only as a routing
         // target for RN, not as a dashboard window.
         guard route != "home" else {
@@ -179,11 +206,19 @@ private enum NativeRelayOriginPolicy {
         // stay shared with Windows. Fabric component views below that surface
         // supply AppKit controls, focus behavior, and system appearance.
         let windowRoute = canonicalRoute(route)
+        ensureReactHostStarted()
         let window: NSWindow
         if let existing = routeWindows[windowRoute] {
-            window = existing
+            if let initialLogTab,
+               let refreshed = routeWindowFactory?(route, initialLogTab, existing) {
+                window = refreshed
+                routeWindows[windowRoute] = window
+                window.delegate = self
+            } else {
+                window = existing
+            }
             window.title = title
-        } else if let created = routeWindowFactory?(route) {
+        } else if let created = routeWindowFactory?(route, initialLogTab, nil) {
             window = created
             routeWindows[windowRoute] = window
             window.delegate = self
@@ -288,6 +323,41 @@ private enum NativeRelayOriginPolicy {
         alert.addButton(withTitle: confirmTitle)
         alert.addButton(withTitle: localized("cancel", fallback: "Cancel"))
         return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    func showReadOnlyText(title: String, text: String, closeTitle: String) {
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 680, height: 420))
+        scrollView.borderType = .bezelBorder
+        scrollView.hasHorizontalScroller = true
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+
+        let textView = NSTextView(frame: scrollView.contentView.bounds)
+        textView.string = text
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = true
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = false
+        textView.setAccessibilityLabel(title)
+        scrollView.documentView = textView
+
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.accessoryView = scrollView
+        alert.addButton(withTitle: closeTitle)
+        alert.buttons.first?.keyEquivalent = "\u{1b}"
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     func showActionMenu(title: String, items: [String], anchor: [String: NSNumber]) -> Int? {
@@ -853,6 +923,25 @@ private enum NativeRelayOriginPolicy {
         return menu
     }
 
+    private func refreshStatusMenu() {
+        guard !menuTracking else {
+            menuNeedsRefresh = true
+            return
+        }
+        menuNeedsRefresh = false
+        statusItem.menu = makeMenu(actions: menuActions)
+    }
+
+    public func menuWillOpen(_ menu: NSMenu) {
+        menuTracking = true
+    }
+
+    public func menuDidClose(_ menu: NSMenu) {
+        menuTracking = false
+        guard menuNeedsRefresh else { return }
+        refreshStatusMenu()
+    }
+
     private func addMenuActionItem(
         _ id: String,
         from actions: [String: MenuAction],
@@ -1022,7 +1111,7 @@ private enum NativeRelayOriginPolicy {
     public func openRouteFromDeepLink(_ route: String, logTab: String?) {
         guard let title = routeWindowTitle(route) else { return }
         guard logTab == nil || (route == "logs" && isAllowedLogTab(logTab!)) else { return }
-        open(route: route, title: title)
+        open(route: route, title: title, initialLogTab: logTab)
         if let logTab {
             emitAction("open-logs?tab=\(logTab)")
         } else {
@@ -1051,7 +1140,11 @@ private enum NativeRelayOriginPolicy {
     }
 
     private func updateActivationPolicy() {
-        NSApp.setActivationPolicy(routeWindows.isEmpty ? .accessory : .regular)
+        if routeWindows.isEmpty {
+            NSApp.setActivationPolicy(.accessory)
+            return
+        }
+        NSApp.setActivationPolicy(.regular)
     }
 
     private func configure(_ window: NSWindow, for route: String, title: String) {
@@ -1060,6 +1153,7 @@ private enum NativeRelayOriginPolicy {
         window.minSize = layout.minSize
         window.maxSize = layout.maxSize ?? Self.unconstrainedWindowSize
         window.setContentSize(layout.contentSize)
+        window.center()
         window.collectionBehavior = [.fullScreenPrimary]
         window.level = .normal
     }
@@ -1118,11 +1212,17 @@ private enum NativeRelayOriginPolicy {
     }
 
     private func emitAction(_ action: String) {
+        ensureReactHostStarted()
         if let menuActionHandler {
             menuActionHandler(action)
         } else {
             pendingActions.append(action)
         }
+    }
+
+    private func ensureReactHostStarted() {
+        guard routeWindowFactory == nil else { return }
+        reactHostStarter?()
     }
 
     private func routeTitle(_ route: String) -> String? {
@@ -1169,7 +1269,7 @@ private enum NativeRelayOriginPolicy {
     @objc private func openWebDAV() { openNamedRoute("webdav-settings") }
     private func openLogs(tab: String?) {
         guard let title = routeWindowTitle("logs") else { return }
-        open(route: "logs", title: title)
+        open(route: "logs", title: title, initialLogTab: tab)
         emitAction(tab.map { "open-logs?tab=\($0)" } ?? "open-logs")
     }
     @objc private func openLogs() { openLogs(tab: nil) }
@@ -1193,12 +1293,14 @@ private enum NativeRelayOriginPolicy {
         }
     }
     func requestQuit() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            CoreIPCBridge.shared.stop()
-            DispatchQueue.main.async {
-                NSApp.terminate(nil)
-            }
-        }
+        NSApp.terminate(nil)
+    }
+
+    public func prepareForTermination() {
+        statusItem.menu = nil
+        NSStatusBar.system.removeStatusItem(statusItem)
+        for window in routeWindows.values { window.orderOut(nil) }
+        hostWindow?.orderOut(nil)
     }
 
     @objc private func quit() { requestQuit() }

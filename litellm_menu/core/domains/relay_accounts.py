@@ -559,6 +559,11 @@ class RelayAccountsDomain:
             "pending_credential_cleanups": pending_cleanups,
         }
 
+    def draft_state(self) -> object:
+        # Relay-account operations persist immediately; this domain has no
+        # unapplied draft state for the shared Apply/Cancel lifecycle.
+        return {}
+
     def reload(self) -> dict[str, Any]:
         try:
             loaded = self._store.read(
@@ -595,13 +600,6 @@ class RelayAccountsDomain:
         self._pending_credential_cleanups = pending_cleanups
         self.revision += 1
         return self.snapshot()
-
-    def is_read_only_action(self, action: str, payload: object | None = None) -> bool:
-        """Tell CoreStore that relay-type detection never stages account data."""
-
-        del payload
-        name = str(action).strip().lower().replace("-", "_").replace(".", "_")
-        return name in {"detect_type", "account_detect_type", "relay_detect_type"}
 
     def detect_type(self, origin: object) -> dict[str, str | None]:
         """Classify a relay using fixed public endpoints only.

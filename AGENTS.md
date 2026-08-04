@@ -26,6 +26,7 @@
 ## Runtime And Compatibility
 
 - The runtime starts from `.litellm-runtime/config.yaml`; source configuration is validated and staged explicitly. No file mutation may silently restart the service.
+- The macOS LiteLLM proxy must run with `LITELLM_NUM_WORKERS=16`. Do not lower the default, alter it during a restart, or use a smaller worker count as a performance or recovery workaround unless the user explicitly requests that configuration change.
 - Preserve LiteLLM routing, Responses stream semantics, tool ordering, IDs, explicit terminal errors, and metadata-driven compatibility bridges. Do not add request-specific or provider-specific routing hacks.
 - The Core IPC schema beside the implementation is the durable contract. Update its validators, typed client, host bridges, and focused tests together when the contract changes.
 - The macOS Vision helper is built into `Contents/Resources/Core/bin/vision_ocr`. Keep its source in the RN macOS host and never restore a `Resources/App` lookup.

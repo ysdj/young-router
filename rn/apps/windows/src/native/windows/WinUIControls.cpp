@@ -117,7 +117,7 @@ ScrollViewer FindTextEditorScrollViewer(
 
 double ColumnWidth(std::vector<float> const& widths, size_t index) {
   if (index >= widths.size() || widths[index] <= 0) return 140.0;
-  return std::max(36.0, static_cast<double>(widths[index]));
+  return std::max(88.0, static_cast<double>(widths[index]));
 }
 
 void ApplyKeyboardType(TextBox const& text_box, std::optional<std::string> const& keyboard_type) {
@@ -461,19 +461,25 @@ struct TableComponentView final
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     root_ = Grid{};
+    table_ = Grid{};
+    horizontal_scroller_ = ScrollViewer{};
+    horizontal_scroller_.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+    horizontal_scroller_.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch);
+    horizontal_scroller_.HorizontalScrollBarVisibility(
+        winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
+    horizontal_scroller_.VerticalScrollBarVisibility(
+        winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled);
     auto header_row = winrt::Microsoft::UI::Xaml::Controls::RowDefinition{};
     auto body_row = winrt::Microsoft::UI::Xaml::Controls::RowDefinition{};
     header_row.Height(winrt::Microsoft::UI::Xaml::GridLengthHelper::Auto());
-    root_.RowDefinitions().Append(header_row);
-    root_.RowDefinitions().Append(body_row);
+    table_.RowDefinitions().Append(header_row);
+    table_.RowDefinitions().Append(body_row);
 
     header_ = Grid{};
     list_ = ListView{};
     list_.SelectionMode(ListViewSelectionMode::Single);
+    list_.IsItemClickEnabled(true);
     list_.HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
-    // Tables deliberately clip/truncate fixed columns rather than reserving a
-    // bottom scrollbar. Keep the native vertical track automatic so it only
-    // appears when rows exceed the visible pane.
     ScrollViewer::SetHorizontalScrollBarVisibility(
         list_, winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled);
     ScrollViewer::SetVerticalScrollBarVisibility(
@@ -487,6 +493,17 @@ struct TableComponentView final
         args.index = index;
         args.key = Props()->rowKeys[static_cast<size_t>(index)];
         emitter->onSelectionChange(std::move(args));
+      }
+    });
+    list_.ItemClick([this](auto const&, auto const& args) {
+      if (!Props()) return;
+      uint32_t index = 0;
+      if (!list_.Items().IndexOf(args.ClickedItem(), index) || index >= Props()->rowKeys.size()) return;
+      if (auto emitter = EventEmitter()) {
+        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange event;
+        event.index = static_cast<int32_t>(index);
+        event.key = Props()->rowKeys[index];
+        emitter->onSelectionChange(std::move(event));
       }
     });
     list_.DoubleTapped([this](auto const&, auto const&) {
@@ -503,8 +520,10 @@ struct TableComponentView final
 
     Grid::SetRow(header_, 0);
     Grid::SetRow(list_, 1);
-    root_.Children().Append(header_);
-    root_.Children().Append(list_);
+    table_.Children().Append(header_);
+    table_.Children().Append(list_);
+    horizontal_scroller_.Content(table_);
+    root_.Children().Append(horizontal_scroller_);
     island_.Content(root_);
     island_view.Connect(island_.ContentIsland());
     ApplyProps();
@@ -528,16 +547,27 @@ struct TableComponentView final
     }
   }
 
+  double TableWidth(std::vector<float> const& widths, size_t count) const noexcept {
+    double width = 0;
+    for (size_t index = 0; index < count; ++index) {
+      width += ColumnWidth(widths, index);
+    }
+    return width;
+  }
+
   void ApplyProps() noexcept {
     if (!root_ || !Props()) return;
     auto const& props = *Props();
+    const auto disabled_row_keys = props.disabledRowKeys.value_or(std::vector<std::string>{});
+    const auto secondary_cell_keys = props.secondaryCellKeys.value_or(std::vector<std::string>{});
     const auto column_count = props.columnLabels.size();
     const bool columns_changed = !has_applied_ || column_labels_ != props.columnLabels || column_widths_ != props.columnWidths || compact_ != props.compact;
-    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != props.disabledRowKeys || compact_ != props.compact;
+    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || compact_ != props.compact;
     const bool selection_changed = !has_applied_ || selected_key_ != props.selectedKey;
     syncing_ = true;
 
     if (columns_changed) {
+      table_.MinWidth(TableWidth(props.columnWidths, column_count));
       header_.Children().Clear();
       AddColumns(header_, props.columnWidths, column_count);
       for (size_t column_index = 0; column_index < column_count; ++column_index) {
@@ -556,7 +586,7 @@ struct TableComponentView final
       for (size_t row_index = 0; row_index < props.rowKeys.size(); ++row_index) {
         auto row = Grid{};
         row.MinHeight(props.compact.value_or(false) ? 22.0 : 28.0);
-        const bool disabled = std::find(props.disabledRowKeys.begin(), props.disabledRowKeys.end(), props.rowKeys[row_index]) != props.disabledRowKeys.end();
+        const bool disabled = std::find(disabled_row_keys.begin(), disabled_row_keys.end(), props.rowKeys[row_index]) != disabled_row_keys.end();
         if (props.alternatingRows.value_or(false) && row_index % 2 == 1) {
           row.Background(AlternatingRowBrush());
         } else {
@@ -571,7 +601,9 @@ struct TableComponentView final
           const double vertical_margin = props.compact.value_or(false) ? 2.0 : 5.0;
           cell.Margin({8, vertical_margin, 8, vertical_margin});
           cell.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-          if (disabled) cell.Foreground(SecondaryTextBrush());
+          const auto cell_key = props.rowKeys[row_index] + "\x1f" + std::to_string(column_index);
+          const bool secondary = std::find(secondary_cell_keys.begin(), secondary_cell_keys.end(), cell_key) != secondary_cell_keys.end();
+          if (disabled || secondary) cell.Foreground(SecondaryTextBrush());
           Grid::SetColumn(cell, static_cast<int32_t>(column_index));
           row.Children().Append(cell);
         }
@@ -590,7 +622,8 @@ struct TableComponentView final
     selected_key_ = props.selectedKey;
     alternating_rows_ = props.alternatingRows;
     compact_ = props.compact;
-    disabled_row_keys_ = props.disabledRowKeys;
+    disabled_row_keys_ = disabled_row_keys;
+    secondary_cell_keys_ = secondary_cell_keys;
     if (props.followBottom.value_or(false) && rows_changed && !props.rowKeys.empty()) {
       list_.ScrollIntoView(list_.Items().GetAt(static_cast<uint32_t>(props.rowKeys.size() - 1)));
     }
@@ -601,8 +634,10 @@ struct TableComponentView final
   bool syncing_ = false;
   winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
   Grid root_{nullptr};
+  Grid table_{nullptr};
   Grid header_{nullptr};
   ListView list_{nullptr};
+  ScrollViewer horizontal_scroller_{nullptr};
   bool has_applied_ = false;
   std::vector<std::string> column_labels_;
   std::vector<float> column_widths_;
@@ -612,6 +647,7 @@ struct TableComponentView final
   std::optional<bool> alternating_rows_;
   std::optional<bool> compact_;
   std::vector<std::string> disabled_row_keys_;
+  std::vector<std::string> secondary_cell_keys_;
 };
 
 struct TextEditorComponentView final
@@ -1449,6 +1485,7 @@ struct SecureTextInputComponentView final
       password_box_.MinHeight(30.0);
       password_box_.Padding(winrt::Microsoft::UI::Xaml::Thickness{8, 0, 8, 0});
       password_box_.VerticalContentAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+      password_box_.PasswordRevealMode(winrt::Microsoft::UI::Xaml::Controls::PasswordRevealMode::Hidden);
       password_box_.MaxLength(16 * 1024);
       dispatcher_ = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
       auto weak_self = get_weak();
@@ -1497,12 +1534,12 @@ struct SecureTextInputComponentView final
   bool IsPlainTextProviderKey(
       winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps const& props) const noexcept {
     return props.plainText.value_or(false) && props.autoCommit.value_or(false) &&
-        props.domain == "providers_models" && props.field == "api_key" && !props.target.empty();
+        props.domain == "providers_models" &&
+        props.field == "api_key" && !props.target.empty();
   }
 
   bool IsPlainTextProviderKey() const noexcept {
-    if (!Props()) return false;
-    return IsPlainTextProviderKey(*Props());
+    return Props() && IsPlainTextProviderKey(*Props());
   }
 
   void SetPassword(winrt::hstring const& value) noexcept {

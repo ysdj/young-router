@@ -83,7 +83,7 @@ void RemoveRuntimeDirectory(std::wstring const& directory) {
 
 void StopCoreProcess(HANDLE process, std::wstring const& directory) {
   if (process) {
-    DWORD const grace_result = WaitForSingleObject(process, 100);
+    DWORD const grace_result = WaitForSingleObject(process, 8000);
     if (grace_result != WAIT_OBJECT_0) {
       TerminateProcess(process, 0);
       WaitForSingleObject(process, INFINITE);
@@ -416,16 +416,12 @@ std::optional<CoreIPCBridge::SecretStageResult> CoreIPCBridge::StageSecret(
 }
 
 std::optional<CoreIPCBridge::SecretReadCapability> CoreIPCBridge::CreateSecretReadCapability(
-    std::string const& domain,
-    std::string const& field,
     std::string const& target) {
-  if (domain != "providers_models" || field != "api_key" || target.empty() || target.size() > 256) {
-    return std::nullopt;
-  }
+  if (target.empty() || target.size() > 256) return std::nullopt;
   try {
     winrt::Windows::Data::Json::JsonObject payload;
-    payload.SetNamedValue(L"domain", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(domain)));
-    payload.SetNamedValue(L"field", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(field)));
+    payload.SetNamedValue(L"domain", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"providers_models"));
+    payload.SetNamedValue(L"field", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"api_key"));
     payload.SetNamedValue(L"target", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(target)));
     auto result = HostRequest(L"host/secret/read-capability", WideToUtf8(payload.Stringify().c_str()), false);
     if (!result || result->status != 200 || result->body.empty()) return std::nullopt;
@@ -439,7 +435,7 @@ std::optional<CoreIPCBridge::SecretReadCapability> CoreIPCBridge::CreateSecretRe
     if (revision < 0 || revision != std::floor(revision) || token.empty() || token.size() > 256) {
       return std::nullopt;
     }
-    return SecretReadCapability{std::move(token), response.GetNamedBoolean(L"present", false)};
+    return SecretReadCapability{std::move(token)};
   } catch (...) {
     return std::nullopt;
   }
@@ -470,7 +466,7 @@ std::optional<std::string> CoreIPCBridge::ReadSecret(std::string const& secret_r
 }
 
 std::optional<std::string> CoreIPCBridge::ReadProviderAPIKey(std::string const& target) {
-  auto capability = CreateSecretReadCapability("providers_models", "api_key", target);
+  auto capability = CreateSecretReadCapability(target);
   if (!capability) return std::nullopt;
   return ReadSecret(capability->token);
 }
@@ -955,7 +951,7 @@ void CoreIPCBridge::Stop() {
   // before reaping Core. Direct process termination remains the final fallback.
   if (shutdown_endpoint && !shutdown_token.empty()) {
     try {
-      Request(*shutdown_endpoint, L"host/shutdown", L"POST", "{}", shutdown_token, 1000);
+      Request(*shutdown_endpoint, L"host/shutdown", L"POST", "{}", shutdown_token, 4000);
     } catch (...) {
     }
   }

@@ -396,6 +396,46 @@ bool WinUI3NativeLeaf::Confirm(
   return RunOwnedModalWindow(dialog, window_handle_, {440, 220}, finished) && accepted;
 }
 
+void WinUI3NativeLeaf::ShowReadOnlyText(
+    std::wstring_view title,
+    std::wstring_view text,
+    std::wstring_view close_label) {
+  namespace xaml = winrt::Microsoft::UI::Xaml;
+  namespace controls = winrt::Microsoft::UI::Xaml::Controls;
+
+  xaml::Window dialog;
+  dialog.Title(winrt::hstring(title));
+
+  controls::Grid root;
+  root.RowDefinitions().Append(controls::RowDefinition());
+  controls::RowDefinition action_row;
+  action_row.Height(xaml::GridLengthHelper::Auto());
+  root.RowDefinitions().Append(action_row);
+
+  auto viewer = CreateTextEditor();
+  viewer.Text(winrt::hstring(text));
+  viewer.IsReadOnly(true);
+  viewer.IsSpellCheckEnabled(false);
+  viewer.Margin(xaml::Thickness{16, 16, 16, 12});
+  root.Children().Append(viewer);
+
+  controls::StackPanel actions;
+  actions.Orientation(controls::Orientation::Horizontal);
+  actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
+  actions.Margin(xaml::Thickness{16, 0, 16, 16});
+  actions.SetValue(controls::Grid::RowProperty(), winrt::box_value(1));
+  controls::Button close;
+  close.Content(winrt::box_value(winrt::hstring(close_label)));
+  actions.Children().Append(close);
+  root.Children().Append(actions);
+  dialog.Content(root);
+
+  bool finished = false;
+  close.Click([dialog](auto const&, auto const&) { dialog.Close(); });
+  dialog.Closed([&finished](auto const&, auto const&) { finished = true; });
+  RunOwnedModalWindow(dialog, window_handle_, {760, 520}, finished);
+}
+
 std::optional<size_t> WinUI3NativeLeaf::ShowActionMenu(
     std::wstring_view title,
     std::vector<std::wstring> const& items,

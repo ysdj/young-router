@@ -14,6 +14,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual(tool["name"], hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME)
         dumped = json.dumps(tool)
         self.assertIn('"query"', dumped)
+        self.assertIn('"page"', dumped)
         self.assertIn('"url"', dumped)
         self.assertIn('"pattern"', dumped)
         self.assertNotIn("openPage", dumped)
@@ -696,7 +697,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual(dumped["status"], "completed")
         self.assertEqual(dumped["arguments"], {"query": "spawn agent", "limit": 8})
 
-    def test_reasoning_summary_message_is_stripped_when_tool_call_present(self) -> None:
+    def test_reasoning_summary_is_preserved_while_duplicate_message_is_stripped(self) -> None:
         hooks, _ = load_hook_module()
         response = {
             "id": "resp_chat",
@@ -741,6 +742,13 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual(
             sanitized["output"],
             [
+                {
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "summary": [
+                        {"type": "summary_text", "text": "Let me check the current"}
+                    ],
+                },
                 {
                     "id": "call_1",
                     "type": "function_call",

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Read live, credential-scoped billing data for LiteLLM Menu models.
+"""Read live, credential-scoped multipliers for LiteLLM Menu models.
 
 The command intentionally recognizes response shapes instead of provider names or
-hosts. It never writes a cache: each invocation is a bounded live refresh, and
+hosts. It never writes a cache: each invocation is a bounded live read, and
 the emitted document excludes API bases, credentials, and upstream response text.
 """
 
@@ -32,12 +32,9 @@ SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 4.0
 MIN_TIMEOUT_SECONDS = 0.5
 MAX_TIMEOUT_SECONDS = 15.0
-MAX_ACCOUNTS_PER_REFRESH = 24
+MAX_CREDENTIALS_PER_REFRESH = 24
 MAX_RESPONSE_BYTES = 256 * 1024
-MULTIPLIER_UNAVAILABLE_DETAIL = (
-    "The billing API does not expose a model multiplier to this credential."
-)
-UNLIMITED_QUOTA_DETAIL = "The provider reports unlimited quota; no finite balance is available."
+MULTIPLIER_UNAVAILABLE_DETAIL = "The provider does not expose a model multiplier to this credential."
 
 
 class BillingConfigError(ValueError):
@@ -58,22 +55,6 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 HttpOpener = Callable[[urllib.request.Request, float], Any]
-BrowserProbe = Callable[..., Any]
-
-
-def _default_browser_probe(
-    api_base: str,
-    api_key: str,
-    *,
-    timeout: float,
-) -> tuple[str, int | None, dict[str, Any] | None]:
-    """Ask the optional local browser bridge without importing it at startup."""
-
-    try:
-        from browser_billing import fetch_browser_token_search
-    except (ImportError, OSError):
-        return "unavailable", None, None
-    return fetch_browser_token_search(api_base, api_key, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -106,21 +87,6 @@ def _utc_now() -> str:
 
 def _string(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
-
-
-def _enabled(value: Any, default: bool = True) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return bool(value)
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on", "enabled"}:
-        return True
-    if text in {"0", "false", "no", "off", "disabled"}:
-        return False
-    return default
 
 
 def _credential_value(value: Any) -> str:
@@ -240,17 +206,11 @@ def _service_root(api_base: str) -> str | None:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
 
-def _endpoint_candidates(api_base: str) -> list[tuple[str, str]]:
+def _multiplier_endpoint(api_base: str) -> str | None:
     root = _service_root(api_base)
     if root is None:
-        return []
-    root_path = urllib.parse.urlsplit(root).path.rstrip("/").lower()
-    newapi_usage_path = "/usage/token/" if root_path.endswith("/api") else "/api/usage/token/"
-    return [
-        ("sub2api-v1-usage", f"{root}/v1/usage"),
-        ("sub2api-key-billing", f"{root}/v1/sub2api/billing"),
-        ("newapi-token-usage", f"{root}{newapi_usage_path}"),
-    ]
+        return None
+    return f"{root}/v1/sub2api/billing"
 
 
 def _billing_http_opener() -> urllib.request.OpenerDirector:
@@ -278,7 +238,7 @@ def _fetch_json(
         headers={
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
-            "User-Agent": "LiteLLM-Menu-Billing/1",
+            "User-Agent": "LiteLLM-Menu-Multiplier/1",
         },
         method="GET",
     )
@@ -330,175 +290,6 @@ def _number(value: Any) -> int | float | None:
     return None
 
 
-def _display_text(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    text = " ".join(value.split())
-    if not text or len(text) > 64:
-        return None
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", text):
-        return None
-    return text
-
-
-def _data_mapping(payload: dict[str, Any]) -> dict[str, Any]:
-    data = payload.get("data")
-    return data if isinstance(data, dict) else payload
-
-
-def _browser_fallback_allowed(api_base: str) -> bool:
-    """Require an explicit opt-in before invoking any browser automation."""
-
-    setting = os.environ.get("LITELLM_BROWSER_BILLING", "").strip().lower()
-    return setting in {"1", "true", "yes", "on", "enabled"}
-
-
-def _browser_token_item(payload: dict[str, Any], api_key: str) -> dict[str, Any] | None:
-    data = payload.get("data")
-    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-        return None
-    items = [item for item in data["items"] if isinstance(item, dict)]
-    if not items:
-        return None
-    for item in items:
-        for field in ("key", "token", "value"):
-            if item.get(field) == api_key:
-                return item
-    # Never attribute a row to a different credential merely because the server
-    # returned one masked or unrelated item.
-    if len(items) == 1 and items[0].get("__browser_match") is True:
-        return items[0]
-    return None
-
-
-def _recognized_browser_billing(
-    payload: dict[str, Any], api_key: str
-) -> dict[str, Any] | None:
-    item = _browser_token_item(payload, api_key)
-    if item is None:
-        return None
-    # The browser bridge marks an exact key match before redacting the key;
-    # never infer a match from an arbitrary singleton response in that path.
-    if "__browser_match" in item and item.get("__browser_match") is not True:
-        return None
-    remain = _number(item.get("remain_quota"))
-    used = _number(item.get("used_quota"))
-    granted = _number(item.get("total_granted"))
-    unlimited = item.get("unlimited_quota") is True
-    if not unlimited and remain is None:
-        return None
-
-    multiplier = None
-    for field in (
-        "__browser_multiplier",
-        "effective_rate_multiplier",
-        "rate_multiplier",
-        "multiplier",
-    ):
-        multiplier = _number(item.get(field))
-        if multiplier is not None:
-            break
-    result: dict[str, Any] = {
-        "source": "newapi-browser-token-search",
-        "balance": None
-        if unlimited
-        else {"kind": "remaining_quota", "value": remain, "unit": "quota"},
-        "usage": (
-            {"used": used, "limit": granted, "unit": "quota"}
-            if not unlimited and used is not None and granted is not None
-            else None
-        ),
-        "group": _display_text(item.get("group")),
-        "mode": _display_text(item.get("status")),
-        "detail": UNLIMITED_QUOTA_DETAIL if unlimited else "Browser session billing data is available.",
-    }
-    if multiplier is not None:
-        result["multiplier"] = {
-            "status": "ok",
-            "value": multiplier,
-            "detail": "Effective model multiplier from the browser keys table.",
-        }
-    return result
-
-
-def _recognized_billing(
-    endpoint: str, payload: dict[str, Any]
-) -> dict[str, Any] | None:
-    data = _data_mapping(payload)
-    object_name = _string(data.get("object")) or _string(payload.get("object"))
-    if endpoint == "sub2api-v1-usage":
-        quota = data.get("quota")
-        if isinstance(quota, dict):
-            limit = _number(quota.get("limit"))
-            used = _number(quota.get("used"))
-            remaining = _number(quota.get("remaining"))
-            unit = _display_text(quota.get("unit")) or "provider_credit"
-            if remaining is not None:
-                return {
-                    "source": "sub2api-v1-usage",
-                    "balance": {"kind": "remaining_quota", "value": remaining, "unit": unit},
-                    "usage": (
-                        {"used": used, "limit": limit, "unit": unit}
-                        if used is not None and limit is not None
-                        else None
-                    ),
-                    "group": _display_text(data.get("planName")),
-                    "mode": _display_text(data.get("mode")),
-                }
-        remaining = _number(data.get("remaining"))
-        unit = _display_text(data.get("unit")) or "provider_credit"
-        if remaining is not None:
-            return {
-                "source": "sub2api-v1-usage",
-                "balance": {"kind": "balance", "value": remaining, "unit": unit},
-                "usage": None,
-                "group": _display_text(data.get("planName")),
-                "mode": _display_text(data.get("mode")),
-            }
-
-    if endpoint == "sub2api-key-billing" and object_name == "sub2api.key_billing":
-        multiplier = _number(data.get("effective_rate_multiplier"))
-        if multiplier is None:
-            return None
-        return {
-            "source": "sub2api-key-billing",
-            "balance": None,
-            "usage": None,
-            "group": None,
-            "mode": _display_text(data.get("billing_scope")),
-            "multiplier": {
-                "status": "ok",
-                "value": multiplier,
-                "detail": "Effective key billing multiplier.",
-            },
-        }
-
-    total_granted = _number(data.get("total_granted"))
-    total_used = _number(data.get("total_used"))
-    total_available = _number(data.get("total_available"))
-    if endpoint == "newapi-token-usage" and object_name == "token_usage":
-        unlimited = data.get("unlimited_quota") is True
-        if not unlimited and total_available is None:
-            return None
-        return {
-            "source": "newapi-token-usage",
-            "balance": None if unlimited else {
-                "kind": "remaining_quota",
-                "value": total_available,
-                "unit": "quota",
-            } if total_available is not None else None,
-            "usage": (
-                {"used": total_used, "limit": total_granted, "unit": "quota"}
-                if not unlimited and total_used is not None and total_granted is not None
-                else None
-            ),
-            "group": None,
-            "mode": None,
-            "detail": UNLIMITED_QUOTA_DETAIL if unlimited else None,
-        }
-    return None
-
-
 def _multiplier_unavailable() -> dict[str, Any]:
     return {
         "status": "unavailable",
@@ -507,15 +298,11 @@ def _multiplier_unavailable() -> dict[str, Any]:
     }
 
 
-def _account_result(
+def _multiplier_result(
     status: str,
     detail: str,
     *,
     source: str | None = None,
-    balance: dict[str, Any] | None = None,
-    usage: dict[str, Any] | None = None,
-    group: str | None = None,
-    mode: str | None = None,
     multiplier: dict[str, Any] | None = None,
     http_status: int | None = None,
 ) -> dict[str, Any]:
@@ -523,10 +310,6 @@ def _account_result(
         "status": status,
         "detail": detail,
         "source": source,
-        "balance": balance,
-        "usage": usage,
-        "group": group,
-        "mode": mode,
         "multiplier": multiplier or _multiplier_unavailable(),
     }
     if http_status is not None:
@@ -534,153 +317,79 @@ def _account_result(
     return result
 
 
-def _failure_result(attempts: list[tuple[str, str, int | None]]) -> dict[str, Any]:
-    if attempts and all(
-        kind in {"unsupported", "http"} and http_status in {404, 405}
-        for _, kind, http_status in attempts
-    ):
-        return _account_result(
+def _failure_result(kind: str, http_status: int | None) -> dict[str, Any]:
+    if kind == "http" and http_status in {404, 405}:
+        return _multiplier_result(
             "unsupported",
-            "This provider does not expose a supported billing endpoint.",
+            "This provider does not expose an effective multiplier endpoint.",
         )
     priority = (
         ("auth", "auth_error", "The provider rejected the configured credential."),
         ("rate", "rate_limited", "The provider rate-limited the billing request."),
-        ("timeout", "timeout", "The provider did not answer before the billing timeout."),
-        ("network", "network_error", "The provider could not be reached for billing."),
-        ("http", "http_error", "The provider returned an HTTP error for billing."),
+        ("timeout", "timeout", "The provider did not answer before the multiplier timeout."),
+        ("network", "network_error", "The provider could not be reached for the multiplier."),
+        ("http", "http_error", "The provider returned an HTTP error for the multiplier."),
     )
     for needle, status, detail in priority:
-        for endpoint, kind, http_status in reversed(attempts):
-            if (
-                needle == "auth"
-                and kind == "http"
-                and http_status in {401, 403}
-            ):
-                return _account_result(status, detail, http_status=http_status)
-            if needle == "rate" and kind == "http" and http_status == 429:
-                return _account_result(status, detail, http_status=http_status)
-            if kind == needle:
-                return _account_result(status, detail, http_status=http_status)
-    return _account_result(
+        if needle == "auth" and kind == "http" and http_status in {401, 403}:
+            return _multiplier_result(status, detail, http_status=http_status)
+        if needle == "rate" and kind == "http" and http_status == 429:
+            return _multiplier_result(status, detail, http_status=http_status)
+        if kind == needle:
+            return _multiplier_result(status, detail, http_status=http_status)
+    return _multiplier_result(
         "unsupported",
-        "No supported billing response was available from this provider.",
+        "No supported effective multiplier response was available from this provider.",
     )
 
 
-def probe_account(
-    api_base: str,
-    api_key: str,
+def _key_multiplier(payload: dict[str, Any]) -> int | float | None:
+    if _string(payload.get("object")) != "sub2api.key_billing":
+        return None
+    if _string(payload.get("billing_scope")) != "token":
+        return None
+    return _number(payload.get("effective_rate_multiplier"))
+
+
+def probe_model(
+    target: BillingTarget,
     *,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     opener: HttpOpener = _default_open,
-    browser_probe: BrowserProbe | None = _default_browser_probe,
 ) -> dict[str, Any]:
-    if not api_base:
-        return _account_result(
+    if not target.api_base:
+        return _multiplier_result(
             "invalid_config", "The configured model has no provider API base."
         )
-    if not api_key:
-        return _account_result(
+    if not target.api_key:
+        return _multiplier_result(
             "credential_unavailable",
             "The configured model has no usable provider credential in this environment.",
         )
-    endpoints = _endpoint_candidates(api_base)
-    if not endpoints:
-        return _account_result(
+    endpoint = _multiplier_endpoint(target.api_base)
+    if endpoint is None:
+        return _multiplier_result(
             "invalid_config", "The configured model has an unsupported provider API base."
         )
-
-    # The configured timeout is an account-wide budget. Unsupported endpoints
-    # must not turn one UI refresh into several consecutive network timeouts.
-    deadline = time.monotonic() + timeout
-    attempts: list[tuple[str, str, int | None]] = []
-    billing_multiplier: dict[str, Any] | None = None
-    billing_result: dict[str, Any] | None = None
-    for endpoint, url in endpoints:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            attempts.append((endpoint, "timeout", None))
-            break
-        kind, http_status, payload = _fetch_json(
-            url,
-            api_key,
-            min(timeout, remaining),
-            opener,
+    kind, http_status, payload = _fetch_json(endpoint, target.api_key, timeout, opener)
+    if kind != "ok" or payload is None:
+        return _failure_result(kind, http_status)
+    multiplier = _key_multiplier(payload)
+    if multiplier is None:
+        return _multiplier_result(
+            "unsupported",
+            "This credential does not expose an effective key multiplier.",
         )
-        if kind == "ok" and payload is not None:
-            recognized = _recognized_billing(endpoint, payload)
-            if recognized is not None:
-                if recognized["source"] == "sub2api-key-billing":
-                    billing_multiplier = recognized.get("multiplier")
-                else:
-                    billing_result = recognized
-                if endpoint == "newapi-token-usage":
-                    break
-            else:
-                attempts.append((endpoint, "unsupported", http_status))
-        else:
-            attempts.append((endpoint, kind, http_status))
-
-        # A recognized Sub2API balance is authoritative for this credential.
-        # Its one companion endpoint is the documented multiplier source; a
-        # New API endpoint cannot add useful data after that probe.
-        if (
-            endpoint == "sub2api-key-billing"
-            and billing_result is not None
-            and billing_result["source"] == "sub2api-v1-usage"
-        ):
-            break
-    browser_allowed = browser_probe is not None and _browser_fallback_allowed(api_base)
-    # Do not touch Chrome when the normal provider endpoint already supplied a
-    # finite balance. The browser path is strictly a balance-recovery fallback.
-    browser_needed = billing_result is None or billing_result.get("balance") is None
-    if browser_allowed and browser_needed:
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            try:
-                kind, http_status, browser_payload = browser_probe(
-                    api_base,
-                    api_key,
-                    timeout=min(timeout, remaining),
-                )
-            except Exception:
-                kind, http_status, browser_payload = "unavailable", None, None
-            if kind == "ok" and browser_payload is not None:
-                recognized = _recognized_browser_billing(browser_payload, api_key)
-                if recognized is not None:
-                    if billing_result is None:
-                        billing_result = recognized
-                        billing_multiplier = recognized.get("multiplier")
-                    else:
-                        if billing_result.get("balance") is None:
-                            billing_result["balance"] = recognized.get("balance")
-                        if billing_result.get("usage") is None:
-                            billing_result["usage"] = recognized.get("usage")
-                        if billing_result.get("group") is None:
-                            billing_result["group"] = recognized.get("group")
-                        if billing_result.get("mode") is None:
-                            billing_result["mode"] = recognized.get("mode")
-                        if billing_multiplier is None:
-                            billing_multiplier = recognized.get("multiplier")
-                        billing_result["source"] = recognized.get(
-                            "source", billing_result["source"]
-                        )
-                        if recognized.get("detail"):
-                            billing_result["detail"] = recognized["detail"]
-
-    if billing_result is not None:
-        return _account_result(
-            "ok",
-            str(billing_result.get("detail") or "Live provider billing data is available."),
-            source=str(billing_result["source"]),
-            balance=billing_result["balance"],
-            usage=billing_result["usage"],
-            group=billing_result["group"],
-            mode=billing_result["mode"],
-            multiplier=billing_multiplier,
-        )
-    return _failure_result(attempts)
+    return _multiplier_result(
+        "ok",
+        "Live effective key multiplier is available.",
+        source="sub2api-key-billing",
+        multiplier={
+            "status": "ok",
+            "value": multiplier,
+            "detail": "Effective key billing multiplier.",
+        },
+    )
 
 
 def _model_identity(target: BillingTarget) -> dict[str, str]:
@@ -691,23 +400,29 @@ def _model_identity(target: BillingTarget) -> dict[str, str]:
     }
 
 
-def _model_billing(target: BillingTarget, account: dict[str, Any]) -> dict[str, Any]:
+def _model_billing(target: BillingTarget, result: dict[str, Any]) -> dict[str, Any]:
     model = _model_identity(target)
     model.update(
         {
-            "status": account["status"],
-            "detail": account["detail"],
-            "source": account["source"],
-            "balance": account["balance"],
-            "usage": account["usage"],
-            "multiplier": account["multiplier"],
+            "status": result["status"],
+            "detail": result["detail"],
+            "source": result["source"],
+            "multiplier": result["multiplier"],
         }
     )
+    if "http_status" in result:
+        model["http_status"] = result["http_status"]
     return model
 
 
-def _provider_status(accounts: list[dict[str, Any]]) -> str:
-    statuses = {str(account.get("status", "unsupported")) for account in accounts}
+def _multiplier_identity(target: BillingTarget) -> tuple[str, str]:
+    """Return the credential-scoped endpoint identity for a model target."""
+
+    return (_multiplier_endpoint(target.api_base) or target.api_base, target.api_key)
+
+
+def _provider_status(models: list[dict[str, Any]]) -> str:
+    statuses = {str(model.get("status", "unsupported")) for model in models}
     if statuses == {"ok"}:
         return "ok"
     if "ok" in statuses:
@@ -732,7 +447,6 @@ def collect_billing(
     *,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     opener: HttpOpener = _default_open,
-    browser_probe: BrowserProbe | None = _default_browser_probe,
 ) -> dict[str, Any]:
     timeout = float(timeout)
     if not math.isfinite(timeout):
@@ -745,65 +459,61 @@ def collect_billing(
     for target in targets:
         by_provider.setdefault(target.provider, []).append(target)
 
-    provider_accounts: dict[str, list[list[BillingTarget]]] = {}
-    probe_plan: list[tuple[str, int, BillingTarget]] = []
-    for provider_name, provider_targets in by_provider.items():
-        by_account: dict[tuple[str, str], list[BillingTarget]] = {}
+    target_identities: dict[BillingTarget, tuple[str, str]] = {}
+    probe_targets: dict[tuple[str, str], BillingTarget] = {}
+    for provider_targets in by_provider.values():
         for target in provider_targets:
-            by_account.setdefault((target.api_base, target.api_key), []).append(target)
-        account_groups = list(by_account.values())
-        provider_accounts[provider_name] = account_groups
-        for account_index, account_targets in enumerate(account_groups):
-            probe_plan.append((provider_name, account_index, account_targets[0]))
+            identity = _multiplier_identity(target)
+            target_identities[target] = identity
+            probe_targets.setdefault(identity, target)
 
     deadline = time.monotonic() + timeout
-    account_results: dict[tuple[str, int], dict[str, Any]] = {}
-    limited_plan = probe_plan[:MAX_ACCOUNTS_PER_REFRESH]
-    skipped_plan = probe_plan[MAX_ACCOUNTS_PER_REFRESH:]
+    results: dict[tuple[str, str], dict[str, Any]] = {}
+    probe_plan = list(probe_targets.items())
+    limited_plan = probe_plan[:MAX_CREDENTIALS_PER_REFRESH]
+    skipped_plan = probe_plan[MAX_CREDENTIALS_PER_REFRESH:]
 
-    # Credential accounts are independent. Serial probing lets one slow provider
-    # spend the whole UI refresh window and falsely time out every other account.
-    # The account limit also bounds the number of concurrent credential-bearing
-    # requests in a refresh.
+    # Multiplier reads are independent. Serial probing lets one slow provider
+    # spend the whole UI refresh window and falsely time out every other
+    # credential. Each credential is queried once, regardless of model count.
     condition = threading.Condition()
-    pending: set[tuple[str, int]] = set()
+    pending: set[tuple[str, str]] = set()
 
-    def run_probe(key: tuple[str, int], representative: BillingTarget, request_timeout: float) -> None:
+    def run_probe(
+        identity: tuple[str, str], target: BillingTarget, request_timeout: float
+    ) -> None:
         try:
-            result = probe_account(
-                representative.api_base,
-                representative.api_key,
+            result = probe_model(
+                target,
                 timeout=request_timeout,
                 opener=opener,
-                browser_probe=browser_probe,
             )
         except Exception:
-            result = _account_result(
+            result = _multiplier_result(
                 "network_error",
-                "The provider could not be reached for billing.",
+                "The provider could not be reached for the multiplier.",
             )
         with condition:
-            if key in pending:
-                account_results[key] = result
-                pending.remove(key)
+            if identity in pending:
+                results[identity] = result
+                pending.remove(identity)
                 condition.notify_all()
 
     if limited_plan:
-        for provider_name, account_index, representative in limited_plan:
+        for identity, target in limited_plan:
             remaining = deadline - time.monotonic()
-            key = (provider_name, account_index)
             if remaining <= 0:
-                account_results[key] = _account_result(
+                results[identity] = _multiplier_result(
                     "timeout",
-                    "Billing refresh reached its bounded account or time limit.",
+                    "Multiplier refresh reached its bounded credential or time limit.",
                 )
                 continue
             with condition:
-                pending.add(key)
+                pending.add(identity)
             threading.Thread(
                 target=run_probe,
-                args=(key, representative, min(timeout, remaining)),
-                name="litellm-menu-billing-probe",
+                args=(identity, target, min(timeout, remaining)),
+                name="litellm-menu-multiplier-probe",
                 daemon=True,
             ).start()
 
@@ -815,35 +525,31 @@ def collect_billing(
                 condition.wait(timeout=remaining)
             timed_out = tuple(pending)
             pending.clear()
-        for key in timed_out:
-            account_results[key] = _account_result(
+        for identity in timed_out:
+            results[identity] = _multiplier_result(
                 "timeout",
-                "Billing refresh reached its bounded account or time limit.",
+                "Multiplier refresh reached its bounded credential or time limit.",
             )
 
-    for provider_name, account_index, _ in skipped_plan:
-        account_results[(provider_name, account_index)] = _account_result(
+    for identity, _ in skipped_plan:
+        results[identity] = _multiplier_result(
             "timeout",
-            "Billing refresh reached its bounded account or time limit.",
+            "Multiplier refresh reached its bounded credential or time limit.",
         )
 
     providers: list[dict[str, Any]] = []
     available_models = 0
-    for provider_name, account_groups in provider_accounts.items():
-        accounts: list[dict[str, Any]] = []
+    for provider_name, provider_targets in by_provider.items():
         models: list[dict[str, Any]] = []
-        for account_index, account_targets in enumerate(account_groups):
-            account = account_results[(provider_name, account_index)]
-            account["models"] = [_model_identity(target) for target in account_targets]
-            accounts.append(account)
-            models.extend(_model_billing(target, account) for target in account_targets)
-            available_models += sum(1 for target in account_targets if account["status"] == "ok")
+        for target in provider_targets:
+            result = results[target_identities[target]]
+            models.append(_model_billing(target, result))
+            available_models += int(result["status"] == "ok")
 
         providers.append(
             {
                 "name": provider_name,
-                "status": _provider_status(accounts),
-                "accounts": accounts,
+                "status": _provider_status(models),
                 "models": models,
             }
         )
@@ -879,7 +585,7 @@ def _error_payload() -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Print sanitized live billing data for LiteLLM Menu models."
+        description="Print sanitized live multipliers for LiteLLM Menu models."
     )
     parser.add_argument("--config", default=str(default_config_path()))
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)

@@ -33,7 +33,6 @@ try {
   Remove-Item -LiteralPath $Core -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $Core | Out-Null
   foreach ($Name in @(
-      "browser_billing.py",
       "codex_config.py",
       "configuration_package.py",
       "external_provider_import.py",

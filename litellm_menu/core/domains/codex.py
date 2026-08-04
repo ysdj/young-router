@@ -105,6 +105,9 @@ class CodexSettingsDomain:
     def snapshot(self) -> dict[str, Any]:
         return self._safe_snapshot(self._draft, self.revision)
 
+    def draft_state(self) -> object:
+        return copy.deepcopy(self._draft)
+
     def _sync(self, config_text: str, auth_text: str, patch: object | None = None) -> dict[str, Any]:
         import codex_config
 

@@ -106,6 +106,28 @@ export interface ProviderSummary {
   models?: ProviderModelSummary[];
 }
 
+export type ProbeSurfaceName = "openai/responses" | "openai/chat" | "anthropic";
+
+export interface ProbeOriginalRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: Record<string, unknown>;
+}
+
+export interface ProbeSurfaceResult {
+  surface: ProbeSurfaceName | string;
+  available: boolean;
+  status?: string;
+  original_request?: ProbeOriginalRequest;
+}
+
+export interface ProbeSummary {
+  available_surfaces: string[];
+  unavailable_surfaces: string[];
+  statuses: Record<string, string>;
+}
+
 export interface ProviderModelSummary {
   id: string;
   display_name: string;
@@ -114,12 +136,13 @@ export interface ProviderModelSummary {
   enabled: boolean;
   order: number | string;
   billing?: string;
-  usage?: string;
   probe?: {
     available: boolean;
-    recommended_surface?: "openai/responses" | "openai/chat" | "anthropic" | null;
+    recommended_surface?: ProbeSurfaceName | null;
+    recommended_order?: ProbeSurfaceName[];
+    summary?: ProbeSummary;
     checked_at?: string;
-    surfaces?: Record<string, { available: boolean; status?: string }>;
+    surfaces?: Record<string, Omit<ProbeSurfaceResult, "surface">>;
   };
 }
 
@@ -199,7 +222,9 @@ export interface IpcResults {
     provider_id?: string;
     model_id?: string;
     recommended_surface?: "openai/responses" | "openai/chat" | "anthropic" | null;
-    surfaces?: { surface: string; available: boolean; status?: string }[];
+    recommended_order?: ("openai/responses" | "openai/chat" | "anthropic")[];
+    summary?: { available_surfaces: string[]; unavailable_surfaces: string[]; statuses: Record<string, string> };
+    surfaces?: { surface: string; available: boolean; status?: string; original_request?: { method: string; url: string; headers: Record<string, string>; body: Record<string, unknown> } }[];
   };
   export: { revision: number; section_count: number; sections?: ConfigDomain[] };
   import: {
@@ -372,6 +397,7 @@ export interface NativeLeafAdapter {
   saveFilePicker(options: { suggestedName: string }): Promise<string | undefined>;
   showActionMenu(options: { title: string; items: string[]; anchor: NativeMenuAnchor }): Promise<number | undefined>;
   showConfirmation(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
+  showReadOnlyText(options: { title: string; text: string; closeLabel: string }): Promise<void>;
   chooseModelsToAdd(options: {
     models: string[];
     providerName: string;

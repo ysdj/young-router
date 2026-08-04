@@ -28,7 +28,6 @@ class CoreIPCBridge {
 
   struct SecretReadCapability {
     std::string token;
-    bool present = false;
   };
 
   struct EditorStageResult {
@@ -75,10 +74,7 @@ class CoreIPCBridge {
       std::string const& secret_token,
       std::optional<std::string> const& value,
       bool clear);
-  std::optional<SecretReadCapability> CreateSecretReadCapability(
-      std::string const& domain,
-      std::string const& field,
-      std::string const& target);
+  std::optional<SecretReadCapability> CreateSecretReadCapability(std::string const& target);
   std::optional<std::string> ReadSecret(std::string const& secret_read_token);
   std::optional<std::string> ReadProviderAPIKey(std::string const& target);
   std::optional<RelayLoginResult> AcceptRelayLogin(

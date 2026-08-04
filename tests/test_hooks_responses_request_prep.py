@@ -1020,6 +1020,109 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertEqual(modified["input"][1]["output"], "x" * 600_000)
 
+    async def test_pre_call_preserves_realistic_structured_compaction_request_shape(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        image_url = "data:image/png;base64," + "A" * 180_000
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "stream": True,
+            "client_metadata": {
+                "session_id": "thread-structured-compaction",
+                "thread_id": "thread-structured-compaction",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "functions",
+                            "tools": [{"type": "function", "name": "exec"}],
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_image",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Inspect this image."},
+                        {"type": "input_image", "image_url": image_url, "detail": "high"},
+                    ],
+                },
+                {
+                    "type": "custom_tool_call",
+                    "id": "call_item",
+                    "call_id": "call_structured",
+                    "name": "exec",
+                    "input": '{"cmd":"inspect"}',
+                    "status": "completed",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "output_item",
+                    "call_id": "call_structured",
+                    "output": [
+                        {"type": "input_text", "text": "x" * 1_100_000},
+                        {"type": "input_image", "image_url": image_url, "detail": "high"},
+                    ],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "reasoning_signed",
+                    "summary": [],
+                    "encrypted_content": "opaque-encrypted-reasoning",
+                },
+                {
+                    "type": "compaction",
+                    "id": "compaction_previous",
+                    "encrypted_content": "opaque-encrypted-compaction",
+                },
+                {"type": "compaction_trigger"},
+            ],
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+        original_input_json = json.dumps(
+            original["input"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        modified = await hook.async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            json.dumps(
+                modified["input"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            original_input_json,
+        )
+        self.assertEqual(modified["tools"], [])
+        self.assertEqual(modified["tool_choice"], "auto")
+        self.assertFalse(modified["parallel_tool_calls"])
+        self.assertEqual(
+            modified["input"][4]["encrypted_content"],
+            "opaque-encrypted-reasoning",
+        )
+        self.assertEqual(
+            modified["input"][5]["encrypted_content"],
+            "opaque-encrypted-compaction",
+        )
+        self.assertEqual(modified["input"][1]["content"][1]["image_url"], image_url)
+        self.assertEqual(modified["input"][3]["output"][1]["image_url"], image_url)
+
     async def test_pre_call_deployment_hook_keeps_ordinary_codex_turn_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()

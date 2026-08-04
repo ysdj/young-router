@@ -95,22 +95,15 @@ class HookRouteRecoveryTests(HookTestCase):
             self.assertEqual(
                 keepalive,
                 {
-                    "type": "response.in_progress",
-                    "response": {
-                        "id": keepalive["response"]["id"],
-                        "object": "response",
-                        "created_at": keepalive["response"]["created_at"],
-                        "model": "default-chat",
-                        "status": "in_progress",
-                        "output": [],
-                        "metadata": {
-                            "litellm_menu_keepalive": "route_recovery",
-                            "phase": "attempt",
-                            "attempt": 1,
-                        },
+                    "type": "response.metadata",
+                    "metadata": {
+                        "litellm_menu_keepalive": "route_recovery",
+                        "phase": "attempt",
+                        "attempt": 1,
                     },
                 },
             )
+            self.assertNotIn("response", keepalive)
             touched = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertNotEqual(
                 touched["recoveries"][key]["heartbeat_at"],
@@ -507,6 +500,72 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertIn({"type": "response.completed", "response": {"id": "resp-recovered"}}, chunks)
         self.assertFalse(any(isinstance(chunk, str) for chunk in chunks))
 
+    async def test_route_recovery_round_streams_non_streaming_success(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class ServiceUnavailable(Exception):
+            status_code = 503
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return {
+                    "id": "resp-non-stream-recovery",
+                    "object": "response",
+                    "status": "completed",
+                    "output_text": "recovered",
+                    "output": [
+                        {
+                            "id": "msg-non-stream-recovery",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "recovered",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
+                }
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "failed-route", "order": 1},
+        }
+        first_exception = ServiceUnavailable("upstream temporarily unavailable")
+        first_exception.failed_deployment_id = "failed-route"
+        first_exception.failed_deployment_order = 1
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._stream_streaming_error_fallback_round(
+                request_data,
+                first_exception,
+                allow_repeated_attempt=True,
+                route_recovery_poll=True,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["stream"])
+        self.assertIn(
+            "recovered",
+            [chunk.get("delta") for chunk in chunks if isinstance(chunk, dict)],
+        )
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(chunks[-1]["response"]["id"], "resp-non-stream-recovery")
+
     async def test_route_recovery_keeps_logical_group_and_uses_healthy_peer(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
@@ -897,11 +956,10 @@ class HookRouteRecoveryTests(HookTestCase):
         ]
         self.assertGreaterEqual(len(attempts), 2)
         self.assertGreaterEqual(len(keepalives), 1)
-        self.assertTrue(all(chunk.get("type") == "response.in_progress" for chunk in keepalives))
+        self.assertTrue(all(chunk.get("type") == "response.metadata" for chunk in keepalives))
         self.assertTrue(
             all(
-                chunk.get("response", {})
-                .get("metadata", {})
+                chunk.get("metadata", {})
                 .get("litellm_menu_keepalive")
                 == "route_recovery"
                 for chunk in keepalives

@@ -31,6 +31,7 @@ export interface NativeLeafBridge {
   saveFilePicker(suggestedName: string): Promise<string | undefined>;
   showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor): Promise<number | undefined>;
   showConfirmation(title: string, message: string, confirmLabel: string): Promise<boolean>;
+  showReadOnlyText(title: string, text: string, closeLabel: string): Promise<void>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
   editSecureDocument(editorToken: string, language: "toml" | "json", title: string): Promise<number | undefined>;
   editSecret(
@@ -116,6 +117,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     saveFilePicker: ({ suggestedName }) => bridge.saveFilePicker(suggestedName),
     showActionMenu: ({ title, items, anchor }) => bridge.showActionMenu(title, items, anchor),
     showConfirmation: ({ title, message, confirmLabel }) => bridge.showConfirmation(title, message, confirmLabel),
+    showReadOnlyText: ({ title, text, closeLabel }) => bridge.showReadOnlyText(title, text, closeLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
     editSecureDocument: ({ editorToken, language, title }) => bridge.editSecureDocument(editorToken, language, title),
     editSecret: ({ domain, field, target, title, allowClear }) => bridge.editSecret(domain, field, target, title, allowClear),

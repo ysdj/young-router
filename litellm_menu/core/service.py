@@ -121,6 +121,8 @@ class DomainAdapter(Protocol):
 
     name: str
 
+    def draft_state(self) -> object: ...
+
     def snapshot(self) -> Mapping[str, Any]: ...
 
     def dispatch(self, action: str, payload: object | None = None) -> Mapping[str, Any] | None: ...
@@ -422,6 +424,11 @@ class RecoverableDomain:
             neutral["choice"] = "system"
         return {"domain": self.name, "available": False, "error_code": "settings_unavailable", **neutral}
 
+    def draft_state(self) -> object:
+        if self._delegate is not None:
+            return self._delegate.draft_state()
+        return {"available": False}
+
     def _require_delegate(self) -> DomainAdapter:
         if self._delegate is None:
             raise CoreError("domain_unavailable", "Settings could not be loaded")
@@ -503,6 +510,9 @@ class MemoryDomain:
     def snapshot(self) -> Mapping[str, Any]:
         return {"domain": self.name, "revision": self.revision, "state": copy.deepcopy(self._draft)}
 
+    def draft_state(self) -> object:
+        return copy.deepcopy(self._draft)
+
     def dispatch(self, action: str, payload: object | None = None) -> Mapping[str, Any]:
         data = _as_mapping(payload)
         if action in {"set", "patch"}:
@@ -548,6 +558,9 @@ class UnavailableDomain:
             "available": False,
             "error": "Settings could not be loaded",
         }
+
+    def draft_state(self) -> object:
+        return {"available": False}
 
     def dispatch(self, action: str, payload: object | None = None) -> Mapping[str, Any]:
         raise CoreError("domain_unavailable", "Settings could not be loaded")
@@ -700,26 +713,28 @@ class CoreStore:
             adapters.append(RelayAccountsDomain(runtime_root))
         except Exception:
             adapters.append(UnavailableDomain("relay_accounts"))
-        try:
-            from .operations import CoreServiceController
+        from .operations import CoreServiceController
 
-            controller = CoreServiceController(runtime_root)
-            operations = (
-                "start",
-                "stop",
-                "restart",
-                "reload",
-                "health",
-                "status",
-                "autostart_enable",
-                "autostart_disable",
-                "autostart_status",
-            )
-            service_handlers = {operation: controller.dispatch for operation in operations}
-            initial_service = controller.status()
-        except Exception:
-            service_handlers = {}
-            initial_service = {"state": "unknown"}
+        controller = CoreServiceController(runtime_root)
+        operations = (
+            "start",
+            "stop",
+            "restart",
+            "reload",
+            "health",
+            "status",
+            "autostart_enable",
+            "autostart_disable",
+            "autostart_status",
+        )
+        service_handlers = {operation: controller.dispatch for operation in operations}
+        initial_service = controller.status()
+        if initial_service.get("state") == "stopped":
+            # Core establishes the proxy side of the lifecycle unit; it does
+            # not expose IPC while the configured 4000 service is absent.
+            initial_service = controller.start()
+        if initial_service.get("state") != "running":
+            raise RuntimeError("LiteLLM service is unavailable")
         store = cls(metadata_path=metadata_path, domains=adapters, service_handlers=service_handlers)
         if isinstance(initial_service, Mapping):
             store._set_service_from_result(initial_service, increment=False)
@@ -774,11 +789,15 @@ class CoreStore:
     def register_domain(self, adapter: DomainAdapter) -> str:
         name_value = getattr(adapter, "name", None)
         name = _canonical_domain(name_value)
-        if not callable(getattr(adapter, "snapshot", None)) or not callable(getattr(adapter, "dispatch", None)):
+        if (
+            not callable(getattr(adapter, "draft_state", None))
+            or not callable(getattr(adapter, "snapshot", None))
+            or not callable(getattr(adapter, "dispatch", None))
+        ):
             raise CoreError("invalid_domain", "The settings domain is unavailable")
         with self._lock:
             self._domains[name] = adapter
-            current = self._adapter_snapshot(name)
+            current = self._adapter_draft_state(name)
             self._baselines[name] = copy.deepcopy(current)
             self._drafts[name] = {
                 "dirty": False,
@@ -811,6 +830,17 @@ class CoreStore:
         if not isinstance(value, Mapping):
             raise CoreError("domain_unavailable", "The settings domain returned invalid state")
         return _safe_public(value)
+
+    def _adapter_draft_state(self, name: str) -> object:
+        adapter = self._domains.get(name)
+        if adapter is None:
+            raise DomainNotFound(name)
+        try:
+            return copy.deepcopy(adapter.draft_state())
+        except CoreError:
+            raise
+        except Exception as exc:
+            raise CoreError("domain_unavailable", safe_exception_message(exc)) from None
 
     def _persist_metadata(self) -> None:
         if self._metadata_store is None:
@@ -852,6 +882,19 @@ class CoreStore:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            # The managed proxy can outlive a replaced Core briefly.  Project
+            # the controller's current ownership/health result into every
+            # snapshot so a persisted transitional state cannot leave the
+            # native menu displaying "Starting" after the service is ready.
+            # This read-only projection deliberately neither persists nor
+            # emits: snapshot callers need the live status without creating a
+            # synthetic Core state transition.
+            status_handler = self._service_handlers.get("status")
+            if status_handler is not None:
+                result = status_handler("status")
+                if not isinstance(result, Mapping):
+                    raise CoreError("service_error", "LiteLLM service returned invalid status")
+                self._set_service_from_result(result, increment=False)
             self._refresh_external_disk_state()
             domain_states = {name: self._adapter_snapshot(name) for name in self._domains}
             providers = self._providers_summary(domain_states)
@@ -917,7 +960,7 @@ class CoreStore:
             if changed and not self._drafts.get(name, {}).get("dirty"):
                 try:
                     adapter.reload()
-                    self._baselines[name] = copy.deepcopy(self._adapter_snapshot(name))
+                    self._baselines[name] = self._adapter_draft_state(name)
                     self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
                     self._revision += 1
                     changed = False
@@ -1039,13 +1082,11 @@ class CoreStore:
             }
 
     def trusted_secret_descriptor(self, domain: str, field: str, target: object | None = None) -> dict[str, Any]:
-        """Describe the sole native-readable provider API-key slot.
+        """Validate the sole plaintext-native secret slot.
 
-        This is deliberately narrower than ``secret_descriptor``.  Other
-        secrets may be staged by native controls, but no other secret is
-        eligible for a plaintext read-back capability. The descriptor follows
-        the staged provider draft, while native controls only request it when
-        a selected target changes.
+        Only ``providers_models/api_key`` can be read back, and only through
+        the Core IPC server's short-lived native read capability.  It is never
+        included in snapshots or the normal React request protocol.
         """
 
         with self._lock:
@@ -1085,18 +1126,12 @@ class CoreStore:
         *,
         revision: int,
     ) -> str:
-        """Read one provider API key only through an authenticated native path.
-
-        Callers must hold a session-bound, one-time capability issued by the
-        IPC server.  The value is intentionally absent from snapshots and the
-        ordinary versioned React IPC contract.
-        """
+        """Read a provider API key via an already-authorized native lease."""
 
         with self._lock:
             self._check_revision(revision)
             descriptor = self.trusted_secret_descriptor(domain, field, target)
-            name = str(descriptor["domain"])
-            adapter = self._domains.get(name)
+            adapter = self._domains.get(str(descriptor["domain"]))
             reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
             if not callable(reader):
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
@@ -1133,7 +1168,7 @@ class CoreStore:
             before = copy.deepcopy(self._baselines.get(name))
             try:
                 adapter.stage_secret(str(descriptor["field"]), descriptor["target"], value)  # type: ignore[attr-defined]
-                after = self._adapter_snapshot(name)
+                after = self._adapter_draft_state(name)
                 present = bool(adapter.secret_present(str(descriptor["field"]), descriptor["target"]))  # type: ignore[attr-defined]
             except Exception as exc:
                 raise CoreError(
@@ -1181,10 +1216,15 @@ class CoreStore:
                     raise CoreError("relay_import_failed", "Provider/model import could not be rolled back") from None
                 raise CoreError("relay_import_failed", safe_exception_message(exc)) from None
             self._revision += 1
+            provider_dirty = self._adapter_draft_state("providers_models") != self._baselines.get("providers_models")
             self._mark_domain(
                 "providers_models",
-                dirty=True,
-                base_revision=self._drafts.get("providers_models", {}).get("base_revision", self._revision),
+                dirty=provider_dirty,
+                base_revision=(
+                    self._drafts.get("providers_models", {}).get("base_revision", self._revision)
+                    if provider_dirty
+                    else self._revision
+                ),
             )
             self._last_actions["relay_accounts"] = {
                 "resources_ready": True,
@@ -1272,7 +1312,7 @@ class CoreStore:
                 # discovery is a separate explicit action so a station API
                 # outage cannot change the result of a successful sign-in.
                 self._revision += 1
-                self._baselines["relay_accounts"] = copy.deepcopy(self._adapter_snapshot("relay_accounts"))
+                self._baselines["relay_accounts"] = self._adapter_draft_state("relay_accounts")
                 self._mark_domain(
                     "relay_accounts",
                     dirty=False,
@@ -1342,7 +1382,7 @@ class CoreStore:
             resource_status = result.get("resource_status", "unavailable") if isinstance(result, Mapping) else "unavailable"
             resource_count = len(resources) if isinstance(resources, list) else 0
             self._revision += 1
-            self._baselines["relay_accounts"] = copy.deepcopy(self._adapter_snapshot("relay_accounts"))
+            self._baselines["relay_accounts"] = self._adapter_draft_state("relay_accounts")
             self._mark_domain(
                 "relay_accounts",
                 dirty=False,
@@ -1422,7 +1462,7 @@ class CoreStore:
                 else:
                     raise CoreError("relay_restore_failed", "Relay login status is invalid")
                 self._revision += 1
-                self._baselines["relay_accounts"] = copy.deepcopy(self._adapter_snapshot("relay_accounts"))
+                self._baselines["relay_accounts"] = self._adapter_draft_state("relay_accounts")
                 self._mark_domain(
                     "relay_accounts",
                     dirty=False,
@@ -1478,7 +1518,7 @@ class CoreStore:
         for index, item in enumerate(raw):
             if not isinstance(item, Mapping):
                 continue
-            provider_id = item.get("id", item.get("name", f"provider-{index + 1}"))
+            provider_id = item.get("editor_id", item.get("id", item.get("name", f"provider-{index + 1}")))
             display_name = item.get("display_name", item.get("name", provider_id))
             raw_models = item.get("models", [])
             models: list[dict[str, Any]] = []
@@ -1487,8 +1527,8 @@ class CoreStore:
                     if not isinstance(model, Mapping):
                         continue
                     model_id = model.get(
-                        "id",
-                        model.get("deployment_id", model.get("model_name", f"model-{model_index + 1}")),
+                        "editor_id",
+                        model.get("id", model.get("deployment_id", model.get("model_name", f"model-{model_index + 1}"))),
                     )
                     public_model = model.get(
                         "public_model",
@@ -1496,6 +1536,8 @@ class CoreStore:
                     )
                     model_display_name = model.get("display_name", model.get("name", public_model))
                     upstream_model = model.get("upstream_model", model.get("litellm_model", ""))
+                    if isinstance(upstream_model, str) and "/" in upstream_model:
+                        upstream_model = upstream_model.split("/", 1)[1]
                     order_value = model.get("order", 1)
                     try:
                         order = int(order_value) if not isinstance(order_value, bool) else 1
@@ -1506,10 +1548,10 @@ class CoreStore:
                         "display_name": str(model_display_name),
                         "public_model": str(public_model),
                         "upstream_model": str(upstream_model),
-                        "enabled": model.get("enabled", model.get("model_enabled", True)) is not False,
+                        "enabled": model.get("model_enabled", model.get("enabled", True)) is not False,
                         "order": order,
                     }
-                    for optional_key in ("billing", "usage", "multiplier"):
+                    for optional_key in ("billing", "multiplier"):
                         optional_value = optional_text(model.get(optional_key))
                         if optional_value is not None:
                             summary[optional_key] = optional_value
@@ -1603,20 +1645,6 @@ class CoreStore:
         if base_revision is not None:
             record["base_revision"] = base_revision
 
-    @staticmethod
-    def _is_read_only_action(adapter: DomainAdapter, action: str, payload: object | None) -> bool:
-        """Query an adapter-only classification without expanding the IPC contract."""
-
-        classifier = getattr(adapter, "is_read_only_action", None)
-        if not callable(classifier):
-            return False
-        try:
-            return bool(classifier(action, payload))
-        except Exception:
-            # A missing or broken optional classifier must never convert a
-            # mutating action into a clean draft.
-            return False
-
     def dispatch(
         self,
         action: Mapping[str, Any],
@@ -1684,20 +1712,19 @@ class CoreStore:
                     # Domain exceptions are authored to be safe, but still
                     # normalize a third-party/legacy exception defensively.
                     raise CoreError("domain_error", safe_exception_message(exc)) from None
-                after = self._adapter_snapshot(name)
+                after = self._adapter_draft_state(name)
                 if isinstance(result, Mapping):
                     safe_result = _safe_public(result)
                     if isinstance(safe_result, Mapping):
                         self._last_actions[name] = dict(safe_result)
-                read_only = self._is_read_only_action(adapter, action_type, payload)
-                dirty = bool(self._drafts.get(name, {}).get("dirty")) if read_only else after != before
+                dirty = after != before
                 self._revision += 1
                 self._mark_domain(
                     name,
                     dirty=dirty,
                     base_revision=(
                         self._drafts.get(name, {}).get("base_revision", self._revision)
-                        if read_only or dirty
+                        if dirty
                         else self._revision
                     ),
                 )
@@ -1938,7 +1965,7 @@ class CoreStore:
                         adapter.apply()
                     else:
                         adapter.apply(payload)
-                    self._baselines[name] = copy.deepcopy(self._adapter_snapshot(name))
+                    self._baselines[name] = self._adapter_draft_state(name)
                     self._disk[name] = {
                         "changed": False,
                         "generation": int(self._disk.get(name, {}).get("generation", 0)),
@@ -1985,7 +2012,7 @@ class CoreStore:
                     adapter.reload()
                 except Exception as exc:
                     raise CoreError("reload_failed", safe_exception_message(exc)) from None
-                self._baselines[name] = copy.deepcopy(self._adapter_snapshot(name))
+                self._baselines[name] = self._adapter_draft_state(name)
                 self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
                 self._disk[name] = {
                     "changed": False,
@@ -1998,18 +2025,70 @@ class CoreStore:
             return {"revision": self._revision}
 
     def probe(self, payload: Mapping[str, Any] | None = None, *, domain: str | None = None) -> dict[str, Any]:
+        name = _canonical_domain(domain or "providers-models")
+        data = dict(payload or {})
         with self._lock:
-            name = _canonical_domain(domain or "providers-models")
             adapter = self._domains.get(name)
             if adapter is None:
                 return {"ok": False, "protocols": [], "detail": "Probe is unavailable"}
+            prepare = getattr(adapter, "prepare_probe", None)
+            perform = getattr(adapter, "perform_probe", None)
+            commit = getattr(adapter, "commit_probe", None)
+            if name == "providers_models" and all(callable(method) for method in (prepare, perform, commit)):
+                try:
+                    prepared = prepare(data)
+                except Exception as exc:
+                    return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
+            else:
+                prepared = None
+
+        if prepared is not None:
+            try:
+                value = perform(prepared)
+            except Exception as exc:
+                return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
+            with self._lock:
+                if self._domains.get(name) is not adapter:
+                    return {"ok": False, "protocols": [], "detail": "Probe is unavailable"}
+                try:
+                    value, changed = commit(prepared, value)
+                except Exception as exc:
+                    return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
+                if changed:
+                    self._revision += 1
+                    self._persist_metadata()
+                    self._emit()
+                result = _safe_public(value if isinstance(value, Mapping) else {})
+                if not isinstance(result, dict):
+                    result = {}
+                result.setdefault("ok", False)
+                result.setdefault("protocols", [])
+                return result
+
+        with self._lock:
             method = getattr(adapter, "probe", None)
             if not callable(method):
                 return {"ok": False, "protocols": [], "detail": "Probe is unavailable"}
+            before = self._adapter_draft_state(name)
             try:
-                value = method(dict(payload or {}))
+                value = method(data)
             except Exception as exc:
                 return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
+            after = self._adapter_draft_state(name)
+            if after != before:
+                dirty = after != self._baselines.get(name)
+                self._revision += 1
+                self._mark_domain(
+                    name,
+                    dirty=dirty,
+                    base_revision=(
+                        self._drafts.get(name, {}).get("base_revision", self._revision)
+                        if dirty
+                        else self._revision
+                    ),
+                )
+                self._persist_metadata()
+                self._emit()
             result = _safe_public(value if isinstance(value, Mapping) else {})
             if not isinstance(result, dict):
                 result = {}
@@ -2261,7 +2340,16 @@ class CoreStore:
                     staged.append(name)
                 importing = False
                 for name in staged:
-                    self._mark_domain(name, dirty=True, base_revision=self._revision)
+                    dirty = self._adapter_draft_state(name) != self._baselines.get(name)
+                    self._mark_domain(
+                        name,
+                        dirty=dirty,
+                        base_revision=(
+                            self._drafts.get(name, {}).get("base_revision", self._revision)
+                            if dirty
+                            else self._revision
+                        ),
+                    )
                 self._revision += 1
                 self._persist_metadata()
             except Exception as exc:

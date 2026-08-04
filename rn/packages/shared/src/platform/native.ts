@@ -20,6 +20,7 @@ export function createNativeLeafAdapter(overrides: Partial<NativeLeafAdapter> = 
     saveFilePicker: overrides.saveFilePicker ?? (async () => undefined),
     showActionMenu: overrides.showActionMenu ?? (async () => undefined),
     showConfirmation: overrides.showConfirmation ?? (async () => false),
+    showReadOnlyText: overrides.showReadOnlyText ?? (async () => undefined),
     chooseModelsToAdd: overrides.chooseModelsToAdd ?? (async () => undefined),
     editSecureDocument: overrides.editSecureDocument ?? (async () => undefined),
     editSecret: overrides.editSecret ?? (async () => undefined),

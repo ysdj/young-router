@@ -78,11 +78,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title: "Codex" }, { id: "claude", title: "Claude"',
             'selected={settingsTab} disabled={busy}',
             'await flushPendingFields();',
-            'const dirtyDomains = (["codex", "claude"] as const)',
+            'const dirtyDomains = settingsRoute',
+            '? (["codex", "claude"] as const).filter((name) => current.drafts[name]?.dirty)',
             'for (const name of dirtyDomains) await enqueueDispatch("cancel", {}, name);',
             "const claudeDeploymentDraftRef = useRef<ClaudeDeploymentDraft | undefined>(undefined);",
             "const hasClaudeDeploymentChanges = (currentSnapshot: CoreSnapshot | undefined)",
-            'if (dirtyDomains.length === 0 && !hasClaudeDeploymentChanges(current))',
+            'if (dirtyDomains.length === 0 && (!settingsRoute || !hasClaudeDeploymentChanges(current)))',
             "claudeDeploymentDraftRef.current = next;",
             'if (reloadDomain === "claude") {',
             '}, [route]);',
@@ -113,15 +114,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("native.window.setContentSize", self.ui)
         self.assertIn("}, [isPrimaryHost, native, snapshotLanguage, translate]);", self.ui)
 
-    def test_provider_probe_and_apply_activate_the_running_runtime(self) -> None:
+    def test_provider_probe_applies_a_changed_recommendation_without_locking_the_workspace(self) -> None:
         for marker in (
-            'title={translate("providers.probeAll")}',
-            'label={translate("providers.usable")}',
-            'label={translate("providers.responsesUsable")}',
-            'label={translate("providers.recommendedApi")}',
-            'const reloaded = await ipc.dispatch({ type: "service.reload" }, result.revision);',
+            'title={probing ? translate("providers.probing") : translate("providers.probe")}',
+            'function modelProbePresentation(',
+            'translate("providers.probeSummaryAvailable"',
+            'tooltip={probePresentation.full}',
+            'translate("providers.probeOriginalRequest"',
+            'const selectedOrder = [nextOrder[0]];',
+            'if (sameStringOrder(currentOrder, selectedOrder)) return;',
+            'await enqueueDispatch("model.patch", {',
+            'await ipc.apply("providers_models", staged.revision, confirmations);',
+            'supported_upstream_url_surfaces: selectedOrder,',
+            'label={translate("common.enable")}',
+            'changes: { model_enabled }',
         ):
             self.assert_ui_has(marker)
+        self.assertNotIn('await flushPendingFields();\n      const before = await ipc.snapshot();', self.ui)
+
+    def test_provider_selection_and_new_models_keep_independent_stable_state(self) -> None:
+        self.assert_ui_has('onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }}')
+        self.assert_ui_has('const knownModelIdsByProvider = useRef<Map<string, Set<string>> | undefined>(undefined);')
+        self.assert_ui_has('Promise.all(added.map(({ providerId: targetProviderId, modelId }) => probeModel(targetProviderId, modelId)))')
+        self.assert_ui_has('const key = modelProbeKey(targetProviderId, targetModelId);')
 
     def test_log_view_identifies_when_the_recent_record_limit_is_reached(self) -> None:
         english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
@@ -154,17 +169,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # 2pt native table bezel. Its left sibling is 190pt with 188pt of
         # columns (140 + 48), so the 668pt workspace leaves 466pt after the
         # 12pt inter-table gap. The inspector keeps its key list beside the
-        # selected key editor; the editor now follows the legacy direct-edit
-        # behavior rather than adding Set/Clear buttons beneath the form.
+        # selected key editor; credentials remain native secure inputs without
+        # extra Set/Clear controls beneath the form.
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0 }")
         self.assert_ui_has("providerListPane: { width: 190, minWidth: 190, maxWidth: 190")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 140 }, { label: translate("providers.models"), width: 48 }]}')
         self.assert_ui_has('columns={[{ label: translate("providers.model"), width: 118 }, { label: translate("providers.upstream"), width: 130 }, { label: translate("providers.balance"), width: 112 }, { label: translate("providers.apiKeyOrder"), width: 104 }]}')
         self.assert_ui_has('columns={[{ label: translate("providers.key"), width: 138 }]}')
         self.assert_ui_has('label={translate("providers.keyName")} labelWidth={64} labelAlign="left"')
-        self.assert_ui_has('plainText autoCommit label={translate("common.apiKey")} labelWidth={64} labelAlign="left"')
-        self.assert_ui_has('plainText autoCommit label={translate("common.apiKey")}')
-        self.assertNotIn('NativeSecretField actionsBelow plainText', self.ui)
+        self.assert_ui_has('NativeSecretField plainText autoCommit label={translate("common.apiKey")}')
         self.assert_ui_has('providerKeyGrid: { flex: 1, minHeight: 142, flexDirection: "row", alignItems: "flex-start", gap: 12 }')
         self.assert_ui_has('providerKeyTable: { width: 138, minWidth: 138, maxWidth: 138, height: 142, minHeight: 142, flexShrink: 0 }')
         self.assert_ui_has('modelListPane: { flex: 1, minWidth: 464')
@@ -180,10 +193,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('width: 130 }, { label: translate("providers.upstream"), width: 164')
         self.assert_ui_has('providerSourceModel ? <ProviderEditor provider={activeRoute.provider}')
         self.assert_ui_has('model={activeRoute.model}')
-        self.assert_ui_has('onProviderClick={() => setProviderSourceModel(identifier(activeRoute.model))}')
+        self.assert_ui_has('onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))}')
         self.assert_ui_has('setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`)')
         self.assert_ui_has('disabledRowKeys={disabledModelKeys}')
         self.assert_ui_has('disabledRowKeys={disabledRouteKeys}')
+        self.assertNotIn('secondaryCellKeys={routeSecondaryCellKeys}', self.ui)
         self.assertNotIn('<ScrollView contentContainerStyle={styles.inspectorContent}>', self.ui)
         self.assert_ui_has('native.window.open("relay-accounts")')
         self.assert_ui_has('route === "relay-accounts" ? <RelayAccountManager visible')
@@ -376,7 +390,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         for spec in (mac_table_spec, windows_table_spec):
             self.assertIn("alternatingRows?: WithDefault<boolean, false>;", spec)
+            self.assertIn("secondaryCellKeys?: ReadonlyArray<string>;", spec)
         self.assertIn("alternatingRows = false", self.native_controls)
+        self.assertIn("secondaryCellKeys = []", self.native_controls)
+        self.assertIn("secondaryCellKeys,", self.native_controls)
         # The fetched-model picker is now a native modal leaf, so its old
         # React table no longer belongs to the shared window tree.
         self.assertEqual(self.ui.count("<NativeTable"), 8)
@@ -388,6 +405,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             mac_native,
         )
         self.assertIn("props.alternatingRows.value_or(false)", windows_native)
+        self.assertIn('rowKey + "\\x1f" + std::to_string(columnIndex)', mac_native)
+        self.assertIn("static_cast<size_t>(row) >= viewProps.rowKeys.size()", mac_native)
+        self.assertIn("static_cast<size_t>(columnIndex) >= columnCount", mac_native)
+        self.assertIn("label.textColor = disabled || secondary", mac_native)
+        self.assertIn('props.rowKeys[row_index] + "\\x1f" + std::to_string(column_index)', windows_native)
+        self.assertIn("if (disabled || secondary) cell.Foreground(SecondaryTextBrush());", windows_native)
 
     def test_native_log_tables_support_compact_rows_on_both_hosts(self) -> None:
         mac_table_spec = (
@@ -408,6 +431,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("_tableView.rowHeight = newViewProps.compact ? 22 : 28;", mac_native)
         self.assertIn("row.MinHeight(props.compact.value_or(false) ? 22.0 : 28.0);", windows_native)
         self.assertIn("AlternatingRowBrush()", windows_native)
+
+    def test_native_tables_keep_short_log_columns_readable_and_scroll_overflow(self) -> None:
+        mac_native = (
+            ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm"
+        ).read_text(encoding="utf-8")
+        windows_native = (
+            ROOT / "rn/apps/windows/src/native/windows/WinUIControls.cpp"
+        ).read_text(encoding="utf-8")
+        self.assertIn("column.minWidth = 96;", mac_native)
+        self.assertIn("column.maxWidth = CGFLOAT_MAX;", mac_native)
+        self.assertIn("_scrollView.hasHorizontalScroller = needsHorizontalScroller;", mac_native)
+        self.assertIn("NSTableViewNoColumnAutoresizing", mac_native)
+        self.assertIn("std::vector<CGFloat> _requestedColumnWidths;", mac_native)
+        self.assertIn("NSTableViewColumnDidResizeNotification", mac_native)
+        self.assertIn("MAX(NSWidth(visibleBounds), contentWidth)", mac_native)
+        self.assertIn("std::max(88.0, static_cast<double>(widths[index]))", windows_native)
+        self.assertIn("ScrollBarVisibility::Auto", windows_native)
+        self.assertIn("horizontal_scroller_.Content(table_);", windows_native)
+        self.assertIn("table_.MinWidth(TableWidth(props.columnWidths, column_count));", windows_native)
 
     def test_legacy_window_footers_keep_close_and_apply_actions(self) -> None:
         self.assert_ui_has("function DialogFooter(")
@@ -517,11 +559,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(57, len(keys))
+        self.assertEqual(54, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
-        for category in ("Timeouts", "Recovery", "Web Search", "Vision Bridge", "Fallback", "Billing", "Computer Facade", "Logs", "Network", "Service"):
+        for category in ("Timeouts", "Recovery", "Web Search", "Vision Bridge", "Fallback", "Computer Facade", "Logs", "Network", "Service"):
             self.assertIn(f'  "{category}":', localized)
         self.assertIn("const optionValues = stringList(item.options);", self.ui)
         self.assertIn("const next = optionValues[nativeEvent.index];", self.ui)
@@ -683,23 +725,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('title={translate("common.restoreDefaults")}', self.ui)
         self.assertIn('route === "runtime-settings" ? translate("common.saveAndApply")', self.ui)
 
-    def test_provider_billing_refresh_follows_runtime_interval_without_dirtying_draft(self) -> None:
-        for marker in (
-            'LITELLM_MENU_BALANCE_REFRESH_MINUTES',
-            'providers.refresh_billing',
-            'billingRefreshMinutes > 0',
-            'Live billing is optional and must not disturb the editable draft.',
-        ):
-            self.assert_ui_has(marker)
+    def test_provider_workspace_fetches_multiplier_once_without_usage_polling(self) -> None:
+        self.assertNotIn('providers.refresh_billing', self.ui)
+        self.assertIn('providers.refresh_multiplier', self.ui)
+        self.assertIn('multiplierRefreshStarted.current = true', self.ui)
+        self.assertNotIn('billingRefreshMinutes', self.ui)
+        self.assertNotIn('billingUsageValue(', self.ui)
 
     def test_model_inspector_matches_legacy_breadcrumb_and_compact_billing_surface(self) -> None:
         for marker in (
             'NativeButton title={providerLabel} link',
-            'billingBalanceValue(model.billing, translate)',
-            'billingUsageValue(model.usage, translate)',
             'billingMultiplierValue(model.multiplier, translate)',
-            'function billingToolTip(',
-            'translate("providers.billingStatus", { status: billingStatusText(status, translate) })',
+            '`${translate("providers.balance")}: ${translate("providers.billingUnavailable")}  ${translate("providers.multiplier")}: ${billingMultiplierValue(model.multiplier, translate)}`',
+            '<Text numberOfLines={1} style={styles.billingSummaryText}>{billingSummary}</Text>',
         ):
             self.assert_ui_has(marker)
 
@@ -763,12 +801,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'label={translate("providers.baseUrl")} labelWidth={96} labelAlign="left"',
             'label={translate("providers.providerName")} labelWidth={96} labelAlign="left"',
             'label={translate("providers.keyName")} labelWidth={64} labelAlign="left"',
-            'plainText autoCommit label={translate("common.apiKey")} labelWidth={64} labelAlign="left"',
+            'NativeSecretField plainText autoCommit label={translate("common.apiKey")} hint={selectedKeyConfigured',
             'title={translate("providers.backToModel", { model: sourceModelLabel })} link',
             'providerEditorHeader:',
             'providerEditorSection:',
             'providerKeysHeading:',
-            'plainText autoCommit label={translate("common.apiKey")}',
+            'NativeSecretField plainText autoCommit label={translate("common.apiKey")}',
         ):
             self.assert_ui_has(marker)
 
@@ -783,7 +821,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const proxyPrefix = detail.match",
             'translate("logs.duration")',
             'translate("logs.tokenCount")',
-            "const columns = logColumns(selected, translate).filter",
+            "const columns = logColumns(selected, translate);",
             "rows={rows.map",
             "logFilterRow: { width: 360, minWidth: 220, maxWidth: 360",
             "logToolbarSpacer: { flex: 1, minWidth: 0",
@@ -794,6 +832,67 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row"',
         ):
             self.assert_ui_has(marker)
+
+    def test_logs_always_show_public_and_upstream_model_columns(self) -> None:
+        for marker in (
+            "const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);",
+            "upstreamModel: compactUpstreamLogModel(upstreamModel)",
+            '{ label: translate("providers.publicModel"), width: 126, value: (row) => row.model }',
+            '{ label: translate("providers.upstream"), width: 126, value: (row) => row.upstreamModel }',
+        ):
+            self.assert_ui_has(marker)
+        self.assertNotIn("function conditionalUpstreamLogModel(", self.ui)
+
+    def test_logs_project_recovery_route_identity_and_localize_route_diagnostics(self) -> None:
+        for marker in (
+            "function recoveryStatusLabel(",
+            "function recoveryDetailLabel(",
+            "function routeTraceServiceTierLabel(",
+            'return translate("logs.routeEvent.routeEvent");',
+            "let source = logTitle(tab, translate);",
+            '{ label: translate("common.provider"), width: 104, value: (row) => row.provider },',
+            '{ label: translate("logs.apiKeyName"), width: 100, value: (row) => row.apiKeyName },',
+            'model: model || recoveryFallback,',
+            'upstreamModel: compactUpstreamLogModel(upstreamModel) || recoveryFallback,',
+        ):
+            self.assert_ui_has(marker)
+
+    def test_menu_logs_do_not_repeat_actions_as_detail(self) -> None:
+        self.assertIn(
+            'if (tab === "menu") return [\n'
+            '    time,\n'
+            '    { label: translate("logs.action"), width: 112, value: (row) => row.action },\n'
+            '    status,\n'
+            '  ];',
+            self.ui,
+        )
+
+    def test_route_trace_logs_use_diagnostic_columns_and_compact_detail(self) -> None:
+        self.assertIn(
+            'if (tab === "route-trace") return [\n'
+            '    { ...time, width: 154 },\n'
+            '    { label: translate("logs.event"), width: 142, value: (row) => row.event },\n'
+            '    { label: translate("providers.publicModel"), width: 130, value: (row) => row.model },\n'
+            '    { label: translate("providers.upstream"), width: 130, value: (row) => row.upstreamModel },\n'
+            '    { label: translate("common.provider"), width: 104, value: (row) => row.provider },\n'
+            '    { ...detail, width: 192 },\n'
+            '  ];',
+            self.ui,
+        )
+        for marker in (
+            "function routeTraceEventLabel(value: string, translate: Translate): string {",
+            "function routeTraceReasonLabel(value: string, translate: Translate): string {",
+            "function routeTraceProtocolLabel(value: string, translate: Translate): string {",
+            "function routeTraceDetailPartLabel(value: string, translate: Translate): string {",
+            "function routeTraceDetailLabel(value: string, translate: Translate): string {",
+            'selected_deployment: "logs.routeEvent.selected",',
+            'deployment_failover_marked: "logs.routeEvent.failoverMarked",',
+            'next_order_fallback_available: "logs.routeEvent.nextOrder",',
+            'external_web_search_bridge_synthesis_done: "logs.routeEvent.webSearchSynthesisDone",',
+            'return details.join(" · ");',
+        ):
+            self.assert_ui_has(marker)
+        self.assertNotIn("logs.routeTrace.otherDetail", self.ui)
 
     def test_relay_manager_uses_url_wizard_and_checks_sessions_on_demand(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -903,7 +1002,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'if ((next.disk[diskDomain]?.generation ?? 0) > priorGeneration && !next.disk[diskDomain]?.changed && (diskDomain === "codex" || diskDomain === "claude"))',
             "await flushPendingFields();",
             "reloadToken={rawReloadToken}",
-            "reloadNonce, reloadToken, translate",
+            "reloadNonce, reloadToken, reset, translate",
         ):
             self.assert_ui_has(marker)
 

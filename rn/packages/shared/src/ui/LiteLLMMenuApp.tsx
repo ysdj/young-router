@@ -12,6 +12,7 @@ import type {
   CoreSnapshot,
   DiskState,
   IpcClient,
+  IpcResults,
   LogTab,
   LogView,
   NativeLeafAdapter,
@@ -23,6 +24,7 @@ import type {
 type Translate = (key: string, values?: Record<string, string | number>) => string;
 type UnknownRecord = Record<string, unknown>;
 type Dispatch = (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<void>;
+type ApplyProbedOrder = (providerId: string, modelId: string, nextOrder: string[]) => Promise<boolean>;
 type NativeSecretClear = (options: {
   domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
   field: string;
@@ -44,6 +46,11 @@ const CLAUDE_CUSTOM_THEME = /^custom:[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 const PendingFieldContext = createContext<PendingFieldRegistry | undefined>(undefined);
 const TranslationContext = createContext<Translate | undefined>(undefined);
+// React Native macOS supports `tooltip` on Text, but its published TypeScript
+// declaration has not caught up with that native prop. Keep the cast narrow so
+// the full probe result is a real native hover tooltip, not an accessibility-
+// only hint.
+const TooltipText = Text as unknown as React.ComponentType<React.ComponentProps<typeof Text> & { tooltip?: string }>;
 const SERVICE_HEALTH_POLL_MS = 10_000;
 const SERVICE_RECOVERY_RETRY_MS = 15_000;
 const SETTINGS_DISK_POLL_MS = 2_000;
@@ -283,7 +290,6 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
     setError(undefined);
     if (isPrimaryHost) {
       native.menuBar.setStatus(next.service);
-      native.tray.setStatus(next.service);
     }
   }, [isPrimaryHost, native]);
 
@@ -368,7 +374,6 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
     // instead of retaining a bootstrap title until the next health poll.
     if (snapshot) {
       native.menuBar.setStatus(snapshot.service);
-      native.tray.setStatus(snapshot.service);
     }
   }, [isPrimaryHost, native, snapshotLanguage, translate]);
 
@@ -403,8 +408,8 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
       const current = await runServiceOperation("health", true);
       if (!active || !current || !serviceShouldBeRunning.current) return;
       // Starting an owned-but-unhealthy process is rejected by Core and can
-      // never repair it. Only recover a process that has actually exited;
-      // explicit Restart remains the destructive unhealthy-service action.
+      // never repair it. A stopped state includes a verified orphan, which
+      // Core reclaims before starting a new App/Core/proxy unit.
       if (current.service.state !== "stopped") return;
       const now = Date.now();
       if (now - lastServiceRecoveryAttempt.current < SERVICE_RECOVERY_RETRY_MS) return;
@@ -525,7 +530,6 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
       { id: "quit", title: translate("menu.quit"), enabled: true },
     ];
     native.menuBar.setActions(actions);
-    native.tray.setActions(actions);
   }, [isPrimaryHost, native, serviceOperationPending, snapshot, translate]);
 
   return (
@@ -572,6 +576,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const revision = useRef<number | undefined>(snapshot?.revision);
   const latestSnapshot = useRef<CoreSnapshot | undefined>(snapshot);
   const dispatchQueue = useRef<Promise<void>>(Promise.resolve());
+  const probedOrderApplyQueue = useRef<Promise<void>>(Promise.resolve());
   const lastDispatchError = useRef<unknown>(undefined);
   const pendingFields = useRef(new Map<symbol, PendingField>());
   const [, forcePendingFieldDirtyRender] = useState(0);
@@ -792,11 +797,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       return reloaded;
     }, "common.applied");
   };
-  const cancel = (): Promise<void> => {
-    if (!domain) return Promise.resolve();
-    discardPendingFields();
-    return run(() => enqueueDispatch("cancel", {}, domain), "common.discarded");
-  };
   const validate = (): Promise<void> => {
     if (!domain) return Promise.resolve();
     return run(async () => {
@@ -813,7 +813,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       onSnapshot(refreshed);
       const domains = settingsRoute
         ? (["codex", "claude"] as const).filter((name) => refreshed.drafts[name]?.dirty)
-        : [domain];
+        : refreshed.drafts[domain]?.dirty ? [domain] : [];
       if (domains.length === 0) return { cancelled: true };
       const risks = domains.includes("claude") ? riskCodes(refreshed, "claude") : [];
       const diskConflicts = domains.filter((name) => refreshed.disk[name]?.changed);
@@ -842,49 +842,91 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       return result;
     });
   };
+  const applyProbedOrder: ApplyProbedOrder = (providerId, modelId, nextOrder) => {
+    let applied = false;
+    const queued = probedOrderApplyQueue.current.catch(() => undefined).then(async () => {
+      const before = await ipc.snapshot();
+      revision.current = before.revision;
+      onSnapshot(before);
+      const currentModel = providerModelByEditorId(before, providerId, modelId);
+      if (!currentModel) throw new Error("The selected model is unavailable");
+      const currentOrder = protocolOrder(currentModel);
+      const selectedOrder = [nextOrder[0]];
+      if (sameStringOrder(currentOrder, selectedOrder)) return;
+      const diskChanged = before.disk.providers_models?.changed === true;
+      const currentLabels = currentOrder.map((surface) => probeSurfaceLabel(surface, translate)).join(" → ") || translate("common.none");
+      const nextLabels = selectedOrder.map((surface) => probeSurfaceLabel(surface, translate)).join(" → ") || translate("common.none");
+      const confirmationMessage = [
+        translate("providers.probeApplyMessage", { current: currentLabels, next: nextLabels }),
+        diskChanged ? translate("settings.overwriteDiskConfirm") : "",
+      ].filter(Boolean).join("\n\n");
+      const confirmed = await native.showConfirmation({
+        title: translate("providers.probeApplyTitle"),
+        message: confirmationMessage,
+        confirmLabel: translate("screen.confirm"),
+      });
+      if (!confirmed) return;
+      await enqueueDispatch("model.patch", {
+        provider_id: providerId,
+        model_id: modelId,
+        changes: {
+          upstream_url_surface: selectedOrder[0],
+          supported_upstream_url_surfaces: selectedOrder,
+        },
+      }, "providers_models");
+      const staged = await ipc.snapshot();
+      revision.current = staged.revision;
+      onSnapshot(staged);
+      const confirmations = staged.disk.providers_models?.changed ? ["overwrite_external_providers_models"] : undefined;
+      const result = await ipc.apply("providers_models", staged.revision, confirmations);
+      revision.current = result.revision;
+      if (staged.service.state === "running" || staged.service.state === "unhealthy") {
+        const reloaded = await ipc.dispatch({ type: "service.reload" }, result.revision);
+        revision.current = reloaded.revision;
+      }
+      await refresh();
+      setResult(translate("common.applied"));
+      applied = true;
+    });
+    probedOrderApplyQueue.current = queued.then(() => undefined, () => undefined);
+    return queued.then(() => applied).catch((reason: unknown) => {
+      setResult(errorMessage(reason, translate));
+      return false;
+    });
+  };
   const closeRoute = (): void => {
     native.window.close(nativeWindowRoute(route));
     onClose();
   };
   const requestClose = (): void => {
     if (busy) return;
-    if (settingsRoute) {
-      void run(async () => {
-        await flushPendingFields();
-        const current = await ipc.snapshot();
-        revision.current = current.revision;
-        onSnapshot(current);
-        const dirtyDomains = (["codex", "claude"] as const).filter((name) => current.drafts[name]?.dirty);
-        if (dirtyDomains.length === 0 && !hasClaudeDeploymentChanges(current)) {
-          closeRoute();
-          return { cancelled: true };
-        }
-        const confirmed = await native.showConfirmation({
-          title: translate("menu.close"),
-          message: translate("common.discarded"),
-          confirmLabel: translate("menu.close"),
-        });
-        if (!confirmed) return { cancelled: true };
-        discardPendingFields();
-        for (const name of dirtyDomains) await enqueueDispatch("cancel", {}, name);
+    void run(async () => {
+      await flushPendingFields();
+      const current = await ipc.snapshot();
+      revision.current = current.revision;
+      onSnapshot(current);
+      const dirtyDomains = settingsRoute
+        ? (["codex", "claude"] as const).filter((name) => current.drafts[name]?.dirty)
+        : domain && current.drafts[domain]?.dirty ? [domain] : [];
+      if (dirtyDomains.length === 0 && (!settingsRoute || !hasClaudeDeploymentChanges(current))) {
+        closeRoute();
+        return { cancelled: true };
+      }
+      const confirmed = await native.showConfirmation({
+        title: translate("menu.close"),
+        message: translate("common.discarded"),
+        confirmLabel: translate("menu.close"),
+      });
+      if (!confirmed) return { cancelled: true };
+      discardPendingFields();
+      for (const name of dirtyDomains) await enqueueDispatch("cancel", {}, name);
+      if (settingsRoute) {
         claudeDeploymentDraftRef.current = undefined;
         setClaudeDeploymentDraft(undefined);
-        closeRoute();
-        return {};
-      }, "common.discarded");
-      return;
-    }
-    if (!domain || !snapshot?.drafts[domain]?.dirty) {
+      }
       closeRoute();
-      return;
-    }
-    void native.showConfirmation({
-      title: translate("menu.close"),
-      message: translate("common.discarded"),
-      confirmLabel: translate("menu.close"),
-    }).then((confirmed) => confirmed
-      ? cancel().then(closeRoute)
-      : undefined);
+      return {};
+    }, "common.discarded");
   };
   useEffect(() => {
     if (nativeAction?.id !== `request-close-${route}` && nativeAction?.id !== `request-close-${nativeWindowRoute(route)}`) return;
@@ -895,7 +937,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
     {route !== "providers-models" && route !== "logs" && route !== "relay-accounts" ? <WindowTitle title={windowTitle} validation={issues.length > 0 ? `${issues.length} ${translate("common.validationIssues")}` : undefined} /> : null}
     {route === "providers-models" || settingsRoute || route === "logs" || route === "relay-accounts" || route === "runtime-settings" || route === "webdav-settings" ? <View style={[styles.windowContent, styles.windowContentFixed, route === "providers-models" && styles.providersContent, settingsRoute && styles.settingsContent, route === "logs" && styles.logsContent, route === "relay-accounts" && styles.relayAccountsContent, route === "runtime-settings" && styles.runtimeContent, route === "webdav-settings" && styles.webDavContent]}>
-    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} probe={(providerId, modelId) => run(() => ipc.probe(providerId, modelId, "providers_models"), "providers.probeComplete")} /> : null}
+    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} applyProbedOrder={applyProbedOrder} /> : null}
     {settingsRoute ? <><View style={styles.settingsTabBar}><WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]} selected={settingsTab} disabled={busy} onSelect={(next) => switchSettingsTab(next as AssistantSettingsDomain)} style={styles.settingsTabs} /></View>{settingsTab === "codex" ? <CodexWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} rawReloadToken={settingsRawReloadToken} /> : <ClaudeScreen snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} deployment={claudeDeployment} onDeploymentChange={(key, value) => {
       const next = { ...(claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(snapshot)), [key]: value };
       claudeDeploymentDraftRef.current = next;
@@ -954,22 +996,29 @@ function riskCodes(snapshot: CoreSnapshot, domain: ConfigDomain): string[] {
   return Array.isArray(settings.risk_confirmations) ? settings.risk_confirmations.filter((item): item is string => typeof item === "string") : [];
 }
 
-function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, onSecretState, probe }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; probe: (providerId?: string, modelId?: string) => void }): React.JSX.Element {
+function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, onSecretState, applyProbedOrder }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; applyProbedOrder: ApplyProbedOrder }): React.JSX.Element {
   const state = domainState(snapshot, "providers_models");
   const details = asRecords(state.providers);
   const fallback = snapshot?.providers_models.providers ?? [];
   const providers = details.length > 0 ? details : fallback.map(providerRecord);
   const [selectedProvider, setSelectedProvider] = useState<string>();
-  const provider = providers.find((item) => identifier(item) === selectedProvider) ?? providers[0];
-  const providerId = provider ? identifier(provider) : "";
+  const pendingProviderIds = useRef<Set<string> | undefined>(undefined);
+  const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);
+  const knownModelIdsByProvider = useRef<Map<string, Set<string>> | undefined>(undefined);
+  const provider = providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0];
+  const providerId = provider ? editorIdentifier(provider) : "";
   const models = provider ? asRecords(provider.models).map(modelRecord) : [];
   const [selectedModel, setSelectedModel] = useState<string>();
   const [providerSourceModel, setProviderSourceModel] = useState<string>();
-  const model = models.find((item) => identifier(item) === selectedModel);
+  const model = models.find((item) => editorIdentifier(item) === selectedModel);
   const [viewMode, setViewMode] = useState<"providers" | "routes">("providers");
   const [selectedRoute, setSelectedRoute] = useState<string>();
   const [fetchKeyName, setFetchKeyName] = useState<string>();
   const [fetchedModelsOpen, setFetchedModelsOpen] = useState(false);
+  const probingModelKeys = useRef(new Set<string>());
+  const [, setProbeActivityRevision] = useState(0);
+  const [probeResults, setProbeResults] = useState<Record<string, IpcResults["probe"]>>({});
+  const multiplierRefreshStarted = useRef(false);
   const transferButtonRef = useRef<HostInstance | null>(null);
   const operation = asRecord(snapshot?.action_summaries?.providers_models);
   const operationSummary = asRecord(operation.operation_summary);
@@ -977,9 +1026,102 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const fetchKeyOptions = apiKeyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) }));
   const selectedFetchKey = fetchKeyName ?? apiKeyNames[0] ?? "";
   const selectedFetchLabel = fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default");
-  const runtimeSettings = asRecords(domainState(snapshot, "runtime").settings);
-  const billingRefreshSetting = runtimeSettings.find((item) => identifier(item) === "LITELLM_MENU_BALANCE_REFRESH_MINUTES");
-  const billingRefreshMinutes = Math.max(0, Math.min(1_440, numberValue(billingRefreshSetting?.value, 5)));
+  async function probeModel(targetProviderId: string, targetModelId: string): Promise<void> {
+    const key = modelProbeKey(targetProviderId, targetModelId);
+    if (probingModelKeys.current.has(key)) return;
+    probingModelKeys.current.add(key);
+    setProbeActivityRevision((value) => value + 1);
+    try {
+      const result = await ipc.probe(targetProviderId, targetModelId, "providers_models");
+      setProbeResults((current) => ({ ...current, [key]: result }));
+      onSnapshot(await ipc.snapshot());
+      const nextOrder = stringList(result.recommended_order).filter(isProbeSurface);
+      if (result.ok && nextOrder.length > 0) await applyProbedOrder(targetProviderId, targetModelId, nextOrder);
+    } catch (reason: unknown) {
+      setProbeResults((current) => ({
+        ...current,
+        [key]: { ok: false, protocols: [], detail: errorMessage(reason, translate), provider_id: targetProviderId, model_id: targetModelId },
+      }));
+    } finally {
+      probingModelKeys.current.delete(key);
+      setProbeActivityRevision((value) => value + 1);
+    }
+  }
+  const modelProbeProps = (targetProviderId: string, targetModelId: string): { probing: boolean; probeResult?: IpcResults["probe"] } => {
+    const key = modelProbeKey(targetProviderId, targetModelId);
+    return { probing: probingModelKeys.current.has(key), probeResult: probeResults[key] };
+  };
+  useEffect(() => {
+    if (!snapshot || multiplierRefreshStarted.current) return;
+    multiplierRefreshStarted.current = true;
+    let active = true;
+    void (async () => {
+      const current = await ipc.snapshot();
+      const staged = await ipc.dispatch(
+        { domain: "providers_models", type: "providers.refresh_multiplier" },
+        current.revision,
+      );
+      const next = await ipc.snapshot();
+      if (active && next.revision >= staged.revision) onSnapshot(next);
+    })().catch(() => undefined);
+    return () => { active = false; };
+  }, [ipc, onSnapshot, snapshot]);
+  const modelIdentitySignature = providers.map((entry) => `${editorIdentifier(entry)}:${asRecords(entry.models).map(editorIdentifier).join(",")}`).join("|");
+  useEffect(() => {
+    if (!snapshot) return;
+    const current = new Map<string, Set<string>>();
+    const added: Array<{ providerId: string; modelId: string }> = [];
+    for (const entry of providers) {
+      const currentProviderId = editorIdentifier(entry);
+      const currentModelIds = new Set(asRecords(entry.models).map(editorIdentifier));
+      const previousModelIds = knownModelIdsByProvider.current?.get(currentProviderId);
+      if (previousModelIds) {
+        for (const modelId of currentModelIds) {
+          if (!previousModelIds.has(modelId)) added.push({ providerId: currentProviderId, modelId });
+        }
+      }
+      current.set(currentProviderId, currentModelIds);
+    }
+    const wasInitialized = knownModelIdsByProvider.current !== undefined;
+    knownModelIdsByProvider.current = current;
+    if (wasInitialized) void Promise.all(added.map(({ providerId: targetProviderId, modelId }) => probeModel(targetProviderId, modelId)));
+  }, [modelIdentitySignature]);
+  useEffect(() => {
+    const pending = pendingProviderIds.current;
+    if (pending) {
+      const added = providers.find((item) => !pending.has(editorIdentifier(item)));
+      if (added) {
+        setSelectedProvider(editorIdentifier(added));
+        setSelectedModel(undefined);
+        setProviderSourceModel(undefined);
+        pendingProviderIds.current = undefined;
+        return;
+      }
+    }
+    if (providers.length === 0) {
+      if (selectedProvider !== undefined) setSelectedProvider(undefined);
+      return;
+    }
+    if (!providers.some((item) => editorIdentifier(item) === selectedProvider)) {
+      setSelectedProvider(editorIdentifier(providers[0]));
+    }
+  }, [providers, selectedProvider]);
+  useEffect(() => {
+    const pending = pendingModelIds.current;
+    if (pending?.providerId === providerId) {
+      const added = models.find((item) => !pending.ids.has(editorIdentifier(item)));
+      if (added) {
+        const addedId = editorIdentifier(added);
+        setSelectedModel(addedId);
+        setProviderSourceModel(undefined);
+        pendingModelIds.current = undefined;
+        return;
+      }
+    }
+    if (selectedModel !== undefined && !models.some((item) => editorIdentifier(item) === selectedModel)) {
+      setSelectedModel(undefined);
+    }
+  }, [models, providerId, selectedModel]);
   useEffect(() => {
     if (!apiKeyNames.includes(fetchKeyName ?? "")) setFetchKeyName(apiKeyNames[0]);
   }, [apiKeyNames, fetchKeyName, providerId]);
@@ -995,32 +1137,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then((selection) => {
       const selectedModels = (selection ?? []).filter((model, index, all) => candidateSet.has(model) && all.indexOf(model) === index);
       if (selectedModels.length === 0) return;
-      void Promise.all(selectedModels.map((upstreamModel, index) => dispatch("model.add", { provider_id: providerId, model: { name: upstreamModel, upstream_model: upstreamModel, api_key_name: fetchKeyName, enabled: true, order: models.length + index + 1, upstream_url_surface: "openai/responses", supported_upstream_url_surfaces: ["openai/responses"] } })));
+      void Promise.all(selectedModels.map((upstreamModel, index) => dispatch("model.add", { provider_id: providerId, model: { name: upstreamModel, upstream_model: upstreamModel, api_key_name: fetchKeyName, enabled: true, order: models.length + index + 1, upstream_url_surface: "openai/responses", supported_upstream_url_surfaces: ["openai/responses"] } })))
+        .catch(() => undefined);
     }).catch(() => undefined);
   }, [busy, fetchedModelsOpen, fetchKeyName, native, operationSummary, provider, providerId, models.length, dispatch, translate]);
-  useEffect(() => {
-    let active = true;
-    let inFlight = false;
-    const refreshBilling = async (): Promise<void> => {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        const current = await ipc.snapshot();
-        const staged = await ipc.dispatch({ domain: "providers_models", type: "providers.refresh_billing" }, current.revision);
-        const next = await ipc.snapshot();
-        if (active && next.revision >= staged.revision) onSnapshot(next);
-      } catch {
-        // Live billing is optional and must not disturb the editable draft.
-      } finally {
-        inFlight = false;
-      }
-    };
-    void refreshBilling();
-    const interval = billingRefreshMinutes > 0
-      ? setInterval(() => { void refreshBilling(); }, billingRefreshMinutes * 60 * 1000)
-      : undefined;
-    return () => { active = false; if (interval) clearInterval(interval); };
-  }, [billingRefreshMinutes, ipc, onSnapshot]);
   const importSelected = async (): Promise<void> => {
     const fileToken = await native.openFilePicker({ purpose: "import" });
     if (fileToken) await dispatch("providers.import_selected", { file_token: fileToken });
@@ -1055,10 +1175,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       });
     });
   };
-  const addProvider = (): void => { void dispatch("provider.add", { provider: { name: "", enabled: true, models: [], create_default_api_key: true } }); };
+  const addProvider = (): void => {
+    pendingProviderIds.current = new Set(providers.map(editorIdentifier));
+    void dispatch("provider.add", { provider: { name: "", enabled: true, models: [], create_default_api_key: true } });
+  };
   const addModel = (): void => {
     if (!provider) return;
-    dispatch("model.add", { provider_id: providerId, model: { name: "", upstream_model: "", enabled: true, order: models.length + 1, upstream_url_surface: "openai/responses", supported_upstream_url_surfaces: ["openai/responses"] } });
+    const knownModelIds = new Set(models.map(editorIdentifier));
+    pendingModelIds.current = { providerId, ids: knownModelIds };
+    void dispatch("model.add", { provider_id: providerId, model: { name: "", upstream_model: "", enabled: true, order: models.length + 1, upstream_url_surface: "openai/responses", supported_upstream_url_surfaces: ["openai/responses"] } });
+  };
+  const duplicateModel = (): void => {
+    if (!model) return;
+    void dispatch("model.duplicate", { provider_id: providerId, model_id: editorIdentifier(model) });
   };
   const routes = providers.flatMap((entry, providerIndex) => asRecords(entry.models).map(modelRecord).flatMap((entryModel, modelIndex) => {
     const publicModel = stringValue(entryModel.name).trim();
@@ -1066,15 +1195,20 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!publicModel || !deploymentID) return [];
     const keyNames = new Set(stringList(entry.api_key_names));
     const keyName = stringValue(entryModel.api_key_name).trim();
+    const providerEnabled = booleanValue(entry.enabled, true);
+    const modelEnabled = booleanValue(entryModel.model_enabled, booleanValue(entryModel.enabled, true));
+    const keyAvailable = booleanValue(entryModel.api_key_configured, !keyName || keyNames.has(keyName));
     return [{
-      key: `${identifier(entry)}:${deploymentID}`,
+      key: `${editorIdentifier(entry)}:${deploymentID}`,
       deploymentID,
       publicModel,
       provider: entry,
       providerIndex,
       model: entryModel,
       modelIndex,
-      enabled: booleanValue(entry.enabled, true) && booleanValue(entryModel.enabled, true) && booleanValue(entryModel.model_enabled, true) && (!keyName || keyNames.has(keyName)),
+      providerEnabled,
+      modelEnabled,
+      keyAvailable,
     }];
   })).sort((left, right) => {
     const modelOrder = left.publicModel.localeCompare(right.publicModel, undefined, { sensitivity: "base" });
@@ -1105,31 +1239,31 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   };
   const confirmDeleteProvider = (): void => {
     if (!provider) return;
-    const label = stringValue(provider.name, identifier(provider));
+    const label = stringValue(provider.name, translate("providers.newProvider"));
     void native.showConfirmation({ title: translate("providers.deleteProvider"), message: `${label} (${models.length} ${translate("providers.models")})`, confirmLabel: translate("common.delete") }).then((confirmed) => confirmed ? dispatch("provider.delete", { provider_id: providerId }).then(() => { setSelectedProvider(undefined); setSelectedModel(undefined); setProviderSourceModel(undefined); }) : undefined);
   };
   const confirmDeleteModel = (): void => {
     if (!model) return;
-    const modelId = identifier(model);
+    const modelId = editorIdentifier(model);
     void native.showConfirmation({ title: translate("providers.deleteModel"), message: stringValue(model.name, modelId), confirmLabel: translate("common.delete") }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }).then(() => setSelectedModel(undefined)) : undefined);
   };
-  const providerRows = providers.map((item) => ({ key: identifier(item), cells: [stringValue(item.display_name, stringValue(item.name, identifier(item))), String(asRecords(item.models).length || numberValue(item.model_count))] }));
-  const disabledProviderKeys = providers.filter((item) => !booleanValue(item.enabled, true)).map(identifier);
-  const modelRows = models.map((item) => ({ key: identifier(item), cells: [stringValue(item.display_name, stringValue(item.name, identifier(item))), upstreamModelLabel(item), billingBalanceValue(item.billing, translate), `${apiKeyDisplayName(item.api_key_name, translate)} / ${numberValue(item.order, 1)}`] }));
-  const disabledModelKeys = models.filter((item) => !booleanValue(item.enabled, true)).map(identifier);
+  const providerRows = providers.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newProvider"))), String(asRecords(item.models).length || numberValue(item.model_count))] }));
+  const disabledProviderKeys = providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier);
+  const modelRows = models.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newModel"))), upstreamModelLabel(item), translate("providers.billingUnavailable"), `${apiKeyDisplayName(item.api_key_name, translate)} / ${numberValue(item.order, 1)}`] }));
+  const disabledModelKeys = models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier);
   const routeRows = routes.map((entry, index) => {
     const startsGroup = index === 0 || routes[index - 1]?.publicModel !== entry.publicModel;
     const numericOrder = numberValue(entry.model.order, Number.NaN);
     const order = Number.isFinite(numericOrder) ? String(numericOrder) : stringValue(entry.model.order).trim();
     return { key: entry.key, cells: [startsGroup ? entry.publicModel : "", order || "-", `${stringValue(entry.provider.name)} / ${apiKeyDisplayName(entry.model.api_key_name, translate)}`, upstreamModelLabel(entry.model) || translate("common.notAvailable")] };
   });
-  const disabledRouteKeys = routes.filter((entry) => !entry.enabled).map((entry) => entry.key);
+  const disabledRouteKeys = routes.filter((entry) => !entry.providerEnabled || !entry.modelEnabled || !entry.keyAvailable).map((entry) => entry.key);
   const selectRoute = (routeId: string): void => {
     const selected = routes.find((entry) => entry.key === routeId);
     setSelectedRoute(routeId);
     if (selected) {
-      setSelectedProvider(identifier(selected.provider));
-      setSelectedModel(identifier(selected.model));
+      setSelectedProvider(editorIdentifier(selected.provider));
+      setSelectedModel(editorIdentifier(selected.model));
       setProviderSourceModel(undefined);
     }
   };
@@ -1155,7 +1289,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         <NativeTable columns={[{ label: translate("providers.model"), width: 170 }, { label: translate("common.order"), width: 56 }, { label: `${translate("providers.provider")} / ${translate("providers.key")}`, width: 130 }, { label: translate("providers.upstream"), width: 164 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} alternatingRows onSelectionChange={selectRoute} style={styles.nativeRouteTable} />
       </TablePane>
       <View style={styles.providerInspector}>
-        {activeRoute ? (providerSourceModel ? <ProviderEditor provider={activeRoute.provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(identifier(activeRoute.model)); }} /> : <ModelInspector providers={providers} provider={activeRoute.provider} providerId={identifier(activeRoute.provider)} model={activeRoute.model} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={probe} onProviderClick={() => setProviderSourceModel(identifier(activeRoute.model))} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: identifier(activeRoute.provider), model_id: identifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(identifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />}
+        {activeRoute ? (providerSourceModel ? <ProviderEditor provider={activeRoute.provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} /> : <ModelInspector providers={providers} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />}
       </View>
     </View> : <View style={styles.providerWorkspace}>
       <View style={styles.providerLeftColumn}>
@@ -1163,13 +1297,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !provider} onPress={confirmDeleteProvider} /></>}>
             <NativeTable columns={[{ label: translate("providers.provider"), width: 140 }, { label: translate("providers.models"), width: 48 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
-          <TablePane style={styles.modelListPane} title={translate("providers.models")} actions={<><IconButton label="+" title={translate("providers.newModel")} disabled={busy || !provider} onPress={addModel} /><IconButton label="⧉" title={translate("common.copy")} disabled={busy || !model} onPress={() => model && dispatch("model.duplicate", { provider_id: providerId, model_id: identifier(model) })} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !model} onPress={confirmDeleteModel} /></>}>
+          <TablePane style={styles.modelListPane} title={translate("providers.models")} actions={<><IconButton label="+" title={translate("providers.newModel")} disabled={busy || !provider} onPress={addModel} /><IconButton label="⧉" title={translate("common.copy")} disabled={busy || !model} onPress={duplicateModel} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !model} onPress={confirmDeleteModel} /></>}>
             <NativeTable columns={[{ label: translate("providers.model"), width: 118 }, { label: translate("providers.upstream"), width: 130 }, { label: translate("providers.balance"), width: 112 }, { label: translate("providers.apiKeyOrder"), width: 104 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
             <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={selectedFetchLabel} disabled={busy || !provider || apiKeyNames.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyName(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} disabled={busy || !provider || !fetchKeyName} onPress={() => { void dispatch("providers.fetch_models", { provider_id: providerId, api_key_name: fetchKeyName }).then(() => setFetchedModelsOpen(true)); }} /></View>
           </TablePane>
         </View>
       </View>
-      <View style={styles.providerInspector}>{provider && model ? <ModelInspector providers={providers} provider={provider} providerId={providerId} model={model} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={probe} onProviderClick={() => { setProviderSourceModel(identifier(model)); setSelectedModel(undefined); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: identifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(identifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor provider={provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={models.find((item) => identifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} /> : <EmptyState translate={translate} />}</View>
+      <View style={styles.providerInspector}>{provider && model ? <ModelInspector providers={providers} provider={provider} providerId={providerId} model={model} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(providerId, editorIdentifier(model))} {...modelProbeProps(providerId, editorIdentifier(model))} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor provider={provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} /> : <EmptyState translate={translate} />}</View>
     </View>}
   </View>;
 }
@@ -1178,21 +1312,21 @@ function TablePane({ title, actions, wide, style, children }: { title: string; a
   return <View style={[styles.tablePane, wide && styles.tablePaneWide, style]}><View style={styles.tableTitleRow}><Text style={styles.tableTitle}>{title}</Text><View style={styles.tableActions}>{actions}</View></View>{children}</View>;
 }
 
-function ModelInspector({ providers, provider, providerId, model, native, busy, translate, dispatch, probe, onProviderClick, onProviderChange }: { providers: UnknownRecord[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: (providerId?: string, modelId?: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void }): React.JSX.Element {
-  const id = identifier(model);
-  const providerLabels = providers.map((item) => stringValue(item.name, identifier(item)));
-  const providerIndex = providers.findIndex((item) => identifier(item) === providerId);
+function ModelInspector({ providers, provider, providerId, model, native, busy, translate, dispatch, probe, probing, probeResult, onProviderClick, onProviderChange }: { providers: UnknownRecord[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; onProviderClick: () => void; onProviderChange: (providerId: string) => void }): React.JSX.Element {
+  const id = editorIdentifier(model);
+  const providerLabels = providers.map((item) => stringValue(item.name, translate("providers.newProvider")));
+  const providerIndex = providers.findIndex((item) => editorIdentifier(item) === providerId);
   const providerLabel = providerLabels[Math.max(0, providerIndex)] ?? "";
   const keyNames = stringList(provider.api_key_names);
   const keyOptions = keyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) }));
   const selectedKey = stringValue(model.api_key_name, keyNames[0] ?? "");
-  const billingTip = billingToolTip(model, translate);
-  const probeInfo = modelProbeInfo(model, translate);
-  return <View style={styles.inspectorContent}><View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{stringValue(model.name, id)}</Text></View><View style={styles.inspectorDivider} /><View style={styles.inspectorBody}><View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enabled")} value={booleanValue(model.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { enabled } })} /><ActionButton title={translate("providers.probeAll")} disabled={busy} onPress={() => probe(providerId, id)} /></View><View style={styles.billingGrid}><InspectorInfoRow label={translate("providers.usable")} value={probeInfo.available} /><InspectorInfoRow label={translate("providers.responsesUsable")} value={probeInfo.responses} /><InspectorInfoRow label={translate("providers.recommendedApi")} value={probeInfo.recommended} /><InspectorInfoRow label={translate("providers.balance")} value={billingBalanceValue(model.billing, translate)} toolTip={billingTip} /><InspectorInfoRow label={translate("common.usage")} value={billingUsageValue(model.usage, translate)} toolTip={billingTip} /><InspectorInfoRow label={translate("providers.multiplier")} value={billingMultiplierValue(model.multiplier, translate)} toolTip={billingTip} /></View><TextField label={translate("providers.publicModel")} labelWidth={96} labelAlign="left" value={stringValue(model.name)} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} /><PickerField label={translate("providers.provider")} labelWidth={96} labelAlign="left" value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers.find((item) => stringValue(item.name, identifier(item)) === label); if (next) onProviderChange(identifier(next)); }} /><PickerField label={translate("common.apiKey")} labelWidth={96} labelAlign="left" value={selectedKey} values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]} disabled={busy || keyNames.length === 0} onSelect={(api_key_name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { api_key_name } })} /><TextField label={translate("providers.upstream")} labelWidth={96} labelAlign="left" value={stringValue(model.upstream_model)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} /><TextField label={translate("common.order")} labelWidth={96} labelAlign="left" controlWidth={64} value={String(numberValue(model.order, 1))} keyboardType="numeric" onCommit={(order) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { order: Number(order) || 1 } })} /><ProtocolOrderEditor providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} /></View></View>;
+  const probePresentation = modelProbePresentation(model, probeResult, translate);
+  const billingSummary = `${translate("providers.balance")}: ${translate("providers.billingUnavailable")}  ${translate("providers.multiplier")}: ${billingMultiplierValue(model.multiplier, translate)}`;
+  return <View style={styles.inspectorContent}><View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{stringValue(model.name, translate("providers.newModel"))}</Text></View><View style={styles.inspectorDivider} /><View style={styles.inspectorBody}><View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} style={styles.inspectorEnableControl} /><ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} onPress={probe} /><TooltipText numberOfLines={2} tooltip={probePresentation.full} accessibilityHint={probePresentation.full} style={styles.probeSummary}>{probePresentation.compact}</TooltipText></View><Text numberOfLines={1} style={styles.billingSummaryText}>{billingSummary}</Text><TextField label={translate("providers.publicModel")} labelWidth={96} labelAlign="left" value={stringValue(model.name)} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} /><PickerField label={translate("providers.provider")} labelWidth={96} labelAlign="left" value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers.find((item) => stringValue(item.name, translate("providers.newProvider")) === label); if (next) onProviderChange(editorIdentifier(next)); }} /><PickerField label={translate("common.apiKey")} labelWidth={96} labelAlign="left" value={selectedKey} values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]} disabled={busy || keyNames.length === 0} onSelect={(api_key_name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { api_key_name } })} /><TextField label={translate("providers.upstream")} labelWidth={96} labelAlign="left" value={upstreamModelLabel(model)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} /><TextField label={translate("common.order")} labelWidth={96} labelAlign="left" controlWidth={64} value={String(numberValue(model.order, 1))} keyboardType="numeric" onCommit={(order) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { order: Number(order) || 1 } })} /><ProtocolOrderEditor providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} /></View></View>;
 }
 
 function ProtocolOrderEditor({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
-  const id = identifier(model);
+  const id = editorIdentifier(model);
   const supported = stringList(model.supported_upstream_url_surfaces);
   const current = supported.length > 0 ? supported : [stringValue(model.upstream_url_surface, "openai/responses")];
   const all = [...current, ...["openai/responses", "openai/chat", "anthropic"].filter((item) => !current.includes(item))];
@@ -1208,7 +1342,38 @@ function providerRecord(provider: ProviderSummary): UnknownRecord {
 }
 
 function modelRecord(model: UnknownRecord): UnknownRecord {
-  return { ...model, id: identifier(model), name: stringValue(model.name, stringValue(model.display_name, stringValue(model.model))), display_name: stringValue(model.display_name, stringValue(model.name)), enabled: booleanValue(model.enabled, true), order: numberValue(model.order, 1) };
+  const modelEnabled = booleanValue(model.model_enabled, booleanValue(model.enabled, true));
+  return { ...model, id: editorIdentifier(model), name: stringValue(model.name, stringValue(model.display_name, stringValue(model.model))), display_name: stringValue(model.display_name, stringValue(model.name)), enabled: modelEnabled, model_enabled: modelEnabled, order: numberValue(model.order, 1) };
+}
+
+function isProbeSurface(value: string): value is "openai/responses" | "openai/chat" | "anthropic" {
+  return value === "openai/responses" || value === "openai/chat" || value === "anthropic";
+}
+
+function modelProbeKey(providerId: string, modelId: string): string {
+  return `${providerId}\x1f${modelId}`;
+}
+
+function sameStringOrder(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function protocolOrder(model: UnknownRecord): string[] {
+  const supported = stringList(model.supported_upstream_url_surfaces).filter(isProbeSurface);
+  if (supported.length > 0) return supported;
+  const primary = stringValue(model.upstream_url_surface, "openai/responses");
+  return isProbeSurface(primary) ? [primary] : ["openai/responses"];
+}
+
+function providerModelsByEditorId(snapshot: CoreSnapshot, providerId: string): UnknownRecord[] {
+  const state = domainState(snapshot, "providers_models");
+  const providers = asRecords(state.providers);
+  const provider = providers.find((item) => editorIdentifier(item) === providerId);
+  return provider ? asRecords(provider.models) : [];
+}
+
+function providerModelByEditorId(snapshot: CoreSnapshot, providerId: string, modelId: string): UnknownRecord | undefined {
+  return providerModelsByEditorId(snapshot, providerId).find((item) => editorIdentifier(item) === modelId);
 }
 
 function upstreamModelLabel(model: UnknownRecord): string {
@@ -1221,9 +1386,14 @@ function identifier(record: UnknownRecord): string {
   return stringValue(record.id, stringValue(record.editor_id, stringValue(record.name, "new-item")));
 }
 
+function editorIdentifier(record: UnknownRecord): string {
+  return stringValue(record.editor_id, identifier(record));
+}
+
 function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretState, sourceModel, onReturnToModel }: { provider: UnknownRecord; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void }): React.JSX.Element {
-  const id = identifier(provider);
+  const id = editorIdentifier(provider);
   const keys = stringList(provider.api_key_names);
+  const keyStates = asRecords(provider.key_states);
   const [selectedKey, setSelectedKey] = useState<string>(keys[0] ?? "");
   useEffect(() => { if (!keys.includes(selectedKey)) setSelectedKey(keys[0] ?? ""); }, [keys, selectedKey]);
   const addKey = (): void => { const name = uniqueKeyName(keys); void dispatch("provider.key_add", { provider_id: id, name }).then(() => setSelectedKey(name)); };
@@ -1237,12 +1407,13 @@ function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretS
       confirmLabel: translate("common.delete"),
     }).then((confirmed) => confirmed ? dispatch("provider.key_delete", { provider_id: id, name: selectedKey }).then(() => setSelectedKey(replacement)) : undefined);
   };
-  const providerLabel = stringValue(provider.display_name, stringValue(provider.name, id));
-  const sourceModelLabel = sourceModel ? stringValue(sourceModel.name, identifier(sourceModel)) : "";
+  const providerLabel = stringValue(provider.display_name, stringValue(provider.name, translate("providers.newProvider")));
+  const sourceModelLabel = sourceModel ? stringValue(sourceModel.name, translate("providers.newModel")) : "";
+  const selectedKeyConfigured = booleanValue(keyStates.find((state) => stringValue(state.name) === selectedKey)?.configured);
   const keyRows = keys.map((key) => ({ key, cells: [apiKeyDisplayName(key, translate)] }));
   return <View style={styles.providerEditorContent}>
     <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerLabel}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
-    <View style={styles.providerEditorSection}><View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enabled")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch("provider.patch", { provider_id: id, changes: { enabled } })} /></View>
+    <View style={styles.providerEditorSection}><View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch("provider.patch", { provider_id: id, changes: { enabled } })} /></View>
     <TextField label={translate("providers.baseUrl")} labelWidth={96} labelAlign="left" value={stringValue(provider.endpoint, stringValue(provider.api_base))} onCommit={(endpoint) => dispatch("provider.patch", { provider_id: id, changes: { endpoint } })} />
     <TextField label={translate("providers.providerName")} labelWidth={96} labelAlign="left" value={stringValue(provider.name, stringValue(provider.display_name))} onCommit={(name) => dispatch("provider.patch", { provider_id: id, changes: { name } })} />
     <View style={styles.providerKeysEditor}>
@@ -1258,7 +1429,7 @@ function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretS
         <View style={styles.providerKeyFields}>
           {selectedKey ? <>
             <TextField label={translate("providers.keyName")} labelWidth={64} labelAlign="left" value={selectedKey} onCommit={renameKey} />
-            <NativeSecretField plainText autoCommit label={translate("common.apiKey")} labelWidth={64} labelAlign="left" busy={busy || !selectedKey} domain="providers_models" field="api_key" target={`${id}\x1f${selectedKey}`} onSecretState={onSecretState} />
+            <NativeSecretField plainText autoCommit label={translate("common.apiKey")} hint={selectedKeyConfigured ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} labelWidth={64} labelAlign="left" busy={busy || !selectedKey} domain="providers_models" field="api_key" target={`${id}\x1f${selectedKey}`} onSecretState={onSecretState} />
           </> : <Text style={styles.empty}>{translate("common.notAvailable")}</Text>}
         </View>
       </View>
@@ -1821,6 +1992,7 @@ type RenderedLogRecord = {
   source: string;
   status: string;
   model: string;
+  upstreamModel: string;
   provider: string;
   apiKeyName: string;
   event: string;
@@ -1854,6 +2026,229 @@ function compactLogValue(value: unknown): string {
     }
   }
   return "";
+}
+
+function compactUpstreamLogModel(value: unknown): string {
+  const model = compactLogValue(value);
+  const separator = model.indexOf("/");
+  return separator >= 0 ? model.slice(separator + 1) : model;
+}
+
+function routeTraceEventLabel(value: string, translate: Translate): string {
+  const labels: Record<string, Parameters<Translate>[0]> = {
+    selected_deployment: "logs.routeEvent.selected",
+    filter_deployments: "logs.routeEvent.filtered",
+    generic_fallback_helper_start: "logs.routeEvent.fallback",
+    generic_fallback_helper_error: "logs.routeEvent.fallbackFailed",
+    deployment_failover_marked: "logs.routeEvent.failoverMarked",
+    fallback_deployment_cooldown_filter: "logs.routeEvent.cooldownFilter",
+    next_order_fallback_available: "logs.routeEvent.nextOrder",
+    final_order_fallback_retry_start: "logs.routeEvent.finalOrder",
+    deployment_cooldown_started: "logs.routeEvent.cooldownStarted",
+    stream_start_timeout: "logs.routeEvent.streamStartTimeout",
+    codex_fast_default_service_tier_injected: "logs.routeEvent.serviceTier",
+    responses_request_gzip_enabled: "logs.routeEvent.compression",
+    responses_chat_bridge_preemptive: "logs.routeEvent.chatBridge",
+    responses_chat_bridge_preemptive_start: "logs.routeEvent.chatBridge",
+    responses_chat_bridge_preemptive_retry_start: "logs.routeEvent.chatBridge",
+    responses_chat_bridge_preemptive_error: "logs.routeEvent.chatBridge",
+    external_web_search_bridge_chat_tool_start: "logs.routeEvent.webSearchToolStart",
+    external_web_search_bridge_chat_tool_done: "logs.routeEvent.webSearchToolDone",
+    external_web_search_bridge_chat_tool_malformed_retry: "logs.routeEvent.webSearchRetry",
+    external_web_search_bridge_chat_tool_progress_retry: "logs.routeEvent.webSearchRetry",
+    external_web_search_bridge_actions_executed: "logs.routeEvent.webSearchActions",
+    external_web_search_bridge_continuation_start: "logs.routeEvent.webSearchContinuationStart",
+    external_web_search_bridge_continuation_done: "logs.routeEvent.webSearchContinuationDone",
+    external_web_search_bridge_continuation_error: "logs.routeEvent.webSearchContinuationFailed",
+    external_web_search_bridge_empty_continuation_synthesis: "logs.routeEvent.webSearchSynthesisFallback",
+    external_web_search_bridge_synthesis_start: "logs.routeEvent.webSearchSynthesisStart",
+    external_web_search_bridge_synthesis_done: "logs.routeEvent.webSearchSynthesisDone",
+    external_web_search_bridge_synthesis_error: "logs.routeEvent.webSearchSynthesisFailed",
+    external_web_search_bridge_synthesis_chat_start: "logs.routeEvent.webSearchSynthesisChatStart",
+    external_web_search_bridge_synthesis_chat_done: "logs.routeEvent.webSearchSynthesisChatDone",
+    external_web_search_bridge_final_invalid: "logs.routeEvent.webSearchFinalInvalid",
+    external_web_search_bridge_initial_no_action_invalid: "logs.routeEvent.webSearchInitialInvalid",
+    external_web_search_bridge_model_retry: "logs.routeEvent.webSearchModelRetry",
+    route_recovery_poll_start: "logs.routeEvent.recoveryStart",
+    route_recovery_poll_waiting_for_cooldown: "logs.routeEvent.recoveryWaiting",
+    route_recovery_poll_attempt_start: "logs.routeEvent.recoveryAttempt",
+    route_recovery_poll_next_attempt_scheduled: "logs.routeEvent.recoveryRetry",
+    route_recovery_poll_success: "logs.routeEvent.recoverySuccess",
+    route_recovery_poll_attempt_failed: "logs.routeEvent.recoveryFailed",
+    route_recovery_poll_attempt_empty: "logs.routeEvent.recoveryFailed",
+    route_recovery_poll_terminal_error: "logs.routeEvent.recoveryEnded",
+    route_recovery_poll_max_duration_reached: "logs.routeEvent.recoveryEnded",
+    route_recovery_poll_context_size_error: "logs.routeEvent.recoveryEnded",
+    route_recovery_poll_route_pool_reset: "logs.routeEvent.recoveryReset",
+    standalone_web_search_start: "logs.routeEvent.standaloneWebSearchStart",
+    standalone_web_search_completed: "logs.routeEvent.standaloneWebSearchCompleted",
+  };
+  const key = labels[value];
+  if (key) return translate(key);
+  if (value.startsWith("external_web_search_bridge_")) return translate("logs.routeEvent.webSearch");
+  if (value.startsWith("responses_chat_bridge_")) return translate("logs.routeEvent.chatBridge");
+  if (value.startsWith("responses_external_web_search_bridge_")) return translate("logs.routeEvent.webSearch");
+  if (value.startsWith("responses_")) return translate("logs.routeEvent.responses");
+  if (value.includes("fallback")) return translate("logs.routeEvent.fallback");
+  return translate("logs.routeEvent.routeEvent");
+}
+
+function routeTraceServiceTierLabel(value: string, translate: Translate): string {
+  const labels: Record<string, Parameters<Translate>[0]> = {
+    priority: "logs.routeTrace.serviceTierPriority",
+    flex: "logs.routeTrace.serviceTierFlex",
+    default: "logs.routeTrace.serviceTierDefault",
+    standard: "logs.routeTrace.serviceTierDefault",
+    auto: "logs.routeTrace.serviceTierAuto",
+  };
+  return translate(labels[value.trim().toLowerCase()] ?? "logs.routeTrace.serviceTierOther");
+}
+
+function routeTraceProtocolLabel(value: string, translate: Translate): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized.includes("responses")) return translate("logs.routeTrace.protocolResponses");
+  if (normalized.includes("chat")) return translate("logs.routeTrace.protocolChat");
+  if (normalized.includes("messages") || normalized.includes("anthropic")) return translate("logs.routeTrace.protocolMessages");
+  return translate("logs.routeTrace.protocolOther");
+}
+
+function routeTraceReasonLabel(value: string, translate: Translate): string {
+  const labels: Record<string, Parameters<Translate>[0]> = {
+    "upstream-auth-or-balance": "logs.routeTrace.reasonAuth",
+    "upstream-compatible-bad-request": "logs.routeTrace.reasonCompatibility",
+    "upstream-gateway-bad-request": "logs.routeTrace.reasonGateway",
+    "responses-schema-unsupported": "logs.routeTrace.reasonResponses",
+    "image-parameter-or-capability-bad-request": "logs.routeTrace.reasonResponses",
+    "upstream-network-connectivity": "logs.routeTrace.reasonNetwork",
+    "upstream-temporary-class": "logs.routeTrace.reasonTemporary",
+    "upstream-temporary-text": "logs.routeTrace.reasonTemporary",
+    "terminal-prompt-or-policy": "logs.routeTrace.reasonTerminal",
+    "stream_start_timeout": "logs.routeTrace.reasonStreamStartTimeout",
+    "responses_endpoint_unsupported": "logs.routeTrace.reasonResponsesUnsupported",
+    "malformed_web_search_function_call": "logs.routeTrace.reasonWebSearchFormat",
+  };
+  const upstreamStatus = value.match(/^upstream-status-(\d+)$/);
+  if (upstreamStatus?.[1]) return translate("logs.routeTrace.upstreamStatus", { status: upstreamStatus[1] });
+  return translate(labels[value.trim().toLowerCase()] ?? "logs.routeTrace.reasonUnknown");
+}
+
+function routeTraceDetailPartLabel(value: string, translate: Translate): string {
+  const candidates = value.match(/^candidates=(\d+)$/);
+  if (candidates?.[1]) return translate("logs.routeTrace.candidates", { count: candidates[1] });
+  const selected = value.match(/^selected=(\d+)$/);
+  if (selected?.[1]) return translate("logs.routeTrace.selected", { count: selected[1] });
+  const excluded = value.match(/^excluded=(\d+)$/);
+  if (excluded?.[1]) return translate("logs.routeTrace.excluded", { count: excluded[1] });
+  const failedOrder = value.match(/^failed_order=(.+)$/);
+  if (failedOrder?.[1]) return translate("logs.routeTrace.failedOrder", { value: failedOrder[1] });
+  const nextOrder = value.match(/^next_order=(.+)$/);
+  if (nextOrder?.[1]) return translate("logs.routeTrace.nextOrder", { value: nextOrder[1] });
+  const retry = value.match(/^retry=(.+)$/);
+  if (retry?.[1]) return translate("logs.routeTrace.retry", { value: retry[1] });
+  const maxRetries = value.match(/^max_retries=(.+)$/);
+  if (maxRetries?.[1]) return translate("logs.routeTrace.maxRetries", { value: maxRetries[1] });
+  const retryDelay = value.match(/^retry_delay=(.+)s$/);
+  if (retryDelay?.[1]) return translate("logs.routeTrace.retryDelay", { value: retryDelay[1] });
+  const protocol = value.match(/^protocol=(.+)$/);
+  if (protocol?.[1]) return routeTraceProtocolLabel(protocol[1], translate);
+  if (value === "stream=true") return translate("logs.routeTrace.streaming");
+  if (value === "stream=false") return translate("logs.routeTrace.nonStreaming");
+  const cooling = value.match(/^cooling=(\d+)$/);
+  if (cooling?.[1]) return translate("logs.routeTrace.cooling", { count: cooling[1] });
+  if (value === "all_cooled=true") return translate("logs.routeTrace.allCooled");
+  if (value === "all_cooled=false") return translate("logs.routeTrace.usableRoutesRemain");
+  const originalBytes = value.match(/^original_bytes=(\d+)$/);
+  if (originalBytes?.[1]) return translate("logs.routeTrace.originalBytes", { value: originalBytes[1] });
+  const compressedBytes = value.match(/^compressed_bytes=(\d+)$/);
+  if (compressedBytes?.[1]) return translate("logs.routeTrace.compressedBytes", { value: compressedBytes[1] });
+  if (value === "phase=initial") return translate("logs.routeTrace.phaseInitial");
+  if (value === "phase=continuation") return translate("logs.routeTrace.phaseContinuation");
+  if (value === "phase=synthesis") return translate("logs.routeTrace.phaseSynthesis");
+  const actions = value.match(/^actions=(\d+)$/);
+  if (actions?.[1]) return translate("logs.routeTrace.actions", { count: actions[1] });
+  const sources = value.match(/^sources=(\d+)$/);
+  if (sources?.[1]) return translate("logs.routeTrace.sources", { count: sources[1] });
+  const evidence = value.match(/^evidence=(\d+)$/);
+  if (evidence?.[1]) return translate("logs.routeTrace.evidence", { value: evidence[1] });
+  const continuationEvidence = value.match(/^continuation_evidence=(\d+)$/);
+  if (continuationEvidence?.[1]) return translate("logs.routeTrace.continuationEvidence", { value: continuationEvidence[1] });
+  const input = value.match(/^input=(\d+)$/);
+  if (input?.[1]) return translate("logs.routeTrace.input", { value: input[1] });
+  const outputLimit = value.match(/^output_limit=(\d+)$/);
+  if (outputLimit?.[1]) return translate("logs.routeTrace.outputLimit", { value: outputLimit[1] });
+  const queries = value.match(/^queries=(\d+)$/);
+  if (queries?.[1]) return translate("logs.routeTrace.queries", { count: queries[1] });
+  const nextActions = value.match(/^next_actions=(\d+)$/);
+  if (nextActions?.[1]) return translate("logs.routeTrace.nextActions", { count: nextActions[1] });
+  const nextQueries = value.match(/^next_queries=(\d+)$/);
+  if (nextQueries?.[1]) return translate("logs.routeTrace.nextQueries", { count: nextQueries[1] });
+  const failures = value.match(/^failures=(\d+)$/);
+  if (failures?.[1]) return translate("logs.routeTrace.failures", { value: failures[1] });
+  const threshold = value.match(/^threshold=(\d+)$/);
+  if (threshold?.[1]) return translate("logs.routeTrace.threshold", { value: threshold[1] });
+  const timeout = value.match(/^timeout=(.+)s$/);
+  if (timeout?.[1]) return translate("logs.routeTrace.timeout", { value: timeout[1] });
+  const buffered = value.match(/^buffered=(\d+)$/);
+  if (buffered?.[1]) return translate("logs.routeTrace.buffered", { value: buffered[1] });
+  if (value === "saw_chunk=true") return translate("logs.routeTrace.hasOutput");
+  if (value === "saw_chunk=false") return translate("logs.routeTrace.noOutput");
+  const serviceTier = value.match(/^service_tier=(.+)$/);
+  if (serviceTier?.[1]) return translate("logs.routeTrace.serviceTier", { value: routeTraceServiceTierLabel(serviceTier[1], translate) });
+  const order = value.match(/^order=(.+)$/);
+  if (order?.[1]) return translate("logs.routeTrace.order", { value: order[1] });
+  const cooldown = value.match(/^cooldown=(.+)s$/);
+  if (cooldown?.[1]) return translate("logs.routeTrace.cooldown", { value: cooldown[1] });
+  const round = value.match(/^round=(.+)$/);
+  if (round?.[1]) return translate("logs.routeTrace.round", { value: round[1] });
+  const reason = value.match(/^reason=(.+)$/);
+  if (reason?.[1]) return routeTraceReasonLabel(reason[1], translate);
+  if (value === "upstream-auth-or-balance") return translate("logs.routeTrace.upstreamAuth");
+  const upstreamStatus = value.match(/^upstream-status-(\d+)$/);
+  if (upstreamStatus?.[1]) return translate("logs.routeTrace.upstreamStatus", { status: upstreamStatus[1] });
+  return "";
+}
+
+function routeTraceDetailLabel(value: string, translate: Translate): string {
+  const details = value.split(" · ").map((part) => routeTraceDetailPartLabel(part, translate)).filter(Boolean);
+  return details.join(" · ");
+}
+
+function recoveryStatusLabel(value: string, translate: Translate): string {
+  const labels: Record<string, Parameters<Translate>[0]> = {
+    waiting: "logs.recoveryStatus.waiting",
+    polling: "logs.recoveryStatus.polling",
+    success: "logs.recoveryStatus.success",
+    succeeded: "logs.recoveryStatus.success",
+    failure: "logs.recoveryStatus.failed",
+    failed: "logs.recoveryStatus.failed",
+    error: "logs.recoveryStatus.failed",
+  };
+  const normalized = value.trim().toLowerCase();
+  return normalized ? translate(labels[normalized] ?? "logs.recoveryStatus.other") : "";
+}
+
+function recoveryDetailLabel(value: string, translate: Translate): string {
+  const reasonLabels: Record<string, Parameters<Translate>[0]> = {
+    billing: "logs.recoveryReason.billing",
+    authentication: "logs.recoveryReason.authentication",
+    network: "logs.recoveryReason.network",
+    rate_limit: "logs.recoveryReason.rateLimit",
+    timeout: "logs.recoveryReason.timeout",
+    unknown: "logs.recoveryReason.unknown",
+  };
+  return value.split(" · ").map((part) => {
+    const attempt = part.match(/^attempt=(.+)$/);
+    if (attempt?.[1]) return translate("logs.recoveryDetail.attempt", { value: attempt[1] });
+    const timeout = part.match(/^timeout=(.+)s$/);
+    if (timeout?.[1]) return translate("logs.recoveryDetail.timeout", { value: timeout[1] });
+    const cooldown = part.match(/^cooldown=(.+)s$/);
+    if (cooldown?.[1]) return translate("logs.recoveryDetail.cooldown", { value: cooldown[1] });
+    const retry = part.match(/^retry=(.+)s$/);
+    if (retry?.[1]) return translate("logs.recoveryDetail.retry", { value: retry[1] });
+    const reason = part.match(/^reason=(.+)$/);
+    if (reason?.[1]) return translate(reasonLabels[reason[1]] ?? "logs.recoveryReason.unknown");
+    return "";
+  }).filter(Boolean).join(" · ");
 }
 
 function logErrorDetail(value: unknown): string {
@@ -1896,7 +2291,7 @@ function parseTextLogRecord(record: string, tab: LogTab, index: number, translat
       detail = `${leadingTimestamp[1] ?? ""}${leadingTimestamp[3] ?? ""}`.trim();
     }
   }
-  let source = tab === "service" ? "" : logTitle(tab, translate);
+  let source = logTitle(tab, translate);
   let status = "";
   let model = "";
   let tokens = "";
@@ -1932,7 +2327,7 @@ function parseTextLogRecord(record: string, tab: LogTab, index: number, translat
     }
   }
   const action = tab === "menu" ? detail.split(/[:;,]/, 1)[0]?.trim() ?? "" : "";
-  return { key: `${tab}:${index}:${record}`, time, source, status, model, provider: "", apiKeyName: "", event: "", action, duration: "", tokens, detail, original: record };
+  return { key: `${tab}:${index}:${record}`, time, source, status, model, upstreamModel: "", provider: "", apiKeyName: "", event: "", action, duration: "", tokens, detail, original: record };
 }
 
 function renderLogRecord(record: unknown, tab: LogTab, index: number, translate: Translate): RenderedLogRecord {
@@ -1941,10 +2336,16 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const time = shortLogTimestamp(value.ts ?? value.timestamp ?? value.time ?? value.created_at ?? value.updated_at ?? value.checked_at);
   const provider = compactLogValue(value.provider);
   const apiKeyName = compactLogValue(value.api_key_name);
-  const model = compactLogValue(value.model_group ?? value.public_model ?? value.upstream_model ?? value.model);
+  const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);
+  const upstreamModel = compactLogValue(value.upstream_model);
+  const model = publicModel || upstreamModel;
   const source = compactLogValue(value.source ?? value.route_key) || provider || logTitle(tab, translate);
-  const status = compactLogValue(value.status ?? value.result) || (value.error ? translate("logs.failed") : "");
-  const event = compactLogValue(value.event);
+  const rawStatus = compactLogValue(value.status ?? value.result);
+  const status = tab === "recovery"
+    ? recoveryStatusLabel(rawStatus, translate)
+    : rawStatus || (value.error ? translate("logs.failed") : "");
+  const rawEvent = compactLogValue(value.event);
+  const event = tab === "route-trace" ? routeTraceEventLabel(rawEvent, translate) : rawEvent;
   const action = compactLogValue(value.action);
   const duration = compactLogValue(value.duration_ms);
   const usage = asRecord(value.usage);
@@ -1953,14 +2354,34 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const directDetail = value.error === undefined
     ? compactLogValue(value.detail ?? value.message)
     : logErrorDetail(value.error);
-  if (directDetail) details.push(directDetail);
+  if (directDetail) details.push(
+    tab === "route-trace"
+      ? routeTraceDetailLabel(directDetail, translate)
+      : tab === "recovery" ? recoveryDetailLabel(directDetail, translate) : directDetail,
+  );
   const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "status", "result", "detail", "message", "event", "action", "error", "upstream_model", "model", "duration_ms", "usage", "total_tokens"]);
   for (const [key, item] of Object.entries(value)) {
     if (used.has(key)) continue;
     const display = compactLogValue(item);
     if (display) details.push(`${key}: ${display}`);
   }
-  return { key: `${tab}:${index}:${time}:${source}:${status}:${details.join(" ")}`, time, source, status, model, provider, apiKeyName, event, action, duration, tokens, detail: details.join(" · "), original: safeOriginalLogRecord(record) };
+  const recoveryFallback = tab === "recovery" ? translate("common.notAvailable") : "";
+  return {
+    key: `${tab}:${index}:${time}:${source}:${status}:${details.join(" ")}`,
+    time,
+    source,
+    status,
+    model: model || recoveryFallback,
+    upstreamModel: compactUpstreamLogModel(upstreamModel) || recoveryFallback,
+    provider: provider || recoveryFallback,
+    apiKeyName: apiKeyName || recoveryFallback,
+    event,
+    action,
+    duration,
+    tokens,
+    detail: details.filter(Boolean).join(" · "),
+    original: safeOriginalLogRecord(record),
+  };
 }
 
 function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
@@ -1969,7 +2390,8 @@ function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
   const detail = { label: translate("logs.detail"), width: 230, value: (row: RenderedLogRecord) => row.detail };
   if (tab === "requests") return [
     time,
-    { label: translate("common.model"), width: 105, value: (row) => row.model },
+    { label: translate("providers.publicModel"), width: 126, value: (row) => row.model },
+    { label: translate("providers.upstream"), width: 126, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 70, value: (row) => row.provider },
     { label: translate("logs.apiKeyName"), width: 90, value: (row) => row.apiKeyName },
     status,
@@ -1978,24 +2400,26 @@ function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
     detail,
   ];
   if (tab === "route-trace") return [
-    time,
-    { label: translate("logs.event"), width: 130, value: (row) => row.event },
-    { label: translate("common.model"), width: 108, value: (row) => row.model },
-    { label: translate("common.provider"), width: 82, value: (row) => row.provider },
-    status,
-    detail,
+    { ...time, width: 154 },
+    { label: translate("logs.event"), width: 142, value: (row) => row.event },
+    { label: translate("providers.publicModel"), width: 130, value: (row) => row.model },
+    { label: translate("providers.upstream"), width: 130, value: (row) => row.upstreamModel },
+    { label: translate("common.provider"), width: 104, value: (row) => row.provider },
+    { ...detail, width: 192 },
   ];
   if (tab === "menu") return [
     time,
     { label: translate("logs.action"), width: 112, value: (row) => row.action },
     status,
-    { ...detail, width: 490 },
   ];
   if (tab === "recovery") return [
     time,
-    { label: translate("common.model"), width: 126, value: (row) => row.model },
-    status,
-    { ...detail, width: 458 },
+    { label: translate("providers.publicModel"), width: 126, value: (row) => row.model },
+    { label: translate("providers.upstream"), width: 126, value: (row) => row.upstreamModel },
+    { label: translate("common.provider"), width: 104, value: (row) => row.provider },
+    { label: translate("logs.apiKeyName"), width: 100, value: (row) => row.apiKeyName },
+    { ...status, width: 76 },
+    { ...detail, width: 260 },
   ];
   if (tab === "online-usage") return [
     time,
@@ -2044,7 +2468,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     return () => { mounted = false; clearInterval(interval); };
   }, [ipc, selected]);
   const rows = (active?.records ?? []).map((record, index) => renderLogRecord(record, selected, index, translate));
-  const columns = logColumns(selected, translate).filter((column) => rows.some((row) => column.value(row).trim().length > 0));
+  const columns = logColumns(selected, translate);
   const tabOptions = LOG_TABS.map((tab) => ({ id: tab, title: logTitle(tab, translate) }));
   const lineCount = active?.line_count ?? rows.length;
   const statusParts = [
@@ -2134,7 +2558,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     {rows.length > 0 ? <NativeTable columns={columns.map(({ label, width }) => ({ label, width }))} rows={rows.map((row) => ({ key: row.key, cells: columns.map((column) => column.value(row)) }))} compact followBottom onRowDoublePress={(_key, index) => {
       const row = rows[index];
       if (!row) return;
-      void native.showConfirmation({ title: translate("logs.originalRecord"), message: row.original, confirmLabel: translate("common.ok") });
+      void native.showReadOnlyText({ title: translate("logs.originalRecord"), text: row.original, closeLabel: translate("menu.close") });
     }} style={styles.logTable} /> : <View style={styles.logEmptySurface}><Text style={styles.logEmptyText}>{active ? translate("logs.empty") : translate("logs.loading")}</Text></View>}
     <View style={styles.logInfoBar}><Text numberOfLines={1} style={styles.cardHint}>{statusParts.join(" · ")}</Text></View>
   </View>;
@@ -2297,8 +2721,39 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
   const [staged, setStaged] = useState(false);
   const [error, setError] = useState<string>();
   const [reloadNonce, setReloadNonce] = useState(0);
+  const registry = useContext(PendingFieldContext);
+  const fieldId = useRef(Symbol(`${domain}:${document}:raw`));
+  const nativeStatusRef = useRef<string | undefined>(undefined);
+  const pendingCommit = useRef<{ promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void } | undefined>(undefined);
+  const commit = useCallback((): Promise<void> => {
+    if (nativeStatusRef.current !== "dirty" && nativeStatusRef.current !== "saving") return Promise.resolve();
+    if (pendingCommit.current) return pendingCommit.current.promise;
+    let resolvePromise!: () => void;
+    let rejectPromise!: (reason: Error) => void;
+    const promise = new Promise<void>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    pendingCommit.current = { promise, resolve: resolvePromise, reject: rejectPromise };
+    return promise;
+  }, []);
+  const reset = useCallback((): void => {
+    pendingCommit.current?.resolve();
+    pendingCommit.current = undefined;
+    nativeStatusRef.current = "ready";
+    registry?.setDirty(fieldId.current, false);
+  }, [registry]);
+  useEffect(() => {
+    registry?.register(fieldId.current, { commit, reset, isDirty: () => nativeStatusRef.current === "dirty" || nativeStatusRef.current === "saving" });
+    return () => {
+      pendingCommit.current?.resolve();
+      pendingCommit.current = undefined;
+      registry?.register(fieldId.current);
+    };
+  }, [commit, registry, reset]);
   useEffect(() => {
     let active = true;
+    reset();
     setEditorToken(undefined);
     setLoading(true);
     setNativeStatus(undefined);
@@ -2315,7 +2770,7 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
       setError(translate("error.coreUnavailable"));
     });
     return () => { active = false; };
-  }, [document, domain, ipc, reloadNonce, reloadToken, translate]);
+  }, [document, domain, ipc, reloadNonce, reloadToken, reset, translate]);
   const reloadEditor = (): void => {
     if (nativeStatus === "dirty" || nativeStatus === "saving" || nativeErrorCode === "stage_failed" || nativeErrorCode === "invalid_text") return;
     setReloadNonce((value) => value + 1);
@@ -2323,33 +2778,10 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
   const nativeLoading = editorToken !== undefined && (nativeStatus === undefined || nativeStatus === "loading");
   const nativeReadFailed = nativeStatus === "error" && nativeErrorCode !== "stage_failed" && nativeErrorCode !== "invalid_text";
   const reloadDisabled = busy || loading || nativeLoading || nativeStatus === "dirty" || nativeStatus === "saving" || nativeErrorCode === "stage_failed" || nativeErrorCode === "invalid_text";
-  return <View style={[styles.rawEditor, codexPane && styles.codexRawEditorBase, style]}><View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}><Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text>{showReload ? <ActionButton title={translate("menu.reload")} disabled={reloadDisabled} onPress={reloadEditor} /> : null}</View>{codexPane ? null : <Text style={styles.fieldHint}>{translate("settings.rawProtectedHint")}</Text>}{editorToken ? <View style={styles.rawNativeEditorFrame}><NativeSecureTextEditor editorToken={editorToken} language={language} unavailableLabel={translate("common.secureEditorUnavailable")} style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]} onEditorState={({ status, error: nextNativeErrorCode }) => { setNativeStatus(status); setStaged(status === "saved"); setNativeErrorCode(nextNativeErrorCode || undefined); if (!nextNativeErrorCode) { setError(undefined); return; } setError(nextNativeErrorCode === "stage_failed" ? translate("common.secureEditorStageFailed") : nextNativeErrorCode === "invalid_text" ? translate("common.invalidText") : translate("common.secureEditorReadFailed")); }} />{nativeLoading ? <View pointerEvents="none" style={styles.rawEditorOverlay}><Text style={styles.cardHint}>{translate("common.secureEditorLoading")}</Text></View> : null}{nativeReadFailed ? <View style={styles.rawEditorOverlay}><Text style={styles.error}>{error ?? translate("common.secureEditorReadFailed")}</Text><ActionButton title={translate("menu.reload")} disabled={busy} onPress={reloadEditor} /></View> : null}</View> : <View style={[styles.rawEditorLoading, codexPane && styles.codexRawEditorLoading]}><Text style={styles.cardHint}>{loading ? translate("common.loading") : translate("error.coreUnavailable")}</Text></View>}{staged ? <Text style={styles.result}>{translate("common.staged")}</Text> : null}{error && editorToken && !nativeReadFailed ? <Text style={styles.error}>{error}</Text> : null}</View>;
+  return <View style={[styles.rawEditor, codexPane && styles.codexRawEditorBase, style]}><View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}><Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text>{showReload ? <ActionButton title={translate("menu.reload")} disabled={reloadDisabled} onPress={reloadEditor} /> : null}</View>{codexPane ? null : <Text style={styles.fieldHint}>{translate("settings.rawProtectedHint")}</Text>}{editorToken ? <View style={styles.rawNativeEditorFrame}><NativeSecureTextEditor editorToken={editorToken} language={language} unavailableLabel={translate("common.secureEditorUnavailable")} style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]} onEditorState={({ status, error: nextNativeErrorCode }) => { nativeStatusRef.current = status; setNativeStatus(status); setStaged(status === "saved"); setNativeErrorCode(nextNativeErrorCode || undefined); const pending = pendingCommit.current; if (status === "dirty" || status === "saving") registry?.setDirty(fieldId.current, true); else { registry?.setDirty(fieldId.current, false); if (pending) { pendingCommit.current = undefined; if (status === "error") pending.reject(new Error(nextNativeErrorCode || "Raw editor could not be staged")); else pending.resolve(); } } if (!nextNativeErrorCode) { setError(undefined); return; } setError(nextNativeErrorCode === "stage_failed" ? translate("common.secureEditorStageFailed") : nextNativeErrorCode === "invalid_text" ? translate("common.invalidText") : translate("common.secureEditorReadFailed")); }} />{nativeLoading ? <View pointerEvents="none" style={styles.rawEditorOverlay}><Text style={styles.cardHint}>{translate("common.secureEditorLoading")}</Text></View> : null}{nativeReadFailed ? <View style={styles.rawEditorOverlay}><Text style={styles.error}>{error ?? translate("common.secureEditorReadFailed")}</Text><ActionButton title={translate("menu.reload")} disabled={busy} onPress={reloadEditor} /></View> : null}</View> : <View style={[styles.rawEditorLoading, codexPane && styles.codexRawEditorLoading]}><Text style={styles.cardHint}>{loading ? translate("common.loading") : translate("error.coreUnavailable")}</Text></View>}{staged ? <Text style={styles.result}>{translate("common.staged")}</Text> : null}{error && editorToken && !nativeReadFailed ? <Text style={styles.error}>{error}</Text> : null}</View>;
 }
 
 function InfoPair({ label, value, toolTip }: { label: string; value: string; toolTip?: string }): React.JSX.Element { return <View style={styles.infoPair}><Text style={styles.fieldLabel}>{label}</Text><Text style={styles.cardHint} accessibilityHint={toolTip}>{value}</Text></View>; }
-
-function InspectorInfoRow({ label, value, toolTip }: { label: string; value: string; toolTip?: string }): React.JSX.Element { return <View style={styles.inspectorInfoRow}><Text style={styles.inspectorInfoLabel}>{label}</Text><Text style={styles.inspectorInfoValue} accessibilityHint={toolTip}>{value}</Text></View>; }
-
-function compactNumber(value: number): string {
-  const absolute = Math.abs(value);
-  const [scaled, suffix] = absolute >= 1_000_000_000 ? [value / 1_000_000_000, "B"] : absolute >= 1_000_000 ? [value / 1_000_000, "M"] : absolute >= 1_000 ? [value / 1_000, "K"] : [value, ""];
-  return `${Number.isInteger(scaled) ? scaled.toFixed(0) : scaled.toFixed(2)}${suffix}`;
-}
-
-function billingBalanceValue(value: unknown, translate: Translate): string {
-  const balance = asRecord(asRecord(value).balance);
-  const number = numberValue(balance.value, Number.NaN);
-  if (!Number.isFinite(number) || number < 0 || (stringValue(balance.kind) !== "balance" && stringValue(balance.kind) !== "remaining_quota")) return translate("providers.billingUnavailable");
-  return [compactNumber(number), stringValue(balance.unit)].filter(Boolean).join(" ");
-}
-
-function billingUsageValue(value: unknown, translate: Translate): string {
-  const usage = asRecord(value);
-  const used = numberValue(usage.used, Number.NaN);
-  const limit = numberValue(usage.limit, Number.NaN);
-  if (!Number.isFinite(used) || !Number.isFinite(limit)) return translate("providers.billingUnavailable");
-  return `${compactNumber(used)} / ${compactNumber(limit)}${stringValue(usage.unit) ? ` ${stringValue(usage.unit)}` : ""}`;
-}
 
 function billingMultiplierValue(value: unknown, translate: Translate): string {
   const multiplier = asRecord(value);
@@ -2357,30 +2789,42 @@ function billingMultiplierValue(value: unknown, translate: Translate): string {
   return stringValue(multiplier.status) === "ok" && Number.isFinite(number) ? `${number.toFixed(2)}x` : translate("providers.billingUnavailable");
 }
 
-function modelProbeInfo(model: UnknownRecord, translate: Translate): { available: string; responses: string; recommended: string } {
-  const probe = asRecord(model.probe);
+function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"] | undefined, translate: Translate): { compact: string; full: string } {
+  const resultRecord = result as UnknownRecord | undefined;
+  const probe = resultRecord ?? asRecord(model.probe);
   if (Object.keys(probe).length === 0) {
-    return {
-      available: translate("providers.probeNotRun"),
-      responses: translate("providers.probeNotRun"),
-      recommended: translate("providers.probeNotRun"),
-    };
+    const text = translate("providers.probeNotRun");
+    return { compact: text, full: text };
   }
-  const surfaces = asRecord(probe.surfaces);
-  const responses = asRecord(surfaces["openai/responses"]);
-  const availability = booleanValue(probe.available)
-    ? translate("providers.probeAvailable")
-    : translate("providers.probeUnavailable");
-  const responsesAvailability = Object.keys(responses).length === 0
-    ? translate("providers.probeNotRun")
-    : booleanValue(responses.available)
-      ? translate("providers.probeAvailable")
-      : translate("providers.probeUnavailable");
-  return {
-    available: availability,
-    responses: responsesAvailability,
-    recommended: probeSurfaceLabel(stringValue(probe.recommended_surface), translate),
-  };
+  const surfaces: Array<{ surface: string; available?: boolean; status?: string; original_request?: unknown }> = result?.surfaces
+    ?? Object.entries(asRecord(probe.surfaces)).map(([surface, value]) => ({
+      surface,
+      available: booleanValue(asRecord(value).available),
+      status: stringValue(asRecord(value).status),
+      original_request: asRecord(value).original_request,
+    }));
+  const availableSurfaces = surfaces
+    .filter((surface) => surface.available === true)
+    .map((surface) => probeSurfaceLabel(surface.surface, translate));
+  const availabilitySummary = availableSurfaces.length > 0
+    ? translate("providers.probeSummaryAvailable", { surfaces: availableSurfaces.join("、") })
+    : translate("providers.probeSummaryUnavailable");
+  const summaryRecord = asRecord(probe.summary);
+  const statuses = Object.entries(asRecord(summaryRecord.statuses))
+    .map(([surface, status]) => `${probeSurfaceLabel(surface, translate)}: ${stringValue(status, "unavailable")}`)
+    .join("；");
+  const summary = [availabilitySummary, statuses].filter(Boolean).join("；");
+  const requests = surfaces.map((surface) => ({
+    surface: surface.surface,
+    status: surface.status ?? "unavailable",
+    original_request: surface.original_request ?? {},
+  }));
+  const compactRequest = requests.length > 0
+    ? requests.map((item) => `${item.surface}: ${stringValue(asRecord(item.original_request).url) || translate("common.none")}`).join("；")
+    : result?.detail ?? "";
+  const compact = [summary, compactRequest ? translate("providers.probeOriginalRequest", { request: compactRequest }) : ""].filter(Boolean).join("\n");
+  const full = [summary, result?.detail ?? "", translate("providers.probeOriginalRequest", { request: JSON.stringify(requests, null, 2) })].filter(Boolean).join("\n\n");
+  return { compact, full };
 }
 
 function probeSurfaceLabel(surface: string, translate: Translate): string {
@@ -2388,32 +2832,6 @@ function probeSurfaceLabel(surface: string, translate: Translate): string {
   if (surface === "openai/chat") return translate("providers.chat");
   if (surface === "anthropic") return translate("providers.anthropic");
   return translate("providers.probeNotRun");
-}
-
-function billingStatusText(status: string, translate: Translate): string {
-  return translate(({
-    ok: "providers.billingLive", partial: "providers.billingPartial", timeout: "providers.billingTimedOut",
-    network_error: "providers.billingOffline", auth_error: "providers.billingAuthError",
-    rate_limited: "providers.billingRateLimited", http_error: "providers.billingHttpError",
-    credential_unavailable: "providers.billingNoCredential", permission_required: "providers.billingPermissionRequired",
-    invalid_config: "providers.billingInvalidConfig", unsupported: "providers.billingUnavailable",
-  } as Record<string, string>)[status] ?? "providers.billingUnavailable");
-}
-
-function billingToolTip(model: UnknownRecord, translate: Translate): string | undefined {
-  const billing = asRecord(model.billing);
-  if (Object.keys(billing).length === 0) return undefined;
-  const status = stringValue(billing.status);
-  const unavailable = translate("providers.billingUnavailable");
-  const balance = billingBalanceValue(billing, translate);
-  const usage = billingUsageValue(model.usage, translate);
-  const multiplier = billingMultiplierValue(model.multiplier, translate);
-  return [
-    translate("providers.billingStatus", { status: billingStatusText(status, translate) }),
-    balance !== unavailable ? `${translate("providers.balance")}: ${balance}` : stringValue(billing.detail),
-    usage !== unavailable ? `${translate("common.usage")}: ${usage}` : "",
-    multiplier !== unavailable ? `${translate("providers.multiplier")}: ${multiplier}` : "",
-  ].filter(Boolean).join("\n") || undefined;
 }
 
 function IssueList({ issues, translate }: { issues: ValidationSummary["issues"]; translate: Translate }): React.JSX.Element {
@@ -2467,7 +2885,7 @@ const styles = StyleSheet.create({
   footer: { height: 60, minHeight: 60, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 20, paddingVertical: 12, gap: 8 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: 12, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 },
   providerToolbar: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 28 }, settingsTabBar: { minHeight: 42, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsTabs: { alignSelf: "flex-start", width: 250 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   routeWorkspaceWithInspector: { flexDirection: "row", gap: 12 }, routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
-  providersLayout: { flex: 1, minHeight: 0, gap: 8 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerLeftColumn: { flex: 1, minWidth: 0 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 12 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, importSourcePicker: { width: 152, height: 26 }, fetchKeyPicker: { width: 190, height: 26, marginRight: 8, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 190, minWidth: 190, maxWidth: 190, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 464 }, providerInspectorPane: { minWidth: 340 }, tablePane: { flex: 1, minWidth: 0, gap: 8 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 28, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: 13, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 8 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: 17 }, tableHeader: { height: 28, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: 12, paddingHorizontal: 8, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 28, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: 13, paddingHorizontal: 8 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 118 }, modelUpstreamColumn: { flex: 1, minWidth: 120 }, modelBillingColumn: { width: 112 }, routeModelColumn: { width: 170 }, routeOrderColumn: { width: 56, textAlign: "right" }, routeProviderColumn: { width: 130 }, routeUpstreamColumn: { flex: 1, minWidth: 164 }, tableBottomRow: { minHeight: 30, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 340, minWidth: 340, maxWidth: 340, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 4, paddingHorizontal: 14, paddingRight: 10, paddingBottom: 16, gap: 10 }, providerEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: 13, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 4, gap: 10 }, providerEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center" }, inspectorContent: { paddingTop: 4, paddingHorizontal: 14, paddingRight: 6, paddingBottom: 16, gap: 10 }, inspectorBody: { gap: 10 }, modelBreadcrumb: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 5 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: 13, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: 13 }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: 13 }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, billingGrid: { gap: 5, paddingVertical: 4 }, inspectorInfoRow: { minHeight: 20, flexDirection: "row", alignItems: "center", gap: 8 }, inspectorInfoLabel: { width: 96, color: systemColors.label, fontSize: 12 }, inspectorInfoValue: { color: systemColors.secondaryLabel, fontSize: 12 }, protocolField: { gap: 4 }, protocolFieldLabel: { width: 96, color: systemColors.label, fontSize: 12 }, protocolRows: { gap: 4 }, protocolRank: { width: 20, textAlign: "right", color: systemColors.secondaryLabel, fontSize: 12 }, protocolCheckbox: { flex: 1, minWidth: 112 }, providerKeysEditor: { gap: 7 }, providerKeysHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: 12, fontWeight: "600" }, providerKeyGrid: { flex: 1, minHeight: 142, flexDirection: "row", alignItems: "flex-start", gap: 12 }, providerKeyTable: { width: 138, minWidth: 138, maxWidth: 138, height: 142, minHeight: 142, flexShrink: 0 }, providerKeyFields: { flex: 1, minWidth: 0, gap: 8 }, providerKeyActions: { flexDirection: "row", gap: 6, flexShrink: 0 },
+  providersLayout: { flex: 1, minHeight: 0, gap: 8 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerLeftColumn: { flex: 1, minWidth: 0 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 12 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, importSourcePicker: { width: 152, height: 26 }, fetchKeyPicker: { width: 190, height: 26, marginRight: 8, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 190, minWidth: 190, maxWidth: 190, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 464 }, providerInspectorPane: { minWidth: 340 }, tablePane: { flex: 1, minWidth: 0, gap: 8 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 28, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: 13, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 8 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: 17 }, tableHeader: { height: 28, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: 12, paddingHorizontal: 8, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 28, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: 13, paddingHorizontal: 8 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 118 }, modelUpstreamColumn: { flex: 1, minWidth: 120 }, modelBillingColumn: { width: 112 }, routeModelColumn: { width: 170 }, routeOrderColumn: { width: 56, textAlign: "right" }, routeProviderColumn: { width: 130 }, routeUpstreamColumn: { flex: 1, minWidth: 164 }, tableBottomRow: { minHeight: 30, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 340, minWidth: 340, maxWidth: 340, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 4, paddingHorizontal: 14, paddingRight: 10, paddingBottom: 16, gap: 10 }, providerEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: 13, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 4, gap: 10 }, providerEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center" }, inspectorContent: { paddingTop: 4, paddingHorizontal: 14, paddingRight: 6, paddingBottom: 16, gap: 10 }, inspectorBody: { gap: 10 }, modelBreadcrumb: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 5 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: 13, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: 13 }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: 13 }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, inspectorEnableControl: { flexShrink: 0 }, probeSummary: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: 12 }, billingSummaryText: { color: systemColors.secondaryLabel, fontSize: 12, paddingVertical: 4 }, protocolField: { gap: 4 }, protocolFieldLabel: { width: 96, color: systemColors.label, fontSize: 12 }, protocolRows: { gap: 4 }, protocolRank: { width: 20, textAlign: "right", color: systemColors.secondaryLabel, fontSize: 12 }, protocolCheckbox: { flex: 1, minWidth: 112 }, providerKeysEditor: { gap: 7 }, providerKeysHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: 12, fontWeight: "600" }, providerKeyGrid: { flex: 1, minHeight: 142, flexDirection: "row", alignItems: "flex-start", gap: 12 }, providerKeyTable: { width: 138, minWidth: 138, maxWidth: 138, height: 142, minHeight: 142, flexShrink: 0 }, providerKeyFields: { flex: 1, minWidth: 0, gap: 8 }, providerKeyActions: { flexDirection: "row", gap: 6, flexShrink: 0 },
   codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: 12 }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: 12 }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, codexSplit: { flex: 1, minWidth: 0, minHeight: 0 }, codexStructuredPane: { flex: 1, minWidth: 360, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructured: { flexGrow: 1, gap: 14, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 16 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: 14, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: 13, fontWeight: "600" }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, listToolRail: { width: 32, paddingTop: 8, alignItems: "center", gap: 5, borderLeftWidth: 1, borderLeftColor: systemColors.separator }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeFileToolbar: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, runtimeFieldLabel: { width: 142, flexShrink: 0, color: systemColors.label, fontSize: 12, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanSlot: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center" }, runtimeBooleanControl: { alignSelf: "flex-start", minHeight: 26 }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: 12 }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 150, paddingTop: 4 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: 11, lineHeight: 15 },
   webDavForm: { flex: 1, gap: 14, paddingTop: 0 }, webdavStateRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 12, paddingBottom: 4, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, webdavEnabledControl: { width: 190, flexGrow: 0, flexShrink: 0 }, webdavInlineStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: 12 }, webdavFormRows: { gap: 10 }, webdavWideControl: { flex: 1, minWidth: 0 }, webdavPasswordInput: { width: "100%", minHeight: 30 }, webdavFooterLeading: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 10, flex: 1, minWidth: 0 }, webdavProbeStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: 12 },

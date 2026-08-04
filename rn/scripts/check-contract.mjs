@@ -88,7 +88,10 @@ function schemaType(schema) {
   if (value?.type === "integer" || value?.type === "number") return "number";
   if (value?.type === "boolean") return "boolean";
   if (value?.type === "null") return "null";
-  if (value?.type === "array") return `${schemaType(value.items)}[]`;
+  if (value?.type === "array") {
+    const item = schemaType(value.items);
+    return item.includes("|") ? `(${item})[]` : `${item}[]`;
+  }
   if (value?.type !== "object") fail("schema cannot be converted to a TypeScript type");
   const required = new Set(value.required ?? []);
   const properties = value.properties ?? {};

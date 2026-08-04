@@ -4,6 +4,40 @@ from hook_test_utils import *
 
 
 class HookResponsesChatBridgeTests(HookTestCase):
+    def test_chat_bridge_removes_empty_nested_enum_from_tool_schema(self) -> None:
+        hooks, _ = load_hook_module()
+        tools, _, stats = hooks._responses_chat_bridge_sanitize_tools(
+            [
+                {
+                    "type": "function",
+                    "name": "update_plan",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "plan": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "status": {
+                                            "type": "string",
+                                            "enum": [],
+                                        }
+                                    },
+                                },
+                            }
+                        },
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(
+            tools[0]["parameters"]["properties"]["plan"]["items"]["properties"]["status"],
+            {"type": "string"},
+        )
+        self.assertTrue(stats["changed"])
+
     def test_chat_bridge_stream_payload_maps_responses_max_output_tokens(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -1123,6 +1157,14 @@ class HookResponsesChatBridgeTests(HookTestCase):
         )
         self.assertEqual(chunks[-1]["type"], "response.completed")
         self.assertEqual(chunks[-1]["response"]["output_text"], "hello")
+        message_starts = [
+            chunk["item"]
+            for chunk in chunks
+            if chunk.get("type") == "response.output_item.added"
+            and chunk.get("item", {}).get("type") == "message"
+        ]
+        self.assertEqual(message_starts[0]["phase"], "final_answer")
+        self.assertEqual(chunks[-1]["response"]["output"][0]["phase"], "final_answer")
         self.assertEqual(chunks[-1]["response"]["usage"]["input_tokens"], 4)
         self.assertEqual(chunks[-1]["response"]["usage"]["output_tokens"], 2)
 
@@ -1225,6 +1267,141 @@ class HookResponsesChatBridgeTests(HookTestCase):
         )
         self.assertEqual(tool_call["name"], "exec_command")
         self.assertEqual(tool_call["input"], "pwd")
+
+    async def test_selected_chat_route_sanitizes_responses_tools_when_chat_dispatch_is_set(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        class UnknownToolTypeError(Exception):
+            status_code = 400
+
+        tools = [
+            {
+                "type": "custom",
+                "name": "exec_command",
+                "description": "Run a local command.",
+            },
+            {
+                "type": "namespace",
+                "name": "codex_app",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "read_thread",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+            },
+        ]
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            if any(tool.get("type") in {"custom", "namespace"} for tool in kwargs["tools"]):
+                raise UnknownToolTypeError(
+                    "Unknown tool type: custom, currently only function and plugin are supported"
+                )
+            return {
+                "id": "resp_chat_dispatch",
+                "status": "completed",
+                "output_text": "ok",
+                "output": [
+                    {
+                        "id": "msg_chat_dispatch",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "ok",
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        request_kwargs = {
+            "original_generic_function": original_generic_function,
+            "call_type": "aresponses",
+            "model": "mapped-chat",
+            "input": "Reply with ok.",
+            "tools": tools,
+            "stream": True,
+        }
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="openai/chat-only-model",
+            input="Reply with ok.",
+            tools=tools,
+            stream=True,
+            use_chat_completions_api=True,
+            model_info={
+                "id": "chat-only-route",
+                "model_group": "mapped-chat",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+            _litellm_menu_upstream_url_surface="openai/chat",
+        )
+
+        self.assertEqual(response["output_text"], "ok")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["use_chat_completions_api"])
+        self.assertEqual(
+            {tool["name"] for tool in calls[0]["tools"]},
+            {"exec_command", "read_thread"},
+        )
+        self.assertTrue(all(tool["type"] == "function" for tool in calls[0]["tools"]))
+        metadata = calls[0]["litellm_metadata"]
+        self.assertTrue(metadata[hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY])
+        self.assertEqual(
+            metadata["responses_chat_bridge_preemptive_reason"],
+            "responses_endpoint_unsupported",
+        )
+        self.assertNotIn(hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY, metadata)
+
+    def test_selected_chat_route_does_not_retry_on_responses_function_surface(self) -> None:
+        hooks, _ = load_hook_module()
+
+        class UnknownToolTypeError(Exception):
+            status_code = 400
+
+        error = UnknownToolTypeError(
+            "Unknown tool type: custom, currently only function and plugin are supported"
+        )
+        selected_chat = {
+            "call_type": "aresponses",
+            "model": "openai/chat-only-model",
+            "input": "Reply with ok.",
+            "tools": [{"type": "custom", "name": "exec_command"}],
+            "stream": True,
+            "use_chat_completions_api": True,
+            "model_info": {
+                "id": "chat-only-route",
+                "model_group": "mapped-chat",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+        }
+        outer_responses = {
+            "call_type": "aresponses",
+            "model": "mapped-chat",
+            "input": "Reply with ok.",
+            "tools": [{"type": "custom", "name": "exec_command"}],
+            "stream": True,
+        }
+
+        self.assertIsNone(
+            hooks._responses_function_tool_bridge_retry_kwargs(
+                error,
+                selected_chat,
+                outer_responses,
+            )
+        )
 
     async def test_direct_chat_bridge_stream_error_after_text_yields_failed_event(self) -> None:
         hooks, proxy_server = load_hook_module()

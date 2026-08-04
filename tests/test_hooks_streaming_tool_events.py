@@ -1145,6 +1145,89 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertEqual(events[-1]["response"]["output"][0]["type"], "custom_tool_call")
         self.assertEqual(events[-1]["response"]["output"][0]["id"], "ctc_patch")
 
+    async def test_guarded_responses_stream_completes_finished_custom_tool_before_terminal_event(self) -> None:
+        hooks, _ = load_hook_module()
+
+        for terminal_type in ("response.failed", "response.incomplete"):
+            async def upstream_stream():
+                yield {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_patch",
+                        "object": "response",
+                        "status": "in_progress",
+                        "output": [],
+                    },
+                }
+                yield {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_patch",
+                        "call_id": "call_patch",
+                        "name": "apply_patch",
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                }
+                yield {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "fc_patch",
+                    "output_index": 0,
+                    "arguments": '{"input":"*** Begin Patch"}',
+                }
+                yield {
+                    "type": terminal_type,
+                    "response": {
+                        "id": "resp_patch",
+                        "status": "incomplete" if terminal_type == "response.incomplete" else "failed",
+                        "error": {
+                            "message": "upstream stopped before response.completed",
+                            **({"status_code": 500} if terminal_type == "response.failed" else {}),
+                        },
+                    },
+                }
+
+            request_data = {
+                "model": "default-chat",
+                "input": "edit a file",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "apply_patch",
+                        "parameters": {"type": "object"},
+                        hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY: True,
+                    }
+                ],
+            }
+
+            events = [
+                jsonable_stream_chunk(chunk)
+                async for chunk in hooks._yield_guarded_original_stream(
+                    [],
+                    upstream_stream(),
+                    request_data,
+                )
+            ]
+
+            self.assertEqual(
+                [event["type"] for event in events],
+                [
+                    "response.created",
+                    "response.output_item.added",
+                    "response.custom_tool_call_input.done",
+                    "response.output_item.done",
+                    "response.completed",
+                ],
+            )
+            self.assertEqual(events[-2]["item"]["type"], "custom_tool_call")
+            self.assertEqual(events[-2]["item"]["input"], "*** Begin Patch")
+            self.assertEqual(events[-2]["item"]["status"], "completed")
+            self.assertEqual(events[-1]["response"]["status"], "completed")
+            self.assertEqual(events[-1]["response"]["output"], [events[-2]["item"]])
+
     def test_completed_stream_output_does_not_duplicate_custom_tool_call_events(self) -> None:
         hooks, _ = load_hook_module()
         seen_item_ids: set[str] = set()

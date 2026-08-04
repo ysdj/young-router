@@ -41,26 +41,23 @@ from .security import REDACT_TEXT, safe_exception_message
 MAX_OPERATION_OUTPUT_BYTES = 128 * 1024
 MAX_USAGE_ROWS = 100
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
-OWNER_RECORD_VERSION = 1
+OWNER_RECORD_VERSION = 2
 OWNER_TOKEN_ENV = "LITELLM_MENU_SERVICE_OWNER_TOKEN"
+CORE_PID_ENV = "LITELLM_MENU_CORE_PID"
 OWNER_TOKEN_BYTES = 32
+MACOS_DEFAULT_WORKERS = "16"
+PROXY_STOP_GRACE_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
 class ServiceOwnerRecord:
-    """Private identity evidence for one managed LiteLLM child.
-
-    A Core process can be restarted while its managed service remains alive, so
-    the record cannot contain the Core PID as its proof of ownership.  The
-    service PID is instead paired with an OS-issued process-start identity and
-    a random token inherited by the child.  On POSIX the token is checked from
-    the live process environment; Windows uses its high-resolution creation
-    time, where an exact PID reuse cannot retain the same identity.
-    """
+    """Private identity evidence for one Core-owned LiteLLM child."""
 
     pid: int
     identity: str
     token: str
+    core_pid: int
+    core_identity: str
 
 
 def _runtime_root(value: Path | str | None = None) -> Path:
@@ -92,7 +89,6 @@ class RuntimePaths:
     config: Path
     runtime_config: Path
     settings: Path
-    state: Path
     pid: Path
     owner: Path
     autostart: Path
@@ -111,7 +107,6 @@ class RuntimePaths:
             config=Path(os.environ.get("LITELLM_CONFIG_FILE", base / "config.yaml")).expanduser(),
             runtime_config=Path(os.environ.get("LITELLM_RUNTIME_CONFIG", runtime / "config.yaml")).expanduser(),
             settings=Path(os.environ.get("LITELLM_MENU_RUNTIME_SETTINGS_FILE", base / "runtime-settings.env")).expanduser(),
-            state=Path(os.environ.get("LITELLM_STATE_FILE", base / ".litellm-runtime-state")).expanduser(),
             pid=Path(os.environ.get("LITELLM_NATIVE_PID_FILE", runtime / "litellm.pid")).expanduser(),
             owner=Path(os.environ.get("LITELLM_NATIVE_OWNER_FILE", runtime / "litellm.owner")).expanduser(),
             autostart=Path(os.environ.get("LITELLM_AUTOSTART_STATE_FILE", runtime / "autostart.enabled")).expanduser(),
@@ -294,11 +289,13 @@ class CoreServiceController:
             payload = read_json(self.paths.owner)
         except PersistenceError:
             return None
-        if set(payload) != {"version", "pid", "identity", "token"}:
+        if set(payload) != {"version", "pid", "identity", "token", "core_pid", "core_identity"}:
             return None
         pid = payload.get("pid")
         identity = payload.get("identity")
         token = payload.get("token")
+        core_pid = payload.get("core_pid")
+        core_identity = payload.get("core_identity")
         if (
             payload.get("version") != OWNER_RECORD_VERSION
             or type(pid) is not int
@@ -309,9 +306,27 @@ class CoreServiceController:
             or not isinstance(token, str)
             or len(token) < 32
             or len(token.encode("utf-8")) > 256
+            or type(core_pid) is not int
+            or core_pid <= 0
+            or not isinstance(core_identity, str)
+            or not core_identity
+            or len(core_identity.encode("utf-8")) > 160
         ):
             return None
-        return ServiceOwnerRecord(pid=pid, identity=identity, token=token)
+        return ServiceOwnerRecord(
+            pid=pid,
+            identity=identity,
+            token=token,
+            core_pid=core_pid,
+            core_identity=core_identity,
+        )
+
+    def _core_identity(self) -> tuple[int, str] | None:
+        core_pid = os.getpid()
+        identity = self._process_identity(core_pid)
+        if identity is None:
+            return None
+        return core_pid, identity
 
     def _write_owner_record(self, process: subprocess.Popen[bytes] | subprocess.Popen[str], token: str) -> None:
         # Popen has returned, but the child may need a few scheduler turns
@@ -327,6 +342,10 @@ class CoreServiceController:
             time.sleep(0.02)
         if identity is None:
             raise PersistenceError("LiteLLM service identity could not be recorded")
+        core = self._core_identity()
+        if core is None:
+            raise PersistenceError("Core process identity could not be recorded")
+        core_pid, core_identity = core
         atomic_write_json(
             self.paths.owner,
             {
@@ -334,8 +353,19 @@ class CoreServiceController:
                 "pid": process.pid,
                 "identity": identity,
                 "token": token,
+                "core_pid": core_pid,
+                "core_identity": core_identity,
             },
         )
+
+    def _remove_owner_files(self) -> None:
+        for path in (self.paths.pid, self.paths.owner):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
     def _configured_runtime_values(self, *, strict: bool) -> dict[str, str]:
         """Read only explicitly persisted, schema-validated environment values."""
@@ -364,12 +394,21 @@ class CoreServiceController:
         # This optional credential is file-owned: clearing it in Runtime
         # Settings must override an inherited host environment.
         env.pop("LITELLM_MENU_VISION_BRIDGE_API_KEY", None)
-        env.update(self._configured_runtime_values(strict=strict))
+        configured = self._configured_runtime_values(strict=strict)
+        # The native preview port is a host-owned isolation boundary. A
+        # persisted user setting must not redirect an isolated preview back
+        # onto production's 4000 listener.
+        forced_port = self._environment.get("LITELLM_PORT")
+        env.update(configured)
+        if forced_port is not None:
+            env["LITELLM_PORT"] = forced_port
         env["LITELLM_RUNTIME_ROOT"] = str(self.paths.root)
         env["LITELLM_CONFIG_FILE"] = str(self.paths.config)
         env["LITELLM_RUNTIME_CONFIG"] = str(self.paths.runtime_config)
         env["LITELLM_MENU_RUNTIME_SETTINGS_FILE"] = str(self.paths.settings)
         env["LITELLM_NATIVE_PID_FILE"] = str(self.paths.pid)
+        env["LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE"] = str(self.paths.recovery)
+        env["LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE"] = str(self.paths.cooldowns)
         # Keep request summaries beside the managed configuration for both
         # Finder-launched and terminal-launched Core processes.  The native
         # preview path sets this explicitly too; production must not rely on
@@ -391,6 +430,14 @@ class CoreServiceController:
         env["LITELLM_MENU_PROXY_PROCESS"] = "1"
         env["LITELLM_MENU_TIMESTAMP_OUTPUT"] = "1"
         env["LITELLM_MENU_SERVICE_LOG"] = str(self.paths.root / "menu-server.log")
+        env["LITELLM_WORKER_STARTUP_HOOKS"] = (
+            "litellm_menu.search_endpoint:register"
+        )
+        # The packaged LiteLLM already ships its model catalog.  Never make
+        # each of the sixteen macOS worker starts wait on a best-effort
+        # GitHub refresh before serving the local proxy.
+        env["LITELLM_LOCAL_MODEL_COST_MAP"] = "true"
+        env[CORE_PID_ENV] = str(os.getpid())
         return env
 
     def _configured_port(self, env: Mapping[str, str] | None = None) -> int:
@@ -402,7 +449,7 @@ class CoreServiceController:
             return 4000
         return port if 1 <= port <= 65535 else 4000
 
-    def _pid(self) -> int | None:
+    def _recorded_pid(self) -> int | None:
         try:
             raw = read_text(self.paths.pid)
             if raw is None:
@@ -418,6 +465,36 @@ class CoreServiceController:
         if identity is None or not secrets.compare_digest(identity, record.identity):
             return None
         if not self._posix_process_has_token(pid, record.token):
+            return None
+        return pid
+
+    def _pid(self) -> int | None:
+        """Return the proxy only when this exact Core owns it."""
+
+        pid = self._recorded_pid()
+        record = self._read_owner_record()
+        core = self._core_identity()
+        if pid is None or record is None or core is None:
+            return None
+        core_pid, core_identity = core
+        if record.core_pid != core_pid or not secrets.compare_digest(record.core_identity, core_identity):
+            return None
+        return pid
+
+    def _recorded_proxy_is_orphaned(self) -> int | None:
+        """Return only a verified proxy whose recorded Core has exited."""
+
+        pid = self._recorded_pid()
+        record = self._read_owner_record()
+        if pid is None or record is None:
+            return None
+        current_core = self._core_identity()
+        if current_core is not None:
+            current_pid, current_identity = current_core
+            if record.core_pid == current_pid and secrets.compare_digest(record.core_identity, current_identity):
+                return None
+        recorded_core_identity = self._process_identity(record.core_pid)
+        if recorded_core_identity is not None and secrets.compare_digest(recorded_core_identity, record.core_identity):
             return None
         return pid
 
@@ -452,19 +529,6 @@ class CoreServiceController:
         except Exception:
             raise RuntimeError("Provider/model configuration is invalid") from None
 
-    def _write_state(self, state: str) -> None:
-        if state not in SERVICE_STATES:
-            return
-        atomic_write_text(self.paths.state, f"{int(time.time())} {state}\n")
-
-    def _clear_state(self) -> None:
-        try:
-            self.paths.state.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
-
     def status(self) -> dict[str, Any]:
         pid = self._pid()
         port = self._configured_port()
@@ -473,18 +537,16 @@ class CoreServiceController:
             state = "running"
         elif pid is not None:
             state = "unhealthy"
+        elif self._recorded_proxy_is_orphaned() is not None:
+            # A verified child of a dead Core is recoverable by normal start;
+            # it is not an unrelated listener occupying the configured port.
+            state = "stopped"
         elif healthy:
             # A listener without this Core process's private ownership record
             # must never be stopped or adopted implicitly.
             state = "unknown"
         else:
             state = "stopped"
-            try:
-                stamp, prior = self.paths.state.read_text(encoding="utf-8").split(maxsplit=1)
-                if int(stamp) + 180 >= int(time.time()) and prior.strip() == "starting":
-                    state = "starting"
-            except (OSError, ValueError):
-                pass
         result: dict[str, Any] = {"state": state, "auto_start_state": self.autostart_status()}
         if pid is not None:
             result["pid"] = pid
@@ -521,18 +583,22 @@ class CoreServiceController:
         current = self.status()
         if current["state"] == "running":
             return current
+        orphaned_pid = self._recorded_proxy_is_orphaned()
+        if orphaned_pid is not None:
+            self._stop_process_group(orphaned_pid)
+            self._remove_owner_files()
+            current = self.status()
         if current["state"] == "unknown":
             raise RuntimeError("The configured LiteLLM port is already in use")
-        if current["state"] in {"starting", "unhealthy"}:
+        if current["state"] == "unhealthy":
             raise RuntimeError("A managed LiteLLM service is already active")
         self._stage_runtime_config()
         self.paths.runtime_config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._write_state("starting")
         environment = self._runtime_env()
         owner_token = secrets.token_urlsafe(OWNER_TOKEN_BYTES)
         environment[OWNER_TOKEN_ENV] = owner_token
         port = self._configured_port(environment)
-        workers = environment.get("LITELLM_NUM_WORKERS", "16")
+        workers = environment.get("LITELLM_NUM_WORKERS", MACOS_DEFAULT_WORKERS if sys.platform == "darwin" else "16")
         launcher = [self.litellm_bin]
         if os.name == "nt" and Path(self.litellm_bin).suffix.lower() in {".cmd", ".bat"}:
             # Packaged Windows installs expose a small command shim for users,
@@ -556,8 +622,9 @@ class CoreServiceController:
             "--telemetry",
             "False",
         ]
-        # Gunicorn's forked worker path loses the bundled callback runtime on
-        # macOS; Uvicorn's supervisor retains the configured concurrency.
+        # Uvicorn starts macOS workers with ``spawn``.  Gunicorn preloads the
+        # proxy and forks those workers, which can abort when an imported
+        # dependency reaches the Objective-C runtime after fork.
         if os.name != "nt" and sys.platform != "darwin":
             command.append("--run_gunicorn")
         server_log = self.paths.root / "menu-server.log"
@@ -578,55 +645,48 @@ class CoreServiceController:
             atomic_write_text(self.paths.pid, f"{process.pid}\n")
         except (OSError, PersistenceError) as exc:
             if "process" in locals():
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-            self._write_state("unhealthy")
+                self._stop_process_group(process.pid)
+            self._remove_owner_files()
             raise RuntimeError("LiteLLM service could not start") from exc
         deadline = time.monotonic() + min(max(float(environment.get("LITELLM_HEALTH_WAIT_SECONDS", "60")), 1), 60)
         while time.monotonic() < deadline:
             if self._health():
-                self._clear_state()
                 return self.status()
             if process.poll() is not None:
                 break
             time.sleep(0.1)
-        self._write_state("unhealthy")
+        self._stop_process_group(process.pid)
+        self._remove_owner_files()
         raise RuntimeError("LiteLLM service did not become healthy")
+
+    @staticmethod
+    def _stop_process_group(pid: int) -> None:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(pid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+        deadline = time.monotonic() + PROXY_STOP_GRACE_SECONDS
+        while time.monotonic() < deadline and CoreServiceController._process_alive(pid):
+            time.sleep(0.1)
+        if CoreServiceController._process_alive(pid):
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(pid, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
     def stop(self) -> dict[str, Any]:
         pid = self._pid()
-        if pid is not None:
-            try:
-                if hasattr(os, "killpg"):
-                    os.killpg(pid, signal.SIGTERM)
-                else:
-                    os.kill(pid, signal.SIGTERM)
-            except OSError:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and self._pid() is not None:
-                time.sleep(0.1)
-            if self._pid() is not None:
-                try:
-                    if hasattr(os, "killpg"):
-                        os.killpg(pid, signal.SIGKILL)
-                    else:
-                        os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-        for path in (self.paths.pid, self.paths.owner):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-        self._clear_state()
+        if pid is None:
+            # Do not erase an active replacement Core's ownership evidence.
+            return self.status()
+        self._stop_process_group(pid)
+        self._remove_owner_files()
         return self.status()
 
     def restart(self) -> dict[str, Any]:
@@ -634,18 +694,9 @@ class CoreServiceController:
         return self.start()
 
     def reload(self) -> dict[str, Any]:
-        pid = self._pid()
-        if pid is None:
+        if self._pid() is None:
             raise RuntimeError("No managed LiteLLM service is running")
-        self._stage_runtime_config()
-        hangup = getattr(signal, "SIGHUP", None)
-        if hangup is None:
-            return self.restart()
-        try:
-            os.kill(pid, hangup)
-        except OSError as exc:
-            raise RuntimeError("LiteLLM service could not reload") from exc
-        return self.status()
+        return self.restart()
 
     def autostart_enable(self) -> dict[str, Any]:
         # Platform native hosts own the actual login-item registration. Core

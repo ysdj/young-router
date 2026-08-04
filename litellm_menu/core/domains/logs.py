@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from collections.abc import Mapping
 from typing import Any
 
-from ..security import REDACT_TEXT, redact
+from ..security import REDACT_TEXT
 from ...log_rotation import append_bounded_log
 
 
@@ -76,13 +76,505 @@ def _safe_scalar(value: object, limit: int = 160) -> object:
     return None
 
 
-def _safe_request_record(raw: Mapping[str, Any]) -> dict[str, Any]:
+def _public_model_from_route_key(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    match = re.search(r"(?:^|/)\s*model\s*=\s*([^/]+?)\s*(?=/|$)", value)
+    return match.group(1).strip() if match else ""
+
+
+def _matches_upstream_model(public_model: object, upstream_model: object) -> bool:
+    if not isinstance(public_model, str) or not isinstance(upstream_model, str):
+        return False
+    public_name = public_model.strip()
+    upstream_name = upstream_model.strip()
+    if not public_name or not upstream_name:
+        return False
+    _, separator, unprefixed_name = upstream_name.partition("/")
+    return public_name == upstream_name or (
+        bool(separator) and public_name == unprefixed_name
+    )
+
+
+def _configured_public_models(config_path: Path) -> dict[str, str]:
+    return {
+        deployment_id: deployment["public_model"]
+        for deployment_id, deployment in _configured_deployments(config_path).items()
+        if deployment["public_model"]
+    }
+
+
+def _string_record_value(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _mapping_value(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _route_key_value(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        return ""
+    match = re.search(rf"(?:^|/)\s*{re.escape(name)}\s*=\s*(.*?)\s*(?=/\s*[A-Za-z_]+\s*=|$)", value)
+    return match.group(1).strip() if match else ""
+
+
+def _upstream_model_name(value: object) -> str:
+    model = _string_record_value(value)
+    return model.partition("/")[2] or model
+
+
+def _configured_deployments(config_path: Path) -> dict[str, dict[str, str]]:
+    from config_editor_core import load as config_load
+
+    try:
+        document = config_load.config_document_from_path(config_path)
+        payload = config_load.load_config_document(document)
+    except (OSError, TypeError, ValueError):
+        return {}
+
+    configured: dict[str, dict[str, str]] = {}
+    providers = payload.get("providers")
+    if not isinstance(providers, list):
+        return configured
+    for provider in providers:
+        if not isinstance(provider, Mapping):
+            continue
+        provider_name = _string_record_value(provider.get("name"))
+        models = provider.get("models")
+        if not isinstance(models, list):
+            continue
+        for model in models:
+            if not isinstance(model, Mapping):
+                continue
+            deployment_id = _string_record_value(model.get("deployment_id"))
+            if not deployment_id:
+                continue
+            configured[deployment_id] = {
+                "public_model": _string_record_value(model.get("model_name")),
+                "upstream_model": _upstream_model_name(model.get("litellm_model")),
+                "provider": _string_record_value(model.get("provider")) or provider_name,
+                "api_key_name": _string_record_value(model.get("api_key_name")),
+            }
+    return configured
+
+
+def _trace_value(value: object, limit: int = 160) -> str:
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return REDACT_TEXT(value)[:limit]
+    if isinstance(value, Mapping):
+        return ", ".join(
+            f"{key}={_trace_value(item, limit=80)}"
+            for key, item in value.items()
+            if _trace_value(item, limit=80)
+        )[:limit]
+    if isinstance(value, list):
+        return ", ".join(
+            item for item in (_trace_value(item, limit=80) for item in value) if item
+        )[:limit]
+    return ""
+
+
+def _trace_count(value: object) -> int | None:
+    return len(value) if isinstance(value, list) else None
+
+
+def _trace_bool(value: object) -> str:
+    return str(value).lower() if isinstance(value, bool) else ""
+
+
+def _trace_detail_parts(*parts: tuple[str, object, str]) -> str:
+    details: list[str] = []
+    for name, value, suffix in parts:
+        text = _trace_value(value)
+        if text:
+            details.append(f"{name}={text}{suffix}")
+    return " · ".join(details)
+
+
+def _trace_reason(raw: Mapping[str, Any], exception: Mapping[str, Any]) -> str:
+    return _string_record_value(
+        exception.get("reason")
+        or raw.get("invalid_reason")
+        or raw.get("preemptive_reason")
+        or raw.get("reason")
+    )
+
+
+def _trace_detail(raw: Mapping[str, Any]) -> str:
+    event = _string_record_value(raw.get("event"))
+    request = _mapping_value(raw.get("request"))
+    interface = _mapping_value(request.get("interface"))
+    deployment = _mapping_value(raw.get("deployment"))
+    exception = _mapping_value(raw.get("exception") or raw.get("error"))
+    reason = _trace_reason(raw, exception)
+    excluded = _trace_count(raw.get("excluded_deployment_ids"))
+
+    if event == "filter_deployments":
+        return _trace_detail_parts(
+            ("candidates", _trace_count(raw.get("after_constraints")), ""),
+            ("selected", _trace_count(raw.get("selected_candidates")), ""),
+            ("excluded", excluded, ""),
+        )
+
+    if event == "deployment_failover_marked":
+        return _trace_detail_parts(
+            (
+                "failed_order",
+                exception.get("failed_deployment_order") or raw.get("deployment_order"),
+                "",
+            ),
+            ("reason", reason, ""),
+        )
+
+    if event == "selected_deployment":
+        selected_order = deployment.get("order")
+        if selected_order is None:
+            selected_order = raw.get("target_order")
+        return _trace_detail_parts(
+            ("order", selected_order, ""),
+            (
+                "protocol",
+                interface.get("effective_upstream_surface")
+                or interface.get("client_surface")
+                or interface.get("requested_endpoint"),
+                "",
+            ),
+            ("stream", _trace_bool(interface.get("stream")), ""),
+        )
+
+    if event == "generic_fallback_helper_start":
+        return _trace_detail_parts(
+            (
+                "protocol",
+                interface.get("effective_upstream_surface")
+                or interface.get("client_surface")
+                or interface.get("requested_endpoint"),
+                "",
+            ),
+            ("stream", _trace_bool(interface.get("stream")), ""),
+            ("order", raw.get("target_order"), ""),
+            ("excluded", excluded, ""),
+        )
+
+    if event == "browser_compatible_headers_retry_start":
+        return _trace_detail_parts(
+            ("order", raw.get("target_order"), ""),
+            ("excluded", excluded, ""),
+        )
+
+    if event == "generic_fallback_helper_error":
+        return _trace_detail_parts(
+            ("retry", raw.get("retry_attempt"), ""),
+            ("order", raw.get("target_order"), ""),
+            ("excluded", excluded, ""),
+            ("reason", reason, ""),
+        )
+
+    if event == "fallback_deployment_cooldown_filter":
+        return _trace_detail_parts(
+            ("cooling", _trace_count(raw.get("cooldown_deployments")), ""),
+            ("all_cooled", _trace_bool(raw.get("cooldown_all_candidates")), ""),
+        )
+
+    if event == "next_order_fallback_available":
+        return _trace_detail_parts(
+            ("failed_order", raw.get("failed_order"), ""),
+            ("next_order", raw.get("target_order"), ""),
+            ("candidates", _trace_count(raw.get("candidates")), ""),
+            ("excluded", excluded, ""),
+        )
+
+    if event == "final_order_fallback_retry_start":
+        return _trace_detail_parts(
+            ("next_order", raw.get("target_order"), ""),
+            ("excluded", excluded, ""),
+            ("reason", reason, ""),
+        )
+
+    if event.startswith("external_web_search_bridge_chat_tool_"):
+        return _trace_detail_parts(
+            ("phase", raw.get("phase"), ""),
+            ("reason", reason, ""),
+        )
+
+    if event == "external_web_search_bridge_actions_executed":
+        return _trace_detail_parts(
+            ("round", raw.get("round"), ""),
+            ("actions", _trace_count(raw.get("actions")), ""),
+            ("sources", raw.get("source_url_count"), ""),
+            ("evidence", raw.get("evidence_chars"), ""),
+        )
+
+    if event == "external_web_search_bridge_continuation_start":
+        return _trace_detail_parts(
+            ("round", raw.get("round"), ""),
+            ("queries", _trace_count(raw.get("queries")), ""),
+            ("evidence", raw.get("evidence_chars"), ""),
+            ("continuation_evidence", raw.get("continuation_evidence_chars"), ""),
+            ("input", raw.get("continuation_input_chars"), ""),
+            ("output_limit", raw.get("continuation_max_output_tokens"), ""),
+        )
+
+    if event == "external_web_search_bridge_continuation_done":
+        return _trace_detail_parts(
+            ("round", raw.get("round"), ""),
+            ("queries", _trace_count(raw.get("queries")), ""),
+            ("next_actions", _trace_count(raw.get("next_actions")), ""),
+            ("next_queries", _trace_count(raw.get("next_queries")), ""),
+        )
+
+    if event == "external_web_search_bridge_continuation_error":
+        return _trace_detail_parts(
+            ("round", raw.get("round"), ""),
+            ("queries", _trace_count(raw.get("queries")), ""),
+            ("reason", reason, ""),
+        )
+
+    if event == "external_web_search_bridge_empty_continuation_synthesis":
+        return _trace_detail_parts(
+            ("round", raw.get("round"), ""),
+            ("queries", _trace_count(raw.get("queries")), ""),
+        )
+
+    if event in {
+        "external_web_search_bridge_synthesis_start",
+        "external_web_search_bridge_synthesis_done",
+        "external_web_search_bridge_synthesis_error",
+        "external_web_search_bridge_final_invalid",
+    }:
+        return _trace_detail_parts(
+            ("queries", _trace_count(raw.get("queries")), ""),
+            ("sources", raw.get("source_url_count"), ""),
+            ("reason", reason, ""),
+        )
+
+    if event in {
+        "external_web_search_bridge_synthesis_chat_start",
+        "external_web_search_bridge_synthesis_chat_done",
+    }:
+        return _trace_detail_parts(("phase", "synthesis", ""))
+
+    if event.startswith("external_web_search_bridge_"):
+        return _trace_detail_parts(
+            ("phase", raw.get("phase"), ""),
+            ("round", raw.get("round"), ""),
+            ("queries", _trace_count(raw.get("queries")), ""),
+            ("sources", raw.get("source_url_count"), ""),
+            ("retry", raw.get("retry_attempt"), ""),
+            ("max_retries", raw.get("max_retries"), ""),
+            ("retry_delay", raw.get("retry_delay_seconds"), "s"),
+            ("reason", reason, ""),
+        )
+
+    if event.startswith("responses_chat_bridge_preemptive") or event == "responses_chat_bridge_preemptive":
+        return _trace_detail_parts(("reason", reason, ""))
+
+    if event == "deployment_cooldown_started":
+        return _trace_detail_parts(
+            ("cooldown", raw.get("cooldown_remaining_seconds") or raw.get("cooldown_seconds"), "s"),
+            ("failures", raw.get("failures"), ""),
+            ("threshold", raw.get("failure_threshold"), ""),
+            ("reason", reason, ""),
+        )
+
+    if event == "stream_start_timeout":
+        return _trace_detail_parts(
+            ("timeout", raw.get("start_seconds"), "s"),
+            ("buffered", raw.get("buffered_chunks"), ""),
+            ("saw_chunk", _trace_bool(raw.get("saw_chunk")), ""),
+        )
+
+    return _trace_detail_parts(
+        ("round", raw.get("round"), ""),
+        ("order", raw.get("target_order"), ""),
+        ("service_tier", raw.get("service_tier"), ""),
+        ("cooldown", raw.get("cooldown_remaining_seconds"), "s"),
+        ("reason", reason, ""),
+    )
+
+
+def _recovery_detail(raw: Mapping[str, Any]) -> str:
+    details: list[str] = []
+    for source, key, suffix in (
+        (raw.get("attempt"), "attempt", ""),
+        (raw.get("attempt_timeout_seconds"), "timeout", "s"),
+        (raw.get("cooldown_remaining_seconds"), "cooldown", "s"),
+        (raw.get("poll_interval_seconds"), "retry", "s"),
+    ):
+        value = _trace_value(source)
+        if value:
+            details.append(f"{key}={value}{suffix}")
+    diagnostic = _mapping_value(raw.get("diagnostic"))
+    reason = _string_record_value(diagnostic.get("kind"))
+    if reason:
+        details.append(f"reason={reason}")
+    return " · ".join(details)
+
+
+def _recovery_candidate(raw: Mapping[str, Any]) -> Mapping[str, Any]:
+    candidates = raw.get("cooldown_deployments")
+    if not isinstance(candidates, list):
+        return {}
+    model_group = _string_record_value(raw.get("model_group"))
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        if _public_model_from_route_key(candidate.get("route_key")) == model_group:
+            return candidate
+    return next(
+        (candidate for candidate in candidates if isinstance(candidate, Mapping)),
+        {},
+    )
+
+
+def _safe_recovery_record(
+    raw: Mapping[str, Any],
+    configured_deployments: Mapping[str, Mapping[str, str]],
+) -> dict[str, Any]:
+    request = _mapping_value(raw.get("request"))
+    exception = _mapping_value(raw.get("exception") or raw.get("error"))
+    route_key = (
+        raw.get("route_key")
+        or request.get("route_key")
+        or exception.get("failed_deployment_route_key")
+        or exception.get("failed_route_key")
+    )
+    candidate = _recovery_candidate(raw) if not route_key else {}
+    if not route_key:
+        route_key = candidate.get("route_key")
+    deployment_id = _string_record_value(
+        raw.get("deployment_id")
+        or request.get("deployment_id")
+        or exception.get("failed_deployment_id")
+        or candidate.get("id")
+    )
+    configured = configured_deployments.get(deployment_id, {})
+    route_public_model = _public_model_from_route_key(route_key)
+    route_upstream_model = _route_key_value(route_key, "upstream")
+    public_model = (
+        route_public_model
+        or configured.get("public_model", "")
+        or _string_record_value(raw.get("public_model"))
+        or _string_record_value(raw.get("model_group"))
+        or _string_record_value(request.get("public_model"))
+        or _string_record_value(request.get("model_group"))
+    )
+    upstream_model = _upstream_model_name(
+        route_upstream_model
+        or configured.get("upstream_model", "")
+        or candidate.get("model")
+        or raw.get("upstream_model")
+        or request.get("upstream_model")
+        or exception.get("upstream_model")
+    )
+    provider = (
+        _route_key_value(route_key, "provider")
+        or configured.get("provider", "")
+        or _string_record_value(candidate.get("provider"))
+        or _string_record_value(raw.get("provider"))
+        or _string_record_value(request.get("provider"))
+        or _string_record_value(exception.get("provider"))
+    )
+    api_key_name = (
+        _route_key_value(route_key, "key")
+        or configured.get("api_key_name", "")
+        or _string_record_value(candidate.get("api_key_name"))
+        or _string_record_value(raw.get("api_key_name"))
+        or _string_record_value(request.get("api_key_name"))
+    )
+    result: dict[str, Any] = {
+        "timestamp": _safe_scalar(raw.get("updated_at") or raw.get("heartbeat_at") or raw.get("started_at")),
+        "public_model": _safe_scalar(public_model),
+        "upstream_model": _safe_scalar(upstream_model),
+        "provider": _safe_scalar(provider),
+        "api_key_name": _safe_scalar(api_key_name),
+        "status": _safe_scalar(raw.get("status")),
+        "detail": _safe_scalar(_recovery_detail(raw), limit=260),
+    }
+    return {key: value for key, value in result.items() if value not in (None, "")}
+
+
+def _safe_route_trace_record(
+    raw: Mapping[str, Any],
+    configured_public_models: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    request = _mapping_value(raw.get("request"))
+    deployment = _mapping_value(raw.get("deployment"))
+    exception = _mapping_value(raw.get("exception") or raw.get("error"))
+    route_key = (
+        raw.get("route_key")
+        or deployment.get("route_key")
+        or request.get("route_key")
+        or exception.get("failed_deployment_route_key")
+        or exception.get("failed_route_key")
+    )
+    deployment_id = (
+        raw.get("deployment_id")
+        or deployment.get("id")
+        or request.get("deployment_id")
+        or exception.get("failed_deployment_id")
+    )
+    route_public_model = _public_model_from_route_key(route_key)
+    public_model = (
+        route_public_model
+        or _string_record_value(raw.get("public_model"))
+        or _string_record_value(raw.get("model_group"))
+        or _string_record_value(request.get("model_group"))
+    )
+    configured_public_model = (
+        configured_public_models.get(deployment_id.strip())
+        if configured_public_models
+        and isinstance(deployment_id, str)
+        and deployment_id.strip()
+        else None
+    )
+    if configured_public_model and not route_public_model:
+        public_model = configured_public_model
+    upstream_model = _upstream_model_name(
+        _route_key_value(route_key, "upstream")
+        or raw.get("upstream_model")
+        or deployment.get("model")
+        or request.get("upstream_model")
+        or exception.get("upstream_model")
+    )
+    provider = (
+        _route_key_value(route_key, "provider")
+        or _string_record_value(raw.get("provider"))
+        or _string_record_value(deployment.get("provider"))
+        or _string_record_value(request.get("provider"))
+        or _string_record_value(exception.get("provider"))
+    )
+    status = _string_record_value(raw.get("status") or raw.get("result"))
+    if not status and (raw.get("exception") is not None or raw.get("error") is not None):
+        status = "error"
+    result: dict[str, Any] = {
+        "timestamp": _safe_scalar(raw.get("timestamp") or raw.get("ts")),
+        "event": _safe_scalar(raw.get("event")),
+        "public_model": _safe_scalar(public_model),
+        "upstream_model": _safe_scalar(upstream_model),
+        "provider": _safe_scalar(provider),
+        "status": _safe_scalar(status),
+        "detail": _safe_scalar(_trace_detail(raw), limit=260),
+    }
+    return {key: value for key, value in result.items() if value not in (None, "")}
+
+
+def _safe_request_record(
+    raw: Mapping[str, Any],
+    configured_public_models: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key in (
         "ts",
         "timestamp",
         "status",
         "model_group",
+        "public_model",
         "provider",
         "api_key_name",
         "upstream_model",
@@ -91,6 +583,34 @@ def _safe_request_record(raw: Mapping[str, Any]) -> dict[str, Any]:
     ):
         if key in raw:
             result[key] = _safe_scalar(raw[key])
+    route_public_model = _public_model_from_route_key(result.get("route_key"))
+    if route_public_model:
+        result["public_model"] = route_public_model
+    route_upstream_model = _route_key_value(result.get("route_key"), "upstream")
+    if route_upstream_model:
+        result["upstream_model"] = _safe_scalar(route_upstream_model)
+    route_provider = _route_key_value(result.get("route_key"), "provider")
+    if route_provider:
+        result["provider"] = _safe_scalar(route_provider)
+    route_api_key_name = _route_key_value(result.get("route_key"), "key")
+    if route_api_key_name:
+        result["api_key_name"] = _safe_scalar(route_api_key_name)
+    deployment_id = raw.get("deployment_id")
+    configured_public_model = (
+        configured_public_models.get(deployment_id.strip())
+        if configured_public_models
+        and isinstance(deployment_id, str)
+        and deployment_id.strip()
+        else None
+    )
+    if configured_public_model and (
+        not route_public_model
+        or _matches_upstream_model(
+            route_public_model,
+            result.get("upstream_model"),
+        )
+    ):
+        result["public_model"] = _safe_scalar(configured_public_model)
     usage = raw.get("usage")
     if isinstance(usage, Mapping):
         result["usage"] = {
@@ -139,31 +659,6 @@ def _is_service_noise(line: str) -> bool:
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.:/-]+", message):
         return True
     return False
-
-
-def _safe_json_record(raw: Mapping[str, Any]) -> dict[str, Any]:
-    projected = redact(raw)
-    if not isinstance(projected, Mapping):
-        return {}
-    # Log bodies and raw payloads are never useful enough to justify crossing
-    # IPC. Keep summaries, counters and state while dropping high-risk blobs.
-    forbidden = {
-        "body",
-        "request",
-        "response",
-        "messages",
-        "input",
-        "output",
-        "raw",
-        "payload",
-        "config",
-        "headers",
-    }
-    return {
-        str(key): value
-        for key, value in projected.items()
-        if str(key).strip().lower().replace("-", "_") not in forbidden
-    }
 
 
 class LogsDomain:
@@ -318,12 +813,13 @@ class LogsDomain:
             except (TypeError, json.JSONDecodeError):
                 payload = {}
             recoveries = payload.get("recoveries") if isinstance(payload, Mapping) else None
+            configured_deployments = _configured_deployments(self.config_path)
             if isinstance(recoveries, Mapping):
                 records = [
                     projected
                     for value in recoveries.values()
                     if isinstance(value, Mapping)
-                    and (projected := _safe_json_record(value))
+                    and (projected := _safe_recovery_record(value, configured_deployments))
                 ]
             needle = self._filters.get(tab, "").casefold()
             if needle:
@@ -341,6 +837,11 @@ class LogsDomain:
                 for line in lines
                 if "litellm_route_trace" not in line and not _is_service_noise(line)
             ]
+        configured_public_models = (
+            _configured_public_models(self.config_path)
+            if tab in {"requests", "route-trace"}
+            else {}
+        )
         records: list[object] = []
         for line in lines:
             if not line.strip():
@@ -355,7 +856,11 @@ class LogsDomain:
                 except (TypeError, json.JSONDecodeError):
                     parsed = None
             if isinstance(parsed, Mapping):
-                record = _safe_request_record(parsed) if tab == "requests" else _safe_json_record(parsed)
+                record = (
+                    _safe_request_record(parsed, configured_public_models)
+                    if tab == "requests"
+                    else _safe_route_trace_record(parsed, configured_public_models)
+                )
                 if record:
                     records.append(record)
             elif tab not in {"requests", "route-trace"}:
@@ -466,6 +971,9 @@ class LogsDomain:
             },
         }
 
+    def draft_state(self) -> object:
+        return {}
+
     def view(self, tab: str, known_revision: int | None = None) -> dict[str, Any]:
         if tab not in LOG_TABS:
             raise LogsDomainError("Log tab is invalid")
@@ -534,22 +1042,6 @@ class LogsDomain:
         self.revision += 1
         self._refresh(str(tab), force=True)
         return self.snapshot()
-
-    def is_read_only_action(self, action: str, payload: object | None = None) -> bool:
-        del payload
-        return action.removeprefix("logs.").replace("-", "_") in {
-            "record_menu_action",
-            "pause",
-            "resume",
-            "clear",
-            "set_filter",
-            "filter",
-            "set_limit",
-            "limit",
-            "refresh",
-            "reload",
-            "refresh_online_usage",
-        }
 
     def validate(self, payload: object | None = None) -> dict[str, Any]:
         return {"valid": True, "errors": []}

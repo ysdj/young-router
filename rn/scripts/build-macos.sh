@@ -127,7 +127,6 @@ CORE="$APP/Contents/Resources/Core"
 rm -rf "$CORE"
 mkdir -p "$CORE"
 for file in \
-  browser_billing.py \
   codex_config.py \
   configuration_package.py \
   external_provider_import.py \

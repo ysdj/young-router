@@ -9,8 +9,8 @@ import type {
 /**
  * This leaf intentionally has no text prop or text-change event.  The
  * The native field owns the value, exchanges a one-time Core capability, and
- * reports only presence/revision/status back to React. plainText changes only
- * native rendering for legacy provider API-key editing.
+ * reports only presence/revision/status back to React. `plainText` alters
+ * native rendering only for the provider API-key editor.
  */
 type SecretStateEvent = Readonly<{
   revision: Int32;

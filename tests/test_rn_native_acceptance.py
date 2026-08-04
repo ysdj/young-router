@@ -20,8 +20,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         for source in (mac, windows):
             self.assertIn("host/shutdown", source)
             self.assertIn("Authorization", source)
-        self.assertIn("timeoutInterval: 1", mac)
-        self.assertIn("shutdown_token, 1000", windows)
+        self.assertIn("private static let coreShutdownTimeout: TimeInterval = 4", mac)
+        self.assertIn("timeoutInterval: Self.coreShutdownTimeout", mac)
+        self.assertIn("shutdown_token, 4000", windows)
 
     def test_macos_upgrade_stops_the_proxy_before_replacing_the_bundle(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
@@ -262,10 +263,40 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("stopCoreProcess(staleProcess, directory: staleDirectory)", mac)
         self.assertIn("WaitForSingleObject(process, INFINITE);", windows)
         self.assertIn('L" --parent-pid " + std::to_wstring(GetCurrentProcessId())', windows)
-        self.assertIn("DWORD const grace_result = WaitForSingleObject(process, 100);", windows)
+        self.assertIn("DWORD const grace_result = WaitForSingleObject(process, 8000);", windows)
         self.assertIn("if (grace_result != WAIT_OBJECT_0)", windows)
         self.assertIn("StopCoreProcess(process.hProcess, directory);", windows)
         self.assertNotIn("WaitForSingleObject(process.hProcess, INFINITE);", windows)
+
+    def test_macos_core_bootstrap_waits_for_the_managed_listener(self) -> None:
+        mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
+        start = mac.split("    private func startCoreLocked() throws -> Endpoint {", 1)[1].split(
+            "    private func previewProfileEnvironment", 1
+        )[0]
+
+        self.assertIn("private static let coreStartupTimeout: TimeInterval = 65", mac)
+        self.assertIn("Date().addingTimeInterval(Self.coreStartupTimeout)", start)
+        self.assertIn("guard process.isRunning else { break }", start)
+        self.assertIn("stopCoreProcess(process, directory: directory)", start)
+
+    def test_macos_core_never_mutates_the_signed_bundle_with_bytecode(self) -> None:
+        mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
+
+        self.assertIn('childEnvironment["PYTHONDONTWRITEBYTECODE"] = "1"', mac)
+
+    def test_macos_event_poll_retries_without_replacing_core(self) -> None:
+        mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
+        poll = mac.split("    private func poll(subscription: String, generation: Int) {", 1)[1].split(
+            "    private func requestMetadata", 1
+        )[0]
+
+        self.assertIn("let retry = !pollCancelled", poll)
+        self.assertIn("&& subscriptionID == subscription", poll)
+        self.assertIn("&& self.generation == generation", poll)
+        self.assertIn("guard retry else { return }", poll)
+        self.assertIn("Thread.sleep(forTimeInterval: 1)", poll)
+        self.assertNotIn("resetCore(expectedGeneration: generation)", poll)
+        self.assertNotIn("scheduleSubscriptionRecovery()", poll)
 
     def test_hosts_renew_an_unexpired_ipc_session_before_replacing_core(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
@@ -374,6 +405,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('[item.name isEqualToString:@"tab"]', app_delegate)
         self.assertIn("openRouteFromDeepLink:route logTab:logTab", app_delegate)
         self.assertIn("route == \"logs\" && isAllowedLogTab", leaf)
+        self.assertIn("initialLogTab: logTab", leaf)
+        self.assertIn("@\"initialLogTab\"", app_delegate)
         self.assertIn('emitAction("open-logs?tab=', leaf)
         self.assertNotIn("config-watch", app_delegate)
         self.assertNotIn("config-watch", leaf)
@@ -424,11 +457,61 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         ):
             self.assertIn(f'environment["{key}"]', bridge)
 
-    def test_macos_preview_uses_a_distinct_menu_bar_monogram(self) -> None:
+    def test_macos_uses_a_native_template_status_bar_icon(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
 
-        self.assertIn('Bundle.main.bundleIdentifier == "menu.litellm.menu.preview" ? "LL·P" : "LL"', leaf)
-        self.assertIn('statusItem.length = menuBarMonogram == "LL·P" ? 42 : 32', leaf)
+        self.assertIn('systemSymbolName: "bolt.horizontal.circle.fill"', leaf)
+        self.assertIn("image.isTemplate = true", leaf)
+        self.assertIn("NSStatusItem.squareLength", leaf)
+        self.assertIn("statusItem.button?.image = Self.statusBarIcon", leaf)
+        self.assertNotIn("menuBarMonogram", leaf)
+
+    def test_macos_status_item_is_ready_before_react_and_defers_menu_rebuilds_while_tracking(self) -> None:
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        platform_entry = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+
+        native_shell = app_delegate.index("AppKitNativeLeaf *nativeLeaf = AppKitNativeLeaf.shared;")
+        core_warm = app_delegate.index("[CoreIPCBridge.shared warm];")
+        react_start = app_delegate.index("[super applicationDidFinishLaunching:notification];")
+        self.assertLess(native_shell, react_start)
+        self.assertIn("self.automaticallyLoadReactNativeWindow = NO;", app_delegate)
+        self.assertIn("[nativeLeaf setReactHostStarter:^{", app_delegate)
+        self.assertIn("- (void)startReactHostWhenNeeded", app_delegate)
+        self.assertIn("[self loadReactNativeWindow:nil];", app_delegate)
+        self.assertLess(native_shell, core_warm)
+        self.assertLess(native_shell, react_start)
+        self.assertIn("private var reactHostStarter", leaf)
+        self.assertIn("public func setReactHostStarter", leaf)
+        self.assertIn("private func ensureReactHostStarted()", leaf)
+        self.assertIn("guard routeWindowFactory == nil else { return }", leaf)
+        self.assertIn("ensureReactHostStarted()\n        if let menuActionHandler", leaf)
+        self.assertIn("guard title != statusTitle || running != statusRunning else { return }", leaf)
+        self.assertIn("zip(nextActions, menuActions).contains", leaf)
+        self.assertIn("private var menuTracking = false", leaf)
+        self.assertIn("public func menuWillOpen(_ menu: NSMenu)", leaf)
+        self.assertIn("public func menuDidClose(_ menu: NSMenu)", leaf)
+        self.assertIn("guard !menuTracking else", leaf)
+        self.assertNotIn("native.tray.setActions(routeActions);", platform_entry)
+        self.assertNotIn("native.tray.setStatus(next.service);", ui)
+        self.assertNotIn("native.tray.setActions(actions);", ui)
+
+    def test_macos_quit_cancels_startup_and_finishes_off_the_main_thread(self) -> None:
+        bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+
+        self.assertIn("private let stoppingLock = NSLock()", bridge)
+        self.assertIn("guard beginStopping() else { return }", bridge)
+        self.assertIn("guard !isStopping() else { break }", bridge)
+        self.assertIn("func requestQuit() {\n        NSApp.terminate(nil)", leaf)
+        self.assertIn("NSStatusBar.system.removeStatusItem(statusItem)", leaf)
+        self.assertIn("applicationShouldTerminate", app_delegate)
+        self.assertIn("return NSTerminateLater", app_delegate)
+        self.assertIn("dispatch_get_global_queue(QOS_CLASS_USER_INITIATED", app_delegate)
+        self.assertIn("replyToApplicationShouldTerminate:YES", app_delegate)
+        self.assertNotIn("applicationWillTerminate", app_delegate)
 
     def test_language_is_a_state_backed_native_menu_submenu_not_a_route(self) -> None:
         ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
@@ -490,12 +573,19 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("private var routeWindows: [String: NSWindow] = [:]", leaf)
         self.assertIn("setRouteWindowFactory", leaf)
+        self.assertIn("routeWindowFactory?(route, initialLogTab, existing)", leaf)
+        self.assertIn("NSWindow *existingWindow", app_delegate)
         self.assertIn('self.initialProps = @{ @"isPrimaryHost": @YES, @"isWindowManagerHost": @YES };', app_delegate)
         self.assertIn('@"isPrimaryHost": @NO', app_delegate)
         self.assertIn("viewWithModuleName:@\"LiteLLMMenu\" initialProperties:props", app_delegate)
         self.assertNotIn("NSApplicationActivationPolicyRegular", app_delegate)
         self.assertIn("LSUIElement", info)
-        self.assertIn("NSApp.setActivationPolicy(routeWindows.isEmpty ? .accessory : .regular)", leaf)
+        self.assertIn("<key>CFBundleIconFile</key>\n\t<string>AppIcon</string>", info)
+        self.assertIn("NSApp.setActivationPolicy(.accessory)", leaf)
+        self.assertIn('Bundle.main.url(forResource: "AppIcon", withExtension: "icns")!', leaf)
+        self.assertIn("NSApp.applicationIconImage = Self.applicationIcon", leaf)
+        self.assertIn("NSApp.setActivationPolicy(.regular)", leaf)
+        self.assertIn("window.center()", leaf)
 
     def test_action_menu_is_anchored_to_the_triggering_control_on_both_hosts(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
@@ -529,6 +619,37 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("GetCursorPos(&point)", windows)
         self.assertIn("JSValueObject const& anchor", windows_module_header)
         self.assertIn("TryGetDouble", windows_module)
+
+    def test_log_original_record_uses_a_single_action_read_only_native_viewer(self) -> None:
+        types = (SHARED / "types.ts").read_text(encoding="utf-8")
+        bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
+        platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        mac_module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
+        mac_bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        windows_header = (WIN_NATIVE / "WinUI3NativeLeafModule.h").read_text(encoding="utf-8")
+        windows_module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("showReadOnlyText(options:", types)
+        self.assertIn("showReadOnlyText(title: string, text: string, closeLabel: string)", bridge)
+        self.assertIn("showReadOnlyText?: (title: string, text: string, closeLabel: string)", platform)
+        self.assertIn('native.showReadOnlyText({ title: translate("logs.originalRecord")', ui)
+        self.assertNotIn('native.showConfirmation({ title: translate("logs.originalRecord")', ui)
+
+        self.assertIn("func showReadOnlyText(title: String, text: String, closeTitle: String)", mac)
+        self.assertIn("textView.isEditable = false", mac)
+        self.assertIn("textView.isSelectable = true", mac)
+        self.assertIn("alert.addButton(withTitle: closeTitle)", mac)
+        self.assertIn("@objc func showReadOnlyText", mac_module)
+        self.assertIn("RCT_EXTERN_METHOD(showReadOnlyText:", mac_bridge)
+
+        self.assertIn("void WinUI3NativeLeaf::ShowReadOnlyText(", windows)
+        self.assertIn("viewer.IsReadOnly(true);", windows)
+        self.assertIn("actions.Children().Append(close);", windows)
+        self.assertIn('REACT_METHOD(ShowReadOnlyText, L"showReadOnlyText")', windows_header)
+        self.assertIn("void WinUI3NativeLeafModule::ShowReadOnlyText(", windows_module)
 
     def test_windows_secure_editor_is_composed_from_winui3_controls(self) -> None:
         source = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
@@ -671,7 +792,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('guard type == "sub2api" else { return originURL }', mac_leaf)
         self.assertIn('originURL.appendingPathComponent("login")', mac_leaf)
         self.assertIn("private let loadingOverlay = NSVisualEffectView()", mac_leaf)
-        self.assertIn('loadingLabel.stringValue = text("Loading sign-in page…", "正在加载登录页面…")', mac_leaf)
+        self.assertIn(': text("Loading sign-in page…", "正在加载登录页面…")', mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didStartProvisionalNavigation", mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didFailProvisionalNavigation", mac_leaf)
         self.assertIn("let passwordExpression = rememberPassword", mac_leaf)
@@ -919,11 +1040,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("LiteLLMWinUISecureTextInput", windows_spec)
         for spec in (mac_spec, windows_spec):
             self.assertNotIn("value?:", spec)
+            self.assertIn("plainText?: WithDefault<boolean, false>;", spec)
             self.assertNotIn("onChangeText", spec)
             self.assertIn("onSecretState", spec)
         self.assertIn("NSSecureTextField *_field", mac)
         self.assertIn("NSTextField *_plainField", mac)
-        self.assertIn("return [_host.control isKindOfClass:NSTextField.class]", mac)
+        self.assertIn("loadProviderAPIKeyForTarget", mac)
         self.assertIn("_field.usesSingleLineMode = YES", mac)
         self.assertIn("_field.lineBreakMode = NSLineBreakByTruncatingTail", mac)
         self.assertIn("fieldCell.wraps = NO", mac)
@@ -940,7 +1062,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "password_box_.VerticalContentAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);",
             windows,
         )
-        self.assertIn("PasswordRevealMode(props.plainText.value_or(false)", windows)
+        self.assertIn("PasswordRevealMode::Hidden", windows)
+        self.assertIn("PasswordRevealMode::Visible", windows)
+        self.assertIn("IsPlainTextProviderKey", windows)
         self.assertIn("CreateSecretCapability(", windows)
         self.assertIn("StageSecret(capability->token, secret, false)", windows)
         self.assertNotIn("onChangeText", windows_codegen)
@@ -948,24 +1072,23 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NativeSecretInputControl", ui)
         self.assertNotIn('onEdit={() => stageSecret({ domain: "runtime"', ui)
 
-    def test_provider_plaintext_key_readback_is_limited_to_native_provider_key_bridge(self) -> None:
+    def test_provider_api_key_plaintext_readback_is_narrow_and_native_only(self) -> None:
         ipc = (ROOT / "litellm_menu" / "core" / "ipc.py").read_text(encoding="utf-8")
         service = (ROOT / "litellm_menu" / "core" / "service.py").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         windows_header = (WIN_NATIVE / "CoreIPCBridge.h").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
 
-        self.assertIn('"/v1/host/secret/read-capability"', ipc)
-        self.assertIn('"/v1/host/secret/read"', ipc)
-        self.assertIn('("providers_models", "api_key")', service)
+        self.assertIn('route in {"/v1/host/secret/read-capability", "/v1/host/secret/read"}', ipc)
+        self.assertIn('if (name, field_name) != ("providers_models", "api_key"):', service)
+        self.assertIn("_SecretReadCapability", ipc)
+        self.assertIn("read_secret_capability", ipc)
         self.assertIn("readProviderAPIKeyForTarget", mac)
-        self.assertIn('domain == "providers_models"', mac)
-        self.assertIn('field == "api_key"', mac)
         self.assertIn("ReadProviderAPIKey", windows_header)
-        self.assertIn('CreateSecretReadCapability("providers_models", "api_key", target)', windows)
+        self.assertIn("ReadProviderAPIKey", windows)
         self.assertNotIn("secret/read", (SHARED / "platform" / "nativeBridge.ts").read_text(encoding="utf-8"))
 
-    def test_provider_api_key_uses_the_legacy_direct_plaintext_editor_without_set_or_clear(self) -> None:
+    def test_provider_api_key_uses_native_plaintext_auto_commit(self) -> None:
         ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         mac_core = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
@@ -981,12 +1104,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("onClear={() => clearSecret", provider_editor)
         self.assertNotIn("providers.apiKeyHint", provider_editor)
         for spec in (mac_spec, windows_spec):
+            self.assertIn("plainText?: WithDefault<boolean, false>;", spec)
             self.assertIn("autoCommit?: WithDefault<boolean, false>;", spec)
-        self.assertIn("_plainField.action = @selector(submitSecret:);", mac)
+        self.assertIn("_field.action = @selector(submitSecret:);", mac)
         self.assertIn("controlTextDidEndEditing", mac)
         self.assertIn("loadProviderAPIKeyForTarget", mac)
-        self.assertIn("readProviderAPIKeyForTarget", mac_core)
-        self.assertIn("host/secret/read-capability", mac_core)
+        self.assertIn("readProviderAPIKey", mac_core)
         self.assertIn("host/secret/read", mac_core)
         self.assertIn("ReadProviderAPIKey", windows_core)
 
@@ -1102,16 +1225,39 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("label.font = [NSFont systemFontOfSize:13];", controls)
         self.assertIn("constraintEqualToAnchor:cell.leadingAnchor constant:8", controls)
 
-    def test_macos_provider_tables_only_show_vertical_scrollers_for_overflow(self) -> None:
+    def test_macos_tables_only_show_scrollers_for_overflow(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        self.assertIn("_scrollView.scrollerStyle = NSScrollerStyleLegacy", controls)
         self.assertIn("_scrollView.hasHorizontalScroller = NO", controls)
         self.assertIn("_scrollView.hasVerticalScroller = NO", controls)
         self.assertIn("_scrollView.horizontalScrollElasticity = NSScrollElasticityNone", controls)
-        self.assertIn("column.minWidth = index + 1 == newViewProps.columnLabels.size() ? 1 : 48", controls)
+        self.assertIn("_scrollView.verticalScrollElasticity = NSScrollElasticityNone", controls)
+        self.assertIn("@interface LiteLLMTableScrollView : NSScrollView", controls)
+        self.assertIn("- (void)scrollWheel:(NSEvent *)event", controls)
+        self.assertIn("if (!_acceptsVerticalScroll && !_acceptsHorizontalScroll)", controls)
+        self.assertIn("_scrollView.acceptsVerticalScroll = NO", controls)
+        self.assertIn("@interface LiteLLMTableClipView : NSClipView", controls)
+        self.assertIn("_clipView.acceptsVerticalScroll = NO", controls)
+        self.assertIn("_scrollView.contentView = _clipView;", controls)
+        self.assertIn("_clipView.acceptsVerticalScroll = needsVerticalScroller;", controls)
+        self.assertNotIn("constrainBoundsRect", controls)
+        self.assertIn("@interface LiteLLMTableView : NSTableView", controls)
+        self.assertIn("_tableView.acceptsVerticalScroll = NO", controls)
+        self.assertIn("column.minWidth = 96;", controls)
+        self.assertIn("column.maxWidth = CGFLOAT_MAX;", controls)
         self.assertIn("const bool dataChanged = columnsChanged || compactChanged || nextDataSignature != _dataSignature;", controls)
         self.assertIn("- (void)updateScrollerVisibility", controls)
-        self.assertIn("const BOOL needsVerticalScroller = rowsHeight > viewportHeight + 0.5;", controls)
-        self.assertIn("MAX(NSHeight(visibleBounds), rowsHeight)", controls)
+        self.assertIn("const CGFloat headerHeight = _tableView.headerView == nil ? 0 : NSHeight(_tableView.headerView.frame);", controls)
+        self.assertIn("const CGFloat dataViewportHeight = MAX(0, NSHeight(_scrollView.contentView.bounds) - headerHeight);", controls)
+        self.assertIn("const CGFloat rowsHeight = _tableView.numberOfRows * _tableView.rowHeight;", controls)
+        self.assertIn("const BOOL needsVerticalScroller = rowsHeight > dataViewportHeight;", controls)
+        self.assertIn("const BOOL needsHorizontalScroller = contentWidth > NSWidth(visibleBounds) + 0.5;", controls)
+        self.assertIn("MAX(dataViewportHeight, rowsHeight));", controls)
+        self.assertIn("_scrollView.acceptsVerticalScroll = needsVerticalScroller;", controls)
+        self.assertIn("_tableView.acceptsVerticalScroll = needsVerticalScroller;", controls)
+        self.assertIn("if (selectionChanged && _scrollView.hasVerticalScroller)", controls)
+        self.assertIn("_tableView.action = @selector(handleRowClick:);", controls)
+        self.assertIn("- (void)handleRowClick", controls)
 
     def test_macos_menu_autostart_fallback_uses_localization(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -1176,7 +1322,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("const BOOL selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey;", mac)
         self.assertIn("if (selectionChanged || _tableView.selectedRow != selectedIndex)", mac)
-        self.assertIn("if (selectionChanged) {\n      [_tableView scrollRowToVisible:selectedIndex];", mac)
+        self.assertIn("if (selectionChanged && _scrollView.hasVerticalScroller) {\n      [_tableView scrollRowToVisible:selectedIndex];", mac)
         checkbox = windows.split("struct CheckboxComponentView final", 1)[1].split(
             "struct TableComponentView final", 1
         )[0]
@@ -1199,9 +1345,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "struct TextEditorComponentView final", 1
         )[0]
         self.assertIn("ScrollViewer::SetHorizontalScrollBarVisibility(", table)
+        self.assertIn("list_.IsItemClickEnabled(true);", table)
+        self.assertIn("list_.ItemClick", table)
         self.assertIn("ScrollBarVisibility::Disabled", table)
         self.assertIn("ScrollViewer::SetVerticalScrollBarVisibility(", table)
         self.assertIn("ScrollBarVisibility::Auto", table)
+        self.assertIn("std::max(88.0, static_cast<double>(widths[index]))", windows)
+        self.assertIn("table_.MinWidth(TableWidth(props.columnWidths, column_count));", table)
+        self.assertIn("horizontal_scroller_.HorizontalScrollBarVisibility(", table)
 
     def test_native_text_inputs_do_not_rewrite_active_text_for_unrelated_prop_updates(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")

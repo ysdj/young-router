@@ -115,6 +115,12 @@ class WebDAVSettingsDomain:
             "last_probe": self._last_probe,
         }
 
+    def draft_state(self) -> object:
+        return {
+            "enabled": self._draft_enabled,
+            "settings": copy.deepcopy(self._draft_settings),
+        }
+
     def _patch(self, data: Mapping[str, Any]) -> None:
         allowed = {"url", "username", "password", "remote_name", "sync_interval_minutes", "timeout_seconds"}
         source = data.get("settings", data.get("values", data))

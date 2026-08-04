@@ -4,6 +4,65 @@ from hook_test_utils import *
 
 
 class HookResponsesWebSearchBridgeTests(HookTestCase):
+    def test_external_search_response_marks_final_answer_phase(self) -> None:
+        hooks, _ = load_hook_module()
+        response = hooks._external_web_search_message_response(
+            {"model": "synthetic-search-model"},
+            "Sunny.",
+        )
+        self.assertEqual(response["output"][0]["phase"], "final_answer")
+
+        enriched = hooks._with_external_web_search_call_action_items(
+            {
+                "output": [
+                    {
+                        "id": "msg_final",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [],
+                    }
+                ]
+            },
+            [{"type": "search", "query": "Suzhou weather"}],
+        )
+        self.assertEqual(enriched["output"][-1]["phase"], "final_answer")
+
+        already_enriched = hooks._with_external_web_search_call_action_items(
+            {
+                "output": [
+                    {
+                        "id": "ws_existing",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "Suzhou weather"},
+                    },
+                    {
+                        "id": "msg_existing_final",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                ]
+            },
+            [{"type": "search", "query": "Suzhou weather"}],
+        )
+        self.assertEqual(already_enriched["output"][-1]["phase"], "final_answer")
+
+        message_events = hooks._external_web_search_message_stream_events(
+            {
+                "id": "msg_stream_final",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [],
+            },
+            1,
+        )
+        self.assertEqual(message_events[0]["item"]["phase"], "final_answer")
+        self.assertEqual(message_events[-1]["item"]["phase"], "final_answer")
+
     def test_provider_citation_suffix_is_removed_from_source_url(self) -> None:
         hooks, _ = load_hook_module()
         self.assertEqual(
@@ -238,15 +297,19 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             web_events[1]["sequence_number"],
             web_events[0]["sequence_number"] + 1,
         )
-        self.assertGreater(
-            web_events[2]["sequence_number"],
-            78,
-        )
+        self.assertEqual(web_events[2]["sequence_number"], 78)
         delta_index = next(
             index
             for index, chunk in enumerate(chunks)
             if chunk.get("type") == "response.output_text.delta"
         )
+        search_done_index = next(
+            index
+            for index, chunk in enumerate(chunks)
+            if chunk.get("type") == "response.output_item.done"
+            and chunk.get("item", {}).get("type") == "web_search_call"
+        )
+        self.assertLess(search_done_index, delta_index - 2)
         self.assertEqual(
             [chunk.get("type") for chunk in chunks[delta_index - 2 : delta_index + 1]],
             [
@@ -257,8 +320,10 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         )
         self.assertEqual(chunks[delta_index - 2]["item"]["id"], "msg_seq")
         self.assertEqual(chunks[delta_index - 2]["item"]["type"], "message")
+        self.assertEqual(chunks[delta_index - 2]["item"]["phase"], "final_answer")
         self.assertEqual(chunks[delta_index - 1]["item_id"], "msg_seq")
         self.assertEqual(chunks[delta_index]["delta"], "stub")
+        self.assertEqual(chunks[-1]["response"]["output"][-1]["phase"], "final_answer")
         sequence_numbers = [
             chunk["sequence_number"]
             for chunk in chunks
@@ -326,7 +391,118 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         self.assertEqual(len(message_starts), 1)
         self.assertEqual(len(content_starts), 1)
         self.assertEqual(message_starts[0]["item"]["id"], "msg_existing")
+        self.assertEqual(message_starts[0]["item"]["phase"], "final_answer")
         self.assertEqual(content_starts[0]["item_id"], "msg_existing")
+
+    async def test_standard_search_and_message_missing_starts_are_synthesized(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def upstream():
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "ws_missing_start",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "Suzhou weather"},
+                },
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg_missing_start",
+                "output_index": 1,
+                "content_index": 0,
+                "delta": "Sunny",
+            }
+
+        chunks = [
+            hooks._jsonable(chunk)
+            async for chunk in hooks._adapt_provider_hidden_web_search_stream(
+                upstream(),
+                {"tools": [{"type": "web_search"}]},
+            )
+        ]
+        search_completed_index = next(
+            index
+            for index, chunk in enumerate(chunks)
+            if chunk.get("type") == "response.output_item.done"
+            and chunk.get("item", {}).get("type") == "web_search_call"
+        )
+        self.assertEqual(
+            chunks[search_completed_index - 1]["type"],
+            "response.output_item.added",
+        )
+        self.assertEqual(
+            chunks[search_completed_index - 1]["item"]["id"],
+            "ws_missing_start",
+        )
+        delta_index = next(
+            index
+            for index, chunk in enumerate(chunks)
+            if chunk.get("type") == "response.output_text.delta"
+        )
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks[delta_index - 2 : delta_index + 1]],
+            [
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+            ],
+        )
+        self.assertEqual(chunks[delta_index - 2]["item"]["phase"], "final_answer")
+
+    async def test_hidden_provider_search_completes_before_message_start(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def upstream():
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 3,
+                "item": {"id": "tco_order-0", "type": "reasoning"},
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 9,
+                "item": {
+                    "id": "msg_order",
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg_order",
+                "output_index": 9,
+                "content_index": 0,
+                "delta": "visible",
+            }
+
+        chunks = [
+            hooks._jsonable(chunk)
+            async for chunk in hooks._adapt_provider_hidden_web_search_stream(
+                upstream(),
+                {"tools": [{"type": "web_search"}]},
+            )
+        ]
+        search_done_index = next(
+            index
+            for index, chunk in enumerate(chunks)
+            if chunk.get("type") == "response.output_item.done"
+            and chunk.get("item", {}).get("type") == "web_search_call"
+        )
+        message_start_index = next(
+            index
+            for index, chunk in enumerate(chunks)
+            if chunk.get("type") == "response.output_item.added"
+            and chunk.get("item", {}).get("type") == "message"
+        )
+        self.assertLess(search_done_index, message_start_index)
+        self.assertEqual(chunks[search_done_index]["output_index"], 3)
+        self.assertEqual(chunks[message_start_index]["output_index"], 9)
+        self.assertEqual(chunks[message_start_index]["item"]["phase"], "final_answer")
 
     async def test_hidden_provider_search_with_answer_never_runs_local_bridge(self) -> None:
         hooks, _ = load_hook_module()

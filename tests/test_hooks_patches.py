@@ -4,6 +4,84 @@ from hook_test_utils import *
 
 
 class HookPatchTests(HookTestCase):
+    async def test_install_all_keeps_large_responses_json_on_native_http_path(self) -> None:
+        hooks, _ = load_hook_module()
+        received = {}
+
+        class AsyncHTTPHandler:
+            async def post(
+                self,
+                url,
+                data=None,
+                json=None,
+                params=None,
+                headers=None,
+                timeout=None,
+                stream=False,
+                logging_obj=None,
+                files=None,
+                content=None,
+            ):
+                received.update(
+                    {
+                        "url": url,
+                        "data": data,
+                        "json": json,
+                        "headers": headers,
+                        "content": content,
+                    }
+                )
+                return {"stream": True}
+
+        class HTTPHandler:
+            def post(self, *args, **kwargs):
+                return {"sync": True}
+
+        litellm_llms = types.ModuleType("litellm.llms")
+        custom_httpx = types.ModuleType("litellm.llms.custom_httpx")
+        http_handler_module = types.ModuleType(
+            "litellm.llms.custom_httpx.http_handler"
+        )
+        http_handler_module.AsyncHTTPHandler = AsyncHTTPHandler
+        http_handler_module.HTTPHandler = HTTPHandler
+        sys.modules["litellm.llms"] = litellm_llms
+        sys.modules["litellm.llms.custom_httpx"] = custom_httpx
+        sys.modules["litellm.llms.custom_httpx.http_handler"] = http_handler_module
+
+        original_post = AsyncHTTPHandler.post
+        hooks.install_all()
+
+        body = {
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_large",
+                    "output": "x" * 1_100_000,
+                },
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+        }
+        headers = {"Content-Type": "application/json"}
+        response = await AsyncHTTPHandler().post(
+            "https://gateway.example.test/v1/responses",
+            json=body,
+            headers=headers,
+            stream=True,
+        )
+
+        self.assertIs(AsyncHTTPHandler.post, original_post)
+        self.assertEqual(response, {"stream": True})
+        self.assertIs(received["json"], body)
+        self.assertIsNone(received["data"])
+        self.assertIsNone(received["content"])
+        self.assertEqual(received["headers"], headers)
+        self.assertNotIn(
+            "content-encoding",
+            {key.lower(): value for key, value in received["headers"].items()},
+        )
+
     def test_anthropic_unversioned_messages_endpoint_skips_only_the_duplicate_suffix(self) -> None:
         hooks, _ = load_hook_module()
         litellm_module = sys.modules["litellm"]
@@ -186,6 +264,10 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(request_kwargs["litellm_params"]["api_base"], "https://chat-provider.example/v1")
         self.assertNotIn("api_key", request_kwargs["litellm_params"])
         self.assertEqual(request_kwargs["litellm_metadata"]["api_base"], "https://chat-provider.example/v1")
+        self.assertEqual(
+            request_kwargs["litellm_metadata"]["deployment_model_name"],
+            "legacy-chat",
+        )
         self.assertEqual(request_kwargs["model_info"]["model_group"], "legacy-chat")
 
     async def test_generic_helper_patch_wraps_bound_original_generic_function(self) -> None:

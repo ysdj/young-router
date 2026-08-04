@@ -20,7 +20,6 @@ import Foundation
 
     struct SecretReadCapability {
         let token: String
-        let present: Bool
     }
 
     struct EditorStageResult {
@@ -48,7 +47,13 @@ import Foundation
     }
 
     private let lock = NSLock()
+    private let stoppingLock = NSLock()
     private static let relayLoginTimeout: TimeInterval = 60
+    private static let coreShutdownTimeout: TimeInterval = 4
+    // Core publishes its IPC endpoint only after its managed LiteLLM listener
+    // is healthy.  The controller waits for that listener for at most 60s, so
+    // the native host must not mistake a normal cold start for a failed one.
+    private static let coreStartupTimeout: TimeInterval = 65
     private var endpoint: Endpoint?
     private var sessionToken: String?
     private var sessionExpiresAt: Date?
@@ -66,8 +71,22 @@ import Foundation
 
     private override init() { super.init() }
 
-    /// Start the authenticated Core session while the React bundle is loading.
-    /// Service lifecycle remains owned by the shared React startup path.
+    private func isStopping() -> Bool {
+        stoppingLock.lock()
+        defer { stoppingLock.unlock() }
+        return stopping
+    }
+
+    private func beginStopping() -> Bool {
+        stoppingLock.lock()
+        defer { stoppingLock.unlock() }
+        guard !stopping else { return false }
+        stopping = true
+        return true
+    }
+
+    /// Start the complete Core/proxy unit while the React bundle is loading.
+    /// Failure remains visible to the menu so the user can inspect or retry.
     public func warm() {
         DispatchQueue.global(qos: .userInitiated).async {
             _ = try? self.ensureSession()
@@ -83,10 +102,7 @@ import Foundation
     func send(_ request: String, completion: @escaping (Result<String, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                self.lock.lock()
-                let stopping = self.stopping
-                self.lock.unlock()
-                guard !stopping else { throw BridgeError.unavailable }
+                guard !self.isStopping() else { throw BridgeError.unavailable }
                 guard let data = request.data(using: .utf8),
                       let metadata = self.requestMetadata(data) else { throw BridgeError.invalidResponse }
                 let (body, _, requestGeneration, restarted) = try self.performCoreRequest(route: "", method: "POST", body: data)
@@ -491,20 +507,14 @@ import Foundation
         return SecretStageResult(revision: revision.intValue, present: present)
     }
 
-    /// Obtains a short-lived, read-once token for a provider API key. This
-    /// route is intentionally narrower than secret staging: it never accepts
-    /// another domain or secret field, and the token stays in the native host.
-    @nonobjc func createSecretReadCapability(
-        domain: String,
-        field: String,
-        target: String
-    ) throws -> SecretReadCapability {
-        guard domain == "providers_models",
-              field == "api_key",
-              !target.isEmpty,
+    /// The only Core route that exposes a provider API key. The lease remains
+    /// session-bound, expires quickly, and is consumed before the value is
+    /// returned to this native host.
+    @nonobjc func createSecretReadCapability(target: String) throws -> SecretReadCapability {
+        guard !target.isEmpty,
               target.utf8.count <= 256,
               let body = try? JSONSerialization.data(
-                  withJSONObject: ["domain": domain, "field": field, "target": target],
+                  withJSONObject: ["domain": "providers_models", "field": "api_key", "target": target],
                   options: []
               ) else { throw BridgeError.invalidResponse }
         let (data, response, requestGeneration, restarted) = try performCoreRequest(
@@ -523,16 +533,13 @@ import Foundation
               let revision = object["revision"] as? NSNumber,
               revision.doubleValue.rounded(.towardZero) == revision.doubleValue,
               revision.intValue >= 0,
-              let present = object["present"] as? Bool else {
+              object["present"] is Bool else {
             if response.statusCode >= 500 { _ = resetCore(expectedGeneration: requestGeneration) }
             throw BridgeError.invalidResponse
         }
-        return SecretReadCapability(token: token, present: present)
+        return SecretReadCapability(token: token)
     }
 
-    /// Returns the raw API key to native code only. The read capability is
-    /// consumed by Core before it serves this response and must never cross
-    /// the React Native bridge.
     @nonobjc func readSecret(_ secretReadToken: String) throws -> String {
         guard !secretReadToken.isEmpty,
               secretReadToken.utf8.count <= 256,
@@ -561,21 +568,12 @@ import Foundation
         return value
     }
 
-    /// Reads a provider API key through the complete native-only handshake.
-    /// The opaque read token exists only on this stack frame and is consumed
-    /// before the plaintext response is returned.
     @nonobjc func readProviderAPIKey(_ target: String) throws -> String {
-        let capability = try createSecretReadCapability(
-            domain: "providers_models",
-            field: "api_key",
-            target: target
-        )
-        return try readSecret(capability.token)
+        try readSecret(createSecretReadCapability(target: target).token)
     }
 
-    /// Objective-C++ Fabric leaves cannot invoke an ``@nonobjc`` Swift
-    /// method. Keep this completion native-only: the supplied value must not
-    /// be forwarded through the React Native module or component event.
+    /// The completion is invoked only by the AppKit Fabric leaf; plaintext is
+    /// never emitted through a React Native module or component event.
     @objc(readProviderAPIKeyForTarget:completion:)
     public func readProviderAPIKeyForTarget(
         _ target: String,
@@ -625,20 +623,16 @@ import Foundation
     }
 
     public func stop() {
+        guard beginStopping() else { return }
         lock.lock()
-        guard !stopping else {
-            lock.unlock()
-            return
-        }
-        stopping = true
         pollCancelled = true
         let shutdownEndpoint = endpoint
         let shutdownToken = sessionToken
         lock.unlock()
 
         // The authenticated host route owns the managed LiteLLM lifecycle.
-        // A replacement app deliberately stops the old proxy before the new
-        // bundle starts, so the new Core can claim the configured port.
+        // Wait for it to finish stopping the proxy before terminating Core;
+        // otherwise a forced Core exit can orphan the 4000 listener.
         if let shutdownEndpoint, let shutdownToken {
             _ = try? performRequest(
                 endpoint: shutdownEndpoint,
@@ -646,7 +640,7 @@ import Foundation
                 method: "POST",
                 body: Data("{}".utf8),
                 token: shutdownToken,
-                timeoutInterval: 1
+                timeoutInterval: Self.coreShutdownTimeout
             )
         }
 
@@ -725,7 +719,7 @@ import Foundation
     private func ensureSession() throws -> (Endpoint, String, Int, Bool) {
         lock.lock()
         defer { lock.unlock() }
-        guard !stopping else { throw BridgeError.unavailable }
+        guard !isStopping() else { throw BridgeError.unavailable }
         if let endpoint, let sessionToken, let sessionExpiresAt,
            sessionExpiresAt.timeIntervalSinceNow > 15 {
             return (endpoint, sessionToken, generation, false)
@@ -799,13 +793,18 @@ import Foundation
             childEnvironment["PYTHONPATH"] = current.map { "\(rootPath):\($0)" } ?? rootPath
             childEnvironment["LITELLM_BIN"] = coreRoot.appendingPathComponent("runtime/bin/litellm").path
         }
+        // Core imports from a signed application bundle.  Bytecode caches
+        // must never be written beside those signed resources at runtime.
+        childEnvironment["PYTHONDONTWRITEBYTECODE"] = "1"
         process.environment = childEnvironment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()
 
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(Self.coreStartupTimeout)
         while Date() < deadline {
+            guard !isStopping() else { break }
+            guard process.isRunning else { break }
             if let data = try? Data(contentsOf: endpointFile),
                let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                raw["kind"] as? String == "loopback",
@@ -967,8 +966,13 @@ import Foundation
                 }
                 handler?(eventText)
             } catch {
-                if resetCore(expectedGeneration: generation) { scheduleSubscriptionRecovery() }
-                return
+                lock.lock()
+                let retry = !pollCancelled
+                    && subscriptionID == subscription
+                    && self.generation == generation
+                lock.unlock()
+                guard retry else { return }
+                Thread.sleep(forTimeInterval: 1)
             }
         }
     }

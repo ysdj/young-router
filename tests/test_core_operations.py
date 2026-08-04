@@ -15,6 +15,7 @@ from unittest import mock
 from litellm_menu.core import CoreStore
 from litellm_menu.core.domains.legacy import ProvidersModelsDomain, RuntimeSettingsDomain, WebDAVSettingsDomain
 from litellm_menu.core.operations import CoreServiceController
+from litellm_menu.core.persistence import PersistenceError
 
 
 PROVIDER_CONFIG = """
@@ -29,6 +30,16 @@ model_list: []
 
 
 class CoreOperationsTests(unittest.TestCase):
+    def test_reload_restarts_the_managed_service(self) -> None:
+        controller = CoreServiceController("/tmp/unused-runtime")
+        expected = {"state": "running"}
+        with mock.patch.object(controller, "_pid", return_value=4811), mock.patch.object(
+            controller, "restart", return_value=expected
+        ) as restart:
+            self.assertEqual(expected, controller.reload())
+
+        restart.assert_called_once_with()
+
     @unittest.skipIf(os.name == "nt", "POSIX process states are unavailable on Windows")
     def test_process_alive_rejects_zombies(self) -> None:
         zombie = subprocess.CompletedProcess(
@@ -61,9 +72,9 @@ class CoreOperationsTests(unittest.TestCase):
                 controller, "status", return_value={"state": "stopped"}
             ), mock.patch.object(controller, "_stage_runtime_config"), mock.patch.object(
                 controller, "_runtime_env", return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "1"}
-            ), mock.patch.object(controller, "_write_state"), mock.patch.object(
-                controller, "_write_owner_record"
-            ), mock.patch.object(controller, "_health", return_value=True), mock.patch(
+            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                controller, "_health", return_value=True
+            ), mock.patch(
                 "litellm_menu.core.operations.atomic_write_text"
             ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
@@ -74,7 +85,7 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertIn("from litellm import run_server", command[2])
             self.assertNotIn(controller.litellm_bin, command)
 
-    def test_macos_uses_configured_uvicorn_workers_without_gunicorn(self) -> None:
+    def test_macos_uses_configured_spawn_workers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
             process = mock.Mock(pid=4813)
@@ -87,9 +98,9 @@ class CoreOperationsTests(unittest.TestCase):
                 controller,
                 "_runtime_env",
                 return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "16"},
-            ), mock.patch.object(controller, "_write_state"), mock.patch.object(
-                controller, "_write_owner_record"
-            ), mock.patch.object(controller, "_health", return_value=True), mock.patch(
+            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                controller, "_health", return_value=True
+            ), mock.patch(
                 "litellm_menu.core.operations.atomic_write_text"
             ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
@@ -99,7 +110,7 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual("16", command[workers_index + 1])
             self.assertNotIn("--run_gunicorn", command)
 
-    def test_macos_defaults_to_sixteen_uvicorn_workers(self) -> None:
+    def test_macos_defaults_to_sixteen_spawn_workers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
             process = mock.Mock(pid=4815)
@@ -112,9 +123,9 @@ class CoreOperationsTests(unittest.TestCase):
                 controller,
                 "_runtime_env",
                 return_value={"LITELLM_PORT": "4000"},
-            ), mock.patch.object(controller, "_write_state"), mock.patch.object(
-                controller, "_write_owner_record"
-            ), mock.patch.object(controller, "_health", return_value=True), mock.patch(
+            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                controller, "_health", return_value=True
+            ), mock.patch(
                 "litellm_menu.core.operations.atomic_write_text"
             ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
@@ -123,6 +134,28 @@ class CoreOperationsTests(unittest.TestCase):
             workers_index = command.index("--num_workers")
             self.assertEqual("16", command[workers_index + 1])
             self.assertNotIn("--run_gunicorn", command)
+
+    def test_non_macos_posix_retains_gunicorn_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            process = mock.Mock(pid=4816)
+            process.poll.return_value = None
+            with mock.patch("litellm_menu.core.operations.os.name", "posix"), mock.patch(
+                "litellm_menu.core.operations.sys.platform", "linux"
+            ), mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(
+                controller,
+                "_runtime_env",
+                return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "16"},
+            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                controller, "_health", return_value=True
+            ), mock.patch(
+                "litellm_menu.core.operations.atomic_write_text"
+            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                controller.start()
+
+            self.assertIn("--run_gunicorn", popen.call_args.args[0])
 
     def test_service_dispatch_projects_real_status_and_autostart(self) -> None:
         calls: list[str] = []
@@ -200,6 +233,63 @@ class CoreOperationsTests(unittest.TestCase):
 
         self.assertEqual(revision, core.revision)
         self.assertEqual([], events)
+
+    def test_snapshot_projects_live_service_status_without_persisting_a_transition(self) -> None:
+        status = {
+            "state": "running",
+            "pid": 123,
+            "port": 49173,
+            "auto_start_state": "enabled",
+        }
+        calls: list[str] = []
+
+        def handler(operation: str) -> dict[str, object]:
+            calls.append(operation)
+            return dict(status)
+
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory) / "core-state.json"
+            prior_core = CoreStore(metadata_path=metadata)
+            prior_core.set_service_status("starting")
+            core = CoreStore(metadata_path=metadata, service_handlers={"status": handler})
+            revision = core.revision
+            persisted = metadata.read_bytes()
+            events: list[dict[str, object]] = []
+            unsubscribe = core.subscribe(events.append)
+            self.addCleanup(unsubscribe)
+
+            snapshot = core.snapshot()
+
+            self.assertEqual(["status"], calls)
+            self.assertEqual("running", snapshot["service"]["state"])
+            self.assertEqual(49173, snapshot["service"]["port"])
+            self.assertEqual(revision, core.revision)
+            self.assertEqual(persisted, metadata.read_bytes())
+            self.assertEqual([], events)
+
+    def test_default_core_starts_the_service_before_exposing_its_snapshot(self) -> None:
+        with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
+            controller = controller_type.return_value
+            controller.status.return_value = {"state": "stopped"}
+            controller.start.return_value = {
+                "state": "running",
+                "pid": 123,
+                "port": 4000,
+                "auto_start_state": "enabled",
+            }
+            controller.dispatch.return_value = dict(controller.start.return_value)
+
+            core = CoreStore.with_default_domains(runtime_root="/tmp/litellm-menu-core-start")
+
+        controller.start.assert_called_once_with()
+        self.assertEqual("running", core.snapshot()["service"]["state"])
+
+    def test_default_core_rejects_a_non_running_service(self) -> None:
+        with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
+            controller_type.return_value.status.return_value = {"state": "unknown"}
+
+            with self.assertRaisesRegex(RuntimeError, "service is unavailable"):
+                CoreStore.with_default_domains(runtime_root="/tmp/litellm-menu-core-unavailable")
 
     def test_controller_status_and_autostart_use_private_runtime_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -324,6 +414,24 @@ class CoreOperationsTests(unittest.TestCase):
             with mock.patch.object(controller, "_health", return_value=True):
                 self.assertEqual("unknown", controller.status()["state"])
 
+    def test_controller_ignores_removed_persisted_runtime_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runtime-settings.env").write_text(
+                "LITELLM_PORT=49173\n"
+                "LITELLM_MENU_WEB_SEARCH_READ_RESULTS=1\n"
+                "LITELLM_MENU_BALANCE_REFRESH_MINUTES=5\n"
+                "LITELLM_BROWSER_BILLING=1\n",
+                encoding="utf-8",
+            )
+
+            environment = CoreServiceController(root)._runtime_env()
+
+            self.assertEqual("49173", environment["LITELLM_PORT"])
+            self.assertNotIn("LITELLM_MENU_WEB_SEARCH_READ_RESULTS", environment)
+            self.assertNotIn("LITELLM_MENU_BALANCE_REFRESH_MINUTES", environment)
+            self.assertNotIn("LITELLM_BROWSER_BILLING", environment)
+
     def test_proxy_environment_loads_bundled_callback_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
@@ -334,9 +442,27 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual("1", environment["LITELLM_MENU_TIMESTAMP_OUTPUT"])
             self.assertEqual(str(Path(directory) / "menu-server.log"), environment["LITELLM_MENU_SERVICE_LOG"])
             self.assertEqual(str(Path(directory) / "recent-requests.jsonl"), environment["LITELLM_RECENT_REQUESTS_LOG"])
+            self.assertEqual("true", environment["LITELLM_LOCAL_MODEL_COST_MAP"])
+            self.assertEqual(str(controller.paths.recovery), environment["LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE"])
+            self.assertEqual(str(controller.paths.cooldowns), environment["LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE"])
+            self.assertEqual(
+                "litellm_menu.search_endpoint:register",
+                environment["LITELLM_WORKER_STARTUP_HOOKS"],
+            )
             self.assertEqual(str(core_root), environment["LITELLM_TEMPLATE_ROOT"])
             self.assertEqual(str(core_root), environment["PYTHONPATH"].split(os.pathsep)[0])
             self.assertTrue((core_root / "sitecustomize.py").is_file())
+
+    def test_explicit_controller_port_overrides_persisted_runtime_port(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "runtime-settings.env"
+            settings.write_text("LITELLM_PORT=4000\n", encoding="utf-8")
+            controller = CoreServiceController(
+                directory,
+                environment={"LITELLM_PORT": "44001"},
+            )
+
+            self.assertEqual("44001", controller._runtime_env()["LITELLM_PORT"])
 
     def test_service_start_appends_proxy_output_to_service_log(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -347,9 +473,9 @@ class CoreOperationsTests(unittest.TestCase):
                 controller, "_stage_runtime_config"
             ), mock.patch.object(
                 controller, "_runtime_env", return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "1"}
-            ), mock.patch.object(controller, "_write_state"), mock.patch.object(
-                controller, "_write_owner_record"
-            ), mock.patch.object(controller, "_health", return_value=True), mock.patch(
+            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                controller, "_health", return_value=True
+            ), mock.patch(
                 "litellm_menu.core.operations.atomic_write_text"
             ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
@@ -402,31 +528,36 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual("portable", completed.stdout.strip())
 
-    def test_owner_record_is_independent_of_the_core_process(self) -> None:
+    def test_owner_record_requires_the_current_core_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            first = CoreServiceController(directory)
-            first.paths.pid.parent.mkdir(parents=True, exist_ok=True)
-            first.paths.pid.write_text("4242\n", encoding="utf-8")
-            first.paths.owner.write_text(
+            controller = CoreServiceController(directory)
+            controller.paths.pid.parent.mkdir(parents=True, exist_ok=True)
+            controller.paths.pid.write_text("4242\n", encoding="utf-8")
+            controller.paths.owner.write_text(
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "pid": 4242,
                         "identity": "synthetic-process-identity",
                         "token": "synthetic-service-owner-token-1234567890",
+                        "core_pid": 4343,
+                        "core_identity": "synthetic-core-identity",
                     }
                 ),
                 encoding="utf-8",
             )
 
-            replacement = CoreServiceController(directory)
             with mock.patch.object(
-                replacement, "_process_identity", return_value="synthetic-process-identity"
-            ), mock.patch.object(replacement, "_posix_process_has_token", return_value=True):
-                self.assertEqual(4242, replacement._pid())
+                controller, "_recorded_pid", return_value=4242
+            ), mock.patch.object(controller, "_core_identity", return_value=(4343, "synthetic-core-identity")):
+                self.assertEqual(4242, controller._pid())
+            with mock.patch.object(
+                controller, "_recorded_pid", return_value=4242
+            ), mock.patch.object(controller, "_core_identity", return_value=(4444, "replacement-core-identity")):
+                self.assertIsNone(controller._pid())
 
     @unittest.skipIf(os.name == "nt", "the fixture uses POSIX signals")
-    def test_controller_recognizes_owned_service_after_core_restart(self) -> None:
+    def test_controller_reclaims_only_a_verified_orphan_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             first = CoreServiceController(directory)
             token = "synthetic-service-owner-token-1234567890"
@@ -454,11 +585,105 @@ class CoreOperationsTests(unittest.TestCase):
             first.paths.pid.write_text(f"{process.pid}\n", encoding="utf-8")
 
             replacement = CoreServiceController(directory)
+            record = first._read_owner_record()
+            self.assertIsNotNone(record)
+            assert record is not None
 
-            self.assertEqual(process.pid, replacement._pid())
             self.assertEqual(0o600, stat.S_IMODE(replacement.paths.owner.stat().st_mode))
-            with mock.patch.object(replacement, "_health", return_value=True):
-                self.assertEqual("running", replacement.status()["state"])
+            with mock.patch.object(
+                replacement, "_core_identity", return_value=(record.core_pid + 1, "replacement-core-identity")
+            ), mock.patch.object(replacement, "_recorded_pid", return_value=process.pid), mock.patch.object(
+                replacement, "_process_identity", side_effect=lambda pid: (
+                    record.identity if pid == process.pid else record.core_identity if pid == record.core_pid else None
+                )
+            ):
+                self.assertIsNone(replacement._pid())
+                self.assertIsNone(replacement._recorded_proxy_is_orphaned())
+            with mock.patch.object(
+                replacement, "_core_identity", return_value=(record.core_pid + 1, "replacement-core-identity")
+            ), mock.patch.object(replacement, "_process_identity", side_effect=lambda pid: (
+                record.identity if pid == process.pid else None
+            )), mock.patch.object(replacement, "_posix_process_has_token", return_value=True):
+                self.assertEqual(process.pid, replacement._recorded_proxy_is_orphaned())
+
+    def test_stop_preserves_another_core_ownership_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.pid.parent.mkdir(parents=True, exist_ok=True)
+            controller.paths.pid.write_text("4242\n", encoding="utf-8")
+            controller.paths.owner.write_text("owner\n", encoding="utf-8")
+
+            with mock.patch.object(controller, "_pid", return_value=None), mock.patch.object(
+                controller, "status", return_value={"state": "unknown"}
+            ) as status:
+                result = controller.stop()
+
+            self.assertEqual({"state": "unknown"}, result)
+            status.assert_called_once_with()
+            self.assertEqual("4242\n", controller.paths.pid.read_text(encoding="utf-8"))
+            self.assertEqual("owner\n", controller.paths.owner.read_text(encoding="utf-8"))
+
+    def test_verified_orphan_projects_as_stopped_for_normal_recovery(self) -> None:
+        controller = CoreServiceController("/tmp/unused-runtime")
+
+        with mock.patch.object(controller, "_pid", return_value=None), mock.patch.object(
+            controller, "_health", return_value=True
+        ), mock.patch.object(controller, "_recorded_proxy_is_orphaned", return_value=4242):
+            self.assertEqual("stopped", controller.status()["state"])
+
+    def test_unhealthy_start_cleans_the_owned_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.pid.parent.mkdir(parents=True, exist_ok=True)
+            process = mock.Mock()
+            process.pid = 4242
+            process.poll.return_value = None
+            controller.paths.pid.write_text("4242\n", encoding="utf-8")
+            controller.paths.owner.write_text("owner\n", encoding="utf-8")
+
+            with mock.patch.object(controller, "status", side_effect=[{"state": "stopped"}]), mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(controller, "_runtime_env", return_value={"LITELLM_HEALTH_WAIT_SECONDS": "1"}), mock.patch.object(
+                controller, "_configured_port", return_value=4000
+            ), mock.patch(
+                "litellm_menu.core.operations.subprocess.Popen", return_value=process
+            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                controller, "_health", return_value=False
+            ), mock.patch.object(controller, "_stop_process_group") as stop_group, mock.patch(
+                "litellm_menu.core.operations.time.sleep"
+            ), mock.patch(
+                "litellm_menu.core.operations.time.monotonic", side_effect=[0, 0, 2]
+            ):
+                with self.assertRaisesRegex(RuntimeError, "did not become healthy"):
+                    controller.start()
+
+            stop_group.assert_called_once_with(4242)
+            self.assertFalse(controller.paths.pid.exists())
+            self.assertFalse(controller.paths.owner.exists())
+
+    def test_start_failure_clears_partial_ownership_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.pid.parent.mkdir(parents=True, exist_ok=True)
+            controller.paths.pid.write_text("4242\n", encoding="utf-8")
+            controller.paths.owner.write_text("owner\n", encoding="utf-8")
+            process = mock.Mock(pid=4242)
+
+            with mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(controller, "_runtime_env", return_value={}), mock.patch.object(
+                controller, "_configured_port", return_value=4000
+            ), mock.patch(
+                "litellm_menu.core.operations.subprocess.Popen", return_value=process
+            ), mock.patch.object(
+                controller, "_write_owner_record", side_effect=PersistenceError("write failed")
+            ), mock.patch.object(controller, "_stop_process_group") as stop_group:
+                with self.assertRaisesRegex(RuntimeError, "could not start"):
+                    controller.start()
+
+            stop_group.assert_called_once_with(4242)
+            self.assertFalse(controller.paths.pid.exists())
+            self.assertFalse(controller.paths.owner.exists())
 
     @unittest.skipIf(os.name == "nt", "the fixture uses POSIX process metadata")
     def test_controller_rejects_forged_or_reused_pid_record(self) -> None:
@@ -488,10 +713,12 @@ class CoreOperationsTests(unittest.TestCase):
             controller.paths.owner.write_text(
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "pid": process.pid,
                         "identity": identity,
                         "token": "different-synthetic-owner-token-12345",
+                        "core_pid": os.getpid(),
+                        "core_identity": controller._process_identity(os.getpid()),
                     }
                 ),
                 encoding="utf-8",
@@ -502,10 +729,12 @@ class CoreOperationsTests(unittest.TestCase):
             controller.paths.owner.write_text(
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "pid": process.pid,
                         "identity": "posix-lstart-sha256:" + "0" * 64,
                         "token": token,
+                        "core_pid": os.getpid(),
+                        "core_identity": controller._process_identity(os.getpid()),
                     }
                 ),
                 encoding="utf-8",

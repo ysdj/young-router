@@ -20,6 +20,7 @@ type NativeModule = {
   saveFilePicker?: (suggestedName: string) => Promise<string | undefined>;
   showActionMenu?: (title: string, items: string[], anchor: NativeMenuAnchor) => Promise<number | undefined>;
   showConfirmation?: (title: string, message: string, confirmLabel: string) => Promise<boolean>;
+  showReadOnlyText?: (title: string, text: string, closeLabel: string) => Promise<void>;
   chooseModelsToAdd?: (models: string[], providerName: string, keyName: string) => Promise<string[] | undefined>;
   editSecureDocument?: (editorToken: string, language: "toml" | "json", title: string) => Promise<number | undefined>;
   editSecret?: (
@@ -118,6 +119,10 @@ const nativeBridge: NativeLeafBridge = {
   saveFilePicker: async (suggestedName) => leaf.saveFilePicker?.(suggestedName),
   showActionMenu: async (title, items, anchor) => leaf.showActionMenu?.(title, items, anchor),
   showConfirmation: async (title, message, confirmLabel) => leaf.showConfirmation?.(title, message, confirmLabel) ?? false,
+  showReadOnlyText: async (title, text, closeLabel) => {
+    if (!leaf.showReadOnlyText) throw new Error("The native read-only text viewer is unavailable.");
+    await leaf.showReadOnlyText(title, text, closeLabel);
+  },
   chooseModelsToAdd: async (models, providerName, keyName) => leaf.chooseModelsToAdd?.(models, providerName, keyName),
   editSecureDocument: async (editorToken, language, title) => leaf.editSecureDocument?.(editorToken, language, title),
   editSecret: async (domain, field, target, title, allowClear) => leaf.editSecret?.(domain, field, target, title, allowClear),
@@ -153,7 +158,6 @@ const routeActions: NativeMenuAction[] = [
 
 const native = createNativeLeafBridgeAdapter(nativeBridge);
 native.menuBar.setActions(routeActions);
-native.tray.setActions(routeActions);
 
 const ipc = createIpcClient(createNativeIpcTransport(ipcBridge));
 

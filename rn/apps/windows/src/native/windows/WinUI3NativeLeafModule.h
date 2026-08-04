@@ -20,6 +20,7 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(OpenFilePicker, L"openFilePicker");
   REACT_METHOD(SaveFilePicker, L"saveFilePicker");
   REACT_METHOD(ShowConfirmation, L"showConfirmation");
+  REACT_METHOD(ShowReadOnlyText, L"showReadOnlyText");
   REACT_METHOD(ShowActionMenu, L"showActionMenu");
   REACT_METHOD(ChooseModelsToAdd, L"chooseModelsToAdd");
   REACT_METHOD(EditSecureDocument, L"editSecureDocument");
@@ -56,6 +57,11 @@ struct WinUI3NativeLeafModule {
       std::wstring const& message,
       std::wstring const& confirm_label,
       winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept;
+  void ShowReadOnlyText(
+      std::wstring const& title,
+      std::wstring const& text,
+      std::wstring const& close_label,
+      winrt::Microsoft::ReactNative::ReactPromise<void> const& promise) noexcept;
   void ShowActionMenu(
       std::wstring const& title,
       std::vector<std::wstring> const& items,

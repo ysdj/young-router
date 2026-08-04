@@ -123,6 +123,137 @@ class HookStreamingTimeoutTests(HookTestCase):
             datetime,
         )
 
+    async def test_codex_responses_initial_keepalive_opens_stream_without_cancelling_upstream_read(self) -> None:
+        hooks, _ = load_hook_module()
+        original_grace = hooks._CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS
+        hooks._CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS = 0.001
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS",
+            original_grace,
+        )
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.05")
+        upstream_cancelled = False
+        upstream_closed = False
+
+        async def upstream():
+            nonlocal upstream_cancelled, upstream_closed
+            try:
+                await asyncio.sleep(0.006)
+                yield {"type": "response.output_text.delta", "delta": "ready"}
+                yield {"type": "response.completed", "response": {"id": "resp-ready"}}
+            except asyncio.CancelledError:
+                upstream_cancelled = True
+                raise
+            finally:
+                upstream_closed = True
+
+        request_data = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+        }
+
+        stream = hooks._yield_codex_responses_initial_keepalive_stream(
+            upstream(),
+            request_data,
+        ).__aiter__()
+        chunks = [jsonable_stream_chunk(await stream.__anext__())]
+        self.assertTrue(hooks._is_codex_responses_initial_sse_keepalive(chunks[0]))
+        chunks.append(jsonable_stream_chunk(await stream.__anext__()))
+        self.assertIsInstance(
+            request_data.get(hooks._FIRST_STREAM_OUTPUT_TIME_KEY),
+            datetime,
+        )
+        chunks.extend(
+            [
+                jsonable_stream_chunk(chunk)
+                async for chunk in stream
+            ]
+        )
+
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            [
+                "response.metadata",
+                "response.output_text.delta",
+                "response.completed",
+            ],
+        )
+        self.assertEqual(
+            chunks[0]["metadata"],
+            {
+                "litellm_menu_keepalive": "initial_wait",
+                "phase": "awaiting_upstream_first_event",
+            },
+        )
+        self.assertFalse(upstream_cancelled)
+        self.assertTrue(upstream_closed)
+
+    async def test_codex_responses_initial_keepalive_preserves_first_event_deadline(self) -> None:
+        hooks, _ = load_hook_module()
+        original_grace = hooks._CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS
+        hooks._CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS = 0.001
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_CODEX_RESPONSES_INITIAL_SSE_GRACE_SECONDS",
+            original_grace,
+        )
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
+        upstream_cancelled = False
+
+        async def upstream():
+            nonlocal upstream_cancelled
+            try:
+                await asyncio.sleep(1)
+                yield {"type": "response.output_text.delta", "delta": "too late"}
+            except asyncio.CancelledError:
+                upstream_cancelled = True
+                raise
+
+        request_data = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+        }
+        stream = hooks._yield_codex_responses_initial_keepalive_stream(
+            upstream(),
+            request_data,
+        ).__aiter__()
+
+        first = jsonable_stream_chunk(await stream.__anext__())
+        self.assertTrue(hooks._is_codex_responses_initial_sse_keepalive(first))
+        with self.assertRaises(TimeoutError) as captured:
+            await stream.__anext__()
+        self.assertEqual(
+            getattr(captured.exception, "body", {}).get("reason"),
+            "stream_start_timeout",
+        )
+        self.assertTrue(upstream_cancelled)
+
+    def test_codex_responses_initial_keepalive_excludes_structured_compaction(self) -> None:
+        hooks, _ = load_hook_module()
+        request_data = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": [
+                {"role": "user", "content": "Continue."},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"compaction"}'},
+        }
+
+        self.assertFalse(
+            hooks._should_emit_codex_responses_initial_sse_keepalive(request_data)
+        )
+
     async def test_streaming_start_timeout_replays_via_router_and_logs_stuck(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
@@ -429,7 +560,7 @@ class HookStreamingTimeoutTests(HookTestCase):
             if log_path.exists():
                 self.assertEqual(log_path.read_text(encoding="utf-8").strip(), "")
 
-    async def test_streaming_reasoning_events_are_not_delivered(self) -> None:
+    async def test_streaming_reasoning_summary_is_delivered_but_raw_reasoning_is_not(self) -> None:
         hooks, proxy_server = load_hook_module()
 
         class FakeRouter:
@@ -442,10 +573,71 @@ class HookStreamingTimeoutTests(HookTestCase):
 
         async def original_stream():
             yield {"type": "response.output_text.delta", "delta": "\n\n"}
-            yield {"type": "response.reasoning_summary_text.delta", "delta": "duplicate text"}
             yield {
                 "type": "response.output_item.added",
-                "item": {"id": "rs_1", "type": "reasoning", "summary": []},
+                "output_index": 0,
+                "item": {
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "private"}],
+                },
+            }
+            yield {
+                "type": "response.reasoning_summary_part.added",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            }
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "Verifying tool choice compatibility in auto mode",
+            }
+            yield {
+                "type": "response.reasoning_text.delta",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "private chain of thought",
+            }
+            yield {
+                "type": "response.reasoning_summary_text.done",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "text": "Verifying tool choice compatibility in auto mode",
+            }
+            yield {
+                "type": "response.reasoning_summary_part.done",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {
+                    "type": "summary_text",
+                    "text": "Verifying tool choice compatibility in auto mode",
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [
+                        {
+                            "type": "summary_text",
+                            "text": "Verifying tool choice compatibility in auto mode",
+                        }
+                    ],
+                    "content": [{"type": "reasoning_text", "text": "private"}],
+                    "encrypted_content": "opaque-signed-reasoning",
+                },
             }
             yield {"type": "response.output_text.delta", "delta": "visible"}
             yield {
@@ -453,7 +645,21 @@ class HookStreamingTimeoutTests(HookTestCase):
                 "response": {
                     "id": "resp-original",
                     "output": [
-                        {"id": "rs_1", "type": "reasoning", "summary": []},
+                        {
+                            "id": "rs_1",
+                            "type": "reasoning",
+                            "status": "completed",
+                            "summary": [
+                                {
+                                    "type": "summary_text",
+                                    "text": "Verifying tool choice compatibility in auto mode",
+                                }
+                            ],
+                            "content": [
+                                {"type": "reasoning_text", "text": "private"}
+                            ],
+                            "encrypted_content": "opaque-signed-reasoning",
+                        },
                         {
                             "id": "msg_1",
                             "type": "message",
@@ -484,12 +690,81 @@ class HookStreamingTimeoutTests(HookTestCase):
         self.assertEqual(
             chunks,
             [
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "status": "in_progress",
+                        "summary": [],
+                    },
+                },
+                {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""},
+                },
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": "Verifying tool choice compatibility in auto mode",
+                },
+                {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "text": "Verifying tool choice compatibility in auto mode",
+                },
+                {
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": "rs_1",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "part": {
+                        "type": "summary_text",
+                        "text": "Verifying tool choice compatibility in auto mode",
+                    },
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "status": "completed",
+                        "summary": [
+                            {
+                                "type": "summary_text",
+                                "text": "Verifying tool choice compatibility in auto mode",
+                            }
+                        ],
+                        "encrypted_content": "opaque-signed-reasoning",
+                    },
+                },
                 {"type": "response.output_text.delta", "delta": "visible"},
                 {
                     "type": "response.completed",
                     "response": {
                         "id": "resp-original",
                         "output": [
+                            {
+                                "id": "rs_1",
+                                "type": "reasoning",
+                                "status": "completed",
+                                "summary": [
+                                    {
+                                        "type": "summary_text",
+                                        "text": "Verifying tool choice compatibility in auto mode",
+                                    }
+                                ],
+                                "encrypted_content": "opaque-signed-reasoning",
+                            },
                             {
                                 "id": "msg_1",
                                 "type": "message",

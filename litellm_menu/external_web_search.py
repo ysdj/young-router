@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from html.parser import HTMLParser
+
 from .base import (
     Any,
     Optional,
@@ -7,24 +9,17 @@ from .base import (
     _EXTERNAL_WEB_SEARCH_BACKEND_ENV,
     _EXTERNAL_WEB_SEARCH_MAX_RESULTS_DEFAULT,
     _EXTERNAL_WEB_SEARCH_MAX_RESULTS_ENV,
-    _EXTERNAL_WEB_SEARCH_READ_CHARS_DEFAULT,
-    _EXTERNAL_WEB_SEARCH_READ_CHARS_ENV,
-    _EXTERNAL_WEB_SEARCH_READ_RESULTS_DEFAULT,
-    _EXTERNAL_WEB_SEARCH_READ_RESULTS_ENV,
     _EXTERNAL_WEB_SEARCH_REGION_DEFAULT,
     _EXTERNAL_WEB_SEARCH_REGION_ENV,
     _EXTERNAL_WEB_FETCH_TIMEOUT_DEFAULT,
     _EXTERNAL_WEB_FETCH_TIMEOUT_ENV,
-    _FALLBACK_BROWSER_USER_AGENT,
     _SearchResponse,
     _SearchResult,
     _WebSearchTransformation,
     os,
-    quote,
     re,
     urllib,
 )
-
 
 
 def _external_web_search_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -54,54 +49,90 @@ def _external_web_search_float_env(
     return max(minimum, min(maximum, value))
 
 
-def _jina_reader_excerpt(url: str, *, timeout: float, max_chars: int) -> str:
+class _ExternalWebSearchHTMLTextExtractor(HTMLParser):
+    _BLOCK_TAGS = {
+        "article",
+        "aside",
+        "br",
+        "div",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "li",
+        "main",
+        "p",
+        "section",
+        "table",
+        "td",
+        "th",
+        "tr",
+    }
+    _IGNORED_TAGS = {"noscript", "script", "style", "svg"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized = tag.lower()
+        if normalized in self._IGNORED_TAGS:
+            self._ignored_depth += 1
+            return
+        if normalized in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if normalized in self._IGNORED_TAGS:
+            self._ignored_depth = max(0, self._ignored_depth - 1)
+            return
+        if normalized in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth == 0:
+            self.parts.append(data)
+
+
+def _external_web_search_normalize_page_text(text: str, *, max_chars: int) -> str:
+    text = re.sub(r"[\t\r\f\v ]+", " ", text)
+    text = re.sub(r"\n[ ]*\n+", "\n", text).strip()
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "..."
+    return text
+
+
+def _web_page_excerpt(url: str, *, timeout: float, max_chars: int) -> str:
     if not url.startswith(("http://", "https://")):
         return ""
-    reader_url = "https://r.jina.ai/" + quote(url, safe=":/")
     request = urllib.request.Request(
-        reader_url,
+        url,
         headers={
-            "Accept": "text/plain, */*",
-            "User-Agent": _FALLBACK_BROWSER_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+            "User-Agent": "LiteLLM-Menu/1.0",
         },
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            text = response.read(max_chars * 4).decode("utf-8", "ignore")
+            raw = response.read(max_chars * 16)
+            content_type = str(response.headers.get("Content-Type") or "").lower()
     except (urllib.error.URLError, TimeoutError, OSError):
         return ""
-    text = "\n".join(line.rstrip() for line in text.splitlines())
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "..."
-    return text
+    text = raw.decode("utf-8", "ignore")
+    if "html" in content_type or "<html" in text[:1024].lower():
+        parser = _ExternalWebSearchHTMLTextExtractor()
+        parser.feed(text)
+        text = "".join(parser.parts)
+    return _external_web_search_normalize_page_text(text, max_chars=max_chars)
 
 
-def _jina_reader_excerpts(
-    urls: list[str],
-    *,
-    timeout: float,
-    max_chars: int,
-) -> list[str]:
-    if not urls:
-        return []
-    from concurrent.futures import ThreadPoolExecutor
-
-    workers = min(4, len(urls))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="jina-reader") as executor:
-        return list(
-            executor.map(
-                lambda url: _jina_reader_excerpt(
-                    url,
-                    timeout=timeout,
-                    max_chars=max_chars,
-                ),
-                urls,
-            )
-        )
-
-
-def _ddgs_jina_web_search_sync(query: str) -> tuple[str, Any]:
+def _ddgs_jina_web_search_sync(query: str, *, page: int = 1) -> tuple[str, Any]:
     try:
         from ddgs import DDGS
     except ImportError as exc:
@@ -114,18 +145,6 @@ def _ddgs_jina_web_search_sync(query: str) -> tuple[str, Any]:
         _EXTERNAL_WEB_SEARCH_MAX_RESULTS_DEFAULT,
         1,
         20,
-    )
-    read_results = _external_web_search_int_env(
-        _EXTERNAL_WEB_SEARCH_READ_RESULTS_ENV,
-        _EXTERNAL_WEB_SEARCH_READ_RESULTS_DEFAULT,
-        0,
-        max_results,
-    )
-    read_chars = _external_web_search_int_env(
-        _EXTERNAL_WEB_SEARCH_READ_CHARS_ENV,
-        _EXTERNAL_WEB_SEARCH_READ_CHARS_DEFAULT,
-        200,
-        5000,
     )
     timeout = _external_web_search_float_env(
         _EXTERNAL_WEB_FETCH_TIMEOUT_ENV,
@@ -144,8 +163,14 @@ def _ddgs_jina_web_search_sync(query: str) -> tuple[str, Any]:
     backends = [
         item.strip()
         for item in re.split(r"[, ]+", backend)
-        if item.strip()
-    ] or [_EXTERNAL_WEB_SEARCH_BACKEND_DEFAULT]
+        if item.strip() and item.strip().lower() != "auto"
+    ]
+    if not backends:
+        backends = [
+            item.strip()
+            for item in re.split(r"[, ]+", _EXTERNAL_WEB_SEARCH_BACKEND_DEFAULT)
+            if item.strip()
+        ]
 
     raw_results: list[dict[str, Any]] = []
     last_exception: Optional[Exception] = None
@@ -157,6 +182,8 @@ def _ddgs_jina_web_search_sync(query: str) -> tuple[str, Any]:
                         query,
                         max_results=max_results,
                         region=region,
+                        safesearch="off",
+                        page=page,
                         backend=backend_name,
                     )
                 )
@@ -169,6 +196,7 @@ def _ddgs_jina_web_search_sync(query: str) -> tuple[str, Any]:
                 continue
             url = str(raw.get("href") or raw.get("url") or "").strip()
             title = str(raw.get("title") or "").strip()
+            snippet = str(raw.get("body") or raw.get("snippet") or "").strip()
             dedupe_key = url or title
             if not dedupe_key:
                 continue
@@ -190,16 +218,6 @@ def _ddgs_jina_web_search_sync(query: str) -> tuple[str, Any]:
     if not raw_results and last_exception is not None:
         raise last_exception
 
-    readable_urls: list[str] = []
-    for raw in raw_results[:read_results]:
-        if isinstance(raw, dict):
-            readable_urls.append(str(raw.get("href") or raw.get("url") or "").strip())
-    excerpts = _jina_reader_excerpts(
-        readable_urls,
-        timeout=min(timeout, 15.0),
-        max_chars=read_chars,
-    )
-
     results: list[Any] = []
     fallback_lines: list[str] = []
     for index, raw in enumerate(raw_results[:max_results]):
@@ -208,8 +226,6 @@ def _ddgs_jina_web_search_sync(query: str) -> tuple[str, Any]:
         url = str(raw.get("href") or raw.get("url") or "").strip()
         title = str(raw.get("title") or url or "Untitled result").strip()
         snippet = str(raw.get("body") or raw.get("snippet") or "").strip()
-        if index < len(excerpts) and excerpts[index]:
-            snippet = f"{snippet}\n\nJina Reader excerpt:\n{excerpts[index]}".strip()
         fallback_lines.append(f"Title: {title}\nURL: {url}\nSnippet: {snippet}")
         if _SearchResult is not None:
             results.append(

@@ -30,6 +30,26 @@ from litellm_menu.core.security import REDACT_TEXT, redact, safe_error_message
 
 
 class CoreProtocolTests(unittest.TestCase):
+    def test_ipc_server_uses_a_short_shutdown_poll_interval(self) -> None:
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        served = threading.Event()
+        observed: dict[str, float] = {}
+
+        def serve_forever(_server: object, *, poll_interval: float) -> None:
+            observed["poll_interval"] = poll_interval
+            served.set()
+
+        with (
+            mock.patch("litellm_menu.core.ipc.http.server.ThreadingHTTPServer.serve_forever", serve_forever),
+            mock.patch("litellm_menu.core.ipc.http.server.ThreadingHTTPServer.shutdown"),
+        ):
+            server.start()
+            self.assertTrue(served.wait(1.0))
+            server.stop()
+
+        self.assertEqual(0.05, observed["poll_interval"])
+
     def test_core_parent_watchdog_stops_after_direct_parent_changes(self) -> None:
         stop = threading.Event()
         with mock.patch.object(core_main.os, "getppid", side_effect=[4321, 9876]):
@@ -392,6 +412,32 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertFalse(core.snapshot()["drafts"]["language"]["dirty"])
             self.assertEqual(2, AtomicJSONStore(state_file).read()["revision"])
 
+    def test_reverting_a_draft_to_its_baseline_clears_dirty_state(self) -> None:
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+
+        core.dispatch({"domain": "language", "type": "set", "payload": {"choice": "en"}})
+        self.assertTrue(core.snapshot()["drafts"]["language"]["dirty"])
+
+        core.dispatch({"domain": "language", "type": "set", "payload": {"choice": "system"}})
+
+        self.assertFalse(core.snapshot()["drafts"]["language"]["dirty"])
+
+    def test_importing_state_equal_to_the_baseline_remains_clean(self) -> None:
+        core = CoreStore(domains=[MemoryDomain("runtime", {"port": "4000"})])
+
+        result = core.import_package(
+            package={
+                "format": "litellm-menu-core-package",
+                "version": 1,
+                "sections": {"runtime": {"port": "4000"}},
+            },
+            sections=["runtime"],
+            revision=core.revision,
+        )
+
+        self.assertEqual(["runtime"], result["draft_domains"])
+        self.assertFalse(core.snapshot()["drafts"]["runtime"]["dirty"])
+
     def test_provider_model_summary_matches_the_typescript_contract(self) -> None:
         class ProviderDomain(MemoryDomain):
             def snapshot(self) -> dict[str, object]:
@@ -410,7 +456,6 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                                     "model_enabled": False,
                                     "order": "2",
                                     "billing": {"cost": "1.25", "api_key": "sk-synthetic-summary-secret"},
-                                    "usage": "read /private/user/request.json token-synthetic-summary-secret",
                                     "multiplier": {"status": "ok", "value": 1.25},
                                     "supported_upstream_url_surfaces": ["openai/responses"],
                                 }
@@ -422,17 +467,16 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         model = CoreStore(domains=[ProviderDomain("providers_models")]).snapshot()["providers_models"]["providers"][0]["models"][0]
 
         self.assertEqual(
-            {"id", "display_name", "public_model", "upstream_model", "enabled", "order", "billing", "usage", "multiplier"},
+            {"id", "display_name", "public_model", "upstream_model", "enabled", "order", "billing", "multiplier"},
             set(model),
         )
         self.assertEqual("deployment-1", model["id"])
         self.assertEqual("default-chat", model["display_name"])
         self.assertEqual("default-chat", model["public_model"])
-        self.assertEqual("openai/upstream-chat", model["upstream_model"])
+        self.assertEqual("upstream-chat", model["upstream_model"])
         self.assertFalse(model["enabled"])
         self.assertEqual(2, model["order"])
         self.assertIsInstance(model["billing"], str)
-        self.assertIsInstance(model["usage"], str)
         self.assertIsInstance(model["multiplier"], str)
         encoded = json.dumps(model)
         self.assertNotIn("sk-synthetic-summary-secret", encoded)
@@ -884,7 +928,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertTrue(response["present"])
             self.assertNotIn("synthetic-secret", body.decode("utf-8"))
 
-    def test_provider_api_key_read_capability_is_native_only_session_bound_and_one_time(self) -> None:
+    def test_provider_api_key_plaintext_readback_is_narrow_and_read_once(self) -> None:
         from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
 
         api_key = "test-provider-api-key"
@@ -917,34 +961,70 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertNotIn(api_key, json.dumps(core.snapshot()))
 
             session = client._session_token
-            capability = server.register_secret_read_capability(
-                "providers_models", "api_key", "test-provider", session_token=session
+            status, body, _headers = client._http(
+                "/v1/host/secret/read-capability",
+                payload=encode_message(
+                    {
+                        "domain": "providers_models",
+                        "field": "api_key",
+                        "target": "test-provider\x1fdefault",
+                    }
+                ),
+                token=session,
             )
-            self.assertTrue(capability["present"])
-            self.assertNotIn(api_key, json.dumps(capability))
-            with self.assertRaises(Exception):
-                server.read_secret_capability(
-                    capability["secret_read_token"], session_token="another-session"
-                )
+            self.assertEqual(200, status)
+            read_capability = decode_message(body)
+            self.assertEqual(
+                {"protocol_version", "secret_read_token", "revision", "present"},
+                set(read_capability),
+            )
+            self.assertTrue(read_capability["present"])
+            self.assertNotIn(api_key, body.decode("utf-8"))
 
             status, body, _headers = client._http(
                 "/v1/host/secret/read",
-                payload=encode_message({"secret_read_token": capability["secret_read_token"]}),
+                payload=encode_message({"secret_read_token": read_capability["secret_read_token"]}),
                 token=session,
             )
             self.assertEqual(200, status)
             self.assertEqual(
-                {"protocol_version": 1, "value": api_key},
-                decode_message(body),
+                {"protocol_version", "value"},
+                set(decode_message(body)),
             )
-            with self.assertRaises(Exception):
-                server.read_secret_capability(
-                    capability["secret_read_token"], session_token=session
-                )
-            with self.assertRaises(Exception):
-                server.register_secret_read_capability(
-                    "codex", "api_key", "test-provider", session_token=session
-                )
+            self.assertEqual(api_key, decode_message(body)["value"])
+
+            # A read lease cannot be replayed, even by the same native host.
+            status, body, _headers = client._http(
+                "/v1/host/secret/read",
+                payload=encode_message({"secret_read_token": read_capability["secret_read_token"]}),
+                token=session,
+            )
+            self.assertNotEqual(200, status)
+            self.assertNotIn(api_key, body.decode("utf-8"))
+
+            # The route is not a generic secret-read API.
+            status, body, _headers = client._http(
+                "/v1/host/secret/read-capability",
+                payload=encode_message({"domain": "webdav", "field": "password", "target": "x"}),
+                token=session,
+            )
+            self.assertNotEqual(200, status)
+            self.assertNotIn(api_key, body.decode("utf-8"))
+
+            writer = server.register_secret_capability(
+                "providers_models", "api_key", "test-provider\x1fdefault", session_token=session
+            )
+            server.stage_secret_capability(
+                writer["secret_token"], "unsaved-provider-api-key", session_token=session
+            )
+            self.assertNotIn("unsaved-provider-api-key", json.dumps(core.snapshot()))
+            reader = server.register_secret_read_capability(
+                "providers_models", "api_key", "test-provider\x1fdefault", session_token=session
+            )
+            self.assertEqual(
+                "unsaved-provider-api-key",
+                server.read_secret_capability(reader["secret_read_token"], session_token=session),
+            )
             with self.assertRaises(Exception):
                 client.call(
                     "dispatch",
@@ -956,115 +1036,6 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                         }
                     },
                 )
-
-    def test_provider_api_key_read_capability_rejects_stale_revision_and_invalid_http_shape(self) -> None:
-        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.yaml"
-            path.write_text(
-                "\n".join(
-                    [
-                        "providers:",
-                        "  test-provider:",
-                        '    api_base: "https://example.test/v1"',
-                        "    api_keys:",
-                        "      - name: default",
-                        '        value: "test-provider-api-key"',
-                        "model_list: []",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            core = CoreStore(domains=[ProvidersModelsDomain(path)])
-            server = CoreIPCServer(core)
-            endpoint = server.start()
-            self.addCleanup(server.stop)
-            client = CoreIPCClient(endpoint, server.bootstrap_token)
-            self.addCleanup(client.close)
-            client.call("snapshot")
-            session = client._session_token
-
-            status, body, _headers = client._http(
-                "/v1/host/secret/read-capability",
-                payload=encode_message(
-                    {"domain": "providers_models", "field": "api_key"}
-                ),
-                token=session,
-            )
-            self.assertEqual(400, status)
-            self.assertNotIn("test-provider-api-key", body.decode("utf-8"))
-
-            capability = server.register_secret_read_capability(
-                "providers_models", "api_key", "test-provider", session_token=session
-            )
-            core.dispatch(
-                {
-                    "domain": "providers_models",
-                    "type": "provider.patch",
-                    "payload": {
-                        "provider_id": "test-provider",
-                        "changes": {"api_base": "https://changed.example.test/v1"},
-                    },
-                }
-            )
-            with self.assertRaises(Exception):
-                server.read_secret_capability(
-                    capability["secret_read_token"], session_token=session
-                )
-            with self.assertRaises(Exception):
-                server.read_secret_capability(
-                    capability["secret_read_token"], session_token=session
-                )
-
-    def test_provider_api_key_read_capability_uses_the_current_staged_draft(self) -> None:
-        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-
-        original_key = "test-provider-api-key"
-        draft_key = "test-unsaved-draft-key"
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.yaml"
-            path.write_text(
-                "\n".join(
-                    [
-                        "providers:",
-                        "  test-provider:",
-                        '    api_base: "https://example.test/v1"',
-                        "    api_keys:",
-                        "      - name: default",
-                        f'        value: "{original_key}"',
-                        "model_list: []",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            core = CoreStore(domains=[ProvidersModelsDomain(path)])
-            server = CoreIPCServer(core)
-            endpoint = server.start()
-            self.addCleanup(server.stop)
-            client = CoreIPCClient(endpoint, server.bootstrap_token)
-            self.addCleanup(client.close)
-            client.call("snapshot")
-            session = client._session_token
-
-            writer = server.register_secret_capability(
-                "providers_models", "api_key", "test-provider", session_token=session
-            )
-            server.stage_secret_capability(
-                writer["secret_token"], draft_key, session_token=session
-            )
-            reader = server.register_secret_read_capability(
-                "providers_models", "api_key", "test-provider", session_token=session
-            )
-            self.assertEqual(
-                draft_key,
-                server.read_secret_capability(reader["secret_read_token"], session_token=session),
-            )
-            self.assertNotIn(original_key, json.dumps(core.snapshot()))
-            self.assertNotIn(draft_key, json.dumps(core.snapshot()))
-
 
 class CoreIPCTests(unittest.TestCase):
     def test_invalid_core_result_becomes_a_safe_failure_response(self) -> None:

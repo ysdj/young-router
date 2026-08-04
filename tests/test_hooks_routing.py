@@ -76,6 +76,29 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
         self.assertFalse(hooks._is_route_recovery_poll_error(error))
 
+    def test_unknown_custom_tool_type_is_not_a_deployment_failover(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        error = RuntimeError("OpenAIException invalid_request_error: unknown tool type: custom")
+        error.status_code = 400
+        error.failed_deployment_id = "route-a"
+
+        self.assertFalse(hooks._is_deployment_compatible_bad_request_error(error))
+        self.assertFalse(hooks._is_priority_deployment_failover_error(error))
+        self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
+
+    def test_upstream_high_risk_rejection_never_enters_recovery(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        error = RuntimeError(
+            "OpenAIException - the request was rejected because it was considered high risk"
+        )
+        error.status_code = 400
+        error.failed_deployment_id = "route-a"
+
+        self.assertTrue(hooks._is_terminal_prompt_or_policy_error(error))
+        self.assertFalse(hooks._is_deployment_compatible_bad_request_error(error))
+        self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
+        self.assertFalse(hooks._is_route_recovery_poll_error(error))
+
     async def test_filter_deployments_keeps_image_tool_candidates_for_runtime_probe(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
@@ -711,7 +734,7 @@ class HookRoutingTests(HookTestCase):
         stream = hooks._stream_route_recovery_poll(request_data, failure)
         first_chunk = jsonable_stream_chunk(await anext(stream))
         self.assertTrue(hooks._is_route_recovery_sse_keepalive(first_chunk))
-        self.assertEqual(first_chunk["response"]["metadata"]["phase"], "cooldown")
+        self.assertEqual(first_chunk["metadata"]["phase"], "cooldown")
         self.assertEqual(calls, [])
         waiting_state = json.loads(recovery_state_path.read_text(encoding="utf-8"))
         record = next(iter(waiting_state["recoveries"].values()))
@@ -723,7 +746,7 @@ class HookRoutingTests(HookTestCase):
         await asyncio.sleep(0.01)
         next_chunk = jsonable_stream_chunk(await anext(stream))
         self.assertTrue(hooks._is_route_recovery_sse_keepalive(next_chunk))
-        self.assertEqual(next_chunk["response"]["metadata"]["phase"], "cooldown")
+        self.assertEqual(next_chunk["metadata"]["phase"], "cooldown")
         self.assertEqual(calls, [])
 
         chunks = [first_chunk, next_chunk]

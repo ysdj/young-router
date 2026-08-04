@@ -259,6 +259,9 @@ class LanguageSettingsDomain:
             "options": list(LANGUAGE_OPTIONS),
         }
 
+    def draft_state(self) -> object:
+        return self.choice
+
     def validate(self, payload: object | None = None) -> dict[str, Any]:
         value = self.choice if payload is None else (payload.get("language") if isinstance(payload, Mapping) else payload)
         try:

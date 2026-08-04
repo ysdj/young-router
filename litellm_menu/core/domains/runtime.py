@@ -121,6 +121,9 @@ class RuntimeSettingsDomain:
             "raw_editor_available": True,
         }
 
+    def draft_state(self) -> object:
+        return copy.deepcopy(self._draft_values)
+
     def _validate_values(self, values: Mapping[str, object]) -> dict[str, str]:
         from runtime_settings_io import validate_values
 

@@ -230,6 +230,22 @@ def _upstream_url_surfaces(value: Any) -> list[str]:
     return modes
 
 
+def canonical_litellm_model(value: Any, surfaces: list[str]) -> str:
+    """Store a LiteLLM adapter prefix derived from the selected primary surface."""
+
+    model = _string_value(value).strip()
+    if not model:
+        return ""
+    if "/" in model:
+        existing_prefix, raw_model = model.split("/", 1)
+        if existing_prefix in {"openai", "anthropic"}:
+            model = raw_model.strip()
+    if not model:
+        return ""
+    prefix = "anthropic" if surfaces and surfaces[0] == "anthropic" else "openai"
+    return f"{prefix}/{model}"
+
+
 def _editor_deployment_id(value: Any) -> str:
     return _string_value(value).strip()
 

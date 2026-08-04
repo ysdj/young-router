@@ -290,6 +290,27 @@ void WinUI3NativeLeafModule::ShowConfirmation(
   }
 }
 
+void WinUI3NativeLeafModule::ShowReadOnlyText(
+    std::wstring const& title,
+    std::wstring const& text,
+    std::wstring const& close_label,
+    winrt::Microsoft::ReactNative::ReactPromise<void> const& promise) noexcept {
+  try {
+    auto leaf = leaf_;
+    auto js_dispatcher = context_.JSDispatcher();
+    context_.UIDispatcher().Post([leaf, title, text, close_label, promise, js_dispatcher] {
+      try {
+        leaf->ShowReadOnlyText(title, text, close_label);
+        js_dispatcher.Post([promise] { promise.Resolve(); });
+      } catch (...) {
+        js_dispatcher.Post([promise] { promise.Reject("The read-only text viewer could not be opened."); });
+      }
+    });
+  } catch (...) {
+    promise.Reject("The read-only text viewer could not be opened.");
+  }
+}
+
 void WinUI3NativeLeafModule::ShowActionMenu(
     std::wstring const& title,
     std::vector<std::wstring> const& items,

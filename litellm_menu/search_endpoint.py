@@ -244,7 +244,15 @@ def commands_to_actions(
         raw_query = operation.get("q") if isinstance(operation, dict) else operation
         query = _clean_query(raw_query)
         if query:
-            actions.append({"type": "search", "query": query})
+            action: dict[str, str] = {"type": "search", "query": query}
+            page = (
+                _bridge._external_web_search_page_number(operation.get("page"))
+                if isinstance(operation, dict)
+                else None
+            )
+            if page and page > 1:
+                action["page"] = str(page)
+            actions.append(action)
 
     for operation in _command_list(commands, "open"):
         ref_id = operation.get("ref_id") if isinstance(operation, dict) else operation

@@ -110,6 +110,13 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    @objc func showReadOnlyText(_ title: String, text: String, closeLabel: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+        DispatchQueue.main.async {
+            self.leaf.showReadOnlyText(title: title, text: text, closeTitle: closeLabel)
+            resolve(nil)
+        }
+    }
+
     @objc(showActionMenu:items:anchor:resolver:rejecter:)
     func showActionMenu(_ title: String, items: [String], anchor: [String: NSNumber], resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
         DispatchQueue.main.async {

@@ -3,6 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Focused local test runs may intentionally reuse the installed app's bundled
+# Python. Never let those imports write __pycache__ files into the signed app
+# bundle, because any post-signing file invalidates the macOS code signature.
+export PYTHONDONTWRITEBYTECODE=1
+
 # Keep the shared desktop UI contract in the same gate as the Python Core.
 # This check is intentionally dependency-free: CI and checkout-only test runs
 # should still catch route/protocol drift before installing the RN toolchain.

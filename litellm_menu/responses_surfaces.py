@@ -521,15 +521,30 @@ def _request_supports_responses_function_tools(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
-    for request in (request_kwargs, outer_request_kwargs):
-        model_info = _request_context_module._request_model_info(request)
+    if isinstance(request_kwargs, dict):
+        model_info = _request_context_module._request_model_info(request_kwargs)
         configured_support = model_info.get(
             _SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY
         )
+        route_is_selected = bool(
+            _routing_module._request_current_upstream_surface(request_kwargs)
+            or _request_has_explicit_surface_metadata(request_kwargs)
+        )
         if isinstance(configured_support, bool):
             return configured_support
-        if _request_uses_responses_endpoint(request):
+        if route_is_selected and not _request_uses_responses_endpoint(request_kwargs):
+            return False
+        if _request_uses_responses_endpoint(request_kwargs):
             return True
+
+    model_info = _request_context_module._request_model_info(outer_request_kwargs)
+    configured_support = model_info.get(
+        _SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY
+    )
+    if isinstance(configured_support, bool):
+        return configured_support
+    if _request_uses_responses_endpoint(outer_request_kwargs):
+        return True
     return False
 
 
@@ -845,6 +860,10 @@ def _responses_chat_bridge_preemptive_reason(
 ) -> Optional[str]:
     if not isinstance(request_kwargs, dict):
         return None
+    if not _responses_request_module._request_is_responses_api(request_kwargs):
+        return None
+    if _responses_request_module._request_is_codex_compaction(request_kwargs):
+        return None
     outer_for_tool_reason = (
         None
         if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
@@ -867,8 +886,6 @@ def _responses_chat_bridge_preemptive_kwargs(
 ) -> Optional[dict]:
     if not isinstance(request_kwargs, dict):
         return None
-    if request_kwargs.get("use_chat_completions_api") is True:
-        return None
     if _request_has_preemptive_responses_chat_bridge(request_kwargs):
         return request_kwargs
     if _responses_request_module._request_already_attempted_responses_chat_bridge(request_kwargs):
@@ -880,6 +897,22 @@ def _responses_chat_bridge_preemptive_kwargs(
         else outer_request_kwargs
     )
     plan = _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
+    reasoning = request_kwargs.get("reasoning")
+    requested_xhigh = (
+        isinstance(reasoning, dict) and reasoning.get("effort") == "xhigh"
+    ) or request_kwargs.get("reasoning_effort") == "xhigh"
+    if (
+        request_kwargs.get("use_chat_completions_api") is True
+        and requested_xhigh
+        and not plan.hosted_web_search
+    ):
+        # An explicit Chat dispatch may reject xhigh independently of its
+        # Responses-shaped tool payload. Preserve that payload for the
+        # dedicated xhigh -> high retry below rather than changing two request
+        # dimensions at once. Hosted web search is different: it must enter
+        # the bridge before the Chat call because the upstream has no native
+        # web-search tool.
+        return None
     reason = _responses_chat_bridge_preemptive_reason(
         request_kwargs,
         outer_for_tool_plan,

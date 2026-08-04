@@ -127,6 +127,7 @@ type TableProps = {
   compact?: boolean;
   followBottom?: boolean;
   disabledRowKeys?: string[];
+  secondaryCellKeys?: string[];
   onSelectionChange?: (key: string, index: number) => void;
   onRowDoublePress?: (key: string, index: number) => void;
   style?: StyleProp<ViewStyle>;
@@ -271,7 +272,7 @@ export function NativePicker({ labels, selectedValue, disabled, compact, onChang
 }
 
 
-export function NativeTable({ columns, rows, selectedKey = "", alternatingRows = false, compact = false, followBottom = false, disabledRowKeys = [], onSelectionChange, onRowDoublePress, style }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", alternatingRows = false, compact = false, followBottom = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style }: TableProps): React.JSX.Element {
   const nativeProps = {
     columnLabels: columns.map((column) => column.label),
     columnWidths: columns.map((column) => column.width),
@@ -282,6 +283,7 @@ export function NativeTable({ columns, rows, selectedKey = "", alternatingRows =
     compact,
     followBottom,
     disabledRowKeys,
+    secondaryCellKeys,
   };
   if (Platform.OS === "windows") {
     return <WinUITable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
