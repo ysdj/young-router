@@ -1,7 +1,8 @@
 import React, { useMemo, useRef, useState } from "react";
 import { Platform, PlatformColor, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter } from "../types";
-import { NativeButton, NativeCheckbox, NativeSelectableRow, NativeTextField } from "./NativeControls";
+import { NativeButton, NativeCheckbox, NativeSegmentedControl, NativeSelectableRow, NativeTextField } from "./NativeControls";
+import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type UnknownRecord = Record<string, unknown>;
 type Translate = (key: string, values?: Record<string, string | number>) => string;
@@ -142,6 +143,7 @@ export function RelayAccountManager({
   const [origin, setOrigin] = useState("");
   const [rememberPassword, setRememberPassword] = useState(false);
   const [typeDetection, setTypeDetection] = useState<RelayTypeDetection>();
+  const [manualType, setManualType] = useState<RelayType>();
   const [selectedResources, setSelectedResources] = useState<string[]>([]);
   const [formBusy, setFormBusy] = useState(false);
   const [loginBusy, setLoginBusy] = useState(false);
@@ -157,6 +159,7 @@ export function RelayAccountManager({
     setAdding(false);
     setOrigin("");
     setTypeDetection(undefined);
+    setManualType(undefined);
     setSelectedResources([]);
     rememberPasswordRef.current = false;
     setRememberPassword(false);
@@ -206,11 +209,16 @@ export function RelayAccountManager({
     setFeedback(undefined);
     try {
       const detected = await detectRelayType();
-      if (!detected) {
+      const accountType = detected ?? manualType;
+      if (!accountType) {
+        // A white-label site can block the public detection probes while
+        // still presenting a normal sign-in page. Let the user choose the
+        // station family, then open the native browser as usual.
+        setManualType("newapi");
         setFeedback(translate("relay.typeNotDetected"));
         return;
       }
-      const account = await addAccount(detected, origin.trim(), rememberPasswordRef.current);
+      const account = await addAccount(accountType, origin.trim(), rememberPasswordRef.current);
       if (!account) throw new Error("Relay account could not be created");
       resetForm();
       setSelectedID(account.id);
@@ -381,7 +389,8 @@ export function RelayAccountManager({
         {adding ? <View key="relay-add-account" style={styles.detailFrame}>
           <Text style={styles.sectionTitle}>{translate("relay.add")}</Text>
           <View style={styles.formCard}>
-            <Field label={translate("relay.origin")}><View style={styles.fieldControl}><NativeTextField value={origin} placeholder={translate("relay.originPlaceholder")} editable={!controlsBusy} accessibilityLabel={translate("relay.origin")} autoCapitalize="none" autoCorrect={false} onChangeText={(value) => { typeDetectionRequest.current += 1; setOrigin(value); setTypeDetection(undefined); }} onBlur={() => { void detectRelayType(); }} style={styles.control} />{typeDetection ? <Text style={styles.typeDetection}>{typeDetection === "checking" ? translate("relay.detectingType") : typeDetection === "unknown" ? translate("relay.typeNotDetected") : translate("relay.typeDetected", { type: relayTypeLabel(typeDetection, translate) })}</Text> : null}</View></Field>
+            <Field label={translate("relay.origin")}><View style={styles.fieldControl}><NativeTextField value={origin} placeholder={translate("relay.originPlaceholder")} editable={!controlsBusy} accessibilityLabel={translate("relay.origin")} autoCapitalize="none" autoCorrect={false} onChangeText={(value) => { typeDetectionRequest.current += 1; setOrigin(value); setTypeDetection(undefined); setManualType(undefined); }} onBlur={() => { void detectRelayType(); }} style={styles.control} />{typeDetection ? <Text style={styles.typeDetection}>{typeDetection === "checking" ? translate("relay.detectingType") : typeDetection === "unknown" ? translate("relay.typeNotDetected") : translate("relay.typeDetected", { type: relayTypeLabel(typeDetection, translate) })}</Text> : null}</View></Field>
+            {typeDetection === "unknown" ? <Field label={translate("relay.type")}><NativeSegmentedControl labels={[relayTypeLabel("newapi", translate), relayTypeLabel("sub2api", translate)]} selectedValue={relayTypeLabel(manualType ?? "newapi", translate)} disabled={controlsBusy} onChange={({ nativeEvent }) => { setManualType(nativeEvent.index === 1 ? "sub2api" : "newapi"); }} style={styles.typeSelector} /></Field> : null}
             <NativeCheckbox label={translate("relay.rememberPassword")} value={rememberPassword} disabled={controlsBusy} onValueChange={(next) => { rememberPasswordRef.current = next; setRememberPassword(next); }} />
           </View>
           {feedback ? <Text accessibilityLiveRegion="polite" style={styles.feedback}>{feedback}</Text> : null}
@@ -390,7 +399,7 @@ export function RelayAccountManager({
           <View style={styles.accountSummary}>
             <View style={styles.accountSummaryCopy}>
               <Text numberOfLines={1} style={styles.sectionTitle}>{selected.label}</Text>
-              <Text numberOfLines={1} style={styles.summaryDetail}>{`${relayTypeLabel(selected.type, translate)} · ${selected.origin}`}</Text>
+              <Text numberOfLines={1} style={styles.summaryDetail}>{`${relayTypeLabel(selected.type, translate)} - ${selected.origin}`}</Text>
             </View>
             <Text numberOfLines={1} style={styles.statusBadge}>{translate(statusKey(selected.loginStatus))}</Text>
           </View>
@@ -402,7 +411,7 @@ export function RelayAccountManager({
           <View style={styles.preferenceBlock}><NativeCheckbox label={translate("relay.rememberPassword")} value={selected.rememberPassword} disabled={controlsBusy} onValueChange={(next) => { void updateRememberPassword(next); }} /></View>
           <View style={styles.resourcePane}>
             <View style={styles.resourceHeader}><Text style={styles.resourceTitle}>{translate("relay.resources")}</Text>{selected.resourceStatus === "ready" ? <Text style={styles.resourceCount}>{translate("relay.resourceCount", { count: selected.resources.length })}</Text> : null}</View>
-            {selected.resources.length > 0 ? <ScrollView style={styles.resourceList} contentContainerStyle={styles.resourceListContent}>{selected.resources.map((resource) => <View key={resource.id} style={styles.resourceRow}><NativeCheckbox label={`${resource.apiName}${resource.keyHint ? ` · ${resource.keyHint}` : ""}`} value={selectedResources.includes(resource.id)} disabled={controlsBusy} onValueChange={() => toggleResource(resource.id)} /><Text numberOfLines={1} style={styles.resourceDetail}>{`${resource.apiBase} · ${translate("relay.modelsCount", { count: resource.models.length })}`}</Text></View>)}</ScrollView> : <Text style={styles.hint}>{selected.resourceStatus === "unavailable" ? translate("relay.resourcesUnavailable") : translate("relay.resourcesAfterLogin")}</Text>}
+            {selected.resources.length > 0 ? <ScrollView style={styles.resourceList} contentContainerStyle={styles.resourceListContent}>{selected.resources.map((resource) => <View key={resource.id} style={styles.resourceRow}><NativeCheckbox label={`${resource.apiName}${resource.keyHint ? ` | ${resource.keyHint}` : ""}`} value={selectedResources.includes(resource.id)} disabled={controlsBusy} onValueChange={() => toggleResource(resource.id)} /><Text numberOfLines={1} style={styles.resourceDetail}>{`${resource.apiBase} | ${translate("relay.modelsCount", { count: resource.models.length })}`}</Text></View>)}</ScrollView> : <Text style={styles.hint}>{selected.resourceStatus === "unavailable" ? translate("relay.resourcesUnavailable") : translate("relay.resourcesAfterLogin")}</Text>}
           </View>
           {feedback ? <Text accessibilityLiveRegion="polite" style={styles.feedback}>{feedback}</Text> : null}
           <View style={styles.detailActions}>
@@ -438,18 +447,18 @@ const styles = StyleSheet.create({
   hidden: { display: "none" },
   workspace: { flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", backgroundColor: colors.window },
   header: { minHeight: 68, paddingHorizontal: 18, paddingVertical: 12, flexDirection: "row", flexWrap: "wrap", alignItems: "center", borderBottomWidth: 1, borderBottomColor: colors.separator, gap: 12 },
-  headerCopy: { flex: 1, flexBasis: 260, minWidth: 0, gap: 3 }, title: { color: colors.text, fontSize: 17, fontWeight: "600" }, subtitle: { color: colors.secondary, fontSize: 12, lineHeight: 17 },
+  headerCopy: { flex: 1, flexBasis: 260, minWidth: 0, gap: 3 }, title: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" }, subtitle: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 17 },
   body: { flex: 1, minHeight: 0, minWidth: 0, flexDirection: "row" }, sidebar: { width: 268, minWidth: 220, flexShrink: 1, borderRightWidth: 1, borderRightColor: colors.separator, backgroundColor: colors.panel },
-  sidebarHeader: { minHeight: 48, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: 1, borderBottomColor: colors.separator }, sidebarTitle: { color: colors.text, fontSize: 13, fontWeight: "600" },
+  sidebarHeader: { minHeight: 48, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: 1, borderBottomColor: colors.separator }, sidebarTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   sidebarActions: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end", gap: 6 }, addButton: { minWidth: 88 },
   accountList: { flex: 1, minWidth: 0 }, accountListContent: { paddingHorizontal: 6, paddingVertical: 6, minWidth: 0 }, accountRow: { minHeight: 48, marginBottom: 4 },
-  detail: { flex: 1, minWidth: 0, backgroundColor: colors.window }, detailContent: { flexGrow: 1, minWidth: 0, paddingHorizontal: 24, paddingTop: 22, paddingBottom: 28 }, detailFrame: { width: "100%", maxWidth: 680, minWidth: 0, gap: 14 }, sectionTitle: { color: colors.text, fontSize: 17, fontWeight: "600", marginBottom: 1 },
-  formCard: { minWidth: 0, padding: 16, gap: 12, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }, field: { minHeight: 32, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 12 }, label: { width: 128, flexShrink: 0, color: colors.text, fontSize: 13 }, fieldControl: { flex: 1, minWidth: 180, gap: 4 }, control: { flex: 1, flexShrink: 1, minWidth: 180, height: 28 }, typeDetection: { color: colors.secondary, fontSize: 12, lineHeight: 16 },
-  accountSummary: { minHeight: 54, paddingHorizontal: 16, paddingVertical: 12, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }, accountSummaryCopy: { flex: 1, minWidth: 180, gap: 3 }, summaryDetail: { color: colors.secondary, fontSize: 12, lineHeight: 16 }, statusBadge: { flexShrink: 1, maxWidth: "100%", paddingHorizontal: 8, paddingVertical: 3, color: colors.text, fontSize: 12, fontWeight: "600", borderWidth: 1, borderColor: colors.separator, borderRadius: 4, backgroundColor: colors.window },
-  detailsCard: { minWidth: 0, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.window }, info: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, value: { flex: 1, minWidth: 180, color: colors.secondary, fontSize: 13, lineHeight: 18 },
-  preferenceBlock: { minWidth: 0, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.separator, gap: 6 }, hint: { color: colors.secondary, fontSize: 12, lineHeight: 17 },
-  resourcePane: { minWidth: 0, maxHeight: 260, padding: 12, gap: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }, resourceHeader: { minHeight: 20, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, resourceTitle: { color: colors.text, fontSize: 14, fontWeight: "600" }, resourceCount: { color: colors.secondary, fontSize: 12 }, resourceList: { minHeight: 0 }, resourceListContent: { gap: 6 }, resourceRow: { minWidth: 0, paddingVertical: 4, gap: 3, borderBottomWidth: 1, borderBottomColor: colors.separator }, resourceDetail: { paddingLeft: 4, color: colors.secondary, fontSize: 12, lineHeight: 16 },
-  detailActions: { minHeight: 36, marginTop: 4, flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", alignItems: "center", gap: 8 }, loginButton: { minWidth: 136 }, feedback: { color: colors.secondary, fontSize: 12, lineHeight: 17 },
-  pendingCleanupList: { maxHeight: 116, borderBottomWidth: 1, borderBottomColor: colors.separator, backgroundColor: colors.panel }, pendingCleanupListContent: { paddingHorizontal: 18, paddingVertical: 8, gap: 6 }, pendingCleanup: { minHeight: 30, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 12 }, pendingCleanupText: { flex: 1, flexBasis: 260, minWidth: 0, color: colors.secondary, fontSize: 12, lineHeight: 16 },
-  empty: { color: colors.secondary, fontSize: 13, lineHeight: 18, textAlign: "center" }, blank: { flex: 1, minHeight: 200, alignItems: "center", justifyContent: "center", gap: 12, paddingHorizontal: 20 },
+  detail: { flex: 1, minWidth: 0, backgroundColor: colors.window }, detailContent: { flexGrow: 1, minWidth: 0, paddingHorizontal: 24, paddingTop: 22, paddingBottom: 28 }, detailFrame: { width: "100%", maxWidth: 680, minWidth: 0, gap: 14 }, sectionTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600", marginBottom: 1 },
+  formCard: { minWidth: 0, padding: 16, gap: 12, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }, field: { minHeight: 32, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 12 }, label: { width: 128, flexShrink: 0, color: colors.text, fontSize: UI_FONT_SIZE }, fieldControl: { flex: 1, minWidth: 180, gap: 4 }, control: { flex: 1, flexShrink: 1, minWidth: 180, height: 28 }, typeSelector: { minWidth: 220, flexShrink: 1 }, typeDetection: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  accountSummary: { minHeight: 54, paddingHorizontal: 16, paddingVertical: 12, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }, accountSummaryCopy: { flex: 1, minWidth: 180, gap: 3 }, summaryDetail: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 16 }, statusBadge: { flexShrink: 1, maxWidth: "100%", paddingHorizontal: 8, paddingVertical: 3, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600", borderWidth: 1, borderColor: colors.separator, borderRadius: 4, backgroundColor: colors.window },
+  detailsCard: { minWidth: 0, padding: 16, gap: 10, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.window }, info: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, value: { flex: 1, minWidth: 180, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18 },
+  preferenceBlock: { minWidth: 0, paddingTop: 12, borderTopWidth: 1, borderTopColor: colors.separator, gap: 6 }, hint: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  resourcePane: { minWidth: 0, maxHeight: 260, padding: 12, gap: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }, resourceHeader: { minHeight: 20, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, resourceTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" }, resourceCount: { color: colors.secondary, fontSize: UI_FONT_SIZE }, resourceList: { minHeight: 0 }, resourceListContent: { gap: 6 }, resourceRow: { minWidth: 0, paddingVertical: 4, gap: 3, borderBottomWidth: 1, borderBottomColor: colors.separator }, resourceDetail: { paddingLeft: 4, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 16 },
+  detailActions: { minHeight: 36, marginTop: 4, flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", alignItems: "center", gap: 8 }, loginButton: { minWidth: 136 }, feedback: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 17 },
+  pendingCleanupList: { maxHeight: 116, borderBottomWidth: 1, borderBottomColor: colors.separator, backgroundColor: colors.panel }, pendingCleanupListContent: { paddingHorizontal: 18, paddingVertical: 8, gap: 6 }, pendingCleanup: { minHeight: 30, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 12 }, pendingCleanupText: { flex: 1, flexBasis: 260, minWidth: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 16 },
+  empty: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" }, blank: { flex: 1, minHeight: 200, alignItems: "center", justifyContent: "center", gap: 12, paddingHorizontal: 20 },
 });

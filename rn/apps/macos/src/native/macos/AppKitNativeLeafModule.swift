@@ -110,6 +110,26 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    @objc(showCodexRestartConfirmation:message:restartLabel:laterLabel:resolver:rejecter:)
+    func showCodexRestartConfirmation(
+        _ title: String,
+        message: String,
+        restartLabel: String,
+        laterLabel: String,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: RCTPromiseRejectBlock
+    ) {
+        DispatchQueue.main.async {
+            self.leaf.showCodexRestartConfirmation(
+                title: title,
+                message: message,
+                restartLabel: restartLabel,
+                laterLabel: laterLabel,
+                completion: { choice in resolve(choice) }
+            )
+        }
+    }
+
     @objc func showReadOnlyText(_ title: String, text: String, closeLabel: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
         DispatchQueue.main.async {
             self.leaf.showReadOnlyText(title: title, text: text, closeTitle: closeLabel)
@@ -469,6 +489,12 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 return
             }
             resolve(true)
+        }
+    }
+
+    @objc func restartCodex(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        DispatchQueue.main.async {
+            resolve(self.leaf.restartCodex())
         }
     }
 

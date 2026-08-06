@@ -1405,6 +1405,178 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(selected["model_info"]["id"], "peer-b")
         self.assertNotIn(hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY, request_kwargs)
 
+    def test_sync_selection_uses_unique_cooling_candidate_for_fresh_request(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        router_module = types.ModuleType("litellm.router")
+        deployment = {
+            "litellm_params": {"order": 1, "model": "openai/only"},
+            "model_info": {"id": "only-route"},
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            def get_available_deployment(self, model, request_kwargs=None):
+                error = RuntimeError(
+                    "You passed in model=default-chat. There are no healthy deployments for this model."
+                )
+                error.status_code = 400
+                raise error
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+        cooldown_error = RuntimeError("upstream route failure")
+        cooldown_error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            cooldown_error,
+            {
+                "model": "default-chat",
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            },
+        )
+
+        selected = Router().get_available_deployment(
+            "default-chat",
+            request_kwargs={"model": "default-chat"},
+        )
+
+        self.assertEqual(selected["model_info"]["id"], "only-route")
+
+    async def test_async_selection_uses_unique_cooling_candidate_for_fresh_request(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        router_module = types.ModuleType("litellm.router")
+        deployment = {
+            "litellm_params": {"order": 1, "model": "openai/only"},
+            "model_info": {"id": "only-route"},
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            async def async_get_available_deployment(self, model, request_kwargs):
+                error = RuntimeError(
+                    "You passed in model=default-chat. There are no healthy deployments for this model."
+                )
+                error.status_code = 400
+                raise error
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+        cooldown_error = RuntimeError("upstream route failure")
+        cooldown_error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            cooldown_error,
+            {
+                "model": "default-chat",
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            },
+        )
+
+        selected = await Router().async_get_available_deployment(
+            "default-chat",
+            {"model": "default-chat"},
+        )
+
+        self.assertEqual(selected["model_info"]["id"], "only-route")
+
+    async def test_async_selection_does_not_bypass_unique_cooling_candidate_for_route_recovery_poll(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        router_module = types.ModuleType("litellm.router")
+        deployment = {
+            "litellm_params": {"order": 1, "model": "openai/only"},
+            "model_info": {"id": "only-route"},
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            async def async_get_available_deployment(self, model, request_kwargs):
+                error = RuntimeError("no healthy deployments")
+                error.status_code = 400
+                raise error
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+        cooldown_error = RuntimeError("upstream route failure")
+        cooldown_error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            cooldown_error,
+            {
+                "model": "default-chat",
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "no healthy deployments"):
+            await Router().async_get_available_deployment(
+                "default-chat",
+                {
+                    "model": "default-chat",
+                    "litellm_metadata": {
+                        hooks._ROUTE_RECOVERY_POLL_METADATA_KEY: True,
+                    },
+                },
+            )
+
+    def test_selection_does_not_bypass_unique_cooling_candidate_for_fallback_attempt(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        router_module = types.ModuleType("litellm.router")
+        deployment = {
+            "litellm_params": {"order": 1, "model": "openai/only"},
+            "model_info": {"id": "only-route"},
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            def get_available_deployment(self, model, request_kwargs=None):
+                error = RuntimeError(
+                    "You passed in model=default-chat. There are no healthy deployments for this model."
+                )
+                error.status_code = 400
+                raise error
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_routing_constraint_patch()
+        cooldown_error = RuntimeError("upstream route failure")
+        cooldown_error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            cooldown_error,
+            {
+                "model": "default-chat",
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            },
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "There are no healthy deployments"):
+            Router().get_available_deployment(
+                "default-chat",
+                request_kwargs={
+                    "model": "default-chat",
+                    "_excluded_deployment_ids": ["another-route"],
+                },
+            )
+
     async def test_verified_peer_selection_still_respects_menu_cooldown(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")

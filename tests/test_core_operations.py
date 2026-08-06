@@ -85,7 +85,7 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertIn("from litellm import run_server", command[2])
             self.assertNotIn(controller.litellm_bin, command)
 
-    def test_macos_uses_configured_spawn_workers(self) -> None:
+    def test_macos_uses_configured_forkserver_workers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
             process = mock.Mock(pid=4813)
@@ -106,11 +106,13 @@ class CoreOperationsTests(unittest.TestCase):
                 controller.start()
 
             command = popen.call_args.args[0]
-            workers_index = command.index("--num_workers")
+            self.assertEqual([controller.python, "-m", "litellm_menu.macos_proxy"], command[:3])
+            workers_index = command.index("--workers")
             self.assertEqual("16", command[workers_index + 1])
             self.assertNotIn("--run_gunicorn", command)
+            self.assertNotIn(controller.litellm_bin, command)
 
-    def test_macos_defaults_to_sixteen_spawn_workers(self) -> None:
+    def test_macos_defaults_to_sixteen_forkserver_workers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
             process = mock.Mock(pid=4815)
@@ -131,7 +133,7 @@ class CoreOperationsTests(unittest.TestCase):
                 controller.start()
 
             command = popen.call_args.args[0]
-            workers_index = command.index("--num_workers")
+            workers_index = command.index("--workers")
             self.assertEqual("16", command[workers_index + 1])
             self.assertNotIn("--run_gunicorn", command)
 
@@ -212,6 +214,53 @@ class CoreOperationsTests(unittest.TestCase):
 
             self.assertEqual(1, summary["recovering"])
             self.assertEqual(1, summary["cooldown"])
+
+    def test_new_proxy_start_clears_previous_recovery_and_cooldown_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.recovery.parent.mkdir(parents=True)
+            controller.paths.recovery.write_text('{"recoveries":{"old":{}}}', encoding="utf-8")
+            controller.paths.cooldowns.write_text('{"cooldowns":{"old":{}}}', encoding="utf-8")
+            process = mock.Mock(pid=4817)
+            process.poll.return_value = None
+
+            def spawn(*_args: object, **_kwargs: object) -> mock.Mock:
+                self.assertFalse(controller.paths.recovery.exists())
+                self.assertFalse(controller.paths.cooldowns.exists())
+                return process
+
+            with mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(
+                controller,
+                "_runtime_env",
+                return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "16"},
+            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                controller, "_health", return_value=True
+            ), mock.patch(
+                "litellm_menu.core.operations.atomic_write_text"
+            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", side_effect=spawn):
+                controller.start()
+
+            self.assertFalse(controller.paths.recovery.exists())
+            self.assertFalse(controller.paths.cooldowns.exists())
+
+    def test_repeated_start_of_running_proxy_keeps_current_routing_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.recovery.parent.mkdir(parents=True)
+            controller.paths.recovery.write_text('{"recoveries":{"live":{}}}', encoding="utf-8")
+            controller.paths.cooldowns.write_text('{"cooldowns":{"live":{}}}', encoding="utf-8")
+            running = {"state": "running", "pid": 4818, "port": 4000}
+
+            with mock.patch.object(controller, "status", return_value=running), mock.patch(
+                "litellm_menu.core.operations.subprocess.Popen"
+            ) as popen:
+                self.assertEqual(running, controller.start())
+
+            popen.assert_not_called()
+            self.assertTrue(controller.paths.recovery.exists())
+            self.assertTrue(controller.paths.cooldowns.exists())
 
     def test_unchanged_service_health_does_not_publish_a_new_revision(self) -> None:
         status = {

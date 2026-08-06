@@ -12,6 +12,11 @@ MACOS_LEAF = ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift"
 MACOS_PROJECT = ROOT / "rn/apps/macos/macos/LiteLLMMenu.xcodeproj/project.pbxproj"
 PLATFORM_ENTRY = ROOT / "rn/packages/shared/src/platformEntry.ts"
 RELAY_MANAGER = ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx"
+TYPOGRAPHY = ROOT / "rn/packages/shared/src/ui/typography.ts"
+MACOS_CONTROLS = ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm"
+WINDOWS_CONTROLS = ROOT / "rn/apps/windows/src/native/windows/WinUIControls.cpp"
+WINDOWS_LEAF = ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeaf.cpp"
+WINDOWS_RELAY = ROOT / "rn/apps/windows/src/native/windows/WindowsRelayLogin.cpp"
 
 
 class ReactNativeUiParityTests(unittest.TestCase):
@@ -68,7 +73,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("Number.isInteger(status.port) && status.port >= 1 && status.port <= 65535", self.platform_entry)
         self.assertIn('serviceRunningOnPort ?? "Running (port {port})"', self.platform_entry)
         self.assertIn('"service.runningOnPort": "Running (port {port})"', english)
-        self.assertIn('"service.runningOnPort": "运行中（端口 {port}）"', chinese)
+        self.assertIn('"service.runningOnPort": "运行中 (端口 {port})"', chinese)
+
+    def test_non_sentence_chinese_ui_copy_uses_ascii_punctuation(self) -> None:
+        chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        for marker in (
+            '"menu.logsSummary": "日志 (路由恢复 {recovering}, 冷却 {cooldown})"',
+            '"claude.permission.unknown": "其他 ({value})"',
+            '"logs.duration": "耗时 (毫秒)"',
+            '"service.status": "状态: {status}"',
+            '"common.empty": "(空)"',
+            '"providers.probeApplyTitle": "应用探测顺序?"',
+            '"settings.rawLiveDraft": "原始文件 - 实时草稿"',
+            '"relay.typeDetected": "已识别: {type}"',
+        ):
+            self.assertIn(marker, chinese)
+        self.assertIn('{translate("providers.provider")}: {providerLabel}', self.ui)
+        self.assertIn('{translate("common.default")}: {defaultValue}', self.ui)
+        self.assertIn('return details.join(" | ");', self.ui)
 
     def test_assistant_settings_use_one_tabbed_surface_with_active_domain_actions(self) -> None:
         for marker in (
@@ -119,7 +141,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title={probing ? translate("providers.probing") : translate("providers.probe")}',
             'function modelProbePresentation(',
             'translate("providers.probeSummaryAvailable"',
-            'tooltip={probePresentation.full}',
+            'tooltip={probeTooltip}',
+            'screenBoundedTooltipText(probePresentation.full, Dimensions.get("screen"))',
             'translate("providers.probeOriginalRequest"',
             'const selectedOrder = [nextOrder[0]];',
             'if (sameStringOrder(currentOrder, selectedOrder)) return;',
@@ -143,7 +166,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
         self.assert_ui_has('active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines"')
         self.assertIn('"logs.latestLinesAtLimit": "Latest {count} lines (view limit)"', english)
-        self.assertIn('"logs.latestLinesAtLimit": "最近 {count} 行（视图上限）"', chinese)
+        self.assertIn('"logs.latestLinesAtLimit": "最近 {count} 行 (视图上限)"', chinese)
 
     def test_providers_workspace_keeps_legacy_segmented_three_pane_structure(self) -> None:
         self.assert_ui_has("function ProviderWorkspace(")
@@ -176,7 +199,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 140 }, { label: translate("providers.models"), width: 48 }]}')
         self.assert_ui_has('columns={[{ label: translate("providers.model"), width: 118 }, { label: translate("providers.upstream"), width: 130 }, { label: translate("providers.balance"), width: 112 }, { label: translate("providers.apiKeyOrder"), width: 104 }]}')
         self.assert_ui_has('columns={[{ label: translate("providers.key"), width: 138 }]}')
-        self.assert_ui_has('label={translate("providers.keyName")} labelWidth={64} labelAlign="left"')
+        self.assert_ui_has('label={translate("providers.keyName")} labelWidth={64}')
         self.assert_ui_has('NativeSecretField plainText autoCommit label={translate("common.apiKey")}')
         self.assert_ui_has('providerKeyGrid: { flex: 1, minHeight: 142, flexDirection: "row", alignItems: "flex-start", gap: 12 }')
         self.assert_ui_has('providerKeyTable: { width: 138, minWidth: 138, maxWidth: 138, height: 142, minHeight: 142, flexShrink: 0 }')
@@ -189,8 +212,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('routeWorkspaceWithInspector: { flexDirection: "row", gap: 12 }')
         self.assert_ui_has('routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 }')
         self.assert_ui_has('onSelectionChange={selectRoute}')
-        self.assert_ui_has('width: 170 }, { label: translate("common.order"), width: 56')
+        self.assert_ui_has('label: translate("providers.provider"), width: 170 }, { label: translate("common.order"), width: 56')
         self.assert_ui_has('width: 130 }, { label: translate("providers.upstream"), width: 164')
+        self.assert_ui_has('label: translate("providers.keyName"), width: 130')
+        self.assertNotIn('const displayRoutes = useMemo', self.ui)
+        self.assert_ui_has('key: `route-public-model:${entry.publicModel}`')
+        self.assert_ui_has('spanning: true')
+        self.assert_ui_has(r'cells: [`\t${stringValue(entry.provider.display_name')
+        self.assert_ui_has('rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} onSelectionChange={selectRoute}')
+        self.assert_ui_has('rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} onSelectionChange=')
+        self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} onSelectionChange=')
+        self.assert_ui_has('rows={keyRows} selectedKey={selectedKey} onSelectionChange={setSelectedKey}')
+        select_route = self.ui.split('const selectRoute = useCallback', 1)[1].split('const chooseViewMode', 1)[0]
+        self.assertLess(select_route.index('if (!selected) return;'), select_route.index('setSelectedRoute(routeId);'))
         self.assert_ui_has('providerSourceModel ? <ProviderEditor provider={activeRoute.provider}')
         self.assert_ui_has('model={activeRoute.model}')
         self.assert_ui_has('onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))}')
@@ -241,11 +275,65 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("footerExact", self.ui)
         self.assertNotIn('exact={route === "providers-models"}', self.ui)
 
+    def test_application_fonts_use_medium_size_with_smaller_form_tips(self) -> None:
+        typography = TYPOGRAPHY.read_text(encoding="utf-8")
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        macos_controls = MACOS_CONTROLS.read_text(encoding="utf-8")
+        windows_controls = WINDOWS_CONTROLS.read_text(encoding="utf-8")
+        windows_leaf = WINDOWS_LEAF.read_text(encoding="utf-8")
+        windows_relay = WINDOWS_RELAY.read_text(encoding="utf-8")
+
+        self.assertIn("export const UI_FONT_SIZE = 13;", typography)
+        self.assertIn("export const UI_TIP_FONT_SIZE = 12;", typography)
+        self.assertEqual(
+            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE"},
+            {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", self.ui)},
+        )
+        self.assertEqual(
+            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE"},
+            {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", relay)},
+        )
+        self.assertEqual(
+            {"UI_FONT_SIZE"},
+            {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", self.native_controls)},
+        )
+        self.assertIn("runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE", self.ui)
+        self.assertIn("fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE", self.ui)
+        self.assertIn("typeDetection: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE", relay)
+        self.assertIn("hint: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE", relay)
+
+        self.assertIn("constexpr CGFloat LiteLLMUIFontSize = 13.0;", macos_controls)
+        self.assertNotIn("systemFontSizeForControlSize", macos_controls)
+        self.assertNotRegex(macos_controls, r"(?:systemFontOfSize|monospacedSystemFontOfSize):\d")
+        self.assertIn("column.headerCell.attributedStringValue = TableHeaderTitle(columnTitle);", macos_controls)
+        self.assertIn("NSFontAttributeName: [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightMedium]", macos_controls)
+
+        self.assertIn("private let nativeUIFontSize: CGFloat = 13", self.macos_leaf)
+        application_leaf_ui = self.macos_leaf.split("func showReadOnlyText", 1)[1]
+        self.assertNotRegex(application_leaf_ui, r"ofSize:\s*\d")
+
+        for source in (windows_controls, windows_leaf, windows_relay):
+            self.assertIn("constexpr double kUIFontSize = 13.0;", source)
+            self.assertNotRegex(source, r"FontSize\((?!kUIFontSize\))")
+
     def test_logs_default_to_requests_and_follow_the_latest_row(self) -> None:
         bootstrap = (ROOT / "rn/packages/shared/src/bootstrap.tsx").read_text(encoding="utf-8")
         self.assertIn('setLogTabRequest(tab && LOG_TABS.includes(tab) ? tab : "requests");', bootstrap)
         self.assert_ui_has('useState<typeof LOG_TABS[number]>("requests")')
-        self.assert_ui_has('compact followBottom onRowDoublePress=')
+        self.assert_ui_has('compact followBottom onSelectionChange=')
+        self.assert_ui_has('const [selectedKeys, setSelectedKeys] = useState<Partial<Record<LogTab, string>>>({});')
+        self.assert_ui_has('type PauseIntent = { tab: typeof LOG_TABS[number]; paused: boolean; token: number };')
+        self.assert_ui_has('type ClearIntent = { tab: typeof LOG_TABS[number]; token: number };')
+        self.assert_ui_has('const paused = pauseIntent?.tab === selected ? pauseIntent.paused : active?.paused ?? false;')
+        self.assert_ui_has('const nextPaused = !paused;')
+        self.assert_ui_has('const result = await ipc.logs(tab);')
+        self.assert_ui_has('const clearing = clearIntent?.tab === selected;')
+        self.assert_ui_has('setSelectedKeys((current) => ({ ...current, [tab]: undefined }));')
+        self.assert_ui_has('void dispatch("logs.clear", { tab }, "logs").then(async () => {')
+        self.assert_ui_has('const lineCount = clearing ? 0 : active?.line_count ?? rows.length;')
+        self.assert_ui_has('IconButton label="" symbol={paused ? "play" : "pause"}')
+        self.assert_ui_has('IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs}')
+        self.assertNotIn('dispatch("logs.refresh", { tab: selected }, "logs")', self.ui)
         self.assert_ui_has('translate("logs.apiKeyName")')
         self.assert_ui_has('value.api_key_name')
         self.assert_ui_has('`${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}')
@@ -274,17 +362,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for value in (
             '"providers.currentCodex": "Import from Current Codex Settings"',
             '"providers.currentClaude": "Import from Current Claude Settings"',
-            '"providers.configurationFile": "Import from File…"',
-            '"providers.relay": "Import from Relay…"',
-            '"providers.exportFile": "Export to File…"',
+            '"providers.configurationFile": "Import from File..."',
+            '"providers.relay": "Import from Relay..."',
+            '"providers.exportFile": "Export to File..."',
         ):
             self.assertIn(value, english)
         for value in (
             '"providers.currentCodex": "从当前 Codex 设置导入"',
             '"providers.currentClaude": "从当前 Claude 设置导入"',
-            '"providers.configurationFile": "从文件导入…"',
-            '"providers.relay": "从中转站导入…"',
-            '"providers.exportFile": "导出到文件…"',
+            '"providers.configurationFile": "从文件导入..."',
+            '"providers.relay": "从中转站导入..."',
+            '"providers.exportFile": "导出到文件..."',
         ):
             self.assertIn(value, chinese)
 
@@ -297,7 +385,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_claude_structured_forms_are_named_for_their_single_column_layout(self) -> None:
         self.assert_ui_has("styles.structuredForm")
-        self.assert_ui_has("structuredForm: { gap: 7 }")
+        self.assert_ui_has("structuredForm: { gap: 6 }")
         self.assertNotIn("twoColumnForm", self.ui)
 
     def test_claude_settings_expose_safe_capability_skill_worktree_and_advanced_controls(self) -> None:
@@ -374,7 +462,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('kind: "password" }, "relay_accounts")', password)
         self.assertIn('translate("relay.retryCleanup")', relay)
 
-    def test_native_tables_match_legacy_route_only_alternating_rows(self) -> None:
+    def test_native_tables_use_framed_platform_list_chrome_and_grouping(self) -> None:
         mac_table_spec = (
             ROOT / "rn/packages/shared/src/ui/macos/NativeTableNativeComponent.ts"
         ).read_text(encoding="utf-8")
@@ -391,20 +479,65 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for spec in (mac_table_spec, windows_table_spec):
             self.assertIn("alternatingRows?: WithDefault<boolean, false>;", spec)
             self.assertIn("secondaryCellKeys?: ReadonlyArray<string>;", spec)
-        self.assertIn("alternatingRows = false", self.native_controls)
+            self.assertIn("spanningRowKeys?: ReadonlyArray<string>;", spec)
+        self.assertIn("striped = true, alternatingRows = false", self.native_controls)
+        self.assertIn("const stripedRows = striped && (alternatingRows || rows.length > 0);", self.native_controls)
+        self.assertIn("alternatingRows: stripedRows,", self.native_controls)
         self.assertIn("secondaryCellKeys = []", self.native_controls)
         self.assertIn("secondaryCellKeys,", self.native_controls)
+        self.assertIn("const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);", self.native_controls)
+        self.assertIn("spanningRowKeys,", self.native_controls)
         # The fetched-model picker is now a native modal leaf, so its old
         # React table no longer belongs to the shared window tree.
         self.assertEqual(self.ui.count("<NativeTable"), 8)
-        self.assertEqual(self.ui.count("alternatingRows"), 1)
-        self.assertIn("selectedKey={selectedRoute ?? \"\"} alternatingRows", self.ui)
-        self.assertIn("_tableView.usesAlternatingRowBackgroundColors = NO;", mac_native)
+        self.assertEqual(self.ui.count("alternatingRows"), 0)
+        self.assertNotIn("selectedKey={selectedRoute ?? \"\"} alternatingRows", self.ui)
+        self.assertNotIn("striped={false}", self.ui)
+        self.assertIn("_tableView.usesAlternatingRowBackgroundColors = YES;", mac_native)
+        self.assertIn("_tableView.gridStyleMask = NSTableViewGridNone;", mac_native)
+        self.assertNotIn("NSTableViewSolidVerticalGridLineMask", mac_native)
+        self.assertNotIn("NSTableViewSolidHorizontalGridLineMask", mac_native)
+        table_native = mac_native.split("@implementation LiteLLMAppKitTableComponentView", 1)[1].split("@end", 1)[0]
+        self.assertIn("LiteLLMTableFrameView", mac_native)
+        self.assertIn("_frameView.framedContentView = _scrollView;", table_native)
+        self.assertIn("self.contentView = _frameView;", table_native)
+        self.assertIn("_scrollView.borderType = NSNoBorder;", table_native)
+        self.assertNotIn("_scrollView.borderType = NSLineBorder;", table_native)
+        self.assertNotIn("_scrollView.borderType = NSBezelBorder;", table_native)
+        self.assertIn("column.headerCell.bordered = NO;", table_native)
+        self.assertIn("column.headerCell.bezeled = NO;", table_native)
+        self.assertIn("column.headerCell.attributedStringValue = TableHeaderTitle(columnTitle);", table_native)
+        self.assertIn("_tableView.floatsGroupRows = NO;", table_native)
+        self.assertIn("isGroupRow:(NSInteger)row", table_native)
+        self.assertIn("shouldSelectRow:(NSInteger)row", table_native)
+        self.assertIn("return ![self isSpanningRow:row];", table_native)
+        self.assertIn('identifier = @"LiteLLMAppKitTableGroupCell";', table_native)
+        self.assertIn("NSFont *TableCellFont()", mac_native)
+        self.assertIn("label.font = TableCellFont();", table_native)
+        self.assertIn("cell.textField.font = TableCellFont();", table_native)
+        self.assertIn("cell.textField.textColor = NSColor.secondaryLabelColor;", table_native)
+        self.assertIn("heightOfRow:(NSInteger)row", table_native)
+        self.assertIn("NSMaxY([_tableView rectOfRow:rowCount - 1])", table_native)
+        self.assertNotIn("_tableView.numberOfRows * _tableView.rowHeight", table_native)
         self.assertIn(
             "_tableView.usesAlternatingRowBackgroundColors = newViewProps.alternatingRows;",
             mac_native,
         )
         self.assertIn("props.alternatingRows.value_or(false)", windows_native)
+        self.assertIn("table_frame_ = Border{};", windows_native)
+        self.assertIn("table_frame_.BorderThickness(Thickness{1, 1, 1, 1});", windows_native)
+        self.assertIn("header_frame_.BorderThickness(Thickness{0, 0, 0, 0});", windows_native)
+        self.assertNotIn("header_frame_.BorderThickness(Thickness{0, 0, 0, 1});", windows_native)
+        self.assertIn("FontWeights::SemiBold()", windows_native)
+        spanning_block = windows_native.split("if (spanning) {", 1)[1].split("} else {", 1)[0]
+        self.assertIn("label.FontSize(kUIFontSize);", spanning_block)
+        self.assertIn("FontWeights::Normal()", spanning_block)
+        self.assertNotIn("FontWeights::SemiBold()", spanning_block)
+        self.assertIn("tableFallbackGroupText: { fontSize: UI_FONT_SIZE },", self.native_controls)
+        self.assertIn("spanningRowKeys", windows_native)
+        self.assertIn("Grid::SetColumnSpan(label", windows_native)
+        self.assertIn("if (IsSpanningKey(Props()->rowKeys[index])) return;", windows_native)
+        self.assertIn("RestoreControlledSelection();", windows_native)
         self.assertIn('rowKey + "\\x1f" + std::to_string(columnIndex)', mac_native)
         self.assertIn("static_cast<size_t>(row) >= viewProps.rowKeys.size()", mac_native)
         self.assertIn("static_cast<size_t>(columnIndex) >= columnCount", mac_native)
@@ -439,13 +572,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         windows_native = (
             ROOT / "rn/apps/windows/src/native/windows/WinUIControls.cpp"
         ).read_text(encoding="utf-8")
-        self.assertIn("column.minWidth = 96;", mac_native)
+        self.assertIn("column.minWidth = MIN(96, width);", mac_native)
         self.assertIn("column.maxWidth = CGFLOAT_MAX;", mac_native)
         self.assertIn("_scrollView.hasHorizontalScroller = needsHorizontalScroller;", mac_native)
         self.assertIn("NSTableViewNoColumnAutoresizing", mac_native)
         self.assertIn("std::vector<CGFloat> _requestedColumnWidths;", mac_native)
         self.assertIn("NSTableViewColumnDidResizeNotification", mac_native)
-        self.assertIn("MAX(NSWidth(visibleBounds), contentWidth)", mac_native)
+        self.assertIn("const CGFloat availableColumnWidth = NSWidth(visibleBounds) + horizontalChromeWidth;", mac_native)
+        self.assertIn("MAX(NSWidth(visibleBounds), laidOutContentWidth)", mac_native)
         self.assertIn("std::max(88.0, static_cast<double>(widths[index]))", windows_native)
         self.assertIn("ScrollBarVisibility::Auto", windows_native)
         self.assertIn("horizontal_scroller_.Content(table_);", windows_native)
@@ -481,11 +615,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """Opaque Fabric controls must not collapse to a bare checkmark square."""
         self.assertIn("function nativeCheckboxMinimumWidth(label: string)", self.native_controls)
         self.assertIn("Array.from(label)", self.native_controls)
-        self.assertIn("const sizedStyle = [{ minWidth: nativeCheckboxMinimumWidth(label) }, style];", self.native_controls)
+        self.assertIn("const sizedStyle = [{ minWidth: labelVisible ? nativeCheckboxMinimumWidth(label) : 24 }, style];", self.native_controls)
         self.assertIn("style={sizedStyle}", self.native_controls)
-        self.assertIn('runtimeBooleanSlot: { flex: 1, minWidth: 0, minHeight: 26', self.ui)
-        self.assertIn('runtimeBooleanControl: { alignSelf: "flex-start", minHeight: 26 }', self.ui)
-        self.assertNotIn("runtimeBooleanSlot: { width: 100", self.ui)
+        self.assertIn('<NativeCheckbox label={label} labelVisible={false}', self.ui)
+        self.assertIn('<Text numberOfLines={2} style={styles.runtimeFieldLabel}', self.ui)
+        self.assertIn('<View style={styles.runtimeValueSlot}>{control}</View>', self.ui)
+        self.assertIn('runtimeBooleanControl: { width: 24, minWidth: 24, height: 24', self.ui)
+        self.assertNotIn("runtimeBooleanSlot", self.ui)
+        self.assertNotIn("runtimeBooleanHelpSlot", self.ui)
 
     def test_settings_workspaces_keep_their_legacy_layout_roots(self) -> None:
         expected_components = {
@@ -559,11 +696,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(54, len(keys))
+        self.assertEqual(58, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
-        for category in ("Timeouts", "Recovery", "Web Search", "Vision Bridge", "Fallback", "Computer Facade", "Logs", "Network", "Service"):
+        for category in ("Timeouts", "Recovery", "Web Search", "Vision Bridge", "Model Context", "Fallback", "Computer Facade", "Logs", "Network", "Service"):
             self.assertIn(f'  "{category}":', localized)
         self.assertIn("const optionValues = stringList(item.options);", self.ui)
         self.assertIn("const next = optionValues[nativeEvent.index];", self.ui)
@@ -704,6 +841,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             "runtimeInputRow:",
             "runtimeFieldLabel:",
+            'runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }',
             "runtimeValueSlot:",
             "runtimeUnit:",
             "runtimeActionSlot:",
@@ -723,6 +861,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('runtimeOptionLabel(key, rawDefaultValue, translate)', self.ui)
         self.assertNotIn('translate("runtime.subtitle")', self.ui)
         self.assertIn('title={translate("common.restoreDefaults")}', self.ui)
+        self.assertIn('style={styles.runtimeRestoreButton}', self.ui)
+        self.assertIn('runtimeRestoreButton: { minWidth: 120 }', self.ui)
+        chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        self.assertIn('"common.restoreDefaults": "恢复默认"', chinese)
         self.assertIn('route === "runtime-settings" ? translate("common.saveAndApply")', self.ui)
 
     def test_provider_workspace_fetches_multiplier_once_without_usage_polling(self) -> None:
@@ -736,7 +878,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'NativeButton title={providerLabel} link',
             'billingMultiplierValue(model.multiplier, translate)',
-            '`${translate("providers.balance")}: ${translate("providers.billingUnavailable")}  ${translate("providers.multiplier")}: ${billingMultiplierValue(model.multiplier, translate)}`',
+            '`${translate("providers.balance")}: ${translate("providers.billingUnavailable")} | ${translate("providers.multiplier")}: ${billingMultiplierValue(model.multiplier, translate)}`',
             '<Text numberOfLines={1} style={styles.billingSummaryText}>{billingSummary}</Text>',
         ):
             self.assert_ui_has(marker)
@@ -752,7 +894,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # index. Resolve that index through the raw value so "默认" never
         # becomes the persisted API-key identifier.
         for marker in (
-            'const fetchKeyOptions = apiKeyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) }));',
+            '() => apiKeyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) })),',
             'const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyName(option.value);',
             'const keyOptions = keyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) }));',
             'values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]}',
@@ -794,34 +936,48 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("list.MinHeight(220);", windows_leaf)
         self.assertIn("list.Height(420);", windows_leaf)
 
-    def test_provider_inspector_keeps_the_legacy_provider_form_and_return_link(self) -> None:
-        """The AppKit editor uses a 96pt, left-aligned provider form and source-model return link."""
+    def test_provider_inspector_keeps_the_compact_provider_form_and_return_link(self) -> None:
+        """The provider editor uses compact, consistently aligned rows and a source-model return link."""
         for marker in (
             'const [providerSourceModel, setProviderSourceModel] = useState<string>();',
-            'label={translate("providers.baseUrl")} labelWidth={96} labelAlign="left"',
-            'label={translate("providers.providerName")} labelWidth={96} labelAlign="left"',
-            'label={translate("providers.keyName")} labelWidth={64} labelAlign="left"',
+            'label={translate("providers.baseUrl")} labelWidth={80}',
+            'label={translate("providers.providerName")} labelWidth={80}',
+            'label={translate("providers.keyName")} labelWidth={64}',
             'NativeSecretField plainText autoCommit label={translate("common.apiKey")} hint={selectedKeyConfigured',
             'title={translate("providers.backToModel", { model: sourceModelLabel })} link',
             'providerEditorHeader:',
             'providerEditorSection:',
             'providerKeysHeading:',
             'NativeSecretField plainText autoCommit label={translate("common.apiKey")}',
+            'formRow: { width: "100%", minHeight: 26',
+            'formRowLabel: { width: 112, flexShrink: 0',
+            'textAlign: "left"',
+            'formRowControl: { flex: 1, minWidth: 0, gap: 3',
         ):
             self.assert_ui_has(marker)
+        self.assert_ui_has('label={translate("providers.publicModel")} labelWidth={72}')
 
     def test_logs_keep_the_legacy_dense_toolbar_and_table_frame(self) -> None:
         for marker in (
             "function LogsWorkspace(",
             "<WindowTabs nativeRef={tabsRef} values={tabOptions} selected={selected}",
             "function renderLogRecord(",
+            'routingState === "no_available_deployment"',
+            'translate("logs.noAvailableRoute")',
+            'routingState === "model_not_configured"',
+            'translate("logs.modelNotConfigured")',
+            'routingState === "unselected"',
+            'translate("logs.notRouted")',
             "function logColumns(",
             '<NativeTable columns={columns.map(({ label, width }) => ({ label, width }))}',
             "translate(\"logs.failed\")",
             "const proxyPrefix = detail.match",
             'translate("logs.duration")',
             'translate("logs.tokenCount")',
-            "const columns = logColumns(selected, translate);",
+            "const columns = fitLogColumns(logColumns(selected, translate), tableWidth);",
+            "const rows = renderLogRecords(clearing ? [] : (active?.records ?? []), selected, translate);",
+            "selectedKey={selectedKey}",
+            "logTableFrame:",
             "rows={rows.map",
             "logFilterRow: { width: 360, minWidth: 220, maxWidth: 360",
             "logToolbarSpacer: { flex: 1, minWidth: 0",
@@ -837,8 +993,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             "const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);",
             "upstreamModel: compactUpstreamLogModel(upstreamModel)",
-            '{ label: translate("providers.publicModel"), width: 126, value: (row) => row.model }',
-            '{ label: translate("providers.upstream"), width: 126, value: (row) => row.upstreamModel }',
+            '{ label: translate("providers.publicModel"), width: 142, value: (row) => row.model }',
+            '{ label: translate("providers.upstream"), width: 142, value: (row) => row.upstreamModel }',
         ):
             self.assert_ui_has(marker)
         self.assertNotIn("function conditionalUpstreamLogModel(", self.ui)
@@ -849,9 +1005,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function recoveryDetailLabel(",
             "function routeTraceServiceTierLabel(",
             'return translate("logs.routeEvent.routeEvent");',
-            "let source = logTitle(tab, translate);",
+            'let source = tab === "service" ? translate("logs.service") : logTitle(tab, translate);',
             '{ label: translate("common.provider"), width: 104, value: (row) => row.provider },',
-            '{ label: translate("logs.apiKeyName"), width: 100, value: (row) => row.apiKeyName },',
+            '{ label: translate("logs.apiKeyName"), width: 120, value: (row) => row.apiKeyName },',
             'model: model || recoveryFallback,',
             'upstreamModel: compactUpstreamLogModel(upstreamModel) || recoveryFallback,',
         ):
@@ -861,7 +1017,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn(
             'if (tab === "menu") return [\n'
             '    time,\n'
-            '    { label: translate("logs.action"), width: 112, value: (row) => row.action },\n'
+            '    { label: translate("logs.action"), width: 180, flex: true, value: (row) => row.action },\n'
             '    status,\n'
             '  ];',
             self.ui,
@@ -870,12 +1026,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_route_trace_logs_use_diagnostic_columns_and_compact_detail(self) -> None:
         self.assertIn(
             'if (tab === "route-trace") return [\n'
-            '    { ...time, width: 154 },\n'
-            '    { label: translate("logs.event"), width: 142, value: (row) => row.event },\n'
-            '    { label: translate("providers.publicModel"), width: 130, value: (row) => row.model },\n'
-            '    { label: translate("providers.upstream"), width: 130, value: (row) => row.upstreamModel },\n'
+            '    time,\n'
+            '    { label: translate("logs.event"), width: 154, value: (row) => row.event },\n'
+            '    { label: translate("logs.routePath"), width: 340, flex: true, value: (row) => row.routePath },\n'
+            '    { label: translate("providers.publicModel"), width: 142, value: (row) => row.model },\n'
+            '    { label: translate("providers.upstream"), width: 142, value: (row) => row.upstreamModel },\n'
             '    { label: translate("common.provider"), width: 104, value: (row) => row.provider },\n'
-            '    { ...detail, width: 192 },\n'
+            '    status,\n'
+            '    { ...detail, width: 280 },\n'
             '  ];',
             self.ui,
         )
@@ -889,7 +1047,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'deployment_failover_marked: "logs.routeEvent.failoverMarked",',
             'next_order_fallback_available: "logs.routeEvent.nextOrder",',
             'external_web_search_bridge_synthesis_done: "logs.routeEvent.webSearchSynthesisDone",',
-            'return details.join(" · ");',
+            'return details.join(" | ");',
         ):
             self.assert_ui_has(marker)
         self.assertNotIn("logs.routeTrace.otherDetail", self.ui)
@@ -900,7 +1058,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("refreshResources: (accountId: string) => Promise<void>;", relay)
         self.assertIn("await refreshResources(account.id);", relay)
         self.assertIn('title={translate("relay.importSelected")}', relay)
-        self.assertIn("const account = await addAccount(detected, origin.trim(), rememberPasswordRef.current);", relay)
+        self.assertIn("const accountType = detected ?? manualType;", relay)
+        self.assertIn("const account = await addAccount(accountType, origin.trim(), rememberPasswordRef.current);", relay)
+        self.assertIn("NativeSegmentedControl", relay)
         self.assertIn('title={translate("relay.next")}', relay)
         self.assertIn('title={translate("relay.importSelected")}', relay)
         self.assertNotIn("NativePicker", relay)
@@ -952,7 +1112,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function WebDavPasswordField(",
             'placeholder={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")}',
             "webdavWideControl: { flex: 1, minWidth: 0 }",
-            'webdavPasswordInput: { width: "100%", minHeight: 30 }',
+            'webdavPasswordInput: { width: "100%", minHeight: 26 }',
             "wideButton: { minWidth: 92 }",
         ):
             self.assert_ui_has(marker)
@@ -976,10 +1136,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function WebDavPasswordField(",
             'isDirty: () => dirtyRef.current',
             "<NativeSecretField plainText autoCommit label={translate(\"common.apiKey\")}",
-            'input: { width: "100%", minHeight: 30',
-            'formRow: { width: "100%", minHeight: 30',
+            'input: { width: "100%", minHeight: 26',
+            'formRow: { width: "100%", minHeight: 26',
+            'form: { gap: 6 }',
+            'structuredForm: { gap: 6 }',
         ):
             self.assert_ui_has(marker)
+        appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
+        native_controls = (ROOT / "rn/packages/shared/src/ui/NativeControls.tsx").read_text(encoding="utf-8")
+        self.assertIn("textField: { minHeight: 26 }", appkit_controls)
+        self.assertIn("compact = true", native_controls)
         self.assertNotIn("providers.apiKeyHint", self.ui)
 
     def test_protocol_names_are_not_localized(self) -> None:
@@ -1048,18 +1214,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('translate("webdav.subtitle")', self.ui)
 
     def test_settings_surfaces_omit_static_draft_tips_but_keep_actionable_disk_conflicts(self) -> None:
+        english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
+        chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         for marker in (
             'translate("settings.subtitle")',
             'translate("settings.rawDraftHint")',
             'translate("settings.synchronized")',
+            'translate("common.staged")',
+            'setStaged(',
+            'run(() => enqueueDispatch(type, payload, targetDomain), "common.applied"',
         ):
             self.assertNotIn(marker, self.ui)
+        self.assertIn('run(() => enqueueDispatch(type, payload, targetDomain), null, true)', self.ui)
         for marker in (
             'translate("settings.diskChangedTitle")',
             'message: translate("settings.diskChangedBody")',
             'confirmLabel: translate("settings.useDisk")',
-        ):
+            ):
             self.assert_ui_has(marker)
+        for source in (english, chinese, translation_keys):
+            self.assertNotIn('"common.staged"', source)
+        self.assertNotIn('"已暂存"', chinese)
+        self.assertIn('"relay.resourcesImported": "已将所选 API 资源添加到供应商设置。"', chinese)
 
     def test_macos_leaf_localizes_window_titles_and_keeps_status_menu_order(self) -> None:
         for title in (
@@ -1071,7 +1248,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(title, self.macos_leaf, title)
         self.assertIn("private static let statusMenuOrder", self.macos_leaf)
         for ordered_item in (
-            '"toggle-autostart", "separator"',
+            '"toggle-autostart", "toggle-codex-model-catalog", "separator"',
             '"open-providers-models", "open-runtime-settings", "open-codex-settings", "open-relay-accounts", "separator"',
             '"webdav-status", "open-webdav-settings", "separator"',
             '"open-logs", "separator"',
@@ -1096,6 +1273,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_service_lifecycle_stays_in_the_shared_menu_surface(self) -> None:
         """Lifecycle labels and state-specific enablement are shared by AppKit and WinUI."""
         for marker in (
+            'receiveSnapshot({ ...snapshot, service: { ...snapshot.service, state: "starting" } });',
             'const serviceState = snapshot.service.state;',
             'const serviceStartAvailable = !serviceOperationPending && serviceState === "stopped";',
             'const serviceRestartAvailable = !serviceOperationPending && serviceState !== "unknown" && serviceState !== "starting";',

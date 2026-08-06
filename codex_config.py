@@ -30,6 +30,7 @@ DEFAULT_KEY = "sk-local-litellm"
 # TOML remains available for every other Codex setting and is never discarded.
 CORE_SCALAR_KEYS = (
     "model",
+    "model_catalog_json",
     "review_model",
     "model_provider",
     "openai_base_url",

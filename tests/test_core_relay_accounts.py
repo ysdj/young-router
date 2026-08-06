@@ -684,6 +684,45 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual(1, result["model_count"])
             self.assertTrue(all(headers == {"Cookie": "session=replace-cookie"} for _, _, headers in fake.requests))
 
+    def test_sub2api_import_uses_the_selected_key_id_when_names_repeat(self) -> None:
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Default", "status": "active", "key": "sk-replace-old-key"},
+                            {"id": 5, "name": "Default", "status": "active", "key": "sk-replace-selected-key"},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {
+                    "code": 0,
+                    "data": [{"name": "channel", "platforms": [{"platform": "openai", "supported_models": [{"name": "model-a"}]}]}],
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample@example.test",
+                access_token="replace-access-token",
+            )
+            resources = domain.refresh_resources(account_id)["resources"]
+            providers = ProvidersModelsDomain(root / "config.yaml")
+
+            domain.import_resources(account_id, ["sub2api-5"], providers)
+
+            private = providers.export(include_sensitive=True)["providers"][0]
+            self.assertEqual("sk-replace-selected-key", private["api_key"])
+            self.assertEqual(["Default"], [item["name"] for item in private["api_keys"]])
+
     def test_selected_resources_are_staged_only_after_explicit_import(self) -> None:
         fake = FakeRelayHTTPClient(
             {

@@ -97,7 +97,21 @@ class LiteLLMMenuHook(CustomLogger):
             _responses_request_module._with_incoming_user_agent_header,
             _responses_request_module._with_browser_compatible_headers,
         ):
+            image_budget_before = None
+            if update_request is _image_inputs_module._with_bounded_image_inputs:
+                image_budget_before = _image_inputs_module._image_input_budget(modified_kwargs)
             updated_kwargs = update_request(modified_kwargs)
+            if image_budget_before is not None:
+                _trace_module._route_trace(
+                    "image_input_budget",
+                    request_id=_routing_module._trace_request_id(modified_kwargs),
+                    session=_routing_module._trace_session_context(modified_kwargs),
+                    changed=updated_kwargs is not None,
+                    before=image_budget_before,
+                    after=_image_inputs_module._image_input_budget(
+                        updated_kwargs if updated_kwargs is not None else modified_kwargs
+                    ),
+                )
             if updated_kwargs is None:
                 continue
             modified_kwargs = updated_kwargs
@@ -268,6 +282,15 @@ class LiteLLMMenuHook(CustomLogger):
         response: Any,
         request_data: dict,
     ) -> AsyncIterator[Any]:
+        selected_marker = _routing_module._selected_deployment_marker_from_response(
+            response
+        )
+        if selected_marker is not None:
+            _routing_module._apply_selected_deployment_marker_to_request(
+                request_data,
+                selected_marker,
+            )
+
         def deliver_chunk(chunk: Any) -> Any:
             return _streaming_module._responses_stream_chunk_for_delivery(
                 chunk,

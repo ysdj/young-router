@@ -31,6 +31,7 @@ export interface NativeLeafBridge {
   saveFilePicker(suggestedName: string): Promise<string | undefined>;
   showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor): Promise<number | undefined>;
   showConfirmation(title: string, message: string, confirmLabel: string): Promise<boolean>;
+  showCodexRestartConfirmation(title: string, message: string, restartLabel: string, laterLabel: string): Promise<"restart" | "later" | undefined>;
   showReadOnlyText(title: string, text: string, closeLabel: string): Promise<void>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
   editSecureDocument(editorToken: string, language: "toml" | "json", title: string): Promise<number | undefined>;
@@ -72,6 +73,7 @@ export interface NativeLeafBridge {
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
+  restartCodex(): Promise<boolean>;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
 }
@@ -117,6 +119,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     saveFilePicker: ({ suggestedName }) => bridge.saveFilePicker(suggestedName),
     showActionMenu: ({ title, items, anchor }) => bridge.showActionMenu(title, items, anchor),
     showConfirmation: ({ title, message, confirmLabel }) => bridge.showConfirmation(title, message, confirmLabel),
+    showCodexRestartConfirmation: ({ title, message, restartLabel, laterLabel }) => bridge.showCodexRestartConfirmation(title, message, restartLabel, laterLabel),
     showReadOnlyText: ({ title, text, closeLabel }) => bridge.showReadOnlyText(title, text, closeLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
     editSecureDocument: ({ editorToken, language, title }) => bridge.editSecureDocument(editorToken, language, title),
@@ -128,6 +131,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     clearRelayPassword: (accountId) => bridge.clearRelayPassword(accountId),
     clearRelayCredentials: (accountId) => bridge.clearRelayCredentials(accountId),
     setLaunchAtLogin: (enabled) => bridge.setLaunchAtLogin(enabled),
+    restartCodex: () => bridge.restartCodex(),
     setLocalization: (strings) => bridge.setLocalization(strings),
     setShortcuts: (shortcuts) => bridge.setShortcuts(shortcuts),
   };

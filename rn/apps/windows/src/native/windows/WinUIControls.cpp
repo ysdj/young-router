@@ -23,6 +23,7 @@
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Windows.System.h>
+#include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.UI.h>
 
 #include <algorithm>
@@ -43,8 +44,10 @@ namespace {
 
 using winrt::Microsoft::ReactNative::Composition::ContentIslandComponentView;
 using winrt::Microsoft::UI::Xaml::Controls::Button;
+using winrt::Microsoft::UI::Xaml::Controls::Border;
 using winrt::Microsoft::UI::Xaml::Controls::CheckBox;
 using winrt::Microsoft::UI::Xaml::Controls::ComboBox;
+using winrt::Microsoft::UI::Xaml::Controls::FontIcon;
 using winrt::Microsoft::UI::Xaml::Controls::Grid;
 using winrt::Microsoft::UI::Xaml::Controls::HyperlinkButton;
 using winrt::Microsoft::UI::Xaml::Controls::ListView;
@@ -60,10 +63,13 @@ using winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::Thumb;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::ToggleButton;
 using winrt::Microsoft::UI::Xaml::Media::SolidColorBrush;
+using winrt::Microsoft::UI::Xaml::Media::FontFamily;
+using winrt::Microsoft::UI::Xaml::Thickness;
 
 constexpr size_t kSecureEditorMaximumBytes = 2 * 1024 * 1024;
 constexpr auto kSecureEditorDebounce = std::chrono::milliseconds{450};
 constexpr int32_t kSecureEditorInitialRevision = 0;
+constexpr double kUIFontSize = 13.0;
 
 winrt::hstring ToHString(std::string const& value) {
   return winrt::to_hstring(value);
@@ -115,6 +121,24 @@ ScrollViewer FindTextEditorScrollViewer(
   return nullptr;
 }
 
+ScrollViewer FindListScrollViewer(
+    winrt::Microsoft::UI::Xaml::DependencyObject const& root) {
+  if (!root) return nullptr;
+  auto const child_count = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper::GetChildrenCount(root);
+  for (int32_t index = 0; index < child_count; ++index) {
+    auto const child = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper::GetChild(root, index);
+    if (auto const viewer = child.try_as<ScrollViewer>()) return viewer;
+    if (auto const viewer = FindListScrollViewer(child)) return viewer;
+  }
+  return nullptr;
+}
+
+bool ListIsFollowingBottom(ListView const& list) {
+  auto const viewer = FindListScrollViewer(list);
+  return !viewer || viewer.ScrollableHeight() <= 4.0 ||
+      viewer.ScrollableHeight() - viewer.VerticalOffset() <= 4.0;
+}
+
 double ColumnWidth(std::vector<float> const& widths, size_t index) {
   if (index >= widths.size() || widths[index] <= 0) return 140.0;
   return std::max(88.0, static_cast<double>(widths[index]));
@@ -155,6 +179,8 @@ struct ButtonComponentView final
     container_ = Grid{};
     button_ = Button{};
     hyperlink_ = HyperlinkButton{};
+    button_.FontSize(kUIFontSize);
+    hyperlink_.FontSize(kUIFontSize);
     button_.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
     button_.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Stretch);
     hyperlink_.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
@@ -199,7 +225,16 @@ struct ButtonComponentView final
     if (!button_ || !Props()) return;
     auto const& props = *Props();
     bool const link = props.link.value_or(false);
-    button_.Content(winrt::box_value(ToHString(props.title)));
+    const auto symbol = props.symbol.value_or("");
+    if (symbol.empty()) {
+      button_.Content(winrt::box_value(ToHString(props.title)));
+    } else {
+      auto icon = FontIcon{};
+      icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+      icon.FontSize(kUIFontSize);
+      icon.Glyph(symbol == "pause" ? L"\xE769" : symbol == "play" ? L"\xE768" : L"\xE74D");
+      button_.Content(icon);
+    }
     hyperlink_.Content(winrt::box_value(ToHString(props.title)));
     button_.IsEnabled(Enabled(props.disabled));
     hyperlink_.IsEnabled(Enabled(props.disabled));
@@ -300,6 +335,7 @@ struct SegmentedComponentView final
     }
     for (int32_t index = 0; index < static_cast<int32_t>(props.labels.size()); ++index) {
       auto item = ToggleButton{};
+      item.FontSize(kUIFontSize);
       item.Content(winrt::box_value(ToHString(props.labels[static_cast<size_t>(index)])));
       item.IsChecked(index == selected_index);
       item.IsEnabled(Enabled(props.disabled));
@@ -333,6 +369,7 @@ struct PickerComponentView final
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     picker_ = ComboBox{};
+    picker_.FontSize(kUIFontSize);
     picker_.SelectionChanged([this](auto const&, auto const&) {
       if (syncing_ || !Props()) return;
       const auto index = picker_.SelectedIndex();
@@ -398,6 +435,7 @@ struct CheckboxComponentView final
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     checkbox_ = CheckBox{};
+    checkbox_.FontSize(kUIFontSize);
     checkbox_.Click([this](auto const&, auto const&) {
       if (syncing_) return;
       if (auto emitter = EventEmitter()) {
@@ -430,9 +468,13 @@ struct CheckboxComponentView final
     const bool value_changed = !old_props || old_props->value != props.value;
     const bool disabled_changed = !old_props || old_props->disabled != props.disabled;
     const bool label_changed = !old_props || old_props->label != props.label;
+    const bool label_visibility_changed = !old_props || old_props->labelVisible != props.labelVisible;
     const bool compact_changed = !old_props || old_props->compact != props.compact;
     syncing_ = true;
-    if (label_changed) checkbox_.Content(winrt::box_value(ToHString(props.label)));
+    if (label_changed || label_visibility_changed) {
+      checkbox_.Content(props.labelVisible.value_or(true) ? winrt::box_value(ToHString(props.label)) : nullptr);
+      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(checkbox_, ToHString(props.label));
+    }
     if (value_changed) checkbox_.IsChecked(props.value.value_or(false));
     syncing_ = false;
     if (disabled_changed) checkbox_.IsEnabled(Enabled(props.disabled));
@@ -461,6 +503,7 @@ struct TableComponentView final
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     root_ = Grid{};
+    table_frame_ = Border{};
     table_ = Grid{};
     horizontal_scroller_ = ScrollViewer{};
     horizontal_scroller_.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
@@ -476,10 +519,28 @@ struct TableComponentView final
     table_.RowDefinitions().Append(body_row);
 
     header_ = Grid{};
+    header_frame_ = Border{};
+    header_frame_.Child(header_);
+    header_frame_.Background(ThemeBrush(
+        L"LayerFillColorDefaultBrush",
+        winrt::Windows::UI::Color{255, 249, 249, 249}));
+    header_frame_.BorderThickness(Thickness{0, 0, 0, 0});
+    table_frame_.BorderBrush(ThemeBrush(
+        L"ControlStrokeColorDefaultBrush",
+        winrt::Windows::UI::Color{255, 140, 140, 140}));
+    table_frame_.BorderThickness(Thickness{1, 1, 1, 1});
+    table_frame_.Background(ThemeBrush(
+        L"ControlFillColorDefaultBrush",
+        winrt::Windows::UI::Color{255, 255, 255, 255}));
     list_ = ListView{};
     list_.SelectionMode(ListViewSelectionMode::Single);
     list_.IsItemClickEnabled(true);
     list_.HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Stretch);
+    list_.Padding(Thickness{0, 0, 0, 0});
+    list_.Background(ThemeBrush(
+        L"ControlFillColorDefaultBrush",
+        winrt::Windows::UI::Color{255, 255, 255, 255}));
+    list_.BorderThickness(Thickness{0, 0, 0, 0});
     ScrollViewer::SetHorizontalScrollBarVisibility(
         list_, winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Disabled);
     ScrollViewer::SetVerticalScrollBarVisibility(
@@ -488,6 +549,10 @@ struct TableComponentView final
       if (syncing_ || !Props()) return;
       const auto index = list_.SelectedIndex();
       if (index < 0 || index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
+      if (IsSpanningKey(Props()->rowKeys[static_cast<size_t>(index)])) {
+        RestoreControlledSelection();
+        return;
+      }
       if (auto emitter = EventEmitter()) {
         winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange args;
         args.index = index;
@@ -499,6 +564,7 @@ struct TableComponentView final
       if (!Props()) return;
       uint32_t index = 0;
       if (!list_.Items().IndexOf(args.ClickedItem(), index) || index >= Props()->rowKeys.size()) return;
+      if (IsSpanningKey(Props()->rowKeys[index])) return;
       if (auto emitter = EventEmitter()) {
         winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange event;
         event.index = static_cast<int32_t>(index);
@@ -510,6 +576,7 @@ struct TableComponentView final
       if (!Props()) return;
       const auto index = list_.SelectedIndex();
       if (index < 0 || index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
+      if (IsSpanningKey(Props()->rowKeys[static_cast<size_t>(index)])) return;
       if (auto emitter = EventEmitter()) {
         winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter::OnRowDoublePress args;
         args.index = index;
@@ -518,12 +585,13 @@ struct TableComponentView final
       }
     });
 
-    Grid::SetRow(header_, 0);
+    Grid::SetRow(header_frame_, 0);
     Grid::SetRow(list_, 1);
-    table_.Children().Append(header_);
+    table_.Children().Append(header_frame_);
     table_.Children().Append(list_);
     horizontal_scroller_.Content(table_);
-    root_.Children().Append(horizontal_scroller_);
+    table_frame_.Child(horizontal_scroller_);
+    root_.Children().Append(table_frame_);
     island_.Content(root_);
     island_view.Connect(island_.ContentIsland());
     ApplyProps();
@@ -555,15 +623,37 @@ struct TableComponentView final
     return width;
   }
 
+  bool IsSpanningKey(std::string const& key) const noexcept {
+    if (!Props() || !Props()->spanningRowKeys) return false;
+    auto const& spanning_row_keys = *Props()->spanningRowKeys;
+    return std::find(spanning_row_keys.begin(), spanning_row_keys.end(), key) != spanning_row_keys.end();
+  }
+
+  void RestoreControlledSelection() noexcept {
+    if (!Props()) return;
+    auto const& props = *Props();
+    auto selected = std::find(props.rowKeys.begin(), props.rowKeys.end(), props.selectedKey);
+    const auto selected_index = selected == props.rowKeys.end()
+        ? -1
+        : static_cast<int32_t>(std::distance(props.rowKeys.begin(), selected));
+    syncing_ = true;
+    list_.SelectedIndex(selected_index);
+    syncing_ = false;
+  }
+
   void ApplyProps() noexcept {
     if (!root_ || !Props()) return;
     auto const& props = *Props();
     const auto disabled_row_keys = props.disabledRowKeys.value_or(std::vector<std::string>{});
     const auto secondary_cell_keys = props.secondaryCellKeys.value_or(std::vector<std::string>{});
+    const auto spanning_row_keys = props.spanningRowKeys.value_or(std::vector<std::string>{});
     const auto column_count = props.columnLabels.size();
     const bool columns_changed = !has_applied_ || column_labels_ != props.columnLabels || column_widths_ != props.columnWidths || compact_ != props.compact;
-    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || compact_ != props.compact;
+    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || spanning_row_keys_ != spanning_row_keys || compact_ != props.compact;
     const bool selection_changed = !has_applied_ || selected_key_ != props.selectedKey;
+    const bool was_following_bottom = props.followBottom.value_or(false) && rows_changed
+        ? (!has_applied_ || ListIsFollowingBottom(list_))
+        : false;
     syncing_ = true;
 
     if (columns_changed) {
@@ -575,7 +665,10 @@ struct TableComponentView final
         label.Text(ToHString(props.columnLabels[column_index]));
         const double vertical_margin = props.compact.value_or(false) ? 2.0 : 5.0;
         label.Margin({8, vertical_margin, 8, vertical_margin});
-        label.FontSize(12);
+        label.FontSize(kUIFontSize);
+        label.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+        label.Foreground(SecondaryTextBrush());
+        label.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
         Grid::SetColumn(label, static_cast<int32_t>(column_index));
         header_.Children().Append(label);
       }
@@ -590,22 +683,41 @@ struct TableComponentView final
         if (props.alternatingRows.value_or(false) && row_index % 2 == 1) {
           row.Background(AlternatingRowBrush());
         } else {
-          row.Background(nullptr);
+          row.Background(ThemeBrush(
+              L"ControlFillColorDefaultBrush",
+              winrt::Windows::UI::Color{255, 255, 255, 255}));
         }
         AddColumns(row, props.columnWidths, column_count);
-        for (size_t column_index = 0; column_index < column_count; ++column_index) {
-          const auto cell_index = row_index * column_count + column_index;
-          auto cell = TextBlock{};
-          cell.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
-          if (!cell.Text().empty()) ToolTipService::SetToolTip(cell, winrt::box_value(cell.Text()));
-          const double vertical_margin = props.compact.value_or(false) ? 2.0 : 5.0;
-          cell.Margin({8, vertical_margin, 8, vertical_margin});
-          cell.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-          const auto cell_key = props.rowKeys[row_index] + "\x1f" + std::to_string(column_index);
-          const bool secondary = std::find(secondary_cell_keys.begin(), secondary_cell_keys.end(), cell_key) != secondary_cell_keys.end();
-          if (disabled || secondary) cell.Foreground(SecondaryTextBrush());
-          Grid::SetColumn(cell, static_cast<int32_t>(column_index));
-          row.Children().Append(cell);
+        const bool spanning = std::find(spanning_row_keys.begin(), spanning_row_keys.end(), props.rowKeys[row_index]) != spanning_row_keys.end();
+        if (spanning) {
+          const auto cell_index = row_index * column_count;
+          auto label = TextBlock{};
+          label.FontSize(kUIFontSize);
+          label.FontWeight(winrt::Windows::UI::Text::FontWeights::Normal());
+          label.Foreground(SecondaryTextBrush());
+          label.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
+          if (!label.Text().empty()) ToolTipService::SetToolTip(label, winrt::box_value(label.Text()));
+          const double vertical_margin = props.compact.value_or(false) ? 4.0 : 7.0;
+          label.Margin({8, vertical_margin, 8, vertical_margin});
+          label.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+          Grid::SetColumnSpan(label, static_cast<int32_t>(std::max<size_t>(1, column_count)));
+          row.Children().Append(label);
+        } else {
+          for (size_t column_index = 0; column_index < column_count; ++column_index) {
+            const auto cell_index = row_index * column_count + column_index;
+            auto cell = TextBlock{};
+            cell.FontSize(kUIFontSize);
+            cell.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
+            if (!cell.Text().empty()) ToolTipService::SetToolTip(cell, winrt::box_value(cell.Text()));
+            const double vertical_margin = props.compact.value_or(false) ? 2.0 : 5.0;
+            cell.Margin({8, vertical_margin, 8, vertical_margin});
+            cell.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+            const auto cell_key = props.rowKeys[row_index] + "\x1f" + std::to_string(column_index);
+            const bool secondary = std::find(secondary_cell_keys.begin(), secondary_cell_keys.end(), cell_key) != secondary_cell_keys.end();
+            if (disabled || secondary) cell.Foreground(SecondaryTextBrush());
+            Grid::SetColumn(cell, static_cast<int32_t>(column_index));
+            row.Children().Append(cell);
+          }
         }
         list_.Items().Append(row);
       }
@@ -624,7 +736,8 @@ struct TableComponentView final
     compact_ = props.compact;
     disabled_row_keys_ = disabled_row_keys;
     secondary_cell_keys_ = secondary_cell_keys;
-    if (props.followBottom.value_or(false) && rows_changed && !props.rowKeys.empty()) {
+    spanning_row_keys_ = spanning_row_keys;
+    if (props.followBottom.value_or(false) && rows_changed && was_following_bottom && !props.rowKeys.empty()) {
       list_.ScrollIntoView(list_.Items().GetAt(static_cast<uint32_t>(props.rowKeys.size() - 1)));
     }
     has_applied_ = true;
@@ -634,8 +747,10 @@ struct TableComponentView final
   bool syncing_ = false;
   winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
   Grid root_{nullptr};
+  Border table_frame_{nullptr};
   Grid table_{nullptr};
   Grid header_{nullptr};
+  Border header_frame_{nullptr};
   ListView list_{nullptr};
   ScrollViewer horizontal_scroller_{nullptr};
   bool has_applied_ = false;
@@ -648,6 +763,7 @@ struct TableComponentView final
   std::optional<bool> compact_;
   std::vector<std::string> disabled_row_keys_;
   std::vector<std::string> secondary_cell_keys_;
+  std::vector<std::string> spanning_row_keys_;
 };
 
 struct TextEditorComponentView final
@@ -664,6 +780,7 @@ struct TextEditorComponentView final
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     editor_ = TextBox{};
+    editor_.FontSize(kUIFontSize);
     editor_.AcceptsReturn(true);
     editor_.TextChanged([this](auto const&, auto const&) {
       if (syncing_) return;
@@ -825,6 +942,7 @@ struct SecureTextEditorComponentView final
     try {
       island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
       editor_ = TextBox{};
+      editor_.FontSize(kUIFontSize);
       editor_.AcceptsReturn(true);
       editor_.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Consolas"));
       editor_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
@@ -1365,6 +1483,7 @@ struct TextInputComponentView final
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     text_box_ = TextBox{};
+    text_box_.FontSize(kUIFontSize);
     // React Native owns the outer field height.  Keep the native editor's
     // content box centered with enough vertical room for the shared 13pt
     // font instead of inheriting template padding that can clip the glyphs.
@@ -1479,6 +1598,7 @@ struct SecureTextInputComponentView final
     try {
       island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
       password_box_ = PasswordBox{};
+      password_box_.FontSize(kUIFontSize);
       // Keep secret fields visually and typographically identical to regular
       // inputs. PasswordBox otherwise inherits template padding that differs
       // from TextBox and can make a 13pt value look vertically clipped.
@@ -1879,13 +1999,14 @@ struct SelectableRowComponentView final
     content_ = StackPanel{};
     content_.Spacing(2);
     title_ = TextBlock{};
+    title_.FontSize(kUIFontSize);
     title_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
     title_.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
     detail_ = TextBlock{};
+    detail_.FontSize(kUIFontSize);
     detail_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
     detail_.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
     detail_.Opacity(0.68);
-    detail_.FontSize(11);
     content_.Children().Append(title_);
     content_.Children().Append(detail_);
     button_.Content(content_);

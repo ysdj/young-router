@@ -6,6 +6,144 @@ from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    async def test_incomplete_responses_stream_after_tool_activity_cools_route_immediately(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Run the command."}],
+            "stream": True,
+            "model_info": {
+                "id": "partial-tool-route",
+                "route_key": "provider / openai/default-chat / key=primary / order=1",
+                "order": 1,
+            },
+        }
+
+        async def incomplete_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-partial", "status": "in_progress"},
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "call-partial",
+                    "type": "function_call",
+                    "name": "exec",
+                    "arguments": "{",
+                },
+            }
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-partial",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "stream_interrupted"},
+                },
+            }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=incomplete_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[-1]["type"], "response.failed")
+        cooldown = hooks._DEPLOYMENT_COOLDOWNS["id:partial-tool-route"]
+        self.assertEqual(cooldown["failures"], 1)
+        self.assertGreater(cooldown["cooldown_until"], time.time())
+
+    def test_route_recovery_rejects_reasoning_only_completed_response(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+        reasoning_only = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-reasoning-only",
+                "status": "completed",
+                "output": [{"id": "reasoning-only", "type": "reasoning", "summary": []}],
+            },
+        }
+        tool_call = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-tool-call",
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "call-tool",
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": "{}",
+                    }
+                ],
+            },
+        }
+
+        self.assertFalse(
+            hooks._stream_chunk_has_deliverable_route_recovery_output(
+                reasoning_only, request_data
+            )
+        )
+        self.assertTrue(
+            hooks._stream_chunk_has_deliverable_route_recovery_output(
+                tool_call, request_data
+            )
+        )
+
+    async def test_route_recovery_reasoning_only_completion_returns_failure(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.01")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        calls = []
+
+        async def reasoning_only_stream():
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-reasoning-only",
+                    "status": "completed",
+                    "output": [{"id": "reasoning-only", "type": "reasoning", "summary": []}],
+                },
+            }
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return reasoning_only_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+        failure = RuntimeError("temporary upstream failure")
+        failure.status_code = 503
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._stream_route_recovery_poll(request_data, failure)
+        ]
+
+        self.assertGreaterEqual(len(calls), 1)
+        self.assertEqual([chunk["type"] for chunk in chunks], ["response.failed"])
+
     async def test_empty_non_streaming_responses_result_enters_route_recovery(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []

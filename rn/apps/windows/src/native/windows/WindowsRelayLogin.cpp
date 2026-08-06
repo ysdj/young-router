@@ -38,6 +38,7 @@ constexpr size_t kMaxPasswordBytes = 4096;
 constexpr size_t kCredentialChunkBytes = 2400;
 constexpr size_t kMaxCredentialChunks = 48;
 constexpr wchar_t kCredentialRoot[] = L"LiteLLM Menu/relay/";
+constexpr double kUIFontSize = 13.0;
 
 std::wstring Utf8ToWide(std::string const& value) {
   if (value.empty()) return {};
@@ -960,10 +961,11 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
   labels.Spacing(3);
   controls::TextBlock title;
   title.Text(Utf8ToWide(state->options.label));
-  title.FontSize(17);
+  title.FontSize(kUIFontSize);
   title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
   labels.Children().Append(title);
   controls::TextBlock account;
+  account.FontSize(kUIFontSize);
   auto const account_type = state->options.account_type == "newapi"
       ? Text(state->options, L"New API  |  ", L"NewAPI  |  ")
       : std::wstring(L"Sub2API  |  ");
@@ -971,8 +973,9 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
   account.TextTrimming(xaml::TextTrimming::CharacterEllipsis);
   labels.Children().Append(account);
   controls::TextBlock status;
+  status.FontSize(kUIFontSize);
   state->status = status;
-  status.Text(Text(state->options, L"Sign in on the site, then select Check Sign-In.", L"请在站点内完成登录，然后选择“检查登录”。"));
+  status.Text(Text(state->options, L"Enter your account and password in the page, then select Check Sign-In.", L"请在页面中输入账号和密码完成登录，然后选择“检查登录”。"));
   status.TextWrapping(xaml::TextWrapping::Wrap);
   labels.Children().Append(status);
   header.Children().Append(labels);
@@ -983,10 +986,12 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
   actions.SetValue(controls::Grid::ColumnProperty(), winrt::box_value(1));
   actions.VerticalAlignment(xaml::VerticalAlignment::Center);
   controls::Button check;
+  check.FontSize(kUIFontSize);
   state->check = check;
   check.Content(winrt::box_value(Text(state->options, L"Check Sign-In", L"检查登录")));
   check.IsEnabled(false);
   controls::Button cancel;
+  cancel.FontSize(kUIFontSize);
   state->cancel = cancel;
   cancel.Content(winrt::box_value(Text(state->options, L"Cancel", L"取消")));
   actions.Children().Append(check);

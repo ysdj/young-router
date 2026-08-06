@@ -7,16 +7,17 @@ import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const checker = path.join(root, "scripts", "check-contract.mjs");
-const original = fs.readFileSync(path.join(root, "packages", "shared", "src", "types.ts"), "utf8");
+const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const rnRoot = path.join(repository, "rn");
+const checker = path.join(rnRoot, "scripts", "check-contract.mjs");
+const original = fs.readFileSync(path.join(rnRoot, "packages", "shared", "src", "types.ts"), "utf8");
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "litellm-menu-contract-"));
 
 function run(types) {
   const candidate = path.join(temporary, "types.ts");
   fs.writeFileSync(candidate, types, "utf8");
   return spawnSync(process.execPath, [checker], {
-    cwd: root,
+    cwd: rnRoot,
     encoding: "utf8",
     env: { ...process.env, LITELLM_MENU_CONTRACT_TYPES: candidate },
   });

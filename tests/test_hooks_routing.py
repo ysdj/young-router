@@ -29,6 +29,7 @@ class HookRoutingTests(HookTestCase):
 
     def test_recovery_policy_defaults_match_error_boundaries(self) -> None:
         hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)
 
         balance = RuntimeError("insufficient account balance")
         balance.status_code = 403
@@ -48,14 +49,14 @@ class HookRoutingTests(HookTestCase):
         request_error.status_code = 400
 
         self.assertEqual(hooks._recovery_policy_for_exception(balance), "recovery_cooldown")
-        self.assertEqual(hooks._recovery_policy_for_exception(rate_limit), "recovery_cooldown")
-        self.assertEqual(hooks._recovery_policy_for_exception(overload), "recovery_cooldown")
+        self.assertEqual(hooks._recovery_policy_for_exception(rate_limit), "recovery")
+        self.assertEqual(hooks._recovery_policy_for_exception(overload), "recovery")
         self.assertEqual(hooks._recovery_policy_for_exception(network), "recovery")
         self.assertEqual(hooks._recovery_policy_for_exception(start_timeout), "recovery_cooldown")
         self.assertEqual(hooks._recovery_policy_for_exception(idle_timeout), "recovery")
         self.assertEqual(hooks._recovery_policy_for_exception(request_error), "error")
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(network))
-        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
+        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(start_timeout))
 
     def test_recovery_policy_is_runtime_configurable(self) -> None:
@@ -66,6 +67,14 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(hooks._recovery_policy_for_exception(error), "recovery_cooldown")
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(error))
+
+        rate_limit = RuntimeError("rate limit exceeded")
+        rate_limit.status_code = 429
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, "recovery_cooldown")
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(rate_limit), "recovery_cooldown"
+        )
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
 
     def test_deterministic_request_error_never_enters_recovery_even_when_marked_failed(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -387,6 +396,74 @@ class HookRoutingTests(HookTestCase):
             request_kwargs={},
         )
         self.assertEqual(filtered, [deployments[1]])
+
+    def test_deployment_cooldown_defaults_split_ordinary_and_compaction_writes(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED_ENV, None)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV, None)
+
+        ordinary_request = {"model": "default-chat", "input": [{"role": "user", "content": "work"}]}
+        compaction_request = {
+            "model": "default-chat",
+            "input": [{"type": "compaction_trigger", "id": "compact-now"}],
+        }
+
+        self.assertTrue(
+            hooks._deployment_cooldown_recording_enabled_for_request(ordinary_request)
+        )
+        self.assertFalse(
+            hooks._deployment_cooldown_recording_enabled_for_request(compaction_request)
+        )
+
+    def test_compaction_cooldown_setting_keeps_one_shared_pool(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV, "0")
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        deployment = {
+            "litellm_params": {"model": "openai/x-cheap"},
+            "model_info": {"id": "cooldown-shared-route"},
+        }
+        ordinary_request = {
+            "model": "default-chat",
+            "litellm_params": {"model": "openai/x-cheap"},
+            "model_info": {"id": "cooldown-shared-route"},
+        }
+        compaction_request = {
+            "model": "default-chat",
+            "input": [{"type": "compaction_trigger", "id": "compact-now"}],
+            "litellm_params": {"model": "openai/x-cheap"},
+            "model_info": {"id": "cooldown-shared-route"},
+        }
+
+        ordinary_error = RuntimeError("temporary upstream failure")
+        ordinary_error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(ordinary_error, ordinary_request)
+        cooldown_key = "id:cooldown-shared-route"
+        self.assertIn(cooldown_key, hooks._DEPLOYMENT_COOLDOWNS)
+
+        available, cooled, filtered = hooks._with_active_deployment_cooldowns(
+            [deployment], request_kwargs=compaction_request
+        )
+        self.assertEqual(available, [])
+        self.assertEqual(len(cooled), 1)
+        self.assertTrue(filtered)
+
+        compaction_error = RuntimeError("temporary upstream failure")
+        compaction_error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(compaction_error, compaction_request)
+        self.assertEqual(hooks._DEPLOYMENT_COOLDOWNS[cooldown_key]["failures"], 1)
+
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV, "1")
+        enabled_compaction_error = RuntimeError("temporary upstream failure")
+        enabled_compaction_error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            enabled_compaction_error, compaction_request
+        )
+        self.assertEqual(hooks._DEPLOYMENT_COOLDOWNS[cooldown_key]["failures"], 2)
 
     async def test_deployment_cooldown_persists_across_worker_memory(self) -> None:
         hooks, _ = load_hook_module()
@@ -901,7 +978,7 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(filtered, deployments)
 
-    async def test_deployment_cooldown_counts_rate_limit_but_not_request_shape_or_context_errors(self) -> None:
+    async def test_deployment_cooldown_does_not_count_rate_limit_or_request_errors_by_default(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -942,7 +1019,7 @@ class HookRoutingTests(HookTestCase):
             messages=None,
             request_kwargs={},
         )
-        self.assertEqual(filtered, [deployments[1]])
+        self.assertEqual(filtered, deployments)
 
     async def test_deployment_cooldown_counts_server_timeouts_but_not_stream_idle_errors(self) -> None:
         hooks, _ = load_hook_module()

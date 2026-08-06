@@ -44,6 +44,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('start_installed_app "$OLD_PIDS"', installer)
         self.assertIn('curl --fail --silent --show-error --max-time 1', installer)
         self.assertIn('health/liveliness', installer)
+        self.assertIn(' -m litellm_menu.macos_proxy ', installer)
         self.assertIn('stable_checks >= REQUIRED_HEALTH_CHECKS', installer)
         self.assertIn('restore_previous_app', installer)
         self.assertIn("copy_tree()", installer)
@@ -167,6 +168,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
             "pnpm run test && pnpm run contract-check && pnpm run typecheck",
         )
         self.assertIn("pnpm run check:macos &", script)
+        self.assertIn('"$PROJECT_ROOT/scripts/update-litellm.sh"', script)
         self.assertNotIn("pnpm run build &", script)
         self.assertIn("STATIC_CHECKS_PID=$!", script)
         self.assertIn('wait "$STATIC_CHECKS_PID"', script)
@@ -262,6 +264,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
 
         self.assertIn('"codegen:windows:check"', package)
         self.assertIn("pnpm run codegen:windows:check", script)
+        self.assertIn("scripts\\update_litellm.py", script)
         self.assertIn("RunCodegenWindows=false", script)
         self.assertIn('"sitecustomize.py"', script)
         self.assertIn("LITELLM_MENU_PROXY_PROCESS", script)

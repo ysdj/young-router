@@ -20,6 +20,7 @@ export function createNativeLeafAdapter(overrides: Partial<NativeLeafAdapter> = 
     saveFilePicker: overrides.saveFilePicker ?? (async () => undefined),
     showActionMenu: overrides.showActionMenu ?? (async () => undefined),
     showConfirmation: overrides.showConfirmation ?? (async () => false),
+    showCodexRestartConfirmation: overrides.showCodexRestartConfirmation ?? (async () => undefined),
     showReadOnlyText: overrides.showReadOnlyText ?? (async () => undefined),
     chooseModelsToAdd: overrides.chooseModelsToAdd ?? (async () => undefined),
     editSecureDocument: overrides.editSecureDocument ?? (async () => undefined),
@@ -31,6 +32,7 @@ export function createNativeLeafAdapter(overrides: Partial<NativeLeafAdapter> = 
     clearRelayPassword: overrides.clearRelayPassword ?? (async () => undefined),
     clearRelayCredentials: overrides.clearRelayCredentials ?? (async () => undefined),
     setLaunchAtLogin: overrides.setLaunchAtLogin ?? (async () => undefined),
+    restartCodex: overrides.restartCodex ?? (async () => false),
     setLocalization: overrides.setLocalization ?? (() => undefined),
     setShortcuts: overrides.setShortcuts ?? (() => undefined),
   };

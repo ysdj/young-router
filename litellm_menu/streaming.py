@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from . import computer_facade as _computer_facade_module
 from . import image_generation as _image_generation_module
 from . import image_inputs as _image_inputs_module
@@ -507,6 +509,13 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
         in lowered
     ):
         status_code = 400
+    elif status_code is None and error_code in {
+        "upstream_compaction_failure",
+        "upstream_route_failure",
+    }:
+        match = re.search(r"\bhttp\s+([45]\d\d)\b", lowered)
+        if match is not None:
+            status_code = int(match.group(1))
 
     exception = RuntimeError(text)
     if status_code is not None:
@@ -526,6 +535,17 @@ def _stream_chunk_priority_error_exception(chunk: Any) -> Optional[Exception]:
     if exception is None:
         return None
     return exception if _routing_module._is_priority_deployment_failover_error(exception) else None
+
+
+def _is_structured_codex_compaction_failure_chunk(chunk: Any) -> bool:
+    """Recognize the terminal failure event produced for a prior compaction attempt."""
+    dumped = _stream_chunk_dump(chunk)
+    if dumped.get("type") != "response.failed":
+        return False
+    response = dumped.get("response")
+    response = response if isinstance(response, dict) else {}
+    error = response.get("error")
+    return isinstance(error, dict) and error.get("code") == "upstream_compaction_failure"
 
 
 def _stream_chunk_dump(chunk: Any) -> dict[str, Any]:
@@ -1152,11 +1172,10 @@ def _responses_incomplete_stream_exception(
             if terminal_exception is not None
             else None
         )
-        exception.status_code = (  # type: ignore[attr-defined]
-            terminal_status
-            if terminal_status is not None
-            else 400 if _routing_module._is_context_size_error(exception) else 502
-        )
+        if terminal_status is not None:
+            exception.status_code = terminal_status  # type: ignore[attr-defined]
+        elif _routing_module._is_context_size_error(exception):
+            exception.status_code = 400  # type: ignore[attr-defined]
     except Exception:
         pass
     if buffer is not None:
@@ -1362,7 +1381,7 @@ def _responses_completed_chunk_has_route_recovery_output(
             return True
         if all(_response_item_is_web_search_call(item) for item in output):
             return False
-    return not _responses_output_module._response_is_effectively_empty(response)
+    return _responses_completed_chunk_has_usable_output(chunk, request_data)
 
 
 def _stream_chunk_has_deliverable_route_recovery_output(
@@ -4113,18 +4132,22 @@ async def _yield_validated_structured_codex_compaction_stream(
     completion_state = _ResponsesStreamCompletionState(request_data)
     raw_tool_call_text_filter = _responses_web_search_bridge_module._RawToolCallTextFilter()
 
-    def remember(chunk: Any) -> bool:
+    def remember(chunk: Any) -> Optional[str]:
         sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(
             chunk
         )
         if sanitized_chunk is None:
-            return False
+            return None
         sanitized_chunk = _responses_web_search_bridge_module._sanitize_raw_tool_call_text_stream_chunk(
             sanitized_chunk,
             raw_tool_call_text_filter,
         )
         if sanitized_chunk is None:
-            return False
+            return None
+        if _is_structured_codex_compaction_failure_chunk(sanitized_chunk):
+            events.append(sanitized_chunk)
+            completion_state.remember(sanitized_chunk)
+            return "failed"
         chunk_exception = _stream_chunk_priority_error_exception(sanitized_chunk)
         if chunk_exception is not None:
             raise chunk_exception
@@ -4137,7 +4160,7 @@ async def _yield_validated_structured_codex_compaction_stream(
                 request_data=request_data,
             )
         if not _responses_stream_chunk_is_completed(sanitized_chunk):
-            return False
+            return None
         if not _responses_completed_chunk_has_usable_output(
             sanitized_chunk,
             request_data,
@@ -4147,10 +4170,10 @@ async def _yield_validated_structured_codex_compaction_stream(
                 buffer=events,
                 request_data=request_data,
             )
-        return True
+        return "completed"
 
     for chunk in buffer:
-        if remember(chunk):
+        if remember(chunk) is not None:
             for event in events:
                 yield _responses_stream_chunk_for_delivery(event)
             await _close_async_iterator_safely(response)
@@ -4163,7 +4186,7 @@ async def _yield_validated_structured_codex_compaction_stream(
             stream_started_at=stream_started_at,
             initial_chunk_count=len(buffer),
         ):
-            if remember(chunk):
+            if remember(chunk) is not None:
                 for event in events:
                     yield _responses_stream_chunk_for_delivery(event)
                 await _close_async_iterator_safely(response)
@@ -5066,6 +5089,15 @@ async def _yield_guarded_original_stream(
 
     def failed_terminal_event(reason: str, exception: Optional[Exception] = None) -> _JSONStreamEvent:
         failure = exception or _responses_incomplete_stream_exception(reason, buffer=event_tail)
+        # Once part of a Responses stream has reached Codex, replaying that
+        # stream could duplicate a tool call or visible output.  Keep the
+        # terminal failure for this response, but quarantine the route before
+        # Codex reconnects so the next attempt selects a healthy deployment.
+        if _routing_module._is_priority_deployment_failover_error(failure):
+            _routing_module._mark_exception_for_deployment_failover(
+                failure,
+                request_data,
+            )
         _trace_module._route_trace(
             "responses_active_stream_failed_terminal_event",
             request_id=_routing_module._trace_request_id(request_data),

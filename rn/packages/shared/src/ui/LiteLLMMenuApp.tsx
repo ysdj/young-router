@@ -1,11 +1,13 @@
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState, useContext } from "react";
-import { Platform, PlatformColor, ScrollView, StyleSheet, Text, View, type HostInstance, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
+import { Dimensions, Platform, PlatformColor, ScrollView, StyleSheet, Text, View, type HostInstance, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, codexFeatureLabel, localizeCodexValidationMessage, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
 import { LOG_TABS, ROUTES } from "../routes";
 import { NativeButton, NativeCheckbox, NativePicker, NativeSecureTextEditor, NativeSecureTextInput, NativeSegmentedControl, NativeSplitView, NativeTable, NativeTextEditor, NativeTextField } from "./NativeControls";
 import { RelayAccountManager } from "./RelayAccountManager";
+import { screenBoundedTooltipText } from "./tooltip";
+import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import type {
   AppRoute,
   ConfigDomain,
@@ -136,6 +138,10 @@ function domainState(snapshot: CoreSnapshot | undefined, domain: ConfigDomain): 
   const record = asRecord(snapshot?.domains[domain]);
   const state = asRecord(record.state);
   return Object.keys(state).length > 0 ? state : record;
+}
+
+function codexModelCatalogState(snapshot: CoreSnapshot | undefined): UnknownRecord {
+  return asRecord(domainState(snapshot, "codex").model_catalog);
 }
 
 function domainForRoute(route: AppRoute): ConfigDomain | undefined {
@@ -270,6 +276,8 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
   const serviceOperationQueue = useRef<Promise<void>>(Promise.resolve());
   const lastServiceRecoveryAttempt = useRef(0);
   const acceptedSnapshotRevision = useRef<number>(-1);
+  const presentedCatalogRestartEvent = useRef(0);
+  const catalogRestartConfirmationOpen = useRef(false);
 
   const recordMenuAction = useCallback(async (action: string): Promise<void> => {
     try {
@@ -310,6 +318,9 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
       serviceShouldBeRunning.current = true;
       lastServiceRecoveryAttempt.current = Date.now();
     }
+    if (!background && snapshot && (operation === "start" || operation === "restart" || operation === "reload")) {
+      receiveSnapshot({ ...snapshot, service: { ...snapshot.service, state: "starting" } });
+    }
     if (!background) setServiceOperationPendingCount((count) => count + 1);
     const queued = serviceOperationQueue.current.catch(() => undefined).then(async () => {
       try {
@@ -335,7 +346,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
       void queued.finally(() => setServiceOperationPendingCount((count) => Math.max(0, count - 1)));
     }
     return queued;
-  }, [hostTranslate, ipc, refreshSnapshot]);
+  }, [hostTranslate, ipc, receiveSnapshot, refreshSnapshot, snapshot]);
 
   useEffect(() => {
     if (!isPrimaryHost) return;
@@ -484,6 +495,18 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
           setError(hostTranslate("error.coreUnavailable"));
         }
       })();
+    } else if (action === "toggle-codex-model-catalog" && snapshot) {
+      handledNativeActions.current.add(actionKey);
+      const enabled = !booleanValue(codexModelCatalogState(snapshot).enabled);
+      void (async () => {
+        try {
+          await ipc.dispatch({ domain: "codex", type: "codex.model_catalog.set", payload: { enabled } });
+          receiveSnapshot(await ipc.snapshot());
+          await recordMenuAction(action);
+        } catch {
+          setError(hostTranslate("error.coreUnavailable"));
+        }
+      })();
     } else if (action.startsWith("set-language-") && snapshot) {
       const language = action.slice("set-language-".length);
       if (language !== "system" && language !== "en" && language !== "zh-Hans") return;
@@ -502,14 +525,54 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, routeReq
   }, [hostTranslate, ipc, isPrimaryHost, nativeAction, receiveSnapshot, recordMenuAction, runServiceOperation, snapshot]);
 
   useEffect(() => {
+    if (!isPrimaryHost || Platform.OS !== "macos" || !snapshot) return;
+    const catalog = codexModelCatalogState(snapshot);
+    const event = numberValue(catalog.change_event);
+    if (!booleanValue(catalog.restart_required) || event <= presentedCatalogRestartEvent.current || catalogRestartConfirmationOpen.current) return;
+    presentedCatalogRestartEvent.current = event;
+    catalogRestartConfirmationOpen.current = true;
+    void (async () => {
+      try {
+        let restartFailed = false;
+        for (;;) {
+          const choice = await native.showCodexRestartConfirmation({
+            title: translate("codex.modelCatalogRestartTitle"),
+            message: restartFailed
+              ? `${translate("codex.modelCatalogRestartBody")}\n\n${translate("codex.modelCatalogRestartFailed")}`
+              : translate("codex.modelCatalogRestartBody"),
+            restartLabel: translate("codex.modelCatalogRestartNow"),
+            laterLabel: translate("codex.modelCatalogRestartLater"),
+          });
+          if (choice !== "restart" || await native.restartCodex()) {
+            await ipc.dispatch({ domain: "codex", type: "acknowledge_model_catalog_restart", payload: {} });
+            receiveSnapshot(await ipc.snapshot());
+            return;
+          }
+          restartFailed = true;
+        }
+      } catch {
+        // The native panel is independent from every settings window. Keep
+        // those windows usable if its acknowledgement is temporarily
+        // unavailable, then present the same outstanding event again when
+        // the next Core snapshot arrives.
+        presentedCatalogRestartEvent.current = event - 1;
+      } finally {
+        catalogRestartConfirmationOpen.current = false;
+      }
+    })();
+  }, [hostTranslate, ipc, isPrimaryHost, native, receiveSnapshot, snapshot, translate]);
+
+  useEffect(() => {
     if (!isPrimaryHost || !snapshot) return;
     const serviceState = snapshot.service.state;
     const serviceActive = serviceState === "running" || serviceState === "starting" || serviceState === "unhealthy";
     const serviceStartAvailable = !serviceOperationPending && serviceState === "stopped";
     const serviceRestartAvailable = !serviceOperationPending && serviceState !== "unknown" && serviceState !== "starting";
     const serviceReloadAvailable = !serviceOperationPending && (serviceState === "running" || serviceState === "unhealthy");
+    const catalog = codexModelCatalogState(snapshot);
     const actions = [
       { id: "toggle-autostart", title: translate("menu.autoStart"), enabled: true, checked: snapshot.service.auto_start_state === "enabled" },
+      ...(Platform.OS === "macos" ? [{ id: "toggle-codex-model-catalog", title: translate("menu.codexModelCatalog"), enabled: true, checked: booleanValue(catalog.enabled) }] : []),
       { id: "open-providers-models", title: translate("menu.providers"), enabled: true },
       { id: "open-runtime-settings", title: translate("menu.runtime"), enabled: true },
       { id: "open-codex-settings", title: translate("menu.codex"), enabled: true },
@@ -549,8 +612,8 @@ function DialogFooter({ status, leading, children }: { status?: string; leading?
   return <View style={styles.footer}>{leading ?? (status ? <Text numberOfLines={1} style={styles.footerStatus}>{status}</Text> : <View />)}<View style={styles.footerSpacer} /><View style={styles.footerButtons}>{children}</View></View>;
 }
 
-function IconButton({ label, title, disabled, onPress }: { label: string; title: string; disabled?: boolean; onPress: () => void }): React.JSX.Element {
-  return <NativeButton title={label} toolTip={title} accessibilityLabel={title} compact disabled={disabled} onPress={onPress} style={styles.iconButton} />;
+function IconButton({ label, symbol, title, disabled, onPress }: { label: string; symbol?: "pause" | "play" | "trash"; title: string; disabled?: boolean; onPress: () => void }): React.JSX.Element {
+  return <NativeButton title={label} symbol={symbol} toolTip={title} accessibilityLabel={title} compact disabled={disabled} onPress={onPress} style={styles.iconButton} />;
 }
 
 function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: { values: Array<{ id: string; title: string }>; selected: string; disabled?: boolean; onSelect: (id: string) => void; style?: StyleProp<ViewStyle>; nativeRef?: React.Ref<HostInstance> }): React.JSX.Element {
@@ -636,8 +699,8 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     const staged = await native.clearSecret(options);
     if (staged) revision.current = staged.revision;
     return staged ?? { cancelled: true };
-  }, "common.staged");
-  const run = async (operation: () => Promise<unknown>, message = "common.applied", keepControlsEnabled = false): Promise<void> => {
+  }, null);
+  const run = async (operation: () => Promise<unknown>, message: string | null = "common.applied", keepControlsEnabled = false): Promise<void> => {
     activeRuns.current += 1;
     if (!keepControlsEnabled) setBusy(true);
     setResult(undefined);
@@ -650,7 +713,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
         setResult(value.valid ? translate("common.applied") : `${value.issues.length} ${translate("common.validationIssues")}`);
       } else {
         setIssues([]);
-        setResult(translate(message));
+        setResult(message === null ? undefined : translate(message));
       }
       await refresh();
     } catch (reason: unknown) {
@@ -675,7 +738,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     dispatchQueue.current = queued.then(() => undefined, () => undefined);
     return queued;
   };
-  const dispatch: Dispatch = (type, payload = {}, targetDomain = domain) => run(() => enqueueDispatch(type, payload, targetDomain), "common.staged", true);
+  const dispatch: Dispatch = (type, payload = {}, targetDomain = domain) => run(() => enqueueDispatch(type, payload, targetDomain), null, true);
   const commitRelayMetadata: Dispatch = async (type, payload = {}, targetDomain = domain) => {
     // Relay credential cleanup needs the Core acknowledgement itself, not the
     // UI-oriented `dispatch` wrapper: that wrapper deliberately absorbs
@@ -775,7 +838,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       await flushPendingFields();
       setSettingsTab(next);
       return {};
-    }, "common.staged");
+    }, null);
   };
   const reload = (reloadDomain = domain): Promise<void> => {
     if (!reloadDomain) return Promise.resolve();
@@ -981,7 +1044,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     {route === "webdav-settings" ? <WebDavWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} /> : null}
     {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
     </View> : null}
-    {route !== "logs" && route !== "relay-accounts" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} onPress={() => dispatch("restore_defaults")} /> : route === "webdav-settings" ? <View style={styles.webdavFooterLeading}><ActionButton title={translate("common.test")} disabled={busy} style={styles.wideButton} onPress={() => run(async () => { await flushPendingFields(); return ipc.probe(undefined, undefined, "webdav"); }, "webdav.probe")} /><Text numberOfLines={2} style={styles.webdavProbeStatus}>{snapshot ? webdavMenuStatus(snapshot.service.webdav, snapshot.webdav.enabled, translate) : ""}</Text></View> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" || route === "webdav-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || (settingsRoute ? !(snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()) : domain ? !(snapshot?.drafts[domain]?.dirty || hasPendingFieldEdits()) : false)} style={route === "runtime-settings" || route === "webdav-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
+    {route !== "logs" && route !== "relay-accounts" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : route === "webdav-settings" ? <View style={styles.webdavFooterLeading}><ActionButton title={translate("common.test")} disabled={busy} style={styles.wideButton} onPress={() => run(async () => { await flushPendingFields(); return ipc.probe(undefined, undefined, "webdav"); }, "webdav.probe")} /><Text numberOfLines={2} style={styles.webdavProbeStatus}>{snapshot ? webdavMenuStatus(snapshot.service.webdav, snapshot.webdav.enabled, translate) : ""}</Text></View> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" || route === "webdav-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || (settingsRoute ? !(snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()) : domain ? !(snapshot?.drafts[domain]?.dirty || hasPendingFieldEdits()) : false)} style={route === "runtime-settings" || route === "webdav-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -998,19 +1061,30 @@ function riskCodes(snapshot: CoreSnapshot, domain: ConfigDomain): string[] {
 
 function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, onSecretState, applyProbedOrder }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; applyProbedOrder: ApplyProbedOrder }): React.JSX.Element {
   const state = domainState(snapshot, "providers_models");
-  const details = asRecords(state.providers);
-  const fallback = snapshot?.providers_models.providers ?? [];
-  const providers = details.length > 0 ? details : fallback.map(providerRecord);
+  const providers = useMemo(() => {
+    const details = asRecords(state.providers);
+    if (details.length > 0) return details;
+    return (snapshot?.providers_models.providers ?? []).map(providerRecord);
+  }, [snapshot?.providers_models.providers, state.providers]);
   const [selectedProvider, setSelectedProvider] = useState<string>();
   const pendingProviderIds = useRef<Set<string> | undefined>(undefined);
   const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);
   const knownModelIdsByProvider = useRef<Map<string, Set<string>> | undefined>(undefined);
-  const provider = providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0];
+  const provider = useMemo(
+    () => providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0],
+    [providers, selectedProvider],
+  );
   const providerId = provider ? editorIdentifier(provider) : "";
-  const models = provider ? asRecords(provider.models).map(modelRecord) : [];
+  const models = useMemo(
+    () => provider ? asRecords(provider.models).map(modelRecord) : [],
+    [provider],
+  );
   const [selectedModel, setSelectedModel] = useState<string>();
   const [providerSourceModel, setProviderSourceModel] = useState<string>();
-  const model = models.find((item) => editorIdentifier(item) === selectedModel);
+  const model = useMemo(
+    () => models.find((item) => editorIdentifier(item) === selectedModel),
+    [models, selectedModel],
+  );
   const [viewMode, setViewMode] = useState<"providers" | "routes">("providers");
   const [selectedRoute, setSelectedRoute] = useState<string>();
   const [fetchKeyName, setFetchKeyName] = useState<string>();
@@ -1019,11 +1093,16 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const [, setProbeActivityRevision] = useState(0);
   const [probeResults, setProbeResults] = useState<Record<string, IpcResults["probe"]>>({});
   const multiplierRefreshStarted = useRef(false);
+  const multiplierRefreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const multiplierRefreshUnmounted = useRef(false);
   const transferButtonRef = useRef<HostInstance | null>(null);
   const operation = asRecord(snapshot?.action_summaries?.providers_models);
   const operationSummary = asRecord(operation.operation_summary);
-  const apiKeyNames = stringList(provider?.api_key_names);
-  const fetchKeyOptions = apiKeyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) }));
+  const apiKeyNames = useMemo(() => stringList(provider?.api_key_names), [provider?.api_key_names]);
+  const fetchKeyOptions = useMemo(
+    () => apiKeyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) })),
+    [apiKeyNames, translate],
+  );
   const selectedFetchKey = fetchKeyName ?? apiKeyNames[0] ?? "";
   const selectedFetchLabel = fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default");
   async function probeModel(targetProviderId: string, targetModelId: string): Promise<void> {
@@ -1052,21 +1131,31 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     return { probing: probingModelKeys.current.has(key), probeResult: probeResults[key] };
   };
   useEffect(() => {
+    return () => {
+      multiplierRefreshUnmounted.current = true;
+      if (multiplierRefreshTimer.current !== undefined) clearTimeout(multiplierRefreshTimer.current);
+    };
+  }, []);
+  useEffect(() => {
+    multiplierRefreshUnmounted.current = false;
     if (!snapshot || multiplierRefreshStarted.current) return;
     multiplierRefreshStarted.current = true;
-    let active = true;
-    void (async () => {
-      const current = await ipc.snapshot();
-      const staged = await ipc.dispatch(
-        { domain: "providers_models", type: "providers.refresh_multiplier" },
-        current.revision,
-      );
-      const next = await ipc.snapshot();
-      if (active && next.revision >= staged.revision) onSnapshot(next);
-    })().catch(() => undefined);
-    return () => { active = false; };
+    // Let the native table finish its first layout before the optional remote
+    // multiplier read. This keeps opening the editor responsive even when a
+    // provider takes the full bounded network timeout.
+    multiplierRefreshTimer.current = setTimeout(() => {
+      multiplierRefreshTimer.current = undefined;
+      void (async () => {
+        const staged = await ipc.dispatch({ domain: "providers_models", type: "providers.refresh_multiplier" });
+        const next = await ipc.snapshot();
+        if (!multiplierRefreshUnmounted.current && next.revision >= staged.revision) onSnapshot(next);
+      })().catch(() => undefined);
+    }, 300);
   }, [ipc, onSnapshot, snapshot]);
-  const modelIdentitySignature = providers.map((entry) => `${editorIdentifier(entry)}:${asRecords(entry.models).map(editorIdentifier).join(",")}`).join("|");
+  const modelIdentitySignature = useMemo(
+    () => providers.map((entry) => `${editorIdentifier(entry)}:${asRecords(entry.models).map(editorIdentifier).join(",")}`).join("|"),
+    [providers],
+  );
   useEffect(() => {
     if (!snapshot) return;
     const current = new Map<string, Set<string>>();
@@ -1189,7 +1278,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!model) return;
     void dispatch("model.duplicate", { provider_id: providerId, model_id: editorIdentifier(model) });
   };
-  const routes = providers.flatMap((entry, providerIndex) => asRecords(entry.models).map(modelRecord).flatMap((entryModel, modelIndex) => {
+  const routes = useMemo(() => providers.flatMap((entry, providerIndex) => asRecords(entry.models).map(modelRecord).flatMap((entryModel, modelIndex) => {
     const publicModel = stringValue(entryModel.name).trim();
     const deploymentID = stringValue(entryModel.editor_id, stringValue(entryModel.deployment_id, identifier(entryModel))).trim();
     if (!publicModel || !deploymentID) return [];
@@ -1219,7 +1308,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const providerOrder = stringValue(left.provider.name).localeCompare(stringValue(right.provider.name), undefined, { sensitivity: "base" });
     if (providerOrder !== 0) return providerOrder;
     return left.deploymentID.localeCompare(right.deploymentID);
-  });
+  }), [providers]);
   const activeRoute = routes.find((entry) => entry.key === selectedRoute);
   const activeRouteGroup = activeRoute ? routes.filter((entry) => entry.publicModel === activeRoute.publicModel) : [];
   const activeRouteIndex = activeRoute ? activeRouteGroup.findIndex((entry) => entry.key === activeRoute.key) : -1;
@@ -1247,26 +1336,55 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const modelId = editorIdentifier(model);
     void native.showConfirmation({ title: translate("providers.deleteModel"), message: stringValue(model.name, modelId), confirmLabel: translate("common.delete") }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }).then(() => setSelectedModel(undefined)) : undefined);
   };
-  const providerRows = providers.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newProvider"))), String(asRecords(item.models).length || numberValue(item.model_count))] }));
-  const disabledProviderKeys = providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier);
-  const modelRows = models.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newModel"))), upstreamModelLabel(item), translate("providers.billingUnavailable"), `${apiKeyDisplayName(item.api_key_name, translate)} / ${numberValue(item.order, 1)}`] }));
-  const disabledModelKeys = models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier);
-  const routeRows = routes.map((entry, index) => {
-    const startsGroup = index === 0 || routes[index - 1]?.publicModel !== entry.publicModel;
-    const numericOrder = numberValue(entry.model.order, Number.NaN);
-    const order = Number.isFinite(numericOrder) ? String(numericOrder) : stringValue(entry.model.order).trim();
-    return { key: entry.key, cells: [startsGroup ? entry.publicModel : "", order || "-", `${stringValue(entry.provider.name)} / ${apiKeyDisplayName(entry.model.api_key_name, translate)}`, upstreamModelLabel(entry.model) || translate("common.notAvailable")] };
-  });
-  const disabledRouteKeys = routes.filter((entry) => !entry.providerEnabled || !entry.modelEnabled || !entry.keyAvailable).map((entry) => entry.key);
-  const selectRoute = (routeId: string): void => {
-    const selected = routes.find((entry) => entry.key === routeId);
-    setSelectedRoute(routeId);
-    if (selected) {
-      setSelectedProvider(editorIdentifier(selected.provider));
-      setSelectedModel(editorIdentifier(selected.model));
-      setProviderSourceModel(undefined);
+  const providerRows = useMemo(
+    () => providers.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newProvider"))), String(asRecords(item.models).length || numberValue(item.model_count))] })),
+    [providers, translate],
+  );
+  const disabledProviderKeys = useMemo(
+    () => providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier),
+    [providers],
+  );
+  const modelRows = useMemo(
+    () => models.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newModel"))), upstreamModelLabel(item), translate("providers.billingUnavailable"), `${apiKeyDisplayName(item.api_key_name, translate)} / ${numberValue(item.order, 1)}`] })),
+    [models, translate],
+  );
+  const disabledModelKeys = useMemo(
+    () => models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier),
+    [models, provider?.enabled],
+  );
+  const routeRows = useMemo(() => {
+    const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
+    let previousPublicModel = "";
+    for (const entry of routes) {
+      if (entry.publicModel !== previousPublicModel) {
+        rows.push({
+          key: `route-public-model:${entry.publicModel}`,
+          cells: [entry.publicModel, "", "", ""],
+          spanning: true,
+        });
+        previousPublicModel = entry.publicModel;
+      }
+      const numericOrder = numberValue(entry.model.order, Number.NaN);
+      const order = Number.isFinite(numericOrder) ? String(numericOrder) : stringValue(entry.model.order).trim();
+      rows.push({
+        key: entry.key,
+        cells: [`\t${stringValue(entry.provider.display_name, stringValue(entry.provider.name, translate("providers.newProvider")))}`, order || "-", apiKeyDisplayName(entry.model.api_key_name, translate), upstreamModelLabel(entry.model) || translate("common.notAvailable")],
+      });
     }
-  };
+    return rows;
+  }, [routes, translate]);
+  const disabledRouteKeys = useMemo(
+    () => routes.filter((entry) => !entry.providerEnabled || !entry.modelEnabled || !entry.keyAvailable).map((entry) => entry.key),
+    [routes],
+  );
+  const selectRoute = useCallback((routeId: string): void => {
+    const selected = routes.find((entry) => entry.key === routeId);
+    if (!selected) return;
+    setSelectedRoute(routeId);
+    setSelectedProvider(editorIdentifier(selected.provider));
+    setSelectedModel(editorIdentifier(selected.model));
+    setProviderSourceModel(undefined);
+  }, [routes]);
   const chooseViewMode = (value: "providers" | "routes"): void => {
     if (value === viewMode) return;
     const switchMode = async (): Promise<void> => {
@@ -1286,7 +1404,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     </View>
     {viewMode === "routes" ? <View style={[styles.routeWorkspace, styles.routeWorkspaceWithInspector]}>
       <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="↑" title={translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
-        <NativeTable columns={[{ label: translate("providers.model"), width: 170 }, { label: translate("common.order"), width: 56 }, { label: `${translate("providers.provider")} / ${translate("providers.key")}`, width: 130 }, { label: translate("providers.upstream"), width: 164 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} alternatingRows onSelectionChange={selectRoute} style={styles.nativeRouteTable} />
+        <NativeTable columns={[{ label: translate("providers.provider"), width: 170 }, { label: translate("common.order"), width: 56 }, { label: translate("providers.keyName"), width: 130 }, { label: translate("providers.upstream"), width: 164 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} onSelectionChange={selectRoute} style={styles.nativeRouteTable} />
       </TablePane>
       <View style={styles.providerInspector}>
         {activeRoute ? (providerSourceModel ? <ProviderEditor provider={activeRoute.provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} /> : <ModelInspector providers={providers} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />}
@@ -1321,8 +1439,9 @@ function ModelInspector({ providers, provider, providerId, model, native, busy, 
   const keyOptions = keyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) }));
   const selectedKey = stringValue(model.api_key_name, keyNames[0] ?? "");
   const probePresentation = modelProbePresentation(model, probeResult, translate);
-  const billingSummary = `${translate("providers.balance")}: ${translate("providers.billingUnavailable")}  ${translate("providers.multiplier")}: ${billingMultiplierValue(model.multiplier, translate)}`;
-  return <View style={styles.inspectorContent}><View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{stringValue(model.name, translate("providers.newModel"))}</Text></View><View style={styles.inspectorDivider} /><View style={styles.inspectorBody}><View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} style={styles.inspectorEnableControl} /><ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} onPress={probe} /><TooltipText numberOfLines={2} tooltip={probePresentation.full} accessibilityHint={probePresentation.full} style={styles.probeSummary}>{probePresentation.compact}</TooltipText></View><Text numberOfLines={1} style={styles.billingSummaryText}>{billingSummary}</Text><TextField label={translate("providers.publicModel")} labelWidth={96} labelAlign="left" value={stringValue(model.name)} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} /><PickerField label={translate("providers.provider")} labelWidth={96} labelAlign="left" value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers.find((item) => stringValue(item.name, translate("providers.newProvider")) === label); if (next) onProviderChange(editorIdentifier(next)); }} /><PickerField label={translate("common.apiKey")} labelWidth={96} labelAlign="left" value={selectedKey} values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]} disabled={busy || keyNames.length === 0} onSelect={(api_key_name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { api_key_name } })} /><TextField label={translate("providers.upstream")} labelWidth={96} labelAlign="left" value={upstreamModelLabel(model)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} /><TextField label={translate("common.order")} labelWidth={96} labelAlign="left" controlWidth={64} value={String(numberValue(model.order, 1))} keyboardType="numeric" onCommit={(order) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { order: Number(order) || 1 } })} /><ProtocolOrderEditor providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} /></View></View>;
+  const billingSummary = `${translate("providers.balance")}: ${translate("providers.billingUnavailable")} | ${translate("providers.multiplier")}: ${billingMultiplierValue(model.multiplier, translate)}`;
+  const probeTooltip = screenBoundedTooltipText(probePresentation.full, Dimensions.get("screen"));
+  return <View style={styles.inspectorContent}><View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{stringValue(model.name, translate("providers.newModel"))}</Text></View><View style={styles.inspectorDivider} /><View style={styles.inspectorBody}><View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} style={styles.inspectorEnableControl} /><ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} onPress={probe} /><TooltipText numberOfLines={2} tooltip={probeTooltip} accessibilityHint={probePresentation.full} style={styles.probeSummary}>{probePresentation.compact}</TooltipText></View><Text numberOfLines={1} style={styles.billingSummaryText}>{billingSummary}</Text><TextField label={translate("providers.publicModel")} labelWidth={72} value={stringValue(model.name)} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} /><PickerField label={translate("providers.provider")} labelWidth={72} value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers.find((item) => stringValue(item.name, translate("providers.newProvider")) === label); if (next) onProviderChange(editorIdentifier(next)); }} /><PickerField label={translate("common.apiKey")} labelWidth={72} value={selectedKey} values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]} disabled={busy || keyNames.length === 0} onSelect={(api_key_name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { api_key_name } })} /><TextField label={translate("providers.upstream")} labelWidth={72} value={upstreamModelLabel(model)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} /><TextField label={translate("common.order")} labelWidth={72} controlWidth={64} value={String(numberValue(model.order, 1))} keyboardType="numeric" onCommit={(order) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { order: Number(order) || 1 } })} /><ProtocolOrderEditor providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} /></View></View>;
 }
 
 function ProtocolOrderEditor({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
@@ -1414,8 +1533,8 @@ function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretS
   return <View style={styles.providerEditorContent}>
     <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerLabel}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
     <View style={styles.providerEditorSection}><View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch("provider.patch", { provider_id: id, changes: { enabled } })} /></View>
-    <TextField label={translate("providers.baseUrl")} labelWidth={96} labelAlign="left" value={stringValue(provider.endpoint, stringValue(provider.api_base))} onCommit={(endpoint) => dispatch("provider.patch", { provider_id: id, changes: { endpoint } })} />
-    <TextField label={translate("providers.providerName")} labelWidth={96} labelAlign="left" value={stringValue(provider.name, stringValue(provider.display_name))} onCommit={(name) => dispatch("provider.patch", { provider_id: id, changes: { name } })} />
+    <TextField label={translate("providers.baseUrl")} labelWidth={80} value={stringValue(provider.endpoint, stringValue(provider.api_base))} onCommit={(endpoint) => dispatch("provider.patch", { provider_id: id, changes: { endpoint } })} />
+    <TextField label={translate("providers.providerName")} labelWidth={80} value={stringValue(provider.name, stringValue(provider.display_name))} onCommit={(name) => dispatch("provider.patch", { provider_id: id, changes: { name } })} />
     <View style={styles.providerKeysEditor}>
       <View style={styles.providerKeysHeader}>
         <Text style={styles.providerKeysHeading}>{translate("providers.apiKeys")}</Text>
@@ -1428,8 +1547,8 @@ function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretS
         <NativeTable columns={[{ label: translate("providers.key"), width: 138 }]} rows={keyRows} selectedKey={selectedKey} onSelectionChange={setSelectedKey} style={styles.providerKeyTable} />
         <View style={styles.providerKeyFields}>
           {selectedKey ? <>
-            <TextField label={translate("providers.keyName")} labelWidth={64} labelAlign="left" value={selectedKey} onCommit={renameKey} />
-            <NativeSecretField plainText autoCommit label={translate("common.apiKey")} hint={selectedKeyConfigured ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} labelWidth={64} labelAlign="left" busy={busy || !selectedKey} domain="providers_models" field="api_key" target={`${id}\x1f${selectedKey}`} onSecretState={onSecretState} />
+            <TextField label={translate("providers.keyName")} labelWidth={64} value={selectedKey} onCommit={renameKey} />
+            <NativeSecretField plainText autoCommit label={translate("common.apiKey")} hint={selectedKeyConfigured ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} labelWidth={64} busy={busy || !selectedKey} domain="providers_models" field="api_key" target={`${id}\x1f${selectedKey}`} onSecretState={onSecretState} />
           </> : <Text style={styles.empty}>{translate("common.notAvailable")}</Text>}
         </View>
       </View>
@@ -1461,9 +1580,9 @@ function CodexWorkspace({ snapshot, ipc, native, busy, translate, dispatch, onSe
   const validationStatus = Object.keys(state).length === 0
     ? undefined
     : validationErrors.length > 0
-      ? validationErrors.map((message) => localizeCodexValidationMessage(message, translate)).join(" · ")
+      ? validationErrors.map((message) => localizeCodexValidationMessage(message, translate)).join("\n")
       : validationWarnings.length > 0
-        ? validationWarnings.map((message) => localizeCodexValidationMessage(message, translate)).join(" · ")
+        ? validationWarnings.map((message) => localizeCodexValidationMessage(message, translate)).join("\n")
         : undefined;
   const validationStatusStyle = validationErrors.length > 0
     ? styles.codexValidationError
@@ -1786,7 +1905,7 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
   let control: React.ReactNode;
   let action: React.ReactNode;
   if (kind === "boolean" || kind === "toggle" || kind === "bool" || kind === "bool_auto") {
-    control = <NativeCheckbox label={label} value={booleanValue(item.value)} disabled={busy} onValueChange={(next) => dispatch("set_setting", { key, value: kind === "bool_auto" ? (next ? "auto" : "off") : next })} style={styles.runtimeBooleanControl} />;
+    control = <NativeCheckbox label={label} labelVisible={false} value={booleanValue(item.value)} disabled={busy} onValueChange={(next) => dispatch("set_setting", { key, value: kind === "bool_auto" ? (next ? "auto" : "off") : next })} style={styles.runtimeBooleanControl} />;
   } else if (kind === "select" || kind === "choice" || kind === "enum") {
     const optionValues = stringList(item.options);
     const optionLabels = optionValues.map((option) => runtimeOptionLabel(key, option, translate));
@@ -1799,7 +1918,7 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     control = <RuntimeValueField label={label} value={value} keyboardType={["number", "integer", "int", "float", "mb"].includes(storageKind) ? "numeric" : undefined} onCommit={(next) => dispatch("set_setting", { key, value: next })} />;
   }
   const isBoolean = kind === "boolean" || kind === "toggle" || kind === "bool" || kind === "bool_auto";
-  return <View style={styles.runtimeField}><View style={styles.runtimeInputRow}>{isBoolean ? <View style={styles.runtimeBooleanSlot}>{control}</View> : <><Text numberOfLines={2} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</Text><View style={styles.runtimeValueSlot}>{control}</View>{unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}<View style={styles.runtimeActionSlot}>{action}</View></>}</View><RuntimeFieldMeta item={item} translate={translate} /></View>;
+  return <View style={styles.runtimeField}><View style={styles.runtimeInputRow}><Text numberOfLines={2} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</Text><View style={styles.runtimeValueSlot}>{control}</View>{!isBoolean && unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}{!isBoolean ? <View style={styles.runtimeActionSlot}>{action}</View> : null}</View><RuntimeFieldMeta item={item} translate={translate} /></View>;
 }
 
 function RuntimeFieldMeta({ item, translate }: { item: UnknownRecord; translate: Translate }): React.JSX.Element {
@@ -1988,6 +2107,9 @@ function WebDavPasswordField({ configured, busy, translate, onSecretState }: { c
 
 type RenderedLogRecord = {
   key: string;
+  requestKey: string;
+  routeSteps: string[];
+  routePath: string;
   time: string;
   source: string;
   status: string;
@@ -2003,12 +2125,15 @@ type RenderedLogRecord = {
   original: string;
 };
 
-type LogColumn = { label: string; width: number; value: (row: RenderedLogRecord) => string };
+type LogColumn = { label: string; width: number; flex?: boolean; value: (row: RenderedLogRecord) => string };
 
 function shortLogTimestamp(value: unknown): string {
   const raw = stringValue(value);
   if (!raw) return "";
-  const parsed = new Date(raw);
+  const numeric = Number(raw);
+  const parsed = Number.isFinite(numeric) && /^[-+]?\d+(?:\.\d+)?$/.test(raw.trim())
+    ? new Date(Math.abs(numeric) < 100_000_000_000 ? numeric * 1000 : numeric)
+    : new Date(raw);
   if (Number.isNaN(parsed.getTime())) return raw;
   const pad = (part: number): string => String(part).padStart(2, "0");
   return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;
@@ -2210,7 +2335,7 @@ function routeTraceDetailPartLabel(value: string, translate: Translate): string 
 
 function routeTraceDetailLabel(value: string, translate: Translate): string {
   const details = value.split(" · ").map((part) => routeTraceDetailPartLabel(part, translate)).filter(Boolean);
-  return details.join(" · ");
+  return details.join(" | ");
 }
 
 function recoveryStatusLabel(value: string, translate: Translate): string {
@@ -2248,7 +2373,7 @@ function recoveryDetailLabel(value: string, translate: Translate): string {
     const reason = part.match(/^reason=(.+)$/);
     if (reason?.[1]) return translate(reasonLabels[reason[1]] ?? "logs.recoveryReason.unknown");
     return "";
-  }).filter(Boolean).join(" · ");
+  }).filter(Boolean).join(" | ");
 }
 
 function logErrorDetail(value: unknown): string {
@@ -2263,7 +2388,7 @@ function logErrorDetail(value: unknown): string {
     error.failed_route_key === undefined ? "" : `route=${compactLogValue(error.failed_route_key)}`,
     error.failed_deployment_id === undefined ? "" : `deployment=${compactLogValue(error.failed_deployment_id)}`,
   ].filter(Boolean);
-  return parts.join(" · ");
+  return parts.join(" | ");
 }
 
 function safeOriginalLogRecord(record: unknown): string {
@@ -2275,7 +2400,25 @@ function safeOriginalLogRecord(record: unknown): string {
   }
 }
 
-function parseTextLogRecord(record: string, tab: LogTab, index: number, translate: Translate): RenderedLogRecord {
+function routeIdentityLabel(value: unknown, fallback: { model: string; upstreamModel: string; provider: string }, translate: Translate, allowFallback = false): string {
+  const route = asRecord(value);
+  if (Object.keys(route).length === 0 && !allowFallback) return "";
+  const provider = compactLogValue(route.provider) || fallback.provider;
+  const upstream = compactUpstreamLogModel(route.upstream_model) || fallback.upstreamModel;
+  const publicModel = compactLogValue(route.public_model) || fallback.model;
+  const order = compactLogValue(route.order);
+  const identity = [provider, upstream || publicModel].filter(Boolean).join(" / ");
+  if (!identity) return "";
+  return order ? `${identity} · ${translate("logs.routeTrace.order", { value: order })}` : identity;
+}
+
+function logRecordBaseKey(tab: LogTab, time: string, requestKey: string, event: string, action: string, original: string): string {
+  const identity = [requestKey, time, event, action].filter(Boolean);
+  const stablePart = identity.length > 0 ? identity.join(":") : original.split(" | ", 1)[0]?.slice(0, 180);
+  return `${tab}:${stablePart || "record"}`;
+}
+
+function parseTextLogRecord(record: string, tab: LogTab, _index: number, translate: Translate): RenderedLogRecord {
   let detail = record.trim();
   let time = "";
   while (detail.startsWith("[")) {
@@ -2285,33 +2428,33 @@ function parseTextLogRecord(record: string, tab: LogTab, index: number, translat
     detail = match[2].trim();
   }
   if (!time) {
-    const leadingTimestamp = detail.match(/^(Updated\s+)?(\d{4}-\d{2}-\d{2}T\S+)\s*(.*)$/);
+    const leadingTimestamp = detail.match(/^(Updated\s+)?(\d{4}-\d{2}-\d{2}[T ]\S+)\s*(.*)$/);
     if (leadingTimestamp && !Number.isNaN(new Date(leadingTimestamp[2] ?? "").getTime())) {
       time = shortLogTimestamp(leadingTimestamp[2]);
       detail = `${leadingTimestamp[1] ?? ""}${leadingTimestamp[3] ?? ""}`.trim();
     }
   }
-  let source = logTitle(tab, translate);
+  let source = tab === "service" ? translate("logs.service") : logTitle(tab, translate);
   let status = "";
   let model = "";
   let tokens = "";
   const servicePrefix = detail.match(/^\[(\d+)\]\s+\[([A-Z]+)\]\s*(.*)$/);
   if (servicePrefix) {
-    source = `PID ${servicePrefix[1]}`;
+    if (tab !== "service") source = `PID ${servicePrefix[1]}`;
     status = servicePrefix[2];
     detail = servicePrefix[3].trim();
   } else {
     const proxyPrefix = detail.match(/^(?:\d{2}:\d{2}:\d{2}\s+-\s+)?([^:]+):(DEBUG|INFO|WARNING|ERROR|CRITICAL):\s*(.*)$/);
     const levelPrefix = detail.match(/^(?:\[([A-Z]+)\]|(DEBUG|INFO|WARNING|ERROR|CRITICAL):)\s*(.*)$/);
     if (proxyPrefix) {
-      source = proxyPrefix[1]?.trim() || source;
+      if (tab !== "service") source = proxyPrefix[1]?.trim() || source;
       status = proxyPrefix[2] || "";
       detail = (proxyPrefix[3] ?? "").trim();
     } else if (levelPrefix) {
       status = levelPrefix[1] || levelPrefix[2] || "";
       detail = (levelPrefix[3] ?? "").trim();
       const process = detail.match(/\bprocess \[(\d+)\]/i);
-      if (process?.[1]) source = `PID ${process[1]}`;
+      if (process?.[1] && tab !== "service") source = `PID ${process[1]}`;
     } else if (/\b(error|failed|timeout|exception)\b/i.test(detail)) {
       status = translate("logs.failed");
     }
@@ -2323,23 +2466,54 @@ function parseTextLogRecord(record: string, tab: LogTab, index: number, translat
       const tokenIndex = fields.findIndex((field) => field.startsWith("tokens="));
       if (tokenIndex >= 0) tokens = fields.splice(tokenIndex, 1)[0]?.slice("tokens=".length) ?? "";
       status = fields.shift() ?? status;
-      detail = fields.join(" · ");
+      detail = fields.join(" | ");
     }
   }
   const action = tab === "menu" ? detail.split(/[:;,]/, 1)[0]?.trim() ?? "" : "";
-  return { key: `${tab}:${index}:${record}`, time, source, status, model, upstreamModel: "", provider: "", apiKeyName: "", event: "", action, duration: "", tokens, detail, original: record };
+  const requestKey = `${tab}:${time || "un-timed"}:${source}`;
+  return {
+    key: logRecordBaseKey(tab, time, requestKey, "", action, record),
+    requestKey,
+    routeSteps: [],
+    routePath: "",
+    time,
+    source,
+    status,
+    model,
+    upstreamModel: "",
+    provider: "",
+    apiKeyName: "",
+    event: "",
+    action,
+    duration: "",
+    tokens,
+    detail,
+    original: record,
+  };
 }
 
 function renderLogRecord(record: unknown, tab: LogTab, index: number, translate: Translate): RenderedLogRecord {
   if (typeof record === "string") return parseTextLogRecord(record, tab, index, translate);
   const value = asRecord(record);
-  const time = shortLogTimestamp(value.ts ?? value.timestamp ?? value.time ?? value.created_at ?? value.updated_at ?? value.checked_at);
-  const provider = compactLogValue(value.provider);
+  const time = shortLogTimestamp(value.ts ?? value.timestamp ?? value.time ?? value.created_at ?? value.updated_at ?? value.checked_at ?? value.heartbeat_at ?? value.started_at);
+  const routingState = compactLogValue(value.routing_state);
+  const provider = compactLogValue(value.provider)
+    || (tab === "requests"
+      ? routingState === "no_available_deployment"
+        ? translate("logs.noAvailableRoute")
+        : routingState === "model_not_configured"
+          ? translate("logs.modelNotConfigured")
+          : routingState === "unselected"
+            ? translate("logs.notRouted")
+            : ""
+      : "");
   const apiKeyName = compactLogValue(value.api_key_name);
   const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);
   const upstreamModel = compactLogValue(value.upstream_model);
   const model = publicModel || upstreamModel;
-  const source = compactLogValue(value.source ?? value.route_key) || provider || logTitle(tab, translate);
+  const source = tab === "service"
+    ? translate("logs.service")
+    : compactLogValue(value.source) || provider || logTitle(tab, translate);
   const rawStatus = compactLogValue(value.status ?? value.result);
   const status = tab === "recovery"
     ? recoveryStatusLabel(rawStatus, translate)
@@ -2359,15 +2533,37 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
       ? routeTraceDetailLabel(directDetail, translate)
       : tab === "recovery" ? recoveryDetailLabel(directDetail, translate) : directDetail,
   );
-  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "status", "result", "detail", "message", "event", "action", "error", "upstream_model", "model", "duration_ms", "usage", "total_tokens"]);
+  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "upstream_model", "model", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments"]);
   for (const [key, item] of Object.entries(value)) {
     if (used.has(key)) continue;
     const display = compactLogValue(item);
     if (display) details.push(`${key}: ${display}`);
   }
   const recoveryFallback = tab === "recovery" ? translate("common.notAvailable") : "";
+  const requestId = compactLogValue(value.request_id ?? value.requestId);
+  const session = asRecord(value.session);
+  const sessionId = compactLogValue(value.session_id ?? session.id);
+  const requestKey = requestId || sessionId || `${publicModel || model}:${time || "un-timed"}`;
+  const fallbackRoute = { model: model || recoveryFallback, upstreamModel: compactUpstreamLogModel(upstreamModel), provider };
+  const routeSteps: string[] = [];
+  const route = routeIdentityLabel(value.route, fallbackRoute, translate);
+  const failedRoute = routeIdentityLabel(value.failed_route, fallbackRoute, translate);
+  if (route) routeSteps.push(`✓ ${route}`);
+  if (failedRoute && failedRoute !== route) routeSteps.push(`× ${failedRoute}`);
+  for (const candidate of asRecords(value.candidate_routes ?? value.candidates ?? value.after_constraints ?? value.selected_candidates ?? value.cooldown_deployments)) {
+    const candidateLabel = routeIdentityLabel(candidate, fallbackRoute, translate);
+    if (candidateLabel && !routeSteps.some((step) => step.endsWith(candidateLabel))) routeSteps.push(`${translate("logs.routeTrace.candidate")} ${candidateLabel}`);
+  }
+  if (routeSteps.length === 0 && tab === "route-trace") {
+    const fallback = routeIdentityLabel(undefined, fallbackRoute, translate, true);
+    if (fallback) routeSteps.push(fallback);
+  }
+  const original = safeOriginalLogRecord(record);
   return {
-    key: `${tab}:${index}:${time}:${source}:${status}:${details.join(" ")}`,
+    key: logRecordBaseKey(tab, time, requestKey, rawEvent, action, original),
+    requestKey,
+    routeSteps,
+    routePath: "",
     time,
     source,
     status,
@@ -2379,84 +2575,158 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     action,
     duration,
     tokens,
-    detail: details.filter(Boolean).join(" · "),
-    original: safeOriginalLogRecord(record),
+    detail: details.filter(Boolean).join(" | "),
+    original,
   };
+}
+
+function logTimestampNumber(value: string): number | undefined {
+  if (!value) return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && /^[-+]?\d+(?:\.\d+)?$/.test(value.trim())) {
+    return Math.abs(numeric) < 100_000_000_000 ? numeric * 1000 : numeric;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function renderLogRecords(records: Array<Record<string, unknown> | string>, tab: LogTab, translate: Translate): RenderedLogRecord[] {
+  const rendered = records.map((record, index) => ({ row: renderLogRecord(record, tab, index, translate), index }));
+  rendered.sort((left, right) => {
+    const leftRow = left.row;
+    const rightRow = right.row;
+    const leftTime = logTimestampNumber(leftRow.time);
+    const rightTime = logTimestampNumber(rightRow.time);
+    if (leftTime === undefined && rightTime === undefined) return left.index - right.index;
+    if (leftTime === undefined) return 1;
+    if (rightTime === undefined) return -1;
+    return leftTime - rightTime || left.index - right.index;
+  });
+  const routeGroups = new Map<string, { steps: string[]; seen: Set<string> }>();
+  for (const item of rendered) {
+    const row = item.row;
+    if (tab !== "route-trace") continue;
+    const group = routeGroups.get(row.requestKey) ?? { steps: [], seen: new Set<string>() };
+    for (const step of row.routeSteps) {
+      if (!step || group.seen.has(step)) continue;
+      group.seen.add(step);
+      group.steps.push(step);
+    }
+    routeGroups.set(row.requestKey, group);
+  }
+  const occurrences = new Map<string, number>();
+  return rendered.map(({ row }) => {
+    const group = routeGroups.get(row.requestKey);
+    if (group) row.routePath = group.steps.join(" → ");
+    const occurrence = occurrences.get(row.key) ?? 0;
+    occurrences.set(row.key, occurrence + 1);
+    return { ...row, key: `${row.key}:${occurrence}` };
+  });
 }
 
 function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
   const time = { label: translate("logs.localTime"), width: 164, value: (row: RenderedLogRecord) => row.time };
-  const status = { label: translate("common.status"), width: 58, value: (row: RenderedLogRecord) => row.status };
-  const detail = { label: translate("logs.detail"), width: 230, value: (row: RenderedLogRecord) => row.detail };
+  const status = { label: translate("common.status"), width: 88, value: (row: RenderedLogRecord) => row.status };
+  const detail = { label: translate("logs.detail"), width: 260, flex: true, value: (row: RenderedLogRecord) => row.detail };
   if (tab === "requests") return [
     time,
-    { label: translate("providers.publicModel"), width: 126, value: (row) => row.model },
-    { label: translate("providers.upstream"), width: 126, value: (row) => row.upstreamModel },
-    { label: translate("common.provider"), width: 70, value: (row) => row.provider },
-    { label: translate("logs.apiKeyName"), width: 90, value: (row) => row.apiKeyName },
+    { label: translate("providers.publicModel"), width: 142, value: (row) => row.model },
+    { label: translate("providers.upstream"), width: 142, value: (row) => row.upstreamModel },
+    { label: translate("common.provider"), width: 104, value: (row) => row.provider },
+    { label: translate("logs.apiKeyName"), width: 120, value: (row) => row.apiKeyName },
     status,
-    { label: translate("logs.duration"), width: 68, value: (row) => row.duration },
-    { label: translate("logs.tokenCount"), width: 54, value: (row) => row.tokens },
+    { label: translate("logs.duration"), width: 92, value: (row) => row.duration },
+    { label: translate("logs.tokenCount"), width: 96, value: (row) => row.tokens },
     detail,
   ];
   if (tab === "route-trace") return [
-    { ...time, width: 154 },
-    { label: translate("logs.event"), width: 142, value: (row) => row.event },
-    { label: translate("providers.publicModel"), width: 130, value: (row) => row.model },
-    { label: translate("providers.upstream"), width: 130, value: (row) => row.upstreamModel },
+    time,
+    { label: translate("logs.event"), width: 154, value: (row) => row.event },
+    { label: translate("logs.routePath"), width: 340, flex: true, value: (row) => row.routePath },
+    { label: translate("providers.publicModel"), width: 142, value: (row) => row.model },
+    { label: translate("providers.upstream"), width: 142, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 104, value: (row) => row.provider },
-    { ...detail, width: 192 },
+    status,
+    { ...detail, width: 280 },
   ];
   if (tab === "menu") return [
     time,
-    { label: translate("logs.action"), width: 112, value: (row) => row.action },
+    { label: translate("logs.action"), width: 180, flex: true, value: (row) => row.action },
     status,
   ];
   if (tab === "recovery") return [
     time,
-    { label: translate("providers.publicModel"), width: 126, value: (row) => row.model },
-    { label: translate("providers.upstream"), width: 126, value: (row) => row.upstreamModel },
+    { label: translate("providers.publicModel"), width: 142, value: (row) => row.model },
+    { label: translate("providers.upstream"), width: 142, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 104, value: (row) => row.provider },
-    { label: translate("logs.apiKeyName"), width: 100, value: (row) => row.apiKeyName },
+    { label: translate("logs.apiKeyName"), width: 120, value: (row) => row.apiKeyName },
     { ...status, width: 76 },
-    { ...detail, width: 260 },
+    { ...detail, width: 300 },
   ];
   if (tab === "online-usage") return [
     time,
-    { label: translate("logs.source"), width: 126, value: (row) => row.source },
-    { label: translate("logs.tokenCount"), width: 82, value: (row) => row.tokens },
-    { ...detail, width: 446 },
+    { label: translate("logs.source"), width: 142, value: (row) => row.source },
+    { label: translate("logs.tokenCount"), width: 96, value: (row) => row.tokens },
+    { ...detail, width: 420 },
   ];
   return [
     time,
-    { label: translate("logs.source"), width: 116, value: (row) => row.source },
+    { label: translate("logs.source"), width: 132, value: (row) => row.source },
     status,
     { ...detail, width: 500 },
   ];
 }
 
+function fitLogColumns(columns: LogColumn[], availableWidth: number): LogColumn[] {
+  if (!Number.isFinite(availableWidth) || availableWidth <= 0) return columns;
+  const usableWidth = Math.max(0, availableWidth - 20);
+  const fixedWidth = columns.reduce((total, column) => total + column.width, 0);
+  const flexible = columns.filter((column) => column.flex);
+  const extra = usableWidth - fixedWidth;
+  if (extra <= 0 || flexible.length === 0) return columns;
+  const share = extra / flexible.length;
+  return columns.map((column) => column.flex ? { ...column, width: column.width + share } : column);
+}
+
 function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, requestedTab }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; requestedTab?: typeof LOG_TABS[number] }): React.JSX.Element {
+  type PauseIntent = { tab: typeof LOG_TABS[number]; paused: boolean; token: number };
+  type ClearIntent = { tab: typeof LOG_TABS[number]; token: number };
   const [selected, setSelected] = useState<typeof LOG_TABS[number]>("requests");
   const [active, setActive] = useState<LogView>();
   const [filterDraft, setFilterDraft] = useState("");
+  const [selectedKeys, setSelectedKeys] = useState<Partial<Record<LogTab, string>>>({});
+  const [pauseIntent, setPauseIntent] = useState<PauseIntent>();
+  const [clearIntent, setClearIntent] = useState<ClearIntent>();
+  const [tableWidth, setTableWidth] = useState(0);
   const filterTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const tabsRef = useRef<HostInstance | null>(null);
+  const pauseIntentToken = useRef(0);
+  const clearIntentToken = useRef(0);
+  const viewRevisionRef = useRef<number | undefined>(undefined);
+  const selectedTabRef = useRef(selected);
+  selectedTabRef.current = selected;
   useEffect(() => { if (requestedTab) setSelected(requestedTab); }, [requestedTab]);
   useEffect(() => { setFilterDraft(active?.filter ?? ""); }, [active?.filter, selected]);
   useEffect(() => () => { if (filterTimer.current) clearTimeout(filterTimer.current); }, []);
   useEffect(() => {
     let mounted = true;
     let polling = false;
-    let viewRevision: number | undefined;
+    viewRevisionRef.current = undefined;
     setActive(undefined);
+    setPauseIntent(undefined);
+    setClearIntent(undefined);
     const poll = async (): Promise<void> => {
       if (polling) return;
       polling = true;
       try {
-        const result = await ipc.logs(selected, viewRevision);
+        const result = await ipc.logs(selected, viewRevisionRef.current);
         if (!mounted) return;
-        viewRevision = result.revision;
-        if (result.changed && result.log) setActive(result.log);
+        viewRevisionRef.current = result.revision;
+        if (result.changed && result.log) {
+          setActive(result.log);
+          setPauseIntent((current) => current?.tab === selected && current.paused === result.log?.paused ? undefined : current);
+          setClearIntent((current) => current?.tab === selected && result.log?.line_count === 0 ? undefined : current);
+        }
       } catch {
         // Keep the last visible rows through a transient Core failure.
       } finally {
@@ -2467,13 +2737,54 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     const interval = setInterval(() => { void poll(); }, selected === "online-usage" ? 8000 : 2000);
     return () => { mounted = false; clearInterval(interval); };
   }, [ipc, selected]);
-  const rows = (active?.records ?? []).map((record, index) => renderLogRecord(record, selected, index, translate));
-  const columns = logColumns(selected, translate);
+  const clearing = clearIntent?.tab === selected;
+  const rows = renderLogRecords(clearing ? [] : (active?.records ?? []), selected, translate);
+  const columns = fitLogColumns(logColumns(selected, translate), tableWidth);
+  const selectedKey = selectedKeys[selected] ?? "";
+  const paused = pauseIntent?.tab === selected ? pauseIntent.paused : active?.paused ?? false;
+  const togglePaused = (): void => {
+    const tab = selected;
+    const nextPaused = !paused;
+    const token = pauseIntentToken.current + 1;
+    pauseIntentToken.current = token;
+    setPauseIntent({ tab, paused: nextPaused, token });
+    void dispatch(nextPaused ? "logs.pause" : "logs.resume", { tab }, "logs").then(async () => {
+      try {
+        const result = await ipc.logs(tab);
+        if (selectedTabRef.current !== tab) return;
+        viewRevisionRef.current = result.revision;
+        if (result.log) setActive(result.log);
+      } catch {
+        // The regular log poll will reconcile the confirmed Core state.
+      } finally {
+        setPauseIntent((current) => current?.token === token ? undefined : current);
+      }
+    });
+  };
+  const clearLogs = (): void => {
+    const tab = selected;
+    const token = clearIntentToken.current + 1;
+    clearIntentToken.current = token;
+    setClearIntent({ tab, token });
+    setSelectedKeys((current) => ({ ...current, [tab]: undefined }));
+    void dispatch("logs.clear", { tab }, "logs").then(async () => {
+      try {
+        const result = await ipc.logs(tab);
+        if (selectedTabRef.current !== tab) return;
+        viewRevisionRef.current = result.revision;
+        if (result.log) setActive(result.log);
+      } catch {
+        // The regular log poll will restore the confirmed Core view.
+      } finally {
+        setClearIntent((current) => current?.token === token ? undefined : current);
+      }
+    });
+  };
   const tabOptions = LOG_TABS.map((tab) => ({ id: tab, title: logTitle(tab, translate) }));
-  const lineCount = active?.line_count ?? rows.length;
+  const lineCount = clearing ? 0 : active?.line_count ?? rows.length;
   const statusParts = [
     translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
-    active?.paused ? translate("logs.paused") : "",
+    paused ? translate("logs.paused") : "",
   ].filter(Boolean);
   const openRelayUsageLogs = (): void => {
     const relayDomain = asRecord(snapshot?.domains.relay_accounts);
@@ -2540,7 +2851,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     tabs.measureInWindow((x, y, width, height) => {
       void native.showActionMenu({
         title: translate("logs.onlineUsageSummary"),
-        items: accounts.map((account) => `${account.label} · ${account.type === "newapi" ? "NewAPI" : "Sub2API"}`),
+        items: accounts.map((account) => `${account.label} - ${account.type === "newapi" ? "NewAPI" : "Sub2API"}`),
         anchor: { x, y, width, height },
       }).then((index) => { if (index !== undefined) open(index); });
     });
@@ -2549,18 +2860,18 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     <View style={styles.logsToolbar}>
       <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
       <View style={styles.logToolbarSpacer} />
-      <View style={styles.logActionsRow}><ActionButton title={active?.paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={() => dispatch(active?.paused ? "logs.resume" : "logs.pause", { tab: selected }, "logs")} /><ActionButton title={translate("common.clearView")} disabled={busy} onPress={() => dispatch("logs.clear", { tab: selected }, "logs")} /><ActionButton title={translate("common.refresh")} disabled={busy} onPress={() => dispatch("logs.refresh", { tab: selected }, "logs")} /></View>
+      <View style={styles.logActionsRow}><IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
     </View>
     <WindowTabs nativeRef={tabsRef} values={tabOptions} selected={selected} disabled={busy} onSelect={(tab) => {
       setSelected(tab as LogTab);
       if (tab === "online-usage") openRelayUsageLogs();
     }} style={styles.logsTabs} />
-    {rows.length > 0 ? <NativeTable columns={columns.map(({ label, width }) => ({ label, width }))} rows={rows.map((row) => ({ key: row.key, cells: columns.map((column) => column.value(row)) }))} compact followBottom onRowDoublePress={(_key, index) => {
+    {rows.length > 0 ? <View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={columns.map(({ label, width }) => ({ label, width }))} rows={rows.map((row) => ({ key: row.key, cells: columns.map((column) => column.value(row)) }))} selectedKey={selectedKey} compact followBottom onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
       const row = rows[index];
       if (!row) return;
       void native.showReadOnlyText({ title: translate("logs.originalRecord"), text: row.original, closeLabel: translate("menu.close") });
-    }} style={styles.logTable} /> : <View style={styles.logEmptySurface}><Text style={styles.logEmptyText}>{active ? translate("logs.empty") : translate("logs.loading")}</Text></View>}
-    <View style={styles.logInfoBar}><Text numberOfLines={1} style={styles.cardHint}>{statusParts.join(" · ")}</Text></View>
+    }} style={styles.logTable} /></View> : <View style={styles.logEmptySurface}><Text style={styles.logEmptyText}>{clearing || active ? translate("logs.empty") : translate("logs.loading")}</Text></View>}
+    <View style={styles.logInfoBar}><Text numberOfLines={1} style={styles.cardHint}>{statusParts.join(" | ")}</Text></View>
   </View>;
 }
 
@@ -2718,7 +3029,6 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
   const [loading, setLoading] = useState(true);
   const [nativeStatus, setNativeStatus] = useState<string>();
   const [nativeErrorCode, setNativeErrorCode] = useState<string>();
-  const [staged, setStaged] = useState(false);
   const [error, setError] = useState<string>();
   const [reloadNonce, setReloadNonce] = useState(0);
   const registry = useContext(PendingFieldContext);
@@ -2758,7 +3068,6 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
     setLoading(true);
     setNativeStatus(undefined);
     setNativeErrorCode(undefined);
-    setStaged(false);
     setError(undefined);
     void ipc.editor(domain, document).then((descriptor) => {
       if (!active) return;
@@ -2778,7 +3087,7 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
   const nativeLoading = editorToken !== undefined && (nativeStatus === undefined || nativeStatus === "loading");
   const nativeReadFailed = nativeStatus === "error" && nativeErrorCode !== "stage_failed" && nativeErrorCode !== "invalid_text";
   const reloadDisabled = busy || loading || nativeLoading || nativeStatus === "dirty" || nativeStatus === "saving" || nativeErrorCode === "stage_failed" || nativeErrorCode === "invalid_text";
-  return <View style={[styles.rawEditor, codexPane && styles.codexRawEditorBase, style]}><View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}><Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text>{showReload ? <ActionButton title={translate("menu.reload")} disabled={reloadDisabled} onPress={reloadEditor} /> : null}</View>{codexPane ? null : <Text style={styles.fieldHint}>{translate("settings.rawProtectedHint")}</Text>}{editorToken ? <View style={styles.rawNativeEditorFrame}><NativeSecureTextEditor editorToken={editorToken} language={language} unavailableLabel={translate("common.secureEditorUnavailable")} style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]} onEditorState={({ status, error: nextNativeErrorCode }) => { nativeStatusRef.current = status; setNativeStatus(status); setStaged(status === "saved"); setNativeErrorCode(nextNativeErrorCode || undefined); const pending = pendingCommit.current; if (status === "dirty" || status === "saving") registry?.setDirty(fieldId.current, true); else { registry?.setDirty(fieldId.current, false); if (pending) { pendingCommit.current = undefined; if (status === "error") pending.reject(new Error(nextNativeErrorCode || "Raw editor could not be staged")); else pending.resolve(); } } if (!nextNativeErrorCode) { setError(undefined); return; } setError(nextNativeErrorCode === "stage_failed" ? translate("common.secureEditorStageFailed") : nextNativeErrorCode === "invalid_text" ? translate("common.invalidText") : translate("common.secureEditorReadFailed")); }} />{nativeLoading ? <View pointerEvents="none" style={styles.rawEditorOverlay}><Text style={styles.cardHint}>{translate("common.secureEditorLoading")}</Text></View> : null}{nativeReadFailed ? <View style={styles.rawEditorOverlay}><Text style={styles.error}>{error ?? translate("common.secureEditorReadFailed")}</Text><ActionButton title={translate("menu.reload")} disabled={busy} onPress={reloadEditor} /></View> : null}</View> : <View style={[styles.rawEditorLoading, codexPane && styles.codexRawEditorLoading]}><Text style={styles.cardHint}>{loading ? translate("common.loading") : translate("error.coreUnavailable")}</Text></View>}{staged ? <Text style={styles.result}>{translate("common.staged")}</Text> : null}{error && editorToken && !nativeReadFailed ? <Text style={styles.error}>{error}</Text> : null}</View>;
+  return <View style={[styles.rawEditor, codexPane && styles.codexRawEditorBase, style]}><View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}><Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text>{showReload ? <ActionButton title={translate("menu.reload")} disabled={reloadDisabled} onPress={reloadEditor} /> : null}</View>{codexPane ? null : <Text style={styles.fieldHint}>{translate("settings.rawProtectedHint")}</Text>}{editorToken ? <View style={styles.rawNativeEditorFrame}><NativeSecureTextEditor editorToken={editorToken} language={language} unavailableLabel={translate("common.secureEditorUnavailable")} style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]} onEditorState={({ status, error: nextNativeErrorCode }) => { nativeStatusRef.current = status; setNativeStatus(status); setNativeErrorCode(nextNativeErrorCode || undefined); const pending = pendingCommit.current; if (status === "dirty" || status === "saving") registry?.setDirty(fieldId.current, true); else { registry?.setDirty(fieldId.current, false); if (pending) { pendingCommit.current = undefined; if (status === "error") pending.reject(new Error(nextNativeErrorCode || "Raw editor could not be staged")); else pending.resolve(); } } if (!nextNativeErrorCode) { setError(undefined); return; } setError(nextNativeErrorCode === "stage_failed" ? translate("common.secureEditorStageFailed") : nextNativeErrorCode === "invalid_text" ? translate("common.invalidText") : translate("common.secureEditorReadFailed")); }} />{nativeLoading ? <View pointerEvents="none" style={styles.rawEditorOverlay}><Text style={styles.cardHint}>{translate("common.secureEditorLoading")}</Text></View> : null}{nativeReadFailed ? <View style={styles.rawEditorOverlay}><Text style={styles.error}>{error ?? translate("common.secureEditorReadFailed")}</Text><ActionButton title={translate("menu.reload")} disabled={busy} onPress={reloadEditor} /></View> : null}</View> : <View style={[styles.rawEditorLoading, codexPane && styles.codexRawEditorLoading]}><Text style={styles.cardHint}>{loading ? translate("common.loading") : translate("error.coreUnavailable")}</Text></View>}{error && editorToken && !nativeReadFailed ? <Text style={styles.error}>{error}</Text> : null}</View>;
 }
 
 function InfoPair({ label, value, toolTip }: { label: string; value: string; toolTip?: string }): React.JSX.Element { return <View style={styles.infoPair}><Text style={styles.fieldLabel}>{label}</Text><Text style={styles.cardHint} accessibilityHint={toolTip}>{value}</Text></View>; }
@@ -2807,20 +3116,20 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
     .filter((surface) => surface.available === true)
     .map((surface) => probeSurfaceLabel(surface.surface, translate));
   const availabilitySummary = availableSurfaces.length > 0
-    ? translate("providers.probeSummaryAvailable", { surfaces: availableSurfaces.join("、") })
+    ? translate("providers.probeSummaryAvailable", { surfaces: availableSurfaces.join(", ") })
     : translate("providers.probeSummaryUnavailable");
   const summaryRecord = asRecord(probe.summary);
   const statuses = Object.entries(asRecord(summaryRecord.statuses))
     .map(([surface, status]) => `${probeSurfaceLabel(surface, translate)}: ${stringValue(status, "unavailable")}`)
-    .join("；");
-  const summary = [availabilitySummary, statuses].filter(Boolean).join("；");
+    .join("; ");
+  const summary = [availabilitySummary, statuses].filter(Boolean).join("; ");
   const requests = surfaces.map((surface) => ({
     surface: surface.surface,
     status: surface.status ?? "unavailable",
     original_request: surface.original_request ?? {},
   }));
   const compactRequest = requests.length > 0
-    ? requests.map((item) => `${item.surface}: ${stringValue(asRecord(item.original_request).url) || translate("common.none")}`).join("；")
+    ? requests.map((item) => `${item.surface}: ${stringValue(asRecord(item.original_request).url) || translate("common.none")}`).join("\n")
     : result?.detail ?? "";
   const compact = [summary, compactRequest ? translate("providers.probeOriginalRequest", { request: compactRequest }) : ""].filter(Boolean).join("\n");
   const full = [summary, result?.detail ?? "", translate("providers.probeOriginalRequest", { request: JSON.stringify(requests, null, 2) })].filter(Boolean).join("\n\n");
@@ -2880,16 +3189,16 @@ const systemColors = {
 
 const styles = StyleSheet.create({
   root: { flex: 1, minWidth: 420, backgroundColor: systemColors.window },
-  menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: 13 },
-  windowSurface: { flex: 1, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 16, paddingBottom: 8, gap: 12 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 8, gap: 8 }, settingsContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0, gap: 8 }, logsContent: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 0 }, webDavContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 4, gap: 4 }, windowTitle: { color: systemColors.label, fontSize: 16, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: 12 },
-  footer: { height: 60, minHeight: 60, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 20, paddingVertical: 12, gap: 8 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: 12, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 },
+  menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
+  windowSurface: { flex: 1, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 16, paddingBottom: 8, gap: 12 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 8, gap: 8 }, settingsContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0, gap: 8 }, logsContent: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 0 }, webDavContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 4, gap: 4 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
+  footer: { height: 60, minHeight: 60, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 20, paddingVertical: 12, gap: 8 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
   providerToolbar: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 28 }, settingsTabBar: { minHeight: 42, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsTabs: { alignSelf: "flex-start", width: 250 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   routeWorkspaceWithInspector: { flexDirection: "row", gap: 12 }, routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
-  providersLayout: { flex: 1, minHeight: 0, gap: 8 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerLeftColumn: { flex: 1, minWidth: 0 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 12 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, importSourcePicker: { width: 152, height: 26 }, fetchKeyPicker: { width: 190, height: 26, marginRight: 8, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 190, minWidth: 190, maxWidth: 190, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 464 }, providerInspectorPane: { minWidth: 340 }, tablePane: { flex: 1, minWidth: 0, gap: 8 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 28, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: 13, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 8 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: 17 }, tableHeader: { height: 28, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: 12, paddingHorizontal: 8, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 28, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: 13, paddingHorizontal: 8 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 118 }, modelUpstreamColumn: { flex: 1, minWidth: 120 }, modelBillingColumn: { width: 112 }, routeModelColumn: { width: 170 }, routeOrderColumn: { width: 56, textAlign: "right" }, routeProviderColumn: { width: 130 }, routeUpstreamColumn: { flex: 1, minWidth: 164 }, tableBottomRow: { minHeight: 30, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 340, minWidth: 340, maxWidth: 340, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 4, paddingHorizontal: 14, paddingRight: 10, paddingBottom: 16, gap: 10 }, providerEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: 13, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 4, gap: 10 }, providerEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center" }, inspectorContent: { paddingTop: 4, paddingHorizontal: 14, paddingRight: 6, paddingBottom: 16, gap: 10 }, inspectorBody: { gap: 10 }, modelBreadcrumb: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 5 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: 13, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: 13 }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: 13 }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, inspectorEnableControl: { flexShrink: 0 }, probeSummary: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: 12 }, billingSummaryText: { color: systemColors.secondaryLabel, fontSize: 12, paddingVertical: 4 }, protocolField: { gap: 4 }, protocolFieldLabel: { width: 96, color: systemColors.label, fontSize: 12 }, protocolRows: { gap: 4 }, protocolRank: { width: 20, textAlign: "right", color: systemColors.secondaryLabel, fontSize: 12 }, protocolCheckbox: { flex: 1, minWidth: 112 }, providerKeysEditor: { gap: 7 }, providerKeysHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: 12, fontWeight: "600" }, providerKeyGrid: { flex: 1, minHeight: 142, flexDirection: "row", alignItems: "flex-start", gap: 12 }, providerKeyTable: { width: 138, minWidth: 138, maxWidth: 138, height: 142, minHeight: 142, flexShrink: 0 }, providerKeyFields: { flex: 1, minWidth: 0, gap: 8 }, providerKeyActions: { flexDirection: "row", gap: 6, flexShrink: 0 },
-  codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: 12 }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: 12 }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, codexSplit: { flex: 1, minWidth: 0, minHeight: 0 }, codexStructuredPane: { flex: 1, minWidth: 360, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructured: { flexGrow: 1, gap: 14, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 16 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: 14, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: 13, fontWeight: "600" }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, listToolRail: { width: 32, paddingTop: 8, alignItems: "center", gap: 5, borderLeftWidth: 1, borderLeftColor: systemColors.separator }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
-  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeFileToolbar: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, runtimeFieldLabel: { width: 142, flexShrink: 0, color: systemColors.label, fontSize: 12, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanSlot: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center" }, runtimeBooleanControl: { alignSelf: "flex-start", minHeight: 26 }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: 12 }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 150, paddingTop: 4 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: 11, lineHeight: 15 },
-  webDavForm: { flex: 1, gap: 14, paddingTop: 0 }, webdavStateRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 12, paddingBottom: 4, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, webdavEnabledControl: { width: 190, flexGrow: 0, flexShrink: 0 }, webdavInlineStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: 12 }, webdavFormRows: { gap: 10 }, webdavWideControl: { flex: 1, minWidth: 0 }, webdavPasswordInput: { width: "100%", minHeight: 30 }, webdavFooterLeading: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 10, flex: 1, minWidth: 0 }, webdavProbeStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: 12 },
-  relayAccountsContent: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 12 }, logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, toolbarLabel: { color: systemColors.label, fontSize: 12, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: "100%", minWidth: 0, height: 28, flexShrink: 0, marginTop: 0, marginBottom: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: 13, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },
-  form: { gap: 7 }, structuredForm: { gap: 7 }, field: { gap: 5, minWidth: 220, flexGrow: 1, flexBasis: 300 }, fieldLabel: { color: systemColors.label, fontSize: 12, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: 11 }, input: { width: "100%", minHeight: 30, paddingHorizontal: 7, paddingVertical: 4, color: systemColors.label, fontSize: 13 }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, inputWithAction: { flexDirection: "row", alignItems: "center", gap: 6 }, inputFlex: { flex: 1 }, toggleRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 12 }, toggleControl: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, toggleNativeControl: { width: "100%", minWidth: 220, minHeight: 22 }, actions: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 8 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 30, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 30 }, nativeSecretSetButton: { minWidth: 42, height: 26 }, action: {}, actionPrimary: {}, actionDanger: {}, actionDisabled: {}, actionText: { color: systemColors.label, fontSize: 12, fontWeight: "500" }, actionTextPrimary: {}, actionTextDanger: {}, tabStrip: { flexDirection: "row", flexWrap: "wrap", gap: 7 }, tab: {}, tabSelected: {}, inlineMeta: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 8 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, infoPair: { gap: 2, minWidth: 160 }, rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, logRecords: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, maxHeight: 360, overflow: "scroll", padding: 10, gap: 6 }, logRecord: { color: systemColors.label, fontFamily: "Menlo", fontSize: 12 }, empty: { color: systemColors.secondaryLabel, fontSize: 13, paddingVertical: 12 }, result: { color: systemColors.green, fontSize: 12 }, warning: { color: systemColors.brown, fontSize: 12, backgroundColor: systemColors.control, padding: 8, borderRadius: 4 }, issueBox: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.control, padding: 12, gap: 5 }, issue: { color: systemColors.red, fontSize: 12 }, cardTitle: { color: systemColors.label, fontSize: 13, fontWeight: "500" }, cardHint: { color: systemColors.secondaryLabel, fontSize: 12, marginTop: 2 },
-  formRow: { width: "100%", minHeight: 30, flexDirection: "row", alignItems: "center", gap: 12 }, formRowStacked: { alignItems: "flex-start" }, formRowSecretStacked: { alignItems: "flex-start" }, formRowLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: 12, textAlign: "right" }, formRowLabelStacked: { paddingTop: 6 }, formRowControl: { flex: 1, minWidth: 0, gap: 3 }, picker: { flex: 1, minWidth: 180, height: 26 }, protocolRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 3 },
+  providersLayout: { flex: 1, minHeight: 0, gap: 8 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerLeftColumn: { flex: 1, minWidth: 0 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 12 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, importSourcePicker: { width: 152, height: 26 }, fetchKeyPicker: { width: 190, height: 26, marginRight: 8, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 190, minWidth: 190, maxWidth: 190, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 464 }, providerInspectorPane: { minWidth: 340 }, tablePane: { flex: 1, minWidth: 0, gap: 8 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 28, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 8 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 28, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 8, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 28, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 8 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 118 }, modelUpstreamColumn: { flex: 1, minWidth: 120 }, modelBillingColumn: { width: 112 }, routeModelColumn: { width: 170 }, routeOrderColumn: { width: 56, textAlign: "right" }, routeProviderColumn: { width: 130 }, routeUpstreamColumn: { flex: 1, minWidth: 164 }, tableBottomRow: { minHeight: 30, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 340, minWidth: 340, maxWidth: 340, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 4, paddingHorizontal: 14, paddingRight: 10, paddingBottom: 16, gap: 10 }, providerEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 4, gap: 10 }, providerEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center" }, inspectorContent: { paddingTop: 4, paddingHorizontal: 14, paddingRight: 6, paddingBottom: 16, gap: 10 }, inspectorBody: { gap: 10 }, modelBreadcrumb: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 5 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, inspectorEnableControl: { flexShrink: 0 }, probeSummary: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, billingSummaryText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 4 }, protocolField: { gap: 4 }, protocolFieldLabel: { width: 96, color: systemColors.label, fontSize: UI_FONT_SIZE }, protocolRows: { gap: 4 }, protocolRank: { width: 20, textAlign: "right", color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, protocolCheckbox: { flex: 1, minWidth: 112 }, providerKeysEditor: { gap: 7 }, providerKeysHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyGrid: { flex: 1, minHeight: 142, flexDirection: "row", alignItems: "flex-start", gap: 12 }, providerKeyTable: { width: 138, minWidth: 138, maxWidth: 138, height: 142, minHeight: 142, flexShrink: 0 }, providerKeyFields: { flex: 1, minWidth: 0, gap: 8 }, providerKeyActions: { flexDirection: "row", gap: 6, flexShrink: 0 },
+  codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, codexSplit: { flex: 1, minWidth: 0, minHeight: 0 }, codexStructuredPane: { flex: 1, minWidth: 360, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructured: { flexGrow: 1, gap: 14, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 16 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, listToolRail: { width: 32, paddingTop: 8, alignItems: "center", gap: 5, borderLeftWidth: 1, borderLeftColor: systemColors.separator }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
+  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeFileToolbar: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanControl: { width: 24, minWidth: 24, height: 24, alignSelf: "flex-start" }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 134, paddingTop: 4 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  webDavForm: { flex: 1, gap: 14, paddingTop: 0 }, webdavStateRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, paddingBottom: 4, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, webdavEnabledControl: { width: 190, flexGrow: 0, flexShrink: 0 }, webdavInlineStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, webdavFormRows: { gap: 8 }, webdavWideControl: { flex: 1, minWidth: 0 }, webdavPasswordInput: { width: "100%", minHeight: 26 }, webdavFooterLeading: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flex: 1, minWidth: 0 }, webdavProbeStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  relayAccountsContent: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 12 }, logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: "100%", minWidth: 0, height: 28, flexShrink: 0, marginTop: 0, marginBottom: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },
+  form: { gap: 6 }, structuredForm: { gap: 6 }, field: { gap: 5, minWidth: 220, flexGrow: 1, flexBasis: 300 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, inputWithAction: { flexDirection: "row", alignItems: "center", gap: 6 }, inputFlex: { flex: 1 }, toggleRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, toggleControl: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, toggleNativeControl: { width: "100%", minWidth: 220, minHeight: 22 }, actions: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, nativeSecretSetButton: { minWidth: 42, height: 26 }, action: {}, actionPrimary: {}, actionDanger: {}, actionDisabled: {}, actionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, actionTextPrimary: {}, actionTextDanger: {}, tabStrip: { flexDirection: "row", flexWrap: "wrap", gap: 6 }, tab: {}, tabSelected: {}, inlineMeta: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 6 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, infoPair: { gap: 2, minWidth: 160 }, rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 }, logRecords: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, maxHeight: 360, overflow: "scroll", padding: 10, gap: 6 }, logRecord: { color: systemColors.label, fontFamily: "Menlo", fontSize: UI_FONT_SIZE }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, result: { color: systemColors.green, fontSize: UI_FONT_SIZE }, warning: { color: systemColors.brown, fontSize: UI_FONT_SIZE, backgroundColor: systemColors.control, padding: 8, borderRadius: 4 }, issueBox: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.control, padding: 12, gap: 5 }, issue: { color: systemColors.red, fontSize: UI_FONT_SIZE }, cardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
+  formRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, formRowStacked: { alignItems: "flex-start" }, formRowSecretStacked: { alignItems: "flex-start" }, formRowLabel: { width: 112, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, formRowLabelStacked: { paddingTop: 4 }, formRowControl: { flex: 1, minWidth: 0, gap: 3 }, picker: { flex: 1, minWidth: 180, height: 26 }, protocolRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 3 },
 });

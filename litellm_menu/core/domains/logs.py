@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -53,6 +54,14 @@ MENU_ACTIONS = frozenset(
 )
 ANSI_CONTROL_SEQUENCE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SERVICE_TIMESTAMP_PREFIX = re.compile(r"^(?:\[[^]]+\]\s*)+")
+LEADING_TIMESTAMP = re.compile(
+    r"^\[(?P<bracket>[^\]]+)\]\s*|^(?:Updated\s+)?(?P<iso>\d{4}-\d{2}-\d{2}[T ][^\s]+)\s*"
+)
+TRACEBACK_START = re.compile(r"Traceback \(most recent call last\):", re.IGNORECASE)
+TRACEBACK_TERMINAL = re.compile(
+    r"^(?:[A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit)|Error|Exception):\s*",
+    re.IGNORECASE,
+)
 
 
 class LogsDomainError(ValueError):
@@ -487,8 +496,25 @@ def _safe_recovery_record(
         or _string_record_value(raw.get("api_key_name"))
         or _string_record_value(request.get("api_key_name"))
     )
+    timestamp = next(
+        (
+            raw.get(key)
+            for key in (
+                "ts",
+                "timestamp",
+                "time",
+                "created_at",
+                "updated_at",
+                "checked_at",
+                "heartbeat_at",
+                "started_at",
+            )
+            if raw.get(key) not in (None, "")
+        ),
+        None,
+    )
     result: dict[str, Any] = {
-        "timestamp": _safe_scalar(raw.get("updated_at") or raw.get("heartbeat_at") or raw.get("started_at")),
+        "timestamp": _safe_scalar(timestamp),
         "public_model": _safe_scalar(public_model),
         "upstream_model": _safe_scalar(upstream_model),
         "provider": _safe_scalar(provider),
@@ -499,26 +525,107 @@ def _safe_recovery_record(
     return {key: value for key, value in result.items() if value not in (None, "")}
 
 
+def _safe_route_identity(
+    route_key: object,
+    *,
+    deployment_id: object = "",
+    public_model: object = "",
+    upstream_model: object = "",
+    provider: object = "",
+    order: object = None,
+    configured_public_models: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    route_public_model = _public_model_from_route_key(route_key)
+    deployment_text = _string_record_value(deployment_id)
+    configured_public_model = (
+        configured_public_models.get(deployment_text)
+        if configured_public_models and deployment_text
+        else ""
+    )
+    result = {
+        "deployment_id": _safe_scalar(deployment_text),
+        "public_model": _safe_scalar(
+            route_public_model or _string_record_value(public_model) or configured_public_model
+        ),
+        "upstream_model": _safe_scalar(
+            _upstream_model_name(_route_key_value(route_key, "upstream") or upstream_model)
+        ),
+        "provider": _safe_scalar(_route_key_value(route_key, "provider") or provider),
+        "order": _safe_scalar(_route_key_value(route_key, "order") or order),
+    }
+    return {key: value for key, value in result.items() if value not in (None, "")}
+
+
+def _safe_route_candidates(
+    raw: Mapping[str, Any],
+    *,
+    configured_public_models: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for field in (
+        "candidates",
+        "after_constraints",
+        "selected_candidates",
+        "cooldown_deployments",
+    ):
+        values = raw.get(field)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            route_key = value.get("route_key")
+            identity = _safe_route_identity(
+                route_key,
+                deployment_id=value.get("id") or value.get("deployment_id"),
+                public_model=value.get("public_model") or value.get("model_group"),
+                upstream_model=value.get("model") or value.get("upstream_model"),
+                provider=value.get("provider"),
+                order=value.get("order"),
+                configured_public_models=configured_public_models,
+            )
+            identity_key = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+            if not identity or identity_key in seen:
+                continue
+            seen.add(identity_key)
+            candidates.append(identity)
+            if len(candidates) >= 24:
+                return candidates
+    return candidates
+
+
 def _safe_route_trace_record(
     raw: Mapping[str, Any],
     configured_public_models: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     request = _mapping_value(raw.get("request"))
     deployment = _mapping_value(raw.get("deployment"))
+    peer_entry = _mapping_value(raw.get("peer_entry"))
     exception = _mapping_value(raw.get("exception") or raw.get("error"))
-    route_key = (
+    selected_route_key = (
         raw.get("route_key")
         or deployment.get("route_key")
         or request.get("route_key")
-        or exception.get("failed_deployment_route_key")
-        or exception.get("failed_route_key")
+        or peer_entry.get("route_key")
     )
-    deployment_id = (
+    selected_deployment_id = (
         raw.get("deployment_id")
         or deployment.get("id")
         or request.get("deployment_id")
-        or exception.get("failed_deployment_id")
+        or peer_entry.get("id")
     )
+    failed_route_key = (
+        exception.get("failed_deployment_route_key")
+        or exception.get("failed_route_key")
+        or raw.get("failed_route_key")
+    )
+    failed_deployment_id = (
+        exception.get("failed_deployment_id")
+        or raw.get("failed_deployment_id")
+    )
+    route_key = selected_route_key or failed_route_key
+    deployment_id = selected_deployment_id or failed_deployment_id
     route_public_model = _public_model_from_route_key(route_key)
     public_model = (
         route_public_model
@@ -552,8 +659,25 @@ def _safe_route_trace_record(
     status = _string_record_value(raw.get("status") or raw.get("result"))
     if not status and (raw.get("exception") is not None or raw.get("error") is not None):
         status = "error"
+    timestamp = next(
+        (
+            raw.get(key)
+            for key in (
+                "ts",
+                "timestamp",
+                "time",
+                "created_at",
+                "updated_at",
+                "checked_at",
+                "heartbeat_at",
+                "started_at",
+            )
+            if raw.get(key) not in (None, "")
+        ),
+        None,
+    )
     result: dict[str, Any] = {
-        "timestamp": _safe_scalar(raw.get("timestamp") or raw.get("ts")),
+        "timestamp": _safe_scalar(timestamp),
         "event": _safe_scalar(raw.get("event")),
         "public_model": _safe_scalar(public_model),
         "upstream_model": _safe_scalar(upstream_model),
@@ -561,6 +685,54 @@ def _safe_route_trace_record(
         "status": _safe_scalar(status),
         "detail": _safe_scalar(_trace_detail(raw), limit=260),
     }
+    session = _mapping_value(raw.get("session"))
+    request_id = raw.get("request_id") or request.get("request_id")
+    session_id = raw.get("session_id") or session.get("id")
+    deployment_order = raw.get("deployment_order")
+    if deployment_order is None:
+        deployment_order = deployment.get("order")
+    if deployment_order is None:
+        deployment_order = peer_entry.get("order")
+    route_identity = (
+        _safe_route_identity(
+            selected_route_key,
+            deployment_id=selected_deployment_id,
+            public_model=public_model,
+            upstream_model=upstream_model or peer_entry.get("model"),
+            provider=provider or peer_entry.get("provider"),
+            order=deployment_order,
+            configured_public_models=configured_public_models,
+        )
+        if selected_route_key or selected_deployment_id or deployment or peer_entry
+        else {}
+    )
+    failed_identity = (
+        _safe_route_identity(
+            failed_route_key,
+            deployment_id=failed_deployment_id,
+            public_model=public_model,
+            upstream_model=exception.get("upstream_model"),
+            provider=exception.get("provider"),
+            order=exception.get("failed_deployment_order"),
+            configured_public_models=configured_public_models,
+        )
+        if failed_route_key or failed_deployment_id
+        else {}
+    )
+    safe_fields = {
+        "request_id": _safe_scalar(request_id),
+        "session_id": _safe_scalar(session_id),
+        "deployment_id": _safe_scalar(deployment_id),
+        "deployment_order": _safe_scalar(deployment_order),
+        "target_order": _safe_scalar(raw.get("target_order")),
+        "route": route_identity,
+        "failed_route": failed_identity,
+        "candidate_routes": _safe_route_candidates(
+            raw,
+            configured_public_models=configured_public_models,
+        ),
+    }
+    result.update({key: value for key, value in safe_fields.items() if value not in (None, "", {}, [])})
     return {key: value for key, value in result.items() if value not in (None, "")}
 
 
@@ -572,6 +744,13 @@ def _safe_request_record(
     for key in (
         "ts",
         "timestamp",
+        "time",
+        "created_at",
+        "updated_at",
+        "checked_at",
+        "heartbeat_at",
+        "started_at",
+        "request_id",
         "status",
         "model_group",
         "public_model",
@@ -580,6 +759,7 @@ def _safe_request_record(
         "upstream_model",
         "duration_ms",
         "route_key",
+        "routing_state",
     ):
         if key in raw:
             result[key] = _safe_scalar(raw[key])
@@ -595,6 +775,13 @@ def _safe_request_record(
     route_api_key_name = _route_key_value(result.get("route_key"), "key")
     if route_api_key_name:
         result["api_key_name"] = _safe_scalar(route_api_key_name)
+    if (
+        result.get("routing_state") in (None, "")
+        and not _string_record_value(result.get("route_key"))
+        and not _string_record_value(result.get("provider"))
+        and _string_record_value(result.get("status")) in {"failure", "failed", "error", "stuck"}
+    ):
+        result["routing_state"] = "unselected"
     deployment_id = raw.get("deployment_id")
     configured_public_model = (
         configured_public_models.get(deployment_id.strip())
@@ -661,6 +848,153 @@ def _is_service_noise(line: str) -> bool:
     return False
 
 
+def _timestamp_number(value: object) -> float | None:
+    """Return a comparable timestamp without making log parsing strict."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        return number / 1000 if abs(number) >= 100_000_000_000 else number
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        number = float(text)
+        if not math.isfinite(number):
+            return None
+        return number / 1000 if abs(number) >= 100_000_000_000 else number
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _leading_timestamp(line: str) -> str:
+    match = LEADING_TIMESTAMP.match(line.strip())
+    if not match:
+        return ""
+    candidate = match.group("bracket") or match.group("iso") or ""
+    return candidate if _timestamp_number(candidate) is not None else ""
+
+
+def _record_timestamp(record: object) -> float | None:
+    if isinstance(record, Mapping):
+        for key in (
+            "ts",
+            "timestamp",
+            "time",
+            "created_at",
+            "updated_at",
+            "checked_at",
+            "heartbeat_at",
+            "started_at",
+        ):
+            value = _timestamp_number(record.get(key))
+            if value is not None:
+                return value
+        return None
+    if isinstance(record, str):
+        return _timestamp_number(_leading_timestamp(record))
+    return None
+
+
+def _sort_records_by_time(records: list[object]) -> list[object]:
+    """Keep every view chronological while preserving source order for ties."""
+    decorated = [(_record_timestamp(record), index, record) for index, record in enumerate(records)]
+    decorated.sort(
+        key=lambda item: (
+            item[0] is None,
+            item[0] if item[0] is not None else 0.0,
+            item[1],
+        )
+    )
+    return [record for _timestamp, _index, record in decorated]
+
+
+def _service_continuation(line: str) -> str:
+    """Remove a repeated timestamp from a traceback continuation line."""
+    match = LEADING_TIMESTAMP.match(line.strip())
+    if not match:
+        return line.strip()
+    start = match.end()
+    return line[start:].strip()
+
+
+def _looks_like_traceback_continuation(line: str) -> bool:
+    payload = _service_continuation(line)
+    return bool(
+        re.match(
+            r"^(?:File \"|self\.|raise\b|return\b|if\b|elif\b|else\b|for\b|while\b|try\b|except\b|finally\b|[\^~]+$)",
+            payload.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
+def _service_payload_without_level(line: str) -> str:
+    payload = SERVICE_TIMESTAMP_PREFIX.sub("", line).strip()
+    return re.sub(
+        r"^(?:\[[A-Z]+\]|(?:DEBUG|INFO|WARNING|ERROR|CRITICAL):)\s*",
+        "",
+        payload,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _group_service_lines(lines: list[str]) -> list[str]:
+    """Collapse one logical service event (including traceback lines) to one row."""
+    grouped: list[str] = []
+    current: list[str] = []
+    current_timestamp = ""
+    in_traceback = False
+
+    def flush() -> None:
+        nonlocal current, current_timestamp, in_traceback
+        if current:
+            grouped.append(" | ".join(part for part in current if part))
+        current = []
+        current_timestamp = ""
+        in_traceback = False
+
+    for raw in lines:
+        line = REDACT_TEXT(ANSI_CONTROL_SEQUENCE.sub("", raw)).strip()
+        if not line or "litellm_route_trace" in line or _is_service_noise(line):
+            continue
+        timestamp = _leading_timestamp(line)
+        same_timestamp = bool(
+            current
+            and timestamp
+            and current_timestamp
+            and timestamp == current_timestamp
+        )
+        payload = _service_continuation(line) if same_timestamp else line
+        payload_without_prefix = _service_payload_without_level(payload)
+        continuation = bool(current) and in_traceback and (
+            not timestamp
+            or same_timestamp
+            or _looks_like_traceback_continuation(payload_without_prefix)
+        )
+        if continuation:
+            current.append(payload)
+            if in_traceback and TRACEBACK_TERMINAL.match(payload_without_prefix):
+                in_traceback = False
+            continue
+        flush()
+        current = [line]
+        current_timestamp = timestamp
+        in_traceback = bool(TRACEBACK_START.search(payload_without_prefix))
+    flush()
+    return grouped
+
+
 class LogsDomain:
     name = DOMAIN_NAME
 
@@ -692,6 +1026,7 @@ class LogsDomain:
         self.revision = 0
         self._paused: set[str] = set()
         self._cleared: set[str] = set()
+        self._clear_cursors: dict[str, tuple[object, ...]] = {}
         self._filters: dict[str, str] = {}
         self._limits: dict[str, int] = {}
         self._source_signatures: dict[str, tuple[object, ...]] = {}
@@ -744,6 +1079,26 @@ class LogsDomain:
         name = names.get(tab)
         return self.root / name if name else None
 
+    def _source_cursor(self, tab: str) -> tuple[object, ...]:
+        if tab == "online-usage":
+            return ("online", len(self._online_usage_records), self._online_usage_refreshed)
+        path = self._path(tab)
+        if path is None:
+            return ("none",)
+        try:
+            details = path.lstat()
+        except OSError:
+            return ("file", None, None, 0, 0)
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+            return ("file", None, None, 0, 0)
+        return (
+            "file",
+            details.st_dev,
+            details.st_ino,
+            details.st_mtime_ns,
+            details.st_size,
+        )
+
     def _read_lines(
         self,
         path: Path,
@@ -772,6 +1127,68 @@ class LogsDomain:
         lines = data.decode("utf-8", errors="replace").splitlines()
         return lines if complete_document else lines[-(line_limit or self._default_line_limit()) :]
 
+    def _read_lines_since(
+        self,
+        path: Path,
+        offset: int,
+        *,
+        line_limit: int | None = None,
+    ) -> list[str]:
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            return []
+        except OSError:
+            raise LogsDomainError("Log source is unavailable") from None
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+            raise LogsDomainError("Log source is unavailable")
+        if offset >= details.st_size:
+            return []
+        try:
+            with path.open("rb") as handle:
+                start = offset
+                if details.st_size - offset > self.maximum_read_bytes:
+                    start = details.st_size - self.maximum_read_bytes
+                if start > 0:
+                    handle.seek(start - 1)
+                    if handle.read(1) != b"\n":
+                        handle.readline()
+                data = handle.read(self.maximum_read_bytes)
+        except OSError:
+            raise LogsDomainError("Log source is unavailable") from None
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        return lines if line_limit is None else lines[-line_limit:]
+
+    def _lines_for_cleared_file(
+        self,
+        tab: str,
+        path: Path,
+        *,
+        line_limit: int | None = None,
+    ) -> list[str]:
+        cursor = self._clear_cursors.get(tab)
+        if not cursor or cursor[0] != "file":
+            return self._read_lines(path, line_limit=line_limit)
+        current = self._source_cursor(tab)
+        if current[0] != "file":
+            return []
+        same_file = current[1:3] == cursor[1:3]
+        current_mtime = current[3]
+        current_size = current[4]
+        baseline_mtime = cursor[3]
+        baseline_size = cursor[4]
+        if not same_file or current_size < baseline_size:
+            return self._read_lines(path, line_limit=line_limit)
+        if current_size == baseline_size and current_mtime == baseline_mtime:
+            return []
+        if current_size == baseline_size:
+            return self._read_lines(path, line_limit=line_limit)
+        return self._read_lines_since(path, baseline_size, line_limit=line_limit)
+
+    def _discard_clear(self, tab: str) -> None:
+        self._cleared.discard(tab)
+        self._clear_cursors.pop(tab, None)
+
     def _record_menu_action(self, value: object) -> None:
         action = value if isinstance(value, str) else ""
         if action.startswith("open-logs?tab="):
@@ -794,17 +1211,29 @@ class LogsDomain:
     def _records(self, tab: str) -> tuple[bool, list[object]]:
         if tab == "online-usage":
             records: list[object] = list(self._online_usage_records)
+            cursor = self._clear_cursors.get(tab) if tab in self._cleared else None
+            if cursor and cursor[0] == "online":
+                current = self._source_cursor(tab)
+                if current[0] == "online" and current[2] == cursor[2] and current[1] >= cursor[1]:
+                    records = records[int(cursor[1]) :]
             needle = self._filters.get(tab, "").casefold()
             if needle:
                 records = [record for record in records if needle in str(record).casefold()]
-            return self._online_usage_refreshed, records[-self._line_limit(tab) :]
+            return self._online_usage_refreshed, _sort_records_by_time(records)[-self._line_limit(tab) :]
         path = self._path(tab)
         if path is None:
             return False, []
-        lines = self._read_lines(
-            path,
-            complete_document=tab == "recovery",
-            line_limit=self._line_limit(tab),
+        line_limit = (
+            min(MAX_LINES, self._line_limit(tab) * 4)
+            if tab == "service"
+            else self._line_limit(tab)
+        )
+        lines = (
+            self._read_lines(path, complete_document=True, line_limit=line_limit)
+            if tab == "recovery"
+            else self._lines_for_cleared_file(tab, path, line_limit=line_limit)
+            if tab in self._cleared
+            else self._read_lines(path, line_limit=line_limit)
         )
         if tab == "recovery":
             records: list[object] = []
@@ -828,7 +1257,7 @@ class LogsDomain:
                     for record in records
                     if needle in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
                 ]
-            return path.exists(), records[-self._line_limit(tab) :]
+            return path.exists(), _sort_records_by_time(records)[-self._line_limit(tab) :]
         if tab == "route-trace":
             lines = [line for line in lines if "litellm_route_trace" in line]
         elif tab == "service":
@@ -837,6 +1266,7 @@ class LogsDomain:
                 for line in lines
                 if "litellm_route_trace" not in line and not _is_service_noise(line)
             ]
+            lines = _group_service_lines(lines)
         configured_public_models = (
             _configured_public_models(self.config_path)
             if tab in {"requests", "route-trace"}
@@ -856,6 +1286,22 @@ class LogsDomain:
                 except (TypeError, json.JSONDecodeError):
                     parsed = None
             if isinstance(parsed, Mapping):
+                if tab == "route-trace" and not any(
+                    parsed.get(key) not in (None, "")
+                    for key in (
+                        "ts",
+                        "timestamp",
+                        "time",
+                        "created_at",
+                        "updated_at",
+                        "checked_at",
+                        "heartbeat_at",
+                        "started_at",
+                    )
+                ):
+                    timestamp = _leading_timestamp(line)
+                    if timestamp:
+                        parsed = {**parsed, "timestamp": timestamp}
                 record = (
                     _safe_request_record(parsed, configured_public_models)
                     if tab == "requests"
@@ -872,7 +1318,7 @@ class LogsDomain:
                 for record in records
                 if needle in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
             ]
-        return path.exists(), records[-self._line_limit(tab) :]
+        return path.exists(), _sort_records_by_time(records)[-self._line_limit(tab) :]
 
     def _source_signature(self, tab: str) -> tuple[object, ...]:
         path = self._path(tab)
@@ -913,8 +1359,6 @@ class LogsDomain:
         if not force and self._source_signatures.get(tab) == signature:
             return
         available, records = self._records(tab)
-        if tab in self._cleared:
-            records = []
         self._store_tab(tab, self._fit_view_records({
             "tab": tab,
             "available": available,
@@ -996,30 +1440,30 @@ class LogsDomain:
             if tab != "menu":
                 raise LogsDomainError("Log tab is invalid")
             self._record_menu_action(data.get("menu_action"))
-            self._cleared.discard("menu")
         elif operation == "pause":
             self._paused.add(str(tab))
         elif operation == "resume":
             self._paused.discard(str(tab))
-            self._cleared.discard(str(tab))
+            self._discard_clear(str(tab))
         elif operation == "clear":
             # Clear only the view. Core never deletes diagnostic files without
             # a separate, explicit destructive operation.
             self._cleared.add(str(tab))
+            self._clear_cursors[str(tab)] = self._source_cursor(str(tab))
         elif operation in {"set_filter", "filter"}:
             value = data.get("filter", data.get("query", ""))
             if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_FILTER_BYTES:
                 raise LogsDomainError("Log filter is invalid")
             self._filters[str(tab)] = value.strip()
-            self._cleared.discard(str(tab))
+            self._discard_clear(str(tab))
         elif operation in {"set_limit", "limit"}:
             value = data.get("limit")
             if type(value) is not int or not 1 <= value <= MAX_LINES:
                 raise LogsDomainError("Log line limit is invalid")
             self._limits[str(tab)] = value
-            self._cleared.discard(str(tab))
+            self._discard_clear(str(tab))
         elif operation in {"refresh", "reload", "refresh_online_usage"}:
-            self._cleared.discard(str(tab))
+            self._discard_clear(str(tab))
             if tab == "online-usage":
                 try:
                     reader = self._online_usage_reader
@@ -1051,6 +1495,7 @@ class LogsDomain:
 
     def reload(self) -> dict[str, Any]:
         self._cleared.clear()
+        self._clear_cursors.clear()
         self._source_signatures.clear()
         self._view_revisions = {
             tab: self._view_revisions.get(tab, 0) + 1 for tab in LOG_TABS

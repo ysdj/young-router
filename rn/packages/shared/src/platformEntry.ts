@@ -20,6 +20,7 @@ type NativeModule = {
   saveFilePicker?: (suggestedName: string) => Promise<string | undefined>;
   showActionMenu?: (title: string, items: string[], anchor: NativeMenuAnchor) => Promise<number | undefined>;
   showConfirmation?: (title: string, message: string, confirmLabel: string) => Promise<boolean>;
+  showCodexRestartConfirmation?: (title: string, message: string, restartLabel: string, laterLabel: string) => Promise<"restart" | "later" | undefined>;
   showReadOnlyText?: (title: string, text: string, closeLabel: string) => Promise<void>;
   chooseModelsToAdd?: (models: string[], providerName: string, keyName: string) => Promise<string[] | undefined>;
   editSecureDocument?: (editorToken: string, language: "toml" | "json", title: string) => Promise<number | undefined>;
@@ -63,6 +64,7 @@ type NativeModule = {
   setLocalization?: (strings: NativeLocalization) => void;
   systemLocale?: () => string;
   setLaunchAtLogin?: (enabled: boolean) => Promise<boolean>;
+  restartCodex?: () => Promise<boolean>;
   quit?: () => void;
   setShortcuts?: (shortcuts: Record<string, string>) => void;
 };
@@ -119,6 +121,7 @@ const nativeBridge: NativeLeafBridge = {
   saveFilePicker: async (suggestedName) => leaf.saveFilePicker?.(suggestedName),
   showActionMenu: async (title, items, anchor) => leaf.showActionMenu?.(title, items, anchor),
   showConfirmation: async (title, message, confirmLabel) => leaf.showConfirmation?.(title, message, confirmLabel) ?? false,
+  showCodexRestartConfirmation: async (title, message, restartLabel, laterLabel) => leaf.showCodexRestartConfirmation?.(title, message, restartLabel, laterLabel),
   showReadOnlyText: async (title, text, closeLabel) => {
     if (!leaf.showReadOnlyText) throw new Error("The native read-only text viewer is unavailable.");
     await leaf.showReadOnlyText(title, text, closeLabel);
@@ -142,6 +145,7 @@ const nativeBridge: NativeLeafBridge = {
     if (!leaf.setLaunchAtLogin) throw new Error("The native login-item control is unavailable.");
     if (!await leaf.setLaunchAtLogin(enabled)) throw new Error("The system could not update the login item.");
   },
+  restartCodex: async () => leaf.restartCodex?.() ?? false,
   setLocalization: (strings) => {
     nativeStrings = strings;
     call("setLocalization", strings);

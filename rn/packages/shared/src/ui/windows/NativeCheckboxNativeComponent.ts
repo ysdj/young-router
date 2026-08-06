@@ -12,6 +12,7 @@ export interface NativeCheckboxProps extends ViewProps {
   value?: WithDefault<boolean, false>;
   disabled?: WithDefault<boolean, false>;
   compact?: WithDefault<boolean, false>;
+  labelVisible?: WithDefault<boolean, true>;
   onValueChange?: DirectEventHandler<ChangeEvent>;
 }
 

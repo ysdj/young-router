@@ -345,7 +345,7 @@ def _adapter_persistence_paths(adapter: DomainAdapter) -> tuple[Path, ...]:
     if delegate is not None:
         adapter = delegate
     paths: list[Path] = []
-    for attribute in ("config_path", "runtime_config_path", "settings_path", "preference_path", "enabled_path", "status_path"):
+    for attribute in ("config_path", "runtime_config_path", "settings_path", "preference_path", "enabled_path", "status_path", "model_catalog_path"):
         value = getattr(adapter, attribute, None)
         if isinstance(value, (str, Path)):
             paths.append(Path(value).expanduser())
@@ -644,11 +644,25 @@ class CoreStore:
             from .domains.providers_models import ProvidersModelsDomain
             from .domains.runtime import RuntimeSettingsDomain
             from .domains.webdav import WebDAVSettingsDomain
+            from .domains._shared import _default_runtime_settings_path
+
+            resolved_runtime_settings_path = (
+                Path(runtime_settings_path).expanduser()
+                if runtime_settings_path is not None
+                else _default_runtime_settings_path()
+            )
 
             legacy_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
                 ("providers_models", lambda: ProvidersModelsDomain(config_path)),
-                ("codex", lambda: CodexSettingsDomain(config_path, codex_home=codex_home)),
-                ("runtime", lambda: RuntimeSettingsDomain(runtime_settings_path)),
+                (
+                    "codex",
+                    lambda: CodexSettingsDomain(
+                        config_path,
+                        codex_home=codex_home,
+                        runtime_settings_path=resolved_runtime_settings_path,
+                    ),
+                ),
+                ("runtime", lambda: RuntimeSettingsDomain(resolved_runtime_settings_path)),
                 (
                     "webdav",
                     lambda: WebDAVSettingsDomain(
@@ -1639,6 +1653,117 @@ class CoreStore:
         if base_revision is not None:
             record["base_revision"] = base_revision
 
+    def _dispatch_provider_multiplier_refresh(self, expected_revision: object | None) -> dict[str, Any]:
+        name = "providers_models"
+        with self._lock:
+            self._check_revision(expected_revision)
+            adapter = self._domains.get(name)
+            if adapter is None:
+                raise DomainNotFound(name)
+            prepare = getattr(adapter, "prepare_multiplier_refresh", None)
+            perform = getattr(adapter, "perform_multiplier_refresh", None)
+            commit = getattr(adapter, "commit_multiplier_refresh", None)
+            if not all(callable(method) for method in (prepare, perform, commit)):
+                raise CoreError("domain_error", "Provider multiplier refresh is unavailable")
+            try:
+                prepared = prepare()
+            except Exception as exc:
+                raise CoreError("domain_error", safe_exception_message(exc)) from None
+
+        try:
+            payload = perform(prepared)
+        except Exception as exc:
+            raise CoreError("domain_error", safe_exception_message(exc)) from None
+
+        with self._lock:
+            if self._domains.get(name) is not adapter:
+                raise DomainNotFound(name)
+            try:
+                result, changed = commit(prepared, payload)
+            except Exception as exc:
+                raise CoreError("domain_error", safe_exception_message(exc)) from None
+            if not changed:
+                return {"revision": self._revision}
+            if isinstance(result, Mapping):
+                safe_result = _safe_public(result)
+                if isinstance(safe_result, Mapping):
+                    self._last_actions[name] = dict(safe_result)
+            dirty = self._adapter_draft_state(name) != self._baselines.get(name)
+            self._revision += 1
+            self._mark_domain(
+                name,
+                dirty=dirty,
+                base_revision=(
+                    self._drafts.get(name, {}).get("base_revision", self._revision)
+                    if dirty
+                    else self._revision
+                ),
+            )
+            self._persist_metadata()
+            self._emit()
+            return {"revision": self._revision}
+
+    def _dispatch_codex_model_catalog_toggle(self, enabled: bool, expected_revision: object | None) -> dict[str, Any]:
+        name = "codex"
+        with self._lock:
+            self._refresh_external_disk_state()
+            self._check_revision(expected_revision)
+            adapter = self._domains.get(name)
+            if adapter is None:
+                raise DomainNotFound(name)
+            toggle = getattr(adapter, "set_model_catalog_enabled_immediately", None)
+            baseline = getattr(adapter, "catalog_baseline_state", None)
+            if not callable(toggle) or not callable(baseline):
+                raise CoreError("domain_error", "Codex model catalog is unavailable")
+            adapter_checkpoint = _checkpoint_adapter(adapter, error_code="apply_failed")
+            persistence_paths = list(_adapter_persistence_paths(adapter))
+            if self._metadata_store is not None:
+                persistence_paths.append(self._metadata_store.path)
+            file_checkpoints = _checkpoint_files(persistence_paths)
+            core_checkpoint = {
+                "revision": self._revision,
+                "drafts": copy.deepcopy(self._drafts),
+                "last_actions": copy.deepcopy(self._last_actions),
+                "baselines": copy.deepcopy(self._baselines),
+                "disk": copy.deepcopy(self._disk),
+                "disk_identities": copy.deepcopy(self._disk_identities),
+            }
+            try:
+                result = toggle(enabled)
+                self._baselines[name] = baseline()
+                dirty = self._adapter_draft_state(name) != self._baselines[name]
+                self._disk[name] = {
+                    "changed": False,
+                    "generation": int(self._disk.get(name, {}).get("generation", 0)),
+                    "keep_draft": False,
+                }
+                self._disk_identities[name] = self._external_disk_identity(adapter)
+                self._revision += 1
+                self._mark_domain(
+                    name,
+                    dirty=dirty,
+                    validation={"valid": True, "issues": []},
+                    base_revision=self._revision,
+                )
+                self._persist_metadata()
+            except Exception as exc:
+                try:
+                    _restore_files(file_checkpoints)
+                    _restore_adapter(adapter, adapter_checkpoint)
+                except Exception:
+                    raise CoreError("apply_failed", "Settings could not be rolled back") from None
+                self._revision = int(core_checkpoint["revision"])
+                self._drafts = core_checkpoint["drafts"]
+                self._last_actions = core_checkpoint["last_actions"]
+                self._baselines = core_checkpoint["baselines"]
+                self._disk = core_checkpoint["disk"]
+                self._disk_identities = core_checkpoint["disk_identities"]
+                if isinstance(exc, CoreError):
+                    raise
+                raise CoreError("apply_failed", safe_exception_message(exc)) from None
+            self._emit()
+            return {"revision": self._revision, "result": _safe_public(result)}
+
     def dispatch(
         self,
         action: Mapping[str, Any],
@@ -1651,13 +1776,35 @@ class CoreStore:
         data = dict(action)
         if not _trusted_native_capability:
             self.reject_plaintext_secret_action(data)
+        action_type = data.get("type", data.get("action"))
+        if not isinstance(action_type, str) or not action_type.strip():
+            raise CoreError("invalid_action", "A Core action is required")
+        domain_value = data.get("domain")
+        normalized_action = action_type.replace("-", "_").replace(".", "_").lower()
+        if (
+            domain_value is not None
+            and _canonical_domain(domain_value) == "providers_models"
+            and normalized_action == "providers_refresh_multiplier"
+        ):
+            return self._dispatch_provider_multiplier_refresh(
+                expected_revision if expected_revision is not None else data.get("expected_revision")
+            )
+        if (
+            domain_value is not None
+            and _canonical_domain(domain_value) == "codex"
+            and normalized_action == "codex_model_catalog_set"
+        ):
+            payload = _as_mapping(data.get("payload"))
+            enabled = payload.get("enabled")
+            if not isinstance(enabled, bool):
+                raise CoreError("invalid_action", "The Codex model catalog switch is invalid")
+            return self._dispatch_codex_model_catalog_toggle(
+                enabled,
+                expected_revision if expected_revision is not None else data.get("expected_revision"),
+            )
         with self._lock:
             self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
             previous_revision = self._revision
-            action_type = data.get("type", data.get("action"))
-            if not isinstance(action_type, str) or not action_type.strip():
-                raise CoreError("invalid_action", "A Core action is required")
-            domain_value = data.get("domain")
             if domain_value is None and action_type.startswith("service."):
                 result = self._dispatch_service(action_type, _as_mapping(data.get("payload")))
             else:
@@ -1676,7 +1823,6 @@ class CoreStore:
                     if file_token is not None:
                         selected_path = self.file_capabilities.resolve(file_token, "import")
                         payload = {"path": str(selected_path)}
-                normalized_action = action_type.replace("-", "_").replace(".", "_")
                 if name == "relay_accounts" and normalized_action in {
                     "resources_import",
                     "relay_resources_import",
@@ -1908,7 +2054,11 @@ class CoreStore:
                 # restore an older checkpoint over the newly detected file.
                 raise ConfirmationNeeded(missing_overwrite)
 
-            adapter_checkpoints = {name: _checkpoint_adapter(adapter, error_code="apply_failed") for name, adapter in adapters.items()}
+            transaction_adapters = dict(adapters)
+            adapter_checkpoints = {
+                name: _checkpoint_adapter(adapter, error_code="apply_failed")
+                for name, adapter in transaction_adapters.items()
+            }
             core_checkpoint = {
                 "revision": self._revision,
                 "drafts": copy.deepcopy(self._drafts),
@@ -1917,7 +2067,11 @@ class CoreStore:
                 "disk": copy.deepcopy(self._disk),
                 "disk_identities": copy.deepcopy(self._disk_identities),
             }
-            persistence_paths = [path for adapter in adapters.values() for path in _adapter_persistence_paths(adapter)]
+            persistence_paths = [
+                path
+                for adapter in transaction_adapters.values()
+                for path in _adapter_persistence_paths(adapter)
+            ]
             if self._metadata_store is not None:
                 persistence_paths.append(self._metadata_store.path)
             file_checkpoints = _checkpoint_files(persistence_paths)
@@ -1973,7 +2127,7 @@ class CoreStore:
                 rollback_failed = False
                 try:
                     _restore_files(file_checkpoints)
-                    for name, adapter in adapters.items():
+                    for name, adapter in transaction_adapters.items():
                         _restore_adapter(adapter, adapter_checkpoints[name])
                 except Exception:
                     rollback_failed = True

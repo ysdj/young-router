@@ -11,6 +11,13 @@ import threading
 from collections.abc import Mapping
 from typing import Any, Iterator
 
+from ..model_catalog import (
+    catalog_is_current,
+    managed_catalog_path,
+    selected_model_names,
+    write_catalog,
+)
+from ..model_contexts import ModelContextRegistry, default_context_cache_path
 from ..security import redact
 from ._shared import (
     LegacyDomainError,
@@ -61,9 +68,22 @@ class CodexSettingsDomain:
         runtime_config_path: Path | str | None = None,
         *,
         codex_home: Path | str | None = None,
+        runtime_settings_path: Path | str | None = None,
     ):
         self.runtime_config_path = Path(runtime_config_path).expanduser() if runtime_config_path else _default_provider_config_path()
         self.codex_home = Path(codex_home).expanduser() if codex_home else None
+        configured_home = os.environ.get("CODEX_HOME", "").strip()
+        resolved_home = self.codex_home or (Path(configured_home).expanduser() if configured_home else Path.home() / ".codex")
+        self.model_catalog_path = managed_catalog_path(resolved_home)
+        self._context_registry = ModelContextRegistry(
+            runtime_config_path=self.runtime_config_path,
+            runtime_settings_path=runtime_settings_path,
+            cache_path=default_context_cache_path(resolved_home),
+            refresh_enabled=runtime_settings_path is not None,
+        )
+        self._catalog_restart_required = False
+        self._catalog_change_reason: str | None = None
+        self._catalog_change_event = 0
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._baseline: tuple[str, str] = ("", "{}\n")
@@ -86,10 +106,44 @@ class CodexSettingsDomain:
             raise LegacyDomainError("Codex settings are invalid")
         return copy.deepcopy(dict(payload))
 
+    def _is_catalog_enabled(self, payload: Mapping[str, Any]) -> bool:
+        structured = payload.get("structured", {})
+        value = structured.get("model_catalog_json") if isinstance(structured, Mapping) else None
+        return isinstance(value, str) and Path(value).expanduser() == self.model_catalog_path
+
     @staticmethod
-    def _safe_snapshot(payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
+    def _catalog_model_names(payload: Mapping[str, Any]) -> list[str]:
+        structured = payload.get("structured", {})
+        return selected_model_names(structured)
+
+    def _require_catalog_model_names(self, payload: Mapping[str, Any]) -> list[str]:
+        names = self._catalog_model_names(payload)
+        if not names:
+            raise LegacyDomainError("Select a Codex model before enabling the model catalog")
+        return names
+
+    def _queue_catalog_restart(self, reason: str) -> None:
+        self._catalog_restart_required = True
+        self._catalog_change_reason = reason
+        self._catalog_change_event += 1
+
+    def _ensure_model_catalog_current(self, *, notify: bool) -> bool:
+        if not self._is_catalog_enabled(self._raw):
+            return False
+        names = self._catalog_model_names(self._raw)
+        self._context_registry.refresh_if_due()
+        if catalog_is_current(self.model_catalog_path, names, registry=self._context_registry):
+            return False
+        write_catalog(self.model_catalog_path, names, registry=self._context_registry)
+        if notify:
+            self._queue_catalog_restart("catalog_repaired")
+        self.revision += 1
+        return True
+
+    def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
         errors = payload.get("validation_errors", [])
         warnings = payload.get("warnings", [])
+        public_models = self._catalog_model_names(payload)
         return {
             "domain": "codex",
             "revision": revision,
@@ -100,9 +154,17 @@ class CodexSettingsDomain:
             "validation_errors": redact(errors if isinstance(errors, list) else []),
             "warnings": redact(warnings if isinstance(warnings, list) else []),
             "raw_editor_available": True,
+            "model_catalog": {
+                "enabled": self._is_catalog_enabled(payload),
+                "public_models": public_models or [],
+                "restart_required": self._catalog_restart_required,
+                "change_reason": self._catalog_change_reason,
+                "change_event": self._catalog_change_event,
+            },
         }
 
     def snapshot(self) -> dict[str, Any]:
+        self._ensure_model_catalog_current(notify=True)
         return self._safe_snapshot(self._draft, self.revision)
 
     def draft_state(self) -> object:
@@ -130,7 +192,10 @@ class CodexSettingsDomain:
         auth_text = self._draft.get("auth_text", "{}\n")
         if not isinstance(config_text, str) or not isinstance(auth_text, str):
             raise LegacyDomainError("Codex settings are invalid")
-        if name in {"set_raw", "setraw"}:
+        if name in {"acknowledge_model_catalog_restart", "acknowledgemodelcatalogrestart"}:
+            self._catalog_restart_required = False
+            self._catalog_change_reason = None
+        elif name in {"set_raw", "setraw"}:
             document = data.get("document")
             text = data.get("text")
             next_config = data.get("config_text", data.get("raw_toml", data.get("toml", config_text)))
@@ -205,6 +270,17 @@ class CodexSettingsDomain:
         current = self._load_editor()
         if (current.get("config_text"), current.get("auth_text")) != self._baseline:
             raise LegacyDomainError("Codex settings changed on disk; reload before applying")
+        was_enabled = self._is_catalog_enabled(self._raw)
+        will_be_enabled = self._is_catalog_enabled(self._draft)
+        catalog_models = self._require_catalog_model_names(self._draft) if will_be_enabled else None
+        self._context_registry.refresh_if_due()
+        catalog_changed = catalog_models is not None and not catalog_is_current(
+            self.model_catalog_path,
+            catalog_models,
+            registry=self._context_registry,
+        )
+        if catalog_changed and catalog_models is not None:
+            write_catalog(self.model_catalog_path, catalog_models, registry=self._context_registry)
         try:
             with _codex_environment(self.runtime_config_path, self.codex_home):
                 codex_config.apply_editor(
@@ -217,11 +293,87 @@ class CodexSettingsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Codex settings could not be saved") from None
         self.reload()
+        if will_be_enabled and (not was_enabled or catalog_changed):
+            self._queue_catalog_restart("enabled" if not was_enabled else "catalog_repaired")
+            self.revision += 1
+        elif was_enabled and not will_be_enabled:
+            self._queue_catalog_restart("disabled")
+            self.revision += 1
         return {"applied": True, **self.snapshot()}
+
+    def catalog_baseline_state(self) -> object:
+        """Return the applied Codex editor state for an immediate menu action."""
+
+        return copy.deepcopy(self._raw)
+
+    def set_model_catalog_enabled_immediately(self, enabled: bool) -> dict[str, Any]:
+        """Toggle only the managed catalog, preserving unrelated staged edits."""
+
+        if not isinstance(enabled, bool):
+            raise LegacyDomainError("The Codex model catalog switch is invalid")
+        import codex_config
+
+        current = self._load_editor()
+        if (current.get("config_text"), current.get("auth_text")) != self._baseline:
+            raise LegacyDomainError("Codex settings changed on disk; reload before applying")
+        was_enabled = self._is_catalog_enabled(self._raw)
+        catalog_models = self._require_catalog_model_names(self._raw) if enabled else None
+        self._context_registry.refresh_if_due()
+        catalog_changed = catalog_models is not None and not catalog_is_current(
+            self.model_catalog_path,
+            catalog_models,
+            registry=self._context_registry,
+        )
+        draft_before = copy.deepcopy(self._draft)
+        draft_next = draft_before
+        draft_config = draft_before.get("config_text", "")
+        draft_auth = draft_before.get("auth_text", "{}\n")
+        if isinstance(draft_config, str) and isinstance(draft_auth, str):
+            try:
+                draft_next = self._sync(
+                    draft_config,
+                    draft_auth,
+                    {"model_catalog_json": str(self.model_catalog_path) if enabled else None},
+                )
+            except LegacyDomainError:
+                # A raw editor may intentionally contain an invalid draft. Keep
+                # that draft intact while the menu action updates the applied
+                # document below.
+                draft_next = draft_before
+        if catalog_changed and catalog_models is not None:
+            write_catalog(self.model_catalog_path, catalog_models, registry=self._context_registry)
+        disk_patch = {"model_catalog_json": str(self.model_catalog_path) if enabled else None}
+        next_disk = self._sync(
+            str(current.get("config_text", "")),
+            str(current.get("auth_text", "{}\n")),
+            disk_patch,
+        )
+        try:
+            with _codex_environment(self.runtime_config_path, self.codex_home):
+                codex_config.apply_editor(
+                    {
+                        "config_text": next_disk["config_text"],
+                        "auth_text": next_disk["auth_text"],
+                    },
+                    self.runtime_config_path,
+                )
+        except Exception as exc:
+            raise _safe_problem(exc, "Codex settings could not be saved") from None
+        self.reload()
+        if draft_next != draft_before:
+            self._draft = draft_next
+        if enabled and (not was_enabled or catalog_changed):
+            self._queue_catalog_restart("enabled" if not was_enabled else "catalog_repaired")
+            self.revision += 1
+        elif was_enabled and not enabled:
+            self._queue_catalog_restart("disabled")
+            self.revision += 1
+        return self.snapshot()
 
     def external_disk_state(self) -> dict[str, bool]:
         """Report only whether either private Codex document changed."""
 
+        self._ensure_model_catalog_current(notify=True)
         current = self._load_editor()
         identity = (str(current.get("config_text", "")), str(current.get("auth_text", "{}\n")))
         return {

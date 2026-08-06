@@ -29,6 +29,7 @@ struct LiteLLMWinUICheckboxProps : winrt::implements<LiteLLMWinUICheckboxProps, 
        value = cloneFromProps->value;
        disabled = cloneFromProps->disabled;
        compact = cloneFromProps->compact;
+       labelVisible = cloneFromProps->labelVisible;
        onValueChange = cloneFromProps->onValueChange;  
      }
   }
@@ -48,6 +49,9 @@ struct LiteLLMWinUICheckboxProps : winrt::implements<LiteLLMWinUICheckboxProps, 
 
   REACT_FIELD(compact)
   std::optional<bool> compact{};
+
+  REACT_FIELD(labelVisible)
+  bool labelVisible{true};
 
    // These fields can be used to determine if JS has registered for this event
   REACT_FIELD(onValueChange)

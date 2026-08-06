@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.machinery
 from datetime import datetime, timezone
+import json
 import os
 import signal
 import sys
@@ -22,6 +23,7 @@ def _bounded_writer(stream: Any, text: str) -> int:
 _IMAGE_EDIT_USAGE_PATCH_ATTR = "_openai_image_edit_usage_patch"
 _CONFIG_CALLBACK_IMPORT_PATCH_ATTR = "_litellm_menu_config_callback_import_patch"
 _SYSTEM_PROXY_LOOKUP_PATCH_ATTR = "_litellm_menu_system_proxy_lookup_patch"
+_SYSTEM_PROXY_SNAPSHOT_ENV = "LITELLM_MENU_SYSTEM_PROXY_SNAPSHOT"
 _CONFIG_CALLBACK_ORIGINAL_ATTR = "_litellm_menu_config_callback_import_original"
 _OPTIONAL_DATABASE_ERROR_PATCH_ATTR = "_litellm_menu_optional_database_error_patch"
 _TIMESTAMPED_OUTPUT_ATTR = "_litellm_menu_timestamped_output"
@@ -359,7 +361,8 @@ def _install_litellm_optional_database_error_patch() -> None:
 
 
 def _install_system_proxy_lookup_patch() -> None:
-    if os.environ.get("LITELLM_MENU_DISABLE_SYSTEM_PROXY_LOOKUP") != "1":
+    raw_snapshot = os.environ.pop(_SYSTEM_PROXY_SNAPSHOT_ENV, "")
+    if not raw_snapshot and os.environ.get("LITELLM_MENU_DISABLE_SYSTEM_PROXY_LOOKUP") != "1":
         return
     if getattr(urllib.request.getproxies, _SYSTEM_PROXY_LOOKUP_PATCH_ATTR, False):
         return
@@ -367,14 +370,46 @@ def _install_system_proxy_lookup_patch() -> None:
     original_getproxies = urllib.request.getproxies
     original_proxy_bypass = urllib.request.proxy_bypass
 
-    def patched_getproxies() -> dict[str, str]:
-        return urllib.request.getproxies_environment()
+    if raw_snapshot:
+        try:
+            snapshot = json.loads(raw_snapshot)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Cached macOS proxy settings are invalid") from exc
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("Cached macOS proxy settings are invalid")
+        source = snapshot.get("source")
+        proxies = snapshot.get("proxies")
+        settings = snapshot.get("settings", {})
+        if source not in {"environment", "macos"} or not isinstance(proxies, dict):
+            raise RuntimeError("Cached macOS proxy settings are invalid")
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in proxies.items()):
+            raise RuntimeError("Cached macOS proxy settings are invalid")
+        if source == "macos" and not isinstance(settings, dict):
+            raise RuntimeError("Cached macOS proxy settings are invalid")
 
-    def patched_proxy_bypass(host: str) -> bool:
-        return urllib.request.proxy_bypass_environment(
-            host,
-            urllib.request.getproxies_environment(),
-        )
+        def patched_getproxies() -> dict[str, str]:
+            return dict(proxies)
+
+        if source == "macos":
+
+            def patched_proxy_bypass(host: str) -> bool:
+                return urllib.request._proxy_bypass_macosx_sysconf(host, settings)
+
+        else:
+
+            def patched_proxy_bypass(host: str) -> bool:
+                return urllib.request.proxy_bypass_environment(host, proxies)
+
+    else:
+
+        def patched_getproxies() -> dict[str, str]:
+            return urllib.request.getproxies_environment()
+
+        def patched_proxy_bypass(host: str) -> bool:
+            return urllib.request.proxy_bypass_environment(
+                host,
+                urllib.request.getproxies_environment(),
+            )
 
     setattr(patched_getproxies, _SYSTEM_PROXY_LOOKUP_PATCH_ATTR, True)
     setattr(patched_getproxies, "_original", original_getproxies)

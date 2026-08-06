@@ -6,6 +6,235 @@ from hook_test_utils import *
 
 
 class HookStreamingCompactionTests(HookTestCase):
+    def test_structured_compaction_synthetic_failure_preserves_upstream_status(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "compaction_trigger", "id": "compact-now"}],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        for status_code, error_code in (
+            (500, "upstream_compaction_failure"),
+            (400, "upstream_route_failure"),
+        ):
+            stream_event = {
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "code": error_code,
+                        "message": f"upstream reported HTTP {status_code}",
+                    },
+                },
+            }
+            stream_exception = hooks._stream_chunk_error_exception(stream_event)
+            self.assertIsNotNone(stream_exception)
+            self.assertEqual(
+                getattr(stream_exception, "status_code", None),
+                status_code,
+            )
+            self.assertEqual(
+                getattr(stream_exception, "body", {}).get("code"),
+                error_code,
+            )
+
+            upstream_exception = RuntimeError(f"upstream compaction HTTP {status_code}")
+            upstream_exception.status_code = status_code
+            event = jsonable_stream_chunk(
+                hooks._synthesized_failed_response_event(
+                    request_data,
+                    upstream_exception,
+                )
+            )
+            error = event["response"]["error"]
+            self.assertEqual(error["code"], "upstream_compaction_failure")
+            self.assertIn(f"HTTP {status_code}", error["message"])
+
+            incomplete = hooks._responses_incomplete_stream_exception(
+                "terminal response event before response.completed",
+                buffer=[event],
+                request_data=request_data,
+            )
+            self.assertEqual(
+                getattr(incomplete, "status_code", None),
+                status_code,
+            )
+
+    def test_structured_compaction_stream_read_error_does_not_invent_502(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"type": "compaction_trigger", "id": "compact-now"}],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        terminal = {
+            "type": "error",
+            "error": {
+                "type": "upstream_error",
+                "code": "stream_read_error",
+                "message": "stream_read_error",
+                "detail": "upstream stream ended before response.completed",
+            },
+        }
+
+        incomplete = hooks._responses_incomplete_stream_exception(
+            "stream ended before response.completed",
+            buffer=[terminal],
+            request_data=request_data,
+        )
+
+        self.assertIsNone(getattr(incomplete, "status_code", None))
+        self.assertTrue(hooks._is_priority_deployment_failover_error(incomplete))
+        self.assertEqual(
+            hooks._trace_exception(incomplete)["reason"],
+            "upstream-stream-incomplete",
+        )
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(incomplete),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        failed = jsonable_stream_chunk(
+            hooks._synthesized_failed_response_event(request_data, incomplete)
+        )
+        error = failed["response"]["error"]
+        self.assertEqual(error["code"], "upstream_compaction_failure")
+        self.assertNotIn("HTTP 502", error["message"])
+        self.assertNotIn("HTTP", error["message"])
+
+    async def test_structured_compaction_forwarded_terminal_failure_is_not_retried(self) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        async def failed_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-failed", "status": "in_progress", "output": []},
+            }
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-failed",
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "code": "upstream_compaction_failure",
+                        "message": "upstream reported HTTP 502",
+                    },
+                },
+            }
+
+        class UnexpectedRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("terminal compaction failure must not start a fresh retry")
+
+        proxy_server.llm_router = UnexpectedRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=failed_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual([chunk["type"] for chunk in chunks], ["response.created", "response.failed"])
+        self.assertEqual(
+            chunks[-1]["response"]["error"]["code"],
+            "upstream_compaction_failure",
+        )
+
+    async def test_structured_compaction_stream_http_failure_uses_one_native_route_fallback(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        async def failed_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-original", "status": "in_progress", "output": []},
+            }
+            error = RuntimeError("upstream returned HTTP 502")
+            error.status_code = 502
+            raise error
+
+        async def recovered_stream():
+            compaction_item = {
+                "id": "cmp-recovered",
+                "type": "compaction",
+                "encrypted_content": "encrypted-recovered-summary",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-recovered",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(copy.deepcopy(payload))
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-compaction-http-fallback",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "model_info": {
+                "id": "third-party-large",
+                "provider": "compat_provider",
+                "route_key": "compat_provider / openai/default-chat / key=x-plus",
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=failed_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("use_chat_completions_api", calls[0])
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0]["encrypted_content"],
+            "encrypted-recovered-summary",
+        )
+
     async def test_structured_compaction_done_item_clean_eof_synthesizes_terminal_event(self) -> None:
         hooks, proxy_server = load_hook_module()
 

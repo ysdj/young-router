@@ -649,7 +649,7 @@ def _trace_reasoning_summary(request_kwargs: Optional[dict]) -> dict[str, Any]:
     text_config = request_kwargs.get("text")
     text_dict = text_config if isinstance(text_config, dict) else {}
     effort = request_kwargs.get("reasoning_effort") or reasoning_dict.get("effort")
-    summary = {
+    summary: dict[str, Any] = {
         "present": reasoning is not None or request_kwargs.get("reasoning_effort") is not None,
         "effort": _sanitize_trace_text(str(effort), limit=80) if effort is not None else None,
         "reasoning": _trace_limited_value(reasoning, limit=240)
@@ -810,7 +810,7 @@ def _trace_request_summary(
     method_name: Any = None,
 ) -> dict[str, Any]:
     request_kwargs = request_kwargs or {}
-    return {
+    summary = {
         "model": request_kwargs.get("model"),
         "model_group": _responses_execution_module._request_model_group(request_kwargs),
         "deployment_id": _routing_module._deployment_id_from_request(request_kwargs),
@@ -837,6 +837,10 @@ def _trace_request_summary(
         "tools": _trace_tools_summary(request_kwargs),
         "metadata_flags": _trace_metadata_flags(request_kwargs),
     }
+    image_budget = _image_inputs_module._image_input_budget(request_kwargs)
+    if image_budget is not None:
+        summary["image_budget"] = image_budget
+    return summary
 
 
 _TRACE_TOOL_CALL_TYPES = {

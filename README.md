@@ -289,7 +289,7 @@ Build a macOS preview or release only when explicitly needed, with an isolated o
 
 `VERSION`, `BUILD_NUMBER`, the RN macOS plist/Xcode project, both Windows manifests, and `Casks/litellm-menu.rb` are kept in sync through `scripts/version.py`.
 
-LiteLLM uses a two-stage version policy. Development explicitly advances `LITELLM_VERSION` to the latest stable PyPI release that provides a universal wheel with `./scripts/update-litellm.sh`; releases without a macOS-compatible binary are skipped so app startup never compiles LiteLLM from source. `./scripts/update-litellm.sh --check` fails when the compatible lock is stale. Built and released apps copy that lock and install exactly `litellm[proxy]==<locked version>`, so a release never changes SDK versions merely because a user starts or restarts the service later. After advancing the lock, rebuild, restart, and run the full test suite before release.
+LiteLLM is checked and advanced to the latest stable PyPI release at the beginning of every macOS and Windows build. `./scripts/update-litellm.sh --check` reports whether `LITELLM_VERSION` is current. A build may compile LiteLLM from its source distribution in the controlled build environment when PyPI has not published a matching wheel; the completed app still packages and runs the exact locked version, so app startup never compiles or upgrades LiteLLM.
 
 ---
 
@@ -580,7 +580,7 @@ pnpm exec tsc --noEmit
 
 `VERSION`、`BUILD_NUMBER`、RN macOS plist/Xcode 工程、两个 Windows manifest 和 `Casks/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
 
-LiteLLM 采用两阶段版本策略。开发时用 `./scripts/update-litellm.sh` 显式把 `LITELLM_VERSION` 推进到提供通用 wheel 的 PyPI 最新稳定版；缺少 macOS 兼容二进制包的版本会被跳过，避免应用启动时现场编译 LiteLLM。`./scripts/update-litellm.sh --check` 会在兼容版本锁落后时失败。构建和发布的应用会复制这个锁，并精确安装 `litellm[proxy]==<锁定版本>`，因此用户以后启动或重启服务时不会意外漂移 SDK 版本。更新版本锁后，发布前必须重新构建、重启并运行全套测试。
+每次 macOS 与 Windows 构建开始时，LiteLLM 都会检查并推进到 PyPI 最新稳定版。`./scripts/update-litellm.sh --check` 可检查 `LITELLM_VERSION` 是否最新。若 PyPI 尚未提供匹配 wheel，构建环境会受控地从源码分发构建 LiteLLM；完成后的应用仍打包并运行这个精确锁定版本，因此应用启动时不会编译或自动升级 LiteLLM。
 
 ---
 

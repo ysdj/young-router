@@ -491,6 +491,7 @@ model_list:
             self.assertEqual(18, record["usage"]["total_tokens"])
             self.assertEqual(403, record["error"]["status_code"])
             self.assertEqual("AuthenticationError", record["error"]["type"])
+            self.assertEqual("unselected", record["routing_state"])
             self.assertNotIn("message", record["error"])
 
     def test_service_log_omits_litellm_banner_noise(self) -> None:
@@ -512,6 +513,157 @@ model_list:
             records = LogsDomain(root).view("service")["log"]["records"]
 
             self.assertEqual(["[2026-08-01T04:10:12Z] INFO: Started server process [123]"], records)
+
+    def test_service_traceback_lines_are_one_selectable_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "menu-server.log").write_text(
+                "\n".join(
+                    [
+                        "[2026-08-01T04:10:12Z] INFO: Traceback (most recent call last):",
+                        "[2026-08-01T04:10:12Z] INFO: File \"worker.py\", line 7, in run",
+                        "[2026-08-01T04:10:12Z] INFO: response = await self._send()",
+                        "[2026-08-01T04:10:12Z] INFO: ValueError: upstream failed",
+                        "[2026-08-01T04:10:12Z] INFO: after traceback",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = LogsDomain(root).view("service")["log"]["records"]
+
+            self.assertEqual(2, len(records))
+            self.assertIn("File \"worker.py\"", records[0])
+            self.assertIn("ValueError: upstream failed", records[0])
+            self.assertEqual("[2026-08-01T04:10:12Z] INFO: after traceback", records[1])
+
+    def test_request_records_are_sorted_by_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {"timestamp": "2026-08-01T04:10:13Z", "request_id": "newer", "status": "success"},
+                {"timestamp": "2026-08-01T04:10:11Z", "request_id": "older", "status": "success"},
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+
+            self.assertEqual(["older", "newer"], [record["request_id"] for record in projected])
+
+    def test_request_records_normalize_epoch_seconds_and_milliseconds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {"timestamp": 1_800_000_001_000, "request_id": "newer", "status": "success"},
+                {"timestamp": 1_800_000_000, "request_id": "older", "status": "success"},
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+
+            self.assertEqual(["older", "newer"], [record["request_id"] for record in projected])
+
+    def test_recovery_records_are_sorted_by_updated_at(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".litellm-runtime" / "route-recovery-state.json"
+            state.parent.mkdir()
+            state.write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "newer": {"updated_at": "2026-08-01T04:10:13Z", "status": "waiting"},
+                            "older": {"updated_at": "2026-08-01T04:10:11Z", "status": "waiting"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("recovery")["log"]["records"]
+
+            self.assertEqual(["2026-08-01T04:10:11Z", "2026-08-01T04:10:13Z"], [record["timestamp"] for record in projected])
+
+    def test_recovery_records_accept_canonical_timestamp_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".litellm-runtime" / "route-recovery-state.json"
+            state.parent.mkdir()
+            state.write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "newer": {"timestamp": "2026-08-01T04:10:13Z", "status": "waiting"},
+                            "older": {"time": "2026-08-01T04:10:11Z", "status": "waiting"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("recovery")["log"]["records"]
+
+            self.assertEqual(["2026-08-01T04:10:11Z", "2026-08-01T04:10:13Z"], [record["timestamp"] for record in projected])
+
+    def test_route_trace_exposes_request_and_route_chain_fields_without_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "deployment_failover_marked",
+                "request_id": "request-a",
+                "session_id": "session-a",
+                "route_key": "model=public-chat / provider=provider-a / upstream=openai/one",
+                "deployment": {"id": "deployment-a", "order": 0},
+                "failed_route_key": "model=public-chat / provider=provider-b / upstream=openai/two",
+                "failed_deployment_id": "deployment-b",
+                "candidates": [
+                    {"id": "deployment-c", "provider": "provider-c", "model": "openai/three", "order": 3},
+                ],
+            }
+            (root / "menu-server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertEqual("request-a", record["request_id"])
+            self.assertEqual("session-a", record["session_id"])
+            self.assertEqual("deployment-a", record["route"]["deployment_id"])
+            self.assertEqual(0, record["route"]["order"])
+            self.assertEqual("deployment-b", record["failed_route"]["deployment_id"])
+            self.assertEqual("deployment-c", record["candidate_routes"][0]["deployment_id"])
+
+    def test_route_trace_does_not_mark_a_failed_only_route_as_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "deployment_failover_marked",
+                "exception": {
+                    "failed_deployment_id": "deployment-a",
+                    "failed_deployment_route_key": (
+                        "model=public-chat / provider=provider-a / upstream=openai/one"
+                    ),
+                },
+            }
+            (root / "menu-server.log").write_text(
+                f"litellm_route_trace {json.dumps(payload)}\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("route-trace")["log"]["records"][0]
+
+            self.assertNotIn("route", record)
+            self.assertEqual("deployment-a", record["failed_route"]["deployment_id"])
 
     def test_default_view_limit_is_ten_thousand_and_runtime_configurable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -653,6 +805,25 @@ model_list:
             self.assertTrue(source.exists())
             domain.dispatch("logs.resume", {"tab": "menu"})
             self.assertEqual(1, domain.view("menu")["log"]["line_count"])
+
+    def test_clear_while_playing_reveals_only_new_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "menu-actions.log"
+            source.write_text("first action\nsecond action\n", encoding="utf-8")
+            domain = LogsDomain(root)
+
+            self.assertEqual(2, domain.view("menu")["log"]["line_count"])
+            domain.dispatch("logs.clear", {"tab": "menu"})
+            self.assertEqual(0, domain.view("menu")["log"]["line_count"])
+            domain.dispatch(
+                "logs.record_menu_action",
+                {"tab": "menu", "menu_action": "open-logs"},
+            )
+
+            view = domain.view("menu")["log"]
+            self.assertEqual(1, view["line_count"])
+            self.assertTrue(view["records"][0].endswith("open-logs"))
 
     def test_records_a_safe_timestamped_menu_action(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

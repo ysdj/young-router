@@ -397,6 +397,12 @@ export interface NativeLeafAdapter {
   saveFilePicker(options: { suggestedName: string }): Promise<string | undefined>;
   showActionMenu(options: { title: string; items: string[]; anchor: NativeMenuAnchor }): Promise<number | undefined>;
   showConfirmation(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
+  showCodexRestartConfirmation(options: {
+    title: string;
+    message: string;
+    restartLabel: string;
+    laterLabel: string;
+  }): Promise<"restart" | "later" | undefined>;
   showReadOnlyText(options: { title: string; text: string; closeLabel: string }): Promise<void>;
   chooseModelsToAdd(options: {
     models: string[];
@@ -442,6 +448,7 @@ export interface NativeLeafAdapter {
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
+  restartCodex(): Promise<boolean>;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
 }

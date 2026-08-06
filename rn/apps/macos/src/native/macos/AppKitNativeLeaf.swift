@@ -4,6 +4,8 @@ import Security
 import ServiceManagement
 import WebKit
 
+private let nativeUIFontSize: CGFloat = 13
+
 private enum NativeRelayOriginPolicy {
     static func allows(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme), let host = url.host?.lowercased() else {
@@ -56,12 +58,12 @@ private enum NativeRelayOriginPolicy {
             .foregroundColor: NSColor.black,
         ]
         ("L" as NSString).draw(
-            at: NSPoint(x: 2.5, y: -1),
-            withAttributes: attributes.merging([.font: NSFont.systemFont(ofSize: 18, weight: .regular)]) { _, new in new }
+            at: NSPoint(x: 3, y: 0),
+            withAttributes: attributes.merging([.font: NSFont.systemFont(ofSize: 15, weight: .light)]) { _, new in new }
         )
         ("L" as NSString).draw(
-            at: NSPoint(x: 13, y: 2),
-            withAttributes: attributes.merging([.font: NSFont.systemFont(ofSize: 13, weight: .regular)]) { _, new in new }
+            at: NSPoint(x: 11.5, y: 1),
+            withAttributes: attributes.merging([.font: NSFont.systemFont(ofSize: 13, weight: .light)]) { _, new in new }
         )
 
         image.unlockFocus()
@@ -73,7 +75,7 @@ private enum NativeRelayOriginPolicy {
     // are stable action IDs (plus the two presentation markers), not labels.
     private static let statusMenuOrder = [
         "status", "separator",
-        "toggle-autostart", "separator",
+        "toggle-autostart", "toggle-codex-model-catalog", "separator",
         "open-providers-models", "open-runtime-settings", "open-codex-settings", "open-relay-accounts", "separator",
         "webdav-status", "open-webdav-settings", "separator",
         "open-logs", "separator",
@@ -108,6 +110,8 @@ private enum NativeRelayOriginPolicy {
     private var reactHostStarter: (() -> Void)?
     private var routeWindows: [String: NSWindow] = [:]
     private var approvedCloseRoutes: Set<String> = []
+    private var codexRestartConfirmationPanel: NSPanel?
+    private var codexRestartConfirmationCompletion: ((String) -> Void)?
     // Retain the browser flow across the asynchronous React Native promise.
     private var activeRelayLoginController: NativeRelayLoginController?
     private var statusTitle = "LiteLLM Menu"
@@ -120,7 +124,7 @@ private enum NativeRelayOriginPolicy {
         "appTitle": "LiteLLM Menu", "autoStart": "Auto Start at Login", "serviceUnavailable": "service unavailable",
         "cancel": "Cancel", "set": "Set", "clear": "Clear", "stage": "Stage", "find": "Find", "findNext": "Find Next",
         "edit": "Edit", "undo": "Undo", "redo": "Redo", "cut": "Cut", "copy": "Copy",
-        "paste": "Paste", "selectAll": "Select All", "settings": "Settings…",
+        "paste": "Paste", "selectAll": "Select All", "settings": "Settings...",
         "reload": "Reload", "closeWindow": "Close Window", "version": "Version",
         "build": "build", "ok": "OK", "invalidText": "The document contains invalid text.",
         "languageMenu": "Language", "languageSystem": "System", "languageEnglish": "English", "languageSimplifiedChinese": "简体中文",
@@ -165,7 +169,7 @@ private enum NativeRelayOriginPolicy {
         statusItem.button?.image = Self.statusBarIcon
         statusItem.button?.toolTip = running
             ? localized("appTitle", fallback: "LiteLLM Menu")
-            : "\(localized("appTitle", fallback: "LiteLLM Menu")) — \(localized("serviceUnavailable", fallback: "service unavailable"))"
+            : "\(localized("appTitle", fallback: "LiteLLM Menu")) - \(localized("serviceUnavailable", fallback: "service unavailable"))"
         if let status = statusItem.menu?.item(withTag: 1) {
             status.title = statusTitle
             configureStatusMenuItem(status)
@@ -305,11 +309,17 @@ private enum NativeRelayOriginPolicy {
     }
 
     public func windowWillClose(_ notification: Notification) {
-        if let window = notification.object as? NSWindow,
-           let route = routeForWindow(window) {
+        guard let window = notification.object as? NSWindow else { return }
+        if let panel = codexRestartConfirmationPanel, window === panel {
+            codexRestartConfirmationPanel = nil
+            let completion = codexRestartConfirmationCompletion
+            codexRestartConfirmationCompletion = nil
+            completion?("later")
+            return
+        }
+        if let route = routeForWindow(window) {
             routeWindows.removeValue(forKey: route)
             updateActivationPolicy()
-            return
         }
     }
 
@@ -342,6 +352,106 @@ private enum NativeRelayOriginPolicy {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
+    /// Presents the catalog restart decision in its own floating panel. This
+    /// deliberately does not use an alert sheet or modal run loop, so the
+    /// app's settings windows remain interactive while the choice is visible.
+    func showCodexRestartConfirmation(
+        title: String,
+        message: String,
+        restartLabel: String,
+        laterLabel: String,
+        completion: @escaping (String) -> Void
+    ) {
+        guard !title.isEmpty,
+              !message.isEmpty,
+              !restartLabel.isEmpty,
+              !laterLabel.isEmpty,
+              title.utf8.count <= 320,
+              message.utf8.count <= 2_048,
+              restartLabel.utf8.count <= 160,
+              laterLabel.utf8.count <= 160
+        else {
+            completion("later")
+            return
+        }
+        finishCodexRestartConfirmation(choice: "later")
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 194),
+            styleMask: [.titled, .closable, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = localized("appTitle", fallback: "LiteLLM Menu")
+        panel.isFloatingPanel = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        panel.minSize = NSSize(width: 420, height: 176)
+        panel.maxSize = NSSize(width: 640, height: 280)
+
+        let content = NSView()
+        panel.contentView = content
+        let titleLabel = NSTextField(wrappingLabelWithString: title)
+        titleLabel.font = NSFont.systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.maximumNumberOfLines = 2
+        let messageLabel = NSTextField(wrappingLabelWithString: message)
+        messageLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .regular)
+        messageLabel.textColor = .secondaryLabelColor
+        messageLabel.maximumNumberOfLines = 4
+        let laterButton = NSButton(title: laterLabel, target: self, action: #selector(selectCodexRestartLater(_:)))
+        laterButton.bezelStyle = .rounded
+        laterButton.keyEquivalent = "\u{1b}"
+        let restartButton = NSButton(title: restartLabel, target: self, action: #selector(selectCodexRestartNow(_:)))
+        restartButton.bezelStyle = .rounded
+        restartButton.keyEquivalent = "\r"
+        restartButton.keyEquivalentModifierMask = []
+
+        [titleLabel, messageLabel, laterButton, restartButton].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview($0)
+        }
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
+            messageLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            messageLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            messageLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
+            laterButton.trailingAnchor.constraint(equalTo: restartButton.leadingAnchor, constant: -8),
+            restartButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            restartButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            laterButton.centerYAnchor.constraint(equalTo: restartButton.centerYAnchor),
+            messageLabel.bottomAnchor.constraint(lessThanOrEqualTo: restartButton.topAnchor, constant: -14),
+        ])
+
+        codexRestartConfirmationPanel = panel
+        codexRestartConfirmationCompletion = completion
+        panel.center()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func selectCodexRestartLater(_ sender: NSButton) {
+        finishCodexRestartConfirmation(choice: "later")
+    }
+
+    @objc private func selectCodexRestartNow(_ sender: NSButton) {
+        finishCodexRestartConfirmation(choice: "restart")
+    }
+
+    private func finishCodexRestartConfirmation(choice: String) {
+        guard let panel = codexRestartConfirmationPanel else { return }
+        codexRestartConfirmationPanel = nil
+        let completion = codexRestartConfirmationCompletion
+        codexRestartConfirmationCompletion = nil
+        panel.delegate = nil
+        panel.orderOut(nil)
+        panel.close()
+        completion?(choice)
+    }
+
     func showReadOnlyText(title: String, text: String, closeTitle: String) {
         let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 680, height: 420))
         scrollView.borderType = .bezelBorder
@@ -355,7 +465,7 @@ private enum NativeRelayOriginPolicy {
         textView.isSelectable = true
         textView.isRichText = false
         textView.importsGraphics = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.font = NSFont.monospacedSystemFont(ofSize: nativeUIFontSize, weight: .regular)
         textView.textContainerInset = NSSize(width: 8, height: 8)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = true
@@ -684,7 +794,7 @@ private enum NativeRelayOriginPolicy {
         let content = NSView()
         panel.contentView = content
         let titleLabel = NSTextField(labelWithString: localized("modelChooserHeading", fallback: "Choose models to add"))
-        titleLabel.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
         let subtitleLabel = NSTextField(labelWithString: "\(localized("modelChooserProvider", fallback: "Provider")): \(providerName)    \(localized("modelChooserKey", fallback: "Key")): \(keyName)")
         subtitleLabel.textColor = .secondaryLabelColor
         subtitleLabel.lineBreakMode = .byTruncatingMiddle
@@ -835,7 +945,7 @@ private enum NativeRelayOriginPolicy {
             mainMenu.insertItem(appRoot, at: 0)
         }
         if shortcuts["openMenu"]?.lowercased().contains("cmd+,") == true {
-            let item = applicationMenu.addItem(withTitle: localized("settings", fallback: "Settings…"), action: #selector(openCodex), keyEquivalent: ",")
+            let item = applicationMenu.addItem(withTitle: localized("settings", fallback: "Settings..."), action: #selector(openCodex), keyEquivalent: ",")
             item.keyEquivalentModifierMask = [.command]
             item.target = self
             item.representedObject = "open-settings"
@@ -874,6 +984,32 @@ private enum NativeRelayOriginPolicy {
             return true
         } catch {
             return false
+        }
+    }
+
+    func restartCodex() -> Bool {
+        guard let applicationURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") else {
+            return false
+        }
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex").forEach { application in
+            application.forceTerminate()
+        }
+        launchCodex(applicationURL, attemptsRemaining: 20)
+        return true
+    }
+
+    private func launchCodex(_ applicationURL: URL, attemptsRemaining: Int) {
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex")
+        guard running.isEmpty || attemptsRemaining == 0 else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.launchCodex(applicationURL, attemptsRemaining: attemptsRemaining - 1)
+            }
+            return
+        }
+        DispatchQueue.main.async {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.openApplication(at: applicationURL, configuration: configuration)
         }
     }
 
@@ -977,11 +1113,11 @@ private enum NativeRelayOriginPolicy {
 
     private func menuTitle(for id: String, fallback: String) -> String {
         switch id {
-        case "open-providers-models": return localized("routeProvidersModels", fallback: fallback) + "…"
-        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: fallback) + "…"
-        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: fallback) + "…"
-        case "open-codex-settings": return localized("routeCodexSettings", fallback: fallback) + "…"
-        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: fallback) + "…"
+        case "open-providers-models": return localized("routeProvidersModels", fallback: fallback) + "..."
+        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: fallback) + "..."
+        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: fallback) + "..."
+        case "open-codex-settings": return localized("routeCodexSettings", fallback: fallback) + "..."
+        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: fallback) + "..."
         case "open-logs", "open-logs?tab=recovery": return fallback
         case "quit": return localized("menuQuit", fallback: fallback)
         default: return fallback
@@ -991,11 +1127,12 @@ private enum NativeRelayOriginPolicy {
     private func menuFallback(for id: String) -> String? {
         switch id {
         case "toggle-autostart": return localized("autoStart", fallback: "Auto Start at Login")
-        case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models") + "…"
-        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: "Relay Accounts") + "…"
-        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings") + "…"
-        case "open-codex-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings") + "…"
-        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings") + "…"
+        case "toggle-codex-model-catalog": return "Use LiteLLM models in Codex"
+        case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models") + "..."
+        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: "Relay Accounts") + "..."
+        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings") + "..."
+        case "open-codex-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings") + "..."
+        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings") + "..."
         case "open-logs", "open-logs?tab=recovery": return localized("routeLogs", fallback: "Logs")
         case "show-version": return localized("version", fallback: "Version")
         case "quit": return localized("menuQuit", fallback: "Quit LiteLLM Menu")
@@ -1080,7 +1217,7 @@ private enum NativeRelayOriginPolicy {
         guard let applicationMenu = NSApp.mainMenu?.items.first?.submenu else { return }
         for item in applicationMenu.items {
             switch item.representedObject as? String {
-            case "open-settings": item.title = localized("settings", fallback: "Settings…")
+            case "open-settings": item.title = localized("settings", fallback: "Settings...")
             case "native-reload": item.title = localized("reload", fallback: "Reload")
             case "native-close-window": item.title = localized("closeWindow", fallback: "Close Window")
             case "native-quit": item.title = localized("menuQuit", fallback: "Quit LiteLLM Menu")
@@ -1355,7 +1492,7 @@ final class NativeTextEditor: NSScrollView {
         textView.frame = bounds
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.font = NSFont.monospacedSystemFont(ofSize: nativeUIFontSize, weight: .regular)
         textView.usesFindPanel = true
         textView.textContainer?.widthTracksTextView = false
         textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
@@ -1451,7 +1588,7 @@ private final class NativeModelChooserListView: NSView {
             let checkbox = NSButton(checkboxWithTitle: rows[rowIndex].title, target: self, action: #selector(toggleRow(_:)))
             checkbox.state = rows[rowIndex].selected ? .on : .off
             checkbox.tag = rowIndex
-            checkbox.font = NSFont.systemFont(ofSize: 14)
+            checkbox.font = NSFont.systemFont(ofSize: nativeUIFontSize)
             checkbox.lineBreakMode = .byTruncatingMiddle
             checkbox.toolTip = rows[rowIndex].title
             checkbox.setAccessibilityLabel(rows[rowIndex].title)
@@ -1753,13 +1890,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
         let header = NSView()
         let titleLabel = NSTextField(labelWithString: label)
-        titleLabel.font = NSFont.systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
         titleLabel.lineBreakMode = .byTruncatingTail
         accountLabel.stringValue = "\(type == "newapi" ? text("New API", "NewAPI") : "Sub2API")  |  \(originURL.host ?? originURL.absoluteString)"
         accountLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = mode == .logs
             ? text("Showing the relay site's usage logs.", "正在显示中转站站内用量日志。")
-            : text("Sign in on the site, then select Check Sign-In.", "请在站点内完成登录，然后选择“检查登录”。")
+            : text("Enter your account and password in the page, then select Check Sign-In.", "请在页面中输入账号和密码完成登录，然后选择“检查登录”。")
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
         signInButton.title = mode == .logs ? text("Reload", "刷新") : text("Check Sign-In", "检查登录")
@@ -1787,8 +1924,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
         loadingIndicator.startAnimation(nil)
         loadingLabel.stringValue = mode == .logs
-            ? text("Loading usage logs…", "正在加载用量日志…")
-            : text("Loading sign-in page…", "正在加载登录页面…")
+            ? text("Loading usage logs...", "正在加载用量日志...")
+            : text("Loading sign-in page...", "正在加载登录页面...")
         loadingLabel.textColor = .secondaryLabelColor
         loadingLabel.alignment = .center
         loadingLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -1962,7 +2099,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         capturedRefreshToken = nil
         signInButton.isEnabled = false
         cancelButton.isEnabled = true
-        statusLabel.stringValue = text("Checking sign-in…", "正在检查登录…")
+        statusLabel.stringValue = text("Checking sign-in...", "正在检查登录...")
         captureBrowserCredentials(attempt: attempt) { [weak self, weak attempt] in
             guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
             self.collectCookies(attempt: attempt) { [weak self, weak attempt] cookieHeader in
@@ -2162,7 +2299,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             DispatchQueue.main.async { [weak self, weak attempt] in
                 guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
                 self.cancelButton.isEnabled = false
-                self.statusLabel.stringValue = self.text("Saving sign-in…", "正在保存登录…")
+                self.statusLabel.stringValue = self.text("Saving sign-in...", "正在保存登录...")
             }
             let previousCredentials = NativeRelayCredentialStore.backup(accountID: accountID, includePassword: rememberPassword)
             guard NativeRelayCredentialStore.writeSession(session, accountID: accountID),
@@ -2421,8 +2558,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private func showBrowserLoading() {
         pageReadinessProbe?.cancel()
         loadingLabel.stringValue = mode == .logs
-            ? text("Loading usage logs…", "正在加载用量日志…")
-            : text("Loading sign-in page…", "正在加载登录页面…")
+            ? text("Loading usage logs...", "正在加载用量日志...")
+            : text("Loading sign-in page...", "正在加载登录页面...")
         loadingOverlay.isHidden = false
         loadingIndicator.startAnimation(nil)
     }

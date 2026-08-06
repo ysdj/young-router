@@ -27,6 +27,7 @@
 
 - The runtime starts from `.litellm-runtime/config.yaml`; source configuration is validated and staged explicitly. No file mutation may silently restart the service.
 - The macOS LiteLLM proxy must run with `LITELLM_NUM_WORKERS=16`. Do not lower the default, alter it during a restart, or use a smaller worker count as a performance or recovery workaround unless the user explicitly requests that configuration change.
+- Every newly created proxy process must start with empty route-recovery and deployment-cooldown runtime state. Never carry `.litellm-runtime/route-recovery-state.json` or `.litellm-runtime/deployment-cooldowns.json` across app starts, service starts, restarts, or reloads.
 - Preserve LiteLLM routing, Responses stream semantics, tool ordering, IDs, explicit terminal errors, and metadata-driven compatibility bridges. Do not add request-specific or provider-specific routing hacks.
 - The Core IPC schema beside the implementation is the durable contract. Update its validators, typed client, host bridges, and focused tests together when the contract changes.
 - The macOS Vision helper is built into `Contents/Resources/Core/bin/vision_ocr`. Keep its source in the RN macOS host and never restore a `Resources/App` lookup.
@@ -39,10 +40,14 @@
 - Do not infer that gateways are interchangeable merely because they may ultimately target the same upstream API. Diagnose the exact request, route, account, response event, and terminal status while keeping provider-specific workarounds out of the implementation.
 - A copied, signed, or source-identical app bundle does not prove the running proxy loaded the new code. Any activation claim must show a newly started app/Core/proxy process, a healthy bound endpoint, and the unchanged configured worker count. The proxy process and its listening port are one lifecycle; do not describe a dead proxy as leaving an independently live service port.
 - A stale desktop task status such as an earlier `systemError` is not evidence that the latest retry failed. Correlate the latest rollout turn with the proxy request record. A remote compaction is proven only by a successful request for the same task whose response contains a `compaction` item; a later successful ordinary continuation is not a substitute for that evidence.
+- Do not infer a request-size limit from a structured compaction transport error or upstream 5xx. Require an explicit context-size rejection, preserve the exact upstream status instead of rewriting it to 502, and when a stream terminates without any upstream HTTP status leave the status absent rather than inventing 502. Treat prior successful compactions at comparable token counts as counterevidence to a size diagnosis.
+- Deployment cooldown may remove a failed route when another eligible peer exists. It must not erase the only configured eligible deployment from a fresh request; route-recovery polls may still wait for cooldown expiry. Log pre-route failures as no available deployment or model not configured instead of the ambiguous `unselected` label.
 - Keep image-size handling explicit: the service must still compress new oversized images to an accepted representation. Preserving signed historical images must not become a general exemption that allows new oversized images through unchanged.
 
 ## Development And Verification
 
+- Keep all project-owned automated test source files directly under `tests/`; package scripts may invoke them from there, but do not scatter tests under source, script, `work/`, or `tmp/` directories.
+- Do not retain repository-root `work/` or `tmp/` directories. Ephemeral probes and build scratch data must use a system temporary directory created for that run and remove it when the run finishes.
 - Prefer `rg` for source searches. Run the focused TypeScript and Python checks that exercise the changed behavior directly from the configured project runtime.
 - Do not make `scripts/test.sh`, `scripts/check-rn.sh`, a full build, or a release package an ordinary approval gate. Those scripts may perform broader packaging or state checks that are not needed for a scoped change.
 - For desktop UI work, a successful build, process launch, deep link, or accessibility-tree read does **not** count as visual verification. Call a UI state visually verified only after capturing the target app window and inspecting the rendered image.

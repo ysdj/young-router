@@ -74,20 +74,19 @@ class UpdateLiteLLMTests(unittest.TestCase):
         )
         return result, lock_file
 
-    def test_update_skips_newer_release_without_universal_wheel(self) -> None:
+    def test_update_uses_newest_stable_release_with_an_installable_source_distribution(self) -> None:
         result, lock_file = self.run_update()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(lock_file.read_text(encoding="utf-8"), "1.91.2\n")
-        self.assertIn("1.92.0 has no universal", result.stderr)
-        self.assertIn("1.90.0 -> 1.91.2", result.stdout)
+        self.assertEqual(lock_file.read_text(encoding="utf-8"), "1.92.0\n")
+        self.assertIn("1.90.0 -> 1.92.0", result.stdout)
 
-    def test_check_accepts_latest_universal_wheel_release(self) -> None:
-        result, lock_file = self.run_update("--check", locked_version="1.91.2")
+    def test_check_accepts_latest_stable_release_with_an_installable_artifact(self) -> None:
+        result, lock_file = self.run_update("--check", locked_version="1.92.0")
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(lock_file.read_text(encoding="utf-8"), "1.91.2\n")
-        self.assertIn("lock is current: 1.91.2", result.stdout)
+        self.assertEqual(lock_file.read_text(encoding="utf-8"), "1.92.0\n")
+        self.assertIn("lock is current: 1.92.0", result.stdout)
 
 
 if __name__ == "__main__":

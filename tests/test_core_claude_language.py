@@ -866,8 +866,8 @@ class LanguageSettingsDomainTests(unittest.TestCase):
         translator = create_translator("zh-Hans")
         self.assertEqual("Claude 设置", translator("menu.claude"))
         self.assertEqual("Codex / Claude 设置", translator("menu.codex"))
-        self.assertEqual("日志（1 / 2）", translator("menu.logsSummary", {"recovering": 1, "cooldown": 2}))
-        self.assertEqual("正在加载文档…", translator("common.secureEditorLoading"))
+        self.assertEqual("日志 (路由恢复 1, 冷却 2)", translator("menu.logsSummary", {"recovering": 1, "cooldown": 2}))
+        self.assertEqual("正在加载文档...", translator("common.secureEditorLoading"))
         self.assertEqual("provider-custom", translator("provider-custom"))
 
     def test_apply_refuses_an_external_disk_change(self) -> None:

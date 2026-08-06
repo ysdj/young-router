@@ -222,6 +222,65 @@ def _request_local_verified_fallback_deployment(
     return deployment
 
 
+def _request_local_cooling_only_candidate_deployment(
+    router: Any,
+    model: Any,
+    request_kwargs: Optional[dict],
+    *,
+    target_order: Any,
+) -> Optional[dict]:
+    if not isinstance(model, str) or not model.strip():
+        return None
+    request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
+    if _routing_module._is_route_recovery_poll_payload(request_kwargs):
+        return None
+    if _responses_request_module._request_is_fallback_attempt(request_kwargs):
+        return None
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "metadata",
+    ) or {}
+    try:
+        configured = _routing_module._router_configured_deployments(
+            router,
+            model,
+            team_id=metadata.get("user_api_key_team_id"),
+        )
+    except Exception:
+        return None
+
+    constraints = request_kwargs.copy()
+    if target_order is not None:
+        constraints["_target_order"] = target_order
+    candidates = _responses_request_module._with_retry_target_constraints(
+        list(configured or []),
+        constraints,
+    )
+    if len(candidates) != 1:
+        return None
+    available, cooldown_deployments, cooldown_filtered = (
+        _routing_module._with_active_deployment_cooldowns(
+            candidates,
+            request_kwargs=constraints,
+        )
+    )
+    if available or not cooldown_filtered:
+        return None
+
+    deployment = candidates[0]
+    _trace_module._route_trace(
+        "request_local_cooling_only_candidate_selected",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=model,
+        target_order=target_order,
+        deployment=_routing_module._trace_deployment(deployment),
+        cooldown_deployments=cooldown_deployments,
+        request=_trace_module._trace_request_summary(request_kwargs),
+    )
+    return deployment
+
+
 def _install_routing_constraint_patch() -> None:
     try:
         from litellm.router import Router
@@ -324,6 +383,13 @@ def _install_routing_constraint_patch() -> None:
                         verified_ids=verified_ids,
                         target_order=target_order,
                     )
+                    if deployment is None and not verified_ids:
+                        deployment = _request_local_cooling_only_candidate_deployment(
+                            self,
+                            model,
+                            request_kwargs,
+                            target_order=target_order,
+                        )
                     if deployment is None:
                         raise
                     return deployment
@@ -402,6 +468,13 @@ def _install_routing_constraint_patch() -> None:
                     verified_ids=verified_ids,
                     target_order=target_order,
                 )
+                if deployment is None and not verified_ids:
+                    deployment = _request_local_cooling_only_candidate_deployment(
+                        self,
+                        model,
+                        request_kwargs,
+                        target_order=target_order,
+                    )
                 if deployment is None:
                     raise
                 return deployment
@@ -544,7 +617,22 @@ def _install_selected_deployment_marker_patch() -> None:
     async def patched_make_call(self: Any, original_function: Any, *args: Any, **kwargs: Any) -> Any:
         token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
         try:
-            return await original_make_call(self, original_function, *args, **kwargs)
+            response = await original_make_call(self, original_function, *args, **kwargs)
+            marker = _CURRENT_SELECTED_DEPLOYMENT.get()
+            if marker is not None:
+                # LiteLLM invokes the streaming-iterator hook after make_call
+                # returns.  Persist the selected route on the request object
+                # before the context marker is reset so an initial stream
+                # failure can exclude the route that actually failed.
+                _routing_module._apply_selected_deployment_marker_to_request(
+                    kwargs,
+                    marker,
+                )
+                response = _routing_module._wrap_response_with_selected_deployment_marker(
+                    response,
+                    marker,
+                )
+            return response
         except Exception as exc:
             marker = _CURRENT_SELECTED_DEPLOYMENT.get()
             if marker is not None and _routing_module._is_current_upstream_surface_incompatible_error(

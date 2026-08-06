@@ -529,6 +529,17 @@ class CoreServiceController:
         except Exception:
             raise RuntimeError("Provider/model configuration is invalid") from None
 
+    def _clear_transient_routing_state(self) -> None:
+        """Remove recovery/cooldown data before creating a new proxy."""
+
+        for path in (self.paths.recovery, self.paths.cooldowns):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RuntimeError("Transient routing state could not be reset") from exc
+
     def status(self) -> dict[str, Any]:
         pid = self._pid()
         port = self._configured_port()
@@ -593,6 +604,7 @@ class CoreServiceController:
         if current["state"] == "unhealthy":
             raise RuntimeError("A managed LiteLLM service is already active")
         self._stage_runtime_config()
+        self._clear_transient_routing_state()
         self.paths.runtime_config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         environment = self._runtime_env()
         owner_token = secrets.token_urlsafe(OWNER_TOKEN_BYTES)
@@ -609,24 +621,36 @@ class CoreServiceController:
                 "-c",
                 "from litellm import run_server; run_server()",
             ]
-        command = [
-            *launcher,
-            "--config",
-            str(self.paths.runtime_config),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--num_workers",
-            str(workers),
-            "--telemetry",
-            "False",
-        ]
-        # Uvicorn starts macOS workers with ``spawn``.  Gunicorn preloads the
-        # proxy and forks those workers, which can abort when an imported
-        # dependency reaches the Objective-C runtime after fork.
-        if os.name != "nt" and sys.platform != "darwin":
-            command.append("--run_gunicorn")
+        if os.name != "nt" and sys.platform == "darwin":
+            command = [
+                self.python,
+                "-m",
+                "litellm_menu.macos_proxy",
+                "--config",
+                str(self.paths.runtime_config),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--workers",
+                str(workers),
+            ]
+        else:
+            command = [
+                *launcher,
+                "--config",
+                str(self.paths.runtime_config),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--num_workers",
+                str(workers),
+                "--telemetry",
+                "False",
+            ]
+            if os.name != "nt":
+                command.append("--run_gunicorn")
         server_log = self.paths.root / "menu-server.log"
         server_log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:

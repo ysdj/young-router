@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -335,6 +336,55 @@ class SiteCustomizeTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "{}")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS SystemConfiguration behavior")
+    def test_cached_macos_proxy_lookup_never_reenters_system_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            runtime = temp / "runtime"
+            runtime.mkdir()
+            snapshot = json.dumps(
+                {
+                    "source": "macos",
+                    "proxies": {"https": "http://system-proxy.example:8080"},
+                    "settings": {
+                        "exclude_simple": True,
+                        "exceptions": ["*.example.test"],
+                    },
+                }
+            )
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import os
+                    import urllib.request
+                    from sitecustomize import _SYSTEM_PROXY_LOOKUP_PATCH_ATTR
+
+                    assert getattr(urllib.request.getproxies, _SYSTEM_PROXY_LOOKUP_PATCH_ATTR)
+                    assert getattr(urllib.request.proxy_bypass, _SYSTEM_PROXY_LOOKUP_PATCH_ATTR)
+                    assert "LITELLM_MENU_SYSTEM_PROXY_SNAPSHOT" not in os.environ
+                    print(urllib.request.getproxies())
+                    print(urllib.request.proxy_bypass("printer"))
+                    print(urllib.request.proxy_bypass("service.example.test"))
+                    print(urllib.request.proxy_bypass("public.test"))
+                    """
+                ),
+                extra_env={"LITELLM_MENU_SYSTEM_PROXY_SNAPSHOT": snapshot},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                [
+                    "{'https': 'http://system-proxy.example:8080'}",
+                    "True",
+                    "True",
+                    "False",
+                ],
+                result.stdout.strip().splitlines(),
+            )
 
 
 if __name__ == "__main__":

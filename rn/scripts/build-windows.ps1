@@ -23,6 +23,8 @@ try {
   if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv is required to build the self-contained Windows Core runtime."
   }
+  & uv run --no-project --python 3.12 (Join-Path $ProjectRoot "scripts\update_litellm.py")
+  if ($LASTEXITCODE -ne 0) { throw "Could not update LiteLLM to the latest stable release." }
   if (-not (Test-Path (Join-Path $AppRoot "windows"))) {
     throw "React Native Windows host project is missing at rn/apps/windows/windows."
   }

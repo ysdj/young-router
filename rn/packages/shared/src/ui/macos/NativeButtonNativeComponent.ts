@@ -4,6 +4,7 @@ import type { DirectEventHandler, WithDefault } from "react-native/Libraries/Typ
 
 export interface NativeButtonProps extends ViewProps {
   title: string;
+  symbol?: string;
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: WithDefault<boolean, false>;

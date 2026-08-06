@@ -27,7 +27,7 @@ const featureLabels: Record<string, string> = {
   remote_plugin: "远程插件",
   code_mode: "代码模式",
   js_repl: "JavaScript REPL",
-  experimental_use_unified_exec_tool: "统一执行工具（实验性）",
+  experimental_use_unified_exec_tool: "统一执行工具 实验性",
   shell_snapshot: "Shell 快照",
   shell_tool: "Shell 工具",
   skill_mcp_dependency_install: "技能 / MCP 依赖安装",
@@ -35,7 +35,7 @@ const featureLabels: Record<string, string> = {
 };
 
 const optionLabels: Record<string, string> = {
-  "": "（空）",
+  "": "空",
   auto: "自动",
   file: "文件",
   keyring: "钥匙串",
@@ -95,8 +95,8 @@ const optionLabels: Record<string, string> = {
   powershell: "PowerShell",
   dark: "深色",
   light: "浅色",
-  "dark-daltonized": "深色（色觉辅助）",
-  "light-daltonized": "浅色（色觉辅助）",
+  "dark-daltonized": "深色 色觉辅助",
+  "light-daltonized": "浅色 色觉辅助",
   "dark-ansi": "深色 ANSI",
   "light-ansi": "浅色 ANSI",
   default: "默认",
@@ -107,7 +107,7 @@ const optionLabels: Record<string, string> = {
   tmux: "tmux",
   iterm2: "iTerm2",
   terminal_bell: "终端铃声",
-  iterm2_with_bell: "iTerm2（带铃声）",
+  iterm2_with_bell: "iTerm2 带铃声",
   kitty: "kitty",
   ghostty: "Ghostty",
   terminal: "终端",
@@ -139,7 +139,7 @@ const validationLabels: Record<string, string> = {
 };
 
 function isChinese(translate: Translator): boolean {
-  return translate("common.empty") === "（空）";
+  return translate("common.empty") === "空";
 }
 
 export function assistantSettingOptions(values: Array<string | AssistantSettingOption>, translate: Translator): AssistantSettingOption[] {
@@ -151,7 +151,7 @@ export function assistantSettingOptions(values: Array<string | AssistantSettingO
 
 export function codexFeatureLabel(key: string, translate: Translator): string {
   if (!isChinese(translate)) return key;
-  return featureLabels[key] ?? "其他功能（请在原始配置中编辑）";
+  return featureLabels[key] ?? "其他功能 请在原始配置中编辑";
 }
 
 export function localizeCodexValidationMessage(message: string, translate: Translator): string {

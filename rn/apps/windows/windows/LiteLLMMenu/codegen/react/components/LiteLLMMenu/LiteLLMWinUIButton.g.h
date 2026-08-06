@@ -26,6 +26,7 @@ struct LiteLLMWinUIButtonProps : winrt::implements<LiteLLMWinUIButtonProps, winr
      if (cloneFrom) {
        auto cloneFromProps = cloneFrom.as<LiteLLMWinUIButtonProps>();
        title = cloneFromProps->title;
+       symbol = cloneFromProps->symbol;
        disabled = cloneFromProps->disabled;
        primary = cloneFromProps->primary;
        destructive = cloneFromProps->destructive;
@@ -41,6 +42,9 @@ struct LiteLLMWinUIButtonProps : winrt::implements<LiteLLMWinUIButtonProps, winr
 
   REACT_FIELD(title)
   std::string title;
+
+  REACT_FIELD(symbol)
+  std::optional<std::string> symbol;
 
   REACT_FIELD(disabled)
   std::optional<bool> disabled{};

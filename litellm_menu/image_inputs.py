@@ -191,6 +191,114 @@ def _collect_image_data_url_sizes(value: Any, sizes: List[int]) -> None:
             _collect_image_data_url_sizes(child, sizes)
 
 
+def _image_input_stats(value: Any) -> dict[str, int]:
+    stats = {
+        "image_count": 0,
+        "inline_image_count": 0,
+        "inline_image_bytes": 0,
+        "largest_inline_image_bytes": 0,
+    }
+
+    def visit(current: Any) -> None:
+        if isinstance(current, dict):
+            item_type = current.get("type")
+            image_reference: Any = None
+            is_image_part = (
+                isinstance(item_type, str)
+                and item_type in {"input_image", "image_url"}
+            )
+            if is_image_part:
+                image_reference = (
+                    current.get("image_url")
+                    or current.get("url")
+                    or current.get("file_id")
+                )
+            elif isinstance(current.get("image_url"), (str, dict)):
+                is_image_part = True
+                image_reference = current.get("image_url")
+            if is_image_part:
+                stats["image_count"] += 1
+                reference = _image_reference_string(image_reference)
+                size = _image_data_url_size(reference)
+                if size:
+                    stats["inline_image_count"] += 1
+                    stats["inline_image_bytes"] += size
+                    stats["largest_inline_image_bytes"] = max(
+                        stats["largest_inline_image_bytes"],
+                        size,
+                    )
+                return
+            for child in current.values():
+                visit(child)
+            return
+        if isinstance(current, list):
+            for child in current:
+                visit(child)
+
+    visit(value)
+    return stats
+
+
+def _image_input_budget(request_kwargs: Optional[dict]) -> Optional[dict[str, Any]]:
+    """Return numeric image sizes split at the immutable encrypted boundary."""
+    request_kwargs = request_kwargs or {}
+    total = {
+        "image_count": 0,
+        "inline_image_count": 0,
+        "inline_image_bytes": 0,
+        "largest_inline_image_bytes": 0,
+    }
+    prefix = {
+        "image_count": 0,
+        "inline_image_count": 0,
+        "inline_image_bytes": 0,
+        "largest_inline_image_bytes": 0,
+    }
+    suffix = {
+        "image_count": 0,
+        "inline_image_count": 0,
+        "inline_image_bytes": 0,
+        "largest_inline_image_bytes": 0,
+    }
+
+    for key in ("input", "messages"):
+        value = request_kwargs.get(key)
+        value_stats = _image_input_stats(value)
+        suffix_value = _image_bounding_suffix(value)
+        suffix_stats = _image_input_stats(suffix_value)
+        if isinstance(value, list):
+            prefix_value = value[: len(value) - len(suffix_value)]
+        else:
+            prefix_value = []
+        prefix_stats = _image_input_stats(prefix_value)
+        for name in total:
+            total[name] += value_stats[name]
+            suffix[name] += suffix_stats[name]
+            prefix[name] += prefix_stats[name]
+
+    if total["image_count"] == 0:
+        return None
+
+    return {
+        "image_count": total["image_count"],
+        "inline_image_count": total["inline_image_count"],
+        "inline_image_bytes": total["inline_image_bytes"],
+        "largest_inline_image_bytes": total["largest_inline_image_bytes"],
+        "encrypted_prefix_image_count": prefix["image_count"],
+        "encrypted_prefix_inline_image_count": prefix["inline_image_count"],
+        "encrypted_prefix_inline_image_bytes": prefix["inline_image_bytes"],
+        "encrypted_prefix_largest_inline_image_bytes": prefix["largest_inline_image_bytes"],
+        "new_suffix_image_count": suffix["image_count"],
+        "new_suffix_inline_image_count": suffix["inline_image_count"],
+        "new_suffix_inline_image_bytes": suffix["inline_image_bytes"],
+        "new_suffix_largest_inline_image_bytes": suffix["largest_inline_image_bytes"],
+        "encrypted_boundary_present": any(
+            _value_has_encrypted_content(request_kwargs.get(key))
+            for key in ("input", "messages")
+        ),
+    }
+
+
 def _value_has_encrypted_content(value: Any) -> bool:
     if isinstance(value, dict):
         encrypted_content = value.get("encrypted_content")

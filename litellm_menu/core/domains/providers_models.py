@@ -448,10 +448,19 @@ class ProvidersModelsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Provider configuration could not be imported") from None
 
-    def _refresh_multiplier(self) -> None:
+    def prepare_multiplier_refresh(self) -> dict[str, Any]:
+        return {"domain_revision": self.revision, "config_path": self.config_path}
+
+    @staticmethod
+    def perform_multiplier_refresh(prepared: Mapping[str, Any]) -> Mapping[str, Any]:
         import provider_billing
 
-        payload = provider_billing.collect_billing(self.config_path, timeout=5.0)
+        config_path = prepared.get("config_path")
+        if not isinstance(config_path, Path):
+            raise LegacyDomainError("Provider multiplier configuration is unavailable")
+        return provider_billing.collect_billing(config_path, timeout=5.0)
+
+    def _apply_multiplier_refresh(self, payload: Mapping[str, Any]) -> None:
         providers = payload.get("providers", []) if isinstance(payload, Mapping) else []
         overlay: dict[str, dict[str, dict[str, Any]]] = {}
         if isinstance(providers, Sequence) and not isinstance(providers, (str, bytes, bytearray)):
@@ -478,6 +487,24 @@ class ProvidersModelsDomain:
             "available": True,
             "summary": redact(summary) if isinstance(summary, Mapping) else {},
         }
+
+    def commit_multiplier_refresh(
+        self,
+        prepared: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        if prepared.get("domain_revision") != self.revision:
+            return self.snapshot(), False
+        self._apply_multiplier_refresh(payload)
+        self.revision += 1
+        result = self.snapshot()
+        result["operation_summary"] = copy.deepcopy(self._last_operation)
+        return result, True
+
+    def _refresh_multiplier(self) -> None:
+        prepared = self.prepare_multiplier_refresh()
+        payload = self.perform_multiplier_refresh(prepared)
+        self._apply_multiplier_refresh(payload)
 
     def _import_link(self, link: str) -> None:
         try:

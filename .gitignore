@@ -20,6 +20,5 @@ artifacts/
 LiteLLM Menu.app/
 .litellm-menu/
 .preview-verify/
-tmp/
 menu.litellm.proxy.runtime.plist
 *audit*.png

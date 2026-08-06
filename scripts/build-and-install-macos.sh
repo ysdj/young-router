@@ -156,7 +156,10 @@ proxy_port_for_app() {
   while read -r process_pid; do
     [[ -n "$process_pid" ]] || continue
     command=$(ps -p "$process_pid" -o command= 2>/dev/null || true)
-    [[ "$command" == *"run_server()"* ]] || continue
+    if [[ "$command" != *"run_server()"* \
+      && "$command" != *" -m litellm_menu.macos_proxy "* ]]; then
+      continue
+    fi
     port=$(awk '{ for (field = 1; field < NF; field += 1) if ($field == "--port") { print $(field + 1); exit } }' <<<"$command")
     if [[ "$port" =~ ^[0-9]+$ ]]; then
       printf '%s\n' "$port"
@@ -264,6 +267,9 @@ fi
 if [[ -n "$DEVELOPER_DIR" ]]; then
   export DEVELOPER_DIR
 fi
+
+"$ROOT/scripts/update-litellm.sh"
+export LITELLM_MENU_LITELLM_VERSION_UPDATED=1
 
 # The installed app already carries the exact portable Python runtime needed
 # by repeat local builds. Reuse it only when no caller supplied another

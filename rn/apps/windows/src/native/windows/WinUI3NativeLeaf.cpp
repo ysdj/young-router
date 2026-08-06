@@ -20,6 +20,7 @@ constexpr UINT kTrayMessage = WM_APP + 31;
 constexpr UINT kQuitMessage = WM_APP + 32;
 constexpr UINT kTrayMenuFirstCommand = 41000;
 constexpr size_t kMaxEditorBytes = 2 * 1024 * 1024;
+constexpr double kUIFontSize = 13.0;
 
 struct ContentSize {
   LONG width;
@@ -367,6 +368,7 @@ bool WinUI3NativeLeaf::Confirm(
   root.Margin(xaml::Thickness{20, 20, 20, 20});
 
   controls::TextBlock body;
+  body.FontSize(kUIFontSize);
   body.Text(winrt::hstring(message));
   body.TextWrapping(xaml::TextWrapping::Wrap);
   root.Children().Append(body);
@@ -376,8 +378,10 @@ bool WinUI3NativeLeaf::Confirm(
   actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
   actions.Spacing(8);
   controls::Button cancel;
+  cancel.FontSize(kUIFontSize);
   cancel.Content(winrt::box_value(winrt::hstring(Localized("cancel", L"Cancel"))));
   controls::Button confirm;
+  confirm.FontSize(kUIFontSize);
   confirm.Content(winrt::box_value(winrt::hstring(
       confirm_label.empty() ? Localized("ok", L"OK") : std::wstring(confirm_label))));
   actions.Children().Append(cancel);
@@ -425,6 +429,7 @@ void WinUI3NativeLeaf::ShowReadOnlyText(
   actions.Margin(xaml::Thickness{16, 0, 16, 16});
   actions.SetValue(controls::Grid::RowProperty(), winrt::box_value(1));
   controls::Button close;
+  close.FontSize(kUIFontSize);
   close.Content(winrt::box_value(winrt::hstring(close_label)));
   actions.Children().Append(close);
   root.Children().Append(actions);
@@ -512,16 +517,18 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
 
   controls::TextBlock title;
   title.Text(Localized("modelChooserHeading", L"Choose models to add"));
-  title.FontSize(16);
+  title.FontSize(kUIFontSize);
   root.Children().Append(title);
 
   controls::TextBlock subtitle;
+  subtitle.FontSize(kUIFontSize);
   subtitle.Text(Localized("modelChooserProvider", L"Provider") + L": " + provider_name +
                 L"    " + Localized("modelChooserKey", L"Key") + L": " + key_name);
   subtitle.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
   root.Children().Append(subtitle);
 
   controls::TextBox search;
+  search.FontSize(kUIFontSize);
   search.PlaceholderText(Localized("modelChooserSearch", L"Search models"));
   root.Children().Append(search);
 
@@ -534,10 +541,12 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   selection_buttons.Orientation(controls::Orientation::Horizontal);
   selection_buttons.Spacing(8);
   controls::Button all;
+  all.FontSize(kUIFontSize);
   all.Content(winrt::box_value(Localized("modelChooserAll", L"All")));
   winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetHelpText(
       all, Localized("modelChooserSelectAllVisible", L"Select all visible models"));
   controls::Button invert;
+  invert.FontSize(kUIFontSize);
   invert.Content(winrt::box_value(Localized("modelChooserInvert", L"Invert")));
   winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetHelpText(
       invert, Localized("modelChooserInvertVisible", L"Invert visible model selection"));
@@ -547,6 +556,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   selection_buttons.Children().Append(invert);
   controls_row.Children().Append(selection_buttons);
   controls::TextBlock summary;
+  summary.FontSize(kUIFontSize);
   state->summary = summary;
   summary.VerticalAlignment(xaml::VerticalAlignment::Center);
   summary.HorizontalAlignment(xaml::HorizontalAlignment::Right);
@@ -568,6 +578,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   list_host.Height(420);
   list_host.Children().Append(list);
   controls::TextBlock empty_state;
+  empty_state.FontSize(kUIFontSize);
   empty_state.HorizontalAlignment(xaml::HorizontalAlignment::Center);
   empty_state.VerticalAlignment(xaml::VerticalAlignment::Center);
   empty_state.TextAlignment(xaml::TextAlignment::Center);
@@ -583,8 +594,10 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
   actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
   actions.Spacing(8);
   controls::Button cancel;
+  cancel.FontSize(kUIFontSize);
   cancel.Content(winrt::box_value(winrt::hstring(Localized("cancel", L"Cancel"))));
   controls::Button add;
+  add.FontSize(kUIFontSize);
   add.Content(winrt::box_value(Localized("modelChooserAddSelected", L"Add Selected")));
   add.IsEnabled(false);
   state->add = add;
@@ -610,6 +623,7 @@ std::optional<std::vector<std::wstring>> WinUI3NativeLeaf::ChooseModelsToAdd(
       if (state->selected[index]) ++selected;
       if (!query.empty() && FoldModelSearchText(state->models[index]).find(query) == std::wstring::npos) continue;
       controls::CheckBox item;
+      item.FontSize(kUIFontSize);
       item.Content(winrt::box_value(state->models[index]));
       item.IsChecked(state->selected[index]);
       item.HorizontalAlignment(xaml::HorizontalAlignment::Stretch);
@@ -715,6 +729,7 @@ std::optional<NativeSecretEditResult> WinUI3NativeLeaf::EditSecret(
   root.Spacing(12);
   root.Margin(xaml::Thickness{20, 20, 20, 20});
   controls::PasswordBox input;
+  input.FontSize(kUIFontSize);
   input.MaxLength(16384);
   root.Children().Append(input);
 
@@ -723,14 +738,17 @@ std::optional<NativeSecretEditResult> WinUI3NativeLeaf::EditSecret(
   actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
   actions.Spacing(8);
   controls::Button cancel;
+  cancel.FontSize(kUIFontSize);
   cancel.Content(winrt::box_value(winrt::hstring(Localized("cancel", L"Cancel"))));
   actions.Children().Append(cancel);
   controls::Button clear;
+  clear.FontSize(kUIFontSize);
   if (allow_clear && present) {
     clear.Content(winrt::box_value(winrt::hstring(Localized("clear", L"Clear"))));
     actions.Children().Append(clear);
   }
   controls::Button set;
+  set.FontSize(kUIFontSize);
   set.Content(winrt::box_value(winrt::hstring(Localized("set", L"Set"))));
   set.IsEnabled(false);
   actions.Children().Append(set);
@@ -786,9 +804,11 @@ std::optional<std::string> WinUI3NativeLeaf::EditNativeText(
   editor.MaxLength(static_cast<int>(kMaxEditorBytes));
 
   auto find = controls::TextBox();
+  find.FontSize(kUIFontSize);
   find.PlaceholderText(Localized("find", L"Find"));
   find.Margin(xaml::Thickness{8, 8, 8, 4});
   auto find_next = controls::Button();
+  find_next.FontSize(kUIFontSize);
   find_next.Content(winrt::box_value(Localized("findNext", L"Find Next")));
   find_next.Margin(xaml::Thickness{8, 4, 8, 8});
   find_next.HorizontalAlignment(xaml::HorizontalAlignment::Stretch);
@@ -819,6 +839,7 @@ std::optional<std::string> WinUI3NativeLeaf::EditNativeText(
   edit_menu.Title(Localized("edit", L"Edit"));
   auto add_edit_item = [&](std::string const& key, std::wstring_view fallback, auto handler) {
     controls::MenuFlyoutItem item;
+    item.FontSize(kUIFontSize);
     item.Text(Localized(key, fallback));
     item.Click(handler);
     edit_menu.Items().Append(item);
@@ -845,8 +866,10 @@ std::optional<std::string> WinUI3NativeLeaf::EditNativeText(
   actions.Margin(xaml::Thickness{12, 0, 12, 12});
   actions.SetValue(controls::Grid::RowProperty(), winrt::box_value(2));
   auto cancel = controls::Button();
+  cancel.FontSize(kUIFontSize);
   cancel.Content(winrt::box_value(Localized("cancel", L"Cancel")));
   auto stage = controls::Button();
+  stage.FontSize(kUIFontSize);
   stage.Content(winrt::box_value(Localized("stage", L"Stage")));
   actions.Children().Append(cancel);
   actions.Children().Append(stage);
@@ -965,6 +988,7 @@ winrt::Microsoft::UI::Xaml::Controls::SplitView WinUI3NativeLeaf::CreateSplitVie
 
 winrt::Microsoft::UI::Xaml::Controls::TextBox WinUI3NativeLeaf::CreateTextEditor() const {
   winrt::Microsoft::UI::Xaml::Controls::TextBox editor;
+  editor.FontSize(kUIFontSize);
   editor.AcceptsReturn(true);
   editor.AcceptsTab(true);
   editor.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
@@ -975,7 +999,9 @@ winrt::Microsoft::UI::Xaml::Controls::TextBox WinUI3NativeLeaf::CreateTextEditor
 }
 
 winrt::Microsoft::UI::Xaml::Controls::ComboBox WinUI3NativeLeaf::CreateSelector() const {
-  return winrt::Microsoft::UI::Xaml::Controls::ComboBox();
+  winrt::Microsoft::UI::Xaml::Controls::ComboBox selector;
+  selector.FontSize(kUIFontSize);
+  return selector;
 }
 
 void WinUI3NativeLeaf::EnsureTray() {
@@ -1055,7 +1081,7 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
         action.id == L"open-runtime-settings" ||
         action.id == L"open-codex-settings" ||
         action.id == L"open-webdav-settings") {
-      title += L"…";
+      title += L"...";
     }
     AppendMenuW(menu, flags,
         kTrayMenuFirstCommand + static_cast<UINT>(index), title.c_str());

@@ -99,6 +99,66 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual(source, path.read_text(encoding="utf-8"))
             collect.assert_called_once_with(path, timeout=5.0)
 
+    def test_multiplier_network_read_does_not_block_provider_edits(self) -> None:
+        payload = {
+            "providers": [
+                {
+                    "name": "primary",
+                    "models": [
+                        {
+                            "deployment_id": "00000071",
+                            "status": "ok",
+                            "detail": "Live provider multiplier is available.",
+                            "source": "sub2api-key-billing",
+                            "multiplier": {"status": "ok", "value": 0.25},
+                        }
+                    ],
+                }
+            ],
+            "summary": {"providers": 1, "models": 1, "available_models": 1, "unavailable_models": 0},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            core = CoreStore(domains=[ProvidersModelsDomain(path)])
+            multiplier_started = threading.Event()
+            release_multiplier = threading.Event()
+            refresh_result: dict[str, int] = {}
+
+            def collect(*_args: object, **_kwargs: object) -> dict[str, object]:
+                multiplier_started.set()
+                self.assertTrue(release_multiplier.wait(2))
+                return payload
+
+            def refresh() -> None:
+                refresh_result.update(core.dispatch(
+                    {"domain": "providers_models", "type": "providers.refresh_multiplier"},
+                    expected_revision=core.revision,
+                ))
+
+            with mock.patch("provider_billing.collect_billing", side_effect=collect):
+                refresh_thread = threading.Thread(target=refresh)
+                refresh_thread.start()
+                self.assertTrue(multiplier_started.wait(1))
+
+                edited = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.patch",
+                        "payload": {"provider_id": "primary", "changes": {"enabled": False}},
+                    },
+                    expected_revision=core.revision,
+                )
+                release_multiplier.set()
+                refresh_thread.join(2)
+
+            self.assertFalse(refresh_thread.is_alive())
+            self.assertEqual(edited["revision"], refresh_result["revision"])
+            snapshot = core.snapshot()
+            self.assertTrue(snapshot["drafts"]["providers_models"]["dirty"])
+            model = snapshot["domains"]["providers_models"]["providers"][0]["models"][0]
+            self.assertIsNone(model["multiplier"])
+
     def test_canonical_actions_stage_and_apply_without_exposing_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
@@ -900,6 +960,125 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
 
 class CodexSettingsDomainTests(unittest.TestCase):
+    def test_menu_catalog_toggle_preserves_staged_codex_edits_and_tracks_public_models(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "default-chat"\npersonality = "pragmatic"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            providers = ProvidersModelsDomain(runtime)
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[providers, codex])
+
+            staged = core.dispatch(
+                {"domain": "codex", "type": "patch", "payload": {"model_reasoning_effort": "high"}},
+                expected_revision=core.revision,
+            )
+            toggled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
+                expected_revision=staged["revision"],
+            )
+
+            applied_text = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn("model_catalog_json", applied_text)
+            self.assertNotIn("model_reasoning_effort", applied_text)
+            snapshot = core.snapshot()
+            self.assertEqual(toggled["revision"], snapshot["revision"])
+            self.assertTrue(snapshot["drafts"]["codex"]["dirty"])
+            self.assertTrue(snapshot["domains"]["codex"]["model_catalog"]["enabled"])
+            self.assertTrue(snapshot["domains"]["codex"]["model_catalog"]["restart_required"])
+            self.assertEqual("enabled", snapshot["domains"]["codex"]["model_catalog"]["change_reason"])
+            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
+
+            acknowledged = core.dispatch(
+                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
+                expected_revision=snapshot["revision"],
+            )
+            disabled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": False}},
+                expected_revision=acknowledged["revision"],
+            )
+            disabled_catalog = core.snapshot()["domains"]["codex"]["model_catalog"]
+            self.assertEqual(disabled["revision"], core.snapshot()["revision"])
+            self.assertFalse(disabled_catalog["enabled"])
+            self.assertTrue(disabled_catalog["restart_required"])
+            self.assertEqual("disabled", disabled_catalog["change_reason"])
+
+    def test_provider_apply_updates_enabled_catalog_and_requests_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "default-chat"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            providers = ProvidersModelsDomain(runtime)
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[providers, codex])
+
+            enabled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
+                expected_revision=core.revision,
+            )
+            acknowledged = core.dispatch(
+                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
+                expected_revision=enabled["revision"],
+            )
+            upstream_only = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.patch",
+                    "payload": {
+                        "provider_id": "primary",
+                        "model_id": "00000071",
+                        "changes": {"upstream_model": "openai/fast-chat"},
+                    },
+                },
+                expected_revision=acknowledged["revision"],
+            )
+            upstream_applied = core.apply("providers_models", revision=upstream_only["revision"])
+            unchanged_public_name = core.snapshot()["domains"]["codex"]["model_catalog"]
+            self.assertFalse(unchanged_public_name["restart_required"])
+            changed = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.patch",
+                    "payload": {
+                        "provider_id": "primary",
+                        "model_id": "00000071",
+                        "changes": {"name": "deepseek-v4-flash"},
+                    },
+                },
+                expected_revision=upstream_applied["revision"],
+            )
+            providers_applied = core.apply("providers_models", revision=changed["revision"])
+
+            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
+            self.assertFalse(core.snapshot()["domains"]["codex"]["model_catalog"]["restart_required"])
+
+            selected = core.dispatch(
+                {
+                    "domain": "codex",
+                    "type": "patch",
+                    "payload": {"model": "deepseek-v4-flash"},
+                },
+                expected_revision=providers_applied["revision"],
+            )
+            core.apply("codex", revision=selected["revision"])
+
+            snapshot = core.snapshot()
+            catalog_state = snapshot["domains"]["codex"]["model_catalog"]
+            self.assertTrue(catalog_state["restart_required"])
+            self.assertEqual("catalog_repaired", catalog_state["change_reason"])
+            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
+
     def test_sync_and_apply_preserve_unknown_toml_and_auth_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1016,6 +1195,45 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             saved = path.read_text(encoding="utf-8")
             self.assertIn("LITELLM_PORT=4100", saved)
             self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+
+    def test_runtime_schema_exposes_split_cooldown_write_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime-settings.env"
+            domain = RuntimeSettingsDomain(path)
+            settings = {
+                item["key"]: item for item in domain.snapshot()["settings"]
+            }
+
+            self.assertEqual(
+                "1",
+                settings["LITELLM_MENU_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED"]["value"],
+            )
+            self.assertEqual(
+                "0",
+                settings["LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"]["value"],
+            )
+            self.assertEqual(
+                "toggle",
+                settings["LITELLM_MENU_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED"]["kind"],
+            )
+            self.assertEqual(
+                "toggle",
+                settings["LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"]["kind"],
+            )
+
+            domain.dispatch(
+                "set_setting",
+                {
+                    "key": "LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED",
+                    "value": True,
+                },
+            )
+            domain.apply()
+
+            self.assertIn(
+                "LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED=1",
+                path.read_text(encoding="utf-8"),
+            )
 
     def test_retired_config_watch_values_load_once_and_are_removed_on_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

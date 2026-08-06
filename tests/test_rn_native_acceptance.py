@@ -365,6 +365,36 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("ToggleLaunchAtLogin", windows)
         self.assertIn("setLaunchAtLogin?: (enabled: boolean) => Promise<boolean>", platform)
 
+    def test_macos_codex_catalog_toggle_uses_a_separate_non_modal_restart_confirmation(self) -> None:
+        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
+        bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
+        platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
+
+        self.assertIn('id: "toggle-codex-model-catalog"', ui)
+        self.assertIn('checked: booleanValue(catalog.enabled)', ui)
+        self.assertIn('type: "codex.model_catalog.set"', ui)
+        self.assertNotIn("CodexRestartNotice", ui)
+        self.assertIn("native.showCodexRestartConfirmation({", ui)
+        self.assertIn("await native.restartCodex()", ui)
+        self.assertIn('"toggle-autostart", "toggle-codex-model-catalog", "separator"', leaf)
+        self.assertIn('withBundleIdentifier: "com.openai.codex"', leaf)
+        self.assertIn("func restartCodex() -> Bool", leaf)
+        restart = leaf.split("func restartCodex() -> Bool", 1)[1].split("func systemLocale", 1)[0]
+        self.assertIn("application.forceTerminate()", restart)
+        self.assertNotIn("application.terminate()", restart)
+        confirmation = leaf.split("func showCodexRestartConfirmation(", 1)[1].split("func showReadOnlyText", 1)[0]
+        self.assertIn("NSPanel(", confirmation)
+        self.assertIn("panel.isFloatingPanel = true", confirmation)
+        self.assertNotIn("runModal", confirmation)
+        self.assertIn("func showCodexRestartConfirmation", module)
+        self.assertIn("@objc func restartCodex", module)
+        self.assertIn("showCodexRestartConfirmation", bridge)
+        self.assertIn("RCT_EXTERN_METHOD(restartCodex:", bridge)
+        self.assertIn("showCodexRestartConfirmation?:", platform)
+        self.assertIn("restartCodex?: () => Promise<boolean>", platform)
+
     def test_shared_ui_owns_lifecycle_menu_actions_startup_and_safe_recovery(self) -> None:
         """Both native leaves route lifecycle commands through one React IPC path."""
         ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
@@ -475,11 +505,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
 
         self.assertIn("NSImage(size: NSSize(width: 22, height: 18))", leaf)
-        self.assertIn('("L" as NSString).draw(', leaf)
-        self.assertIn("NSFont.systemFont(ofSize: 18, weight: .regular)", leaf)
-        self.assertIn("NSFont.systemFont(ofSize: 13, weight: .regular)", leaf)
-        self.assertIn("NSPoint(x: 2.5, y: -1)", leaf)
-        self.assertIn("NSPoint(x: 13, y: 2)", leaf)
+        self.assertEqual(leaf.count('("L" as NSString).draw('), 2)
+        self.assertIn("NSFont.systemFont(ofSize: 15, weight: .light)", leaf)
+        self.assertIn("NSFont.systemFont(ofSize: 13, weight: .light)", leaf)
+        self.assertIn("NSPoint(x: 3, y: 0)", leaf)
+        self.assertIn("NSPoint(x: 11.5, y: 1)", leaf)
         self.assertIn("image.isTemplate = true", leaf)
         self.assertIn("NSStatusItem.squareLength", leaf)
         self.assertIn("statusItem.button?.image = Self.statusBarIcon", leaf)
@@ -774,13 +804,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         relay_ui = (SHARED / "ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
         self.assertIn('language: snapshot?.language ?? "system"', relay_ui)
         self.assertIn("const rememberPasswordRef = useRef(false);", relay_ui)
-        self.assertIn("addAccount(detected, origin.trim(), rememberPasswordRef.current)", relay_ui)
+        self.assertIn("const [manualType, setManualType] = useState<RelayType>();", relay_ui)
+        self.assertIn("const accountType = detected ?? manualType;", relay_ui)
+        self.assertIn("NativeSegmentedControl", relay_ui)
+        self.assertIn("addAccount(accountType, origin.trim(), rememberPasswordRef.current)", relay_ui)
         self.assertIn(
             "typeDetectionRequest.current += 1;\n"
             "    setAdding(false);",
             relay_ui,
         )
-        self.assertIn("onChangeText={(value) => { typeDetectionRequest.current += 1; setOrigin(value); setTypeDetection(undefined); }}", relay_ui)
+        self.assertIn("onChangeText={(value) => { typeDetectionRequest.current += 1; setOrigin(value); setTypeDetection(undefined); setManualType(undefined); }}", relay_ui)
         self.assertIn("NativeCheckbox", relay_ui)
         self.assertIn('title={translate("relay.importSelected")}', relay_ui)
 
@@ -815,7 +848,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('guard type == "sub2api" else { return originURL }', mac_leaf)
         self.assertIn('originURL.appendingPathComponent("login")', mac_leaf)
         self.assertIn("private let loadingOverlay = NSVisualEffectView()", mac_leaf)
-        self.assertIn(': text("Loading sign-in page…", "正在加载登录页面…")', mac_leaf)
+        self.assertIn(': text("Loading sign-in page...", "正在加载登录页面...")', mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didStartProvisionalNavigation", mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didFailProvisionalNavigation", mac_leaf)
         self.assertIn("let passwordExpression = rememberPassword", mac_leaf)
@@ -1069,10 +1102,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NSSecureTextField *_field", mac)
         self.assertIn("NSTextField *_plainField", mac)
         self.assertIn("loadProviderAPIKeyForTarget", mac)
-        self.assertIn("_field.usesSingleLineMode = YES", mac)
-        self.assertIn("_field.lineBreakMode = NSLineBreakByTruncatingTail", mac)
-        self.assertIn("fieldCell.wraps = NO", mac)
-        self.assertIn("fieldCell.scrollable = YES", mac)
+        self.assertIn("void ConfigureSingleLineTextField(NSTextField *field)", mac)
+        self.assertIn("field.usesSingleLineMode = YES", mac)
+        self.assertIn("field.lineBreakMode = NSLineBreakByTruncatingTail", mac)
+        self.assertIn("cell.wraps = NO", mac)
+        self.assertIn("cell.scrollable = YES", mac)
+        self.assertIn("ConfigureSingleLineTextField(_field);", mac)
+        self.assertIn("ConfigureSingleLineTextField(_plainField);", mac)
         self.assertIn("stageSecretForDomain", mac)
         self.assertIn("stageSecretForDomain(", mac_core)
         self.assertIn("PasswordBox password_box_", windows)
@@ -1245,7 +1281,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertIn(native_control, controls)
 
         self.assertIn("NSTableCellView *cell", controls)
-        self.assertIn("label.font = [NSFont systemFontOfSize:13];", controls)
+        self.assertIn("NSFont *TableCellFont()", controls)
+        self.assertIn("label.font = TableCellFont();", controls)
+        self.assertIn("column.headerCell.attributedStringValue = TableHeaderTitle(columnTitle);", controls)
         self.assertIn("constraintEqualToAnchor:cell.leadingAnchor constant:8", controls)
 
     def test_macos_tables_only_show_scrollers_for_overflow(self) -> None:
@@ -1266,15 +1304,20 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("constrainBoundsRect", controls)
         self.assertIn("@interface LiteLLMTableView : NSTableView", controls)
         self.assertIn("_tableView.acceptsVerticalScroll = NO", controls)
-        self.assertIn("column.minWidth = 96;", controls)
+        self.assertIn("column.minWidth = MIN(96, width);", controls)
         self.assertIn("column.maxWidth = CGFLOAT_MAX;", controls)
         self.assertIn("const bool dataChanged = columnsChanged || compactChanged || nextDataSignature != _dataSignature;", controls)
         self.assertIn("- (void)updateScrollerVisibility", controls)
         self.assertIn("const CGFloat headerHeight = _tableView.headerView == nil ? 0 : NSHeight(_tableView.headerView.frame);", controls)
         self.assertIn("const CGFloat dataViewportHeight = MAX(0, NSHeight(_scrollView.contentView.bounds) - headerHeight);", controls)
-        self.assertIn("const CGFloat rowsHeight = _tableView.numberOfRows * _tableView.rowHeight;", controls)
+        self.assertIn("const NSInteger rowCount = _tableView.numberOfRows;", controls)
+        self.assertIn("NSMaxY([_tableView rectOfRow:rowCount - 1])", controls)
+        self.assertNotIn("_tableView.numberOfRows * _tableView.rowHeight", controls)
         self.assertIn("const BOOL needsVerticalScroller = rowsHeight > dataViewportHeight;", controls)
-        self.assertIn("const BOOL needsHorizontalScroller = contentWidth > NSWidth(visibleBounds) + 0.5;", controls)
+        self.assertIn("const CGFloat horizontalChromeWidth = MAX(", controls)
+        self.assertIn("const CGFloat availableColumnWidth = NSWidth(visibleBounds) + horizontalChromeWidth;", controls)
+        self.assertIn("const BOOL needsHorizontalScroller = contentWidth > availableColumnWidth + 0.5;", controls)
+        self.assertIn("_automaticLastColumnFill = _scrollView.hasHorizontalScroller", controls)
         self.assertIn("MAX(dataViewportHeight, rowsHeight));", controls)
         self.assertIn("_scrollView.acceptsVerticalScroll = needsVerticalScroller;", controls)
         self.assertIn("_tableView.acceptsVerticalScroll = needsVerticalScroller;", controls)
@@ -1313,8 +1356,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         )[0]
 
         self.assertIn("const BOOL labelChanged = oldViewProps.label != newViewProps.label;", checkbox)
+        self.assertIn("const BOOL labelVisibilityChanged = oldViewProps.labelVisible != newViewProps.labelVisible;", checkbox)
+        self.assertIn('_checkbox.title = newViewProps.labelVisible ? label : @"";', checkbox)
+        self.assertIn("_checkbox.accessibilityLabel = label;", checkbox)
         self.assertIn("const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;", checkbox)
-        self.assertIn("if (labelChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", checkbox)
+        self.assertIn("if (labelChanged || labelVisibilityChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", checkbox)
         self.assertNotIn("[_host setNeedsLayout:YES];", switch)
 
     def test_macos_choice_controls_keep_the_native_selection_until_react_confirms_it(self) -> None:
@@ -1337,7 +1383,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (labelsChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", segmented)
         self.assertNotIn("_control.selectedSegment = SegmentIndex(viewProps.labels", segmented)
         self.assertIn("const BOOL titleChanged = oldViewProps.title != newViewProps.title;", button)
-        self.assertIn("if (titleChanged || linkChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
+        self.assertIn("if (titleChanged || symbolChanged || linkChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
+        self.assertIn('symbolName = @"pause.fill";', controls)
+        self.assertIn('symbolName = @"play.fill";', controls)
+        self.assertIn('symbolName = @"trash";', controls)
+        self.assertIn("_button.imagePosition = symbolImage == nil ? NSNoImage : NSImageOnly;", button)
+
+        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        self.assertIn('const auto symbol = props.symbol.value_or("");', windows)
+        self.assertIn('icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));', windows)
+        self.assertIn('symbol == "pause" ? L"\\xE769" : symbol == "play" ? L"\\xE768" : L"\\xE74D"', windows)
 
     def test_native_boolean_controls_skip_unrelated_prop_rewrites(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
@@ -1346,6 +1401,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("const BOOL selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey;", mac)
         self.assertIn("if (selectionChanged || _tableView.selectedRow != selectedIndex)", mac)
         self.assertIn("if (selectionChanged && _scrollView.hasVerticalScroller) {\n      [_tableView scrollRowToVisible:selectedIndex];", mac)
+        self.assertIn("BOOL TableIsFollowingBottom(NSScrollView *scrollView, NSTableView *tableView)", mac)
+        self.assertIn("const BOOL initialDataLoad = _dataSignature.empty();", mac)
+        self.assertIn("(initialDataLoad || TableIsFollowingBottom(_scrollView, _tableView))", mac)
+        self.assertIn("const BOOL wasFollowingBottom = newViewProps.followBottom && dataChanged", mac)
+        self.assertIn("newViewProps.followBottom && dataChanged && wasFollowingBottom", mac)
         checkbox = windows.split("struct CheckboxComponentView final", 1)[1].split(
             "struct TableComponentView final", 1
         )[0]
@@ -1358,11 +1418,19 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ApplyProps(old_props);", switch)
         self.assertIn("if (value_changed) {\n      syncing_ = true;\n      toggle_.IsOn(props.value.value_or(false));", switch)
 
+        table = windows.split("struct TableComponentView final", 1)[1].split(
+            "struct TextEditorComponentView final", 1
+        )[0]
+        self.assertIn("bool ListIsFollowingBottom(ListView const& list)", windows)
+        self.assertIn("const bool was_following_bottom = props.followBottom.value_or(false) && rows_changed", table)
+        self.assertIn("(!has_applied_ || ListIsFollowingBottom(list_))", table)
+        self.assertIn("props.followBottom.value_or(false) && rows_changed && was_following_bottom", table)
+
     def test_table_scrollbars_only_appear_when_they_are_needed(self) -> None:
         native_controls = (SHARED / "ui" / "NativeControls.tsx").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
 
-        self.assertIn('tableFallback: { minHeight: 120 }', native_controls)
+        self.assertIn('tableFallback: { minHeight: 120, borderWidth: 1, borderColor: "#d4d4d8", overflow: "hidden" }', native_controls)
         self.assertNotIn('tableFallback: { minHeight: 120, overflow: "scroll" }', native_controls)
         table = windows.split("struct TableComponentView final", 1)[1].split(
             "struct TextEditorComponentView final", 1
@@ -1533,7 +1601,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # viewport behavior is still covered by the settings editors above;
         # the log surface must not regress to a giant raw text editor.
         self.assertNotIn('documentKey={`logs:${selected}`}', ui)
-        self.assertIn("const columns = logColumns(selected, translate);", ui)
+        self.assertIn("const columns = fitLogColumns(logColumns(selected, translate), tableWidth);", ui)
         self.assertIn('<NativeTable columns={columns.map(({ label, width }) => ({ label, width }))}', ui)
         self.assertIn("REACT_FIELD(documentKey)", windows_codegen)
 

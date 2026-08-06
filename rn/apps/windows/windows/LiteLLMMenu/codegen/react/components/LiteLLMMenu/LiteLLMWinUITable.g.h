@@ -35,6 +35,7 @@ struct LiteLLMWinUITableProps : winrt::implements<LiteLLMWinUITableProps, winrt:
        followBottom = cloneFromProps->followBottom;
        disabledRowKeys = cloneFromProps->disabledRowKeys;
        secondaryCellKeys = cloneFromProps->secondaryCellKeys;
+       spanningRowKeys = cloneFromProps->spanningRowKeys;
        onSelectionChange = cloneFromProps->onSelectionChange;
        onRowDoublePress = cloneFromProps->onRowDoublePress;  
      }
@@ -73,6 +74,9 @@ struct LiteLLMWinUITableProps : winrt::implements<LiteLLMWinUITableProps, winrt:
 
   REACT_FIELD(secondaryCellKeys)
   std::optional<std::vector<std::string>> secondaryCellKeys;
+
+  REACT_FIELD(spanningRowKeys)
+  std::optional<std::vector<std::string>> spanningRowKeys;
 
    // These fields can be used to determine if JS has registered for this event
   REACT_FIELD(onSelectionChange)

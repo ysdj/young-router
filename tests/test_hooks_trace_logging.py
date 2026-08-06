@@ -416,6 +416,52 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertEqual("public-chat", record["public_model"])
         self.assertEqual("openai/vendor-chat-tagged", record["upstream_model"])
         self.assertTrue(record["route_key"].startswith("model=public-chat /"))
+        self.assertEqual("selected", record["routing_state"])
+
+    def test_request_log_classifies_pre_route_failures_and_trace_reasons(self) -> None:
+        hooks, _ = load_hook_module()
+
+        no_deployment = RuntimeError(
+            "There are no healthy deployments for this model."
+        )
+        no_deployment.status_code = 400
+        no_deployment_record = hooks._request_log_record(
+            "failure",
+            {"model": "fresh-model", "exception": no_deployment},
+        )
+        self.assertEqual(
+            no_deployment_record["routing_state"],
+            "no_available_deployment",
+        )
+        self.assertEqual(
+            no_deployment_record["error"]["reason"],
+            "no-available-deployment",
+        )
+        self.assertEqual(
+            hooks._trace_exception(no_deployment)["reason"],
+            "no-available-deployment",
+        )
+
+        proxy_model_error_type = type("ProxyModelNotFoundError", (Exception,), {})
+        model_not_configured = proxy_model_error_type(
+            "No deployment configured for this model"
+        )
+        model_not_configured_record = hooks._request_log_record(
+            "failure",
+            {"model": "missing-model", "exception": model_not_configured},
+        )
+        self.assertEqual(
+            model_not_configured_record["routing_state"],
+            "model_not_configured",
+        )
+        self.assertEqual(
+            model_not_configured_record["error"]["reason"],
+            "model-not-configured",
+        )
+        self.assertEqual(
+            hooks._trace_exception(model_not_configured)["reason"],
+            "model-not-configured",
+        )
 
     def test_recent_request_timestamp_treats_naive_callback_time_as_local(self) -> None:
         hooks, _ = load_hook_module()
@@ -457,6 +503,7 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertEqual(record["error"]["type"], "ProviderError")
             self.assertEqual(record["error"]["status_code"], 429)
             self.assertEqual(record["error"]["reason"], "upstream-status-429")
+            self.assertEqual(record["routing_state"], "unselected")
             self.assertNotIn("SECRET_ERROR_BODY", raw)
             self.assertNotIn("SECRET_STANDARD_ERROR", raw)
             self.assertNotIn("SECRET_PROMPT_BODY", raw)

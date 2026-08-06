@@ -42,6 +42,11 @@ command -v pnpm >/dev/null 2>&1 || {
   exit 1
 }
 
+if [[ "${LITELLM_MENU_LITELLM_VERSION_UPDATED:-}" != "1" ]]; then
+  "$PROJECT_ROOT/scripts/update-litellm.sh"
+  export LITELLM_MENU_LITELLM_VERSION_UPDATED=1
+fi
+
 NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])')"
 if [[ "$NODE_MAJOR" -lt 22 ]]; then
   echo "Node.js 22 or later is required to build the React Native 0.85 macOS host." >&2
@@ -290,7 +295,7 @@ assert run_server is not None and BaseApplication is not None and UvicornWorker 
   exit 5
 }
 
-PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core, litellm_menu.core.__main__, codex_config, config_editor_core, configuration_package, external_provider_import, provider_billing, webdav.core'
+PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core, litellm_menu.core.__main__, litellm_menu.macos_proxy, codex_config, config_editor_core, configuration_package, external_provider_import, provider_billing, webdav.core'
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null
 PORTABLE_SMOKE="$RUNTIME_WORK/portable-core"
 copy_tree "$CORE" "$PORTABLE_SMOKE"

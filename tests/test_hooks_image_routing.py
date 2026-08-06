@@ -339,6 +339,132 @@ class HookImageRoutingTests(HookTestCase):
             hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
         )
 
+    def test_image_input_budget_separates_encrypted_prefix_from_new_suffix(self) -> None:
+        hooks, _ = load_hook_module()
+
+        import base64
+
+        prefix_url = "data:image/png;base64," + base64.b64encode(b"prefix-bytes").decode("ascii")
+        suffix_url = "data:image/png;base64," + base64.b64encode(b"suffix-bytes").decode("ascii")
+        request_kwargs = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": prefix_url}],
+                },
+                {"type": "compaction", "encrypted_content": "opaque-encrypted-summary"},
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": suffix_url}],
+                },
+            ]
+        }
+
+        budget = hooks._image_input_budget(request_kwargs)
+
+        self.assertIsNotNone(budget)
+        assert budget is not None
+        self.assertEqual(budget["image_count"], 2)
+        self.assertEqual(budget["encrypted_prefix_image_count"], 1)
+        self.assertEqual(budget["new_suffix_image_count"], 1)
+        self.assertEqual(budget["encrypted_prefix_inline_image_bytes"], len(b"prefix-bytes"))
+        self.assertEqual(budget["new_suffix_inline_image_bytes"], len(b"suffix-bytes"))
+        self.assertEqual(
+            budget["encrypted_prefix_largest_inline_image_bytes"],
+            len(b"prefix-bytes"),
+        )
+        self.assertEqual(
+            budget["new_suffix_largest_inline_image_bytes"],
+            len(b"suffix-bytes"),
+        )
+        self.assertTrue(budget["encrypted_boundary_present"])
+
+        summary = hooks._trace_request_summary(request_kwargs)
+        serialized = json.dumps(summary, ensure_ascii=False)
+        self.assertEqual(summary["image_budget"], budget)
+        self.assertNotIn("data:image", serialized)
+        self.assertNotIn(prefix_url, serialized)
+        self.assertNotIn(suffix_url, serialized)
+
+    def test_with_bounded_image_inputs_preserves_encrypted_prefix_while_bounding_suffix(
+        self,
+    ) -> None:
+        hooks, _ = load_hook_module()
+
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        oversized_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        prefix_url = "data:image/png;base64," + base64.b64encode(b"signed-prefix").decode("ascii")
+        request_kwargs = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": prefix_url}],
+                },
+                {"type": "compaction", "encrypted_content": "opaque-encrypted-summary"},
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": oversized_url}],
+                },
+            ]
+        }
+
+        modified = hooks._with_bounded_image_inputs(request_kwargs)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        bounded_prefix = modified["input"][0]["content"][0]["image_url"]
+        bounded_suffix = modified["input"][2]["content"][0]["image_url"]
+        self.assertEqual(bounded_prefix, prefix_url)
+        self.assertNotEqual(bounded_suffix, oversized_url)
+        self.assertLessEqual(
+            hooks._image_data_url_size(bounded_suffix),
+            hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
+        )
+
+    async def test_pre_call_image_budget_trace_contains_only_numeric_image_metadata(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+
+        import base64
+
+        image_url = "data:image/png;base64," + base64.b64encode(b"trace-only-image").decode("ascii")
+        request_kwargs = {
+            "request_id": "request-under-test",
+            "client_metadata": {"session_id": "session-under-test"},
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": image_url}],
+                }
+            ],
+        }
+        calls = []
+        original_trace = hooks._route_trace
+        hooks._route_trace = lambda event, **fields: calls.append((event, fields))
+        self.addCleanup(setattr, hooks, "_route_trace", original_trace)
+
+        await hook.async_pre_call_deployment_hook(request_kwargs, call_type="aresponses")
+
+        image_events = [fields for event, fields in calls if event == "image_input_budget"]
+        self.assertEqual(len(image_events), 1)
+        serialized = json.dumps(image_events[0], ensure_ascii=False)
+        self.assertNotIn("data:image", serialized)
+        self.assertNotIn(image_url, serialized)
+        self.assertEqual(image_events[0]["before"]["image_count"], 1)
+        self.assertEqual(image_events[0]["after"]["image_count"], 1)
+        self.assertFalse(image_events[0]["changed"])
+
     def test_with_bounded_image_inputs_enforces_each_multi_image_target(self) -> None:
         hooks, _ = load_hook_module()
 

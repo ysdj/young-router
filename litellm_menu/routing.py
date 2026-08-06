@@ -28,12 +28,16 @@ from .base import (
     _CURRENT_SELECTED_DEPLOYMENT,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _DEPLOYMENT_COOLDOWNS,
+    _DEPLOYMENT_COOLDOWN_COMPACTION_DEFAULT_ENABLED,
+    _DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV,
     _DEPLOYMENT_COOLDOWN_DEFAULT_FAILURES,
     _DEPLOYMENT_COOLDOWN_DEFAULT_SECONDS,
     _DEPLOYMENT_COOLDOWN_FILE_ENV,
     _DEPLOYMENT_COOLDOWN_FAILURES_ENV,
     _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR,
     _DEPLOYMENT_COOLDOWN_LOCK,
+    _DEPLOYMENT_COOLDOWN_ORDINARY_DEFAULT_ENABLED,
+    _DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED_ENV,
     _DEPLOYMENT_COOLDOWN_SECONDS_ENV,
     _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS,
     _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_LOCK,
@@ -114,6 +118,45 @@ _REQUEST_STARTED_TIMES: dict[str, tuple[float, datetime]] = {}
 _FIRST_STREAM_OUTPUT_TIMES_LOCK = threading.Lock()
 _FIRST_STREAM_OUTPUT_TIMES_MAX = 4096
 _FIRST_STREAM_OUTPUT_TIMES_TTL_SECONDS = 600.0
+
+
+class _SelectedDeploymentMarkerStream:
+    """Carry the route selected before a streaming iterator is consumed."""
+
+    def __init__(self, response: Any, marker: dict[str, Any]) -> None:
+        self._response = response
+        self._litellm_menu_selected_deployment_marker = marker
+
+    def __aiter__(self) -> AsyncIterator[Any]:
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[Any]:
+        async for chunk in self._response:
+            yield chunk
+
+    async def aclose(self) -> None:
+        close = getattr(self._response, "aclose", None)
+        if not callable(close):
+            return
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+
+
+def _wrap_response_with_selected_deployment_marker(
+    response: Any,
+    marker: Any,
+) -> Any:
+    if not isinstance(marker, dict) or not callable(getattr(response, "__aiter__", None)):
+        return response
+    if _selected_deployment_marker_from_response(response) is not None:
+        return response
+    return _SelectedDeploymentMarkerStream(response, marker)
+
+
+def _selected_deployment_marker_from_response(response: Any) -> Optional[dict[str, Any]]:
+    marker = getattr(response, "_litellm_menu_selected_deployment_marker", None)
+    return marker if isinstance(marker, dict) else None
 
 
 def _remember_request_time(
@@ -511,6 +554,16 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_ERROR,
         )
 
+    if status_code is None and getattr(
+        exception,
+        "responses_stream_incomplete",
+        False,
+    ):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+
     if _exception_indicates_network_connectivity_error(exception):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_NETWORK_ENV,
@@ -522,7 +575,7 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     ):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_RATE_LIMIT_ENV,
-            _RECOVERY_POLICY_COOLDOWN,
+            _RECOVERY_POLICY_RECOVERY,
         )
 
     if (
@@ -776,6 +829,23 @@ def _deployment_cooldown_seconds() -> float:
 
 def _deployment_cooldown_enabled() -> bool:
     return _deployment_cooldown_failure_threshold() > 0 and _deployment_cooldown_seconds() > 0
+
+
+def _deployment_cooldown_recording_enabled_for_request(
+    request_kwargs: Optional[dict],
+) -> bool:
+    """Whether this request class may add failures to the shared cooldown pool."""
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_kwargs
+    ):
+        return _env_bool(
+            _DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV,
+            _DEPLOYMENT_COOLDOWN_COMPACTION_DEFAULT_ENABLED,
+        )
+    return _env_bool(
+        _DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED_ENV,
+        _DEPLOYMENT_COOLDOWN_ORDINARY_DEFAULT_ENABLED,
+    )
 
 
 def _deployment_cooldown_file_path() -> Optional[str]:
@@ -1039,6 +1109,24 @@ def _request_log_record(
         _deployment_route_key_from_request(request_kwargs),
         limit=260,
     )
+    deployment_id = _state_module._safe_log_text(
+        _deployment_id_from_request(request_kwargs),
+        limit=180,
+    )
+    request_exception = _request_log_exception(request_kwargs, response_obj)
+    if route_key or deployment_id:
+        routing_state = "selected"
+    elif request_exception is not None and _is_no_deployments_available_error(
+        request_exception
+    ):
+        routing_state = "no_available_deployment"
+    elif (
+        request_exception is not None
+        and type(request_exception).__name__ == "ProxyModelNotFoundError"
+    ):
+        routing_state = "model_not_configured"
+    else:
+        routing_state = "unselected"
     tools_summary = _trace_module._trace_tools_summary(request_kwargs)
 
     record: dict[str, Any] = {
@@ -1061,8 +1149,9 @@ def _request_log_record(
         "call_type": _state_module._safe_log_text(request_kwargs.get("call_type"), limit=80),
         "model_group": _state_module._safe_log_text(_responses_execution_module._request_model_group(request_kwargs), limit=160),
         "public_model": _state_module._safe_log_text(public_model, limit=160),
-        "deployment_id": _state_module._safe_log_text(_deployment_id_from_request(request_kwargs), limit=180),
+        "deployment_id": deployment_id,
         "route_key": route_key,
+        "routing_state": routing_state,
         "deployment_order": _deployment_order_from_request(request_kwargs),
         "provider": _state_module._safe_log_text(provider, limit=120),
         "api_key_name": api_key_name,
@@ -1953,7 +2042,11 @@ def _trace_session_context(request_kwargs: Optional[dict]) -> dict[str, Any]:
 def _trace_exception(exception: Exception) -> dict[str, Any]:
     status_code = _exception_status_code(exception)
     text = _exception_text(exception)
-    if _is_terminal_prompt_or_policy_error(exception):
+    if _is_no_deployments_available_error(exception):
+        reason = "no-available-deployment"
+    elif type(exception).__name__ == "ProxyModelNotFoundError":
+        reason = "model-not-configured"
+    elif _is_terminal_prompt_or_policy_error(exception):
         reason = "terminal-prompt-or-policy"
     elif _is_image_generation_tool_runtime_fallback_error(exception):
         reason = "image-generation-tool-runtime-fallback"
@@ -1967,6 +2060,8 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "image-parameter-or-capability-bad-request"
     elif _is_deployment_compatible_bad_request_error(exception):
         reason = "upstream-compatible-bad-request"
+    elif getattr(exception, "responses_stream_incomplete", False) and status_code is None:
+        reason = "upstream-stream-incomplete"
     elif _exception_indicates_network_connectivity_error(exception):
         reason = "upstream-network-connectivity"
     elif status_code in (408, 429) or (status_code is not None and status_code >= 500):
@@ -2952,6 +3047,8 @@ def _record_deployment_failure_for_cooldown(
 ) -> None:
     if not _deployment_cooldown_enabled():
         return
+    if not _deployment_cooldown_recording_enabled_for_request(request_kwargs):
+        return
     if not _should_count_deployment_failure_for_cooldown(exception, request_kwargs):
         return
     if getattr(exception, _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR, False):
@@ -2974,7 +3071,15 @@ def _record_deployment_failure_for_cooldown(
     except Exception:
         pass
 
-    threshold = _deployment_cooldown_failure_threshold()
+    # An upstream Responses stream that terminates without `response.completed`
+    # has already forced Codex to reconnect.  Unlike an ordinary transient
+    # request error, a second attempt through that route would surface another
+    # user-visible stream failure, so quarantine it after the first occurrence.
+    threshold = (
+        1
+        if getattr(exception, "responses_stream_incomplete", False)
+        else _deployment_cooldown_failure_threshold()
+    )
     cooldown_seconds = _deployment_cooldown_seconds()
     request_log = _request_log_record("cooldown", request_kwargs)
 

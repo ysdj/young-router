@@ -974,9 +974,15 @@ class RelayAccountsDomain:
                 keys = keys.get("items", [])
             if not isinstance(keys, Sequence) or isinstance(keys, (str, bytes, bytearray)):
                 raise RelayAccountsError("Relay API key list is invalid")
-            wanted_name = resource["name"]
             candidates = [item for item in keys if isinstance(item, Mapping) and str(item.get("status", "")).lower() in {"active", "enabled"}]
-            candidate = next((item for item in candidates if _resource_name(item.get("name", item.get("label", item.get("id"))), "") == wanted_name), None)
+            # Resource IDs are derived from the upstream key ID. Prefer that
+            # stable identifier over a display name: duplicate key names are
+            # legal and must not reveal or import the wrong credential.
+            wanted_id = resource["id"].removeprefix("sub2api-")
+            candidate = next((item for item in candidates if str(item.get("id", "")).strip() == wanted_id), None)
+            if candidate is None:
+                wanted_name = resource["name"]
+                candidate = next((item for item in candidates if _resource_name(item.get("name", item.get("label", item.get("id"))), "") == wanted_name), None)
             if candidate is None and len(candidates) == 1:
                 candidate = candidates[0]
             key = candidate.get("key") if isinstance(candidate, Mapping) else None
