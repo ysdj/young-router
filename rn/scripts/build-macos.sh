@@ -135,7 +135,6 @@ for file in \
   codex_config.py \
   configuration_package.py \
   external_provider_import.py \
-  provider_billing.py \
   remote_usage_logs.py \
   runtime_settings_io.py \
   sitecustomize.py
@@ -183,6 +182,7 @@ else
     --python "$CORE/runtime/python/bin/python3.12" \
     --target "$CORE/runtime/site-packages" \
     "litellm[proxy]==$LITELLM_VERSION" \
+    "fastapi==0.140.3" \
     Pillow \
     PyYAML \
     ddgs >/dev/null
@@ -295,7 +295,7 @@ assert run_server is not None and BaseApplication is not None and UvicornWorker 
   exit 5
 }
 
-PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core, litellm_menu.core.__main__, litellm_menu.macos_proxy, codex_config, config_editor_core, configuration_package, external_provider_import, provider_billing, webdav.core'
+PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core, litellm_menu.core.__main__, litellm_menu.macos_proxy, codex_config, config_editor_core, configuration_package, external_provider_import, webdav.core'
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null
 PORTABLE_SMOKE="$RUNTIME_WORK/portable-core"
 copy_tree "$CORE" "$PORTABLE_SMOKE"
@@ -304,6 +304,15 @@ PYTHONDONTWRITEBYTECODE=1 LITELLM_MENU_PROXY_PROCESS=1 PYTHONPATH="$PORTABLE_SMO
   "$PORTABLE_SMOKE/runtime/bin/python" -c \
   'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("litellm_menu.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "LiteLLMMenuHook"'
 PYTHONDONTWRITEBYTECODE=1 "$PORTABLE_SMOKE/runtime/bin/litellm" --help >/dev/null
+
+# The smoke imports above deliberately exercise bytecode generation, but
+# __pycache__ entries are not part of AppKit's signed resource contract.
+# Remove them after validation so strict codesign verification cannot see
+# unsealed cache files in the finished app bundle.
+find "$CORE" \
+  \( -type d -name __pycache__ -prune -exec rm -rf {} + \) \
+  -o \( -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete \)
+
 VERSION="$(tr -d '[:space:]' < "$PROJECT_ROOT/VERSION")"
 BUILD_NUMBER="$(tr -d '[:space:]' < "$PROJECT_ROOT/BUILD_NUMBER")"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist" >/dev/null \
@@ -311,7 +320,14 @@ BUILD_NUMBER="$(tr -d '[:space:]' < "$PROJECT_ROOT/BUILD_NUMBER")"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist" >/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_NUMBER" "$APP/Contents/Info.plist" >/dev/null
 if [[ -n "${LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER:-}" ]]; then
-  PREVIEW_BUNDLE_IDENTIFIER="$LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER"
+  echo "LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER is unsupported: every LiteLLM Menu build must use the production instance identity." >&2
+  exit 6
+fi
+if [[ -n "${LITELLM_MENU_MACOS_DISPLAY_NAME:-}" \
+  || -n "${LITELLM_MENU_MACOS_ROUTE_SCHEME:-}" \
+  || -n "${LITELLM_MENU_MACOS_PREVIEW_PROFILE_ROOT:-}" \
+  || -n "${LITELLM_MENU_MACOS_PREVIEW_PORT:-}" ]]; then
+  PREVIEW_BUNDLE_IDENTIFIER="menu.litellm.menu"
   PREVIEW_DISPLAY_NAME="${LITELLM_MENU_MACOS_DISPLAY_NAME:-LiteLLM Menu Preview}"
   PREVIEW_ROUTE_SCHEME="${LITELLM_MENU_MACOS_ROUTE_SCHEME:-litellm-menu-preview}"
   PREVIEW_PROFILE_ROOT="${LITELLM_MENU_MACOS_PREVIEW_PROFILE_ROOT:-}"
@@ -323,12 +339,11 @@ if [[ -n "${LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER:-}" ]]; then
       exit 6
     }
   if [[ -n "$PREVIEW_PROFILE_ROOT" ]]; then
-    [[ "$PREVIEW_BUNDLE_IDENTIFIER" != "menu.litellm.menu" ]] \
-      && [[ "$PREVIEW_PROFILE_ROOT" = /* ]] \
+    [[ "$PREVIEW_PROFILE_ROOT" = /* ]] \
       && [[ "$PREVIEW_PROFILE_ROOT" != *$'\n'* ]] \
       && [[ "$PREVIEW_PORT" =~ ^[0-9]+$ ]] \
       && (( PREVIEW_PORT >= 1 && PREVIEW_PORT <= 65535 )) || {
-        echo "A preview profile root requires a distinct bundle identifier, absolute path, and valid port." >&2
+        echo "A preview profile root requires an absolute path and valid port." >&2
         exit 6
       }
   fi

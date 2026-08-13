@@ -1,10 +1,30 @@
 import AppKit
 import Foundation
-import Security
+import QuartzCore
 import ServiceManagement
 import WebKit
 
 private let nativeUIFontSize: CGFloat = 13
+// Monospaced glyphs have a larger optical body than the surrounding system
+// labels at the same point size. Keep read-only code text visually aligned.
+private let readOnlyCodeFontSize: CGFloat = 12
+
+private func withoutAnimations(_ changes: () -> Void) {
+    NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0
+        context.allowsImplicitAnimation = false
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        changes()
+        CATransaction.commit()
+    }
+}
+
+// Kept at module scope so every native route, sheet, alert, and file panel
+// shares the same zero-animation presentation policy.
+func configureImmediatePresentation(_ window: NSWindow) {
+    window.animationBehavior = .none
+}
 
 private enum NativeRelayOriginPolicy {
     static func allows(_ url: URL) -> Bool {
@@ -114,7 +134,11 @@ private enum NativeRelayOriginPolicy {
     private var codexRestartConfirmationCompletion: ((String) -> Void)?
     // Retain the browser flow across the asynchronous React Native promise.
     private var activeRelayLoginController: NativeRelayLoginController?
-    private var statusTitle = "LiteLLM Menu"
+    // The native shell is visible before React and Core publish their first
+    // snapshot. Keep that interval explicit instead of showing the app name as
+    // if it were a service state.
+    private var statusTitle = "Status: Starting"
+    private var statusTitleIsBootstrap = true
     private var statusRunning = false
     private var menuActions: [MenuAction] = []
     private var menuTracking = false
@@ -122,6 +146,7 @@ private enum NativeRelayOriginPolicy {
     private var pendingActions: [String] = []
     private var strings: [String: String] = [
         "appTitle": "LiteLLM Menu", "autoStart": "Auto Start at Login", "serviceUnavailable": "service unavailable",
+        "serviceStatus": "Status: {status}", "serviceStarting": "Starting",
         "cancel": "Cancel", "set": "Set", "clear": "Clear", "stage": "Stage", "find": "Find", "findNext": "Find Next",
         "edit": "Edit", "undo": "Undo", "redo": "Redo", "cut": "Cut", "copy": "Copy",
         "paste": "Paste", "selectAll": "Select All", "settings": "Settings...",
@@ -130,7 +155,7 @@ private enum NativeRelayOriginPolicy {
         "languageMenu": "Language", "languageSystem": "System", "languageEnglish": "English", "languageSimplifiedChinese": "简体中文",
         "menuQuit": "Quit LiteLLM Menu",
         "routeHome": "LiteLLM Menu", "routeProvidersModels": "Providers & Models",
-        "routeRelayAccounts": "Relay Accounts",
+        "routeRelayAccounts": "Relay Accounts", "routeRelayAdd": "Add Relay Account",
         "routeCodexSettings": "Codex / Claude Settings", "routeClaudeSettings": "Claude Settings",
         "routeRuntimeSettings": "Runtime Settings",
         "routeWebdavSettings": "WebDAV Sync Settings", "routeLogs": "Logs",
@@ -163,13 +188,13 @@ private enum NativeRelayOriginPolicy {
     func setStatus(title: String, running: Bool) {
         guard title != statusTitle || running != statusRunning else { return }
         statusTitle = title
+        statusTitleIsBootstrap = false
         statusRunning = running
         statusItem.length = NSStatusItem.squareLength
         statusItem.button?.title = ""
         statusItem.button?.image = Self.statusBarIcon
-        statusItem.button?.toolTip = running
-            ? localized("appTitle", fallback: "LiteLLM Menu")
-            : "\(localized("appTitle", fallback: "LiteLLM Menu")) - \(localized("serviceUnavailable", fallback: "service unavailable"))"
+        statusItem.button?.toolTip = statusTitle
+        statusItem.button?.setAccessibilityLabel(statusTitle)
         if let status = statusItem.menu?.item(withTag: 1) {
             status.title = statusTitle
             configureStatusMenuItem(status)
@@ -178,6 +203,13 @@ private enum NativeRelayOriginPolicy {
 
     func setLocalization(_ values: [String: String]) {
         for (key, value) in values where !value.isEmpty { strings[key] = value }
+        if statusTitleIsBootstrap {
+            let template = localized("serviceStatus", fallback: "Status: {status}")
+            let starting = localized("serviceStarting", fallback: "Starting")
+            statusTitle = template.replacingOccurrences(of: "{status}", with: starting)
+            statusItem.button?.toolTip = statusTitle
+            statusItem.button?.setAccessibilityLabel(statusTitle)
+        }
         ensureSystemEditMenu(updateExisting: true)
         updateApplicationMenuTitles()
         refreshStatusMenu()
@@ -228,6 +260,11 @@ private enum NativeRelayOriginPolicy {
         // supply AppKit controls, focus behavior, and system appearance.
         let windowRoute = canonicalRoute(route)
         ensureReactHostStarted()
+        if windowRoute == "relay-add",
+           routeWindows["relay-accounts"] == nil,
+           let parentTitle = routeWindowTitle("relay-accounts") {
+            open(route: "relay-accounts", title: parentTitle)
+        }
         let window: NSWindow
         if let existing = routeWindows[windowRoute] {
             if let initialLogTab,
@@ -249,7 +286,18 @@ private enum NativeRelayOriginPolicy {
             return
         }
         updateActivationPolicy()
-        window.makeKeyAndOrderFront(nil)
+        configureImmediatePresentation(window)
+        withoutAnimations {
+            if windowRoute == "relay-add", let parent = routeWindows["relay-accounts"] {
+                if window.sheetParent == nil {
+                    parent.beginSheet(window)
+                } else {
+                    window.makeKeyAndOrderFront(nil)
+                }
+            } else {
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -264,7 +312,13 @@ private enum NativeRelayOriginPolicy {
         guard let selectedRoute, let window = routeWindows[selectedRoute] else { return }
         approvedCloseRoutes.insert(selectedRoute)
         defer { approvedCloseRoutes.remove(selectedRoute) }
-        window.close()
+        withoutAnimations {
+            if let parent = window.sheetParent {
+                parent.endSheet(window)
+            }
+            window.orderOut(nil)
+            window.close()
+        }
         routeWindows.removeValue(forKey: selectedRoute)
         updateActivationPolicy()
     }
@@ -302,7 +356,7 @@ private enum NativeRelayOriginPolicy {
             if approvedCloseRoutes.contains(route) {
                 return true
             }
-            requestClose(route: route)
+            requestClose(route: route, hiding: sender)
             return false
         }
         return true
@@ -325,6 +379,7 @@ private enum NativeRelayOriginPolicy {
 
     func chooseImportFile(purpose: String = "import") -> String? {
         let panel = NSOpenPanel()
+        configureImmediatePresentation(panel)
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
@@ -338,6 +393,7 @@ private enum NativeRelayOriginPolicy {
               !trimmed.contains("/"),
               !trimmed.contains(":") else { return nil }
         let panel = NSSavePanel()
+        configureImmediatePresentation(panel)
         panel.nameFieldStringValue = trimmed
         panel.canCreateDirectories = true
         return panel.runModal() == .OK ? registerSelection(panel.url, purpose: "export") : nil
@@ -345,6 +401,7 @@ private enum NativeRelayOriginPolicy {
 
     func confirm(title: String, message: String, confirmTitle: String) -> Bool {
         let alert = NSAlert()
+        configureImmediatePresentation(alert.window)
         alert.messageText = title
         alert.informativeText = message
         alert.addButton(withTitle: confirmTitle)
@@ -382,6 +439,7 @@ private enum NativeRelayOriginPolicy {
             backing: .buffered,
             defer: false
         )
+        configureImmediatePresentation(panel)
         panel.title = localized("appTitle", fallback: "LiteLLM Menu")
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
@@ -430,7 +488,7 @@ private enum NativeRelayOriginPolicy {
         codexRestartConfirmationCompletion = completion
         panel.center()
         NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
+        withoutAnimations { panel.makeKeyAndOrderFront(nil) }
     }
 
     @objc private func selectCodexRestartLater(_ sender: NSButton) {
@@ -447,8 +505,10 @@ private enum NativeRelayOriginPolicy {
         let completion = codexRestartConfirmationCompletion
         codexRestartConfirmationCompletion = nil
         panel.delegate = nil
-        panel.orderOut(nil)
-        panel.close()
+        withoutAnimations {
+            panel.orderOut(nil)
+            panel.close()
+        }
         completion?(choice)
     }
 
@@ -465,7 +525,7 @@ private enum NativeRelayOriginPolicy {
         textView.isSelectable = true
         textView.isRichText = false
         textView.importsGraphics = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: nativeUIFontSize, weight: .regular)
+        textView.font = NSFont.monospacedSystemFont(ofSize: readOnlyCodeFontSize, weight: .regular)
         textView.textContainerInset = NSSize(width: 8, height: 8)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = true
@@ -479,6 +539,7 @@ private enum NativeRelayOriginPolicy {
         scrollView.documentView = textView
 
         let alert = NSAlert()
+        configureImmediatePresentation(alert.window)
         alert.messageText = title
         alert.accessoryView = scrollView
         alert.addButton(withTitle: closeTitle)
@@ -528,6 +589,7 @@ private enum NativeRelayOriginPolicy {
         language: String,
         username: String?,
         rememberPassword: Bool,
+        embedded: Bool = false,
         completion: @escaping (CoreIPCBridge.RelayLoginResult?) -> Void
     ) {
         guard Thread.isMainThread else {
@@ -540,6 +602,7 @@ private enum NativeRelayOriginPolicy {
                     language: language,
                     username: username,
                     rememberPassword: rememberPassword,
+                    embedded: embedded,
                     completion: completion
                 )
             }
@@ -568,6 +631,14 @@ private enum NativeRelayOriginPolicy {
             normalized.path = path.isEmpty ? "" : "/" + path
             return normalized.url ?? originURL
         } ?? originURL
+        let embeddedWindow = embedded ? routeWindows["relay-add"].flatMap { $0.contentView == nil ? nil : $0 } : nil
+        guard !embedded || embeddedWindow != nil else {
+            completion(nil)
+            return
+        }
+        let embeddedClose: (() -> Void)? = embedded ? { [weak self] in
+            self?.close(route: "relay-add")
+        } : nil
         let controller = NativeRelayLoginController(
             accountID: accountID,
             type: type,
@@ -575,7 +646,9 @@ private enum NativeRelayOriginPolicy {
             originURL: canonicalOrigin,
             language: language,
             username: username,
-            rememberPassword: rememberPassword
+            rememberPassword: rememberPassword,
+            embeddedWindow: embeddedWindow,
+            embeddedClose: embeddedClose
         )
         activeRelayLoginController = controller
         controller.start { [weak self] result in
@@ -646,7 +719,8 @@ private enum NativeRelayOriginPolicy {
 
     func clearRelayCredentials(accountID: String) -> Bool {
         guard accountID.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"#, options: .regularExpression) != nil else { return false }
-        return NativeRelayCredentialStore.clear(accountID: accountID)
+        NativeRelaySessionMemoryStore.clear(accountID: accountID)
+        return true
     }
 
     func restoreRelaySession(
@@ -674,7 +748,7 @@ private enum NativeRelayOriginPolicy {
             normalized.path = path.isEmpty ? "" : "/" + path
             return normalized.url ?? originURL
         } ?? originURL
-        guard let session = NativeRelayCredentialStore.readSession(
+        guard let session = NativeRelaySessionMemoryStore.readSession(
             accountID: accountID,
             accountType: type,
             origin: canonicalOrigin.absoluteString
@@ -701,9 +775,7 @@ private enum NativeRelayOriginPolicy {
                 accessToken: probe.accessToken,
                 refreshToken: probe.refreshToken
             )
-            guard NativeRelayCredentialStore.writeSession(refreshedSession, accountID: accountID) else {
-                return nil
-            }
+            NativeRelaySessionMemoryStore.writeSession(refreshedSession, accountID: accountID)
             return try? CoreIPCBridge.shared.restoreRelaySession(
                 accountID: accountID,
                 type: type,
@@ -733,7 +805,7 @@ private enum NativeRelayOriginPolicy {
 
     func clearRelayPassword(accountID: String) -> Bool {
         guard accountID.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"#, options: .regularExpression) != nil else { return false }
-        return NativeRelayCredentialStore.clearPassword(accountID: accountID)
+        return true
     }
 
     func chooseModelsToAdd(models: [String], providerName: String, keyName: String) -> [String]? {
@@ -762,10 +834,10 @@ private enum NativeRelayOriginPolicy {
             listHeight: listHeight,
             controller: controller
         )
-        defer { panel.close() }
+        defer { withoutAnimations { panel.close() } }
 
         NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
+        withoutAnimations { panel.makeKeyAndOrderFront(nil) }
         guard NSApp.runModal(for: panel) == .OK else { return nil }
         return controller.selectedModels
     }
@@ -785,6 +857,7 @@ private enum NativeRelayOriginPolicy {
             backing: .buffered,
             defer: false
         )
+        configureImmediatePresentation(panel)
         panel.title = localized("modelChooserTitle", fallback: "Choose Models to Add")
         panel.minSize = NSSize(width: 520, height: 340)
         panel.isReleasedWhenClosed = false
@@ -919,6 +992,7 @@ private enum NativeRelayOriginPolicy {
         split.setPosition(128, ofDividerAt: 0)
 
         let alert = NSAlert()
+        configureImmediatePresentation(alert.window)
         alert.messageText = title
         alert.accessoryView = split
         alert.addButton(withTitle: localized("stage", fallback: "Stage"))
@@ -950,6 +1024,13 @@ private enum NativeRelayOriginPolicy {
             item.target = self
             item.representedObject = "open-settings"
         }
+        let relayItem = applicationMenu.addItem(
+            withTitle: localized("routeRelayAccounts", fallback: "Relay Accounts"),
+            action: #selector(openRelayAccounts),
+            keyEquivalent: ""
+        )
+        relayItem.target = self
+        relayItem.representedObject = "native-open-relay-accounts"
         if shortcuts["reload"]?.lowercased().contains("cmd+r") == true {
             let item = applicationMenu.addItem(withTitle: localized("reload", fallback: "Reload"), action: #selector(reloadFromShortcut), keyEquivalent: "r")
             item.keyEquivalentModifierMask = [.command]
@@ -1022,6 +1103,7 @@ private enum NativeRelayOriginPolicy {
         let version = info["CFBundleShortVersionString"] as? String ?? "?"
         let build = info["CFBundleVersion"] as? String ?? "?"
         let alert = NSAlert()
+        configureImmediatePresentation(alert.window)
         alert.messageText = localized("appTitle", fallback: "LiteLLM Menu")
         alert.informativeText = "\(localized("version", fallback: "Version")) \(version) (\(localized("build", fallback: "build")) \(build))"
         alert.addButton(withTitle: localized("ok", fallback: "OK"))
@@ -1113,11 +1195,11 @@ private enum NativeRelayOriginPolicy {
 
     private func menuTitle(for id: String, fallback: String) -> String {
         switch id {
-        case "open-providers-models": return localized("routeProvidersModels", fallback: fallback) + "..."
-        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: fallback) + "..."
-        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: fallback) + "..."
-        case "open-codex-settings": return localized("routeCodexSettings", fallback: fallback) + "..."
-        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: fallback) + "..."
+        case "open-providers-models": return localized("routeProvidersModels", fallback: fallback)
+        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: fallback)
+        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: fallback)
+        case "open-codex-settings": return localized("routeCodexSettings", fallback: fallback)
+        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: fallback)
         case "open-logs", "open-logs?tab=recovery": return fallback
         case "quit": return localized("menuQuit", fallback: fallback)
         default: return fallback
@@ -1128,11 +1210,11 @@ private enum NativeRelayOriginPolicy {
         switch id {
         case "toggle-autostart": return localized("autoStart", fallback: "Auto Start at Login")
         case "toggle-codex-model-catalog": return "Use LiteLLM models in Codex"
-        case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models") + "..."
-        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: "Relay Accounts") + "..."
-        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings") + "..."
-        case "open-codex-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings") + "..."
-        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings") + "..."
+        case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
+        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: "Relay Accounts")
+        case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
+        case "open-codex-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
+        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings")
         case "open-logs", "open-logs?tab=recovery": return localized("routeLogs", fallback: "Logs")
         case "show-version": return localized("version", fallback: "Version")
         case "quit": return localized("menuQuit", fallback: "Quit LiteLLM Menu")
@@ -1218,6 +1300,8 @@ private enum NativeRelayOriginPolicy {
         for item in applicationMenu.items {
             switch item.representedObject as? String {
             case "open-settings": item.title = localized("settings", fallback: "Settings...")
+            case "native-open-relay-accounts":
+                item.title = localized("routeRelayAccounts", fallback: "Relay Accounts")
             case "native-reload": item.title = localized("reload", fallback: "Reload")
             case "native-close-window": item.title = localized("closeWindow", fallback: "Close Window")
             case "native-quit": item.title = localized("menuQuit", fallback: "Quit LiteLLM Menu")
@@ -1273,8 +1357,18 @@ private enum NativeRelayOriginPolicy {
         }
     }
 
-    private func requestClose(route: String?) {
+    private func requestClose(route: String?, hiding requestedWindow: NSWindow? = nil) {
         guard let route else { return }
+        let windowRoute = canonicalRoute(route)
+        if let window = requestedWindow ?? routeWindows[windowRoute] {
+            withoutAnimations {
+                if let parent = window.sheetParent {
+                    parent.endSheet(window)
+                }
+                window.orderOut(nil)
+            }
+            updateActivationPolicy()
+        }
         emitAction("request-close-\(route)")
     }
 
@@ -1311,11 +1405,12 @@ private enum NativeRelayOriginPolicy {
         window.center()
         window.collectionBehavior = [.fullScreenPrimary]
         window.level = .normal
+        configureImmediatePresentation(window)
     }
 
     private func hideHostWindow() {
         guard let window = hostWindow else { return }
-        window.orderOut(nil)
+        withoutAnimations { window.orderOut(nil) }
         updateActivationPolicy()
     }
 
@@ -1323,14 +1418,20 @@ private enum NativeRelayOriginPolicy {
         switch route {
         case "providers-models":
             return RouteWindowLayout(
-                contentSize: NSSize(width: 1052, height: 600),
-                minSize: NSSize(width: 1052, height: 560),
+                contentSize: NSSize(width: 820, height: 460),
+                minSize: NSSize(width: 820, height: 460),
                 maxSize: nil
             )
         case "relay-accounts":
             return RouteWindowLayout(
                 contentSize: NSSize(width: 920, height: 620),
                 minSize: NSSize(width: 760, height: 500),
+                maxSize: nil
+            )
+        case "relay-add":
+            return RouteWindowLayout(
+                contentSize: NSSize(width: 900, height: 680),
+                minSize: NSSize(width: 720, height: 560),
                 maxSize: nil
             )
         case "codex-settings", "claude-settings":
@@ -1385,6 +1486,7 @@ private enum NativeRelayOriginPolicy {
         case "home": return localized("routeHome", fallback: "LiteLLM Menu")
         case "providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
         case "relay-accounts": return localized("routeRelayAccounts", fallback: "Relay Accounts")
+        case "relay-add": return localized("routeRelayAdd", fallback: "Add Relay Account")
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
         case "webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings")
@@ -1399,7 +1501,8 @@ private enum NativeRelayOriginPolicy {
         switch route {
         case "home": return localized("routeHome", fallback: "LiteLLM Menu")
         case "providers-models": return "LiteLLM " + localized("routeProvidersModels", fallback: "Providers & Models")
-        case "relay-accounts": return "LiteLLM " + localized("routeRelayAccounts", fallback: "Relay Accounts")
+        case "relay-accounts": return localized("routeRelayAccounts", fallback: "Relay Accounts")
+        case "relay-add": return "LiteLLM " + localized("routeRelayAdd", fallback: "Add Relay Account")
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
         case "webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings")
@@ -1429,7 +1532,10 @@ private enum NativeRelayOriginPolicy {
     }
     @objc private func openLogs() { openLogs(tab: nil) }
     @objc private func reloadFromShortcut() { emitAction("service-reload") }
-    @objc private func closeFromShortcut() { requestClose(route: NSApp.keyWindow.flatMap(routeForWindow)) }
+    @objc private func closeFromShortcut() {
+        let window = NSApp.keyWindow
+        requestClose(route: window.flatMap(routeForWindow), hiding: window)
+    }
     @objc private func menuAction(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
         switch id {
@@ -1746,7 +1852,75 @@ private enum NativeRelayBrowserMode {
     case logs
 }
 
-private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNavigationDelegate, URLSessionTaskDelegate {
+private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler, URLSessionTaskDelegate {
+    private static let immediateWebPresentationScript = """
+    (() => {
+      const styleID = '__litellm_menu_immediate_presentation';
+      const gradientPattern = /gradient[(]/i;
+      const imageProperties = ['background-image', 'border-image-source', 'mask-image'];
+      const splitImageLayers = (value) => {
+        const layers = [];
+        let depth = 0;
+        let start = 0;
+        for (let index = 0; index < value.length; index += 1) {
+          const character = value[index];
+          if (character === '(') depth += 1;
+          else if (character === ')') depth = Math.max(0, depth - 1);
+          else if (character === ',' && depth === 0) {
+            layers.push(value.slice(start, index).trim());
+            start = index + 1;
+          }
+        }
+        layers.push(value.slice(start).trim());
+        return layers;
+      };
+      const stripGradients = (root = document.documentElement) => {
+        const elements = root instanceof Element
+          ? [root, ...root.querySelectorAll('*')]
+          : [...document.querySelectorAll('*')];
+        for (const element of elements) {
+          const computed = getComputedStyle(element);
+          for (const property of imageProperties) {
+            const image = computed.getPropertyValue(property);
+            if (!gradientPattern.test(image)) continue;
+            const retained = splitImageLayers(image).filter((layer) => !gradientPattern.test(layer));
+            element.style.setProperty(property, retained.length ? retained.join(', ') : 'none', 'important');
+          }
+        }
+      };
+      const install = () => {
+        if (document.getElementById(styleID)) return;
+        const style = document.createElement('style');
+        style.id = styleID;
+        style.textContent = `
+          html { scroll-behavior: auto !important; }
+          *, *::before, *::after {
+            animation: none !important;
+            transition: none !important;
+            scroll-behavior: auto !important;
+            view-transition-name: none !important;
+          }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+      };
+      install();
+      stripGradients();
+      document.addEventListener('DOMContentLoaded', () => { install(); stripGradients(); }, { once: true });
+      new MutationObserver((records) => {
+        install();
+        records.forEach((record) => {
+          if (record.type === 'attributes') stripGradients(record.target);
+          else record.addedNodes.forEach((node) => { if (node.nodeType === Node.ELEMENT_NODE) stripGradients(node); });
+        });
+      }).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style'],
+        childList: true,
+        subtree: true,
+      });
+    })();
+    """
+
     private struct Probe {
         let path: String
         let usernamePaths: [[String]]
@@ -1760,12 +1934,14 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private let presetUsername: String?
     private let rememberPassword: Bool
     private let mode: NativeRelayBrowserMode
-    private let passwordCapture: NativeRelayPasswordCapture
     private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
-    private let panel: NSPanel
+    private let panel: NSPanel?
+    private weak var embeddedWindow: NSWindow?
+    private let embeddedClose: (() -> Void)?
+    private var embeddedContent: NSView?
+    private var embeddedCloseObserver: NSObjectProtocol?
     private let webView: WKWebView
     private let loadingOverlay = NSVisualEffectView()
-    private let loadingIndicator = NSProgressIndicator()
     private let loadingLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private let accountLabel = NSTextField(labelWithString: "")
@@ -1774,14 +1950,18 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var finished = false
     private var checking = false
     private var result: CoreIPCBridge.RelayLoginResult?
-    private var capturedPassword: String?
     private var capturedAccessToken: String?
     private var capturedRefreshToken: String?
+    private var capturedPassword: String?
     private var restoredSession: NativeRelaySession?
     private var didRestoreSession = false
     private var didLoadInitialPage = false
     private var didProbeRestoredSession = false
     private var pageReadinessProbe: DispatchWorkItem?
+    private var loginFormRevealProbe: DispatchWorkItem?
+    private var loginFormRevealAttempts = 0
+    private var didRevealLoginField = false
+    private var automaticCheckProbe: DispatchWorkItem?
     private var panelClosedDuringCommit = false
     private var activeCheck: NativeRelayLoginAttempt?
     private var completion: ((CoreIPCBridge.RelayLoginResult?) -> Void)?
@@ -1794,6 +1974,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         language: String,
         username: String?,
         rememberPassword: Bool,
+        embeddedWindow: NSWindow? = nil,
+        embeddedClose: (() -> Void)? = nil,
         mode: NativeRelayBrowserMode = .login
     ) {
         self.accountID = accountID
@@ -1804,59 +1986,87 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         self.presetUsername = username?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.rememberPassword = rememberPassword
         self.mode = mode
-        passwordCapture = NativeRelayPasswordCapture()
+        self.embeddedWindow = embeddedWindow
+        self.embeddedClose = embeddedClose
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        if rememberPassword {
-            configuration.userContentController.add(passwordCapture, name: "relayPassword")
-            configuration.userContentController.addUserScript(WKUserScript(
-                source: """
-                (() => {
-                  const send = (value) => {
-                    if (typeof value === 'string' && value.length > 0) {
-                      window.webkit.messageHandlers.relayPassword.postMessage(value);
-                    }
-                  };
-                  document.addEventListener('input', (event) => {
-                    if (event.target?.matches?.('input[type=password], input[autocomplete=current-password]')) send(event.target.value);
-                  }, true);
-                  document.addEventListener('change', (event) => {
-                    if (event.target?.matches?.('input[type=password], input[autocomplete=current-password]')) send(event.target.value);
-                  }, true);
-                  document.addEventListener('submit', (event) => {
-                    send(event.target?.querySelector?.('input[type=password], input[autocomplete=current-password]')?.value || '');
-                  }, true);
-                })();
-                """,
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: Self.immediateWebPresentationScript,
                 injectionTime: .atDocumentStart,
-                forMainFrameOnly: true
-            ))
+                forMainFrameOnly: false
+            )
+        )
+        if rememberPassword && mode == .login {
+            configuration.userContentController.addUserScript(
+                WKUserScript(
+                    source: """
+                    (() => {
+                      const selector = 'input[type=password],input[autocomplete=current-password]';
+                      const capture = (node) => {
+                        const value = node?.value;
+                        if (typeof value === 'string' && value.length) {
+                          const password = value.slice(0, 4096);
+                          sessionStorage.setItem('__litellm_menu_relay_password', password);
+                          try { window.webkit.messageHandlers.litellmRelayPassword.postMessage(password); } catch {}
+                        }
+                      };
+                      document.addEventListener('input', (event) => {
+                        if (event.target?.matches?.(selector)) capture(event.target);
+                      }, true);
+                      document.addEventListener('change', (event) => {
+                        if (event.target?.matches?.(selector)) capture(event.target);
+                      }, true);
+                      document.addEventListener('submit', (event) => {
+                        capture(event.target?.querySelector?.(selector));
+                      }, true);
+                    })();
+                    """,
+                    injectionTime: .atDocumentStart,
+                    forMainFrameOnly: true
+                )
+            )
         }
         webView = WKWebView(frame: .zero, configuration: configuration)
-        panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 820, height: 680),
+        panel = embeddedWindow == nil ? NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
-        )
+        ) : nil
         super.init()
+        if rememberPassword && mode == .login {
+            configuration.userContentController.add(self, name: "litellmRelayPassword")
+        }
         buildPanel()
     }
 
     func start(completion: @escaping (CoreIPCBridge.RelayLoginResult?) -> Void) {
         self.completion = completion
         beginBrowserFlow()
-        NSApp.activate(ignoringOtherApps: true)
-        panel.center()
-        panel.makeKeyAndOrderFront(nil)
+        if let panel {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.center()
+            configureImmediatePresentation(panel)
+            withoutAnimations { panel.makeKeyAndOrderFront(nil) }
+        } else if let embeddedWindow {
+            configureImmediatePresentation(embeddedWindow)
+            embeddedCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: embeddedWindow,
+                queue: .main
+            ) { [weak self] _ in
+                self?.cancel(nil)
+            }
+            withoutAnimations { embeddedWindow.makeKeyAndOrderFront(nil) }
+        }
         restoreSessionAndLoad()
     }
 
     /// Each controller represents one browser login flow. Clear temporary
-    /// captures before its initial navigation rather than when checking a
-    /// completed page: a successful login often removes the password field.
+    /// session captures before its initial navigation.
     private func beginBrowserFlow() {
         _ = activeCheck?.requestCancellation()
         activeCheck = nil
@@ -1879,85 +2089,112 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         localizedChinese ? chinese : english
     }
 
-    private func buildPanel() {
-        panel.title = mode == .logs
-            ? text("Relay Usage Logs", "中转站用量日志")
-            : text("Relay Account Sign In", "中转站账号登录")
-        panel.minSize = NSSize(width: 720, height: 560)
-        panel.isReleasedWhenClosed = false
-        panel.delegate = self
-        webView.navigationDelegate = self
+    private var waitingForSignInStatus: String {
+        text("Waiting for sign-in...", "等待完成登录...")
+    }
 
+    private func setStatus(_ value: String) {
+        guard statusLabel.stringValue != value else { return }
+        statusLabel.stringValue = value
+    }
+
+    private var isEmbeddedPresentation: Bool { embeddedWindow != nil }
+
+    private func buildPanel() {
+        let content = NSView()
         let header = NSView()
-        let titleLabel = NSTextField(labelWithString: label)
+        webView.navigationDelegate = self
+        let titleLabel = NSTextField(labelWithString: isEmbeddedPresentation
+            ? text("1 Relay URL  ›  2 Sign in", "1 中转站 URL  ›  2 登录")
+            : label)
+        let showsReloadAction = mode == .logs && !isEmbeddedPresentation
+        let showsEmbeddedClose = mode == .login && isEmbeddedPresentation
+        let showsPanelActions = showsReloadAction || showsEmbeddedClose
         titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
         titleLabel.lineBreakMode = .byTruncatingTail
-        accountLabel.stringValue = "\(type == "newapi" ? text("New API", "NewAPI") : "Sub2API")  |  \(originURL.host ?? originURL.absoluteString)"
+        accountLabel.stringValue = isEmbeddedPresentation
+            ? text("Sign-in is detected automatically", "登录成功后自动检测")
+            : (originURL.host ?? originURL.absoluteString)
         accountLabel.textColor = .secondaryLabelColor
-        statusLabel.stringValue = mode == .logs
-            ? text("Showing the relay site's usage logs.", "正在显示中转站站内用量日志。")
-            : text("Enter your account and password in the page, then select Check Sign-In.", "请在页面中输入账号和密码完成登录，然后选择“检查登录”。")
+        statusLabel.stringValue = isEmbeddedPresentation
+            ? waitingForSignInStatus
+            : mode == .logs
+                ? text("Showing the relay site's usage logs.", "正在显示中转站用量日志。")
+                : text("Complete sign-in in the page; success is detected automatically.", "请在页面中完成登录，成功后将自动检测。")
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
-        signInButton.title = mode == .logs ? text("Reload", "刷新") : text("Check Sign-In", "检查登录")
-        signInButton.target = self
-        signInButton.action = mode == .logs ? #selector(reloadBrowser(_:)) : #selector(checkSignIn(_:))
-        signInButton.bezelStyle = .rounded
-        signInButton.keyEquivalent = "\r"
-        cancelButton.title = mode == .logs ? text("Close", "关闭") : text("Cancel", "取消")
-        cancelButton.target = self
-        cancelButton.action = #selector(cancel(_:))
-        cancelButton.bezelStyle = .rounded
-        cancelButton.keyEquivalent = "\u{1b}"
+        signInButton.isHidden = !showsReloadAction
+        cancelButton.isHidden = !showsPanelActions
+        if showsReloadAction {
+            signInButton.title = text("Reload", "刷新")
+            signInButton.target = self
+            signInButton.action = #selector(reloadBrowser(_:))
+            signInButton.bezelStyle = .rounded
+            signInButton.keyEquivalent = "\r"
+        }
+        if showsPanelActions {
+            cancelButton.title = text("Close", "关闭")
+            cancelButton.target = self
+            cancelButton.action = showsEmbeddedClose ? #selector(closeEmbeddedWindow(_:)) : #selector(cancel(_:))
+            cancelButton.bezelStyle = .rounded
+            cancelButton.keyEquivalent = "\u{1b}"
+        }
 
-        [titleLabel, accountLabel, statusLabel, signInButton, cancelButton].forEach {
+        [titleLabel, accountLabel, statusLabel].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             header.addSubview($0)
+        }
+        if showsPanelActions {
+            ([showsReloadAction ? signInButton : nil, cancelButton] as [NSButton?]).compactMap { $0 }.forEach {
+                $0.translatesAutoresizingMaskIntoConstraints = false
+                header.addSubview($0)
+            }
         }
         webView.translatesAutoresizingMaskIntoConstraints = false
         loadingOverlay.material = .contentBackground
         loadingOverlay.blendingMode = .withinWindow
         loadingOverlay.state = .active
         loadingOverlay.translatesAutoresizingMaskIntoConstraints = false
-        loadingIndicator.style = .spinning
-        loadingIndicator.controlSize = .regular
-        loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
-        loadingIndicator.startAnimation(nil)
         loadingLabel.stringValue = mode == .logs
             ? text("Loading usage logs...", "正在加载用量日志...")
             : text("Loading sign-in page...", "正在加载登录页面...")
         loadingLabel.textColor = .secondaryLabelColor
         loadingLabel.alignment = .center
         loadingLabel.translatesAutoresizingMaskIntoConstraints = false
-        loadingOverlay.addSubview(loadingIndicator)
         loadingOverlay.addSubview(loadingLabel)
-        let content = NSView()
         content.addSubview(header)
         content.addSubview(webView)
         content.addSubview(loadingOverlay)
         header.translatesAutoresizingMaskIntoConstraints = false
-        panel.contentView = content
+        if let panel {
+            configureImmediatePresentation(panel)
+            panel.title = mode == .logs
+                ? text("Relay Usage Logs", "中转站用量日志")
+                : text("Relay Account Sign In", "中转站账号登录")
+            panel.minSize = NSSize(width: 720, height: 560)
+            panel.isReleasedWhenClosed = false
+            panel.delegate = self
+            panel.contentView = content
+        } else if let embeddedWindow, let hostContent = embeddedWindow.contentView {
+            content.wantsLayer = true
+            content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            content.translatesAutoresizingMaskIntoConstraints = false
+            hostContent.addSubview(content, positioned: .above, relativeTo: nil)
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: hostContent.leadingAnchor),
+                content.trailingAnchor.constraint(equalTo: hostContent.trailingAnchor),
+                content.topAnchor.constraint(equalTo: hostContent.topAnchor),
+                content.bottomAnchor.constraint(equalTo: hostContent.bottomAnchor),
+            ])
+            embeddedContent = content
+        }
 
-        NSLayoutConstraint.activate([
+        let headerHeight: CGFloat = 76
+        var constraints: [NSLayoutConstraint] = [
             header.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             header.topAnchor.constraint(equalTo: content.topAnchor),
-            header.heightAnchor.constraint(equalToConstant: 76),
-            titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
-            titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -16),
-            accountLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 10),
-            accountLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            accountLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -16),
-            statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
-            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: signInButton.leadingAnchor, constant: -16),
-            statusLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -12),
-            signInButton.trailingAnchor.constraint(equalTo: cancelButton.leadingAnchor, constant: -8),
-            signInButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            signInButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
-            cancelButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
-            cancelButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
+            header.heightAnchor.constraint(equalToConstant: headerHeight),
             webView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             webView.topAnchor.constraint(equalTo: header.bottomAnchor),
@@ -1966,17 +2203,62 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             loadingOverlay.trailingAnchor.constraint(equalTo: webView.trailingAnchor),
             loadingOverlay.topAnchor.constraint(equalTo: webView.topAnchor),
             loadingOverlay.bottomAnchor.constraint(equalTo: webView.bottomAnchor),
-            loadingIndicator.centerXAnchor.constraint(equalTo: loadingOverlay.centerXAnchor),
-            loadingIndicator.centerYAnchor.constraint(equalTo: loadingOverlay.centerYAnchor, constant: -12),
-            loadingLabel.topAnchor.constraint(equalTo: loadingIndicator.bottomAnchor, constant: 12),
             loadingLabel.centerXAnchor.constraint(equalTo: loadingOverlay.centerXAnchor),
-        ])
+            loadingLabel.centerYAnchor.constraint(equalTo: loadingOverlay.centerYAnchor),
+        ]
+        if showsReloadAction {
+            constraints += [
+                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
+                titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -16),
+                accountLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 10),
+                accountLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+                accountLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -16),
+                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: signInButton.leadingAnchor, constant: -16),
+                statusLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -12),
+                signInButton.trailingAnchor.constraint(equalTo: cancelButton.leadingAnchor, constant: -8),
+                signInButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+                signInButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
+                cancelButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                cancelButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+                cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
+            ]
+        } else if showsEmbeddedClose {
+            constraints += [
+                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
+                titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -16),
+                accountLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                accountLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
+                accountLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                statusLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                statusLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -12),
+                cancelButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                cancelButton.topAnchor.constraint(equalTo: header.topAnchor, constant: 10),
+                cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
+            ]
+        } else {
+            constraints += [
+                titleLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                titleLabel.topAnchor.constraint(equalTo: header.topAnchor, constant: 12),
+                titleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                accountLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                accountLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
+                accountLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 18),
+                statusLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -18),
+                statusLabel.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -12),
+            ]
+        }
+        NSLayoutConstraint.activate(constraints)
     }
 
     private func restoreSessionAndLoad() {
         guard isBrowserFlowLive, !didLoadInitialPage else { return }
         didLoadInitialPage = true
-        restoredSession = NativeRelayCredentialStore.readSession(
+        restoredSession = NativeRelaySessionMemoryStore.readSession(
             accountID: accountID,
             accountType: type,
             origin: originURL.absoluteString
@@ -2005,9 +2287,17 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         (() => {
           const accessToken = \(jsonLiteral(session.accessToken));
           const refreshToken = \(jsonLiteral(session.refreshToken));
+          const username = \(jsonLiteral(presetUsername ?? ""));
           if (accessToken) {
             localStorage.setItem('auth_token', accessToken);
             localStorage.setItem('access_token', accessToken);
+            try {
+              const current = JSON.parse(localStorage.getItem('user') || 'null');
+              const user = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+              user.token = accessToken;
+              if (username && !user.username) user.username = username;
+              localStorage.setItem('user', JSON.stringify(user));
+            } catch {}
           }
           if (refreshToken) localStorage.setItem('refresh_token', refreshToken);
         })();
@@ -2024,6 +2314,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 return
             }
             if session.accessToken.isEmpty {
+                self.prefillLoginWhenReady()
                 self.probeRestoredSession()
             } else {
                 self.webView.reload()
@@ -2034,28 +2325,19 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private func probeRestoredSession() {
         guard mode == .login, restoredSession != nil, !didProbeRestoredSession, !checking else { return }
         didProbeRestoredSession = true
-        checkSignIn(nil)
+        startSignInCheck(automatically: true)
     }
 
     private func prefillLoginWhenReady() {
         guard mode == .login, isBrowserFlowLive, let username = presetUsername, !username.isEmpty else { return }
         // Let a restored session seed local storage and reload before looking
-        // for a login form. Otherwise a saved session could be sent straight
+        // for a login form. Otherwise a restored session could be sent straight
         // back to the unauthenticated form during its first page load.
         guard restoredSession == nil || didRestoreSession else { return }
-        let password = rememberPassword
-            ? NativeRelayCredentialStore.readPassword(
-                accountID: accountID,
-                accountType: type,
-                origin: originURL.absoluteString
-              )
-            : nil
         let safeUser = jsonLiteral(username)
-        let safePassword = jsonLiteral(password ?? "")
         let script = """
         (() => {
           const user = document.querySelector('input[type=email], input[type=text], input:not([type]), input[name=email], input[name=username], input[autocomplete=username], input[placeholder*="用户名"], input[placeholder*="email" i]');
-          const password = document.querySelector('input[type=password], input[autocomplete=current-password]');
           if (!user) {
             const words = new Set(['login', 'log in', 'sign in', '登录']);
             const signIn = Array.from(document.querySelectorAll('a, button')).find((node) => words.has((node.textContent || node.getAttribute('aria-label') || '').trim().toLowerCase()));
@@ -2070,7 +2352,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             node.dispatchEvent(new Event('change', { bubbles: true }));
           };
           set(user, \(safeUser));
-          if (\(safePassword)) set(password, \(safePassword));
+          return Boolean(user?.value);
         })();
         """
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
@@ -2090,21 +2372,37 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             reloadBrowser(sender)
             return
         }
+        startSignInCheck(automatically: false)
+    }
+
+    private func startSignInCheck(automatically: Bool) {
         guard !finished, !checking else { return }
         let attempt = NativeRelayLoginAttempt()
         activeCheck = attempt
         checking = true
         panelClosedDuringCommit = false
+        automaticCheckProbe?.cancel()
+        automaticCheckProbe = nil
         capturedAccessToken = nil
         capturedRefreshToken = nil
         signInButton.isEnabled = false
         cancelButton.isEnabled = true
-        statusLabel.stringValue = text("Checking sign-in...", "正在检查登录...")
+        if !automatically {
+            setStatus(text("Checking sign-in...", "正在验证登录..."))
+        }
         captureBrowserCredentials(attempt: attempt) { [weak self, weak attempt] in
             guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
             self.collectCookies(attempt: attempt) { [weak self, weak attempt] cookieHeader in
                 guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
-                self.probe(index: 0, cookieHeader: cookieHeader, attempt: attempt)
+                guard !automatically || cookieHeader != nil || self.capturedAccessToken != nil else {
+                    self.finishCheckingFailure(
+                        text("Waiting for sign-in...", "等待完成登录..."),
+                        attempt: attempt,
+                        quiet: true
+                    )
+                    return
+                }
+                self.probe(index: 0, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
             }
         }
     }
@@ -2113,36 +2411,47 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         !finished && checking && activeCheck === attempt && attempt.isActive()
     }
 
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard rememberPassword,
+              mode == .login,
+              message.name == "litellmRelayPassword",
+              message.frameInfo.isMainFrame,
+              message.frameInfo.securityOrigin.host.lowercased() == originURL.host?.lowercased(),
+              let password = message.body as? String,
+              !password.isEmpty,
+              password.utf8.count <= 4_096 else { return }
+        capturedPassword = password
+    }
+
     private var isBrowserFlowLive: Bool {
         !finished && !panelClosedDuringCommit
     }
 
     private func captureBrowserCredentials(attempt: NativeRelayLoginAttempt, completion: @escaping () -> Void) {
         let passwordExpression = rememberPassword
-            ? "document.querySelector('input[type=password], input[autocomplete=current-password]')?.value || ''"
+            ? "sessionStorage.getItem('__litellm_menu_relay_password') || document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || ''"
             : "''"
         let script = """
         (() => ({
-          password: \(passwordExpression),
-          accessToken: localStorage.getItem('auth_token') || localStorage.getItem('access_token') || '',
-          refreshToken: localStorage.getItem('refresh_token') || ''
+          accessToken: (() => {
+            const direct = localStorage.getItem('auth_token') || localStorage.getItem('access_token') || '';
+            if (direct) return direct;
+            try {
+              const user = JSON.parse(localStorage.getItem('user') || 'null');
+              return user && typeof user.token === 'string' ? user.token : '';
+            } catch { return ''; }
+          })(),
+          refreshToken: localStorage.getItem('refresh_token') || '',
+          password: \(passwordExpression)
         }))();
         """
         webView.evaluateJavaScript(script) { [weak self, weak attempt] value, _ in
             DispatchQueue.main.async {
                 guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
                 if let fields = value as? [String: Any] {
-                    if self.rememberPassword {
-                        if let password = (fields["password"] as? String).flatMap({ $0.isEmpty ? nil : $0 }) {
-                            self.capturedPassword = password
-                        } else if let captured = self.passwordCapture.value {
-                            self.capturedPassword = captured
-                        } else if self.capturedPassword == nil {
-                            self.capturedPassword = self.passwordCapture.value
-                        }
-                    }
                     self.capturedAccessToken = (fields["accessToken"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                     self.capturedRefreshToken = (fields["refreshToken"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    self.capturedPassword = (fields["password"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 }
                 completion()
             }
@@ -2207,16 +2516,20 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             : [Probe(path: "api/v1/auth/me", usernamePaths: [["data", "email"], ["data", "username"], ["email"], ["username"]])]
     }
 
-    private func probe(index: Int, cookieHeader: String?, attempt: NativeRelayLoginAttempt) {
+    private func probe(index: Int, cookieHeader: String?, attempt: NativeRelayLoginAttempt, automatically: Bool = false) {
         guard isCurrentCheck(attempt) else { return }
         guard index < probes.count else {
-            finishCheckingFailure(text("No active sign-in was found. Complete login in the page and try again.", "未检测到有效登录。请在页面内完成登录后重试。"), attempt: attempt)
+            finishCheckingFailure(
+                text("No valid sign-in was found. Complete sign-in in the page and try again.", "未检测到有效登录状态。请完成登录后重试。"),
+                attempt: attempt,
+                quiet: automatically
+            )
             return
         }
         let probe = probes[index]
         guard let url = relayURL(path: probe.path),
               sameOrigin(url) else {
-            self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt)
+            self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
             return
         }
         var request = URLRequest(url: url)
@@ -2238,7 +2551,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                   let object = try? JSONSerialization.jsonObject(with: data) else {
                 DispatchQueue.main.async { [weak self, weak attempt] in
                     guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
-                    self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt)
+                    self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
                 }
                 return
             }
@@ -2253,7 +2566,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 let refreshToken = detectedRefreshToken ?? self.capturedRefreshToken ?? self.restoredSession?.refreshToken
                 guard !username.isEmpty,
                       !(acceptedCookie?.isEmpty ?? true) || !(accessToken?.isEmpty ?? true) else {
-                    self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt)
+                    self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
                     return
                 }
                 self.persistVerifiedLogin(
@@ -2279,8 +2592,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let accountType = self.type
         let accountLabel = self.label
         let origin = self.originURL.absoluteString
-        let rememberPassword = self.rememberPassword
-        let capturedPassword = self.capturedPassword ?? self.passwordCapture.value
         let session = NativeRelaySession(
             accountType: accountType,
             origin: origin,
@@ -2288,34 +2599,23 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             accessToken: accessToken ?? "",
             refreshToken: refreshToken ?? ""
         )
-        let saveFailure = text("The signed-in session could not be saved securely.", "无法安全保存已登录会话。")
-        let attachFailure = text("The signed-in session could not be attached.", "无法关联已登录会话。")
+        let attachFailure = text("The signed-in session could not be saved.", "无法保存登录状态。")
+        let shouldRememberPassword = rememberPassword
+        let capturedPassword = self.capturedPassword
         DispatchQueue.global(qos: .userInitiated).async { [weak self, weak attempt] in
             guard let attempt, attempt.isActive() else { return }
-            let passwordToRemember = rememberPassword
-                ? capturedPassword ?? NativeRelayCredentialStore.readPassword(accountID: accountID, accountType: accountType, origin: origin)
-                : nil
             guard attempt.beginCommit() else { return }
             DispatchQueue.main.async { [weak self, weak attempt] in
                 guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
                 self.cancelButton.isEnabled = false
-                self.statusLabel.stringValue = self.text("Saving sign-in...", "正在保存登录...")
+                self.statusLabel.stringValue = self.text("Saving sign-in...", "正在保存登录状态...")
             }
-            let previousCredentials = NativeRelayCredentialStore.backup(accountID: accountID, includePassword: rememberPassword)
-            guard NativeRelayCredentialStore.writeSession(session, accountID: accountID),
-                  NativeRelayCredentialStore.writePassword(
-                    rememberPassword ? passwordToRemember : nil,
-                    accountID: accountID,
-                    accountType: accountType,
-                    origin: origin
-                  ) else {
-                NativeRelayCredentialStore.restore(previousCredentials, accountID: accountID)
-                DispatchQueue.main.async { [weak self, weak attempt] in
-                    guard let self, let attempt else { return }
-                    self.finishCheckingFailure(saveFailure, attempt: attempt)
-                }
-                return
-            }
+            let previousSession = NativeRelaySessionMemoryStore.readSession(
+                accountID: accountID,
+                accountType: accountType,
+                origin: origin
+            )
+            NativeRelaySessionMemoryStore.writeSession(session, accountID: accountID)
             do {
                 let accepted = try CoreIPCBridge.shared.acceptRelayLogin(
                     accountID: accountID,
@@ -2325,14 +2625,19 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                     username: username,
                     cookie: cookie,
                     accessToken: accessToken,
-                    refreshToken: refreshToken
+                    refreshToken: refreshToken,
+                    password: shouldRememberPassword ? capturedPassword : nil
                 )
                 DispatchQueue.main.async { [weak self, weak attempt] in
                     guard let self, let attempt else { return }
                     self.finish(accepted, session: session, attempt: attempt)
                 }
             } catch {
-                NativeRelayCredentialStore.restore(previousCredentials, accountID: accountID)
+                if let previousSession {
+                    NativeRelaySessionMemoryStore.writeSession(previousSession, accountID: accountID)
+                } else {
+                    NativeRelaySessionMemoryStore.clear(accountID: accountID)
+                }
                 DispatchQueue.main.async { [weak self, weak attempt] in
                     guard let self, let attempt else { return }
                     self.finishCheckingFailure(attachFailure, attempt: attempt)
@@ -2410,8 +2715,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         let callback = completion
         completion = nil
         self.session.finishTasksAndInvalidate()
-        panel.orderOut(nil)
-        panel.close()
+        dismissPresentation()
         callback?(value)
     }
 
@@ -2428,10 +2732,9 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         cancelButton.isEnabled = false
         clearCapturedCredentials()
         session.invalidateAndCancel()
-        panel.orderOut(nil)
+        dismissPresentation()
         let callback = completion
         completion = nil
-        panel.close()
         callback?(nil)
     }
 
@@ -2447,7 +2750,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         true
     }
 
-    private func finishCheckingFailure(_ message: String, attempt: NativeRelayLoginAttempt) {
+    private func finishCheckingFailure(_ message: String, attempt: NativeRelayLoginAttempt, quiet: Bool = false) {
         guard isCurrentCheck(attempt) else { return }
         attempt.finish()
         activeCheck = nil
@@ -2463,28 +2766,67 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         }
         signInButton.isEnabled = true
         cancelButton.isEnabled = true
-        statusLabel.stringValue = message
+        if quiet {
+            setStatus(waitingForSignInStatus)
+            scheduleAutomaticSignInCheck()
+        } else {
+            statusLabel.stringValue = message
+        }
+    }
+
+    private func scheduleAutomaticSignInCheck() {
+        guard mode == .login, isBrowserFlowLive, !checking else { return }
+        automaticCheckProbe?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isBrowserFlowLive, !self.checking else { return }
+            self.startSignInCheck(automatically: true)
+        }
+        automaticCheckProbe = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     private func clearCapturedCredentials() {
-        capturedPassword = nil
         capturedAccessToken = nil
         capturedRefreshToken = nil
-        passwordCapture.reset()
+        capturedPassword = nil
     }
 
     private func dismissWhileCommitting() {
         panelClosedDuringCommit = true
         signInButton.isEnabled = false
         cancelButton.isEnabled = false
-        panel.orderOut(nil)
-        panel.close()
+        dismissPresentation()
+    }
+
+    private func dismissPresentation() {
+        automaticCheckProbe?.cancel()
+        automaticCheckProbe = nil
+        pageReadinessProbe?.cancel()
+        pageReadinessProbe = nil
+        loginFormRevealProbe?.cancel()
+        loginFormRevealProbe = nil
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "litellmRelayPassword")
+        if let observer = embeddedCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            embeddedCloseObserver = nil
+        }
+        embeddedContent?.removeFromSuperview()
+        embeddedContent = nil
+        if let panel {
+            panel.orderOut(nil)
+            panel.close()
+        }
     }
 
     @objc private func reloadBrowser(_ sender: Any?) {
         guard isBrowserFlowLive else { return }
         showBrowserLoading()
         webView.reload()
+    }
+
+    @objc private func closeEmbeddedWindow(_ sender: Any?) {
+        guard let embeddedClose else { return cancel(sender) }
+        embeddedClose()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -2496,6 +2838,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             }
             return
         }
+        scheduleLoginFormReveal()
         prefillLoginWhenReady()
         if didRestoreSession {
             probeRestoredSession()
@@ -2532,19 +2875,20 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             self.webView.evaluateJavaScript("Boolean(document.body && document.body.children.length > 0 && document.body.innerText.trim().length > 0)") { [weak self] value, _ in
                 guard let self, self.isBrowserFlowLive else { return }
                 if value as? Bool == true {
-                    self.loadingIndicator.stopAnimation(nil)
-                    self.loadingOverlay.isHidden = true
+                    withoutAnimations { self.loadingOverlay.isHidden = true }
                     if self.mode == .logs {
                         if !self.didRestoreSession {
                             self.restoreLocalStorageWhenReady()
                         }
                     } else {
+                        self.scheduleLoginFormReveal()
                         self.prefillLoginWhenReady()
                         if self.didRestoreSession {
                             self.probeRestoredSession()
-                        } else {
+                        } else if !self.didRestoreSession {
                             self.restoreLocalStorageWhenReady()
                         }
+                        self.scheduleAutomaticSignInCheck()
                     }
                 } else {
                     self.schedulePageReadinessProbe()
@@ -2555,22 +2899,86 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
     }
 
+    private func scheduleLoginFormReveal() {
+        guard mode == .login,
+              isBrowserFlowLive,
+              !didRevealLoginField,
+              loginFormRevealAttempts < 12 else { return }
+        loginFormRevealProbe?.cancel()
+        loginFormRevealAttempts += 1
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isBrowserFlowLive, !self.didRevealLoginField else { return }
+            let script = """
+            (() => {
+              const visible = (node) => {
+                if (!(node instanceof HTMLInputElement) || node.disabled || node.readOnly) return false;
+                const style = getComputedStyle(node);
+                const rect = node.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const selectors = [
+                'input[autocomplete=username]',
+                'input[type=email]',
+                'input[name=username]',
+                'input[name=email]',
+                'input[placeholder*="用户名"]',
+                'input[placeholder*="邮箱"]',
+                'input[placeholder*="email" i]',
+                'input[type=text]',
+                'input:not([type])'
+              ];
+              let user = null;
+              for (const selector of selectors) {
+                user = Array.from(document.querySelectorAll(selector)).find(visible) || null;
+                if (user) break;
+              }
+              if (!user) return false;
+              user.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+              const active = document.activeElement;
+              if (!active || active === document.body || !(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active.isContentEditable)) {
+                try { user.focus({ preventScroll: true }); } catch { user.focus(); }
+              }
+              return true;
+            })();
+            """
+            self.webView.evaluateJavaScript(script) { [weak self] value, _ in
+                guard let self, self.isBrowserFlowLive else { return }
+                if value as? Bool == true {
+                    self.didRevealLoginField = true
+                    self.loginFormRevealProbe = nil
+                } else {
+                    self.scheduleLoginFormReveal()
+                }
+            }
+        }
+        loginFormRevealProbe = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
     private func showBrowserLoading() {
         pageReadinessProbe?.cancel()
+        loginFormRevealProbe?.cancel()
+        loginFormRevealProbe = nil
+        loginFormRevealAttempts = 0
+        didRevealLoginField = false
+        automaticCheckProbe?.cancel()
+        automaticCheckProbe = nil
         loadingLabel.stringValue = mode == .logs
             ? text("Loading usage logs...", "正在加载用量日志...")
             : text("Loading sign-in page...", "正在加载登录页面...")
-        loadingOverlay.isHidden = false
-        loadingIndicator.startAnimation(nil)
+        withoutAnimations { loadingOverlay.isHidden = false }
     }
 
     private func showBrowserFailure() {
         pageReadinessProbe?.cancel()
-        loadingIndicator.stopAnimation(nil)
+        loginFormRevealProbe?.cancel()
+        loginFormRevealProbe = nil
+        automaticCheckProbe?.cancel()
+        automaticCheckProbe = nil
         loadingLabel.stringValue = mode == .logs
             ? text("The usage log page could not be loaded.", "用量日志页面加载失败。")
             : text("The sign-in page could not be loaded.", "登录页面加载失败。")
-        loadingOverlay.isHidden = false
+        withoutAnimations { loadingOverlay.isHidden = false }
     }
 
     func webView(
@@ -2583,22 +2991,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             return
         }
         decisionHandler(.allow)
-    }
-}
-
-private final class NativeRelayPasswordCapture: NSObject, WKScriptMessageHandler {
-    private(set) var value: String?
-
-    func reset() {
-        value = nil
-    }
-
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "relayPassword",
-              let password = message.body as? String,
-              !password.isEmpty,
-              password.utf8.count <= 4_096 else { return }
-        value = password
     }
 }
 
@@ -2789,52 +3181,14 @@ private final class NativeRelayProbeRedirectGuard: NSObject, URLSessionTaskDeleg
     }
 }
 
-private struct NativeRelayPassword: Codable {
-    let accountType: String
-    let origin: String
-    let password: String
-}
-
-private struct NativeRelayCredentialBackup {
-    let password: Data?
-    let session: Data?
-}
-
-private enum NativeRelayCredentialStore {
-    private static var servicePrefix: String {
-        let bundleIdentifier = Bundle.main.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (bundleIdentifier?.isEmpty == false ? bundleIdentifier! : "menu.litellm.menu") + ".relay"
-    }
-    private static var passwordService: String { servicePrefix + "-password" }
-    private static var sessionService: String { servicePrefix + "-session" }
-
-    static func backup(accountID: String, includePassword: Bool) -> NativeRelayCredentialBackup {
-        NativeRelayCredentialBackup(
-            password: includePassword ? read(service: passwordService, accountID: accountID) : nil,
-            session: read(service: sessionService, accountID: accountID)
-        )
-    }
-
-    static func restore(_ backup: NativeRelayCredentialBackup, accountID: String) {
-        _ = write(backup.password, service: passwordService, accountID: accountID)
-        _ = write(backup.session, service: sessionService, accountID: accountID)
-    }
-
-    static func readPassword(accountID: String, accountType: String, origin: String) -> String? {
-        guard let data = read(service: passwordService, accountID: accountID),
-              data.count <= 8 * 1024,
-              let value = try? JSONDecoder().decode(NativeRelayPassword.self, from: data),
-              value.accountType == accountType,
-              value.origin == origin,
-              !value.password.isEmpty,
-              value.password.utf8.count <= 4_096 else { return nil }
-        return value.password
-    }
+private enum NativeRelaySessionMemoryStore {
+    private static let lock = NSLock()
+    private static var sessions: [String: NativeRelaySession] = [:]
 
     static func readSession(accountID: String, accountType: String, origin: String) -> NativeRelaySession? {
-        guard let data = read(service: sessionService, accountID: accountID),
-              data.count <= 96 * 1024,
-              let value = try? JSONDecoder().decode(NativeRelaySession.self, from: data),
+        lock.lock()
+        defer { lock.unlock() }
+        guard let value = sessions[accountID],
               value.accountType == accountType,
               value.origin == origin,
               value.cookie.utf8.count <= 32_768,
@@ -2844,75 +3198,19 @@ private enum NativeRelayCredentialStore {
         return value
     }
 
-    private static func read(service: String, accountID: String) -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: accountID,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else { return nil }
-        return item as? Data
-    }
-
-    @discardableResult
-    static func writePassword(_ password: String?, accountID: String, accountType: String, origin: String) -> Bool {
-        guard (password?.utf8.count ?? 0) <= 4_096 else { return false }
-        let value = password.map { NativeRelayPassword(accountType: accountType, origin: origin, password: $0) }
-        let data = value.flatMap { try? JSONEncoder().encode($0) }
-        guard (data?.count ?? 0) <= 8 * 1024 else { return false }
-        return write(data, service: passwordService, accountID: accountID)
-    }
-
-    @discardableResult
-    static func writeSession(_ session: NativeRelaySession, accountID: String) -> Bool {
+    static func writeSession(_ session: NativeRelaySession, accountID: String) {
         guard session.cookie.utf8.count <= 32_768,
               session.accessToken.utf8.count <= 32_768,
               session.refreshToken.utf8.count <= 32_768,
-              !session.cookie.isEmpty || !session.accessToken.isEmpty,
-              let data = try? JSONEncoder().encode(session),
-              data.count <= 96 * 1024 else { return false }
-        return write(data, service: sessionService, accountID: accountID)
+              !session.cookie.isEmpty || !session.accessToken.isEmpty else { return }
+        lock.lock()
+        sessions[accountID] = session
+        lock.unlock()
     }
 
-    static func clear(accountID: String) -> Bool {
-        let passwordRemoved = delete(service: passwordService, accountID: accountID)
-        let sessionRemoved = delete(service: sessionService, accountID: accountID)
-        return passwordRemoved && sessionRemoved
-    }
-
-    static func clearPassword(accountID: String) -> Bool {
-        delete(service: passwordService, accountID: accountID)
-    }
-
-    private static func delete(service: String, accountID: String) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: accountID,
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
-    }
-
-    private static func write(_ data: Data?, service: String, accountID: String) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: accountID,
-        ]
-        guard let data, !data.isEmpty else { return delete(service: service, accountID: accountID) }
-        let updateStatus = SecItemUpdate(
-            query as CFDictionary,
-            [kSecValueData as String: data] as CFDictionary
-        )
-        if updateStatus == errSecSuccess { return true }
-        guard updateStatus == errSecItemNotFound else { return false }
-        var attributes = query
-        attributes[kSecValueData as String] = data
-        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
+    static func clear(accountID: String) {
+        lock.lock()
+        sessions.removeValue(forKey: accountID)
+        lock.unlock()
     }
 }

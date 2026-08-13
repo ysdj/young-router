@@ -88,6 +88,7 @@ class LiteLLMMenuHook(CustomLogger):
             _responses_request_module._with_plaintext_agent_message_content_restored,
             _image_inputs_module._with_bounded_image_inputs,
             _responses_request_module._with_internal_litellm_metadata,
+            _responses_request_module._with_mcp_auto_approval,
             _responses_request_module._with_codex_descendant_cleanup_instruction,
             _responses_request_module._with_empty_tool_controls_removed,
             _responses_request_module._with_codex_compaction_controls,

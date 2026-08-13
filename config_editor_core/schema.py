@@ -38,8 +38,9 @@ MENU_ROUTE_KEY = "route_key"
 MENU_API_KEY_NAME_KEY = "api_key_name"
 RANDOM_DEPLOYMENT_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 UPSTREAM_URL_SURFACE_KEY = "upstream_url_surface"
-SUPPORTED_UPSTREAM_URL_SURFACES_KEY = "supported_upstream_url_surfaces"
 UPSTREAM_URL_SURFACES = {"openai/chat", "openai/responses", "anthropic"}
+UPSTREAM_PROTOCOL_MODE_KEY = "upstream_protocol_mode"
+UPSTREAM_PROTOCOL_MODES = {"fallback", "fixed"}
 CURRENT_HOOK_CALLBACK = "litellm_menu.callbacks.image_generation_routing_hook"
 YAML_MAX_EXPANDED_NODES = 100_000
 YAML_MAX_NESTING_DEPTH = 100
@@ -210,28 +211,52 @@ def _positive_int(value: Any) -> int | None:
     return number if number > 0 else None
 
 
-def _upstream_url_surfaces(value: Any) -> list[str]:
-    if not isinstance(value, list) or not value:
+def _upstream_url_surface(value: Any) -> str:
+    if not isinstance(value, str) or value not in UPSTREAM_URL_SURFACES:
         raise ValueError(
-            f"{SUPPORTED_UPSTREAM_URL_SURFACES_KEY} must be a non-empty list"
+            f"{UPSTREAM_URL_SURFACE_KEY} must be one of "
+            "openai/responses, anthropic, openai/chat"
         )
-    modes: list[str] = []
-    for index, item in enumerate(value, start=1):
-        if not isinstance(item, str) or item not in UPSTREAM_URL_SURFACES:
-            raise ValueError(
-                f"{SUPPORTED_UPSTREAM_URL_SURFACES_KEY}[{index}] must be one of "
-                "openai/responses, anthropic, openai/chat"
-            )
-        if item in modes:
-            raise ValueError(
-                f"{SUPPORTED_UPSTREAM_URL_SURFACES_KEY} contains duplicate {item}"
-            )
-        modes.append(item)
-    return modes
+    return value
 
 
-def canonical_litellm_model(value: Any, surfaces: list[str]) -> str:
-    """Store a LiteLLM adapter prefix derived from the selected primary surface."""
+def _upstream_protocol_mode(value: Any) -> str:
+    if value is None:
+        return "fallback"
+    if not isinstance(value, str) or value.strip().lower() not in UPSTREAM_PROTOCOL_MODES:
+        raise ValueError(
+            f"{UPSTREAM_PROTOCOL_MODE_KEY} must be one of fallback, fixed"
+        )
+    return value.strip().lower()
+
+
+def infer_upstream_fallback_surface(value: Any) -> str:
+    """Infer the fallback protocol from the exact upstream model identifier.
+
+    The public model alias is deliberately not accepted here.  A route may
+    expose a Claude-shaped public name while targeting a Kimi or GPT model,
+    and that alias must not change the adapter used as the fallback.
+    """
+
+    model = _string_value(value).strip().lower()
+    if "/" in model:
+        prefix, raw_model = model.split("/", 1)
+        if prefix in {"openai", "anthropic"}:
+            model = raw_model.strip()
+    tokens = [token for token in re.split(r"[^a-z0-9]+", model) if token]
+    if any(token in {"claude", "anthropic"} for token in tokens):
+        return "anthropic"
+    if any(
+        token in {"gpt", "openai", "o1", "o2", "o3", "o4", "codex"}
+        or token.startswith(("gpt", "o1", "o2", "o3", "o4"))
+        for token in tokens
+    ):
+        return "openai/responses"
+    return "openai/chat"
+
+
+def canonical_litellm_model(value: Any, surface: str) -> str:
+    """Store a LiteLLM adapter prefix derived from the selected upstream surface."""
 
     model = _string_value(value).strip()
     if not model:
@@ -242,7 +267,7 @@ def canonical_litellm_model(value: Any, surfaces: list[str]) -> str:
             model = raw_model.strip()
     if not model:
         return ""
-    prefix = "anthropic" if surfaces and surfaces[0] == "anthropic" else "openai"
+    prefix = "anthropic" if surface == "anthropic" else "openai"
     return f"{prefix}/{model}"
 
 
@@ -347,7 +372,7 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                         "supports_responses_image_generation_tool"
                         if unsupported_key == "supports_image_generation"
                         else (
-                            "supported_upstream_url_surfaces"
+                            "upstream_url_surface"
                             if unsupported_key in {
                                 "upstream_api_mode",
                                 "supported_upstream_api_modes",
@@ -365,19 +390,19 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 raise ValueError(
                     f"{path.name} {section_name}[{index}] model_info.id must be an 8 character hex deployment token"
                 )
+            if UPSTREAM_URL_SURFACE_KEY in model_info:
+                try:
+                    _upstream_url_surface(model_info.get(UPSTREAM_URL_SURFACE_KEY))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {exc}"
+                    ) from exc
             try:
-                surfaces = _upstream_url_surfaces(
-                    model_info.get(SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
-                )
+                _upstream_protocol_mode(model_info.get(UPSTREAM_PROTOCOL_MODE_KEY))
             except ValueError as exc:
                 raise ValueError(
                     f"{path.name} {section_name}[{index}] {exc}"
                 ) from exc
-            if model_info.get(UPSTREAM_URL_SURFACE_KEY) != surfaces[0]:
-                raise ValueError(
-                    f"{path.name} {section_name}[{index}] {UPSTREAM_URL_SURFACE_KEY} "
-                    f"must equal the first {SUPPORTED_UPSTREAM_URL_SURFACES_KEY} item"
-                )
 
 
 def safe_load_yaml_text(text: str, source_name: str) -> Any:

@@ -38,8 +38,8 @@ from .base import (
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
     _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
-    _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
+    _UPSTREAM_URL_SURFACE_KEY,
     asyncio,
     copy,
     inspect,
@@ -2973,9 +2973,7 @@ def _external_web_search_chat_only_route(request_kwargs: Optional[dict]) -> bool
     model_info = _request_context_module._request_model_info(request_kwargs)
     surface = _routing_module._request_current_upstream_surface(request_kwargs)
     if not surface:
-        supported_surfaces = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
-        if isinstance(supported_surfaces, list) and supported_surfaces:
-            surface = supported_surfaces[0]
+        surface = model_info.get(_UPSTREAM_URL_SURFACE_KEY)
     if surface in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
         return True
     return False

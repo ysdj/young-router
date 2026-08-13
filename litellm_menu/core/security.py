@@ -56,7 +56,17 @@ def is_secret_key(key: object) -> bool:
     # turn fields such as ``token_configured`` into the string marker
     # ``configured``; the shared snapshot contract uses those fields to show
     # whether a credential exists without carrying its value.
-    if text in {"key_name", "key_names", "api_key_name", "api_key_names", "key_id", "key_ids", "credential_store"} or text.endswith(("_configured", "_present", "_exists")):
+    if text in {
+        "key_name",
+        "key_names",
+        "api_key_name",
+        "api_key_names",
+        "key_id",
+        "key_ids",
+        "credential_store",
+        "remember_password",
+        "password_saved",
+    } or text.endswith(("_configured", "_present", "_exists")):
         return False
     return any(marker == text or marker in text for marker in SECRET_KEY_MARKERS)
 

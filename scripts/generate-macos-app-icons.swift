@@ -38,50 +38,41 @@ private func makeMasterIcon() -> CGImage {
         color: CGColor(gray: 0.12, alpha: 0.32)
     )
     context.addPath(iconPath)
-    context.setFillColor(CGColor(gray: 0.86, alpha: 1))
+    context.setFillColor(CGColor(gray: 0.89, alpha: 1))
     context.fillPath()
     context.restoreGState()
 
-    context.saveGState()
     context.addPath(iconPath)
-    context.clip()
-    let gradient = CGGradient(
-        colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-        colors: [
-            CGColor(red: 0.985, green: 0.985, blue: 0.985, alpha: 1),
-            CGColor(red: 0.79, green: 0.79, blue: 0.79, alpha: 1),
-        ] as CFArray,
-        locations: [0, 1]
-    )!
-    context.drawLinearGradient(
-        gradient,
-        start: CGPoint(x: iconRect.midX, y: iconRect.maxY),
-        end: CGPoint(x: iconRect.midX, y: iconRect.minY),
-        options: []
-    )
-    context.restoreGState()
+    context.setFillColor(CGColor(gray: 0.89, alpha: 1))
+    context.fillPath()
 
     context.addPath(iconPath)
     context.setStrokeColor(CGColor(gray: 0.58, alpha: 0.62))
     context.setLineWidth(7)
     context.strokePath()
 
-    let highlightPath = CGPath(
-        roundedRect: iconRect.insetBy(dx: 5, dy: 5),
-        cornerWidth: 179,
-        cornerHeight: 179,
-        transform: nil
-    )
-    context.addPath(highlightPath)
-    context.setStrokeColor(CGColor(gray: 1, alpha: 0.72))
-    context.setLineWidth(4)
-    context.strokePath()
+    let leftGlyph = CGPath(rect: CGRect(x: 322, y: 358, width: 28, height: 310), transform: nil)
+        .mutableCopy()!
+    leftGlyph.addRect(CGRect(x: 322, y: 358, width: 186, height: 28))
 
-    context.setFillColor(CGColor(gray: 0.015, alpha: 1))
-    context.fill(CGRect(x: 324, y: 365, width: 29, height: 318))
-    context.fill(CGRect(x: 324, y: 365, width: 190, height: 29))
-    context.fill(CGRect(x: 563, y: 365, width: 25, height: 239))
-    context.fill(CGRect(x: 563, y: 365, width: 138, height: 25))
+    let rightGlyph = CGPath(rect: CGRect(x: 557, y: 358, width: 25, height: 236), transform: nil)
+        .mutableCopy()!
+    rightGlyph.addRect(CGRect(x: 557, y: 358, width: 137, height: 25))
+
+    let glyphs = CGMutablePath()
+    glyphs.addPath(leftGlyph)
+    glyphs.addPath(rightGlyph)
+
+    context.saveGState()
+    context.setShadow(
+        offset: CGSize(width: 4, height: -4),
+        blur: 7,
+        color: CGColor(gray: 0, alpha: 0.28)
+    )
+    context.addPath(glyphs)
+    context.setFillColor(CGColor(gray: 0.08, alpha: 1))
+    context.fillPath()
+    context.restoreGState()
 
     return context.makeImage()!
 }
@@ -97,6 +88,7 @@ private func pngData(for image: CGImage) -> Data {
     NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!
 }
 
+try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 let masterIcon = makeMasterIcon()
 for size in iconSizes {
     let image = size == canvasSize ? masterIcon : resize(masterIcon, to: size)

@@ -11,7 +11,7 @@ from .schema import (
     MENU_API_KEY_NAME_KEY,
     MENU_MODEL_ENABLED_KEY,
     MENU_ROUTE_KEY,
-    SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
+    UPSTREAM_PROTOCOL_MODE_KEY,
     UPSTREAM_URL_SURFACE_KEY,
     _as_dict,
     _as_list,
@@ -21,7 +21,9 @@ from .schema import (
     _editor_deployment_id,
     _jsonable,
     _string_value,
-    _upstream_url_surfaces,
+    _upstream_protocol_mode,
+    _upstream_url_surface,
+    infer_upstream_fallback_surface,
     load_yaml_text,
 )
 
@@ -169,15 +171,22 @@ def _model_to_editor(
             MENU_ROUTE_KEY,
             MENU_API_KEY_NAME_KEY,
             "supports_responses_image_generation_tool",
+            UPSTREAM_PROTOCOL_MODE_KEY,
             UPSTREAM_URL_SURFACE_KEY,
-            SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
+            "supported_upstream_url_surfaces",
+            "x-litellm-menu-upstream-url-surface-order",
             MENU_MODEL_ENABLED_KEY,
         }
     }
-    supported_upstream_url_surfaces = _upstream_url_surfaces(
-        model_info.get(SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+    raw_upstream_url_surface = model_info.get(UPSTREAM_URL_SURFACE_KEY)
+    upstream_url_surface = (
+        _upstream_url_surface(raw_upstream_url_surface)
+        if raw_upstream_url_surface is not None
+        else infer_upstream_fallback_surface(params.get("model"))
     )
-    upstream_url_surface = supported_upstream_url_surfaces[0]
+    upstream_protocol_mode = _upstream_protocol_mode(
+        model_info.get(UPSTREAM_PROTOCOL_MODE_KEY)
+    )
     entry_extra = {
         key: _jsonable(value)
         for key, value in entry.items()
@@ -208,7 +217,7 @@ def _model_to_editor(
         "supports_responses_image_generation_tool": supports_responses_image_tool,
         "supports_responses_image_generation_tool_present": supports_responses_image_tool_present,
         "upstream_url_surface": upstream_url_surface,
-        "supported_upstream_url_surfaces": supported_upstream_url_surfaces,
+        "upstream_protocol_mode": upstream_protocol_mode,
         "entry_extra": entry_extra,
         "litellm_extra": litellm_extra,
         "model_info_extra": model_info_extra,

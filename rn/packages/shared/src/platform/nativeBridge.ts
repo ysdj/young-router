@@ -47,6 +47,7 @@ export interface NativeLeafBridge {
     field: string,
     target: string | undefined,
   ): Promise<{ revision: number; present: boolean } | undefined>;
+  copySecret(domain: "relay_accounts", field: "api_key", target: string): Promise<boolean>;
   relayLogin(options: {
     accountId: string;
     type: "newapi" | "sub2api";
@@ -55,6 +56,7 @@ export interface NativeLeafBridge {
     language: LanguagePreference;
     username?: string;
     rememberPassword: boolean;
+    embedded?: boolean;
   }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   restoreRelaySession(options: {
     accountId: string;
@@ -125,6 +127,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     editSecureDocument: ({ editorToken, language, title }) => bridge.editSecureDocument(editorToken, language, title),
     editSecret: ({ domain, field, target, title, allowClear }) => bridge.editSecret(domain, field, target, title, allowClear),
     clearSecret: ({ domain, field, target }) => bridge.clearSecret(domain, field, target),
+    copySecret: ({ domain, field, target }) => bridge.copySecret(domain, field, target),
     relayLogin: (options) => bridge.relayLogin(options),
     restoreRelaySession: (options) => bridge.restoreRelaySession(options),
     openRelayLogs: (options) => bridge.openRelayLogs(options),

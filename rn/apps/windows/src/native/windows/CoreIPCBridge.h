@@ -74,9 +74,15 @@ class CoreIPCBridge {
       std::string const& secret_token,
       std::optional<std::string> const& value,
       bool clear);
-  std::optional<SecretReadCapability> CreateSecretReadCapability(std::string const& target);
+  std::optional<SecretReadCapability> CreateSecretReadCapability(
+      std::string const& domain,
+      std::string const& field,
+      std::optional<std::string> const& target);
   std::optional<std::string> ReadSecret(std::string const& secret_read_token);
-  std::optional<std::string> ReadProviderAPIKey(std::string const& target);
+  std::optional<std::string> ReadPlainTextSecret(
+      std::string const& domain,
+      std::string const& field,
+      std::optional<std::string> const& target);
   std::optional<RelayLoginResult> AcceptRelayLogin(
       std::string const& account_id,
       std::string const& account_type,
@@ -85,7 +91,8 @@ class CoreIPCBridge {
       std::string const& username,
       std::optional<std::string> const& cookie,
       std::optional<std::string> const& access_token,
-      std::optional<std::string> const& refresh_token);
+      std::optional<std::string> const& refresh_token,
+      std::optional<std::string> const& password = std::nullopt);
   std::optional<RelaySessionRestoreResult> RestoreRelaySession(
       std::string const& account_id,
       std::string const& account_type,

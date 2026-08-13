@@ -36,6 +36,19 @@ function isProtocolResponse<M extends IpcMethod>(response: IpcResponse<M>, expec
 }
 
 export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint): IpcClient {
+  let latestSnapshot: CoreSnapshot | undefined;
+  let initialSnapshotRequest: Promise<CoreSnapshot> | undefined;
+  const snapshotListeners = new Set<(event: IpcEvent) => void>();
+  let unsubscribeTransport: (() => void) | undefined;
+  let subscriptionStarted = false;
+
+  function rememberSnapshot(next: CoreSnapshot): CoreSnapshot {
+    // Snapshot revisions order mutations. Keep same-revision projections too:
+    // they may carry newer live log data.
+    if (!latestSnapshot || next.revision >= latestSnapshot.revision) latestSnapshot = next;
+    return latestSnapshot;
+  }
+
   async function call<M extends IpcMethod>(method: M, params: IpcParams[M]): Promise<IpcResults[M]> {
     const request: IpcRequest<M> = {
       protocol_version: IPC_PROTOCOL_VERSION,
@@ -56,14 +69,37 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
 
   return {
     endpoint,
-    snapshot: async (): Promise<CoreSnapshot> => (await call("snapshot", {})).snapshot,
+    latestSnapshot: (): CoreSnapshot | undefined => latestSnapshot,
+    snapshot: (): Promise<CoreSnapshot> => {
+      if (latestSnapshot) return call("snapshot", {}).then(({ snapshot }) => rememberSnapshot(snapshot));
+      if (!initialSnapshotRequest) {
+        const promise = call("snapshot", {}).then(({ snapshot }) => rememberSnapshot(snapshot)).finally(() => {
+          if (initialSnapshotRequest === promise) initialSnapshotRequest = undefined;
+        });
+        initialSnapshotRequest = promise;
+      }
+      return initialSnapshotRequest;
+    },
     logs: async (tab, revision) => call("logs", revision === undefined ? { tab } : { tab, revision }),
     editor: async (domain, document): Promise<IpcResults["editor"]> => call("editor", { domain, document }),
     dispatch: async (action: DispatchAction, revision?: number): Promise<{ revision: number }> => call("dispatch", revision === undefined ? { action } : { action, revision }),
     subscribe: (listener: (event: IpcEvent) => void, topics?: string[]): (() => void) => {
-      const unsubscribeTransport = transport.subscribe(listener);
-      void call("subscribe", topics ? { topics } : {}).catch(() => undefined);
-      return unsubscribeTransport;
+      snapshotListeners.add(listener);
+      if (!unsubscribeTransport) {
+        unsubscribeTransport = transport.subscribe((event) => {
+          rememberSnapshot(event.snapshot);
+          for (const snapshotListener of snapshotListeners) snapshotListener(event);
+        });
+      }
+      if (!subscriptionStarted) {
+        subscriptionStarted = true;
+        void call("subscribe", topics ? { topics } : {}).catch(() => {
+          subscriptionStarted = false;
+        });
+      }
+      return () => {
+        snapshotListeners.delete(listener);
+      };
     },
     validate: async (domain: ConfigDomain, revision?: number): Promise<ValidationSummary> => (await call("validate", revision === undefined ? { domain } : { domain, revision })).validate,
     apply: async (domain: ConfigDomain, revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]> => call("apply", confirmation === undefined ? { domain, revision } : { domain, revision, confirmation }),

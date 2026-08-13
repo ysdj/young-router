@@ -26,6 +26,7 @@ export function createNativeLeafAdapter(overrides: Partial<NativeLeafAdapter> = 
     editSecureDocument: overrides.editSecureDocument ?? (async () => undefined),
     editSecret: overrides.editSecret ?? (async () => undefined),
     clearSecret: overrides.clearSecret ?? (async () => undefined),
+    copySecret: overrides.copySecret ?? (async () => false),
     relayLogin: overrides.relayLogin ?? (async () => undefined),
     restoreRelaySession: overrides.restoreRelaySession ?? (async () => undefined),
     openRelayLogs: overrides.openRelayLogs ?? (async () => undefined),

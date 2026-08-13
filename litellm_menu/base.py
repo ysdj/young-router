@@ -100,6 +100,10 @@ _DEPLOYMENT_COOLDOWN_DEFAULT_FAILURES = 2
 _DEPLOYMENT_COOLDOWN_DEFAULT_SECONDS = 300.0
 _DEPLOYMENT_COOLDOWN_ORDINARY_DEFAULT_ENABLED = True
 _DEPLOYMENT_COOLDOWN_COMPACTION_DEFAULT_ENABLED = False
+_PROTOCOL_FALLBACK_TTL_SECONDS_ENV = (
+    "LITELLM_MENU_PROTOCOL_FALLBACK_TTL_SECONDS"
+)
+_PROTOCOL_FALLBACK_DEFAULT_TTL_SECONDS = 600.0
 _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR = (
     "_deployment_cooldown_failure_recorded"
 )
@@ -131,8 +135,10 @@ _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY = (
     "_browser_compatible_headers_retry"
 )
 _RESPONSES_IMAGE_INPUT_SUPPORT_KEY = "supports_responses_image_input"
+_UPSTREAM_PROTOCOL_MODE_KEY = "upstream_protocol_mode"
+_UPSTREAM_PROTOCOL_MODE_FALLBACK = "fallback"
+_UPSTREAM_PROTOCOL_MODE_FIXED = "fixed"
 _UPSTREAM_URL_SURFACE_KEY = "upstream_url_surface"
-_SUPPORTED_UPSTREAM_URL_SURFACES_KEY = "supported_upstream_url_surfaces"
 _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES = "openai/responses"
 _UPSTREAM_URL_SURFACE_OPENAI_CHAT = "openai/chat"
 _UPSTREAM_URL_SURFACE_ANTHROPIC = "anthropic"
@@ -151,6 +157,15 @@ _UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY = (
     "_litellm_menu_upstream_url_surface_deployment_id"
 )
 _SURFACE_TARGET_DEPLOYMENT_ID_KEY = "_litellm_menu_surface_target_deployment_id"
+_PROTOCOL_FALLBACK_FROM_SURFACE_KEY = (
+    "_litellm_menu_protocol_fallback_from_surface"
+)
+_PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY = (
+    "_litellm_menu_protocol_fallback_client_surface"
+)
+_PROTOCOL_FALLBACK_CACHE_HIT_KEY = (
+    "_litellm_menu_protocol_fallback_cache_hit"
+)
 _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY = (
     "responses_chat_bridge_preemptive"
 )
@@ -373,13 +388,11 @@ _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID = contextvars.ContextVar(
     "current_surface_target_deployment_id",
     default=None,
 )
-_CURRENT_DEPLOYMENT_COOLDOWN_SURFACE = contextvars.ContextVar(
-    "current_deployment_cooldown_surface",
-    default=None,
-)
 _OMIT_RESPONSE_VALUE = object()
 _DEPLOYMENT_COOLDOWN_LOCK = threading.Lock()
 _DEPLOYMENT_COOLDOWNS: dict[str, dict[str, Any]] = {}
+_PROTOCOL_FALLBACK_LOCK = threading.Lock()
+_PROTOCOL_FALLBACKS: dict[str, dict[str, Any]] = {}
 _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_LOCK = threading.Lock()
 _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS: dict[str, float] = {}
 _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS_MAX = 512

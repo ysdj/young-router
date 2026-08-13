@@ -163,8 +163,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
                     "id": "chatroute",
                     "provider": "provider_chat",
                     "route_key": "provider_chat / openai/vendor-chat / key=default",
-                "upstream_url_surface": "openai/chat",
-                "supported_upstream_url_surfaces": ["openai/responses", "openai/chat"],
+                    "upstream_url_surface": "openai/responses",
                 },
             )
 

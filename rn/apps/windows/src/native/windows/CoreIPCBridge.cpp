@@ -416,13 +416,22 @@ std::optional<CoreIPCBridge::SecretStageResult> CoreIPCBridge::StageSecret(
 }
 
 std::optional<CoreIPCBridge::SecretReadCapability> CoreIPCBridge::CreateSecretReadCapability(
-    std::string const& target) {
-  if (target.empty() || target.size() > 256) return std::nullopt;
+    std::string const& domain,
+    std::string const& field,
+    std::optional<std::string> const& target) {
+  if (domain.empty() || domain.size() > 64 || field.empty() || field.size() > 128 ||
+      (target && target->size() > 256)) return std::nullopt;
   try {
     winrt::Windows::Data::Json::JsonObject payload;
-    payload.SetNamedValue(L"domain", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"providers_models"));
-    payload.SetNamedValue(L"field", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"api_key"));
-    payload.SetNamedValue(L"target", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(target)));
+    payload.SetNamedValue(L"domain", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(domain)));
+    payload.SetNamedValue(L"field", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(field)));
+    // The Core route has a strict three-field envelope.  Keep the target key
+    // present even for domain-level secrets; JSON null represents no target.
+    if (target && !target->empty()) {
+      payload.SetNamedValue(L"target", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*target)));
+    } else {
+      payload.SetNamedValue(L"target", winrt::Windows::Data::Json::JsonValue::CreateNullValue());
+    }
     auto result = HostRequest(L"host/secret/read-capability", WideToUtf8(payload.Stringify().c_str()), false);
     if (!result || result->status != 200 || result->body.empty()) return std::nullopt;
     auto response = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(result->body));
@@ -465,8 +474,11 @@ std::optional<std::string> CoreIPCBridge::ReadSecret(std::string const& secret_r
   }
 }
 
-std::optional<std::string> CoreIPCBridge::ReadProviderAPIKey(std::string const& target) {
-  auto capability = CreateSecretReadCapability(target);
+std::optional<std::string> CoreIPCBridge::ReadPlainTextSecret(
+    std::string const& domain,
+    std::string const& field,
+    std::optional<std::string> const& target) {
+  auto capability = CreateSecretReadCapability(domain, field, target);
   if (!capability) return std::nullopt;
   return ReadSecret(capability->token);
 }
@@ -479,7 +491,8 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     std::string const& username,
     std::optional<std::string> const& cookie,
     std::optional<std::string> const& access_token,
-    std::optional<std::string> const& refresh_token) {
+    std::optional<std::string> const& refresh_token,
+    std::optional<std::string> const& password) {
   if (account_id.empty() || account_id.size() > 96 ||
       (account_type != "newapi" && account_type != "sub2api") ||
       label.empty() || label.size() > 160 || origin.empty() || origin.size() > 2048 ||
@@ -487,6 +500,7 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
       (cookie && cookie->size() > 32768) ||
       (access_token && access_token->size() > 32768) ||
       (refresh_token && refresh_token->size() > 32768) ||
+      (password && password->size() > 4096) ||
       ((!cookie || cookie->empty()) && (!access_token || access_token->empty()))) {
     return std::nullopt;
   }
@@ -505,6 +519,9 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     }
     if (refresh_token && !refresh_token->empty()) {
       payload.SetNamedValue(L"refresh_token", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*refresh_token)));
+    }
+    if (password && !password->empty()) {
+      payload.SetNamedValue(L"password", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*password)));
     }
     auto body = WideToUtf8(payload.Stringify().c_str());
     if (body.size() > 96 * 1024) return std::nullopt;
@@ -1039,7 +1056,7 @@ void CoreIPCBridge::RememberEditorCapability(
     std::string document = WideToUtf8(params.GetNamedString(L"document", L"").c_str());
     const bool valid_identity =
         (domain == "codex" && (document == "config" || document == "auth")) ||
-        (domain == "claude" && document == "settings");
+        (domain == "claude" && (document == "settings" || document == "desktop" || document == "developer"));
     if (!valid_identity) return;
     auto response = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(response_json));
     if (!response.GetNamedBoolean(L"ok", false)) return;

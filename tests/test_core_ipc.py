@@ -455,8 +455,6 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                                     "litellm_model": "openai/upstream-chat",
                                     "model_enabled": False,
                                     "order": "2",
-                                    "billing": {"cost": "1.25", "api_key": "sk-synthetic-summary-secret"},
-                                    "multiplier": {"status": "ok", "value": 1.25},
                                     "supported_upstream_url_surfaces": ["openai/responses"],
                                 }
                             ],
@@ -467,7 +465,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         model = CoreStore(domains=[ProviderDomain("providers_models")]).snapshot()["providers_models"]["providers"][0]["models"][0]
 
         self.assertEqual(
-            {"id", "display_name", "public_model", "upstream_model", "enabled", "order", "billing", "multiplier"},
+            {"id", "display_name", "public_model", "upstream_model", "enabled", "order"},
             set(model),
         )
         self.assertEqual("deployment-1", model["id"])
@@ -476,8 +474,6 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         self.assertEqual("upstream-chat", model["upstream_model"])
         self.assertFalse(model["enabled"])
         self.assertEqual(2, model["order"])
-        self.assertIsInstance(model["billing"], str)
-        self.assertIsInstance(model["multiplier"], str)
         encoded = json.dumps(model)
         self.assertNotIn("sk-synthetic-summary-secret", encoded)
         self.assertNotIn("/private/user", encoded)
@@ -625,6 +621,69 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 client.read_editor(editor["editor_token"])
 
+    def test_claude_desktop_developer_and_code_raw_editors_stage_their_own_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "settings.json"
+            settings.write_text('{"skipWorkflowUsageWarning":true}\n', encoding="utf-8")
+            developer_settings = root / "Claude" / "developer_settings.json"
+            developer_settings.parent.mkdir(parents=True)
+            developer_settings.write_text('{"allowDevTools":true}\n', encoding="utf-8")
+            library = root / "Claude-3p" / "configLibrary"
+            library.mkdir(parents=True)
+            config_id = "11111111-2222-4333-8444-555555555555"
+            (library / "_meta.json").write_text(
+                json.dumps({"appliedId": config_id, "entries": [{"id": config_id, "name": "Default"}]}),
+                encoding="utf-8",
+            )
+            (library / f"{config_id}.json").write_text(
+                json.dumps(
+                    {
+                        "inferenceProvider": "gateway",
+                        "inferenceGatewayBaseUrl": "http://127.0.0.1:4000",
+                        "inferenceGatewayApiKey": "synthetic-desktop-key",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+
+            core = CoreStore(
+                domains=[ClaudeSettingsDomain(
+                    settings,
+                    desktop_config_library_path=library,
+                    developer_settings_path=developer_settings,
+                )]
+            )
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            desktop_editor = client.call("editor", {"domain": "claude", "document": "desktop"})
+            developer_editor = client.call("editor", {"domain": "claude", "document": "developer"})
+            code_editor = client.call("editor", {"domain": "claude", "document": "settings"})
+            desktop_text = client.read_editor(desktop_editor["editor_token"])
+            developer_text = client.read_editor(developer_editor["editor_token"])
+            code_text = client.read_editor(code_editor["editor_token"])
+            self.assertIn("synthetic-desktop-key", desktop_text)
+            self.assertIn("allowDevTools", developer_text)
+            self.assertIn("skipWorkflowUsageWarning", code_text)
+            self.assertNotIn("synthetic-desktop-key", json.dumps(core.snapshot()))
+
+            client.stage_editor(
+                desktop_editor["editor_token"],
+                '{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"http://127.0.0.1:4100","inferenceGatewayApiKey":"synthetic-desktop-key"}\n',
+            )
+            client.stage_editor(developer_editor["editor_token"], '{"allowDevTools":false}\n')
+            client.stage_editor(code_editor["editor_token"], '{"model":"claude-code-model"}\n')
+            snapshot = core.snapshot()["domains"]["claude"]
+            self.assertEqual("http://127.0.0.1:4100", snapshot["desktop"]["gateway_url"])
+            self.assertFalse(snapshot["developer"]["developer_mode_enabled"])
+            self.assertEqual("claude-code-model", snapshot["settings"]["model"])
+            self.assertNotIn("synthetic-desktop-key", json.dumps(snapshot))
+
     def test_editor_capability_is_session_bound_and_requires_read_before_stage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             from litellm_menu.core.domains.claude import ClaudeSettingsDomain
@@ -765,12 +824,18 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                 session_token=client._session_token,
             )
             self.assertGreater(staged["revision"], config_editor["revision"])
+            codex_after_config = core.snapshot()["domains"]["codex"]
+            self.assertTrue(codex_after_config["config_exists"])
+            self.assertTrue(codex_after_config["auth_file_exists"])
             next_auth = server.stage_editor_capability(
                 auth_editor["editor_token"],
                 '{"kind":"second"}\n',
                 session_token=client._session_token,
             )
             self.assertGreater(next_auth["revision"], staged["revision"])
+            codex_after_auth = core.snapshot()["domains"]["codex"]
+            self.assertTrue(codex_after_auth["config_exists"])
+            self.assertTrue(codex_after_auth["auth_file_exists"])
             self.assertIn("second", core.trusted_editor_text("codex", "config", revision=next_auth["revision"]))
             self.assertIn("second", core.trusted_editor_text("codex", "auth", revision=next_auth["revision"]))
 
@@ -1036,6 +1101,73 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                         }
                     },
                 )
+
+    def test_codex_and_claude_plaintext_fields_use_native_read_once_capabilities(self) -> None:
+        class PlaintextSecretDomain(MemoryDomain):
+            def __init__(self, name: str, field: str, secret: str) -> None:
+                super().__init__(name, {"configured": True})
+                self.field = field
+                self.secret = secret
+
+            def secret_present(self, field: str, target: str | None = None) -> bool:
+                if field != self.field or target is not None:
+                    raise ValueError("unavailable")
+                return bool(self.secret)
+
+            def stage_secret(self, field: str, target: str | None, value: str) -> None:
+                if field != self.field or target is not None:
+                    raise ValueError("unavailable")
+                self.secret = value
+
+            def trusted_secret_value(self, field: str, target: str | None = None) -> str:
+                if field != self.field or target is not None:
+                    raise ValueError("unavailable")
+                return self.secret
+
+        cases = (
+            ("codex", "api_key", "synthetic-codex-key"),
+            ("claude", "deployment_token", "synthetic-claude-code-token"),
+            ("claude", "desktop_gateway_api_key", "synthetic-claude-desktop-key"),
+        )
+        for domain_name, field, secret in cases:
+            with self.subTest(domain=domain_name, field=field):
+                core = CoreStore(domains=[PlaintextSecretDomain(domain_name, field, secret)])
+                server = CoreIPCServer(core)
+                endpoint = server.start()
+                client = CoreIPCClient(endpoint, server.bootstrap_token)
+                try:
+                    self.assertNotIn(secret, json.dumps(client.call("snapshot")))
+                    session = client._session_token
+                    status, body, _headers = client._http(
+                        "/v1/host/secret/read-capability",
+                        payload=encode_message(
+                            {"domain": domain_name, "field": field, "target": None}
+                        ),
+                        token=session,
+                    )
+                    self.assertEqual(200, status)
+                    capability = decode_message(body)
+                    self.assertTrue(capability["present"])
+                    read_status, read_body, _headers = client._http(
+                        "/v1/host/secret/read",
+                        payload=encode_message(
+                            {"secret_read_token": capability["secret_read_token"]}
+                        ),
+                        token=session,
+                    )
+                    self.assertEqual(200, read_status)
+                    self.assertEqual(secret, decode_message(read_body)["value"])
+                    replay_status, _body, _headers = client._http(
+                        "/v1/host/secret/read",
+                        payload=encode_message(
+                            {"secret_read_token": capability["secret_read_token"]}
+                        ),
+                        token=session,
+                    )
+                    self.assertNotEqual(200, replay_status)
+                finally:
+                    client.close()
+                    server.stop()
 
 class CoreIPCTests(unittest.TestCase):
     def test_invalid_core_result_becomes_a_safe_failure_response(self) -> None:

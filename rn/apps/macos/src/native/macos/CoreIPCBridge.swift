@@ -201,7 +201,8 @@ import Foundation
         username: String,
         cookie: String?,
         accessToken: String?,
-        refreshToken: String?
+        refreshToken: String?,
+        password: String? = nil
     ) throws -> RelayLoginResult {
         var payload: [String: Any] = [
             "account_id": accountID,
@@ -213,6 +214,7 @@ import Foundation
         if let cookie, !cookie.isEmpty { payload["cookie"] = cookie }
         if let accessToken, !accessToken.isEmpty { payload["access_token"] = accessToken }
         if let refreshToken, !refreshToken.isEmpty { payload["refresh_token"] = refreshToken }
+        if let password, !password.isEmpty { payload["password"] = password }
         guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []),
               body.count <= 96 * 1024 else { throw BridgeError.invalidResponse }
         let (data, response, _, restarted) = try performCoreRequest(
@@ -506,16 +508,28 @@ import Foundation
         return SecretStageResult(revision: revision.intValue, present: present)
     }
 
-    /// The only Core route that exposes a provider API key. The lease remains
-    /// session-bound, expires quickly, and is consumed before the value is
-    /// returned to this native host.
-    @nonobjc func createSecretReadCapability(target: String) throws -> SecretReadCapability {
-        guard !target.isEmpty,
-              target.utf8.count <= 256,
-              let body = try? JSONSerialization.data(
-                  withJSONObject: ["domain": "providers_models", "field": "api_key", "target": target],
-                  options: []
-              ) else { throw BridgeError.invalidResponse }
+    /// Plaintext credentials remain session-bound, expire quickly, and are
+    /// consumed before the value is returned to this native host.
+    @nonobjc func createSecretReadCapability(
+        domain: String,
+        field: String,
+        target: String?
+    ) throws -> SecretReadCapability {
+        guard !domain.isEmpty,
+              domain.utf8.count <= 64,
+              !field.isEmpty,
+              field.utf8.count <= 128,
+              (target?.utf8.count ?? 0) <= 256 else {
+            throw BridgeError.invalidResponse
+        }
+        // The Core route has a strict three-field envelope.  Keep the
+        // target key present even for domain-level secrets; JSON null is the
+        // explicit representation of a missing target.
+        var payload: [String: Any] = ["domain": domain, "field": field, "target": NSNull()]
+        if let target, !target.isEmpty { payload["target"] = target }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
+            throw BridgeError.invalidResponse
+        }
         let (data, response, requestGeneration, restarted) = try performCoreRequest(
             route: "host/secret/read-capability",
             method: "POST",
@@ -567,24 +581,28 @@ import Foundation
         return value
     }
 
-    @nonobjc func readProviderAPIKey(_ target: String) throws -> String {
-        try readSecret(createSecretReadCapability(target: target).token)
+    @nonobjc func readPlainTextSecret(domain: String, field: String, target: String?) throws -> String {
+        try readSecret(
+            createSecretReadCapability(domain: domain, field: field, target: target).token
+        )
     }
 
     /// The completion is invoked only by the AppKit Fabric leaf; plaintext is
     /// never emitted through a React Native module or component event.
-    @objc(readProviderAPIKeyForTarget:completion:)
-    public func readProviderAPIKeyForTarget(
-        _ target: String,
+    @objc(readPlainTextSecretForDomain:field:target:completion:)
+    public func readPlainTextSecretForDomain(
+        _ domain: String,
+        field: String,
+        target: String?,
         completion: @escaping (NSString?, NSString?) -> Void
     ) {
-        guard !target.isEmpty, target.utf8.count <= 256 else {
+        guard !domain.isEmpty, !field.isEmpty, target == nil || target!.utf8.count <= 256 else {
             DispatchQueue.main.async { completion(nil, "read_failed") }
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let value = try self.readProviderAPIKey(target)
+                let value = try self.readPlainTextSecret(domain: domain, field: field, target: target)
                 DispatchQueue.main.async { completion(value as NSString, nil) }
             } catch {
                 DispatchQueue.main.async { completion(nil, "read_failed") }
@@ -783,9 +801,10 @@ import Foundation
 
         var childEnvironment = previewProfileEnvironment(from: environment)
         // An explicitly isolated Preview must never fall back to the user's
-        // production configuration, assistant state, or LiteLLM service.
-        // The profile is embedded only in a distinct preview bundle, so it
-        // remains effective when the app is launched through Finder or `open`.
+        // production configuration, assistant state, or LiteLLM service. The
+        // profile marker is independent of the app identity, while the native
+        // instance lock still prevents the preview from running beside the
+        // installed menu-bar app.
         if let coreRoot {
             let rootPath = coreRoot.path
             let current = childEnvironment["PYTHONPATH"]
@@ -824,8 +843,7 @@ import Foundation
     }
 
     private func previewProfileEnvironment(from inherited: [String: String]) -> [String: String] {
-        guard Bundle.main.bundleIdentifier != "menu.litellm.menu",
-              let rawRoot = Bundle.main.object(forInfoDictionaryKey: "LiteLLMMenuPreviewProfileRoot") as? String,
+        guard let rawRoot = Bundle.main.object(forInfoDictionaryKey: "LiteLLMMenuPreviewProfileRoot") as? String,
               rawRoot.hasPrefix("/") else {
             return inherited
         }
@@ -992,7 +1010,7 @@ import Foundation
               let domain = params["domain"] as? String,
               let document = params["document"] as? String,
               (domain == "codex" && ["config", "auth"].contains(document)) ||
-                  (domain == "claude" && document == "settings"),
+                  (domain == "claude" && ["settings", "desktop", "developer"].contains(document)),
               let response = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
               response["ok"] as? Bool == true,
               let result = response["result"] as? [String: Any],

@@ -903,23 +903,30 @@ class HookStreamingTimeoutTests(HookTestCase):
         self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
 
-    async def test_dual_surface_incomplete_responses_stream_recovers_via_chat(self) -> None:
+    async def test_incomplete_responses_stream_recovers_via_chat_deployment(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
         candidate_results = []
-        deployment = {
+        responses_deployment = {
             "litellm_params": {
                 "model": "openai/default-chat",
                 "order": 1,
             },
             "model_info": {
-                "id": "dual-route",
+                "id": "responses-route",
                 "model_group": "default-chat",
                 "upstream_url_surface": "openai/responses",
-                "supported_upstream_url_surfaces": [
-                    "openai/responses",
-                    "openai/chat",
-                ],
+            },
+        }
+        chat_deployment = {
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "order": 1,
+            },
+            "model_info": {
+                "id": "chat-route",
+                "model_group": "default-chat",
+                "upstream_url_surface": "openai/chat",
             },
         }
 
@@ -937,13 +944,13 @@ class HookStreamingTimeoutTests(HookTestCase):
 
         class FakeRouter:
             def _get_all_deployments(self, model_name, team_id=None):
-                return [deployment]
+                return [responses_deployment, chat_deployment]
 
             async def aresponses(self, **payload):
                 calls.append(payload)
                 candidates = await hook.async_filter_deployments(
                     "default-chat",
-                    [deployment],
+                    [responses_deployment, chat_deployment],
                     messages=None,
                     request_kwargs=payload,
                 )
@@ -970,8 +977,8 @@ class HookStreamingTimeoutTests(HookTestCase):
             ],
             "tools": [],
             "stream": True,
-            "model_info": deployment["model_info"],
-            "litellm_params": deployment["litellm_params"],
+            "model_info": responses_deployment["model_info"],
+            "litellm_params": responses_deployment["litellm_params"],
             "_excluded_deployment_ids": ["other-route"],
         }
 
@@ -995,26 +1002,22 @@ class HookStreamingTimeoutTests(HookTestCase):
             ],
         )
         self.assertEqual(len(calls), 1)
-        self.assertEqual(candidate_results, [[deployment]])
-        self.assertEqual(
-            calls[0]["_litellm_menu_upstream_url_surface"],
-            "openai/chat",
-        )
+        self.assertEqual(candidate_results, [[chat_deployment]])
+        self.assertNotIn("_litellm_menu_upstream_url_surface", calls[0])
         self.assertEqual(calls[0]["_target_order"], 1)
-        self.assertEqual(calls[0]["_excluded_deployment_ids"], ["other-route"])
-        self.assertEqual([tool["name"] for tool in calls[0]["tools"]], ["exec_command"])
-        self.assertNotIn(
-            "additional_tools",
-            json.dumps(calls[0]["input"], ensure_ascii=False),
+        self.assertEqual(
+            calls[0]["_excluded_deployment_ids"],
+            ["other-route", "responses-route"],
+        )
+        self.assertEqual(
+            calls[0]["_litellm_menu_verified_fallback_deployment_ids"],
+            ["chat-route"],
         )
         self.assertIn(
-            "id:dual-route|surface:openai/responses",
+            "id:responses-route",
             hooks._DEPLOYMENT_COOLDOWNS,
         )
-        self.assertNotIn(
-            "id:dual-route|surface:openai/chat",
-            hooks._DEPLOYMENT_COOLDOWNS,
-        )
+        self.assertFalse(any("|surface:" in key for key in hooks._DEPLOYMENT_COOLDOWNS))
 
     async def test_responses_empty_completed_stream_enters_route_recovery_without_leaking_empty_terminal(self) -> None:
         hooks, proxy_server = load_hook_module()

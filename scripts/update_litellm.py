@@ -14,6 +14,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_FILE = Path(os.environ.get("LITELLM_VERSION_FILE", ROOT / "LITELLM_VERSION"))
 PYPI_JSON_URL = os.environ.get("LITELLM_PYPI_JSON_URL", "https://pypi.org/pypi/litellm/json")
+RUNTIME_WHEEL_TAG = "cp312"
 
 
 def stable_version(value: object) -> tuple[int, int, int] | None:
@@ -27,7 +28,17 @@ def has_installable_artifact(files: object) -> bool:
     return isinstance(files, list) and any(
         isinstance(item, dict)
         and item.get("yanked") is not True
-        and item.get("packagetype") in {"bdist_wheel", "sdist"}
+        and (
+            item.get("packagetype") == "sdist"
+            or (
+                item.get("packagetype") == "bdist_wheel"
+                and isinstance(item.get("filename"), str)
+                and (
+                    f"-{RUNTIME_WHEEL_TAG}-" in item["filename"]
+                    or item["filename"].endswith("-py3-none-any.whl")
+                )
+            )
+        )
         for item in files
     )
 

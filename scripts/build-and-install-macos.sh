@@ -17,6 +17,8 @@ START_TIMEOUT_SECONDS="${LITELLM_MENU_START_TIMEOUT_SECONDS:-70}"
 STOP_TIMEOUT_SECONDS="${LITELLM_MENU_STOP_TIMEOUT_SECONDS:-20}"
 STOP_GRACE_POLLS=20
 REQUIRED_HEALTH_CHECKS=3
+LAUNCH_RETRY_SECONDS=1
+LAST_STARTUP_STATE=""
 
 cleanup() {
   if [[ "$INSTALL_COMPLETE" != "1" && -n "$PREVIOUS_APP" && -e "$PREVIOUS_APP" && ! -e "$DESTINATION" ]]; then
@@ -26,7 +28,7 @@ cleanup() {
   [[ -z "$FAILED_APP" || ! -d "$FAILED_APP" ]] || rm -rf "$FAILED_APP"
   [[ ! -d "$STAGE_ROOT" ]] || rm -rf "$STAGE_ROOT"
   if [[ "$RESTART_ARMED" == "1" && ( -e "$DESTINATION" || -L "$DESTINATION" ) ]]; then
-    [[ -n "$(installed_pids)" ]] || open -n "$DESTINATION" >/dev/null 2>&1 || true
+    [[ -n "$(installed_pids)" ]] || open -g "$DESTINATION" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -41,12 +43,12 @@ copy_tree() {
 
 bundle_roots() {
   ps -axo pid=,command= \
-    | awk -v bundle="$DESTINATION" -v executable="$DESTINATION/Contents/MacOS/LiteLLMMenu" '
+    | awk '
         {
           pid = $1
           line = $0
           sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", line)
-          if (line == executable || index(line, bundle "/Contents/") > 0) print pid
+          if (line ~ /\/LiteLLM ?Menu[^\/]*\.app\/Contents\/MacOS\/LiteLLMMenu$/) print pid
         }
       '
 }
@@ -76,7 +78,7 @@ installed_pids() {
   local pid command
   while read -r pid; do
     command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-    [[ "$command" == "$DESTINATION/Contents/MacOS/LiteLLMMenu" ]] && printf '%s\n' "$pid"
+    [[ "$command" == */LiteLLM*Menu*.app/Contents/MacOS/LiteLLMMenu ]] && printf '%s\n' "$pid"
   done < <(bundle_processes)
   return 0
 }
@@ -170,29 +172,59 @@ proxy_port_for_app() {
 }
 
 app_is_ready() {
+  [[ "$(startup_state_for_app "$1")" == "running" ]]
+}
+
+startup_state_for_app() {
   local app_pid="$1"
   local port
-  core_pid_for_app "$app_pid" >/dev/null || return 1
-  port="$(proxy_port_for_app "$app_pid")" || return 1
-  curl --fail --silent --show-error --max-time 1 \
-    "http://127.0.0.1:$port/health/liveliness" >/dev/null 2>&1
+  if ! ps -p "$app_pid" -o stat= >/dev/null 2>&1; then
+    printf '%s\n' "stopped"
+    return 0
+  fi
+  if ! core_pid_for_app "$app_pid" >/dev/null; then
+    printf '%s\n' "starting (Core)"
+    return 0
+  fi
+  if ! port="$(proxy_port_for_app "$app_pid")"; then
+    printf '%s\n' "starting (proxy)"
+    return 0
+  fi
+  if curl --fail --silent --show-error --max-time 1 \
+    "http://127.0.0.1:$port/health/liveliness" >/dev/null 2>&1; then
+    printf '%s\n' "running"
+  else
+    printf '%s\n' "unhealthy (proxy health check)"
+  fi
+}
+
+report_startup_state() {
+  local state="$1"
+  [[ "$state" == "$LAST_STARTUP_STATE" ]] && return 0
+  LAST_STARTUP_STATE="$state"
+  printf 'LiteLLM Menu: %s\n' "$state"
 }
 
 wait_for_started_app() {
   local rejected_pids="$1"
   local deadline=$((SECONDS + START_TIMEOUT_SECONDS))
-  local app_pids app_pid ready_pid stable_pid="" stable_checks=0
+  local app_pids app_pid candidate_pid ready_pid stable_pid="" stable_checks=0 next_launch_at=0 state
   while :; do
     app_pids="$(installed_pids)"
+    candidate_pid=""
     ready_pid=""
     while read -r app_pid; do
       [[ -n "$app_pid" ]] || continue
       pid_is_listed "$app_pid" "$rejected_pids" && continue
-      if app_is_ready "$app_pid"; then
+      candidate_pid="$app_pid"
+      state="$(startup_state_for_app "$app_pid")"
+      report_startup_state "$state"
+      if [[ "$state" == "running" ]]; then
         ready_pid="$app_pid"
         break
       fi
     done <<<"$app_pids"
+    [[ -n "$candidate_pid" ]] || report_startup_state "stopped (waiting to launch)"
     if [[ -n "$ready_pid" ]]; then
       if [[ "$ready_pid" == "$stable_pid" ]]; then
         stable_checks=$((stable_checks + 1))
@@ -209,18 +241,27 @@ wait_for_started_app() {
       stable_checks=0
     fi
     (( SECONDS >= deadline )) && break
+    # The app's single-instance guard can briefly still see the process we
+    # just stopped through LaunchServices even after its PID exits. A normal
+    # `open` may therefore activate the old registration and return without
+    # starting the replacement. Retry only while no replacement process
+    # exists; never request a forced new instance.
+    if [[ -z "$candidate_pid" && $SECONDS -ge $next_launch_at ]]; then
+      open -g "$DESTINATION" >/dev/null 2>&1 || true
+      next_launch_at=$((SECONDS + LAUNCH_RETRY_SECONDS))
+    fi
     sleep 0.05
   done
+  report_startup_state "failed (startup timeout)"
   return 1
 }
 
 start_installed_app() {
   local rejected_pids="$1"
   # An in-place bundle replacement can leave LaunchServices briefly pointed at
-  # the old instance. Force a fresh launch only after all old bundle processes
-  # have exited, then prove the new process remains healthy before discarding
-  # the rollback bundle.
-  open -n "$DESTINATION"
+  # the old instance. Start only after all old bundle processes have exited,
+  # then prove the new process remains healthy before discarding the rollback
+  # bundle.
   wait_for_started_app "$rejected_pids" || {
     echo "The new LiteLLM Menu app did not start from $DESTINATION." >&2
     return 1
@@ -270,6 +311,7 @@ fi
 
 "$ROOT/scripts/update-litellm.sh"
 export LITELLM_MENU_LITELLM_VERSION_UPDATED=1
+printf '%s\n' "LiteLLM Menu: preparing replacement build"
 
 # The installed app already carries the exact portable Python runtime needed
 # by repeat local builds. Reuse it only when no caller supplied another
@@ -291,6 +333,7 @@ fi
 
 (
   cd "$ROOT/rn"
+  printf '%s\n' "LiteLLM Menu: building and validating macOS bundle"
   pnpm install --frozen-lockfile
   LITELLM_MENU_MACOS_OUTPUT="$STAGED_APP" pnpm run build:macos
 )
@@ -301,6 +344,7 @@ test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/litellm"
 test -x "$STAGED_APP/Contents/Resources/Core/bin/vision_ocr"
 plutil -lint "$STAGED_APP/Contents/Info.plist" >/dev/null
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
+printf '%s\n' "LiteLLM Menu: staged bundle verified"
 
 INSTALL_STAGE="$(dirname "$DESTINATION")/.LiteLLMMenu.install.$$.app"
 PREVIOUS_APP="$(dirname "$DESTINATION")/.LiteLLMMenu.previous.$$.app"
@@ -313,6 +357,7 @@ codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"
 # stopping them only after the new bundle is in place shortens the listener
 # outage to the stop/start interval.
 OLD_PIDS="$(bundle_processes)"
+printf '%s\n' "LiteLLM Menu: replacing bundle and stopping previous process"
 # Arm the EXIT relaunch before moving the live bundle, so an interrupted swap
 # cannot leave the installed path without an app to launch.
 RESTART_ARMED=1
@@ -344,6 +389,7 @@ if [[ -n "$REMAINING_OLD_PIDS" ]] && ! stop_installed_app "$REMAINING_OLD_PIDS";
   }
   exit 1
 fi
+printf '%s\n' "LiteLLM Menu: starting replacement and checking Core/proxy health"
 if ! start_installed_app "$OLD_PIDS"; then
   echo "The new LiteLLM Menu app failed readiness checks; restoring the previous bundle." >&2
   restore_previous_app || {
@@ -358,4 +404,4 @@ rm -rf "$PREVIOUS_APP"
 PREVIOUS_APP=""
 INSTALL_COMPLETE=1
 
-printf '%s\n' "$DESTINATION"
+printf '%s\n' "LiteLLM Menu: running ($DESTINATION)"

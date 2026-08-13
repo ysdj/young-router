@@ -240,6 +240,7 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 input.maximumNumberOfLines = 1
                 alert.accessoryView = input
                 alert.window.initialFirstResponder = input
+                configureImmediatePresentation(alert.window)
                 let response = alert.runModal()
                 let shouldSet = response == .alertFirstButtonReturn
                 let shouldClear = allowClear && capability.present && response == .alertSecondButtonReturn
@@ -329,13 +330,48 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    @objc(copySecret:field:target:resolver:rejecter:)
+    func copySecret(
+        _ domain: String,
+        field: String,
+        target: String,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard !domain.isEmpty,
+              domain.utf8.count <= 64,
+              !field.isEmpty,
+              field.utf8.count <= 64,
+              !target.isEmpty,
+              target.utf8.count <= 256 else {
+            resolve(false)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let value = try CoreIPCBridge.shared.readPlainTextSecret(
+                    domain: domain,
+                    field: field,
+                    target: target
+                )
+                DispatchQueue.main.async {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    resolve(pasteboard.setString(value, forType: .string))
+                }
+            } catch {
+                DispatchQueue.main.async { resolve(false) }
+            }
+        }
+    }
+
     @objc(relayLogin:resolver:rejecter:)
     func relayLogin(
         _ options: [String: Any],
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "rememberPassword"]),
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "rememberPassword", "embedded"]),
               let accountID = options["accountId"] as? String,
               let type = options["type"] as? String,
               let label = options["label"] as? String,
@@ -358,7 +394,17 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
             reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
             return
         }
-        // WKWebView and its panel are created on AppKit's main thread, while
+        let embedded: Bool
+        if let value = options["embedded"] {
+            guard let suppliedEmbedded = value as? Bool else {
+                reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+                return
+            }
+            embedded = suppliedEmbedded
+        } else {
+            embedded = false
+        }
+        // WKWebView and its native host are created on AppKit's main thread, while
         // the React promise is completed asynchronously after the browser
         // flow finishes or is cancelled.
         DispatchQueue.main.async {
@@ -369,7 +415,8 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 origin: origin,
                 language: language,
                 username: options["username"] as? String,
-                rememberPassword: rememberPassword
+                rememberPassword: rememberPassword,
+                embedded: embedded
             ) { result in
                 DispatchQueue.main.async {
                     guard let result else {

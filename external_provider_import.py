@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
-from config_editor_core.schema import safe_load_yaml_text
+from config_editor_core.schema import infer_upstream_fallback_surface, safe_load_yaml_text
 
 
 MAX_INPUT_BYTES = 2 * 1024 * 1024
@@ -430,11 +430,32 @@ def _add_editor_model(
     ) or _strip_adapter(source_model)
     if not source_model:
         return
-    surface = _surface_from_values(
+    explicit_surface = _surface_from_values(
         source.get("upstream_url_surface"),
         source.get("wire_api"),
         source.get("provider_type"),
-        default_surface,
+    )
+    has_explicit_surface = any(
+        _text(source.get(key)).lower() in SUPPORTED_SURFACES
+        or _text(source.get(key)).lower()
+        in {
+            "responses",
+            "response",
+            "openai_responses",
+            "chat",
+            "chat_completions",
+            "completions",
+            "openai_chat",
+            "anthropic",
+            "messages",
+            "anthropic_messages",
+        }
+        for key in ("upstream_url_surface", "wire_api", "provider_type")
+    )
+    surface = (
+        explicit_surface
+        if has_explicit_surface
+        else infer_upstream_fallback_surface(source_model)
     )
     if source_model.startswith("anthropic/"):
         surface = "anthropic"
@@ -464,21 +485,6 @@ def _add_editor_model(
         True,
     )
     effective_enabled = (provider_enabled if provider_enabled is not None else provider.enabled) and model_enabled
-    raw_surfaces = source.get("supported_upstream_url_surfaces")
-    surfaces = [
-        _surface_from_values(value)
-        for value in _list(raw_surfaces)
-        if _surface_from_values(value) in SUPPORTED_SURFACES
-    ]
-    if not surfaces:
-        surfaces = [surface]
-    else:
-        deduplicated: list[str] = []
-        for candidate in surfaces:
-            if candidate not in deduplicated:
-                deduplicated.append(candidate)
-        surfaces = deduplicated
-    primary_surface = surfaces[0]
     model_base = _valid_base_url(_first_text(source, BASE_URL_KEYS))
     if model_base == provider.api_base:
         model_base = ""
@@ -504,8 +510,7 @@ def _add_editor_model(
                 source.get("supports_responses_image_generation_tool"), False
             ),
             "supports_responses_image_generation_tool_present": "supports_responses_image_generation_tool" in source,
-            "upstream_url_surface": primary_surface,
-            "supported_upstream_url_surfaces": surfaces,
+            "upstream_url_surface": surface,
             "entry_extra": {},
             "litellm_extra": {},
             "model_info_extra": {},
@@ -578,7 +583,6 @@ def _import_litellm(data: dict[str, Any]) -> _Drafts | None:
             "order": params.get("order", 1),
             "ssl_verify": params.get("ssl_verify"),
             "upstream_url_surface": info.get("upstream_url_surface"),
-            "supported_upstream_url_surfaces": info.get("supported_upstream_url_surfaces"),
             "x-litellm-menu-model-enabled": info.get("x-litellm-menu-model-enabled", True),
             "supports_responses_image_generation_tool": info.get("supports_responses_image_generation_tool"),
         }

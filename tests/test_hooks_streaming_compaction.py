@@ -549,13 +549,15 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertNotIn("resp-false-success", json.dumps(chunks))
         self.assertNotIn("msg-false-success", json.dumps(chunks))
         self.assertEqual(chunks[-1]["type"], "response.completed")
-        self.assertEqual(chunks[-1]["response"]["output"], [
-            {
-                "id": "cmp-recovered",
-                "type": "compaction",
-                "encrypted_content": "encrypted-recovered-summary",
-            }
-        ])
+        self.assertEqual(
+            chunks[-1]["response"]["output"], [
+                {
+                    "id": "cmp-recovered",
+                    "type": "compaction",
+                    "encrypted_content": "encrypted-recovered-summary",
+                }
+            ],
+        )
 
     async def test_structured_compaction_route_recovery_buffers_message_false_success(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -867,10 +869,7 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertFalse(calls[0]["parallel_tool_calls"])
         self.assertEqual(calls[0]["client_metadata"], client_metadata)
         self.assertEqual(calls[0]["extra_body"]["client_metadata"], client_metadata)
-        self.assertEqual(
-            calls[0]["prompt_cache_key"],
-            "thread-test-0001",
-        )
+        self.assertEqual(calls[0]["prompt_cache_key"], "thread-test-0001")
         headers = {key.lower(): value for key, value in calls[0]["extra_headers"].items()}
         self.assertEqual(headers["x-trace"], "keep-me")
         self.assertEqual(headers["accept"], "text/event-stream")
@@ -886,15 +885,300 @@ class HookStreamingCompactionTests(HookTestCase):
             headers["x-openai-internal-codex-responses-lite"],
             "true",
         )
-        self.assertEqual(
-            headers["x-codex-window-id"],
-            "thread-test-0001:7",
-        )
+        self.assertEqual(headers["x-codex-window-id"], "thread-test-0001:7")
         metadata = calls[0]["litellm_metadata"]
         self.assertTrue(metadata[hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
         self.assertNotIn("codex_compaction_optimized", metadata)
         self.assertNotIn("codex_compaction_max_output_tokens", metadata)
         self.assertEqual(chunks[-1]["type"], "response.completed")
+
+    async def test_codex_compaction_generic_peer_then_streaming_fallback_preserves_state(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
+        router_module = types.ModuleType("litellm.router")
+        generic_calls = []
+        generic_helper_state_ids = []
+        generic_call_state_ids = []
+        streaming_calls = []
+        client_metadata = {
+            "thread_id": "thread-fallback-state",
+            "session_id": "thread-fallback-state",
+            "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+        }
+        request_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "custom", "name": "exec"},
+                    {"type": "custom", "name": "read"},
+                ],
+            },
+            {"type": "message", "role": "user", "content": "history"},
+            {"type": "compaction_trigger", "id": "compact-now"},
+        ]
+        tools = [
+            {"type": "custom", "name": "exec"},
+            {"type": "custom", "name": "read"},
+        ]
+        deployments = [
+            {
+                "litellm_params": {"model": "openai/default-chat", "order": 1},
+                "model_info": {"id": "route-primary", "order": 1},
+            },
+            {
+                "litellm_params": {"model": "openai/default-chat", "order": 1},
+                "model_info": {"id": "route-peer", "order": 1},
+            },
+            {
+                "litellm_params": {"model": "openai/default-chat", "order": 1},
+                "model_info": {"id": "route-streaming", "order": 1},
+            },
+            {
+                "litellm_params": {"model": "openai/default-chat", "order": 1},
+                "model_info": {"id": "route-final", "order": 1},
+            },
+        ]
+
+        class UpstreamError(Exception):
+            status_code = 500
+
+        async def peer_incomplete_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-peer", "status": "in_progress"},
+            }
+
+        async def streaming_incomplete_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-streaming", "status": "in_progress"},
+            }
+
+        async def final_stream():
+            compaction_item = {
+                "id": "cmp-final",
+                "type": "compaction",
+                "encrypted_content": "encrypted-final",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-final",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
+
+        class GenericRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments
+
+            def _update_kwargs_with_deployment(
+                self,
+                deployment,
+                kwargs,
+                function_name=None,
+            ):
+                kwargs["model_info"] = deployment["model_info"] | {
+                    "order": deployment["litellm_params"]["order"],
+                }
+
+            async def make_call(self, original_function, *args, **kwargs):
+                response = original_function(*args, **kwargs)
+                if hasattr(response, "__await__"):
+                    response = await response
+                return response
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                generic_helper_state_ids.append(id(kwargs))
+                excluded_ids = set(kwargs.get("_excluded_deployment_ids") or [])
+                selected = next(
+                    deployment
+                    for deployment in deployments
+                    if deployment["model_info"]["id"] not in excluded_ids
+                )
+                self._update_kwargs_with_deployment(
+                    selected,
+                    kwargs,
+                    function_name="ageneric_api_call_with_fallbacks",
+                )
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = GenericRouter
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        hooks._install_generic_deployment_failover_patch()
+
+        class StreamingRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments
+
+            async def aresponses(self, **payload):
+                streaming_calls.append(copy.deepcopy(payload))
+                excluded_ids = set(payload.get("_excluded_deployment_ids") or [])
+                selected = next(
+                    deployment
+                    for deployment in deployments
+                    if deployment["model_info"]["id"] not in excluded_ids
+                )
+                hooks._remember_selected_deployment(selected)
+                if selected["model_info"]["id"] == "route-streaming":
+                    return streaming_incomplete_stream()
+                if selected["model_info"]["id"] != "route-final":
+                    raise AssertionError("unexpected streaming fallback deployment")
+                return final_stream()
+
+        proxy_server.llm_router = StreamingRouter()
+
+        async def original_generic_function(**kwargs):
+            generic_call_state_ids.append(id(kwargs))
+            generic_calls.append(copy.deepcopy(kwargs))
+            deployment_id = kwargs["model_info"]["id"]
+            if deployment_id == "route-primary":
+                raise UpstreamError("upstream returned HTTP 500")
+            self.assertEqual(deployment_id, "route-peer")
+            return peer_incomplete_stream()
+
+        initial_request = {
+            "input": request_input,
+            "stream": True,
+            "service_tier": "priority",
+            "tools": tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "client_metadata": client_metadata,
+            "extra_headers": {"X-Trace": "keep-me"},
+            "litellm_metadata": {
+                "codex_fast_default_service_tier": "priority",
+            },
+            "model_info": {
+                "id": "route-peer",
+                "order": 1,
+                "route_key": "provider / openai/default-chat / key=peer / order=1",
+            },
+        }
+        request_data = copy.deepcopy(initial_request)
+        request_data["model"] = "default-chat"
+        router = GenericRouter()
+        response = await router.make_call(
+            router._ageneric_api_call_with_fallbacks_helper,
+            "default-chat",
+            original_generic_function,
+            **initial_request,
+        )
+        self.assertNotIn("_excluded_deployment_ids", request_data)
+        response_marker = hooks._selected_deployment_marker_from_response(response)
+        self.assertIsNotNone(response_marker)
+        assert response_marker is not None
+        self.assertEqual(
+            response_marker["_excluded_deployment_ids"],
+            ["route-primary"],
+        )
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=response,
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(
+            [call["model_info"]["id"] for call in generic_calls],
+            ["route-primary", "route-peer"],
+        )
+        self.assertEqual(len(generic_helper_state_ids), 2)
+        self.assertEqual(len(generic_call_state_ids), 2)
+        self.assertTrue(
+            all(
+                helper_state_id != call_state_id
+                for helper_state_id, call_state_id in zip(
+                    generic_helper_state_ids,
+                    generic_call_state_ids,
+                )
+            )
+        )
+        self.assertEqual(
+            generic_calls[1]["_excluded_deployment_ids"],
+            ["route-primary"],
+        )
+        self.assertEqual(len(streaming_calls), 2)
+        first_retry, second_retry = streaming_calls
+        self.assertEqual(first_retry["service_tier"], "priority")
+        self.assertEqual(
+            first_retry["_excluded_deployment_ids"],
+            ["route-peer", "route-primary"],
+        )
+        self.assertEqual(
+            second_retry["_excluded_deployment_ids"],
+            ["route-peer", "route-primary", "route-streaming"],
+        )
+        for retry in streaming_calls:
+            self.assertEqual(retry["service_tier"], "priority")
+            self.assertEqual(retry["input"], request_input)
+            self.assertEqual(retry["client_metadata"], client_metadata)
+            self.assertEqual(retry["tools"], tools)
+            self.assertEqual(retry["tool_choice"], "auto")
+            self.assertFalse(retry["parallel_tool_calls"])
+            self.assertEqual(retry["extra_headers"]["X-Trace"], "keep-me")
+        self.assertEqual(
+            request_data["_excluded_deployment_ids"],
+            ["route-peer", "route-primary", "route-streaming"],
+        )
+        self.assertNotIn("response.failed", [chunk["type"] for chunk in chunks])
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"],
+            [
+                {
+                    "id": "cmp-final",
+                    "type": "compaction",
+                    "encrypted_content": "encrypted-final",
+                }
+            ],
+        )
+
+    def test_streaming_fallback_only_restores_injected_default_service_tier(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        base_request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "continue"}],
+            "stream": True,
+        }
+
+        non_codex_payload = hooks._build_streaming_error_fallback_payload(
+            base_request,
+            method_name="aresponses",
+        )
+        self.assertIsNotNone(non_codex_payload)
+        assert non_codex_payload is not None
+        self.assertNotIn("service_tier", non_codex_payload)
+
+        explicit_standard_payload = hooks._build_streaming_error_fallback_payload(
+            {
+                **base_request,
+                "service_tier": "standard",
+                "litellm_metadata": {
+                    "codex_fast_default_service_tier": "priority",
+                },
+            },
+            method_name="aresponses",
+        )
+        self.assertIsNotNone(explicit_standard_payload)
+        assert explicit_standard_payload is not None
+        self.assertEqual(explicit_standard_payload["service_tier"], "standard")
 
     async def test_structured_codex_compaction_failure_stops_after_bounded_fallback(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -929,6 +1213,20 @@ class HookStreamingCompactionTests(HookTestCase):
             }
 
         class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {
+                            "model": "openai/default-chat",
+                            "order": 1,
+                        },
+                        "model_info": {
+                            "id": "third-party-large",
+                            "order": 1,
+                        },
+                    }
+                ]
+
             async def aresponses(self, **payload):
                 calls.append(payload)
                 if len(calls) > 1:

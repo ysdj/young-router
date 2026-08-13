@@ -27,6 +27,7 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(SetLocalization, L"setLocalization");
   REACT_METHOD(EditSecret, L"editSecret");
   REACT_METHOD(ClearSecret, L"clearSecret");
+  REACT_METHOD(CopySecret, L"copySecret");
   REACT_METHOD(RelayLogin, L"relayLogin");
   REACT_METHOD(RestoreRelaySession, L"restoreRelaySession");
   REACT_METHOD(ClearRelayCredentials, L"clearRelayCredentials");
@@ -90,6 +91,11 @@ struct WinUI3NativeLeafModule {
       std::string const& field,
       std::optional<std::string> const& target,
       winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
+  void CopySecret(
+      std::string const& domain,
+      std::string const& field,
+      std::string const& target,
+      winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept;
   void RelayLogin(
       winrt::Microsoft::ReactNative::JSValueObject const& options,
       winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;

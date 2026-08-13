@@ -215,10 +215,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         self.assertEqual(1, len(provider["models"]))
         self.assertFalse(provider["models"][0]["enabled"])
-        self.assertEqual(
-            ["openai/chat"],
-            provider["models"][0]["supported_upstream_url_surfaces"],
-        )
+        self.assertEqual("openai/chat", provider["models"][0]["upstream_url_surface"])
 
     def test_provider_toggle_preserves_each_model_switch_across_save(self) -> None:
         path = self.write_config(
@@ -538,22 +535,18 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         payload = config_load.load_config(path)
         model = payload["providers"][0]["models"][0]
         model["upstream_url_surface"] = "openai/chat"
-        model["supported_upstream_url_surfaces"] = ["openai/chat", "anthropic"]
 
         config_api.save_config(payload["providers"], path)
         reloaded_model = config_load.load_config(path)["providers"][0]["models"][0]
 
         self.assertEqual("openai/chat", reloaded_model["upstream_url_surface"])
-        self.assertEqual(
-            ["openai/chat", "anthropic"],
-            reloaded_model["supported_upstream_url_surfaces"],
-        )
+        self.assertNotIn("supported_upstream_url_surfaces", reloaded_model)
         self.assertNotIn("upstream_api_mode", reloaded_model["model_info_extra"])
         self.assertNotIn("upstream_url_surface", reloaded_model["model_info_extra"])
         self.assertNotIn("supported_upstream_api_modes", reloaded_model["model_info_extra"])
         self.assertNotIn("supported_upstream_url_surfaces", reloaded_model["model_info_extra"])
 
-    def test_save_round_trip_preserves_complete_editor_protocol_order(self) -> None:
+    def test_save_drops_removed_protocol_order_metadata(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -582,21 +575,14 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         payload = config_load.load_config(path)
         model = payload["providers"][0]["models"][0]
-        self.assertEqual(
-            ["openai/responses", "anthropic", "openai/chat"],
-            model["model_info_extra"]["x-litellm-menu-upstream-url-surface-order"],
-        )
+        self.assertNotIn("x-litellm-menu-upstream-url-surface-order", model["model_info_extra"])
+        self.assertNotIn("supported_upstream_url_surfaces", model)
 
         config_api.save_config(payload["providers"], path)
         saved_model_info = config_schema._load_yaml(path)["model_list"][0]["model_info"]
-        self.assertEqual(
-            ["openai/responses", "anthropic", "openai/chat"],
-            saved_model_info["x-litellm-menu-upstream-url-surface-order"],
-        )
-        self.assertEqual(
-            ["openai/responses"],
-            saved_model_info["supported_upstream_url_surfaces"],
-        )
+        self.assertEqual("openai/responses", saved_model_info["upstream_url_surface"])
+        self.assertNotIn("x-litellm-menu-upstream-url-surface-order", saved_model_info)
+        self.assertNotIn("supported_upstream_url_surfaces", saved_model_info)
 
     def test_load_rejects_removed_api_key_enabled_flag(self) -> None:
         path = self.write_config(
@@ -676,7 +662,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported supports_responses_endpoint"):
             config_load.load_config(path)
 
-    def test_supported_url_surfaces_define_primary_without_legacy_flags(self) -> None:
+    def test_single_upstream_url_surface_is_the_only_protocol_field(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -705,19 +691,54 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         model = payload["providers"][0]["models"][0]
 
         self.assertEqual("openai/chat", model["upstream_url_surface"])
-        self.assertEqual(
-            ["openai/chat", "openai/responses"],
-            model["supported_upstream_url_surfaces"],
-        )
+        self.assertNotIn("supported_upstream_url_surfaces", model)
 
         config_api.save_config(payload["providers"], path)
         saved = config_schema._load_yaml(path)["model_list"][0]["model_info"]
         self.assertEqual("openai/chat", saved["upstream_url_surface"])
-        self.assertEqual(
-            ["openai/chat", "openai/responses"],
-            saved["supported_upstream_url_surfaces"],
-        )
+        self.assertNotIn("supported_upstream_url_surfaces", saved)
         self.assertNotIn("supports_responses_endpoint", saved)
+
+    def test_missing_protocol_fields_default_to_inferred_fallback_mode(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              provider_alpha:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: claude-shaped-public-name
+                litellm_params:
+                  model: openai/kimi-k3
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000027"
+                  provider: provider_alpha
+            """
+        )
+
+        payload = config_load.load_config(path)
+        model = payload["providers"][0]["models"][0]
+
+        self.assertEqual("fallback", model["upstream_protocol_mode"])
+        self.assertEqual("openai/chat", model["upstream_url_surface"])
+
+    def test_fallback_protocol_inference_uses_exact_upstream_model(self) -> None:
+        self.assertEqual(
+            "openai/chat",
+            config_schema.infer_upstream_fallback_surface("openai/kimi-k3"),
+        )
+        self.assertEqual(
+            "openai/responses",
+            config_schema.infer_upstream_fallback_surface("openai/gpt-5"),
+        )
+        self.assertEqual(
+            "anthropic",
+            config_schema.infer_upstream_fallback_surface("anthropic/claude-sonnet"),
+        )
 
     def test_public_model_mapping_keeps_exact_namespaced_upstream_model(self) -> None:
         path = self.write_config(
@@ -759,7 +780,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertIn("model=gpt-compatible", entry["model_info"]["route_key"])
         self.assertIn("upstream=openai/vendor/glm-compatible", entry["model_info"]["route_key"])
 
-    def test_load_rejects_primary_surface_that_differs_from_ordered_list(self) -> None:
+    def test_load_uses_single_surface_and_drops_removed_ordered_list(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -785,8 +806,15 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
 
-        with self.assertRaisesRegex(ValueError, "must equal the first"):
-            config_load.load_config(path)
+        payload = config_load.load_config(path)
+        model = payload["providers"][0]["models"][0]
+        self.assertEqual("openai/chat", model["upstream_url_surface"])
+        self.assertNotIn("supported_upstream_url_surfaces", model)
+
+        config_api.save_config(payload["providers"], path)
+        saved = config_schema._load_yaml(path)["model_list"][0]["model_info"]
+        self.assertEqual("openai/chat", saved["upstream_url_surface"])
+        self.assertNotIn("supported_upstream_url_surfaces", saved)
 
     def test_save_generates_random_deployment_token_and_explicit_route_key(self) -> None:
         path = self.write_config(

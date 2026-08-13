@@ -14,7 +14,9 @@ import concurrent.futures
 import datetime as dt
 import json
 import math
+import os
 import pathlib
+import re
 import socket
 import urllib.error
 import urllib.parse
@@ -22,20 +24,85 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from provider_billing import (
-    BillingConfigError,
-    DEFAULT_TIMEOUT_SECONDS,
-    MAX_RESPONSE_BYTES,
-    _billing_http_opener,
-    _service_root,
-    active_billing_targets,
-)
+from config_editor_core.load import load_config
 
 
 MAX_TARGETS = 4
 MAX_WORKERS = 4
 PAGE_SIZE = 80
 MAX_ROWS_PER_TARGET = 100
+DEFAULT_TIMEOUT_SECONDS = 4.0
+MAX_RESPONSE_BYTES = 256 * 1024
+
+
+class UsageConfigError(ValueError):
+    """The current LiteLLM configuration could not be read safely."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        fp: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _isolated_http_opener() -> urllib.request.OpenerDirector:
+    handlers: list[Any] = [_NoRedirect()]
+    if os.environ.get("LITELLM_USE_SYSTEM_PROXIES") != "1":
+        handlers.insert(0, urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
+
+
+def _string(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _credential_value(value: Any) -> str:
+    text = _string(value)
+    if not text.startswith("os.environ/"):
+        return "" if "\r" in text or "\n" in text else text
+    variable = text.removeprefix("os.environ/").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable):
+        return ""
+    resolved = os.environ.get(variable, "").strip()
+    return "" if "\r" in resolved or "\n" in resolved else resolved
+
+
+def _provider_keys(provider: dict[str, Any]) -> tuple[dict[str, str], list[str]]:
+    by_name: dict[str, str] = {}
+    ordered: list[str] = []
+    raw_keys = provider.get("api_keys")
+    if not isinstance(raw_keys, list):
+        return by_name, ordered
+    for index, item in enumerate(raw_keys, start=1):
+        if not isinstance(item, dict):
+            continue
+        name = _string(item.get("name")) or f"key-{index}"
+        value = _credential_value(item.get("value"))
+        if not value or name in by_name:
+            continue
+        by_name[name] = value
+        ordered.append(value)
+    return by_name, ordered
+
+
+def _credential_for_model(provider: dict[str, Any], model: dict[str, Any]) -> str:
+    direct = _credential_value(model.get("api_key"))
+    if direct:
+        return direct
+    by_name, ordered = _provider_keys(provider)
+    preferred_name = _string(model.get("api_key_name"))
+    if preferred_name and preferred_name in by_name:
+        return by_name[preferred_name]
+    if "default" in by_name:
+        return by_name["default"]
+    return ordered[0] if len(ordered) == 1 else ""
 
 
 @dataclass(frozen=True)
@@ -52,45 +119,91 @@ def _utc_now_iso() -> str:
 
 
 def default_config_path() -> pathlib.Path:
-    from provider_billing import default_config_path as billing_config_path
+    configured = os.environ.get("LITELLM_CONFIG_FILE", "").strip()
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip() or os.environ.get(
+        "LITELLM_MENU_HOME", ""
+    ).strip()
+    if root:
+        return pathlib.Path(root).expanduser() / "config.yaml"
+    return pathlib.Path.home() / ".litellm-menu" / "config.yaml"
 
-    return billing_config_path()
+
+def _service_root(api_base: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlsplit(api_base)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    lower = [part.lower() for part in parts]
+    suffixes = (
+        ("v1", "chat", "completions"),
+        ("v1", "images", "generations"),
+        ("v1", "completions"),
+        ("v1", "responses"),
+        ("v1", "messages"),
+        ("v1", "models"),
+        ("chat", "completions"),
+        ("images", "generations"),
+        ("completions",),
+        ("responses",),
+        ("messages",),
+        ("models",),
+        ("v1",),
+    )
+    for suffix in suffixes:
+        if len(lower) >= len(suffix) and tuple(lower[-len(suffix) :]) == suffix:
+            parts = parts[: -len(suffix)]
+            break
+    path = f"/{'/'.join(parts)}" if parts else ""
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
 
 
 def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
-    """Return one safe read target for each configured relay credential.
+    """Return one safe read target for each configured model credential."""
+    try:
+        payload = load_config(path)
+    except Exception as exc:
+        raise UsageConfigError("The LiteLLM configuration could not be read.") from exc
+    raw_providers = payload.get("providers")
+    if not isinstance(raw_providers, list):
+        raise UsageConfigError("The LiteLLM configuration has no provider list.")
 
-    Billing and online-log refreshes must agree on which enabled model routes
-    can use a credential.  Reusing the billing target builder also keeps
-    environment-backed keys and disabled models consistent with the editor.
-    A relay is queried once per root/credential pair, not once per model.
-    """
-
-    billing_targets = active_billing_targets(path)
     seen: set[tuple[str, str]] = set()
     provider_counts: dict[str, int] = {}
     targets: list[UsageTarget] = []
-    for billing_target in billing_targets:
-        root = _service_root(billing_target.api_base)
-        if not root or not billing_target.api_key:
+    for raw_provider in raw_providers:
+        if not isinstance(raw_provider, dict):
             continue
-        key = (root, billing_target.api_key)
-        if key in seen:
+        provider_name = _string(raw_provider.get("name")) or "Configured relay"
+        provider_base = _string(raw_provider.get("api_base"))
+        raw_models = raw_provider.get("models")
+        if not isinstance(raw_models, list):
             continue
-        seen.add(key)
-        provider = billing_target.provider or "Configured relay"
-        provider_counts[provider] = provider_counts.get(provider, 0) + 1
-        suffix = provider_counts[provider]
-        label = provider if suffix == 1 else f"{provider} · Account {suffix}"
-        targets.append(
-            UsageTarget(
-                provider=label,
-                api_base=billing_target.api_base,
-                api_key=billing_target.api_key,
-            )
-        )
-        if len(targets) >= MAX_TARGETS:
-            break
+        for raw_model in raw_models:
+            if not isinstance(raw_model, dict):
+                continue
+            api_base = _string(raw_model.get("api_base")) or provider_base
+            api_key = _credential_for_model(raw_provider, raw_model)
+            root = _service_root(api_base)
+            if not root or not api_key:
+                continue
+            key = (root, api_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            provider_counts[provider_name] = provider_counts.get(provider_name, 0) + 1
+            suffix = provider_counts[provider_name]
+            label = provider_name if suffix == 1 else f"{provider_name} · Account {suffix}"
+            targets.append(UsageTarget(provider=label, api_base=api_base, api_key=api_key))
+            if len(targets) >= MAX_TARGETS:
+                return targets
     return targets
 
 
@@ -144,7 +257,7 @@ def _fetch_json(
         method="GET",
     )
     try:
-        with _billing_http_opener().open(request, timeout=timeout) as response:
+        with _isolated_http_opener().open(request, timeout=timeout) as response:
             status = int(getattr(response, "status", response.getcode()))
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
@@ -372,7 +485,7 @@ def _fetch_target_safely(
 def render(path: pathlib.Path, timeout: float) -> str:
     try:
         targets = active_usage_targets(path)
-    except BillingConfigError:
+    except UsageConfigError:
         return "Configured relay logs are unavailable because the local configuration could not be read."
     if not targets:
         return "No configured relay exposes a usable credential for online usage logs."

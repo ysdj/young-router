@@ -17,8 +17,8 @@ model_list:
       provider: default
       route_key: model=default-chat / provider=default / upstream=openai/chat-model / host=api.example.test / key=default / order=1
       api_key_name: default
+      upstream_protocol_mode: fallback
       upstream_url_surface: openai/responses
-      supported_upstream_url_surfaces: [openai/responses]
       supports_responses_image_generation_tool: false
 
 litellm_settings:

@@ -17,17 +17,42 @@ from litellm_menu.core.service import CoreError, CoreStore
 
 
 class FakeRelayHTTPClient:
-    def __init__(self, responses: dict[str, object], *, probes: dict[str, object] | None = None):
+    def __init__(
+        self,
+        responses: dict[str, object],
+        *,
+        probes: dict[str, object] | None = None,
+        errors: dict[str, Exception] | None = None,
+        password_login_result: dict[str, str] | Exception | None = None,
+    ):
         self.responses = responses
         self.probe_responses = dict(probes or {})
+        self.errors = dict(errors or {})
+        self.password_login_result = password_login_result
         self.requests: list[tuple[str, str, dict[str, str]]] = []
+        self.post_requests: list[tuple[str, str, dict[str, str]]] = []
         self.probes: list[tuple[str, str]] = []
+        self.password_logins: list[tuple[str, str, str, str]] = []
 
     def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
         self.requests.append((origin, path, dict(headers)))
+        if path in self.errors:
+            raise self.errors[path]
+        # Group selection is optional metadata on older relay deployments.
+        # Existing resource fixtures intentionally omit it.
+        if path == "/api/user/self/groups":
+            return {"data": {}}
+        if path == "/api/v1/groups/available":
+            return {"data": []}
+        if path == "/api/v1/groups/rates":
+            return {"data": {}}
         if path not in self.responses:
             raise AssertionError(f"unexpected relay path: {path}")
         return self.responses[path]
+
+    def post(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+        self.post_requests.append((origin, path, dict(headers)))
+        return self.json(origin, path, headers=headers)
 
     def probe(self, origin: str, path: str) -> tuple[int, object | None]:
         self.probes.append((origin, path))
@@ -40,8 +65,75 @@ class FakeRelayHTTPClient:
             raise AssertionError("invalid relay probe response")
         return result
 
+    def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
+        self.password_logins.append((origin, account_type, username, password))
+        if isinstance(self.password_login_result, Exception):
+            raise self.password_login_result
+        if self.password_login_result is None:
+            raise AssertionError("unexpected relay password login")
+        return dict(self.password_login_result)
+
 
 class RelayAccountsDomainTests(unittest.TestCase):
+    def test_newapi_balance_uses_the_station_quota_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["gpt-test"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {"items": [{"id": 1, "name": "default", "status": 1, "key": "masked"}]}
+                    },
+                    "/api/user/self": {"data": {"quota": 1_250_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {
+                    "type": "newapi",
+                    "label": "New API",
+                    "origin": "https://relay.example.test",
+                },
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"], username="person", access_token="replace-token"
+            )
+
+            refreshed = domain.refresh_resources(account["id"])
+
+            self.assertEqual(2.5, refreshed["balance"])
+
+    def test_sub2api_balance_comes_from_the_user_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/v1/user/profile": {"data": {"balance": 8.75}},
+                    "/api/v1/keys?page=1&page_size=100": {
+                        "data": {"items": [{"id": "key-1", "name": "default", "status": "active", "key": "sk-test"}]}
+                    },
+                    "/api/v1/channels/available": {
+                        "data": [{"platforms": [{"supported_models": ["model-test"]}]}]
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {
+                    "type": "sub2api",
+                    "label": "Sub2API",
+                    "origin": "https://relay.example.test",
+                },
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"], username="person@example.test", access_token="replace-token"
+            )
+
+            refreshed = domain.refresh_resources(account["id"])
+
+            self.assertEqual(8.75, refreshed["balance"])
+
     def test_type_detection_classifies_public_station_signatures_without_staging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake = FakeRelayHTTPClient(
@@ -191,11 +283,53 @@ class RelayAccountsDomainTests(unittest.TestCase):
         self.assertEqual((0, None), redirected_client.probe("https://relay.example.test", "/api/status"))
         self.assertTrue(redirected.closed)
 
+    def test_newapi_key_request_uses_authenticated_post(self) -> None:
+        class Response:
+            status = 200
+
+            def getcode(self) -> int:
+                return self.status
+
+            def read(self, _limit: int) -> bytes:
+                return b'{"success":true,"data":{"key":"replace-key"}}'
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        class Opener:
+            def __init__(self) -> None:
+                self.request: object | None = None
+
+            def open(self, request: object, timeout: float) -> Response:
+                del timeout
+                self.request = request
+                return Response()
+
+        opener = Opener()
+        client = RelayHTTPClient(opener=opener)
+
+        self.assertEqual(
+            {"success": True, "data": {"key": "replace-key"}},
+            client.post(
+                "https://relay.example.test",
+                "/api/token/7/key",
+                headers={"Authorization": "Bearer replace-dashboard-token"},
+            ),
+        )
+        request = opener.request
+        self.assertIsNotNone(request)
+        self.assertEqual("POST", request.get_method())  # type: ignore[union-attr]
+        self.assertEqual("https://relay.example.test/api/token/7/key", request.full_url)  # type: ignore[union-attr]
+        self.assertEqual("Bearer replace-dashboard-token", request.get_header("Authorization"))  # type: ignore[union-attr]
+
     def test_core_login_transaction_signs_in_without_loading_resources_or_staging_provider_models(self) -> None:
         fake = FakeRelayHTTPClient(
             {
                 "/api/user/models": {"success": True, "data": ["model-a"]},
-                "/api/token/?p=0&page_size=100": {
+                "/api/token/?p=1&size=100": {
                     "success": True,
                     "data": {"items": [{"id": 7, "status": 1}]},
                 },
@@ -259,7 +393,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
         fake = FakeRelayHTTPClient(
             {
                 "/api/user/models": {"success": True, "data": []},
-                "/api/token/?p=0&page_size=100": {
+                "/api/token/?p=1&size=100": {
                     "success": True,
                     "data": {"items": [{"id": 7, "status": 1}]},
                 },
@@ -314,7 +448,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 core.refresh_relay_resources(account["id"], revision=core.revision - 1)
             self.assertEqual("revision_conflict", raised.exception.code)
 
-    def test_account_snapshot_and_persistence_never_expose_secrets(self) -> None:
+    def test_account_snapshot_redacts_remembered_credentials_while_private_file_retains_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             domain = RelayAccountsDomain(root)
@@ -333,6 +467,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 username="sample-user",
                 cookie="session=replace-cookie",
                 access_token="replace-access-token",
+                password="replace-password",
             )
 
             self.assertEqual("signed_in", logged_in["login_status"])
@@ -345,11 +480,57 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             storage = root / ".litellm-runtime" / "relay-accounts.json"
             self.assertEqual(0o600, os.stat(storage).st_mode & 0o777)
+            private_text = storage.read_text(encoding="utf-8")
+            self.assertIn("replace-cookie", private_text)
+            self.assertIn("replace-access-token", private_text)
+            self.assertIn("replace-password", private_text)
             reloaded = RelayAccountsDomain(root)
             reloaded_account = reloaded.snapshot()["accounts"][0]
             self.assertEqual("unknown", reloaded_account["login_status"])
             self.assertEqual("sample-user", reloaded_account["username"])
             self.assertTrue(reloaded_account["remember_password"])
+            self.assertTrue(reloaded_account["password_saved"])
+
+    def test_remembered_session_restores_without_opening_the_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root)
+            account = domain.dispatch(
+                "account.add",
+                {
+                    "type": "sub2api",
+                    "label": "Relay Session",
+                    "origin": "https://relay.example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"],
+                username="person@example.test",
+                cookie="session=remembered-cookie",
+                access_token="remembered-token",
+            )
+
+            fake = FakeRelayHTTPClient({"/api/v1/auth/me": {"data": {"email": "person@example.test"}}})
+            restored_domain = RelayAccountsDomain(root, http_client=fake)
+            restored = restored_domain.restore_saved_session(account["id"])
+
+            self.assertIsNotNone(restored)
+            self.assertEqual("signed_in", restored["login_status"])
+            self.assertTrue(restored_domain.secret_present("session", account["id"]))
+            self.assertEqual(
+                [
+                    (
+                        "https://relay.example.test",
+                        "/api/v1/auth/me",
+                        {
+                            "Cookie": "session=remembered-cookie",
+                            "Authorization": "Bearer remembered-token",
+                        },
+                    )
+                ],
+                fake.requests,
+            )
 
     def test_account_delete_persists_secret_free_credential_cleanup_until_confirmed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -395,7 +576,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual([], confirmed["pending_credential_cleanups"])
             self.assertEqual([], RelayAccountsDomain(root).snapshot()["pending_credential_cleanups"])
 
-    def test_disabling_password_remember_persists_secret_free_cleanup_until_confirmed(self) -> None:
+    def test_disabling_password_remember_clears_the_private_file_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             domain = RelayAccountsDomain(root)
@@ -408,33 +589,68 @@ class RelayAccountsDomainTests(unittest.TestCase):
                     "remember_password": True,
                 },
             )["accounts"][0]
+            domain.accept_login_result(
+                account["id"],
+                username="person@example.test",
+                access_token="replace-access-token",
+                password="replace-password",
+            )
 
             disabled = domain.dispatch(
                 "account.update",
                 {"id": account["id"], "remember_password": False},
             )
             self.assertFalse(disabled["accounts"][0]["remember_password"])
-            self.assertEqual(
-                [
-                    {
-                        "account_id": account["id"],
-                        "label": "Relay Password",
-                        "kind": "password",
-                    }
-                ],
-                disabled["pending_credential_cleanups"],
-            )
+            self.assertFalse(disabled["accounts"][0]["password_saved"])
+            self.assertEqual([], disabled["pending_credential_cleanups"])
             persisted = (root / ".litellm-runtime" / "relay-accounts.json").read_text()
             self.assertNotIn("replace-password", persisted)
-
-            reloaded = RelayAccountsDomain(root)
-            self.assertEqual(disabled["pending_credential_cleanups"], reloaded.snapshot()["pending_credential_cleanups"])
-            confirmed = reloaded.dispatch(
-                "credential_cleanup_confirm",
-                {"id": account["id"], "kind": "password"},
-            )
-            self.assertEqual([], confirmed["pending_credential_cleanups"])
+            self.assertNotIn("replace-access-token", persisted)
             self.assertEqual([], RelayAccountsDomain(root).snapshot()["pending_credential_cleanups"])
+
+    def test_remembered_password_is_private_and_restores_without_a_browser_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root)
+            account = domain.dispatch(
+                "account.add",
+                {
+                    "type": "sub2api",
+                    "label": "Relay Password",
+                    "origin": "https://relay.example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]
+            accepted = domain.accept_login_result(
+                account["id"],
+                username="person@example.test",
+                access_token="replace-access-token",
+                password="replace-password",
+            )
+            self.assertTrue(accepted["password_saved"])
+            self.assertNotIn("password", accepted)
+
+            storage = root / ".litellm-runtime" / "relay-accounts.json"
+            self.assertEqual(0o600, storage.stat().st_mode & 0o777)
+            self.assertIn("replace-password", storage.read_text(encoding="utf-8"))
+
+            fake = FakeRelayHTTPClient(
+                {},
+                password_login_result={
+                    "username": "person@example.test",
+                    "cookie": "",
+                    "access_token": "replace-new-token",
+                    "refresh_token": "replace-refresh-token",
+                },
+            )
+            restored_domain = RelayAccountsDomain(root, http_client=fake)
+            restored = restored_domain.restore_saved_password(account["id"])
+            self.assertEqual("signed_in", restored["login_status"])
+            self.assertTrue(restored["password_saved"])
+            self.assertEqual(
+                [("https://relay.example.test", "sub2api", "person@example.test", "replace-password")],
+                fake.password_logins,
+            )
 
     def test_account_delete_supersedes_a_pending_password_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -473,10 +689,31 @@ class RelayAccountsDomainTests(unittest.TestCase):
                     result = domain.dispatch("add", {"type": "newapi", "label": origin, "origin": origin})
                     self.assertEqual(origin, result["accounts"][-1]["origin"])
 
+    def test_relay_origin_add_accepts_host_without_scheme_or_api_base_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory)
+            for origin in ("relay.example.test", "relay.example.test/v1", "https://relay.example.test/"):
+                with self.subTest(origin=origin):
+                    result = domain.dispatch(
+                        "account.add",
+                        {"type": "newapi", "label": origin, "origin": origin},
+                    )
+                    self.assertEqual("https://relay.example.test", result["accounts"][-1]["origin"])
+
     def test_core_restores_a_native_session_without_importing_provider_models(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            relay = RelayAccountsDomain(root)
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["model-a"]},
+                    "/api/token/?p=1&size=100": {
+                        "data": {"items": [{"id": 7, "name": "known-key", "status": 1, "key": "replace-key"}]}
+                    },
+                    "/api/user/self": {"data": {"quota": 1_000_000}},
+                    "/api/status": {"data": {"quota_per_unit": 500_000}},
+                }
+            )
+            relay = RelayAccountsDomain(root, http_client=fake)
             account = relay.dispatch(
                 "add",
                 {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
@@ -488,8 +725,10 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 cookie="session=previous-cookie",
                 access_token="previous-access-token",
             )
-            reloaded = RelayAccountsDomain(root)
+            relay.refresh_resources(account["id"])
+            reloaded = RelayAccountsDomain(root, http_client=fake)
             self.assertEqual("unknown", reloaded.snapshot()["accounts"][0]["login_status"])
+            self.assertEqual(["newapi-7"], [item["id"] for item in reloaded.snapshot()["accounts"][0]["resources"]])
             providers = ProvidersModelsDomain(root / "config.yaml")
             core = CoreStore(
                 metadata_path=root / ".litellm-runtime" / "core-state.json",
@@ -507,6 +746,11 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 access_token="restored-access-token",
             )
 
+            restored_snapshot = core.snapshot()
+            self.assertEqual(
+                ["newapi-7"],
+                [item["id"] for item in restored_snapshot["domains"]["relay_accounts"]["accounts"][0]["resources"]],
+            )
             core.refresh_relay_resources(account["id"], revision=core.revision)
             snapshot = core.snapshot()
             self.assertEqual({"revision": 1, "login_status": "signed_in", "username": "sample-user"}, result)
@@ -517,6 +761,56 @@ class RelayAccountsDomainTests(unittest.TestCase):
             snapshot_text = json.dumps(snapshot)
             self.assertNotIn("restored-cookie", snapshot_text)
             self.assertNotIn("restored-access-token", snapshot_text)
+
+    def test_core_restores_a_remembered_cookie_when_native_memory_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root)
+            account = relay.dispatch(
+                "add",
+                {
+                    "type": "sub2api",
+                    "label": "Relay",
+                    "origin": "https://relay.example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]
+            relay.accept_login_result(
+                account["id"],
+                username="person@example.test",
+                cookie="session=remembered-cookie",
+                password="replace-password",
+            )
+            fake = FakeRelayHTTPClient({"/api/v1/auth/me": {"data": {"email": "person@example.test"}}})
+            reloaded = RelayAccountsDomain(root, http_client=fake)
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[reloaded, ProvidersModelsDomain(root / "config.yaml")],
+            )
+            public_account = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertIs(public_account["remember_password"], True)
+            self.assertIs(public_account["password_saved"], True)
+
+            result = core.restore_relay_session(
+                account_id=account["id"],
+                account_type="sub2api",
+                label="Relay",
+                origin="https://relay.example.test",
+                login_status="signed_out",
+            )
+
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertEqual([], fake.password_logins)
+            self.assertEqual(
+                [
+                    (
+                        "https://relay.example.test",
+                        "/api/v1/auth/me",
+                        {"Cookie": "session=remembered-cookie"},
+                    )
+                ],
+                fake.requests,
+            )
 
     def test_core_records_expired_native_session_without_retaining_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -570,7 +864,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
     def test_newapi_import_stages_provider_models_and_keeps_key_private(self) -> None:
         responses = {
             "/api/user/models": {"success": True, "data": ["chat-a", "chat-b", "chat-a"]},
-            "/api/token/?p=0&page_size=100": {
+            "/api/token/?p=1&size=100": {
                 "success": True,
                 "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
             },
@@ -592,7 +886,11 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             providers = ProvidersModelsDomain(root / "config.yaml")
 
-            result = domain.import_into(account_id, providers)
+            resources = domain.refresh_resources(account_id)["resources"]
+            refreshed_account = domain.snapshot()["accounts"][0]
+            self.assertEqual("ready", refreshed_account["resource_status"])
+            self.assertEqual("none", refreshed_account["resource_error"])
+            result = domain.import_resources(account_id, [resource["id"] for resource in resources], providers)
 
             self.assertTrue(result["imported"])
             self.assertEqual(2, result["model_count"])
@@ -603,8 +901,107 @@ class RelayAccountsDomainTests(unittest.TestCase):
             private = providers.export(include_sensitive=True)["providers"][0]
             self.assertEqual("sk-replace-relay-key", private["api_key"])
             self.assertEqual("openai/chat-a", private["models"][0]["litellm_model"])
+            self.assertEqual(["/api/token/7/key"], [path for _, path, _ in fake.post_requests])
             self.assertTrue(all(headers["Authorization"] == "Bearer replace-dashboard-token" for _, _, headers in fake.requests))
             self.assertTrue(all(headers["Cookie"] == "session=replace-cookie" for _, _, headers in fake.requests))
+
+    def test_resource_refresh_exposes_actionable_failure_reason(self) -> None:
+        cases = (
+            (
+                "no_api_keys",
+                {
+                    "/api/user/models": {"success": True, "data": ["model-a"]},
+                    "/api/token/?p=1&size=100": {"success": True, "data": {"items": []}},
+                },
+                {},
+            ),
+            (
+                "no_models",
+                {
+                    "/api/user/models": {"success": True, "data": []},
+                    "/api/token/?p=1&size=100": {"success": True, "data": {"items": [{"id": 7, "status": 1}]}},
+                },
+                {},
+            ),
+            (
+                "login_expired",
+                {},
+                {"/api/user/models": RelayAccountsError("Relay login has expired")},
+            ),
+        )
+        for resource_error, responses, errors in cases:
+            with self.subTest(resource_error=resource_error), tempfile.TemporaryDirectory() as directory:
+                fake = FakeRelayHTTPClient(responses, errors=errors)
+                domain = RelayAccountsDomain(directory, http_client=fake)
+                account_id = domain.dispatch(
+                    "add",
+                    {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+                )["accounts"][0]["id"]
+                domain.accept_login_result(account_id, username="sample-user", cookie="session=replace-cookie")
+
+                result = domain.refresh_resources(account_id)
+
+                self.assertEqual("unavailable", result["resource_status"])
+                self.assertEqual(resource_error, result["resource_error"])
+                self.assertEqual("expired" if resource_error == "login_expired" else "signed_in", result["login_status"])
+                if resource_error == "no_models":
+                    self.assertEqual(["newapi-7"], [item["id"] for item in result["resources"]])
+                else:
+                    self.assertEqual([], result["resources"])
+                self.assertEqual(resource_error != "login_expired", domain.secret_present("session", account_id))
+
+    def test_failed_refresh_preserves_last_known_resources(self) -> None:
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/user/models": {"success": True, "data": ["model-a"]},
+                "/api/token/?p=1&size=100": {
+                    "success": True,
+                    "data": {"items": [{"id": 7, "name": "known-key", "status": 1, "key": "replace-key"}]},
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample-user", cookie="session=replace-cookie")
+            first = domain.refresh_resources(account_id)
+            self.assertEqual(["newapi-7"], [item["id"] for item in first["resources"]])
+
+            fake.errors["/api/user/models"] = RelayAccountsError("Relay is unavailable")
+            second = domain.refresh_resources(account_id)
+
+            self.assertEqual("unavailable", second["resource_status"])
+            self.assertEqual("unavailable", second["resource_error"])
+            self.assertEqual(["newapi-7"], [item["id"] for item in second["resources"]])
+
+    def test_staging_a_new_browser_session_clears_old_resource_selection(self) -> None:
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/user/models": {"success": True, "data": ["model-a"]},
+                "/api/token/?p=1&size=100": {"success": True, "data": {"items": [{"id": 7, "status": 1}]}},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="first-user", cookie="session=first-cookie")
+            domain.refresh_resources(account_id)
+            self.assertEqual("ready", domain.snapshot()["accounts"][0]["resource_status"])
+
+            domain.stage_secret("session", account_id, json.dumps({"username": "second-user", "cookie": "session=second-cookie"}))
+
+            account = domain.snapshot()["accounts"][0]
+            self.assertEqual("second-user", account["username"])
+            self.assertEqual("signed_in", account["login_status"])
+            self.assertEqual("idle", account["resource_status"])
+            self.assertEqual("none", account["resource_error"])
+            self.assertEqual([], account["resources"])
 
     def test_sub2api_import_flattens_visible_channel_models(self) -> None:
         fake = FakeRelayHTTPClient(
@@ -651,6 +1048,62 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 [model["model_name"] for model in providers.snapshot()["providers"][0]["models"]],
             )
             self.assertTrue(all(headers == {"Authorization": "Bearer replace-access-token"} for _, _, headers in fake.requests))
+
+    def test_sub2api_import_discovers_models_from_each_gateway_key_when_channels_are_unavailable(self) -> None:
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "OpenAI", "status": "active", "key": "sk-replace-openai-key"},
+                            {"id": 5, "name": "Other", "status": "active", "key": "sk-replace-other-key"},
+                        ]
+                    },
+                },
+                "/v1/models": {
+                    "object": "list",
+                    "data": [{"id": "gateway-model"}],
+                },
+            },
+            errors={"/api/v1/channels/available": RelayAccountsError("Relay login has expired")},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample@example.test",
+                access_token="replace-dashboard-token",
+            )
+            providers = ProvidersModelsDomain(root / "config.yaml")
+
+            resources = domain.refresh_resources(account_id)["resources"]
+            result = domain.import_resources(account_id, [resource["id"] for resource in resources], providers)
+
+            self.assertEqual(2, result["model_count"])
+            self.assertEqual(
+                ["gateway-model", "gateway-model"],
+                [model["model_name"] for model in providers.snapshot()["providers"][0]["models"]],
+            )
+            gateway_requests = [
+                headers for _, path, headers in fake.requests if path == "/v1/models"
+            ]
+            self.assertEqual(
+                [
+                    {"Authorization": "Bearer sk-replace-openai-key"},
+                    {"Authorization": "Bearer sk-replace-other-key"},
+                ],
+                gateway_requests,
+            )
+            dashboard_requests = [
+                headers for _, path, headers in fake.requests if path.startswith("/api/v1/")
+            ]
+            self.assertTrue(all(headers == {"Authorization": "Bearer replace-dashboard-token"} for headers in dashboard_requests))
 
     def test_sub2api_cookie_only_session_can_import_models(self) -> None:
         fake = FakeRelayHTTPClient(
@@ -727,7 +1180,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
         fake = FakeRelayHTTPClient(
             {
                 "/api/user/models": {"success": True, "data": ["model-a", "model-b"]},
-                "/api/token/?p=0&page_size=100": {
+                "/api/token/?p=1&size=100": {
                     "success": True,
                     "data": {
                         "items": [

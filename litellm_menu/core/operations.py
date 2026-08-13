@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -36,6 +37,7 @@ from .persistence import (
     read_text,
 )
 from .security import REDACT_TEXT, safe_exception_message
+from .domains.logs import active_cooldown_states, active_recovery_states
 
 
 MAX_OPERATION_OUTPUT_BYTES = 128 * 1024
@@ -47,6 +49,7 @@ CORE_PID_ENV = "LITELLM_MENU_CORE_PID"
 OWNER_TOKEN_BYTES = 32
 MACOS_DEFAULT_WORKERS = "16"
 PROXY_STOP_GRACE_SECONDS = 2.0
+SERVICE_STATUS_CACHE_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,10 @@ class CoreServiceController:
             configured_bin = next((str(path) for path in candidates if path.is_file()), executable_name)
         self.litellm_bin = configured_bin
         self._environment = dict(environment or {})
+        self._status_cache: tuple[float, dict[str, Any]] | None = None
+
+    def _invalidate_status_cache(self) -> None:
+        self._status_cache = None
 
     @staticmethod
     def _process_alive(pid: int) -> bool:
@@ -540,7 +547,14 @@ class CoreServiceController:
             except OSError as exc:
                 raise RuntimeError("Transient routing state could not be reset") from exc
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, force: bool = True) -> dict[str, Any]:
+        # Snapshot requests can arrive from every open native window. Keep
+        # that read-only projection cheap; explicit health/lifecycle actions
+        # pass force=True and retain real-time ownership checks.
+        now = time.monotonic()
+        cached = self._status_cache
+        if not force and cached is not None and now - cached[0] < SERVICE_STATUS_CACHE_SECONDS:
+            return copy.deepcopy(cached[1])
         pid = self._pid()
         port = self._configured_port()
         healthy = self._health(port)
@@ -565,6 +579,7 @@ class CoreServiceController:
             result["port"] = port
         result["route_recovery"] = self._recovery_summary()
         result["webdav"] = self._webdav_summary()
+        self._status_cache = (now, copy.deepcopy(result))
         return result
 
     def dispatch(self, operation: str) -> dict[str, Any]:
@@ -576,11 +591,11 @@ class CoreServiceController:
             "stop": self.stop,
             "restart": self.restart,
             "reload": self.reload,
-            "health": self.status,
-            "status": self.status,
+            "health": lambda: self.status(force=True),
+            "status": lambda: self.status(force=False),
             "autostart_enable": self.autostart_enable,
             "autostart_disable": self.autostart_disable,
-            "autostart_status": lambda: {"auto_start_state": self.autostart_status(), **self.status()},
+            "autostart_status": lambda: {"auto_start_state": self.autostart_status(), **self.status(force=True)},
         }
         method = methods.get(normalized)
         if method is None:
@@ -591,14 +606,14 @@ class CoreServiceController:
         return dict(result)
 
     def start(self) -> dict[str, Any]:
-        current = self.status()
+        current = self.status(force=True)
         if current["state"] == "running":
             return current
         orphaned_pid = self._recorded_proxy_is_orphaned()
         if orphaned_pid is not None:
             self._stop_process_group(orphaned_pid)
             self._remove_owner_files()
-            current = self.status()
+            current = self.status(force=True)
         if current["state"] == "unknown":
             raise RuntimeError("The configured LiteLLM port is already in use")
         if current["state"] == "unhealthy":
@@ -667,6 +682,7 @@ class CoreServiceController:
                 )
             self._write_owner_record(process, owner_token)
             atomic_write_text(self.paths.pid, f"{process.pid}\n")
+            self._invalidate_status_cache()
         except (OSError, PersistenceError) as exc:
             if "process" in locals():
                 self._stop_process_group(process.pid)
@@ -675,12 +691,13 @@ class CoreServiceController:
         deadline = time.monotonic() + min(max(float(environment.get("LITELLM_HEALTH_WAIT_SECONDS", "60")), 1), 60)
         while time.monotonic() < deadline:
             if self._health():
-                return self.status()
+                return self.status(force=True)
             if process.poll() is not None:
                 break
             time.sleep(0.1)
         self._stop_process_group(process.pid)
         self._remove_owner_files()
+        self._invalidate_status_cache()
         raise RuntimeError("LiteLLM service did not become healthy")
 
     @staticmethod
@@ -711,6 +728,7 @@ class CoreServiceController:
             return self.status()
         self._stop_process_group(pid)
         self._remove_owner_files()
+        self._invalidate_status_cache()
         return self.status()
 
     def restart(self) -> dict[str, Any]:
@@ -747,32 +765,8 @@ class CoreServiceController:
         except PersistenceError:
             recoveries, cooldowns = {}, {}
         now = time.time()
-        recovery_count = 0
-        if isinstance(recoveries, Mapping):
-            for value in recoveries.values():
-                if not isinstance(value, Mapping):
-                    continue
-                heartbeat = value.get("heartbeat_at") or value.get("updated_at")
-                try:
-                    parsed_heartbeat = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
-                    if parsed_heartbeat.tzinfo is None:
-                        parsed_heartbeat = parsed_heartbeat.replace(tzinfo=timezone.utc)
-                    heartbeat_at = parsed_heartbeat.timestamp()
-                except (TypeError, ValueError):
-                    continue
-                if now - heartbeat_at <= 45:
-                    recovery_count += 1
-        cooldown_count = 0
-        if isinstance(cooldowns, Mapping):
-            for value in cooldowns.values():
-                if not isinstance(value, Mapping):
-                    continue
-                try:
-                    cooldown_until = float(value.get("cooldown_until") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if cooldown_until > now:
-                    cooldown_count += 1
+        recovery_count = len(active_recovery_states(recoveries, now=now))
+        cooldown_count = len(active_cooldown_states(cooldowns, now=now))
         return {"summary": f"{recovery_count} recovering / {cooldown_count} cooldown", "recovering": recovery_count, "cooldown": cooldown_count}
 
     def _webdav_summary(self) -> dict[str, Any]:

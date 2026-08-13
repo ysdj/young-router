@@ -37,7 +37,7 @@ jobs:
         run: |
           brew install uv
           uv venv --python 3.12 "$RUNNER_TEMP/litellm-menu-ci"
-          uv pip install --python "$RUNNER_TEMP/litellm-menu-ci/bin/python" "litellm[proxy]==$(tr -d '[:space:]' < LITELLM_VERSION)" PyYAML Pillow ddgs
+          uv pip install --python "$RUNNER_TEMP/litellm-menu-ci/bin/python" "litellm[proxy]==$(tr -d '[:space:]' < LITELLM_VERSION)" "fastapi==0.140.3" PyYAML Pillow ddgs
 
       - name: Run full test suite
         env:

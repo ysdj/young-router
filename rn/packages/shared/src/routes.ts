@@ -13,6 +13,7 @@ export const ROUTES: readonly RouteDefinition[] = [
   { id: "runtime-settings", titleKey: "menu.runtime", nativeWindow: true },
   { id: "webdav-settings", titleKey: "menu.webdav", nativeWindow: true },
   { id: "relay-accounts", titleKey: "menu.relay", nativeWindow: true },
+  { id: "relay-add", titleKey: "relay.addAccount", nativeWindow: true },
   { id: "logs", titleKey: "menu.logs", nativeWindow: true },
 ];
 

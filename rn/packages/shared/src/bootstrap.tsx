@@ -13,6 +13,10 @@ export interface DesktopHostDependencies {
 export function registerLiteLLMMenu(componentName: string, dependencies: DesktopHostDependencies): void {
   AppRegistry.registerComponent(componentName, () => function DesktopHost(props: { initialRoute?: AppRoute; initialLogTab?: LogTab; isPrimaryHost?: boolean; isWindowManagerHost?: boolean }): React.JSX.Element {
     const isPrimaryHost = props.isPrimaryHost !== false;
+    // Every route window has its own React root, but all roots in the desktop
+    // process share this IPC client. Seed the new root before its first render
+    // so native tables are built once with real rows instead of an empty shell.
+    const [initialSnapshot] = useState(() => dependencies.ipc.latestSnapshot());
     const [routeRequest, setRouteRequest] = useState<AppRoute>();
     const [routeRequestSequence, setRouteRequestSequence] = useState(0);
     const [logTabRequest, setLogTabRequest] = useState<LogTab>();
@@ -35,11 +39,11 @@ export function registerLiteLLMMenu(componentName: string, dependencies: Desktop
         setRouteRequestSequence((current) => current + 1);
       }
     }, [isPrimaryHost, nativeAction, props.initialRoute]);
-    return <LiteLLMMenuApp {...dependencies} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} nativeAction={nativeAction} />;
+    return <LiteLLMMenuApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} nativeAction={nativeAction} />;
   });
 }
 
-const DESKTOP_ROUTES: readonly AppRoute[] = ["home", "providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "relay-accounts", "logs"];
+const DESKTOP_ROUTES: readonly AppRoute[] = ["home", "providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "relay-accounts", "relay-add", "logs"];
 const LOG_TABS: readonly LogTab[] = ["requests", "service", "menu", "route-trace", "recovery", "online-usage"];
 
 function canonicalWindowRoute(route: AppRoute): AppRoute {

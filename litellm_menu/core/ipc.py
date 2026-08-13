@@ -142,7 +142,7 @@ class _SecretReadCapability:
     session_token: str
     domain: str
     field: str
-    target: str
+    target: str | None
     revision: int
     expires_at: float
 
@@ -263,7 +263,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 data = decode_message(self._read_body())
                 if route.endswith("/relay/login"):
-                    allowed = {"account_id", "type", "label", "origin", "username", "cookie", "access_token", "refresh_token"}
+                    allowed = {"account_id", "type", "label", "origin", "username", "cookie", "access_token", "refresh_token", "password"}
                     required = {"account_id", "type", "label", "origin", "username"}
                     if not required.issubset(data) or set(data).difference(allowed):
                         raise CoreError("relay_login_failed", "Relay login result is invalid")
@@ -276,6 +276,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                         cookie=data.get("cookie", ""),
                         access_token=data.get("access_token", ""),
                         refresh_token=data.get("refresh_token", ""),
+                        password=data.get("password", ""),
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
                 elif route.endswith("/relay/restore"):
@@ -614,7 +615,7 @@ class CoreIPCServer:
         *,
         session_token: str,
     ) -> dict[str, Any]:
-        """Issue a read-once, native-only lease for one provider API key.
+        """Issue a read-once, native-only lease for one visible credential.
 
         This is deliberately narrower than ordinary secret staging.  The
         public React IPC schema remains unable to request or receive a secret.
@@ -623,7 +624,7 @@ class CoreIPCServer:
         if (
             not isinstance(domain, str)
             or not isinstance(field, str)
-            or not isinstance(target, str)
+            or (target is not None and not isinstance(target, str))
             or not self._valid_session(session_token)
         ):
             raise CoreError("invalid_secret", "The requested secret field is unavailable")
@@ -634,7 +635,7 @@ class CoreIPCServer:
             session_token=session_token,
             domain=str(descriptor["domain"]),
             field=str(descriptor["field"]),
-            target=str(descriptor["target"]),
+            target=descriptor["target"],
             revision=int(descriptor["revision"]),
             expires_at=time.monotonic() + SECRET_READ_CAPABILITY_TTL_SECONDS,
         )
@@ -661,7 +662,7 @@ class CoreIPCServer:
         }
 
     def read_secret_capability(self, token: object, *, session_token: str) -> str:
-        """Consume a session-bound provider API-key lease before reading it."""
+        """Consume a session-bound plaintext-secret lease before reading it."""
 
         if (
             not isinstance(token, str)

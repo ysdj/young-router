@@ -145,7 +145,7 @@ class ExternalProviderImportTests(unittest.TestCase):
         self.assertEqual("main", model["api_key_name"])
         self.assertEqual("3", model["order"])
         self.assertEqual("openai/chat", model["upstream_url_surface"])
-        self.assertEqual(["openai/chat", "openai/responses"], model["supported_upstream_url_surfaces"])
+        self.assertNotIn("supported_upstream_url_surfaces", model)
 
     def test_rejects_yaml_alias_bomb_without_echoing_source_values(self) -> None:
         directory = self.temporary_directory()

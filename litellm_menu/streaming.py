@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from . import codex_fast_tier as _codex_fast_tier_module
 from . import computer_facade as _computer_facade_module
 from . import image_generation as _image_generation_module
 from . import image_inputs as _image_inputs_module
@@ -1337,7 +1338,7 @@ def _response_item_has_assistant_text(item: Any) -> bool:
     if not isinstance(json_item, dict):
         return False
     item_type = _responses_web_search_bridge_module._response_item_get(json_item, "type")
-    if _stream_output_item_is_tool_call(item_type):
+    if item_type == "reasoning" or _stream_output_item_is_tool_call(item_type):
         return False
     return bool(_responses_output_module._response_text(json_item).strip())
 
@@ -1971,6 +1972,12 @@ def _build_streaming_error_fallback_payload(
         value = _jsonable(request_data.get(key))
         if value is not None:
             payload[key] = value
+    if "service_tier" not in payload:
+        default_service_tier = (
+            _codex_fast_tier_module._codex_fast_default_service_tier(request_data)
+        )
+        if default_service_tier is not None:
+            payload["service_tier"] = default_service_tier
 
     litellm_metadata = _request_context_module._request_metadata_dict(request_data, "litellm_metadata") or {}
     external_web_search_payload = bool(
@@ -2072,12 +2079,42 @@ def _apply_streaming_error_fallback_constraints(
     *,
     route_recovery_poll: bool = False,
 ) -> None:
+    _routing_module._sync_failed_deployment_exclusions(request_data, exception)
+
+    def cumulative_excluded_ids() -> set[str]:
+        excluded_ids = set(_CURRENT_EXCLUDED_DEPLOYMENT_IDS.get() or ())
+        excluded_ids.update(
+            _routing_module._exception_excluded_deployment_ids(exception)
+        )
+        excluded_ids.update(
+            _responses_request_module._request_excluded_deployment_ids(request_data)
+        )
+        return excluded_ids
+
+    def preserve_cumulative_exclusions(*additional_sources: dict) -> set[str]:
+        excluded_ids = cumulative_excluded_ids()
+        for source in additional_sources:
+            excluded_ids.update(
+                _responses_request_module._request_excluded_deployment_ids(source)
+            )
+        if not excluded_ids:
+            return excluded_ids
+        serialized_excluded_ids = sorted(excluded_ids)
+        request_data["_excluded_deployment_ids"] = serialized_excluded_ids
+        payload["_excluded_deployment_ids"] = serialized_excluded_ids
+        _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids)
+        try:
+            exception.excluded_deployment_ids = serialized_excluded_ids  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return excluded_ids
+
     forced_target_order = _routing_module._coerce_order(
         request_data.get(_ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY)
     )
     if route_recovery_poll and forced_target_order is not None:
         payload["_target_order"] = forced_target_order
-        excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_data)
+        excluded_ids = preserve_cumulative_exclusions()
         if excluded_ids:
             payload["_excluded_deployment_ids"] = sorted(excluded_ids)
         else:
@@ -2089,6 +2126,7 @@ def _apply_streaming_error_fallback_constraints(
         for key, value in peer_entry.items():
             if key != "model":
                 payload[key] = value
+        preserve_cumulative_exclusions(peer_entry)
         return
 
     def explicit_request_order() -> Optional[_RouteOrder]:
@@ -2124,7 +2162,7 @@ def _apply_streaming_error_fallback_constraints(
     if target_order is not None:
         payload["_target_order"] = target_order
 
-    excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_data)
+    excluded_ids = cumulative_excluded_ids()
     retry_same_deployment = _routing_module._should_retry_same_deployment_before_fallback(exception)
     failed_id = _responses_execution_module._failed_deployment_id(exception)
     if failed_id is None and not no_deployments_available and not retry_same_deployment:
@@ -2132,7 +2170,9 @@ def _apply_streaming_error_fallback_constraints(
     if failed_id and not retry_same_deployment and not _routing_module._is_local_stream_timeout_error(exception):
         excluded_ids.add(failed_id)
     if excluded_ids:
-        payload["_excluded_deployment_ids"] = sorted(excluded_ids)
+        preserve_cumulative_exclusions(
+            {"_excluded_deployment_ids": sorted(excluded_ids)}
+        )
 
 
 async def _streaming_error_fallback_response(
@@ -2161,26 +2201,8 @@ async def _streaming_error_fallback_response(
         return None
 
     if getattr(exception, "responses_stream_incomplete", False):
-        current_surface = _routing_module._request_current_upstream_surface(
-            request_data
-        ) or _routing_module._deployment_primary_surface(
-            {"model_info": _request_context_module._request_model_info(request_data)}
-        )
-        if current_surface:
-            attempted_surfaces = _routing_module._request_attempted_upstream_surfaces(
-                request_data
-            )
-            if current_surface not in attempted_surfaces:
-                attempted_surfaces.append(current_surface)
-            _routing_module._set_request_surface_state(
-                request_data,
-                surface=current_surface,
-                attempted_surfaces=attempted_surfaces,
-                deployment_id=_routing_module._deployment_id_from_request(request_data),
-            )
         # The stream itself consumed this deployment attempt.  It is not an
-        # additional same-route retry, so proceed to its compatible surface or
-        # the next ordered route immediately.
+        # additional same-route retry, so proceed to the next ordered route.
         _routing_module._mark_same_deployment_retry_exhausted(exception)
     if (
         _routing_module._is_priority_deployment_failover_error(exception)
@@ -2378,13 +2400,24 @@ async def _stream_streaming_error_fallback_round(
             selected_box=selected_deployment_box,
             update_top_level=False,
         )
-        if route_recovery_poll and _routing_module._is_priority_deployment_failover_error(
-            fallback_exception
+        if (
+            _routing_module._is_priority_deployment_failover_error(
+                fallback_exception
+            )
+            and (
+                route_recovery_poll
+                or getattr(
+                    fallback_exception,
+                    "responses_stream_incomplete",
+                    False,
+                )
+                or _routing_module._same_deployment_retries() <= 0
+            )
         ):
-            # This iterator is one completed upstream attempt inside the poll;
-            # it must not be selected again on the next poll pass.  Ordinary
-            # streaming retries are owned by _stream_streaming_error_fallback,
-            # but route recovery invokes one round at a time.
+            # An incomplete stream consumed this deployment attempt, even if
+            # it emitted only buffered protocol events.  Route-recovery rounds
+            # likewise own a complete attempt, and a zero retry budget must
+            # advance immediately.
             _routing_module._mark_same_deployment_retry_exhausted(
                 fallback_exception
             )
@@ -2486,6 +2519,32 @@ def _configured_deployment_orders(router: Any, request_data: dict) -> list[_Rout
     return sorted(orders)
 
 
+def _configured_deployment_ids(router: Any, request_data: dict) -> set[str]:
+    model_group = _responses_execution_module._request_model_group(request_data)
+    if not isinstance(model_group, str) or not model_group.strip():
+        return set()
+    try:
+        metadata = _request_context_module._request_metadata_dict(
+            request_data,
+            "metadata",
+        ) or {}
+        deployments = _routing_module._router_configured_deployments(
+            router,
+            model_group,
+            team_id=metadata.get("user_api_key_team_id"),
+        )
+    except Exception:
+        return set()
+    return {
+        deployment_id
+        for deployment_id in (
+            _responses_request_module._deployment_id(deployment)
+            for deployment in list(deployments or [])
+        )
+        if deployment_id
+    }
+
+
 def _next_configured_order(
     orders: list[_RouteOrder],
     previous_order: Optional[_RouteOrder],
@@ -2526,57 +2585,154 @@ async def _stream_streaming_error_fallback(
     exception: Exception,
 ) -> AsyncIterator[Any]:
     # Streaming follows the same explicit same-route budget as ordinary
-    # Responses calls, then advances to a peer or next order.
+    # Responses calls.  A failed fallback stream that has not delivered
+    # visible output or a terminal event is a completed route attempt, not a
+    # same-route retry; keep advancing while each failure adds a new excluded
+    # deployment.  The configured deployment pool therefore bounds the loop.
     max_retries = _routing_module._same_deployment_retries()
     delay_seconds = _routing_module._stream_route_exhaustion_retry_delay_seconds()
     attempt = 0
-    last_exception: Optional[Exception] = None
-    while attempt <= max_retries:
-        yielded = False
+    allow_repeated_attempt = False
+    is_responses_stream = _request_is_responses_stream(request_data)
+    while True:
+        buffered_chunks: List[Any] = []
+        started_delivery = False
+        excluded_before = (
+            _responses_request_module._request_excluded_deployment_ids(
+                request_data
+            )
+        )
         try:
-            async for chunk in _stream_streaming_error_fallback_round(request_data, exception):
-                yielded = True
+            async for chunk in _stream_streaming_error_fallback_round(
+                request_data,
+                exception,
+                allow_repeated_attempt=allow_repeated_attempt,
+            ):
+                if is_responses_stream and not started_delivery:
+                    deliverable = (
+                        _stream_chunk_has_visible_output(chunk)
+                        or _responses_completed_chunk_has_usable_output(
+                            chunk,
+                            request_data,
+                        )
+                        or _responses_stream_chunk_is_incomplete_terminal(chunk)
+                    )
+                    if not deliverable:
+                        buffered_chunks.append(chunk)
+                        continue
+                    started_delivery = True
+                    for buffered_chunk in buffered_chunks:
+                        yield buffered_chunk
+                    buffered_chunks.clear()
+                else:
+                    started_delivery = True
                 yield chunk
             return
         except Exception as exc:
-            if (
-                yielded
-                or attempt >= max_retries
-            ):
+            buffered_chunks.clear()
+            if started_delivery:
                 _routing_module._mark_same_deployment_retry_exhausted(exc)
                 _routing_module._sync_failed_deployment_exclusions(request_data, exc)
                 raise
             if not _routing_module._is_no_deployments_available_error(exc) and not _routing_module._is_priority_deployment_failover_error(exc):
                 raise
-            last_exception = exc
-            attempt += 1
-            retry_delay_seconds = _routing_module._route_exhaustion_retry_delay_for_exception(
-                exc,
-                delay_seconds,
+            excluded_after = (
+                _responses_request_module._request_excluded_deployment_ids(
+                    request_data
+                )
             )
+            newly_excluded = excluded_after - excluded_before
+            from litellm.proxy.proxy_server import llm_router
+
+            configured_deployment_ids = (
+                _configured_deployment_ids(llm_router, request_data)
+                if llm_router is not None
+                else set()
+            )
+            remaining_deployment_ids = (
+                configured_deployment_ids - excluded_after
+            )
+            route_attempt_consumed = is_responses_stream and bool(
+                newly_excluded & configured_deployment_ids
+            )
+            if route_attempt_consumed:
+                if not remaining_deployment_ids:
+                    raise
+                _trace_module._route_trace(
+                    "streaming_error_fallback_route_hop",
+                    request_id=_routing_module._trace_request_id(request_data),
+                    session=_routing_module._trace_session_context(request_data),
+                    model_group=_responses_execution_module._request_model_group(
+                        request_data
+                    ),
+                    excluded_deployment_ids=sorted(excluded_after),
+                    newly_excluded_deployment_ids=sorted(newly_excluded),
+                    remaining_deployment_ids=sorted(remaining_deployment_ids),
+                    exception=_routing_module._trace_exception(exc),
+                )
+                exception = exc
+                attempt = 0
+                allow_repeated_attempt = True
+                continue
+
+            if attempt < max_retries:
+                attempt += 1
+                retry_delay_seconds = _routing_module._route_exhaustion_retry_delay_for_exception(
+                    exc,
+                    delay_seconds,
+                )
+                _trace_module._route_trace(
+                    "route_exhaustion_retry",
+                    request_id=_routing_module._trace_request_id(request_data),
+                    session=_routing_module._trace_session_context(request_data),
+                    model_group=_responses_execution_module._request_model_group(request_data),
+                    retry_attempt=attempt,
+                    max_retries=max_retries,
+                    retry_delay_seconds=retry_delay_seconds,
+                    configured_retry_delay_seconds=delay_seconds,
+                    exception=_routing_module._trace_exception(exc),
+                )
+                _reset_route_exhaustion_retry_state(
+                    request_data,
+                    exc,
+                    preserve_failed_deployment=False,
+                    preserve_existing_exclusions=False,
+                )
+                exception = exc
+                allow_repeated_attempt = True
+                if retry_delay_seconds > 0:
+                    await asyncio.sleep(retry_delay_seconds)
+                continue
+
+            _routing_module._mark_same_deployment_retry_exhausted(exc)
+            _routing_module._sync_failed_deployment_exclusions(request_data, exc)
+            excluded_after = (
+                _responses_request_module._request_excluded_deployment_ids(
+                    request_data
+                )
+            )
+            newly_excluded = excluded_after - excluded_before
+            remaining_deployment_ids = configured_deployment_ids - excluded_after
+            if not (
+                newly_excluded & configured_deployment_ids
+                and remaining_deployment_ids
+            ):
+                raise
             _trace_module._route_trace(
-                "route_exhaustion_retry",
+                "streaming_error_fallback_route_hop",
                 request_id=_routing_module._trace_request_id(request_data),
                 session=_routing_module._trace_session_context(request_data),
-                model_group=_responses_execution_module._request_model_group(request_data),
-                retry_attempt=attempt,
-                max_retries=max_retries,
-                retry_delay_seconds=retry_delay_seconds,
-                configured_retry_delay_seconds=delay_seconds,
+                model_group=_responses_execution_module._request_model_group(
+                    request_data
+                ),
+                excluded_deployment_ids=sorted(excluded_after),
+                newly_excluded_deployment_ids=sorted(newly_excluded),
+                remaining_deployment_ids=sorted(remaining_deployment_ids),
                 exception=_routing_module._trace_exception(exc),
             )
-            no_deployments_available = _routing_module._is_no_deployments_available_error(exc)
-            _reset_route_exhaustion_retry_state(
-                request_data,
-                exc,
-                preserve_failed_deployment=False,
-                preserve_existing_exclusions=False,
-            )
             exception = exc
-            if retry_delay_seconds > 0:
-                await asyncio.sleep(retry_delay_seconds)
-    if last_exception is not None:
-        raise last_exception
+            attempt = 0
+            allow_repeated_attempt = True
 
 
 async def _stream_route_recovery_poll_attempt(
@@ -4438,12 +4594,10 @@ async def _yield_guarded_original_stream(
         )
 
     def completed_output_has_visible_assistant_text() -> bool:
-        for item in completed_output_items.values():
-            if _stream_output_item_is_tool_call(_responses_web_search_bridge_module._response_item_get(item, "type")):
-                continue
-            if _responses_output_module._response_text(item).strip():
-                return True
-        return False
+        return any(
+            _response_item_has_assistant_text(item)
+            for item in completed_output_items.values()
+        )
 
     def output_item_is_web_search_only_tool(item: Any) -> bool:
         json_item = _jsonable(item)
@@ -4454,14 +4608,7 @@ async def _yield_guarded_original_stream(
         return _responses_web_search_bridge_module._is_litellm_web_search_call_item(json_item)
 
     def output_item_has_visible_assistant_text(item: Any) -> bool:
-        json_item = _jsonable(item)
-        if not isinstance(json_item, dict):
-            return False
-        if _stream_output_item_is_tool_call(
-            _responses_web_search_bridge_module._response_item_get(json_item, "type")
-        ):
-            return False
-        return bool(_responses_output_module._response_text(json_item).strip())
+        return _response_item_has_assistant_text(item)
 
     def web_search_activity_key_from_item(item: Any, output_index: Any = None) -> Optional[str]:
         json_item = _jsonable(item)
@@ -5012,12 +5159,14 @@ async def _yield_guarded_original_stream(
     ) -> Optional[dict[int, dict[str, Any]]]:
         if not completed_output_items:
             return completed_output_items
-        if not completed_output_is_tool_call_only():
-            return completed_output_items
         if completed_output_has_visible_assistant_text():
             return completed_output_items
-        if allow_tool_call_only:
-            return completed_output_items
+        if completed_output_is_tool_call_only():
+            if allow_tool_call_only:
+                return completed_output_items
+            if synthesized_text().strip():
+                return {}
+            return None
         if synthesized_text().strip():
             return {}
         return None
@@ -5894,6 +6043,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 or (
                     len(buffer) >= _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS
                     and not should_delay_web_search_preamble
+                    and not is_responses_stream
                 )
             ):
                 stream_exhausted = False

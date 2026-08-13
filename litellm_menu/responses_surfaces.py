@@ -26,7 +26,6 @@ from .base import (
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
     _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY,
-    _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
     _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY,
     _SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY,
     _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY,
@@ -34,6 +33,7 @@ from .base import (
     _SUPPORTS_WEB_SEARCH_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
+    _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
@@ -296,11 +296,9 @@ def _request_configured_responses_endpoint_unsupported(request_kwargs: Optional[
     model_info = _request_context_module._request_model_info(request_kwargs)
     mode = _routing_module._request_current_upstream_surface(request_kwargs)
     if not mode:
-        modes = _normalized_upstream_url_surfaces(
-            model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+        mode = _normalized_upstream_url_surface(
+            model_info.get(_UPSTREAM_URL_SURFACE_KEY)
         )
-        if len(modes) == 1:
-            mode = modes[0]
     return mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES
 
 
@@ -308,12 +306,7 @@ def _request_has_explicit_surface_metadata(request_kwargs: Optional[dict]) -> bo
     if not isinstance(request_kwargs, dict):
         return False
     model_info = _request_context_module._request_model_info(request_kwargs)
-    return any(
-        key in model_info
-        for key in (
-            _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
-        )
-    )
+    return _UPSTREAM_URL_SURFACE_KEY in model_info
 
 
 def _current_route_responses_endpoint_unsupported(
@@ -330,10 +323,9 @@ def _current_route_responses_endpoint_unsupported(
 
 
 def _model_info_has_chat_bridge_mode(model_info: dict) -> bool:
-    modes = _normalized_upstream_url_surfaces(
-        model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+    mode = _normalized_upstream_url_surface(
+        model_info.get(_UPSTREAM_URL_SURFACE_KEY)
     )
-    mode = modes[0] if modes else ""
     if mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
         return True
     if mode == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
@@ -389,11 +381,9 @@ def _request_uses_responses_endpoint(
     model_info = _request_context_module._request_model_info(request_kwargs)
     mode = _routing_module._request_current_upstream_surface(request_kwargs)
     if not mode:
-        modes = _normalized_upstream_url_surfaces(
-            model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+        mode = _normalized_upstream_url_surface(
+            model_info.get(_UPSTREAM_URL_SURFACE_KEY)
         )
-        if len(modes) == 1:
-            mode = modes[0]
     if mode:
         if mode == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
             return True
@@ -1243,23 +1233,6 @@ def _responses_function_tool_bridge_retry_kwargs(
         ] = input_stats
     bridge_kwargs["litellm_metadata"] = bridge_metadata
     return bridge_kwargs
-
-
-def _normalized_upstream_url_surfaces(value: Any) -> List[str]:
-    if isinstance(value, list):
-        raw_items = value
-    else:
-        raw_items = []
-    modes: List[str] = []
-    for item in raw_items:
-        mode = _normalized_upstream_url_surface(item)
-        if mode and mode not in modes:
-            modes.append(mode)
-    return modes
-
-
-def _effective_upstream_url_surface(modes: List[str]) -> str:
-    return modes[0] if modes else ""
 
 
 def _normalized_upstream_url_surface(value: Any) -> str:

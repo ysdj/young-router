@@ -14,7 +14,7 @@
     "codegen:windows:check": "pnpm run codegen:windows --test",
     "typecheck": "tsc --noEmit",
     "contract-check": "node scripts/check-contract.mjs",
-    "test": "node ../tests/test_rn_contract.mjs && node --no-warnings --experimental-strip-types ../tests/test_rn_tooltip.mjs",
+    "test": "node ../tests/test_rn_contract.mjs && node --no-warnings --experimental-strip-types ../tests/test_rn_tooltip.mjs && node --no-warnings --experimental-strip-types ../tests/test_rn_relay_origin.mjs",
     "check:macos": "pnpm run test && pnpm run contract-check && pnpm run typecheck",
     "build": "pnpm run test && pnpm run contract-check && pnpm run typecheck && pnpm run codegen:windows:check",
     "build:macos": "./scripts/build-macos.sh",

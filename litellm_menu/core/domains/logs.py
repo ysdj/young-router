@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import time
 from datetime import datetime, timezone
 from collections.abc import Mapping
 from typing import Any
@@ -32,6 +33,7 @@ MAX_VIEW_BYTES = 3 * 1024 * 1024
 DEFAULT_LINES = 10_000
 MAX_LINES = 100_000
 MAX_FILTER_BYTES = 256
+RECOVERY_HEARTBEAT_TTL_SECONDS = 45.0
 MENU_ACTIONS = frozenset(
     {
         "open-providers-models",
@@ -254,6 +256,19 @@ def _trace_detail(raw: Mapping[str, Any]) -> str:
                 "",
             ),
             ("stream", _trace_bool(interface.get("stream")), ""),
+        )
+
+    if event in {
+        "same_deployment_protocol_fallback_available",
+        "protocol_fallback_cache_hit",
+        "protocol_fallback_success",
+        "protocol_fallback_cache_cleared",
+    }:
+        return _trace_detail_parts(
+            ("from_protocol", raw.get("failed_surface") or raw.get("from_surface"), ""),
+            ("fallback_protocol", raw.get("fallback_surface"), ""),
+            ("ttl", raw.get("ttl_seconds"), "s"),
+            ("remaining", raw.get("remaining_seconds"), "s"),
         )
 
     if event == "generic_fallback_helper_start":
@@ -523,6 +538,41 @@ def _safe_recovery_record(
         "detail": _safe_scalar(_recovery_detail(raw), limit=260),
     }
     return {key: value for key, value in result.items() if value not in (None, "")}
+
+
+def _safe_cooldown_record(
+    raw: Mapping[str, Any],
+    cooldown_key: str,
+    configured_deployments: Mapping[str, Mapping[str, str]],
+    *,
+    remaining_seconds: float,
+) -> dict[str, Any]:
+    """Project one live deployment cooldown into the recovery log schema."""
+    timestamp = raw.get("last_failure_at") or raw.get("updated_at") or raw.get("cooldown_until")
+    projected = _safe_recovery_record(
+        {
+            **dict(raw),
+            "status": "cooldown",
+            "timestamp": timestamp,
+            "cooldown_remaining_seconds": round(max(0.0, remaining_seconds), 3),
+        },
+        configured_deployments,
+    )
+    failures = raw.get("failures")
+    try:
+        failure_count = int(failures or 0)
+    except (TypeError, ValueError):
+        failure_count = 0
+    details = [value for value in (projected.get("detail"), f"failures={failure_count}" if failure_count > 0 else "") if value]
+    if details:
+        projected["detail"] = " · ".join(details)
+    if not projected:
+        return {
+            "timestamp": _safe_scalar(timestamp),
+            "status": "cooldown",
+            "detail": _safe_scalar(f"cooldown={round(max(0.0, remaining_seconds), 3)}s"),
+        }
+    return projected
 
 
 def _safe_route_identity(
@@ -877,6 +927,60 @@ def _timestamp_number(value: object) -> float | None:
         return None
 
 
+def active_recovery_states(value: object, *, now: float | None = None) -> list[Mapping[str, Any]]:
+    """Return route-recovery entries that still have a live heartbeat."""
+    if not isinstance(value, Mapping):
+        return []
+    current = time.time() if now is None else now
+    active: list[Mapping[str, Any]] = []
+    for state in value.values():
+        if not isinstance(state, Mapping):
+            continue
+        heartbeat = next(
+            (
+                parsed
+                for key in (
+                    "heartbeat_at",
+                    "updated_at",
+                    "timestamp",
+                    "time",
+                    "ts",
+                    "created_at",
+                    "checked_at",
+                    "started_at",
+                )
+                if (parsed := _timestamp_number(state.get(key))) is not None
+            ),
+            None,
+        )
+        if heartbeat is None or current - heartbeat > RECOVERY_HEARTBEAT_TTL_SECONDS:
+            continue
+        active.append(state)
+    return active
+
+
+def active_cooldown_states(
+    value: object,
+    *,
+    now: float | None = None,
+) -> list[tuple[str, Mapping[str, Any]]]:
+    """Return deployment cooldown entries whose expiry is still in the future."""
+    if not isinstance(value, Mapping):
+        return []
+    current = time.time() if now is None else now
+    active: list[tuple[str, Mapping[str, Any]]] = []
+    for key, state in value.items():
+        if not isinstance(state, Mapping):
+            continue
+        try:
+            cooldown_until = float(state.get("cooldown_until") or 0)
+        except (TypeError, ValueError):
+            continue
+        if cooldown_until > current:
+            active.append((str(key), state))
+    return active
+
+
 def _leading_timestamp(line: str) -> str:
     match = LEADING_TIMESTAMP.match(line.strip())
     if not match:
@@ -1021,6 +1125,14 @@ class LogsDomain:
         self._runtime_line_limit = max(1, min(int(maximum_lines), MAX_LINES))
         self._online_usage_records: list[str] = []
         self._online_usage_refreshed = False
+        self._online_usage_revision = 0
+        runtime = self.root / ".litellm-runtime"
+        self._recovery_path = Path(
+            os.environ.get("LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE", runtime / "route-recovery-state.json")
+        ).expanduser()
+        self._cooldowns_path = Path(
+            os.environ.get("LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE", runtime / "deployment-cooldowns.json")
+        ).expanduser()
         self.maximum_lines = max(1, min(int(maximum_lines), MAX_LINES))
         self.maximum_read_bytes = max(4096, min(int(maximum_read_bytes), MAX_READ_BYTES))
         self.revision = 0
@@ -1074,14 +1186,31 @@ class LogsDomain:
             "service": "menu-server.log",
             "menu": "menu-actions.log",
             "route-trace": "menu-server.log",
-            "recovery": ".litellm-runtime/route-recovery-state.json",
         }
+        if tab == "recovery":
+            return self._recovery_path
         name = names.get(tab)
         return self.root / name if name else None
 
+    @staticmethod
+    def _file_cursor(path: Path) -> tuple[object, ...]:
+        try:
+            details = path.lstat()
+        except OSError:
+            return (None, None, 0, 0)
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+            return (None, None, 0, 0)
+        return (details.st_dev, details.st_ino, details.st_mtime_ns, details.st_size)
+
     def _source_cursor(self, tab: str) -> tuple[object, ...]:
         if tab == "online-usage":
-            return ("online", len(self._online_usage_records), self._online_usage_refreshed)
+            return ("online", self._online_usage_revision, len(self._online_usage_records))
+        if tab == "recovery":
+            return (
+                "state",
+                self._file_cursor(self._recovery_path),
+                self._file_cursor(self._cooldowns_path),
+            )
         path = self._path(tab)
         if path is None:
             return ("none",)
@@ -1105,6 +1234,7 @@ class LogsDomain:
         *,
         complete_document: bool = False,
         line_limit: int | None = None,
+        all_lines: bool = False,
     ) -> list[str]:
         try:
             details = path.lstat()
@@ -1125,7 +1255,49 @@ class LogsDomain:
         except OSError:
             raise LogsDomainError("Log source is unavailable") from None
         lines = data.decode("utf-8", errors="replace").splitlines()
-        return lines if complete_document else lines[-(line_limit or self._default_line_limit()) :]
+        return (
+            lines
+            if complete_document or all_lines
+            else lines[-(line_limit or self._default_line_limit()) :]
+        )
+
+    def _read_current_and_previous_lines(self, path: Path) -> list[str]:
+        """Read the bounded current and immediately previous log segments.
+
+        The proxy keeps the previous segment at ``.1`` when it rotates the
+        service log. Allocate the shared read budget newest-first, then return
+        the segments in chronological file order.
+        """
+        remaining = self.maximum_read_bytes
+        segments: list[list[str]] = []
+        for source in (path, path.with_name(f"{path.name}.1")):
+            if remaining <= 0:
+                break
+            try:
+                details = source.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise LogsDomainError("Log source is unavailable") from None
+            if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+                raise LogsDomainError("Log source is unavailable")
+            read_bytes = min(details.st_size, remaining)
+            if read_bytes == 0:
+                segments.append([])
+                continue
+            try:
+                with source.open("rb") as handle:
+                    start = details.st_size - read_bytes
+                    if start > 0:
+                        handle.seek(start - 1)
+                        if handle.read(1) != b"\n":
+                            handle.readline()
+                    data = handle.read(read_bytes)
+            except OSError:
+                raise LogsDomainError("Log source is unavailable") from None
+            segments.append(data.decode("utf-8", errors="replace").splitlines())
+            remaining -= read_bytes
+        return [line for segment in reversed(segments) for line in segment]
 
     def _read_lines_since(
         self,
@@ -1165,10 +1337,11 @@ class LogsDomain:
         path: Path,
         *,
         line_limit: int | None = None,
+        all_lines: bool = False,
     ) -> list[str]:
         cursor = self._clear_cursors.get(tab)
         if not cursor or cursor[0] != "file":
-            return self._read_lines(path, line_limit=line_limit)
+            return self._read_lines(path, line_limit=line_limit, all_lines=all_lines)
         current = self._source_cursor(tab)
         if current[0] != "file":
             return []
@@ -1178,12 +1351,16 @@ class LogsDomain:
         baseline_mtime = cursor[3]
         baseline_size = cursor[4]
         if not same_file or current_size < baseline_size:
-            return self._read_lines(path, line_limit=line_limit)
+            return self._read_lines(path, line_limit=line_limit, all_lines=all_lines)
         if current_size == baseline_size and current_mtime == baseline_mtime:
             return []
         if current_size == baseline_size:
-            return self._read_lines(path, line_limit=line_limit)
-        return self._read_lines_since(path, baseline_size, line_limit=line_limit)
+            return self._read_lines(path, line_limit=line_limit, all_lines=all_lines)
+        return self._read_lines_since(
+            path,
+            baseline_size,
+            line_limit=None if all_lines else line_limit,
+        )
 
     def _discard_clear(self, tab: str) -> None:
         self._cleared.discard(tab)
@@ -1214,8 +1391,8 @@ class LogsDomain:
             cursor = self._clear_cursors.get(tab) if tab in self._cleared else None
             if cursor and cursor[0] == "online":
                 current = self._source_cursor(tab)
-                if current[0] == "online" and current[2] == cursor[2] and current[1] >= cursor[1]:
-                    records = records[int(cursor[1]) :]
+                if current[0] == "online" and current[1] == cursor[1] and current[2] >= cursor[2]:
+                    records = records[int(cursor[2]) :]
             needle = self._filters.get(tab, "").casefold()
             if needle:
                 records = [record for record in records if needle in str(record).casefold()]
@@ -1223,33 +1400,40 @@ class LogsDomain:
         path = self._path(tab)
         if path is None:
             return False, []
-        line_limit = (
-            min(MAX_LINES, self._line_limit(tab) * 4)
-            if tab == "service"
-            else self._line_limit(tab)
-        )
-        lines = (
-            self._read_lines(path, complete_document=True, line_limit=line_limit)
-            if tab == "recovery"
-            else self._lines_for_cleared_file(tab, path, line_limit=line_limit)
-            if tab in self._cleared
-            else self._read_lines(path, line_limit=line_limit)
-        )
         if tab == "recovery":
-            records: list[object] = []
+            source_cursor = self._source_cursor(tab)
+            clear_cursor = self._clear_cursors.get(tab)
+            if tab in self._cleared and clear_cursor == source_cursor:
+                return self._recovery_path.is_file() or self._cooldowns_path.is_file(), []
+            recovery_lines = self._read_lines(self._recovery_path, complete_document=True)
+            cooldown_lines = self._read_lines(self._cooldowns_path, complete_document=True)
             try:
-                payload = json.loads("\n".join(lines))
+                recovery_payload = json.loads("\n".join(recovery_lines))
             except (TypeError, json.JSONDecodeError):
-                payload = {}
-            recoveries = payload.get("recoveries") if isinstance(payload, Mapping) else None
+                recovery_payload = {}
+            try:
+                cooldown_payload = json.loads("\n".join(cooldown_lines))
+            except (TypeError, json.JSONDecodeError):
+                cooldown_payload = {}
             configured_deployments = _configured_deployments(self.config_path)
-            if isinstance(recoveries, Mapping):
-                records = [
-                    projected
-                    for value in recoveries.values()
-                    if isinstance(value, Mapping)
-                    and (projected := _safe_recovery_record(value, configured_deployments))
-                ]
+            now = time.time()
+            records: list[object] = []
+            recoveries = recovery_payload.get("recoveries") if isinstance(recovery_payload, Mapping) else None
+            for value in active_recovery_states(recoveries, now=now):
+                projected = _safe_recovery_record(value, configured_deployments)
+                if projected:
+                    records.append(projected)
+            cooldowns = cooldown_payload.get("cooldowns") if isinstance(cooldown_payload, Mapping) else None
+            for cooldown_key, value in active_cooldown_states(cooldowns, now=now):
+                remaining = max(0.0, float(value.get("cooldown_until") or 0) - now)
+                projected = _safe_cooldown_record(
+                    value,
+                    cooldown_key,
+                    configured_deployments,
+                    remaining_seconds=remaining,
+                )
+                if projected:
+                    records.append(projected)
             needle = self._filters.get(tab, "").casefold()
             if needle:
                 records = [
@@ -1257,10 +1441,33 @@ class LogsDomain:
                     for record in records
                     if needle in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
                 ]
-            return path.exists(), _sort_records_by_time(records)[-self._line_limit(tab) :]
+            return (
+                self._recovery_path.is_file() or self._cooldowns_path.is_file(),
+                _sort_records_by_time(records)[-self._line_limit(tab) :],
+            )
         if tab == "route-trace":
+            # Route traces are sparse relative to the ordinary proxy output.
+            # Filter across both retained rotation segments before applying the
+            # view limit, otherwise an old trace disappears as soon as enough
+            # non-trace service output is written.
+            lines = (
+                self._lines_for_cleared_file(tab, path, all_lines=True)
+                if tab in self._cleared
+                else self._read_current_and_previous_lines(path)
+            )
             lines = [line for line in lines if "litellm_route_trace" in line]
-        elif tab == "service":
+        else:
+            line_limit = (
+                min(MAX_LINES, self._line_limit(tab) * 4)
+                if tab == "service"
+                else self._line_limit(tab)
+            )
+            lines = (
+                self._lines_for_cleared_file(tab, path, line_limit=line_limit)
+                if tab in self._cleared
+                else self._read_lines(path, line_limit=line_limit)
+            )
+        if tab == "service":
             lines = [
                 line
                 for line in lines
@@ -1318,14 +1525,27 @@ class LogsDomain:
                 for record in records
                 if needle in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
             ]
-        return path.exists(), _sort_records_by_time(records)[-self._line_limit(tab) :]
+        available = path.exists() or (
+            tab == "route-trace" and path.with_name(f"{path.name}.1").exists()
+        )
+        return available, _sort_records_by_time(records)[-self._line_limit(tab) :]
 
     def _source_signature(self, tab: str) -> tuple[object, ...]:
+        if tab == "recovery":
+            source: tuple[object, ...] = (*self._source_cursor(tab), int(time.time()))
+            return (
+                *source,
+                self._filters.get(tab, ""),
+                self._line_limit(tab),
+                tab in self._cleared,
+            )
         path = self._path(tab)
         if path is None:
-            source: tuple[object, ...] = (
-                self._online_usage_refreshed,
-                len(self._online_usage_records),
+            source = self._source_cursor(tab)[1:]
+        elif tab == "route-trace":
+            source = (
+                self._file_cursor(path.with_name(f"{path.name}.1")),
+                self._file_cursor(path),
             )
         else:
             try:
@@ -1481,6 +1701,7 @@ class LogsDomain:
                 except Exception:
                     self._online_usage_records = ["Online usage logs are unavailable."]
                 self._online_usage_refreshed = True
+                self._online_usage_revision += 1
         else:
             raise LogsDomainError("Log action is unavailable")
         self.revision += 1

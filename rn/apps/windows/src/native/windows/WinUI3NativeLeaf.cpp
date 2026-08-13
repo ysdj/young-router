@@ -3,6 +3,7 @@
 #include "CoreIPCBridge.h"
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
@@ -31,8 +32,9 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   // These are the legacy window content sizes in 96-DPI logical pixels. They
   // deliberately live at the native window boundary: React owns the shared
   // page, while Win32 owns frame constraints and DPI conversion.
-  if (route == L"providers-models") return {1052, 560};
+  if (route == L"providers-models") return {820, 560};
   if (route == L"relay-accounts") return {760, 500};
+  if (route == L"relay-add") return {720, 560};
   if (route == L"codex-settings" || route == L"claude-settings") return {1100, 640};
   if (route == L"runtime-settings") return {800, 520};
   if (route == L"webdav-settings") return {700, 420};
@@ -43,8 +45,9 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
 }
 
 ContentSize RouteInitialContentSize(std::wstring_view route) {
-  if (route == L"providers-models") return {1052, 600};
+  if (route == L"providers-models") return {820, 560};
   if (route == L"relay-accounts") return {920, 620};
+  if (route == L"relay-add") return {900, 680};
   if (route == L"codex-settings" || route == L"claude-settings") return {1160, 700};
   if (route == L"runtime-settings") return {1080, 620};
   if (route == L"webdav-settings") return {720, 440};
@@ -149,6 +152,7 @@ bool RunOwnedModalWindow(
     bool& finished) {
   HWND dialog_handle = nullptr;
   winrt::check_hresult(dialog.as<::IWindowNative>()->get_WindowHandle(&dialog_handle));
+  LiteLLMMenu::DisableWindowTransitions(dialog_handle);
   const bool disable_owner = owner != nullptr && IsWindow(owner);
   if (disable_owner) {
     SetWindowLongPtrW(dialog_handle, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
@@ -184,6 +188,16 @@ bool RunOwnedModalWindow(
 
 namespace LiteLLMMenu {
 
+void DisableWindowTransitions(HWND window) noexcept {
+  if (window == nullptr) return;
+  const BOOL disabled = TRUE;
+  DwmSetWindowAttribute(
+      window,
+      DWMWA_TRANSITIONS_FORCEDISABLED,
+      &disabled,
+      static_cast<DWORD>(sizeof(disabled)));
+}
+
 POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height) {
   return FrameTrackSizeForContent(
       window,
@@ -210,18 +224,21 @@ WinUI3NativeLeaf::~WinUI3NativeLeaf() {
 void WinUI3NativeLeaf::Initialize(winrt::Microsoft::UI::Xaml::Window const& window) {
   window_handle_ = nullptr;
   window.as<::IWindowNative>()->get_WindowHandle(&window_handle_);
+  DisableWindowTransitions(window_handle_);
   InstallWindowHook();
   EnsureTray();
 }
 
 void WinUI3NativeLeaf::Initialize(HWND window_handle) {
   window_handle_ = window_handle;
+  DisableWindowTransitions(window_handle_);
   InstallWindowHook();
   EnsureTray();
 }
 
 void WinUI3NativeLeaf::SetStatus(std::wstring_view title, bool running) {
   status_title_ = title;
+  status_title_is_bootstrap_ = false;
   service_running_ = running;
   EnsureTray();
   if (tray_visible_) {
@@ -248,6 +265,13 @@ void WinUI3NativeLeaf::SetActions(std::vector<NativeMenuAction> const& actions) 
 void WinUI3NativeLeaf::SetLocalization(std::map<std::string, std::wstring> strings) {
   for (auto& [key, value] : strings) {
     if (!value.empty()) strings_.insert_or_assign(std::move(key), std::move(value));
+  }
+  if (status_title_is_bootstrap_) {
+    auto status = Localized("serviceStatus", L"Status: {status}");
+    auto starting = Localized("serviceStarting", L"Starting");
+    const auto marker = status.find(L"{status}");
+    if (marker != std::wstring::npos) status.replace(marker, 8, starting);
+    status_title_ = std::move(status);
   }
   if (window_handle_ != nullptr && !active_route_.empty()) {
     SetWindowTextW(window_handle_, RouteTitle(active_route_).c_str());
@@ -903,6 +927,7 @@ std::optional<std::string> WinUI3NativeLeaf::EditNativeText(
 
   HWND dialog_handle = nullptr;
   winrt::check_hresult(dialog.as<::IWindowNative>()->get_WindowHandle(&dialog_handle));
+  DisableWindowTransitions(dialog_handle);
   if (window_handle_ != nullptr) {
     SetWindowLongPtrW(dialog_handle, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(window_handle_));
     EnableWindow(window_handle_, FALSE);
@@ -1076,15 +1101,8 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
         action.id == L"show-version") {
       add_separator();
     }
-    auto title = action.title;
-    if (action.id == L"open-providers-models" || action.id == L"open-relay-accounts" ||
-        action.id == L"open-runtime-settings" ||
-        action.id == L"open-codex-settings" ||
-        action.id == L"open-webdav-settings") {
-      title += L"...";
-    }
     AppendMenuW(menu, flags,
-        kTrayMenuFirstCommand + static_cast<UINT>(index), title.c_str());
+        kTrayMenuFirstCommand + static_cast<UINT>(index), action.title.c_str());
     if (action.id == L"toggle-autostart" ||
         action.id == L"open-webdav-settings" || action.id == L"open-logs") {
       needs_separator = true;
@@ -1149,6 +1167,7 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
   if (route == L"home") return Localized("appTitle", L"LiteLLM Menu");
   if (route == L"providers-models") return Localized("routeProvidersModels", L"Providers & Models");
   if (route == L"relay-accounts") return Localized("routeRelayAccounts", L"Relay Accounts");
+  if (route == L"relay-add") return Localized("routeRelayAdd", L"Add Relay Account");
   if (route == L"codex-settings" || route == L"claude-settings") {
     return Localized("routeCodexSettings", L"Codex / Claude Settings");
   }

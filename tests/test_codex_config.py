@@ -763,6 +763,46 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual(["/tmp"], legacy_again["sandbox_workspace_write"]["writable_roots"])
             self.assertNotIn("default_permissions", legacy_again)
 
+    def test_permission_mode_selector_is_complete_without_hidden_companion_fields(self) -> None:
+        """The segmented mode control sends only ``mode`` and must still write a usable config."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            runtime_config = temp / "config.yaml"
+            codex_home = temp / "codex"
+            self.write_runtime_config(runtime_config)
+            legacy = 'sandbox_mode = "workspace-write"\n'
+
+            to_profile = self.run_command(
+                runtime_config,
+                codex_home,
+                "sync",
+                input_text=self.editor_request(
+                    legacy,
+                    "{}\n",
+                    {"structured": {"permissions": {"mode": "profile"}}},
+                ),
+            )
+            self.assertEqual(0, to_profile.returncode, to_profile.stderr)
+            profile = tomllib.loads(json.loads(to_profile.stdout)["config_text"])
+            self.assertEqual(":workspace", profile["default_permissions"])
+            self.assertNotIn("sandbox_mode", profile)
+
+            to_legacy = self.run_command(
+                runtime_config,
+                codex_home,
+                "sync",
+                input_text=self.editor_request(
+                    json.loads(to_profile.stdout)["config_text"],
+                    "{}\n",
+                    {"structured": {"permissions": {"mode": "legacy"}}},
+                ),
+            )
+            self.assertEqual(0, to_legacy.returncode, to_legacy.stderr)
+            legacy_again = tomllib.loads(json.loads(to_legacy.stdout)["config_text"])
+            self.assertEqual("workspace-write", legacy_again["sandbox_mode"])
+            self.assertNotIn("default_permissions", legacy_again)
+
     def test_editor_direct_connection_writes_the_selected_provider_endpoint(self) -> None:
         """A custom provider must not silently receive an unused openai_base_url."""
 
@@ -831,6 +871,61 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual(
                 "https://new-relay.example.test/v1",
                 built_in_config["model_providers"]["relay"]["base_url"],
+            )
+
+    def test_editor_switches_and_renames_a_custom_provider_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            runtime_config = temp / "config.yaml"
+            codex_home = temp / "codex"
+            self.write_runtime_config(runtime_config)
+            config_text = textwrap.dedent(
+                """
+                model = "direct-model"
+                model_provider = "relay"
+
+                [model_providers.relay]
+                name = "Relay"
+                base_url = "https://old-relay.example.test/v1"
+                wire_api = "responses"
+                """
+            ).lstrip()
+
+            result = self.run_command(
+                runtime_config,
+                codex_home,
+                "sync",
+                input_text=self.editor_request(
+                    config_text,
+                    "{}\n",
+                    {
+                        "structured": {
+                            "providers": [
+                                {
+                                    "id": "renamed-relay",
+                                    "name": "Relay",
+                                    "base_url": "https://new-relay.example.test/v1",
+                                    "wire_api": "responses",
+                                    "auth_mode": "none",
+                                }
+                            ],
+                            "direct_connection": {
+                                "provider": "renamed-relay",
+                                "base_url": "https://new-relay.example.test/v1",
+                            },
+                            "model_provider": "renamed-relay",
+                        }
+                    },
+                ),
+            )
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            parsed = tomllib.loads(json.loads(result.stdout)["config_text"])
+            self.assertEqual("renamed-relay", parsed["model_provider"])
+            self.assertNotIn("relay", parsed["model_providers"])
+            self.assertEqual(
+                "https://new-relay.example.test/v1",
+                parsed["model_providers"]["renamed-relay"]["base_url"],
             )
 
     def test_editor_apply_refuses_symbolic_link_target(self) -> None:

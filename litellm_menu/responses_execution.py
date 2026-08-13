@@ -1301,15 +1301,11 @@ def _wrap_generic_function_for_deployment_failover(
                 kwargs,
                 outer_request_kwargs,
             ):
+                _routing_module._clear_protocol_fallback_cache_for_request(kwargs)
                 _routing_module._mark_exception_for_upstream_surface_failover(
                     exc,
                     kwargs,
                 )
-                if isinstance(outer_request_kwargs, dict):
-                    _routing_module._sync_failed_deployment_exclusions(
-                        outer_request_kwargs,
-                        exc,
-                    )
                 raise
             facade_response = await _computer_facade_module._responses_computer_facade_retry_response(
                 exc,
@@ -1680,14 +1676,7 @@ def _ordered_deployment_fallback_entry(
         _routing_module._next_upstream_surface_for_failed_deployment(
             router, exception, request_kwargs
         )
-        # A protocol incompatibility is a targeted compatibility repair, not
-        # an ordinary same-route retry. Try the deployment's next supported
-        # surface immediately; all other classes wait for their explicit
-        # same-route budget to be exhausted.
-        if (
-            _routing_module._is_upstream_surface_failover_error(exception)
-            or _routing_module._same_deployment_retry_exhausted(exception)
-        )
+        if _routing_module._is_upstream_surface_failover_error(exception)
         else None
     )
     if surface_fallback is not None:
@@ -1708,8 +1697,7 @@ def _ordered_deployment_fallback_entry(
             deployment_id=target_deployment_id,
             target_deployment_id=target_deployment_id,
         )
-        if failed_order is not None:
-            request_kwargs["_target_order"] = failed_order
+        request_kwargs["_target_order"] = failed_order
         excluded_ids.discard(target_deployment_id)
         if excluded_ids:
             request_kwargs["_excluded_deployment_ids"] = sorted(excluded_ids)
@@ -1725,13 +1713,13 @@ def _ordered_deployment_fallback_entry(
         if excluded_ids:
             entry["_excluded_deployment_ids"] = sorted(excluded_ids)
         _trace_module._route_trace(
-            "same_deployment_surface_fallback_available",
+            "same_deployment_protocol_fallback_available",
             request_id=_routing_module._trace_request_id(request_kwargs),
             session=_routing_module._trace_session_context(request_kwargs),
             model_group=model_group,
             failed_deployment_id=failed_id,
             failed_surface=current_surface,
-            next_surface=next_surface,
+            fallback_surface=next_surface,
             target_order=failed_order,
         )
         return entry
@@ -1781,13 +1769,18 @@ def _ordered_deployment_fallback_entry(
         for deployment in cooldown_candidates
         if _responses_request_module._deployment_id(deployment) not in excluded_ids
     ]
+    constrained_no_deployments = no_deployments_available and any(
+        _responses_request_module._deployment_order(deployment) == failed_order
+        and _responses_request_module._deployment_id(deployment) in excluded_ids
+        for deployment in all_deployments
+    )
     peer_deployments = (
         [
             deployment
             for deployment in available_deployments
             if _responses_request_module._deployment_order(deployment) == failed_order
         ]
-        if failed_id is not None
+        if failed_id is not None or constrained_no_deployments
         else []
     )
     if peer_deployments:

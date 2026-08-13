@@ -17,8 +17,6 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 import urllib.request
 
-import litellm
-
 from .persistence import PersistenceError, atomic_write_json, read_json
 
 
@@ -223,6 +221,11 @@ def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str
 
 
 def _litellm_record(model_ids: Sequence[str]) -> dict[str, Any] | None:
+    # LiteLLM's provider registry is large and is not needed for the normal
+    # bundled-context path. Import it only for an unknown model that actually
+    # needs a provider fallback lookup.
+    import litellm
+
     for model_id in model_ids:
         for candidate in _candidate_ids(model_id):
             value = litellm.model_cost.get(candidate)

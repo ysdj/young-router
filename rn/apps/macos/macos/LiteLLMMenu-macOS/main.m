@@ -7,6 +7,11 @@
 // released by the kernel when the process exits, including after a crash.
 static int gLiteLLMMenuInstanceLock = -1;
 
+// This namespace is deliberately independent of the bundle identifier. A
+// preview/debug copy is still the same menu-bar application and must not be
+// able to create a second status item beside the installed copy.
+static NSString * const kLiteLLMMenuInstanceNamespace = @"menu.litellm.menu";
+
 static NSString *LiteLLMMenuInstanceLockPath(void) {
   NSFileManager *fileManager = NSFileManager.defaultManager;
   NSURL *directory = [[fileManager URLsForDirectory:NSApplicationSupportDirectory
@@ -14,14 +19,7 @@ static NSString *LiteLLMMenuInstanceLockPath(void) {
   if (directory == nil) {
     return nil;
   }
-  // Production copies share the same bundle identifier and therefore one
-  // lock. A deliberately distinct preview bundle gets an independent lock,
-  // so it can demonstrate a new build without taking over the user's app.
-  NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
-  if (bundleIdentifier.length == 0) {
-    bundleIdentifier = @"menu.litellm.menu";
-  }
-  NSURL *applicationDirectory = [directory URLByAppendingPathComponent:bundleIdentifier
+  NSURL *applicationDirectory = [directory URLByAppendingPathComponent:kLiteLLMMenuInstanceNamespace
                                                             isDirectory:YES];
   NSError *error = nil;
   if (![fileManager createDirectoryAtURL:applicationDirectory
@@ -53,16 +51,36 @@ static BOOL LiteLLMMenuAcquireInstanceLock(void) {
   return YES;
 }
 
-static NSRunningApplication *LiteLLMMenuExistingInstance(void) {
-  NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
-  if (bundleIdentifier.length == 0) {
-    return nil;
+static BOOL LiteLLMMenuIsManagedApplication(NSRunningApplication *application) {
+  NSURL *bundleURL = application.bundleURL;
+  if (bundleURL == nil) {
+    return NO;
   }
 
+  // Inspect the executable inside the bundle instead of trusting only its
+  // bundle identifier. Older preview/debug bundles used distinct identifiers
+  // and could otherwise bypass a production-only lookup.
+  NSString *executablePath = [[bundleURL URLByAppendingPathComponent:@"Contents/MacOS/LiteLLMMenu"] path];
+  if (![[NSFileManager defaultManager] isExecutableFileAtPath:executablePath]) {
+    return NO;
+  }
+  NSDictionary *info = [NSDictionary dictionaryWithContentsOfURL:
+      [bundleURL URLByAppendingPathComponent:@"Contents/Info.plist"]];
+  NSString *executable = info[@"CFBundleExecutable"];
+  NSString *routeScheme = info[@"LiteLLMMenuRouteScheme"];
+  NSString *bundleIdentifier = application.bundleIdentifier.lowercaseString;
+  BOOL knownIdentifier = [bundleIdentifier isEqualToString:kLiteLLMMenuInstanceNamespace]
+      || [bundleIdentifier hasPrefix:[kLiteLLMMenuInstanceNamespace stringByAppendingString:@"."]];
+  return [executable isEqualToString:@"LiteLLMMenu"]
+      && (knownIdentifier || [routeScheme.lowercaseString hasPrefix:@"litellm-menu"]);
+}
+
+static NSRunningApplication *LiteLLMMenuExistingInstance(void) {
   pid_t currentPID = NSProcessInfo.processInfo.processIdentifier;
-  for (NSRunningApplication *application in
-       [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleIdentifier]) {
-    if (!application.terminated && application.processIdentifier != currentPID) {
+  for (NSRunningApplication *application in NSWorkspace.sharedWorkspace.runningApplications) {
+    if (!application.terminated
+        && application.processIdentifier != currentPID
+        && LiteLLMMenuIsManagedApplication(application)) {
       return application;
     }
   }
@@ -71,9 +89,9 @@ static NSRunningApplication *LiteLLMMenuExistingInstance(void) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    // Launch Services enforces LSMultipleInstancesProhibited for normal app
-    // launches. This keeps a directly executed or copied app bundle from
-    // reaching AppKit, React Native, the status item, or the managed Core.
+    // Check every LiteLLM Menu bundle before AppKit starts. Launch Services'
+    // bundle-identifier rule alone is insufficient for older preview/debug
+    // copies that used a different identifier.
     NSRunningApplication *existing = LiteLLMMenuExistingInstance();
     if (existing != nil) {
       [existing activateWithOptions:NSApplicationActivateAllWindows];

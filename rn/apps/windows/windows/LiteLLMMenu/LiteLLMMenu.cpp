@@ -16,6 +16,7 @@
 #include "CoreIPCBridge.h"
 #include "CoreIPCModule.h"
 #include "WinUIControls.h"
+#include "WinUI3NativeLeaf.h"
 #include "WinUI3NativeLeafModule.h"
 
 namespace {
@@ -177,6 +178,8 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   auto appWindow{reactNativeWin32App.AppWindow()};
   appWindow.Title(L"LiteLLM Menu");
   appWindow.Resize({1120, 680});
+  LiteLLMMenu::DisableWindowTransitions(winrt::Microsoft::UI::GetWindowFromWindowId(appWindow.Id()));
+  LiteLLMMenu::ConfigureImmediateXamlPresentation();
   appWindow.Destroying([](auto const &, auto const &) {
     LiteLLMMenu::CoreIPCBridge::Shared().Stop();
   });

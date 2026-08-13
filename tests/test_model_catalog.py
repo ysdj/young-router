@@ -41,7 +41,7 @@ class ModelCatalogTests(unittest.TestCase):
 
     def test_catalog_carries_known_context_window_to_codex(self) -> None:
         with mock.patch(
-            "litellm_menu.core.model_contexts.litellm.model_cost",
+            "litellm.model_cost",
             {"public-model": {"max_input_tokens": 128_000}},
         ):
             model = catalog_payload(["public-model"])["models"][0]
@@ -53,7 +53,7 @@ class ModelCatalogTests(unittest.TestCase):
 
     def test_catalog_unknown_model_defaults_to_codex_258k_effective_window(self) -> None:
         with mock.patch(
-            "litellm_menu.core.model_contexts.litellm.model_cost",
+            "litellm.model_cost",
             {},
         ):
             model = catalog_payload(["custom-public-model"])["models"][0]
@@ -72,7 +72,7 @@ class ModelCatalogTests(unittest.TestCase):
                 encoding="utf-8",
             )
             registry = ModelContextRegistry(runtime_settings_path=settings, refresh_enabled=False)
-            with mock.patch("litellm_menu.core.model_contexts.litellm.model_cost", {}):
+            with mock.patch("litellm.model_cost", {}):
                 model = catalog_payload(["unlisted-model"], registry=registry)["models"][0]
 
         self.assertEqual(300_000, model["context_window"])

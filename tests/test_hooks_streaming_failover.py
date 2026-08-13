@@ -73,7 +73,18 @@ class HookStreamingFailoverTests(HookTestCase):
             "response": {
                 "id": "resp-reasoning-only",
                 "status": "completed",
-                "output": [{"id": "reasoning-only", "type": "reasoning", "summary": []}],
+                "output": [
+                    {
+                        "id": "reasoning-only",
+                        "type": "reasoning",
+                        "summary": [
+                            {
+                                "type": "summary_text",
+                                "text": "internal reasoning",
+                            }
+                        ],
+                    }
+                ],
             },
         }
         tool_call = {
@@ -102,6 +113,99 @@ class HookStreamingFailoverTests(HookTestCase):
                 tool_call, request_data
             )
         )
+
+    async def test_reasoning_only_clean_eof_fails_over_instead_of_completing(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
+        calls = []
+
+        async def reasoning_only_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-reasoning-eof", "status": "in_progress"},
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning-eof",
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                },
+            }
+            for index in range(20):
+                yield {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "reasoning-eof",
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "delta": f"step {index}",
+                }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "reasoning-eof",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [
+                        {
+                            "type": "summary_text",
+                            "text": "internal reasoning only",
+                        }
+                    ],
+                },
+            }
+
+        async def recovered_stream():
+            yield {"type": "response.output_text.delta", "delta": "recovered"}
+            yield {
+                "type": "response.completed",
+                "response": {"id": "resp-recovered", "status": "completed"},
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {
+                "id": "reasoning-eof-route",
+                "route_key": "provider / openai/default-chat / key=primary / order=1",
+                "order": 1,
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=reasoning_only_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(
+            chunks,
+            [
+                {"type": "response.output_text.delta", "delta": "recovered"},
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp-recovered", "status": "completed"},
+                },
+            ],
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("id:reasoning-eof-route", hooks._DEPLOYMENT_COOLDOWNS)
 
     async def test_route_recovery_reasoning_only_completion_returns_failure(self) -> None:
         hooks, proxy_server = load_hook_module()

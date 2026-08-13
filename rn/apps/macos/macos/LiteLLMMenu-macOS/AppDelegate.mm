@@ -18,6 +18,12 @@
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
 {
+  // LiteLLM Menu intentionally presents every UI state immediately. Keep the
+  // AppKit defaults aligned with that contract before any window or view is
+  // created, including future route surfaces.
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  [defaults setBool:NO forKey:@"NSAutomaticWindowAnimationsEnabled"];
+  [defaults setBool:NO forKey:@"NSScrollAnimationEnabled"];
   self.moduleName = @"LiteLLMMenu";
   self.initialProps = @{ @"isPrimaryHost": @YES, @"isWindowManagerHost": @YES };
   // Publish the native status item immediately. React and Core continue
@@ -68,6 +74,7 @@
                                                      backing:NSBackingStoreBuffered
                                                        defer:NO];
     window.contentViewController = controller;
+    window.animationBehavior = NSWindowAnimationBehaviorNone;
     [window center];
     return window;
   }];
@@ -93,6 +100,15 @@
     });
   });
   return NSTerminateLater;
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)application hasVisibleWindows:(BOOL)hasVisibleWindows
+{
+  if (hasVisibleWindows) {
+    return YES;
+  }
+  [AppKitNativeLeaf.shared openRouteFromDeepLink:@"providers-models" logTab:nil];
+  return NO;
 }
 
 - (void)application:(NSApplication *)application openURLs:(NSArray<NSURL *> *)urls

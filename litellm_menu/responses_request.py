@@ -753,6 +753,40 @@ def _with_internal_litellm_metadata(request_kwargs: dict) -> Optional[dict]:
     return modified_kwargs
 
 
+def _with_mcp_auto_approval(request_kwargs: dict) -> Optional[dict]:
+    """Disable interactive approval for Responses API MCP tool calls when enabled."""
+    if not _routing_module._env_bool(_MCP_AUTO_APPROVE_ENV, False):
+        return None
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return None
+    if not _request_has_responses_shape(request_kwargs):
+        return None
+
+    tools = request_kwargs.get("tools")
+    if not isinstance(tools, list):
+        return None
+
+    updated_tools: list[Any] = []
+    changed = False
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "mcp":
+            updated_tools.append(tool)
+            continue
+        if tool.get("require_approval") == "never":
+            updated_tools.append(tool)
+            continue
+        updated_tool = tool.copy()
+        updated_tool["require_approval"] = "never"
+        updated_tools.append(updated_tool)
+        changed = True
+
+    if not changed:
+        return None
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["tools"] = updated_tools
+    return modified_kwargs
+
+
 def _with_empty_tool_controls_removed(request_kwargs: dict) -> Optional[dict]:
     if _request_is_codex_compaction(request_kwargs):
         return None
@@ -1170,6 +1204,7 @@ def _codex_tool_choice_name(tool_choice: Any) -> Optional[str]:
 
 
 _CODEX_DESCENDANT_CLEANUP_ENV = "LITELLM_MENU_CODEX_DESCENDANT_CLEANUP"
+_MCP_AUTO_APPROVE_ENV = "LITELLM_MENU_MCP_AUTO_APPROVE"
 _CODEX_DESCENDANT_CLEANUP_MARKER = "<litellm_menu_codex_descendant_cleanup>"
 _CODEX_DESCENDANT_CLEANUP_METADATA_KEY = "codex_descendant_cleanup"
 _CODEX_DESCENDANT_LIFECYCLE_TOOLS = {
@@ -1182,6 +1217,16 @@ _CODEX_DESCENDANT_CLEANUP_INSTRUCTION = (
     "Every assistant response without a real tool call terminates the current "
     "Codex turn, even when its text calls itself commentary, a progress update, "
     "or promises future work. Never emit such a response while work remains. "
+    "Completion means the full user-requested outcome, not merely answering the "
+    "latest sentence. A correction, expression of dissatisfaction, evidence "
+    "challenge, status question, or follow-up during unfinished work adds context "
+    "or requirements unless the user clearly replaces the task. If your answer "
+    "would reveal that a promised action, implementation, screenshot, test, "
+    "verification, deployment, or other required result was not actually completed, "
+    "continue doing the work; an admission, apology, explanation, or failed "
+    "verification is not completion. Treat every future-tense commitment you make "
+    "in commentary as outstanding until later evidence establishes it, or until you "
+    "report a concrete blocker after exhausting safe in-scope alternatives. "
     "Before any tool-free response, account for every live descendant with "
     "list_agents, including descendants spawned by another agent in your subtree. "
     "Use canonical agent paths: a subagent may manage only paths beneath its own path, "
@@ -1197,8 +1242,12 @@ _CODEX_DESCENDANT_CLEANUP_INSTRUCTION = (
     "followup_task, or interrupt_agent call invalidates every earlier list_agents "
     "snapshot, so list the full subtree again afterwards. If a required descendant "
     "is still active, make a real wait_agent or other work tool call in the same "
-    "response; a progress-only response would terminate the turn. Visible answer "
-    "text alone is not evidence that implementation work is complete.\n"
+    "response; a progress-only response would terminate the turn. A clean descendant "
+    "snapshot only accounts for descendants; it never proves the root task complete. "
+    "After obtaining one, independently compare the evidence against the full requested "
+    "outcome and every outstanding commentary commitment. If root work remains, call "
+    "a real work tool in the same response. Visible answer text alone is not evidence "
+    "that implementation work is complete.\n"
     "</litellm_menu_codex_descendant_cleanup>"
 )
 

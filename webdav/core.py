@@ -240,6 +240,10 @@ def disabled_models_path(config_path: pathlib.Path) -> pathlib.Path:
     return config_path.with_name(f"{config_path.stem}.disabled-models.yaml")
 
 
+def relay_accounts_path(config_path: pathlib.Path) -> pathlib.Path:
+    return config_path.parent / ".litellm-runtime" / "relay-accounts.json"
+
+
 def _timestamp() -> str:
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -467,6 +471,14 @@ def _load_yaml_mapping(path: pathlib.Path, text: str | None = None) -> dict[str,
 
 
 def validate_config_bytes(name: str, data: bytes, required_key: str) -> dict[str, Any]:
+    if name == "relay-accounts.json":
+        try:
+            loaded = json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+        except Exception as exc:
+            raise SyncError(f"{name} is not valid JSON: {exc}") from exc
+        if not isinstance(loaded, dict) or loaded.get("version") != 1 or not isinstance(loaded.get("accounts"), list):
+            raise SyncError(f"{name} is not a relay account file")
+        return loaded
     try:
         text = data.decode("utf-8")
     except Exception as exc:
@@ -500,6 +512,7 @@ def sync_targets(config_path: pathlib.Path) -> list[tuple[str, pathlib.Path, boo
     return [
         ("config.yaml", config_path, True, "model_list"),
         ("config.disabled-models.yaml", disabled_models_path(config_path), False, "disabled_model_list"),
+        ("relay-accounts.json", relay_accounts_path(config_path), False, "relay_accounts"),
     ]
 
 
@@ -630,6 +643,7 @@ def _expected_bundle_files() -> dict[str, tuple[bool, str]]:
     return {
         "config.yaml": (True, "model_list"),
         "config.disabled-models.yaml": (False, "disabled_model_list"),
+        "relay-accounts.json": (False, "relay_accounts"),
     }
 
 

@@ -27,6 +27,7 @@ elif command -v uv >/dev/null 2>&1; then
   TEST_COMMAND=(
     uv run --python 3.12
     --with "litellm[proxy]==$(tr -d '[:space:]' < LITELLM_VERSION)"
+    --with "fastapi==0.140.3"
     --with PyYAML
     --with Pillow
     --with ddgs

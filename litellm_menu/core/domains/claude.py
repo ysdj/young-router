@@ -21,6 +21,12 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit
 
+from ..claude_desktop import (
+    ClaudeDesktopConfig,
+    ClaudeDesktopConfigError,
+    ClaudeDeveloperSettings,
+)
+
 
 DOMAIN_NAME = "claude"
 SETTINGS_FILENAME = "settings.json"
@@ -1132,13 +1138,37 @@ def _normalise_structured_patch(data: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class ClaudeSettingsDomain:
-    """One Core-owned Claude settings draft and persistence boundary."""
+    """Core-owned drafts for Claude Code and Claude Desktop 3P settings."""
 
     name = DOMAIN_NAME
 
-    def __init__(self, settings_path: pathlib.Path | str | None = None, *, loader: Callable[[pathlib.Path], tuple[str, bool]] | None = None):
+    def __init__(
+        self,
+        settings_path: pathlib.Path | str | None = None,
+        *,
+        loader: Callable[[pathlib.Path], tuple[str, bool]] | None = None,
+        desktop_config_library_path: pathlib.Path | str | None = None,
+        desktop_loader: Callable[[pathlib.Path], tuple[str, bool]] | None = None,
+        developer_settings_path: pathlib.Path | str | None = None,
+        developer_loader: Callable[[pathlib.Path], tuple[str, bool]] | None = None,
+    ):
         self.settings_path = pathlib.Path(settings_path).expanduser() if settings_path else default_settings_path()
         self._loader = loader or _safe_read
+        # Production uses both official sources.  Tests and callers that pass
+        # an explicit Claude Code path stay isolated unless they also provide
+        # an explicit Desktop library.
+        desktop_enabled = desktop_config_library_path is not None or settings_path is None
+        self._desktop = (
+            ClaudeDesktopConfig(desktop_config_library_path, loader=desktop_loader)
+            if desktop_enabled
+            else None
+        )
+        developer_enabled = developer_settings_path is not None or settings_path is None
+        self._developer = (
+            ClaudeDeveloperSettings(developer_settings_path, loader=developer_loader)
+            if developer_enabled
+            else None
+        )
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._exists = False
@@ -1160,28 +1190,56 @@ class ClaudeSettingsDomain:
         self._draft = copy.deepcopy(loaded)
         self._exists = exists
         self._baseline_bytes = text.encode("utf-8") if exists else None
+        if self._desktop is not None:
+            self._desktop.reload()
+        if self._developer is not None:
+            self._developer.reload()
         self._revision += 1
         return self.snapshot()
+
+    def persistence_paths(self) -> tuple[pathlib.Path, ...]:
+        paths = [self.settings_path]
+        if self._desktop is not None:
+            paths.extend(self._desktop.persistence_paths())
+        if self._developer is not None:
+            paths.extend(self._developer.persistence_paths())
+        return tuple(dict.fromkeys(paths))
 
     def external_disk_state(self) -> dict[str, bool]:
         """Compare the current settings file with the last reload/apply baseline."""
 
         current = _current_bytes(self.settings_path)
-        return {"changed": current != self._baseline_bytes, "exists": current is not None}
+        changed = current != self._baseline_bytes
+        if self._desktop is not None:
+            changed = changed or self._desktop.external_disk_state()["changed"]
+        if self._developer is not None:
+            changed = changed or self._developer.external_disk_state()["changed"]
+        return {"changed": changed, "exists": current is not None}
 
     def external_disk_identity(self) -> str:
         """Return an opaque content identity used only by the Core conflict tracker."""
 
         current = _current_bytes(self.settings_path)
-        if current is None:
-            return "missing"
-        return hashlib.sha256(b"present\0" + current).hexdigest()
+        if self._desktop is None and self._developer is None:
+            if current is None:
+                return "missing"
+            return hashlib.sha256(b"present\0" + current).hexdigest()
+        digest = hashlib.sha256(b"missing\0" if current is None else b"present\0" + current)
+        if self._desktop is not None:
+            digest.update(self._desktop.external_disk_identity().encode("ascii"))
+        if self._developer is not None:
+            digest.update(self._developer.external_disk_identity().encode("ascii"))
+        return digest.hexdigest()
 
     def rebase_external_disk(self) -> dict[str, Any]:
         """Accept the current disk bytes as Apply's baseline without touching the draft."""
 
         current = _current_bytes(self.settings_path)
         self._baseline_bytes = current
+        if self._desktop is not None:
+            self._desktop.rebase_external_disk()
+        if self._developer is not None:
+            self._developer.rebase_external_disk()
         self._revision += 1
         return self.snapshot()
 
@@ -1301,24 +1359,82 @@ class ClaudeSettingsDomain:
         return result
 
     def snapshot(self) -> dict[str, Any]:
-        return {"domain": self.name, "revision": self._revision, "settings": self._safe_projection(self._draft)}
+        return {
+            "domain": self.name,
+            "revision": self._revision,
+            "settings": self._safe_projection(self._draft),
+            "desktop": self._desktop.snapshot() if self._desktop is not None else {"available": False},
+            "developer": self._developer.snapshot() if self._developer is not None else {"available": False},
+        }
 
     def draft_state(self) -> object:
-        return copy.deepcopy(self._draft)
+        if self._desktop is None and self._developer is None:
+            return copy.deepcopy(self._draft)
+        result: dict[str, Any] = {"settings": copy.deepcopy(self._draft)}
+        if self._desktop is not None:
+            result["desktop"] = self._desktop.draft_state()
+        if self._developer is not None:
+            result["developer"] = self._developer.draft_state()
+        return result
 
-    def raw_text(self, *, include_sensitive: bool = False) -> str:
+    def raw_text(self, *, include_sensitive: bool = False, document: str = "settings") -> str:
         """Return editor text only when explicitly requested by a trusted UI."""
 
+        if document == "desktop":
+            if self._desktop is None:
+                raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+            return self._desktop.raw_text(include_sensitive=include_sensitive)
+        if document == "developer":
+            if self._developer is None:
+                raise ClaudeSettingsError("Claude Desktop developer settings are unavailable")
+            return self._developer.raw_text()
+        if document != "settings":
+            raise ClaudeSettingsError("The requested editor is unavailable")
         value = self._draft if include_sensitive else redact(self._draft)
         return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
     def validate(self, payload: object | None = None) -> dict[str, Any]:
         candidate = self._draft if payload is None else _mapping(payload, "settings")
         errors = validate_settings(candidate)
+        if self._desktop is not None:
+            desktop_validation = self._desktop.validate()
+            errors.extend(f"Claude Desktop: {error}" for error in desktop_validation["errors"])
+        if self._developer is not None:
+            developer_validation = self._developer.validate()
+            errors.extend(f"Claude Desktop developer settings: {error}" for error in developer_validation["errors"])
         return {"valid": not errors, "errors": errors}
 
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
         data = _mapping(payload or {}, "payload")
+        if action in {"developer_patch", "developerPatch"}:
+            if self._developer is None:
+                raise ClaudeSettingsError("Claude Desktop developer settings are unavailable")
+            try:
+                self._developer.patch(data)
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+            self._revision += 1
+            return self.snapshot()
+        if action in {"desktop_patch", "desktopPatch"}:
+            if self._desktop is None:
+                raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+            try:
+                self._desktop.patch(data)
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+            self._revision += 1
+            return self.snapshot()
+        if action in {"desktop_models_patch", "desktopModelsPatch"}:
+            if self._desktop is None:
+                raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+            if set(data) != {"model_names"}:
+                raise ClaudeSettingsError("Unknown Claude Desktop model-list field")
+            try:
+                self._desktop.set_model_names(data.get("model_names"))
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+            self._revision += 1
+            return self.snapshot()
         candidate = copy.deepcopy(self._draft)
         if action in {"set", "patch"}:
             _validate_structured_patch(data)
@@ -1331,9 +1447,30 @@ class ClaudeSettingsDomain:
                 else:
                     candidate[key] = copy.deepcopy(value)
         elif action in {"set_raw", "setRaw"}:
+            document = data.get("document", "settings")
             raw_text = data.get("raw_json", data.get("rawJson", data.get("text")))
             if not isinstance(raw_text, str):
                 raise ClaudeSettingsError("Claude Settings JSON must be text")
+            if document == "desktop":
+                if self._desktop is None:
+                    raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+                try:
+                    self._desktop.set_raw_text(raw_text)
+                except ClaudeDesktopConfigError as exc:
+                    raise ClaudeSettingsError(str(exc)) from None
+                self._revision += 1
+                return self.snapshot()
+            if document == "developer":
+                if self._developer is None:
+                    raise ClaudeSettingsError("Claude Desktop developer settings are unavailable")
+                try:
+                    self._developer.set_raw_text(raw_text)
+                except ClaudeDesktopConfigError as exc:
+                    raise ClaudeSettingsError(str(exc)) from None
+                self._revision += 1
+                return self.snapshot()
+            if document != "settings":
+                raise ClaudeSettingsError("The requested editor is unavailable")
             try:
                 loaded = json.loads(raw_text)
             except json.JSONDecodeError:
@@ -1347,6 +1484,10 @@ class ClaudeSettingsDomain:
             candidate = _patch_litellm_deployment(candidate, data.get("deployment", data))
         elif action in {"reset", "cancel", "reload"}:
             candidate = copy.deepcopy(self._raw)
+            if self._desktop is not None:
+                self._desktop.reset_draft()
+            if self._developer is not None:
+                self._developer.reset_draft()
         else:
             raise ClaudeSettingsError("Unknown Claude Settings action")
         errors = validate_settings(candidate)
@@ -1359,6 +1500,10 @@ class ClaudeSettingsDomain:
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if target is not None:
             raise ClaudeSettingsError("The requested secret field is unavailable")
+        if field == "desktop_gateway_api_key":
+            if self._desktop is None:
+                raise ClaudeSettingsError("The requested secret field is unavailable")
+            return self._desktop.secret_present(field)
         if field == "auto_memory_directory":
             return bool(self._draft.get("autoMemoryDirectory"))
         if field != "deployment_token":
@@ -1366,9 +1511,38 @@ class ClaudeSettingsDomain:
         env = _mapping(self._draft.get("env", {}), "env")
         return bool(env.get("ANTHROPIC_AUTH_TOKEN") or env.get("ANTHROPIC_API_KEY"))
 
+    def trusted_secret_value(self, field: str, target: str | None = None) -> str:
+        if target is not None:
+            raise ClaudeSettingsError("The requested secret field is unavailable")
+        if field == "desktop_gateway_api_key":
+            if self._desktop is None:
+                raise ClaudeSettingsError("The requested secret field is unavailable")
+            try:
+                return self._desktop.secret_value(field)
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+        if field != "deployment_token":
+            raise ClaudeSettingsError("The requested secret field is unavailable")
+        env = _mapping(self._draft.get("env", {}), "env")
+        value = env.get("ANTHROPIC_AUTH_TOKEN")
+        if not isinstance(value, str):
+            value = env.get("ANTHROPIC_API_KEY")
+        if not isinstance(value, str):
+            return ""
+        return value
+
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
         if target is not None:
             raise ClaudeSettingsError("The requested secret field is unavailable")
+        if field == "desktop_gateway_api_key":
+            if self._desktop is None:
+                raise ClaudeSettingsError("The requested secret field is unavailable")
+            try:
+                self._desktop.stage_secret(field, value)
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+            self._revision += 1
+            return
         if field == "auto_memory_directory":
             directory = _normalise_auto_memory_directory(value) if value else None
             if directory is None:
@@ -1383,8 +1557,16 @@ class ClaudeSettingsDomain:
         if field != "deployment_token":
             raise ClaudeSettingsError("The requested secret field is unavailable")
         env = _mapping(self._draft.get("env", {}), "env")
-        env["ANTHROPIC_AUTH_TOKEN"] = value
-        self._draft["env"] = env
+        if value:
+            token_key = "ANTHROPIC_API_KEY" if "ANTHROPIC_AUTH_TOKEN" not in env and "ANTHROPIC_API_KEY" in env else "ANTHROPIC_AUTH_TOKEN"
+            env[token_key] = value
+        else:
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env.pop("ANTHROPIC_API_KEY", None)
+        if env:
+            self._draft["env"] = env
+        else:
+            self._draft.pop("env", None)
         validation = self.validate()
         if not validation["valid"]:
             raise ClaudeSettingsError("Claude Settings contains invalid values")
@@ -1413,18 +1595,51 @@ class ClaudeSettingsDomain:
         missing = [code for code in risks if code not in confirmed_codes]
         if missing:
             raise ConfirmationRequired(missing)
-        try:
-            text = json.dumps(self._draft, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-        except (TypeError, ValueError):
-            raise ClaudeSettingsError("Claude Settings contains invalid values") from None
         if _current_bytes(self.settings_path) != self._baseline_bytes:
             raise ClaudeSettingsError("Claude Settings changed on disk; reload before applying")
-        _atomic_write(self.settings_path, text)
-        self._raw = copy.deepcopy(self._draft)
-        self._exists = True
-        self._baseline_bytes = text.encode("utf-8")
+        if self._desktop is not None:
+            try:
+                if self._desktop.external_disk_state()["changed"]:
+                    raise ClaudeDesktopConfigError(
+                        "Claude Desktop configuration changed on disk; reload before applying"
+                    )
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+        if self._developer is not None:
+            try:
+                if self._developer.external_disk_state()["changed"]:
+                    raise ClaudeDesktopConfigError(
+                        "Claude Desktop developer settings changed on disk; reload before applying"
+                    )
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+
+        code_dirty = self._draft != self._raw
+        # Preserve the existing standalone Claude Code adapter contract for
+        # explicit-path callers.  In production, a Desktop-only edit must not
+        # create or rewrite ~/.claude/settings.json.
+        write_code = code_dirty or self._desktop is None
+        if write_code:
+            try:
+                text = json.dumps(self._draft, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            except (TypeError, ValueError):
+                raise ClaudeSettingsError("Claude Settings contains invalid values") from None
+            _atomic_write(self.settings_path, text)
+            self._raw = copy.deepcopy(self._draft)
+            self._exists = True
+            self._baseline_bytes = text.encode("utf-8")
+        if self._desktop is not None:
+            try:
+                self._desktop.apply()
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+        if self._developer is not None:
+            try:
+                self._developer.apply()
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
         self._revision += 1
-        return {"applied": True, "domain": self.name, "revision": self._revision, "settings": self._safe_projection(self._draft)}
+        return {"applied": True, **self.snapshot()}
 
     def export(self, *, include_sensitive: bool = False) -> dict[str, Any]:
         settings = copy.deepcopy(self._draft)

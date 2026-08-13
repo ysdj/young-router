@@ -1106,6 +1106,14 @@ class HookRoutingTests(HookTestCase):
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(exc))
         self.assertEqual(hooks._trace_exception(exc)["reason"], "upstream-network-connectivity")
 
+        class ReadError(Exception):
+            pass
+
+        disconnected = ReadError("connection closed.")
+        self.assertTrue(hooks._exception_indicates_network_connectivity_error(disconnected))
+        self.assertTrue(hooks._is_priority_deployment_failover_error(disconnected))
+        self.assertTrue(hooks._should_retry_same_deployment_before_fallback(disconnected))
+
     async def test_deployment_cooldown_does_not_count_stream_start_timeout_after_chunks(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
@@ -1304,7 +1312,7 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(filtered, [deployments[1]])
 
-    async def test_deployment_cooldown_isolated_between_responses_and_chat_surfaces(self) -> None:
+    async def test_deployment_cooldown_applies_to_the_selected_deployment(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -1320,10 +1328,6 @@ class HookRoutingTests(HookTestCase):
                 "provider": "primary",
                 "api_key_name": "default",
                 "upstream_url_surface": "openai/responses",
-                "supported_upstream_url_surfaces": [
-                    "openai/responses",
-                    "openai/chat",
-                ],
             },
         }
         error = RuntimeError("temporary responses upstream failure")
@@ -1362,20 +1366,17 @@ class HookRoutingTests(HookTestCase):
             },
         )
 
-        self.assertEqual(responses_filtered, [deployment])
-        self.assertEqual(chat_filtered, [deployment])
+        self.assertEqual(responses_filtered, [])
+        self.assertEqual(chat_filtered, [])
         self.assertEqual(
             hooks._request_surface_for_deployment({}, deployment),
-            "openai/chat",
+            "openai/responses",
         )
         self.assertIn(
-            "id:dual-protocol-route|surface:openai/responses",
+            "id:dual-protocol-route",
             hooks._DEPLOYMENT_COOLDOWNS,
         )
-        self.assertNotIn(
-            "id:dual-protocol-route|surface:openai/chat",
-            hooks._DEPLOYMENT_COOLDOWNS,
-        )
+        self.assertFalse(any("|surface:" in key for key in hooks._DEPLOYMENT_COOLDOWNS))
 
     def test_surface_adapter_uses_exact_model_for_all_three_protocols(self) -> None:
         hooks, _ = load_hook_module()
@@ -1384,29 +1385,198 @@ class HookRoutingTests(HookTestCase):
             hooks._surface_adapter_model("openai/vendor/model", "openai/responses"),
             "openai/vendor/model",
         )
+
+    def test_fallback_mode_starts_with_the_client_protocol(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/kimi-k3", "order": 1},
+            "model_info": {
+                "id": "kimi-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {"call_type": "aresponses", "input": "hello"}, deployment
+            ),
+            "openai/responses",
+        )
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {"call_type": "messages", "messages": [{"role": "user"}]},
+                deployment,
+            ),
+            "anthropic",
+        )
+
+    def test_fixed_mode_ignores_a_stale_fallback_target(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/kimi-k3", "order": 1},
+            "model_info": {
+                "id": "fixed-route",
+                "upstream_url_surface": "anthropic",
+                "upstream_protocol_mode": "fixed",
+            },
+        }
+
+        request = {
+            "call_type": "aresponses",
+            "input": "hello",
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_litellm_menu_upstream_url_surface_deployment_id": "fixed-route",
+            "_litellm_menu_surface_target_deployment_id": "fixed-route",
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(request, deployment),
+            "anthropic",
+        )
+
+    def test_protocol_fallback_stays_on_the_same_deployment(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/kimi-k3", "order": 1},
+            "model_info": {
+                "id": "kimi-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+        request = {
+            "model": "default-chat",
+            "call_type": "messages",
+            "messages": [{"role": "user", "content": "hello"}],
+            "_target_order": 1,
+            "_litellm_menu_upstream_url_surface": "anthropic",
+            "_litellm_menu_attempted_upstream_url_surfaces": ["anthropic"],
+            "_litellm_menu_upstream_url_surface_deployment_id": "kimi-route",
+            "model_info": deployment["model_info"],
+            "litellm_params": deployment["litellm_params"],
+        }
+        error = RuntimeError("messages endpoint not found")
+        error.status_code = 404
+        hooks._mark_exception_for_upstream_surface_failover(error, request)
+
+        entry = hooks._ordered_deployment_fallback_entry(Router(), error, request)
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["_target_order"], 1)
+        self.assertEqual(entry["_litellm_menu_upstream_url_surface"], "openai/chat")
+        self.assertEqual(
+            entry["_litellm_menu_surface_target_deployment_id"], "kimi-route"
+        )
+        self.assertEqual(
+            request["_litellm_menu_protocol_fallback_from_surface"], "anthropic"
+        )
+
+    def test_successful_protocol_fallback_is_remembered_for_runtime_ttl(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/kimi-k3", "order": 1},
+            "model_info": {
+                "id": "kimi-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(Path(directory) / "routing.json"))
+            self.set_env(hooks._PROTOCOL_FALLBACK_TTL_SECONDS_ENV, "600")
+            request = {
+                "model": "default-chat",
+                "call_type": "messages",
+                "messages": [{"role": "user", "content": "hello"}],
+                "_litellm_menu_upstream_url_surface": "openai/chat",
+                "_litellm_menu_upstream_url_surface_deployment_id": "kimi-route",
+                "_litellm_menu_protocol_fallback_from_surface": "anthropic",
+                "_litellm_menu_protocol_fallback_client_surface": "anthropic",
+                "model_info": deployment["model_info"],
+            }
+            hooks._record_protocol_fallback_success(request)
+
+            next_request = {
+                "call_type": "messages",
+                "messages": [{"role": "user", "content": "again"}],
+            }
+            self.assertEqual(
+                hooks._request_surface_for_deployment(next_request, deployment),
+                "openai/chat",
+            )
+
+    def test_invalid_protocol_fallback_advances_to_the_next_order(self) -> None:
+        hooks, _ = load_hook_module()
+        primary = {
+            "litellm_params": {"model": "openai/kimi-k3", "order": 1},
+            "model_info": {
+                "id": "kimi-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        secondary = {
+            "litellm_params": {"model": "openai/gpt-5", "order": 2},
+            "model_info": {
+                "id": "gpt-route",
+                "upstream_url_surface": "openai/responses",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [primary, secondary]
+
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": "hello",
+            "_target_order": 1,
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_litellm_menu_attempted_upstream_url_surfaces": [
+                "openai/responses",
+                "openai/chat",
+            ],
+            "_litellm_menu_upstream_url_surface_deployment_id": "kimi-route",
+            "model_info": primary["model_info"],
+            "litellm_params": primary["litellm_params"],
+        }
+        error = RuntimeError("chat endpoint not found")
+        error.status_code = 404
+        hooks._mark_exception_for_upstream_surface_failover(error, request)
+
+        entry = hooks._ordered_deployment_fallback_entry(Router(), error, request)
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["_target_order"], 2)
+        self.assertEqual(entry["_excluded_deployment_ids"], ["kimi-route"])
+        self.assertNotIn("_litellm_menu_upstream_url_surface", entry)
         self.assertEqual(
             hooks._surface_adapter_model("anthropic/vendor/model", "openai/chat"),
             "openai/vendor/model",
         )
 
-    def test_ordered_surface_fallback_exhausts_a_before_same_order_b(self) -> None:
+    def test_protocol_incompatibility_skips_to_a_same_order_peer(self) -> None:
         hooks, _ = load_hook_module()
         deployment_a = {
             "litellm_params": {"model": "openai/vendor-a", "order": 1},
             "model_info": {
                 "id": "route-a",
-                "supported_upstream_url_surfaces": [
-                    "openai/responses",
-                    "anthropic",
-                    "openai/chat",
-                ],
+                "upstream_url_surface": "openai/responses",
             },
         }
         deployment_b = {
             "litellm_params": {"model": "openai/vendor-b", "order": 1},
             "model_info": {
                 "id": "route-b",
-                "supported_upstream_url_surfaces": ["openai/responses"],
+                "upstream_url_surface": "openai/chat",
             },
         }
 
@@ -1418,43 +1588,25 @@ class HookRoutingTests(HookTestCase):
             "model": "default-chat",
             "_target_order": 1,
             "_litellm_menu_upstream_url_surface": "openai/responses",
-            "_litellm_menu_attempted_upstream_url_surfaces": ["openai/responses"],
-            "_litellm_menu_upstream_url_surface_deployment_id": "route-a",
             "model_info": deployment_a["model_info"],
             "litellm_params": deployment_a["litellm_params"],
         }
 
         first_error = RuntimeError("responses endpoint not found")
         first_error.status_code = 404
-        hooks._mark_exception_for_upstream_surface_failover(first_error, request)
+        hooks._mark_exception_for_deployment_failover(first_error, request)
         first = hooks._ordered_deployment_fallback_entry(Router(), first_error, request)
 
-        self.assertEqual(first["_litellm_menu_upstream_url_surface"], "anthropic")
-        self.assertEqual(first["_litellm_menu_surface_target_deployment_id"], "route-a")
-        self.assertNotIn("route-a", first.get("_excluded_deployment_ids", []))
+        self.assertEqual(first["_target_order"], 1)
+        self.assertEqual(first["_excluded_deployment_ids"], ["route-a"])
+        self.assertEqual(
+            first["_litellm_menu_verified_fallback_deployment_ids"],
+            ["route-b"],
+        )
+        self.assertNotIn("_litellm_menu_upstream_url_surface", first)
+        self.assertFalse(any("surface_target" in key for key in first))
 
-        request.update({key: value for key, value in first.items() if key != "model"})
-        request["_litellm_menu_upstream_url_surface_deployment_id"] = "route-a"
-        second_error = RuntimeError("anthropic messages endpoint not found")
-        second_error.status_code = 404
-        hooks._mark_exception_for_upstream_surface_failover(second_error, request)
-        second = hooks._ordered_deployment_fallback_entry(Router(), second_error, request)
-
-        self.assertEqual(second["_litellm_menu_upstream_url_surface"], "openai/chat")
-        self.assertEqual(second["_litellm_menu_surface_target_deployment_id"], "route-a")
-
-        request.update({key: value for key, value in second.items() if key != "model"})
-        request["_litellm_menu_upstream_url_surface_deployment_id"] = "route-a"
-        third_error = RuntimeError("chat completions endpoint not found")
-        third_error.status_code = 404
-        hooks._mark_exception_for_upstream_surface_failover(third_error, request)
-        third = hooks._ordered_deployment_fallback_entry(Router(), third_error, request)
-
-        self.assertEqual(third["_target_order"], 1)
-        self.assertEqual(third["_excluded_deployment_ids"], ["route-a"])
-        self.assertNotIn("_litellm_menu_upstream_url_surface", third)
-
-    async def test_deployment_is_filtered_only_after_all_three_surfaces_cool_down(self) -> None:
+    async def test_deployment_is_filtered_after_its_selected_protocol_fails(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -1463,36 +1615,28 @@ class HookRoutingTests(HookTestCase):
             "litellm_params": {"model": "openai/vendor-a", "order": 1},
             "model_info": {
                 "id": "three-surface-route",
-                "supported_upstream_url_surfaces": [
-                    "openai/responses",
-                    "anthropic",
-                    "openai/chat",
-                ],
+                "upstream_url_surface": "anthropic",
             },
         }
 
-        for index, surface in enumerate(
-            ["openai/responses", "anthropic", "openai/chat"],
-            start=1,
-        ):
-            error = RuntimeError(f"temporary {surface} failure")
-            error.status_code = 503
-            hooks._mark_exception_for_deployment_failover(
-                error,
-                {
-                    "model": "default-chat",
-                    "_litellm_menu_upstream_url_surface": surface,
-                    "litellm_params": deployment["litellm_params"],
-                    "model_info": deployment["model_info"],
-                },
-            )
-            filtered = await hook.async_filter_deployments(
-                "default-chat",
-                [deployment],
-                messages=None,
-                request_kwargs={},
-            )
-            self.assertEqual(filtered, [deployment] if index < 3 else [])
+        error = RuntimeError("temporary anthropic failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            error,
+            {
+                "model": "default-chat",
+                "_litellm_menu_upstream_url_surface": "anthropic",
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            },
+        )
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            [deployment],
+            messages=None,
+            request_kwargs={},
+        )
+        self.assertEqual(filtered, [])
 
     def test_current_surface_incompatibility_is_narrowly_classified(self) -> None:
         hooks, _ = load_hook_module()

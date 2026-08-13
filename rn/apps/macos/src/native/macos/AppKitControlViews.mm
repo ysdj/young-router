@@ -31,6 +31,38 @@ using namespace facebook::react;
 namespace {
 
 constexpr CGFloat LiteLLMUIFontSize = 13.0;
+constexpr CGFloat LiteLLMTableMinimumHorizontalPadding = 8.0;
+constexpr CGFloat LiteLLMTableHeaderHorizontalPadding = 6.0;
+
+NSDictionary<NSString *, id> *ImmediateLayerActions()
+{
+  static NSDictionary<NSString *, id> *actions;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    id disabled = NSNull.null;
+    actions = @{
+      @"backgroundColor": disabled,
+      @"bounds": disabled,
+      @"contents": disabled,
+      @"opacity": disabled,
+      @"position": disabled,
+      @"shadowColor": disabled,
+      @"shadowOffset": disabled,
+      @"shadowOpacity": disabled,
+      @"shadowPath": disabled,
+      @"shadowRadius": disabled,
+      @"transform": disabled,
+    };
+  });
+  return actions;
+}
+
+void ConfigureImmediateView(NSView *view)
+{
+  if (view == nil) return;
+  view.wantsLayer = YES;
+  view.layer.actions = ImmediateLayerActions();
+}
 
 NSString *StringFromStdString(const std::string &value)
 {
@@ -65,6 +97,9 @@ NSAttributedString *TableHeaderTitle(NSString *title)
 {
   NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
   paragraph.lineBreakMode = NSLineBreakByTruncatingTail;
+  paragraph.firstLineHeadIndent = LiteLLMTableHeaderHorizontalPadding;
+  paragraph.headIndent = LiteLLMTableHeaderHorizontalPadding;
+  paragraph.tailIndent = -LiteLLMTableHeaderHorizontalPadding;
 
   return [[NSAttributedString alloc] initWithString:title attributes:@{
     NSFontAttributeName: [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightMedium],
@@ -76,10 +111,26 @@ NSAttributedString *TableHeaderTitle(NSString *title)
 NSImage *ButtonSymbolImage(const std::string &symbol)
 {
   NSString *symbolName = nil;
-  if (symbol == "pause") {
+  if (symbol == "check") {
+    symbolName = @"checkmark";
+  } else if (symbol == "close") {
+    symbolName = @"xmark";
+  } else if (symbol == "copy") {
+    symbolName = @"doc.on.doc";
+  } else if (symbol == "edit") {
+    symbolName = @"pencil";
+  } else if (symbol == "power-off") {
+    symbolName = @"power";
+  } else if (symbol == "power-on") {
+    symbolName = @"power.circle.fill";
+  } else if (symbol == "minus") {
+    symbolName = @"minus";
+  } else if (symbol == "pause") {
     symbolName = @"pause.fill";
   } else if (symbol == "play") {
     symbolName = @"play.fill";
+  } else if (symbol == "plus") {
+    symbolName = @"plus";
   } else if (symbol == "trash") {
     symbolName = @"trash";
   }
@@ -91,6 +142,18 @@ NSImage *ButtonSymbolImage(const std::string &symbol)
 NSFont *TableCellFont()
 {
   return [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightRegular];
+}
+
+NSAttributedString *TableCellTitle(NSString *title, NSColor *color)
+{
+  NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
+  paragraph.lineBreakMode = NSLineBreakByTruncatingTail;
+
+  return [[NSAttributedString alloc] initWithString:title attributes:@{
+    NSFontAttributeName: TableCellFont(),
+    NSForegroundColorAttributeName: color,
+    NSParagraphStyleAttributeName: paragraph,
+  }];
 }
 
 NSAttributedString *SelectableRowTitle(NSString *title, NSString *detail)
@@ -182,6 +245,224 @@ void RestoreTextEditorState(NSScrollView *scrollView,
 
 } // namespace
 
+static NSUserInterfaceItemIdentifier const LiteLLMTabStopIdentifier = @"LiteLLMTabStop";
+
+static BOOL LiteLLMTabStopIsEligible(NSView *view)
+{
+  if (view == nil || view.window == nil || view.hiddenOrHasHiddenAncestor || NSIsEmptyRect(view.visibleRect)) {
+    return NO;
+  }
+  if ([view isKindOfClass:NSControl.class] && !((NSControl *)view).enabled) {
+    return NO;
+  }
+  if ([view isKindOfClass:NSTextField.class] && !((NSTextField *)view).editable) {
+    return NO;
+  }
+  if ([view isKindOfClass:NSTextView.class] && !((NSTextView *)view).editable) {
+    return NO;
+  }
+  return YES;
+}
+
+static void CollectLiteLLMTabStops(NSView *view, NSMutableArray<NSView *> *result)
+{
+  if ([view.identifier isEqualToString:LiteLLMTabStopIdentifier] && LiteLLMTabStopIsEligible(view)) {
+    [result addObject:view];
+  }
+  for (NSView *subview in view.subviews) {
+    CollectLiteLLMTabStops(subview, result);
+  }
+}
+
+static BOOL FocusAdjacentLiteLLMTabStop(NSView *source, BOOL backwards)
+{
+  NSWindow *window = source.window;
+  if (window == nil || window.contentView == nil) {
+    return NO;
+  }
+  NSMutableArray<NSView *> *stops = [NSMutableArray array];
+  CollectLiteLLMTabStops(window.contentView, stops);
+  [stops sortUsingComparator:^NSComparisonResult(NSView *left, NSView *right) {
+    NSRect leftRect = [left convertRect:left.bounds toView:nil];
+    NSRect rightRect = [right convertRect:right.bounds toView:nil];
+    const CGFloat vertical = NSMaxY(leftRect) - NSMaxY(rightRect);
+    if (fabs(vertical) > 1.0) {
+      return vertical > 0 ? NSOrderedAscending : NSOrderedDescending;
+    }
+    const CGFloat horizontal = NSMinX(leftRect) - NSMinX(rightRect);
+    if (fabs(horizontal) > 1.0) {
+      return horizontal < 0 ? NSOrderedAscending : NSOrderedDescending;
+    }
+    return NSOrderedSame;
+  }];
+  if (stops.count == 0) {
+    return NO;
+  }
+  NSInteger current = [stops indexOfObjectIdenticalTo:source];
+  if (current == NSNotFound) {
+    current = backwards ? 0 : stops.count - 1;
+  }
+  for (NSInteger offset = 1; offset <= stops.count; offset += 1) {
+    NSInteger next = backwards
+        ? (current - offset + stops.count) % stops.count
+        : (current + offset) % stops.count;
+    if ([window makeFirstResponder:stops[static_cast<NSUInteger>(next)]]) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+static BOOL HandleLiteLLMTabKey(NSView *source, NSEvent *event)
+{
+  if (event.type != NSEventTypeKeyDown || event.keyCode != 48) {
+    return NO;
+  }
+  return FocusAdjacentLiteLLMTabStop(source, (event.modifierFlags & NSEventModifierFlagShift) != 0);
+}
+
+static BOOL HandleLiteLLMTabCommand(NSView *source, SEL commandSelector)
+{
+  if (commandSelector == @selector(insertTab:)) {
+    return FocusAdjacentLiteLLMTabStop(source, NO);
+  }
+  if (commandSelector == @selector(insertBacktab:)) {
+    return FocusAdjacentLiteLLMTabStop(source, YES);
+  }
+  return NO;
+}
+
+@interface LiteLLMTabButton : NSButton
+@end
+
+@implementation LiteLLMTabButton
+
+- (BOOL)acceptsFirstResponder
+{
+  return self.enabled && !self.hidden;
+}
+
+- (void)keyDown:(NSEvent *)event
+{
+  if (HandleLiteLLMTabKey(self, event)) return;
+  [super keyDown:event];
+}
+
+@end
+
+@interface LiteLLMTabPopUpButton : NSPopUpButton
+@end
+
+@implementation LiteLLMTabPopUpButton
+
+- (BOOL)acceptsFirstResponder
+{
+  return self.enabled && !self.hidden;
+}
+
+- (void)keyDown:(NSEvent *)event
+{
+  if (HandleLiteLLMTabKey(self, event)) return;
+  [super keyDown:event];
+}
+
+@end
+
+@interface LiteLLMTabSegmentedControl : NSSegmentedControl
+@end
+
+@implementation LiteLLMTabSegmentedControl
+
+- (BOOL)acceptsFirstResponder
+{
+  return self.enabled && !self.hidden;
+}
+
+- (void)keyDown:(NSEvent *)event
+{
+  if (HandleLiteLLMTabKey(self, event)) return;
+  [super keyDown:event];
+}
+
+@end
+
+
+@interface LiteLLMTabSwitch : NSButton
+@end
+
+@implementation LiteLLMTabSwitch
+
+- (BOOL)acceptsFirstResponder
+{
+  return self.enabled && !self.hidden;
+}
+
+- (void)keyDown:(NSEvent *)event
+{
+  if (HandleLiteLLMTabKey(self, event)) return;
+  [super keyDown:event];
+}
+
+@end
+
+@interface LiteLLMTabTextField : NSTextField
+@end
+
+@implementation LiteLLMTabTextField
+
+- (BOOL)acceptsFirstResponder
+{
+  return self.enabled && self.editable;
+}
+
+- (void)resetCursorRects
+{
+  [super resetCursorRects];
+  if (self.enabled && self.editable) {
+    [self addCursorRect:self.bounds cursor:[NSCursor IBeamCursor]];
+  }
+}
+
+@end
+
+@interface LiteLLMTabSecureTextField : NSSecureTextField
+@end
+
+@implementation LiteLLMTabSecureTextField
+
+- (BOOL)acceptsFirstResponder
+{
+  return self.enabled && self.editable;
+}
+
+- (void)resetCursorRects
+{
+  [super resetCursorRects];
+  if (self.enabled && self.editable) {
+    [self addCursorRect:self.bounds cursor:[NSCursor IBeamCursor]];
+  }
+}
+
+@end
+
+@interface LiteLLMTabTextView : NSTextView
+@end
+
+@implementation LiteLLMTabTextView
+
+- (BOOL)acceptsFirstResponder
+{
+  return self.editable;
+}
+
+- (void)keyDown:(NSEvent *)event
+{
+  if (HandleLiteLLMTabKey(self, event)) return;
+  [super keyDown:event];
+}
+
+@end
+
 static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fillsHeight)
 {
   if (control == nil) {
@@ -215,6 +496,14 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 
 @implementation LiteLLMAppKitControlHostView
 
+- (instancetype)initWithFrame:(NSRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    ConfigureImmediateView(self);
+  }
+  return self;
+}
+
 - (void)setControl:(NSView *)control
 {
   if (_control == control) {
@@ -223,6 +512,7 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
   [_control removeFromSuperview];
   _control = control;
   if (_control != nil) {
+    ConfigureImmediateView(_control);
     _control.autoresizingMask = NSViewWidthSizable;
     [self addSubview:_control];
   }
@@ -248,8 +538,13 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 
 // NSTableView's data viewport begins below its header, while NSClipView uses a
 // negative Y origin to keep that header visible. Treat that AppKit origin as
-// the locked resting position when all rows fit, and consume wheel events
-// outright while there is no actual row overflow.
+// the locked resting position when all rows fit.  A table is nested inside the
+// settings ScrollView, so a wheel event must continue to that ancestor when
+// the table has no overflow or is already at the relevant edge.
+NSScrollView *ParentScrollView(NSView *view);
+BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL acceptsVerticalScroll, BOOL acceptsHorizontalScroll);
+BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
+
 @interface LiteLLMTableScrollView : NSScrollView
 @property(nonatomic) BOOL acceptsVerticalScroll;
 @property(nonatomic) BOOL acceptsHorizontalScroll;
@@ -259,10 +554,12 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 
 - (void)scrollWheel:(NSEvent *)event
 {
-  if (!_acceptsVerticalScroll && !_acceptsHorizontalScroll) {
+  if (TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll)) {
+    [super scrollWheel:event];
     return;
   }
-  [super scrollWheel:event];
+  if (ForwardWheelToParent(self, event)) return;
+  if (_acceptsVerticalScroll || _acceptsHorizontalScroll) [super scrollWheel:event];
 }
 
 @end
@@ -280,10 +577,14 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 
 - (void)scrollWheel:(NSEvent *)event
 {
-  if (!_acceptsVerticalScroll && !_acceptsHorizontalScroll) {
+  NSScrollView *owner = ParentScrollView(self);
+  if (owner != nil && [owner isKindOfClass:LiteLLMTableScrollView.class] &&
+      TableScrollViewCanConsume(owner, event, ((LiteLLMTableScrollView *)owner).acceptsVerticalScroll, ((LiteLLMTableScrollView *)owner).acceptsHorizontalScroll)) {
+    [super scrollWheel:event];
     return;
   }
-  [super scrollWheel:event];
+  if (ForwardWheelToParent(self, event)) return;
+  if (_acceptsVerticalScroll || _acceptsHorizontalScroll) [super scrollWheel:event];
 }
 
 @end
@@ -297,10 +598,46 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 
 - (void)scrollWheel:(NSEvent *)event
 {
-  if (!_acceptsVerticalScroll && !_acceptsHorizontalScroll) {
+  NSScrollView *owner = ParentScrollView(self);
+  if (owner != nil && [owner isKindOfClass:LiteLLMTableScrollView.class] &&
+      TableScrollViewCanConsume(owner, event, ((LiteLLMTableScrollView *)owner).acceptsVerticalScroll, ((LiteLLMTableScrollView *)owner).acceptsHorizontalScroll)) {
+    [super scrollWheel:event];
     return;
   }
-  [super scrollWheel:event];
+  if (ForwardWheelToParent(self, event)) return;
+  if (_acceptsVerticalScroll || _acceptsHorizontalScroll) [super scrollWheel:event];
+}
+
+@end
+
+// AppKit applies its compact/bold group-row typography to the textField of an
+// NSTableCellView whenever a row is marked as a group.  The route table still
+// needs the group-row marker so the title spans all columns, but the title
+// itself should use the same compact regular font as every ordinary cell.  A
+// plain NSView keeps the label out of AppKit's automatic group-cell styling
+// while preserving the native spanning-row layout.
+@interface LiteLLMTableGroupCellView : NSView
+@property(nonatomic, strong) NSTextField *label;
+@end
+
+@implementation LiteLLMTableGroupCellView
+
+- (instancetype)initWithFrame:(NSRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    _label = [NSTextField labelWithString:@""];
+    _label.translatesAutoresizingMaskIntoConstraints = NO;
+    _label.font = TableCellFont();
+    _label.lineBreakMode = NSLineBreakByTruncatingTail;
+    _label.maximumNumberOfLines = 1;
+    [self addSubview:_label];
+    [NSLayoutConstraint activateConstraints:@[
+      [_label.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
+      [_label.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
+      [_label.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+    ]];
+  }
+  return self;
 }
 
 @end
@@ -359,7 +696,7 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 
 @end
 
-@interface LiteLLMNavigationLinkButton : NSButton
+@interface LiteLLMNavigationLinkButton : LiteLLMTabButton
 @property(nonatomic) BOOL linkMode;
 @end
 
@@ -475,6 +812,7 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
     _props = defaultProps;
 
     _button = [LiteLLMNavigationLinkButton buttonWithTitle:@"" target:self action:@selector(pressed:)];
+    _button.identifier = LiteLLMTabStopIdentifier;
     _button.bezelStyle = NSBezelStyleRounded;
     _button.controlSize = NSControlSizeRegular;
     _button.buttonType = NSButtonTypeMomentaryPushIn;
@@ -587,7 +925,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitButtonCls(void)
   if (self = [super initWithFrame:frame]) {
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitCheckboxProps>();
     _props = defaultProps;
-    _checkbox = [NSButton checkboxWithTitle:@"" target:self action:@selector(changed:)];
+    _checkbox = [[LiteLLMTabButton alloc] initWithFrame:NSZeroRect];
+    _checkbox.buttonType = NSButtonTypeSwitch;
+    _checkbox.title = @"";
+    _checkbox.target = self;
+    _checkbox.action = @selector(changed:);
+    _checkbox.identifier = LiteLLMTabStopIdentifier;
     _checkbox.controlSize = NSControlSizeRegular;
     _checkbox.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
     _host = [[LiteLLMAppKitControlHostView alloc] initWithFrame:NSZeroRect];
@@ -674,7 +1017,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCheckboxCls(void)
   if (self = [super initWithFrame:frame]) {
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitPickerProps>();
     _props = defaultProps;
-    _picker = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    _picker = [[LiteLLMTabPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    _picker.identifier = LiteLLMTabStopIdentifier;
     _picker.controlSize = NSControlSizeRegular;
     _picker.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
     _picker.target = self;
@@ -762,7 +1106,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPickerCls(void)
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitSegmentedControlProps>();
     _props = defaultProps;
 
-    _control = [[NSSegmentedControl alloc] initWithFrame:NSZeroRect];
+    _control = [[LiteLLMTabSegmentedControl alloc] initWithFrame:NSZeroRect];
+    _control.identifier = LiteLLMTabStopIdentifier;
     _control.segmentStyle = NSSegmentStyleRounded;
     _control.trackingMode = NSSegmentSwitchTrackingSelectOne;
     _control.controlSize = NSControlSizeRegular;
@@ -860,6 +1205,113 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
 
 @end
 
+// Structured settings place multiline fields inside the outer settings
+// ScrollView.  Forward wheel events to that ancestor when the small field
+// viewport is already at its top/bottom (or has no overflow), so scrolling
+// over a textarea continues moving the settings page instead of stopping.
+@interface LiteLLMTextFieldScrollView : NSScrollView
+@end
+
+NSScrollView *ParentScrollView(NSView *view)
+{
+  NSView *candidate = view.superview;
+  while (candidate != nil) {
+    if ([candidate isKindOfClass:NSScrollView.class]) {
+      return (NSScrollView *)candidate;
+    }
+    candidate = candidate.superview;
+  }
+  return nil;
+}
+
+BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL acceptsVerticalScroll, BOOL acceptsHorizontalScroll)
+{
+  if (scrollView == nil || scrollView.documentView == nil || scrollView.contentView == nil) {
+    return NO;
+  }
+
+  const CGFloat deltaY = event.scrollingDeltaY;
+  const CGFloat deltaX = event.scrollingDeltaX;
+  const NSRect visible = [scrollView.documentView convertRect:scrollView.contentView.bounds fromView:scrollView.contentView];
+  const NSRect document = scrollView.documentView.bounds;
+
+  if (fabs(deltaY) >= 0.01) {
+    if (!acceptsVerticalScroll) return NO;
+    const CGFloat minimumY = NSMinY(document);
+    const CGFloat maximumY = NSMaxY(document) - NSHeight(visible);
+    if (maximumY <= minimumY + 0.5) return NO;
+    const CGFloat offsetY = NSMinY(visible);
+    const BOOL atTop = offsetY <= minimumY + 0.5;
+    const BOOL atBottom = offsetY >= maximumY - 0.5;
+    const BOOL movingUp = deltaY > 0;
+    if (movingUp ? atTop : atBottom) return NO;
+  }
+
+  if (fabs(deltaX) >= 0.01) {
+    if (!acceptsHorizontalScroll) return NO;
+    const CGFloat minimumX = NSMinX(document);
+    const CGFloat maximumX = NSMaxX(document) - NSWidth(visible);
+    if (maximumX <= minimumX + 0.5) return NO;
+    const CGFloat offsetX = NSMinX(visible);
+    const BOOL atLeft = offsetX <= minimumX + 0.5;
+    const BOOL atRight = offsetX >= maximumX - 0.5;
+    const BOOL movingLeft = deltaX > 0;
+    if (movingLeft ? atLeft : atRight) return NO;
+  }
+
+  return YES;
+}
+
+BOOL ForwardWheelToParent(NSView *view, NSEvent *event)
+{
+  NSScrollView *parent = ParentScrollView(view);
+  if (parent != nil && parent != view) {
+    [parent scrollWheel:event];
+    return YES;
+  }
+  return NO;
+}
+
+BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
+{
+  const CGFloat deltaY = event.scrollingDeltaY;
+  if (fabs(deltaY) < 0.01) {
+    return YES;
+  }
+  NSClipView *clipView = scrollView.contentView;
+  NSView *documentView = scrollView.documentView;
+  if (clipView == nil || documentView == nil) {
+    return NO;
+  }
+  const CGFloat maxOffset = MAX(0.0, NSHeight(documentView.bounds) - NSHeight(clipView.bounds));
+  if (maxOffset <= 0.5) {
+    return NO;
+  }
+  const CGFloat offset = clipView.bounds.origin.y;
+  const BOOL atTop = offset <= 0.5;
+  const BOOL atBottom = offset >= maxOffset - 0.5;
+  const BOOL movingUp = deltaY > 0;
+  return !(movingUp ? atTop : atBottom);
+}
+
+@implementation LiteLLMTextFieldScrollView
+
+- (void)scrollWheel:(NSEvent *)event
+{
+  if (TextFieldScrollViewCanConsume(self, event)) {
+    [super scrollWheel:event];
+    return;
+  }
+  NSScrollView *parent = ParentScrollView(self);
+  if (parent != nil && parent != self) {
+    [parent scrollWheel:event];
+    return;
+  }
+  [super scrollWheel:event];
+}
+
+@end
+
 @interface LiteLLMAppKitTextFieldComponentView () <NSTextFieldDelegate, NSTextViewDelegate, RCTLiteLLMAppKitTextFieldViewProtocol>
 @end
 
@@ -889,7 +1341,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
     _props = defaultProps;
 
     _host = [[LiteLLMAppKitTextFieldHostView alloc] initWithFrame:NSZeroRect];
-    _field = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    _field = [[LiteLLMTabTextField alloc] initWithFrame:NSZeroRect];
+    _field.identifier = LiteLLMTabStopIdentifier;
     _field.delegate = self;
     _field.target = self;
     _field.action = @selector(submitted:);
@@ -897,7 +1350,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
     _field.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
     ConfigureSingleLineTextField(_field);
 
-    _secureField = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
+    _secureField = [[LiteLLMTabSecureTextField alloc] initWithFrame:NSZeroRect];
+    _secureField.identifier = LiteLLMTabStopIdentifier;
     _secureField.delegate = self;
     _secureField.target = self;
     _secureField.action = @selector(submitted:);
@@ -905,7 +1359,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
     _secureField.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
     ConfigureSingleLineTextField(_secureField);
 
-    _multilineField = [[NSTextView alloc] initWithFrame:NSZeroRect];
+    _multilineField = [[LiteLLMTabTextView alloc] initWithFrame:NSZeroRect];
+    _multilineField.identifier = LiteLLMTabStopIdentifier;
     _multilineField.delegate = self;
     _multilineField.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
     _multilineField.usesFindPanel = YES;
@@ -916,7 +1371,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
     _multilineField.textContainer.containerSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
     _multilineField.textContainer.widthTracksTextView = YES;
     _multilineField.textContainerInset = NSMakeSize(5, 4);
-    _scrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    _scrollView = [[LiteLLMTextFieldScrollView alloc] initWithFrame:NSZeroRect];
     _scrollView.borderType = NSBezelBorder;
     _scrollView.hasVerticalScroller = YES;
     _scrollView.autohidesScrollers = YES;
@@ -1032,6 +1487,18 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSegmentedControlCls(void)
   }
 }
 
+- (BOOL)control:(__unused NSControl *)control
+       textView:(__unused NSTextView *)textView
+doCommandBySelector:(SEL)commandSelector
+{
+  return HandleLiteLLMTabCommand(_host.activeControl, commandSelector);
+}
+
+- (BOOL)textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector
+{
+  return HandleLiteLLMTabCommand(textView, commandSelector);
+}
+
 - (void)submitted:(__unused id)sender
 {
   if (!_eventEmitter) {
@@ -1075,7 +1542,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
 @end
 
 @implementation LiteLLMAppKitSwitchComponentView {
-  NSSwitch *_switch;
+  NSButton *_switch;
   LiteLLMAppKitControlHostView *_host;
   BOOL _synchronizing;
 }
@@ -1095,9 +1562,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
   if (self = [super initWithFrame:frame]) {
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitSwitchProps>();
     _props = defaultProps;
-    _switch = [[NSSwitch alloc] initWithFrame:NSZeroRect];
-    _switch.target = self;
-    _switch.action = @selector(changed:);
+    _switch = [LiteLLMTabSwitch checkboxWithTitle:@"" target:self action:@selector(changed:)];
+    _switch.identifier = LiteLLMTabStopIdentifier;
+    _switch.controlSize = NSControlSizeRegular;
     _host = [[LiteLLMAppKitControlHostView alloc] initWithFrame:NSZeroRect];
     _host.control = _switch;
     self.contentView = _host;
@@ -1210,6 +1677,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 }
 
 @interface LiteLLMAppKitTableComponentView () <NSTableViewDataSource, NSTableViewDelegate, RCTLiteLLMAppKitTableViewProtocol>
+- (void)updateColumnMinimumWidths;
 - (void)updateScrollerVisibility;
 - (void)tableColumnDidResize:(NSNotification *)notification;
 - (BOOL)isSpanningRow:(NSInteger)row;
@@ -1222,9 +1690,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   LiteLLMTableView *_tableView;
   BOOL _synchronizingSelection;
   BOOL _settingColumnWidths;
-  CGFloat _automaticLastColumnFill;
+  std::vector<CGFloat> _automaticColumnAdjustments;
+  std::vector<CGFloat> _measuredColumnWidths;
   std::vector<CGFloat> _requestedColumnWidths;
-  std::string _dataSignature;
+  std::vector<bool> _userResizedColumns;
+  BOOL _hasLoadedData;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -1249,6 +1719,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     _tableView.allowsColumnReordering = NO;
     _tableView.columnAutoresizingStyle = NSTableViewNoColumnAutoresizing;
     _tableView.focusRingType = NSFocusRingTypeExterior;
+    _tableView.style = NSTableViewStylePlain;
     _tableView.intercellSpacing = NSZeroSize;
     _tableView.rowHeight = 28;
     _tableView.selectionHighlightStyle = NSTableViewSelectionHighlightStyleRegular;
@@ -1258,6 +1729,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     // single outer bezel frames the list while row selection and alternating
     // system fills carry the hierarchy below the header.
     _tableView.gridStyleMask = NSTableViewGridNone;
+    _hasLoadedData = NO;
 
     _scrollView = [[LiteLLMTableScrollView alloc] initWithFrame:NSZeroRect];
     _scrollView.scrollerStyle = NSScrollerStyleLegacy;
@@ -1301,25 +1773,17 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const bool columnsChanged = oldViewProps.columnLabels != newViewProps.columnLabels ||
       oldViewProps.columnWidths != newViewProps.columnWidths;
   const bool compactChanged = oldViewProps.compact != newViewProps.compact;
-  std::string nextDataSignature;
-  nextDataSignature.reserve(newViewProps.rowKeys.size() * 24 + newViewProps.cells.size() * 32);
-  for (const auto &key : newViewProps.rowKeys) {
-    nextDataSignature.append(key).append("\x1f");
-  }
-  for (const auto &cell : newViewProps.cells) {
-    nextDataSignature.append(cell).append("\x1f");
-  }
-  for (const auto &key : newViewProps.disabledRowKeys) {
-    nextDataSignature.append("disabled:").append(key).append("\x1f");
-  }
-  for (const auto &key : newViewProps.secondaryCellKeys) {
-    nextDataSignature.append("secondary:").append(key).append("\x1f");
-  }
-  for (const auto &key : newViewProps.spanningRowKeys) {
-    nextDataSignature.append("spanning:").append(key).append("\x1f");
-  }
-  const bool dataChanged = columnsChanged || compactChanged || nextDataSignature != _dataSignature;
-  const BOOL initialDataLoad = _dataSignature.empty();
+  const bool paddingChanged = oldViewProps.cellHorizontalPadding != newViewProps.cellHorizontalPadding;
+  const bool firstColumnPaddingChanged = oldViewProps.firstColumnHorizontalPadding != newViewProps.firstColumnHorizontalPadding;
+  const bool overflowBehaviorChanged = oldViewProps.scrollTrailingColumnOverflow != newViewProps.scrollTrailingColumnOverflow;
+  const bool rowsChanged = oldViewProps.rowKeys != newViewProps.rowKeys ||
+      oldViewProps.cells != newViewProps.cells ||
+      oldViewProps.disabledRowKeys != newViewProps.disabledRowKeys ||
+      oldViewProps.secondaryCellKeys != newViewProps.secondaryCellKeys ||
+      oldViewProps.spanningRowKeys != newViewProps.spanningRowKeys;
+  const bool dataChanged = columnsChanged || compactChanged || paddingChanged || firstColumnPaddingChanged ||
+      overflowBehaviorChanged || rowsChanged;
+  const BOOL initialDataLoad = !_hasLoadedData;
   const BOOL wasFollowingBottom = newViewProps.followBottom && dataChanged
       ? (initialDataLoad || TableIsFollowingBottom(_scrollView, _tableView))
       : NO;
@@ -1329,6 +1793,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   if (compactChanged) {
     _tableView.rowHeight = newViewProps.compact ? 22 : 28;
+    if (_tableView.headerView != nil) {
+      NSRect headerFrame = _tableView.headerView.frame;
+      headerFrame.size.height = newViewProps.compact ? 24 : 28;
+      _tableView.headerView.frame = headerFrame;
+      [_scrollView tile];
+    }
   }
 
   [super updateProps:props oldProps:oldProps];
@@ -1339,7 +1809,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     while (_tableView.tableColumns.count > 0) {
       [_tableView removeTableColumn:_tableView.tableColumns.lastObject];
     }
+    _automaticColumnAdjustments.clear();
+    _measuredColumnWidths.clear();
     _requestedColumnWidths.clear();
+    _userResizedColumns.clear();
     for (NSUInteger index = 0; index < newViewProps.columnLabels.size(); index++) {
       NSString *identifierValue = [NSString stringWithFormat:@"column-%lu", (unsigned long)index];
       NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:identifierValue];
@@ -1351,18 +1824,28 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       const CGFloat width = index < newViewProps.columnWidths.size() && newViewProps.columnWidths[index] > 0
           ? static_cast<CGFloat>(newViewProps.columnWidths[index])
           : 160;
-      column.minWidth = MIN(96, width);
+      column.minWidth = 1;
       column.maxWidth = CGFLOAT_MAX;
       column.width = width;
       [_tableView addTableColumn:column];
+      _automaticColumnAdjustments.push_back(0);
       _requestedColumnWidths.push_back(width);
+      _userResizedColumns.push_back(false);
     }
     _settingColumnWidths = NO;
   }
 
   if (dataChanged) {
     [_tableView reloadData];
-    _dataSignature = std::move(nextDataSignature);
+    _hasLoadedData = YES;
+    if (newViewProps.scrollTrailingColumnOverflow) {
+      [self updateColumnMinimumWidths];
+    } else {
+      _measuredColumnWidths.clear();
+      _settingColumnWidths = YES;
+      for (NSTableColumn *column in _tableView.tableColumns) column.minWidth = 1;
+      _settingColumnWidths = NO;
+    }
   }
 
   [self updateScrollerVisibility];
@@ -1395,8 +1878,87 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   [self updateScrollerVisibility];
 }
 
+- (void)prepareForRecycle
+{
+  [super prepareForRecycle];
+  static const auto defaultProps = std::make_shared<const LiteLLMAppKitTableProps>();
+  _synchronizingSelection = YES;
+  _props = defaultProps;
+  [_tableView deselectAll:nil];
+  while (_tableView.tableColumns.count > 0) {
+    [_tableView removeTableColumn:_tableView.tableColumns.lastObject];
+  }
+  [_tableView reloadData];
+  _synchronizingSelection = NO;
+  _settingColumnWidths = NO;
+  _automaticColumnAdjustments.clear();
+  _measuredColumnWidths.clear();
+  _requestedColumnWidths.clear();
+  _userResizedColumns.clear();
+  _hasLoadedData = NO;
+  _scrollView.hasHorizontalScroller = NO;
+  _scrollView.hasVerticalScroller = NO;
+  _scrollView.acceptsHorizontalScroll = NO;
+  _scrollView.acceptsVerticalScroll = NO;
+  _clipView.acceptsHorizontalScroll = NO;
+  _clipView.acceptsVerticalScroll = NO;
+  _tableView.acceptsHorizontalScroll = NO;
+  _tableView.acceptsVerticalScroll = NO;
+}
+
+- (void)updateColumnMinimumWidths
+{
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  const NSUInteger columnCount = _tableView.tableColumns.count;
+  if (!viewProps.scrollTrailingColumnOverflow || columnCount == 0 || viewProps.columnLabels.size() != columnCount ||
+      _requestedColumnWidths.size() != columnCount) return;
+
+  const CGFloat horizontalPadding = MAX(
+      LiteLLMTableMinimumHorizontalPadding,
+      static_cast<CGFloat>(viewProps.cellHorizontalPadding));
+  const CGFloat firstColumnHorizontalPadding = MAX(
+      LiteLLMTableMinimumHorizontalPadding,
+      static_cast<CGFloat>(viewProps.firstColumnHorizontalPadding));
+  std::vector<CGFloat> minimumWidths(columnCount, 1);
+  for (NSUInteger index = 0; index < columnCount; index++) {
+    minimumWidths[index] = ceil(_tableView.tableColumns[index].headerCell.cellSize.width);
+  }
+
+  CGFloat spanningWidth = 0;
+  for (NSUInteger row = 0; row < viewProps.rowKeys.size(); row++) {
+    const BOOL spanning = [self isSpanningRow:static_cast<NSInteger>(row)];
+    for (NSUInteger column = 0; column < columnCount; column++) {
+      if (spanning && column > 0) break;
+      const size_t cellIndex = static_cast<size_t>(row) * columnCount + column;
+      NSString *value = cellIndex < viewProps.cells.size() ? StringFromStdString(viewProps.cells[cellIndex]) : @"";
+      const CGFloat columnPadding = column == 0 ? firstColumnHorizontalPadding : horizontalPadding;
+      const CGFloat textWidth = ceil([value sizeWithAttributes:@{NSFontAttributeName: TableCellFont()}].width) +
+          columnPadding * 2;
+      if (spanning) spanningWidth = MAX(spanningWidth, textWidth);
+      else minimumWidths[column] = MAX(minimumWidths[column], textWidth);
+    }
+  }
+
+  CGFloat minimumContentWidth = 0;
+  for (CGFloat width : minimumWidths) minimumContentWidth += width;
+  if (spanningWidth > minimumContentWidth) {
+    minimumWidths.back() += spanningWidth - minimumContentWidth;
+  }
+  _measuredColumnWidths = minimumWidths;
+
+  _settingColumnWidths = YES;
+  for (NSUInteger index = 0; index < columnCount; index++) {
+    _tableView.tableColumns[index].minWidth = MAX(
+        1,
+        MIN(_requestedColumnWidths[index], minimumWidths[index]));
+  }
+  _settingColumnWidths = NO;
+}
+
 - (void)updateScrollerVisibility
 {
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  const CGFloat trailingContentInset = viewProps.scrollTrailingColumnOverflow ? 10 : 0;
   const NSInteger rowCount = _tableView.numberOfRows;
   const CGFloat rowsHeight = rowCount > 0
       ? NSMaxY([_tableView rectOfRow:rowCount - 1])
@@ -1408,23 +1970,36 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     return;
   }
 
+  const auto minimumContentWidth = [&]() {
+    CGFloat width = 0;
+    for (NSTableColumn *column in _tableView.tableColumns) width += column.minWidth;
+    return width;
+  };
   const auto requestedContentWidth = [&]() {
     CGFloat width = 0;
     for (CGFloat columnWidth : _requestedColumnWidths) width += columnWidth;
     return width;
   };
+  const auto trailingOverflowWidth = [&]() {
+    if (!viewProps.scrollTrailingColumnOverflow || _measuredColumnWidths.size() != columnCount ||
+        _userResizedColumns.size() != columnCount || _userResizedColumns.back()) {
+      return static_cast<CGFloat>(0);
+    }
+    return MAX(0, _measuredColumnWidths.back() + trailingContentInset - _requestedColumnWidths.back());
+  };
+  const auto hasUserColumnResize = [&]() {
+    return std::any_of(_userResizedColumns.begin(), _userResizedColumns.end(), [](bool resized) {
+      return resized;
+    });
+  };
 
-  for (NSUInteger index = 0; index < 3; index++) {
+  for (NSUInteger index = 0; index < 4; index++) {
     const NSRect visibleBounds = _scrollView.contentView.bounds;
-    const CGFloat contentWidth = requestedContentWidth();
-    const CGFloat verticalScrollerWidth = _scrollView.hasVerticalScroller && _scrollView.verticalScroller != nil
-        ? NSWidth(_scrollView.verticalScroller.frame)
-        : 0;
-    const CGFloat horizontalChromeWidth = MAX(
-        0,
-        NSWidth(_scrollView.bounds) - NSWidth(visibleBounds) - verticalScrollerWidth);
-    const CGFloat availableColumnWidth = NSWidth(visibleBounds) + horizontalChromeWidth;
-    const BOOL needsHorizontalScroller = contentWidth > availableColumnWidth + 0.5;
+    const CGFloat availableColumnWidth = NSWidth(visibleBounds);
+    const CGFloat preferredContentWidth = requestedContentWidth() + trailingOverflowWidth();
+    const BOOL needsHorizontalScroller = minimumContentWidth() > availableColumnWidth + 0.5 ||
+        ((viewProps.scrollTrailingColumnOverflow || hasUserColumnResize()) &&
+         preferredContentWidth > availableColumnWidth + 0.5);
     if (_scrollView.hasHorizontalScroller != needsHorizontalScroller) {
       _scrollView.hasHorizontalScroller = needsHorizontalScroller;
       [_scrollView tile];
@@ -1441,14 +2016,39 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
 
   const NSRect visibleBounds = _scrollView.contentView.bounds;
-  const CGFloat contentWidth = requestedContentWidth();
-  _automaticLastColumnFill = _scrollView.hasHorizontalScroller
-      ? 0
-      : NSWidth(visibleBounds) - contentWidth;
-  _settingColumnWidths = YES;
+  std::vector<CGFloat> laidOutColumnWidths = _requestedColumnWidths;
+  if (viewProps.scrollTrailingColumnOverflow && _measuredColumnWidths.size() == columnCount &&
+      _userResizedColumns.size() == columnCount && !_userResizedColumns.back()) {
+    laidOutColumnWidths.back() = MAX(
+        laidOutColumnWidths.back(),
+        _measuredColumnWidths.back() + trailingContentInset);
+  }
+  CGFloat contentWidth = 0;
   for (NSUInteger index = 0; index < columnCount; index++) {
-    const CGFloat width = _requestedColumnWidths[index] +
-        (index + 1 == columnCount ? _automaticLastColumnFill : 0);
+    laidOutColumnWidths[index] = MAX(laidOutColumnWidths[index], _tableView.tableColumns[index].minWidth);
+    contentWidth += laidOutColumnWidths[index];
+  }
+  if (!_scrollView.hasHorizontalScroller && !laidOutColumnWidths.empty()) {
+    const CGFloat viewportWidth = NSWidth(visibleBounds);
+    if (contentWidth < viewportWidth) {
+      laidOutColumnWidths.back() += viewportWidth - contentWidth;
+    } else if (contentWidth > viewportWidth) {
+      CGFloat deficit = contentWidth - viewportWidth;
+      for (NSUInteger index = columnCount; index-- > 0 && deficit > 0.5;) {
+        const CGFloat minimumWidth = _tableView.tableColumns[index].minWidth;
+        const CGFloat reduction = MIN(deficit, MAX(0, laidOutColumnWidths[index] - minimumWidth));
+        laidOutColumnWidths[index] -= reduction;
+        deficit -= reduction;
+      }
+    }
+  }
+  _settingColumnWidths = YES;
+  _automaticColumnAdjustments.resize(columnCount);
+  CGFloat laidOutContentWidth = 0;
+  for (NSUInteger index = 0; index < columnCount; index++) {
+    const CGFloat width = laidOutColumnWidths[index];
+    _automaticColumnAdjustments[index] = width - _requestedColumnWidths[index];
+    laidOutContentWidth += width;
     NSTableColumn *column = _tableView.tableColumns[index];
     if (fabs(column.width - width) > 0.5) column.width = width;
   }
@@ -1465,7 +2065,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   _tableView.acceptsVerticalScroll = needsVerticalScroller;
   _tableView.acceptsHorizontalScroll = needsHorizontalScroller;
 
-  const CGFloat laidOutContentWidth = contentWidth + _automaticLastColumnFill;
   const NSSize documentSize = NSMakeSize(
       MAX(NSWidth(visibleBounds), laidOutContentWidth),
       MAX(dataViewportHeight, rowsHeight));
@@ -1483,8 +2082,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const NSUInteger columnCount = _tableView.tableColumns.count;
   NSUInteger resizedColumn = NSNotFound;
   for (NSUInteger index = 0; index < columnCount; index++) {
-    const CGFloat expectedWidth = _requestedColumnWidths[index] +
-        (index + 1 == columnCount ? _automaticLastColumnFill : 0);
+    const CGFloat automaticAdjustment = index < _automaticColumnAdjustments.size()
+        ? _automaticColumnAdjustments[index]
+        : 0;
+    const CGFloat expectedWidth = _requestedColumnWidths[index] + automaticAdjustment;
     if (std::fabs(_tableView.tableColumns[index].width - expectedWidth) > 0.5) {
       resizedColumn = index;
       break;
@@ -1494,8 +2095,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     return;
   }
   const CGFloat width = _tableView.tableColumns[resizedColumn].width;
-  _requestedColumnWidths[resizedColumn] = MAX(_tableView.tableColumns[resizedColumn].minWidth, width -
-      (resizedColumn + 1 == columnCount ? _automaticLastColumnFill : 0));
+  _requestedColumnWidths[resizedColumn] = MAX(_tableView.tableColumns[resizedColumn].minWidth, width);
+  if (_userResizedColumns.size() == columnCount) {
+    _userResizedColumns[resizedColumn] = true;
+  }
   [self updateScrollerVisibility];
 }
 
@@ -1544,28 +2147,24 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     const size_t cellIndex = static_cast<size_t>(row) * columnCount;
     NSString *value = cellIndex < viewProps.cells.size() ? StringFromStdString(viewProps.cells[cellIndex]) : @"";
     NSUserInterfaceItemIdentifier identifier = @"LiteLLMAppKitTableGroupCell";
-    NSTableCellView *cell = [tableView makeViewWithIdentifier:identifier owner:self];
+    LiteLLMTableGroupCellView *cell = (LiteLLMTableGroupCellView *)[tableView makeViewWithIdentifier:identifier owner:self];
     if (cell == nil) {
-      cell = [[NSTableCellView alloc] initWithFrame:NSZeroRect];
+      cell = [[LiteLLMTableGroupCellView alloc] initWithFrame:NSZeroRect];
       cell.identifier = identifier;
-      NSTextField *label = [NSTextField labelWithString:@""];
-      label.translatesAutoresizingMaskIntoConstraints = NO;
-      label.font = TableCellFont();
-      label.lineBreakMode = NSLineBreakByTruncatingTail;
-      label.maximumNumberOfLines = 1;
-      [cell addSubview:label];
-      cell.textField = label;
-      [NSLayoutConstraint activateConstraints:@[
-        [label.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:8],
-        [label.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-8],
-        [label.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
-      ]];
     }
-    cell.textField.stringValue = value;
-    cell.textField.font = TableCellFont();
-    cell.textField.textColor = NSColor.secondaryLabelColor;
-    cell.textField.toolTip = value;
-    cell.textField.accessibilityLabel = value;
+    const CGFloat firstColumnHorizontalPadding = MAX(
+        LiteLLMTableMinimumHorizontalPadding,
+        static_cast<CGFloat>(viewProps.firstColumnHorizontalPadding));
+    for (NSLayoutConstraint *constraint in cell.constraints) {
+      if (constraint.firstItem != cell.label || constraint.secondItem != cell) continue;
+      if (constraint.firstAttribute == NSLayoutAttributeLeading) constraint.constant = firstColumnHorizontalPadding;
+      else if (constraint.firstAttribute == NSLayoutAttributeTrailing) constraint.constant = -firstColumnHorizontalPadding;
+    }
+    cell.label.font = TableCellFont();
+    cell.label.textColor = NSColor.labelColor;
+    cell.label.attributedStringValue = TableCellTitle(value, NSColor.labelColor);
+    cell.label.toolTip = value;
+    cell.label.accessibilityLabel = value;
     cell.toolTip = value;
     cell.accessibilityLabel = value;
     return cell;
@@ -1596,14 +2195,27 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       [label.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
     ]];
   }
+  const CGFloat horizontalPadding = MAX(
+      LiteLLMTableMinimumHorizontalPadding,
+      static_cast<CGFloat>(viewProps.cellHorizontalPadding));
+  const CGFloat firstColumnHorizontalPadding = MAX(
+      LiteLLMTableMinimumHorizontalPadding,
+      static_cast<CGFloat>(viewProps.firstColumnHorizontalPadding));
+  const CGFloat columnPadding = columnIndex == 0 ? firstColumnHorizontalPadding : horizontalPadding;
+  for (NSLayoutConstraint *constraint in cell.constraints) {
+    if (constraint.firstItem != cell.textField || constraint.secondItem != cell) continue;
+    if (constraint.firstAttribute == NSLayoutAttributeLeading) constraint.constant = columnPadding;
+    else if (constraint.firstAttribute == NSLayoutAttributeTrailing) constraint.constant = -columnPadding;
+  }
   NSTextField *label = cell.textField;
-  label.stringValue = value;
   label.font = TableCellFont();
   const std::string &rowKey = viewProps.rowKeys[static_cast<size_t>(row)];
   const bool disabled = std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), rowKey) != viewProps.disabledRowKeys.end();
   const std::string cellKey = rowKey + "\x1f" + std::to_string(columnIndex);
   const bool secondary = std::find(viewProps.secondaryCellKeys.begin(), viewProps.secondaryCellKeys.end(), cellKey) != viewProps.secondaryCellKeys.end();
-  label.textColor = disabled || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor;
+  NSColor *textColor = disabled || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor;
+  label.textColor = textColor;
+  label.attributedStringValue = TableCellTitle(value, textColor);
   label.toolTip = value;
   label.accessibilityLabel = value;
   cell.toolTip = value;
@@ -2107,7 +2719,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
 @interface LiteLLMAppKitSecureTextInputComponentView () <NSTextFieldDelegate, RCTLiteLLMAppKitSecureTextInputViewProtocol>
 - (NSTextField *)activeField;
 - (void)stageCurrentSecretForRequest:(NSInteger)commitRequest;
-- (void)loadProviderAPIKeyForTarget:(NSString *)target generation:(NSUInteger)generation;
+- (void)loadPlainTextSecretForGeneration:(NSUInteger)generation;
 @end
 
 @implementation LiteLLMAppKitSecureTextInputComponentView {
@@ -2141,14 +2753,16 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
   if (self = [super initWithFrame:frame]) {
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitSecureTextInputProps>();
     _props = defaultProps;
-    _field = [[NSSecureTextField alloc] initWithFrame:NSZeroRect];
+    _field = [[LiteLLMTabSecureTextField alloc] initWithFrame:NSZeroRect];
+    _field.identifier = LiteLLMTabStopIdentifier;
     _field.delegate = self;
     _field.target = self;
     _field.action = @selector(submitSecret:);
     _field.bezelStyle = NSTextFieldRoundedBezel;
     _field.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
     ConfigureSingleLineTextField(_field);
-    _plainField = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    _plainField = [[LiteLLMTabTextField alloc] initWithFrame:NSZeroRect];
+    _plainField.identifier = LiteLLMTabStopIdentifier;
     _plainField.delegate = self;
     _plainField.target = self;
     _plainField.action = @selector(submitSecret:);
@@ -2206,7 +2820,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
   _label = label;
   activeField.placeholderString = StringFromStdString(newViewProps.placeholder);
   activeField.accessibilityLabel = label;
-  activeField.enabled = !newViewProps.disabled && !_stageInFlight;
+  const BOOL readOnlyPlainText = newViewProps.plainText && newViewProps.disabled;
+  activeField.enabled = (readOnlyPlainText || !newViewProps.disabled) && !_stageInFlight;
+  activeField.editable = !readOnlyPlainText;
+  activeField.selectable = readOnlyPlainText || !newViewProps.disabled;
   inactiveField.enabled = NO;
 
   if (newViewProps.resetRequest != oldViewProps.resetRequest &&
@@ -2223,10 +2840,15 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
       newViewProps.commitRequest != _lastCommitRequest) {
     [self stageCurrentSecretForRequest:newViewProps.commitRequest];
   }
-  if (identityChanged && newViewProps.plainText && newViewProps.autoCommit &&
-      [domain isEqualToString:@"providers_models"] && [field isEqualToString:@"api_key"] &&
-      target.length > 0) {
-    [self loadProviderAPIKeyForTarget:target generation:_generation];
+  const BOOL readablePlainText = newViewProps.plainText && newViewProps.autoCommit && (
+      ([domain isEqualToString:@"providers_models"] && [field isEqualToString:@"api_key"] && target.length > 0) ||
+      ([domain isEqualToString:@"relay_accounts"] && [field isEqualToString:@"api_key"] && target.length > 0) ||
+      ([domain isEqualToString:@"codex"] && [field isEqualToString:@"api_key"] && target.length == 0) ||
+      ([domain isEqualToString:@"claude"] &&
+       ([field isEqualToString:@"deployment_token"] || [field isEqualToString:@"desktop_gateway_api_key"]) &&
+       target.length == 0));
+  if (identityChanged && readablePlainText) {
+    [self loadPlainTextSecretForGeneration:_generation];
   }
   [_host setNeedsLayout:YES];
   [super updateProps:props oldProps:oldProps];
@@ -2244,8 +2866,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
 {
   if (_stageInFlight) return;
   NSString *value = [[self activeField].stringValue copy];
-  const BOOL allowEmptyValue = _autoCommit && [_domain isEqualToString:@"providers_models"] &&
-      [_secretField isEqualToString:@"api_key"];
+  const BOOL allowEmptyValue = _autoCommit && [_host.control isEqual:_plainField];
   if (value.length == 0 && !allowEmptyValue) {
     _lastCommitRequest = MAX(_lastCommitRequest, commitRequest);
     [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
@@ -2287,7 +2908,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
     LiteLLMAppKitSecureTextInputComponentView *strongSelf = weakSelf;
     if (strongSelf == nil || generation != strongSelf->_generation) return;
     strongSelf->_stageInFlight = NO;
-    [strongSelf activeField].enabled = !(std::static_pointer_cast<const LiteLLMAppKitSecureTextInputProps>(strongSelf->_props)->disabled);
+    const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitSecureTextInputProps>(strongSelf->_props);
+    const BOOL readOnlyPlainText = viewProps.plainText && viewProps.disabled;
+    [strongSelf activeField].enabled = readOnlyPlainText || !viewProps.disabled;
+    [strongSelf activeField].editable = !readOnlyPlainText;
+    [strongSelf activeField].selectable = readOnlyPlainText || !viewProps.disabled;
     if (error.length > 0 || revision == nil || present == nil) {
       strongSelf->_secretDirty = preservePlainText;
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"stage_failed" commitRequest:strongSelf->_lastCommitRequest];
@@ -2297,10 +2922,16 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
   }];
 }
 
-- (void)loadProviderAPIKeyForTarget:(NSString *)target generation:(NSUInteger)generation
+- (void)loadPlainTextSecretForGeneration:(NSUInteger)generation
 {
+  NSString *domain = [_domain copy];
+  NSString *field = [_secretField copy];
+  NSString *target = [_target copy];
   __weak LiteLLMAppKitSecureTextInputComponentView *weakSelf = self;
-  [CoreIPCBridge.shared readProviderAPIKeyForTarget:target completion:^(NSString *_Nullable value, NSString *_Nullable error) {
+  [CoreIPCBridge.shared readPlainTextSecretForDomain:domain
+                                               field:field
+                                              target:(target.length > 0 ? target : nil)
+                                          completion:^(NSString *_Nullable value, NSString *_Nullable error) {
     LiteLLMAppKitSecureTextInputComponentView *strongSelf = weakSelf;
     if (strongSelf == nil || generation != strongSelf->_generation ||
         ![strongSelf->_host.control isEqual:strongSelf->_plainField] || strongSelf->_secretDirty) return;
@@ -2309,7 +2940,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
       return;
     }
     strongSelf->_synchronizingField = YES;
-    strongSelf->_plainField.stringValue = value;
+    if ([domain isEqualToString:@"relay_accounts"] && [field isEqualToString:@"api_key"] && value.length > 12) {
+      strongSelf->_plainField.stringValue = [[value substringToIndex:12] stringByAppendingString:@"…"];
+    } else {
+      strongSelf->_plainField.stringValue = value;
+    }
     strongSelf->_synchronizingField = NO;
     strongSelf->_secretDirty = NO;
   }];
@@ -2332,6 +2967,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
 {
   if (_synchronizingField || notification.object != [self activeField] || !_autoCommit || !_secretDirty) return;
   [self stageCurrentSecretForRequest:_lastCommitRequest + 1];
+}
+
+- (BOOL)control:(__unused NSControl *)control
+       textView:(__unused NSTextView *)textView
+doCommandBySelector:(SEL)commandSelector
+{
+  return HandleLiteLLMTabCommand([self activeField], commandSelector);
 }
 
 - (void)emitRevision:(NSInteger)revision present:(BOOL)present status:(NSString *)status error:(NSString *)error commitRequest:(NSInteger)commitRequest

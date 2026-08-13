@@ -9,6 +9,7 @@
 #include <set>
 #include <shobjidl_core.h>
 #include <winrt/Windows.Globalization.h>
+#include <winrt/Windows.ApplicationModel.DataTransfer.h>
 #include <ReactCoreInjection.h>
 
 namespace {
@@ -575,6 +576,45 @@ void WinUI3NativeLeafModule::ClearSecret(
     }).detach();
   } catch (...) {
     promise.Resolve(std::nullopt);
+  }
+}
+
+void WinUI3NativeLeafModule::CopySecret(
+    std::string const& domain,
+    std::string const& field,
+    std::string const& target,
+    winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept {
+  if (domain.empty() || domain.size() > 64 || field.empty() || field.size() > 64 ||
+      target.empty() || target.size() > 256) {
+    promise.Resolve(false);
+    return;
+  }
+  try {
+    auto ui_dispatcher = context_.UIDispatcher();
+    auto js_dispatcher = context_.JSDispatcher();
+    std::thread([domain, field, target, promise, ui_dispatcher, js_dispatcher] {
+      auto value = CoreIPCBridge::Shared().ReadPlainTextSecret(domain, field, target);
+      if (!value) {
+        js_dispatcher.Post([promise] { promise.Resolve(false); });
+        return;
+      }
+      ui_dispatcher.Post([value = std::move(*value), promise, js_dispatcher]() mutable {
+        bool copied = false;
+        try {
+          using namespace winrt::Windows::ApplicationModel::DataTransfer;
+          DataPackage package;
+          package.SetText(winrt::hstring{Utf8ToWide(value)});
+          Clipboard::SetContent(package);
+          Clipboard::Flush();
+          copied = true;
+        } catch (...) {
+        }
+        value.clear();
+        js_dispatcher.Post([promise, copied] { promise.Resolve(copied); });
+      });
+    }).detach();
+  } catch (...) {
+    promise.Resolve(false);
   }
 }
 

@@ -30,23 +30,23 @@ The status item uses a neutral native template icon. During route recovery, its 
 
 Model groups contain multiple deployments across providers. Fallback is ordered by configured deployment `order`:
 
-1. **Ordered protocol fallback within one deployment** — each deployment uses its `supported_upstream_url_surfaces` list exactly as configured, for example `openai/responses` → `openai/chat` → `anthropic`.
-2. **Same-order peer fallback** — only after that deployment's selected protocols are exhausted does the proxy try another deployment with the same `order` value.
-3. **Next-order fallback** — if no same-order peer is available, the proxy advances to the next higher `order`.
-4. **Wrapped-order fallback** — if the failed deployment was the highest order, the proxy wraps to the lowest available order.
+1. **Same-order peer fallback** — after a deployment fails, the proxy tries another deployment with the same `order` value.
+2. **Next-order fallback** — if no same-order peer is available, the proxy advances to the next higher `order`.
+3. **Wrapped-order fallback** — if the failed deployment was the highest order, the proxy wraps to the lowest available order.
 
-Cooldown is tracked independently for every deployment/protocol pair, so a failed Responses endpoint cannot cool down a healthy Chat or Anthropic endpoint on the same deployment. A deployment is excluded only while all of its configured protocols are cooling down. Cooldown and route-recovery state may use local files to coordinate workers, but both are cleared on service restart and successful Apply.
+Each deployment has a protocol mode and one configured backup protocol. In the default **auto-adapt mode**, the incoming client protocol is attempted first; only an explicit protocol incompatibility switches the same deployment to its configured backup. In **fixed mode**, every request uses the selected protocol. A successful protocol switch is remembered for 10 minutes by default (adjustable in Runtime Settings), so the unsupported original protocol is not retried during that window. If the backup is also invalid, normal same-order / next-order routing continues. Cooldown and route-recovery state may use local files to coordinate workers, but both are cleared on service restart and successful Apply.
 
 The routing constraint patch integrates exclusions and cooldowns directly into LiteLLM's `Router._get_all_deployments` and `get_available_deployment`, so all routing paths respect the active constraints.
 
 ### Responses API Compatibility
 
-Upstreams can expose any ordered combination of OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), and OpenAI Chat Completions (`/v1/chat/completions`). LiteLLM Menu preserves the user's protocol order and adapts a Responses client request to the selected upstream protocol.
+Each deployment uses one of OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), or OpenAI Chat Completions (`/v1/chat/completions`). LiteLLM Menu first follows the client-facing protocol in auto-adapt mode, then switches to the configured backup when the upstream rejects that protocol.
 
 The bridge handles:
 
 - **Tool mapping** — Responses `function`, `custom`, and `tool_search` tool types are converted to Chat Completions function tools. Item IDs and tool call IDs are preserved.
-- **User-defined surface order** — `supported_upstream_url_surfaces` is the single order source; its first item is the deployment's primary protocol.
+- **Protocol mode** — `upstream_protocol_mode` is `fallback` by default; `fixed` always uses the configured `upstream_url_surface`.
+- **Exact-model fallback inference** — the fallback is inferred from the exact upstream model ID (`kimi-k3` → Chat, GPT/Codex → Responses, Claude → Messages), never from the public alias.
 - **Preemptive adaptation** — Chat and Anthropic selections are adapted before the upstream call rather than waiting for a Responses failure.
 - **Streaming conversion** — Chat Completions stream chunks are converted to Responses stream events (`response.created`, `response.output_item.added`, `response.output_text.delta`, `response.completed`) for clients expecting Responses streaming.
 
@@ -193,11 +193,11 @@ The primary configuration file is `~/.litellm-menu/config.yaml`. A sanitized exa
 - **`router_settings`** — routing strategy, retry policy, max fallbacks, cooldown configuration.
 - **`general_settings`** — master key, UI toggle.
 
-The model editor keeps the client-facing public model name separate from the exact upstream model ID. It derives LiteLLM's internal provider prefix from the first configured upstream API surface (`openai` for OpenAI Responses or Chat, `anthropic` for Anthropic Messages), so there is no separate adapter setting. This permits mappings such as a GPT-compatible public route backed by a differently named OpenAI-compatible upstream model without changing the upstream ID.
+The model editor keeps the client-facing public model name separate from the exact upstream model ID. It derives LiteLLM's internal provider prefix from the selected upstream protocol (`openai` for OpenAI Responses or Chat, `anthropic` for Anthropic Messages), so there is no separate adapter setting. This permits mappings such as a GPT-compatible public route backed by a differently named OpenAI-compatible upstream model without changing the upstream ID.
 
 ### Providers & Models Editor
 
-The **Providers** view is a fixed three-column workspace: provider list, model list, and selected deployment details. Selecting a provider always opens its provider settings; selecting a model opens that model. Provider identity and model count remain distinct. Each model has an independent **Probe** action that does not lock the rest of the editor. Its result shows a summary and the sanitized original requests; hover it for the full text. If the available protocol order differs from the current order, confirmation immediately applies it; matching orders do not prompt. New models are probed once after being added. The compact account line always renders balance as unavailable and reads the credential's effective multiplier once when the window opens; it does not request usage or balance endpoints. Upstream ID and route order remain in the selected deployment form and the dedicated **Routes** view.
+The **Providers** view is a fixed three-column workspace: provider list, model list, and selected deployment details. The protocol controls are intentionally two-step and compact: choose **Auto-adapt** (default) or **Fixed protocol**, then choose the protocol value. In auto-adapt mode that value is the **Backup protocol** used only when the upstream rejects the incoming request protocol. Each model has an independent **Probe** action that does not lock the rest of the editor. Its result shows a summary and the sanitized original requests; hover it for the full text. Probe recommendations are based on the configured backup and exact upstream model ID, not the public alias. Upstream ID and route order remain in the selected deployment form and the dedicated **Routes** view.
 
 The **Routes** view groups deployments by public model and shows order, provider/key, upstream ID, and explicit state: **Available**, **Unavailable**, **Uncertain**, **Not probed**, or **Disabled**. Route order controls change only the selected deployment's configured fallback position.
 
@@ -208,12 +208,11 @@ Provider Base URLs may be entered as a host/root, with or without `/v1` and a tr
 Each deployment's `model_info` supports:
 
 - `supports_responses_image_generation_tool` — whether the upstream supports the Responses image generation tool.
-- `supported_upstream_url_surfaces` — enabled API surfaces in numbered order (`openai/responses`, `openai/chat`, `anthropic`); the first item is primary.
-- `x-litellm-menu-upstream-url-surface-order` — editor metadata that preserves the complete numbered order, including unchecked protocols.
-- `upstream_url_surface` — generated mirror of the first ordered surface.
+- `upstream_protocol_mode` — `fallback` (default) follows the client protocol first; `fixed` always uses the selected protocol.
+- `upstream_url_surface` — the configured backup or fixed protocol: `openai/responses`, `openai/chat`, or `anthropic`.
 - `supports_responses_web_search` / `supports_web_search` — web search capability.
 
-Each model deployment has its own **Probe** action. For text models it checks Responses, Chat Completions, Anthropic Messages, and the credential's effective multiplier. A usable result stages the model as enabled and selects exactly one recommended protocol: Anthropic for Claude-family model identifiers when available, otherwise Responses before Chat and Anthropic. The staged recommendation becomes the protocol fallback only when **Apply** succeeds; additional checked protocols remain an explicit user choice. **Upstream API order** is the fallback order from LiteLLM to the deployment endpoint and does not change the client-facing API. Known standalone image models probe only `/v1/images/generations`; an unconfigured model may also test that endpoint only after all three text APIs are definitively unavailable.
+Each model deployment has its own **Probe** action. For text models it checks Responses, Chat Completions, and Anthropic Messages, then recommends the configured backup when available, otherwise the protocol inferred from the exact upstream model ID. A public alias such as `claude-sonnet` does not change a route targeting `kimi-k3`. Known standalone image models probe only `/v1/images/generations`; an unconfigured model may also test that endpoint only after all three text APIs are definitively unavailable.
 
 ### Provider and Model Imports
 
@@ -242,6 +241,7 @@ Adjustable through the menu without editing config files:
 | Vision bridge model | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
 | Computer facade backend | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
 | Computer facade max steps | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
+| MCP auto-approval | `LITELLM_MENU_MCP_AUTO_APPROVE` | 0 (off) |
 | Route recovery interval | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
 
 ### Configuration Files
@@ -323,23 +323,23 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 
 模型组包含跨供应商的多个部署。回退按配置的部署 `order` 排序：
 
-1. **部署内有序协议回退** — 每个部署严格按 `supported_upstream_url_surfaces` 配置尝试，例如 `openai/responses` → `openai/chat` → `anthropic`。
-2. **同序对等回退** — 当前部署选中的协议都尝试完后，才尝试同一 `order` 下的其他供应商或 API 密钥。
-3. **下一序回退** — 无同序对等部署可用时，代理前进到下一个更高的 `order`。
-4. **环绕回退** — 失败部署已是最高序时，代理环绕到最低可用序。
+1. **同序对等回退** — 当前部署失败后，尝试同一 `order` 下的其他供应商或 API 密钥。
+2. **下一序回退** — 无同序对等部署可用时，代理前进到下一个更高的 `order`。
+3. **环绕回退** — 失败部署已是最高序时，代理环绕到最低可用序。
 
-冷却按“部署 + 协议”独立记录，因此坏掉的 Responses 不会连累同一部署中健康的 Chat 或 Anthropic。只有配置的全部协议都处于冷却时，部署才会被排除。冷却和 recovery 可以用本地文件协调多个 worker，但服务重启和成功 Apply 后都会清空。
+每个部署默认使用“自动适配”模式：先沿用当前客户端协议，只有上游明确不支持时才在同一部署切换到配置的备用协议；也可以切换为“指定协议”模式，始终使用指定协议。备用协议生效后默认记忆 10 分钟（可在运行时设置调整），期间不再重试原协议；备用协议也无效时才进入下一个 order。冷却和 recovery 可以用本地文件协调多个 worker，但服务重启和成功 Apply 后都会清空。
 
 路由约束补丁将排除和冷却直接集成到 LiteLLM 的 `Router._get_all_deployments` 和 `get_available_deployment` 中，使所有路由路径均遵循当前约束。
 
 ### Responses API 兼容
 
-上游可按任意顺序支持 OpenAI Responses（`/v1/responses`）、Anthropic Messages（`/v1/messages`）和 OpenAI Chat Completions（`/v1/chat/completions`）。LiteLLM Menu 保留用户配置的协议顺序，并将 Responses 客户端请求适配到选中的上游协议。
+每个部署支持 OpenAI Responses（`/v1/responses`）、Anthropic Messages（`/v1/messages`）和 OpenAI Chat Completions（`/v1/chat/completions`）。默认先使用客户端当前协议，上游不支持时再切换到配置的备用协议。
 
 桥接器处理以下内容：
 
 - **工具映射** — Responses 的 `function`、`custom` 和 `tool_search` 工具类型转换为 Chat Completions 的 function 工具。项 ID 和工具调用 ID 予以保留。
-- **用户自定义接口顺序** — `supported_upstream_url_surfaces` 是唯一顺序真源，第一项为主协议。
+- **协议方式** — `upstream_protocol_mode` 默认为 `fallback`，也可改为 `fixed`。
+- **按上游原始模型推测** — `kimi-k3` 推测为 Chat，GPT/Codex 推测为 Responses，Claude 推测为 Messages；不依据公开模型别名判断。
 - **预先适配** — 选中 Chat 或 Anthropic 时，在调用上游前完成适配，无需先等待 Responses 失败。
 - **流式转换** — Chat Completions 流式数据块转换为 Responses 流式事件（`response.created`、`response.output_item.added`、`response.output_text.delta`、`response.completed`），供期望 Responses 流式的客户端使用。
 
@@ -486,11 +486,11 @@ pnpm run build:windows
 - **`router_settings`** — 路由策略、重试策略、最大回退数、冷却配置。
 - **`general_settings`** — 主密钥、UI 开关。
 
-模型编辑器将客户端看到的公开模型名与上游原始模型 ID 分开保存。LiteLLM 内部供应商前缀由第一个上游 API 协议自动派生（OpenAI Responses 或 Chat 使用 `openai`，Anthropic Messages 使用 `anthropic`），不再单独配置 adapter。这样可以把 GPT 兼容的公开路由映射到名称不同的 OpenAI-compatible 上游模型，同时保持上游 ID 不变。
+模型编辑器将客户端看到的公开模型名与上游原始模型 ID 分开保存。LiteLLM 内部供应商前缀由已选上游协议自动派生（OpenAI Responses 或 Chat 使用 `openai`，Anthropic Messages 使用 `anthropic`），不再单独配置 adapter。这样可以把 GPT 兼容的公开路由映射到名称不同的 OpenAI-compatible 上游模型，同时保持上游 ID 不变。
 
 ### Providers & Models 编辑器
 
-**Providers** 视图将 provider 名称和模型数量分列显示。点击供应商始终打开其供应商设置，点击模型打开该模型。每个模型的 **探测** 相互独立，不会锁住其余编辑控件；结果显示总结和脱敏后的原始请求，鼠标悬停可查看全文。若可用协议顺序与当前不同，确认后会立即应用；相同时不弹确认。新增模型后会自动探测一次。紧凑账户行中的余额固定显示为不可用；窗口打开时只读取一次当前凭据的有效倍率，不请求用量或余额端点。上游 ID 与路由顺序保留在右侧部署表单和专用 **Routes** 视图中。
+**Providers** 视图将 provider 名称和模型数量分列显示。右侧协议控件先选择“自动适配”（默认）或“指定协议”，再选择协议值；自动适配时该值表示上游不支持当前请求协议时使用的“备用协议”，下方短提示直接说明当前行为。每个模型的 **探测** 相互独立，不会锁住其余编辑控件；结果显示总结和脱敏后的原始请求，鼠标悬停可查看全文。探测推荐按已配置备用协议和上游原始模型 ID 判断，不读取公开别名。上游 ID 与路由顺序保留在右侧部署表单和专用 **Routes** 视图中。
 
 **Routes** 视图按公开模型对部署分组，显示顺序、provider/API key、上游 ID 和明确状态：**Available**、**Unavailable**、**Uncertain**、**Not probed** 或 **Disabled**。路由顺序按钮只修改所选部署的配置回退位置。
 
@@ -501,12 +501,11 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 每个部署的 `model_info` 支持：
 
 - `supports_responses_image_generation_tool` — 上游是否支持 Responses 图像生成工具。
-- `supported_upstream_url_surfaces` — 按编号排序的已启用 API 接口列表（`openai/responses`、`openai/chat`、`anthropic`），第一项是主协议。
-- `x-litellm-menu-upstream-url-surface-order` — 编辑器元数据，用于保留包括未勾选协议在内的完整编号顺序。
-- `upstream_url_surface` — 自动生成的第一项镜像。
+- `upstream_protocol_mode` — `fallback`（默认）先沿用客户端协议；`fixed` 始终使用指定协议。
+- `upstream_url_surface` — 兜底或指定协议值：`openai/responses`、`openai/chat` 或 `anthropic`。
 - `supports_responses_web_search` / `supports_web_search` — 网页搜索能力。
 
-每个模型部署都有独立的 **Probe** 操作。文本模型会同时探测 Responses、Chat Completions、Anthropic Messages 和当前凭据的有效倍率。探测不会改变模型开关；Claude 系列的可用顺序优先 Anthropic，其余依次为 Responses、Chat、Anthropic。若探测顺序变化，用户确认后会立即写入并应用；相同则保持不变。**上游 API 顺序** 指 LiteLLM 到该部署端点的回退顺序，不会改变客户端接口。上游模型输入和列表只显示原始模型名；系统按首选协议自动写入 `openai/` 或 `anthropic/` 前缀。已知的独立图片模型只探测 `/v1/images/generations`；尚未配置的模型也只会在三个文本 API 都明确不可用后才尝试该端点。
+每个模型部署都有独立的 **Probe** 操作。文本模型会同时探测 Responses、Chat Completions 和 Anthropic Messages；推荐优先采用已配置备用协议，否则采用按上游原始模型 ID 推测的协议。公开模型名不会覆盖这个判断；例如公开名是 Claude、上游却是 `kimi-k3` 时，默认备用协议仍是 Chat。上游模型输入和列表只显示原始模型名；系统按当前实际协议自动写入 `openai/` 或 `anthropic/` 前缀。已知的独立图片模型只探测 `/v1/images/generations`；尚未配置的模型也只会在三个文本 API 都明确不可用后才尝试该端点。
 
 ### Provider 与模型导入
 
@@ -535,6 +534,7 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 | 视觉桥接模型 | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
 | Computer facade 后端 | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
 | Computer facade 最大步数 | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
+| MCP 自动同意 | `LITELLM_MENU_MCP_AUTO_APPROVE` | 0（关闭） |
 | 路由恢复间隔 | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
 
 ### 配置文件

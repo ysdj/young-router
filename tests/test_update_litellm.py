@@ -44,6 +44,13 @@ class UpdateLiteLLMTests(unittest.TestCase):
                                 "yanked": False,
                             },
                         ],
+                        "1.92.1": [
+                            {
+                                "packagetype": "bdist_wheel",
+                                "filename": "litellm-1.92.1-cp310-cp310-macosx_11_0_arm64.whl",
+                                "yanked": False,
+                            }
+                        ],
                         "1.93.0rc1": [
                             {
                                 "packagetype": "bdist_wheel",
@@ -74,7 +81,7 @@ class UpdateLiteLLMTests(unittest.TestCase):
         )
         return result, lock_file
 
-    def test_update_uses_newest_stable_release_with_an_installable_source_distribution(self) -> None:
+    def test_update_skips_newer_release_without_a_python_312_artifact(self) -> None:
         result, lock_file = self.run_update()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

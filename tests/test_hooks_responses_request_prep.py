@@ -4,6 +4,76 @@ from hook_test_utils import *
 
 
 class HookResponsesRequestPrepTests(HookTestCase):
+    def test_mcp_auto_approval_is_disabled_by_default(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "responses",
+            "input": "Use the MCP tool.",
+            "tools": [{"type": "mcp", "server_label": "example", "require_approval": "always"}],
+        }
+
+        self.assertIsNone(hooks._with_mcp_auto_approval(request))
+        self.assertEqual("always", request["tools"][0]["require_approval"])
+
+    def test_mcp_auto_approval_rewrites_only_responses_mcp_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._MCP_AUTO_APPROVE_ENV, "1")
+        request = {
+            "call_type": "responses",
+            "input": "Use the MCP tool.",
+            "tools": [
+                {"type": "function", "name": "keep_function"},
+                {"type": "mcp", "server_label": "example", "require_approval": "always"},
+                {"type": "mcp", "server_label": "already-open", "require_approval": "never"},
+                {"type": "mcp", "server_label": "object-policy", "require_approval": {"never": ["read"]}},
+            ],
+        }
+
+        modified = hooks._with_mcp_auto_approval(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual("always", request["tools"][1]["require_approval"])
+        self.assertEqual(
+            ["function", "mcp", "mcp", "mcp"],
+            [tool["type"] for tool in modified["tools"]],
+        )
+        self.assertEqual(
+            [None, "never", "never", "never"],
+            [tool.get("require_approval") for tool in modified["tools"]],
+        )
+        self.assertIs(modified["tools"][0], request["tools"][0])
+
+    def test_mcp_auto_approval_does_not_touch_chat_completions(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._MCP_AUTO_APPROVE_ENV, "1")
+        request = {
+            "use_chat_completions_api": True,
+            "messages": [{"role": "user", "content": "Use the MCP tool."}],
+            "tools": [{"type": "mcp", "server_label": "example", "require_approval": "always"}],
+        }
+
+        self.assertIsNone(hooks._with_mcp_auto_approval(request))
+
+    async def test_pre_call_applies_mcp_auto_approval_patch(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._MCP_AUTO_APPROVE_ENV, "1")
+        request = {
+            "call_type": "aresponses",
+            "input": "Use the MCP tool.",
+            "tools": [{"type": "mcp", "server_label": "example", "require_approval": "always"}],
+        }
+
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            request,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual("never", modified["tools"][0]["require_approval"])
+        self.assertEqual("always", request["tools"][0]["require_approval"])
+
     @staticmethod
     def _codex_collaboration_request() -> dict:
         return {
@@ -53,8 +123,18 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIn("never a sibling or ancestor", instructions)
         self.assertIn("root agent owns the entire tree", instructions)
         self.assertIn("Every assistant response without a real tool call terminates", instructions)
+        self.assertIn("full user-requested outcome", instructions)
+        self.assertIn("expression of dissatisfaction", instructions)
+        self.assertIn("evidence challenge", instructions)
+        self.assertIn("failed verification is not completion", instructions)
+        self.assertIn("future-tense commitment", instructions)
+        self.assertIn("concrete blocker after exhausting safe in-scope alternatives", instructions)
         self.assertIn("progress-only response would terminate the turn", instructions)
         self.assertIn("invalidates every earlier list_agents snapshot", instructions)
+        self.assertIn("clean descendant snapshot only accounts for descendants", instructions)
+        self.assertIn("it never proves the root task complete", instructions)
+        self.assertIn("every outstanding commentary commitment", instructions)
+        self.assertIn("If root work remains, call a real work tool", instructions)
         self.assertIn("Visible answer text alone is not evidence", instructions)
         self.assertEqual(
             original["instructions"],
@@ -771,6 +851,28 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertNotIn("Accept", modified["extra_headers"])
         self.assertEqual(original["extra_headers"], {"X-Trace": "keep-me"})
+
+    async def test_pre_call_deployment_hook_preserves_explicit_litellm_headers(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        original = {
+            "api_base": "https://example.com/v1",
+            "extra_headers": {
+                "X-LiteLLM-Model-Name": "downstream-explicit",
+                "User-Agent": "LiteLLM downstream-client/1",
+            },
+        }
+
+        modified = await hook.async_pre_call_deployment_hook(original, call_type=None)
+
+        self.assertIsNone(modified)
+        self.assertEqual(
+            original["extra_headers"],
+            {
+                "X-LiteLLM-Model-Name": "downstream-explicit",
+                "User-Agent": "LiteLLM downstream-client/1",
+            },
+        )
 
     async def test_pre_call_deployment_hook_codex_user_agent_overrides_old_extra_header(self) -> None:
         hooks, _ = load_hook_module()

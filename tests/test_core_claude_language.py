@@ -23,6 +23,63 @@ from litellm_menu.core.domains.language import (
 
 
 class ClaudeSettingsDomainTests(unittest.TestCase):
+    def test_claude_desktop_active_3p_profile_is_loaded_separately_from_claude_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            code_path = root / ".claude" / "settings.json"
+            code_path.parent.mkdir()
+            code_text = json.dumps({"skipWorkflowUsageWarning": True})
+            code_path.write_text(code_text, encoding="utf-8")
+
+            library = root / "Claude-3p" / "configLibrary"
+            library.mkdir(parents=True)
+            config_id = "11111111-2222-4333-8444-555555555555"
+            (library / "_meta.json").write_text(
+                json.dumps({"appliedId": config_id, "entries": [{"id": config_id, "name": "Default"}]}),
+                encoding="utf-8",
+            )
+            desktop_path = library / f"{config_id}.json"
+            desktop_path.write_text(
+                json.dumps(
+                    {
+                        "inferenceProvider": "gateway",
+                        "inferenceGatewayBaseUrl": "http://127.0.0.1:4000",
+                        "inferenceGatewayApiKey": "synthetic-desktop-key",
+                        "inferenceCredentialKind": "apiKey",
+                        "coworkEgressAllowedHosts": ["*"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            domain = ClaudeSettingsDomain(code_path, desktop_config_library_path=library)
+            snapshot = domain.snapshot()
+            self.assertEqual("gateway", snapshot["desktop"]["provider"])
+            self.assertEqual("http://127.0.0.1:4000", snapshot["desktop"]["gateway_url"])
+            self.assertEqual("bearer", snapshot["desktop"]["auth_scheme"])
+            self.assertTrue(snapshot["desktop"]["credential_configured"])
+            self.assertNotIn("synthetic-desktop-key", json.dumps(snapshot))
+            self.assertIn("synthetic-desktop-key", domain.raw_text(include_sensitive=True, document="desktop"))
+            self.assertIn("skipWorkflowUsageWarning", domain.raw_text(include_sensitive=True, document="settings"))
+
+            domain.dispatch(
+                "desktop_patch",
+                {
+                    "inferenceGatewayBaseUrl": "http://127.0.0.1:4100",
+                    "inferenceGatewayAuthScheme": "x-api-key",
+                },
+            )
+            domain.stage_secret("desktop_gateway_api_key", None, "replacement-desktop-key")
+            domain.apply()
+
+            saved = json.loads(desktop_path.read_text(encoding="utf-8"))
+            self.assertEqual("http://127.0.0.1:4100", saved["inferenceGatewayBaseUrl"])
+            self.assertEqual("x-api-key", saved["inferenceGatewayAuthScheme"])
+            self.assertEqual("replacement-desktop-key", saved["inferenceGatewayApiKey"])
+            self.assertEqual(["*"], saved["coworkEgressAllowedHosts"])
+            self.assertEqual(code_text, code_path.read_text(encoding="utf-8"))
+            self.assertEqual(0o600, stat.S_IMODE(desktop_path.stat().st_mode))
+
     def test_core_registers_both_domains_and_keeps_apply_confirmation_at_the_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

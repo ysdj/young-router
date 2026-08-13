@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -14,6 +15,15 @@ from litellm_menu.core.service import LOG_TABS as CORE_LOG_TABS
 class _UsageReader:
     def refresh(self) -> list[str]:
         return ["Updated 2026-01-01T00:00:00Z", "default-chat tokens=12"]
+
+
+class _ChangingUsageReader:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def refresh(self) -> list[str]:
+        self.calls += 1
+        return [f"Updated 2026-01-01T00:00:0{self.calls}Z", f"default-chat tokens={self.calls}"]
 
 
 class LogsDomainTests(unittest.TestCase):
@@ -103,6 +113,97 @@ class LogsDomainTests(unittest.TestCase):
             self.assertEqual(1, tab["line_count"])
             self.assertEqual("deployment_selected", tab["records"][0]["event"])
             self.assertEqual("example-provider", tab["records"][0]["provider"])
+
+    def test_route_trace_reads_previous_segment_and_filters_before_limiting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "runtime-settings.env"
+            settings.write_text("LITELLM_MENU_LOG_VIEW_LIMIT=2\n", encoding="utf-8")
+            previous = root / "menu-server.log.1"
+            current = root / "menu-server.log"
+            older = {
+                "timestamp": "2026-08-01T04:10:11Z",
+                "event": "selected_deployment",
+                "model_group": "older-chat",
+            }
+            newer = {
+                "timestamp": "2026-08-01T04:10:12Z",
+                "event": "selected_deployment",
+                "model_group": "newer-chat",
+            }
+            previous.write_text(
+                "\n".join(
+                    [
+                        f"litellm_route_trace {json.dumps(older)}",
+                        *("ordinary service output" for _ in range(32)),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            current.write_text(
+                f"litellm_route_trace {json.dumps(newer)}\n",
+                encoding="utf-8",
+            )
+
+            tab = LogsDomain(root, runtime_settings_path=settings).view("route-trace")["log"]
+
+            self.assertEqual(2, tab["line_count"])
+            self.assertEqual(
+                ["older-chat", "newer-chat"],
+                [record["public_model"] for record in tab["records"]],
+            )
+
+    def test_cleared_route_trace_does_not_restore_previous_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = root / "menu-server.log.1"
+            current = root / "menu-server.log"
+            previous.write_text(
+                "litellm_route_trace "
+                + json.dumps(
+                    {
+                        "timestamp": "2026-08-01T04:10:11Z",
+                        "event": "selected_deployment",
+                        "model_group": "older-chat",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            current.write_text(
+                "litellm_route_trace "
+                + json.dumps(
+                    {
+                        "timestamp": "2026-08-01T04:10:12Z",
+                        "event": "selected_deployment",
+                        "model_group": "current-chat",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            domain = LogsDomain(root)
+
+            self.assertEqual(2, domain.view("route-trace")["log"]["line_count"])
+            domain.dispatch("logs.clear", {"tab": "route-trace"})
+            self.assertEqual(0, domain.view("route-trace")["log"]["line_count"])
+
+            with current.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    "litellm_route_trace "
+                    + json.dumps(
+                        {
+                            "timestamp": "2026-08-01T04:10:13Z",
+                            "event": "selected_deployment",
+                            "model_group": "after-clear-chat",
+                        }
+                    )
+                    + "\n"
+                )
+
+            records = domain.view("route-trace")["log"]["records"]
+            self.assertEqual(["after-clear-chat"], [record["public_model"] for record in records])
 
     def test_route_trace_projects_nested_deployment_into_table_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -573,14 +674,17 @@ model_list:
     def test_recovery_records_are_sorted_by_updated_at(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            now = datetime.now(timezone.utc)
+            older = (now - timedelta(seconds=2)).isoformat()
+            newer = now.isoformat()
             state = root / ".litellm-runtime" / "route-recovery-state.json"
             state.parent.mkdir()
             state.write_text(
                 json.dumps(
                     {
                         "recoveries": {
-                            "newer": {"updated_at": "2026-08-01T04:10:13Z", "status": "waiting"},
-                            "older": {"updated_at": "2026-08-01T04:10:11Z", "status": "waiting"},
+                            "newer": {"updated_at": newer, "status": "waiting"},
+                            "older": {"updated_at": older, "status": "waiting"},
                         }
                     }
                 ),
@@ -589,19 +693,22 @@ model_list:
 
             projected = LogsDomain(root).view("recovery")["log"]["records"]
 
-            self.assertEqual(["2026-08-01T04:10:11Z", "2026-08-01T04:10:13Z"], [record["timestamp"] for record in projected])
+            self.assertEqual([older, newer], [record["timestamp"] for record in projected])
 
     def test_recovery_records_accept_canonical_timestamp_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            now = datetime.now(timezone.utc)
+            older = (now - timedelta(seconds=2)).isoformat()
+            newer = now.isoformat()
             state = root / ".litellm-runtime" / "route-recovery-state.json"
             state.parent.mkdir()
             state.write_text(
                 json.dumps(
                     {
                         "recoveries": {
-                            "newer": {"timestamp": "2026-08-01T04:10:13Z", "status": "waiting"},
-                            "older": {"time": "2026-08-01T04:10:11Z", "status": "waiting"},
+                            "newer": {"timestamp": newer, "status": "waiting"},
+                            "older": {"time": older, "status": "waiting"},
                         }
                     }
                 ),
@@ -610,7 +717,7 @@ model_list:
 
             projected = LogsDomain(root).view("recovery")["log"]["records"]
 
-            self.assertEqual(["2026-08-01T04:10:11Z", "2026-08-01T04:10:13Z"], [record["timestamp"] for record in projected])
+            self.assertEqual([older, newer], [record["timestamp"] for record in projected])
 
     def test_route_trace_exposes_request_and_route_chain_fields_without_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -685,6 +792,7 @@ model_list:
     def test_recovery_log_projects_route_identity_from_state_and_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            now = datetime.now(timezone.utc).isoformat()
             (root / "config.yaml").write_text(
                 """providers:
   provider-a:
@@ -711,12 +819,12 @@ model_list:
             state.write_text(
                 json.dumps(
                     {
-                        "updated_at": "2026-08-01T04:10:11Z",
+                        "updated_at": now,
                         "recoveries": {
                             "route-a": {
                                 "key": "route-a",
                                 "status": "polling",
-                                "updated_at": "2026-08-01T04:10:11Z",
+                                "updated_at": now,
                                 "model_group": "upstream-chat",
                                 "request": {
                                     "deployment_id": "abcdef12",
@@ -753,6 +861,7 @@ model_list:
     def test_recovery_log_uses_a_cooling_candidate_when_no_route_was_selected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            now = datetime.now(timezone.utc).isoformat()
             state = root / ".litellm-runtime" / "route-recovery-state.json"
             state.parent.mkdir()
             state.write_text(
@@ -760,7 +869,7 @@ model_list:
                     {
                         "recoveries": {
                             "request-a": {
-                                "updated_at": "2026-08-04T04:16:09Z",
+                                "updated_at": now,
                                 "status": "waiting",
                                 "model_group": "public-chat",
                                 "cooldown_deployments": [
@@ -788,6 +897,127 @@ model_list:
             self.assertEqual("upstream-chat", record["upstream_model"])
             self.assertEqual("provider-a", record["provider"])
             self.assertEqual("key-a", record["api_key_name"])
+
+    def test_recovery_view_matches_live_summary_and_includes_active_cooldowns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir()
+            now = datetime.now(timezone.utc)
+            (runtime / "route-recovery-state.json").write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "live": {
+                                "heartbeat_at": (now - timedelta(seconds=5)).isoformat(),
+                                "status": "polling",
+                                "model_group": "public-chat",
+                            },
+                            "stale": {
+                                "heartbeat_at": (now - timedelta(minutes=5)).isoformat(),
+                                "status": "polling",
+                                "model_group": "stale-chat",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (runtime / "deployment-cooldowns.json").write_text(
+                json.dumps(
+                    {
+                        "cooldowns": {
+                            "active": {
+                                "last_failure_at": now.timestamp() - 3,
+                                "cooldown_until": now.timestamp() + 60,
+                                "failures": 2,
+                                "route_key": (
+                                    "model=public-chat / provider=provider-a / "
+                                    "upstream=openai/upstream-chat / key=key-a"
+                                ),
+                            },
+                            "expired": {
+                                "cooldown_until": now.timestamp() - 60,
+                                "model_group": "expired-chat",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            tab = LogsDomain(root).view("recovery")["log"]
+
+            self.assertEqual(2, tab["line_count"])
+            self.assertEqual(["cooldown", "polling"], sorted(record["status"] for record in tab["records"]))
+            cooldown = next(record for record in tab["records"] if record["status"] == "cooldown")
+            self.assertEqual("public-chat", cooldown["public_model"])
+            self.assertEqual("upstream-chat", cooldown["upstream_model"])
+            self.assertEqual("provider-a", cooldown["provider"])
+            self.assertEqual("key-a", cooldown["api_key_name"])
+            self.assertIn("cooldown=", cooldown["detail"])
+            self.assertIn("failures=2", cooldown["detail"])
+            self.assertNotIn("route_key", cooldown)
+            self.assertNotIn("stale-chat", json.dumps(tab))
+            self.assertNotIn("expired-chat", json.dumps(tab))
+
+    def test_clearing_recovery_view_hides_both_state_sources_until_they_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir()
+            now = datetime.now(timezone.utc)
+            recovery_path = runtime / "route-recovery-state.json"
+            recovery_path.write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "first": {
+                                "heartbeat_at": now.isoformat(),
+                                "status": "polling",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (runtime / "deployment-cooldowns.json").write_text(
+                json.dumps(
+                    {
+                        "cooldowns": {
+                            "active": {
+                                "cooldown_until": now.timestamp() + 60,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            domain = LogsDomain(root)
+            self.assertEqual(2, domain.view("recovery")["log"]["line_count"])
+
+            domain.dispatch("logs.clear", {"tab": "recovery"})
+
+            self.assertEqual(0, domain.view("recovery")["log"]["line_count"])
+            recovery_path.write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "first": {
+                                "heartbeat_at": now.isoformat(),
+                                "status": "polling",
+                            },
+                            "second": {
+                                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                                "status": "waiting",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(3, domain.view("recovery")["log"]["line_count"])
 
     def test_pause_filter_clear_and_resume_are_view_operations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -937,6 +1167,21 @@ model_list:
 
             self.assertTrue(tab["available"])
             self.assertEqual(2, tab["line_count"])
+
+    def test_clearing_online_usage_does_not_hide_the_next_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reader = _ChangingUsageReader()
+            domain = LogsDomain(directory, online_usage_reader=reader)
+
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage"})
+            domain.dispatch("logs.clear", {"tab": "online-usage"})
+            self.assertEqual(0, domain.view("online-usage")["log"]["line_count"])
+
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage"})
+            records = domain.view("online-usage")["log"]["records"]
+
+            self.assertEqual(2, len(records))
+            self.assertIn("00:00:02Z", "\n".join(records))
 
 
 if __name__ == "__main__":

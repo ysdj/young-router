@@ -19,7 +19,6 @@ from .base import (
     List,
     Optional,
     _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY,
-    _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID,
     _CURRENT_SELECTED_DEPLOYMENT,
@@ -41,6 +40,58 @@ from .base import (
 _ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR = (
     "_litellm_menu_anthropic_unversioned_endpoint_patch"
 )
+_LATIN1_RESPONSE_HEADERS_PATCH_ATTR = (
+    "_litellm_menu_latin1_response_headers_patch"
+)
+
+
+def _install_latin1_response_headers_patch() -> None:
+    try:
+        from litellm.proxy.common_request_processing import (
+            ProxyBaseLLMRequestProcessing,
+        )
+    except Exception:
+        return
+
+    original_get_custom_headers = getattr(
+        ProxyBaseLLMRequestProcessing,
+        "get_custom_headers",
+        None,
+    )
+    if not callable(original_get_custom_headers) or getattr(
+        original_get_custom_headers,
+        _LATIN1_RESPONSE_HEADERS_PATCH_ATTR,
+        False,
+    ):
+        return
+
+    def patched_get_custom_headers(*args: Any, **kwargs: Any) -> Any:
+        headers = original_get_custom_headers(*args, **kwargs)
+        if not isinstance(headers, dict):
+            return headers
+        compatible_headers: dict[Any, Any] = {}
+        for key, value in headers.items():
+            try:
+                str(key).encode("latin-1")
+                str(value).encode("latin-1")
+            except UnicodeEncodeError:
+                continue
+            compatible_headers[key] = value
+        return compatible_headers
+
+    setattr(
+        patched_get_custom_headers,
+        _LATIN1_RESPONSE_HEADERS_PATCH_ATTR,
+        True,
+    )
+    setattr(
+        patched_get_custom_headers,
+        "_original_get_custom_headers",
+        original_get_custom_headers,
+    )
+    ProxyBaseLLMRequestProcessing.get_custom_headers = staticmethod(
+        patched_get_custom_headers
+    )
 
 
 def _install_anthropic_unversioned_endpoint_patch() -> None:
@@ -363,9 +414,6 @@ def _install_routing_constraint_patch() -> None:
             target_token = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.set(
                 _routing_module._request_surface_target_deployment_id(request_kwargs)
             )
-            cooldown_token = _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.set(
-                _routing_module._deployment_cooldown_surface(request_kwargs)
-            )
             request_token = _CURRENT_ROUTING_REQUEST_KWARGS.set(request_kwargs)
             try:
                 try:
@@ -397,7 +445,6 @@ def _install_routing_constraint_patch() -> None:
                 if isinstance(request_kwargs, dict):
                     request_kwargs.pop(_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY, None)
                 _CURRENT_ROUTING_REQUEST_KWARGS.reset(request_token)
-                _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.reset(cooldown_token)
                 _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.reset(target_token)
                 _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.reset(verified_token)
                 _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(excluded_token)
@@ -444,9 +491,6 @@ def _install_routing_constraint_patch() -> None:
         target_token = _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.set(
             _routing_module._request_surface_target_deployment_id(request_kwargs)
         )
-        cooldown_token = _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.set(
-            _routing_module._deployment_cooldown_surface(request_kwargs)
-        )
         request_token = _CURRENT_ROUTING_REQUEST_KWARGS.set(request_kwargs)
         try:
             try:
@@ -482,7 +526,6 @@ def _install_routing_constraint_patch() -> None:
             if isinstance(request_kwargs, dict):
                 request_kwargs.pop(_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY, None)
             _CURRENT_ROUTING_REQUEST_KWARGS.reset(request_token)
-            _CURRENT_DEPLOYMENT_COOLDOWN_SURFACE.reset(cooldown_token)
             _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID.reset(target_token)
             _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS.reset(verified_token)
             _CURRENT_EXCLUDED_DEPLOYMENT_IDS.reset(excluded_token)
@@ -622,16 +665,21 @@ def _install_selected_deployment_marker_patch() -> None:
             if marker is not None:
                 # LiteLLM invokes the streaming-iterator hook after make_call
                 # returns.  Persist the selected route on the request object
-                # before the context marker is reset so an initial stream
-                # failure can exclude the route that actually failed.
+                # before recording fallback success and before the context
+                # marker is reset, so an initial stream failure can exclude
+                # the route that actually failed and the cache records the
+                # protocol that was really selected.
                 _routing_module._apply_selected_deployment_marker_to_request(
                     kwargs,
                     marker,
                 )
+                _routing_module._record_protocol_fallback_success(kwargs)
                 response = _routing_module._wrap_response_with_selected_deployment_marker(
                     response,
                     marker,
                 )
+            else:
+                _routing_module._record_protocol_fallback_success(kwargs)
             return response
         except Exception as exc:
             marker = _CURRENT_SELECTED_DEPLOYMENT.get()
@@ -639,6 +687,7 @@ def _install_selected_deployment_marker_patch() -> None:
                 exc,
                 marker,
             ):
+                _routing_module._clear_protocol_fallback_cache_for_request(kwargs)
                 _routing_module._mark_exception_for_upstream_surface_failover(
                     exc,
                     marker,
@@ -872,7 +921,7 @@ def _install_generic_deployment_failover_patch() -> None:
         )
         while True:
             try:
-                return await original_helper(
+                response = await original_helper(
                     self,
                     model,
                     _responses_execution_module._wrap_generic_function_for_deployment_failover(
@@ -881,6 +930,16 @@ def _install_generic_deployment_failover_patch() -> None:
                     ),
                     **kwargs,
                 )
+                marker = _routing_module._selected_deployment_marker_from_response(
+                    response
+                )
+                if marker is None:
+                    marker = _routing_module._selected_deployment_marker_from_box()
+                _routing_module._merge_request_routing_state_into_selected_deployment_marker(
+                    marker,
+                    kwargs,
+                )
+                return response
             except Exception as exc:
                 _routing_module._mark_no_deployments_for_order_exhaustion(exc, kwargs)
                 browser_retry_kwargs = None
@@ -1404,6 +1463,7 @@ def _install_responses_tool_search_bridge_patch() -> None:
 
 
 def install_all() -> None:
+    _install_latin1_response_headers_patch()
     _install_anthropic_unversioned_endpoint_patch()
     _install_routing_constraint_patch()
     _install_selected_deployment_marker_patch()

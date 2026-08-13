@@ -38,7 +38,6 @@ try {
       "codex_config.py",
       "configuration_package.py",
       "external_provider_import.py",
-      "provider_billing.py",
       "remote_usage_logs.py",
       "runtime_settings_io.py",
       "sitecustomize.py")) {
@@ -65,7 +64,7 @@ try {
 
   $LiteLLMVersion = (Get-Content -Raw (Join-Path $ProjectRoot "LITELLM_VERSION")).Trim()
   uv pip install --python (Join-Path $RuntimeBin "python.exe") `
-    "litellm[proxy]==$LiteLLMVersion" PyYAML Pillow ddgs
+    "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow ddgs
   $GeneratedScripts = Join-Path $RuntimeBin "Scripts"
   if (Test-Path $GeneratedScripts) {
     Remove-Item -LiteralPath $GeneratedScripts -Recurse -Force
@@ -85,7 +84,7 @@ set "RUNTIME_ROOT=%~dp0"
   $PreviousProxyProcess = $env:LITELLM_MENU_PROXY_PROCESS
   try {
     $env:PYTHONPATH = $Core
-    & $Python -c "import litellm.proxy.proxy_server, litellm_menu.core, codex_config, config_editor_core, configuration_package, external_provider_import, provider_billing, webdav.core"
+    & $Python -c "import litellm.proxy.proxy_server, litellm_menu.core, codex_config, config_editor_core, configuration_package, external_provider_import, webdav.core"
     if ($LASTEXITCODE -ne 0) { throw "Bundled Windows Core import smoke test failed." }
     & (Join-Path $RuntimeBin "litellm.cmd") --help | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Bundled Windows LiteLLM launcher smoke test failed." }

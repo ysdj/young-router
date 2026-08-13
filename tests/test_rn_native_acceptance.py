@@ -89,10 +89,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("POINT MinimumTrackSizeForActiveRoute() const;", header)
         self.assertIn("ContentSize RouteMinimumContentSize(std::wstring_view route)", leaf)
         for route, width, height in (
-            ("providers-models", 1052, 560),
+            ("providers-models", 820, 560),
             ("runtime-settings", 800, 520),
             ("webdav-settings", 700, 420),
             ("relay-accounts", 760, 500),
+            ("relay-add", 720, 560),
             ("logs", 640, 420),
         ):
             self.assertIn(f'route == L"{route}") return {{{width}, {height}}};', leaf)
@@ -107,12 +108,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
         self.assertIn("ContentSize RouteInitialContentSize", leaf)
-        for size in ("{1052, 600}", "{1160, 700}", "{1080, 620}", "{720, 440}", "{920, 620}", "{900, 580}"):
+        for size in ("{820, 560}", "{1160, 700}", "{1080, 620}", "{720, 440}", "{900, 680}", "{920, 620}", "{900, 580}"):
             self.assertIn(size, leaf)
         self.assertIn("RouteInitialContentSize(route)", leaf)
 
     def test_standalone_configuration_package_route_is_not_accepted_by_native_hosts(self) -> None:
         mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        mac_controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         win_leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
         mac_app = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         win_app = (WIN_PROJECT / "LiteLLMMenu.cpp").read_text(encoding="utf-8")
@@ -136,10 +138,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
 
         for width, height, min_width, min_height in (
-            (1052, 600, 1052, 560),
+            (820, 460, 820, 460),
             (1160, 700, 1100, 640),
             (1080, 620, 800, 520),
             (720, 440, 700, 420),
+            (900, 680, 720, 560),
             (920, 620, 760, 500),
             (900, 580, 640, 420),
         ):
@@ -175,6 +178,21 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn('"open-logs", "separator"', mac)
         self.assertIn('case "open-logs", "open-logs?tab=recovery": openLogs(tab:', mac)
+
+    def test_native_trays_do_not_append_ellipses_to_direct_window_links(self) -> None:
+        mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+
+        for route in (
+            "open-providers-models",
+            "open-relay-accounts",
+            "open-runtime-settings",
+            "open-codex-settings",
+            "open-webdav-settings",
+        ):
+            self.assertNotRegex(mac, rf'case "{route}"[^\n]+\+ "\.\.\."')
+        self.assertNotIn('localized("routeRelayAccounts", fallback: "Relay Accounts") + "..."', mac)
+        self.assertNotIn('title += L"...";', windows)
 
     def test_compatibility_claude_route_uses_the_combined_settings_window_title(self) -> None:
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -238,11 +256,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("LSMultipleInstancesProhibited", plist)
         self.assertIn("LiteLLMMenuExistingInstance", source)
-        self.assertIn("runningApplicationsWithBundleIdentifier", source)
+        self.assertIn("NSWorkspace.sharedWorkspace.runningApplications", source)
+        self.assertIn("LiteLLMMenuIsManagedApplication", source)
         self.assertIn("LiteLLMMenuAcquireInstanceLock", source)
         self.assertIn("NSApplicationSupportDirectory", source)
-        self.assertIn("NSBundle.mainBundle.bundleIdentifier", source)
-        self.assertIn('bundleIdentifier = @"menu.litellm.menu"', source)
+        self.assertIn('kLiteLLMMenuInstanceNamespace = @"menu.litellm.menu"', source)
+        self.assertIn("Contents/MacOS/LiteLLMMenu", source)
         self.assertNotIn("NSTemporaryDirectory", source)
         self.assertIn("flock(descriptor, LOCK_EX | LOCK_NB)", source)
         self.assertIn("NSApplicationMain", source)
@@ -422,12 +441,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('action.id != L"service-start"', windows)
 
         self.assertIn('await ipc.dispatch({ type: `service.${operation}` });', ui)
-        self.assertIn("return await refreshSnapshot(!background);", ui)
+        self.assertIn("return await refreshSnapshot();", ui)
         self.assertIn('if (snapshot.service.state === "stopped") void runServiceOperation("start");', ui)
         self.assertIn('if (operation === "stop") serviceShouldBeRunning.current = false;', ui)
-        self.assertIn("const SERVICE_HEALTH_POLL_MS = 10_000;", ui)
-        self.assertIn("const SERVICE_RECOVERY_RETRY_MS = 15_000;", ui)
-        self.assertIn('runServiceOperation("health", true)', ui)
+        self.assertNotIn("SERVICE_HEALTH_POLL_MS", ui)
+        self.assertNotIn("SERVICE_RECOVERY_RETRY_MS", ui)
+        self.assertNotIn("pollServiceHealth", ui)
         self.assertIn('void runServiceOperation("start");', ui)
 
         bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
@@ -457,6 +476,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn('language-settings', app_delegate)
         self.assertNotIn('language-settings', leaf)
 
+    def test_macos_reopen_shows_the_primary_configuration_window(self) -> None:
+        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+
+        self.assertIn("applicationShouldHandleReopen", app_delegate)
+        self.assertIn("hasVisibleWindows", app_delegate)
+        self.assertIn('openRouteFromDeepLink:@"providers-models" logTab:nil', app_delegate)
+        self.assertIn('representedObject = "native-open-relay-accounts"', leaf)
+        self.assertIn("action: #selector(openRelayAccounts)", leaf)
+
     def test_macos_bundle_prohibits_duplicate_menu_bar_instances(self) -> None:
         """A second launch must activate the existing app, not add another LL item."""
 
@@ -465,31 +494,34 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("<key>LSMultipleInstancesProhibited</key>", info)
         self.assertIn("<true/>", info.split("<key>LSMultipleInstancesProhibited</key>", 1)[1].split("</dict>", 1)[0])
-        self.assertIn("runningApplicationsWithBundleIdentifier", main)
+        self.assertIn("NSWorkspace.sharedWorkspace.runningApplications", main)
+        self.assertIn("LiteLLMMenuIsManagedApplication", main)
         self.assertIn("application.processIdentifier != currentPID", main)
         self.assertIn("activateWithOptions", main)
         self.assertLess(main.index("LiteLLMMenuExistingInstance()"), main.index("NSApplicationMain(argc, argv)"))
 
-    def test_macos_preview_metadata_is_opt_in_and_keeps_production_single_instance(self) -> None:
+    def test_macos_preview_metadata_keeps_the_production_instance_identity(self) -> None:
         build = (ROOT / "rn/scripts/build-macos.sh").read_text(encoding="utf-8")
         main = (MAC_PROJECT / "LiteLLMMenu-macOS/main.m").read_text(encoding="utf-8")
 
-        self.assertIn("LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER", build)
+        self.assertIn("LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER is unsupported", build)
         self.assertIn("LITELLM_MENU_MACOS_DISPLAY_NAME", build)
         self.assertIn("LITELLM_MENU_MACOS_ROUTE_SCHEME", build)
         self.assertIn("LITELLM_MENU_MACOS_PREVIEW_PROFILE_ROOT", build)
         self.assertIn("LITELLM_MENU_MACOS_PREVIEW_PORT", build)
         self.assertIn("LiteLLMMenuPreviewProfileRoot", build)
         self.assertIn("LiteLLMMenuPreviewPort", build)
+        self.assertIn('PREVIEW_BUNDLE_IDENTIFIER="menu.litellm.menu"', build)
         self.assertIn("Set :CFBundleIdentifier $PREVIEW_BUNDLE_IDENTIFIER", build)
-        self.assertIn("NSBundle.mainBundle.bundleIdentifier", main)
-        self.assertIn('bundleIdentifier = @"menu.litellm.menu"', main)
+        self.assertIn('kLiteLLMMenuInstanceNamespace = @"menu.litellm.menu"', main)
+        self.assertNotIn("distinct preview bundle", main)
 
-    def test_macos_preview_profile_is_embedded_only_for_a_distinct_bundle(self) -> None:
+    def test_macos_preview_profile_is_embedded_without_a_second_instance_identity(self) -> None:
         bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
 
         self.assertIn("previewProfileEnvironment", bridge)
-        self.assertIn('Bundle.main.bundleIdentifier != "menu.litellm.menu"', bridge)
+        self.assertIn('guard let rawRoot = Bundle.main.object(forInfoDictionaryKey: "LiteLLMMenuPreviewProfileRoot")', bridge)
+        self.assertNotIn('Bundle.main.bundleIdentifier != "menu.litellm.menu"', bridge)
         self.assertIn('"LiteLLMMenuPreviewProfileRoot"', bridge)
         self.assertIn('"LiteLLMMenuPreviewPort"', bridge)
         for key in (
@@ -589,9 +621,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("func windowShouldClose(_ sender: NSWindow) -> Bool", leaf)
         self.assertIn("approvedCloseRoutes", leaf)
         self.assertIn("routeForWindow(sender)", leaf)
+        self.assertIn("requestClose(route: route, hiding: sender)", leaf)
+        self.assertIn("window.orderOut(nil)", leaf)
         self.assertIn('emitAction("request-close-\\(route)")', leaf)
-        self.assertIn("@objc private func closeFromShortcut() { requestClose(route: NSApp.keyWindow.flatMap(routeForWindow)) }", leaf)
+        self.assertIn("requestClose(route: window.flatMap(routeForWindow), hiding: window)", leaf)
         self.assertIn("request-close-", ui)
+        self.assertIn("if (!needsDiscardConfirmation) {\n      closeRoute();\n      return;", ui)
         self.assertIn("onPress={requestClose}", ui)
 
     def test_macos_content_size_bridge_resizes_the_existing_react_window(self) -> None:
@@ -630,10 +665,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("NSApplicationActivationPolicyRegular", app_delegate)
         self.assertIn("LSUIElement", info)
         self.assertIn("<key>CFBundleIconFile</key>\n\t<string>AppIcon</string>", info)
+        self.assertNotIn("CFBundleIconName", info)
+        icon_generator = (ROOT / "scripts/generate-macos-app-icons.swift").read_text(encoding="utf-8")
+        self.assertIn("let iconRect = CGRect(x: 108, y: 108, width: 808, height: 808)", icon_generator)
+        self.assertIn("roundedRect", icon_generator)
+        self.assertNotIn("CGGradient", icon_generator)
+        self.assertNotIn("drawLinearGradient", icon_generator)
+        self.assertNotIn("context.fill(CGRect(x: 0, y: 0, width: canvasSize, height: canvasSize))", icon_generator)
+        self.assertIn("context.setShadow", icon_generator)
         self.assertIn("NSApp.setActivationPolicy(.accessory)", leaf)
+        self.assertIn("NSApp.setActivationPolicy(.regular)", leaf)
         self.assertIn('Bundle.main.url(forResource: "AppIcon", withExtension: "icns")!', leaf)
         self.assertIn("NSApp.applicationIconImage = Self.applicationIcon", leaf)
-        self.assertIn("NSApp.setActivationPolicy(.regular)", leaf)
         self.assertLess(
             leaf.index("NSApp.setActivationPolicy(.regular)"),
             leaf.index("NSApp.applicationIconImage = Self.applicationIcon"),
@@ -694,6 +737,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("func showReadOnlyText(title: String, text: String, closeTitle: String)", mac)
         self.assertIn("textView.isEditable = false", mac)
         self.assertIn("textView.isSelectable = true", mac)
+        self.assertIn("private let readOnlyCodeFontSize: CGFloat = 12", mac)
+        self.assertIn("textView.font = NSFont.monospacedSystemFont(ofSize: readOnlyCodeFontSize, weight: .regular)", mac)
         self.assertIn("alert.addButton(withTitle: closeTitle)", mac)
         self.assertIn("@objc func showReadOnlyText", mac_module)
         self.assertIn("RCT_EXTERN_METHOD(showReadOnlyText:", mac_bridge)
@@ -785,6 +830,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
         mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        mac_controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         mac_module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
         mac_core = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         windows_header = (WIN_NATIVE / "WinUI3NativeLeafModule.h").read_text(encoding="utf-8")
@@ -804,18 +850,39 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         relay_ui = (SHARED / "ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
         self.assertIn('language: snapshot?.language ?? "system"', relay_ui)
         self.assertIn("const rememberPasswordRef = useRef(false);", relay_ui)
+        self.assertIn("const passwordStorageAvailable = true;", relay_ui)
         self.assertIn("const [manualType, setManualType] = useState<RelayType>();", relay_ui)
         self.assertIn("const accountType = detected ?? manualType;", relay_ui)
-        self.assertIn("NativeSegmentedControl", relay_ui)
-        self.assertIn("addAccount(accountType, origin.trim(), rememberPasswordRef.current)", relay_ui)
+        self.assertIn("NativePicker", relay_ui)
+        self.assertIn("addAccount(accountType, candidate, passwordStorageAvailable && rememberPasswordRef.current, {", relay_ui)
         self.assertIn(
             "typeDetectionRequest.current += 1;\n"
-            "    setAdding(false);",
+            "    setAdding(setupOnly);",
             relay_ui,
         )
-        self.assertIn("onChangeText={(value) => { typeDetectionRequest.current += 1; setOrigin(value); setTypeDetection(undefined); setManualType(undefined); }}", relay_ui)
+        self.assertIn('const [addStep, setAddStep] = useState<AddStep>("origin");', relay_ui)
+        self.assertIn('type AddStep = "origin" | "sign-in";', relay_ui)
+        self.assertIn("onChangeText={updateAddOrigin}", relay_ui)
+        self.assertNotIn('onBlur={() => { void detectRelayType(); }}', relay_ui)
+        self.assertIn("setAddStationName(suggestedRelayStationName(value));", relay_ui)
+        self.assertIn("const updateAddStationName = (value: string): void =>", relay_ui)
+        self.assertIn('SetupProgress step="origin"', relay_ui)
+        self.assertNotIn('SetupProgress step="select"', relay_ui)
+        self.assertNotIn('setAddStep("select")', relay_ui)
+        self.assertIn(': !setupOnly && selected ? <View style={styles.detailWorkspace}>', relay_ui)
+        self.assertIn('onClose?.();\n        native.window.focus("relay-accounts");', relay_ui)
+        self.assertIn("if (embedded) return true;", relay_ui)
         self.assertIn("NativeCheckbox", relay_ui)
         self.assertIn('title={translate("relay.importSelected")}', relay_ui)
+        self.assertIn('type SavedSessionRestore = "signed_in" | "expired" | "unavailable";', relay_ui)
+        self.assertIn("const openedAccountIDs = useRef(new Set<string>());", relay_ui)
+        self.assertIn("const refreshLoginState = async (account: RelayAccount, automatic = false): Promise<void> => {", relay_ui)
+        self.assertIn("void refreshLoginState(selected, true);", relay_ui)
+        self.assertIn('title={translate("common.refresh")}', relay_ui)
+        self.assertIn('native.window.open("relay-add")', relay_ui)
+        self.assertIn('translate("relay.passwordNotSaved")', relay_ui)
+        self.assertNotIn('onPress={() => { void refreshWorkspace(); }}', relay_ui)
+        self.assertNotIn('translate("relay.status.signed_out")', relay_ui)
 
         self.assertIn("import WebKit", mac_leaf)
         self.assertIn("configuration.websiteDataStore = .nonPersistent()", mac_leaf)
@@ -823,49 +890,79 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('Probe(path: "api/user/self"', mac_leaf)
         self.assertIn('Probe(path: "api/v1/auth/me"', mac_leaf)
         self.assertIn("sameOrigin(url)", mac_leaf)
-        self.assertIn("NativeRelayCredentialStore", mac_leaf)
-        self.assertIn('private static var servicePrefix: String', mac_leaf)
-        self.assertIn('Bundle.main.bundleIdentifier', mac_leaf)
-        self.assertIn('private static var sessionService: String { servicePrefix + "-session" }', mac_leaf)
-        self.assertIn("kSecAttrAccount as String: accountID", mac_leaf)
+        self.assertIn("NativeRelaySessionMemoryStore", mac_leaf)
+        self.assertNotIn("NativeRelayCredentialStore", mac_leaf)
+        self.assertNotIn("import Security", mac_leaf)
+        self.assertNotIn("SecItem", mac_leaf)
+        self.assertNotIn("kSec", mac_leaf)
         self.assertIn("accountType: type,", mac_leaf)
         self.assertIn("origin: originURL.absoluteString", mac_leaf)
         self.assertIn("restoreSessionAndLoad()", mac_leaf)
         self.assertIn("httpCookieStore.setCookie(cookie)", mac_leaf)
         self.assertIn("localStorage.setItem('access_token', accessToken)", mac_leaf)
+        self.assertIn("localStorage.getItem('user')", mac_leaf)
+        self.assertIn("user.token = accessToken", mac_leaf)
+        self.assertIn("typeof user.token === 'string' ? user.token : ''", mac_leaf)
+        self.assertIn("WKScriptMessageHandler", mac_leaf)
+        self.assertIn('configuration.userContentController.add(self, name: "litellmRelayPassword")', mac_leaf)
+        self.assertIn("window.webkit.messageHandlers.litellmRelayPassword.postMessage(password)", mac_leaf)
+        self.assertIn("capturedPassword = password", mac_leaf)
+        sign_in_check = mac_leaf.split("private func startSignInCheck", 1)[1].split("private func isCurrentCheck", 1)[0]
+        self.assertNotIn("capturedPassword = nil", sign_in_check)
         self.assertIn("let probeAccessToken = capturedAccessToken ?? restoredSession?.accessToken", mac_leaf)
         self.assertIn("!(acceptedCookie?.isEmpty ?? true) || !(accessToken?.isEmpty ?? true)", mac_leaf)
         self.assertIn("guard !cookie.isEmpty || !accessToken.isEmpty else", mac_leaf)
-        self.assertIn("NativeRelayPasswordCapture", mac_leaf)
-        self.assertIn('name: "relayPassword"', mac_leaf)
-        self.assertIn("if rememberPassword {", mac_leaf)
         self.assertIn("let username = detectedUsername ?? self.presetUsername ?? \"\"", mac_leaf)
-        self.assertIn("let password = rememberPassword", mac_leaf)
         self.assertIn("set(user, \\(safeUser))", mac_leaf)
-        self.assertIn("if (\\(safePassword)) set(password, \\(safePassword))", mac_leaf)
         self.assertIn("input[type=email], input[type=text]", mac_leaf)
         self.assertIn("const words = new Set(['login', 'log in', 'sign in', '登录']);", mac_leaf)
         self.assertIn('guard type == "sub2api" else { return originURL }', mac_leaf)
         self.assertIn('originURL.appendingPathComponent("login")', mac_leaf)
         self.assertIn("private let loadingOverlay = NSVisualEffectView()", mac_leaf)
+        self.assertNotIn("NSProgressIndicator", mac_leaf)
+        self.assertNotIn("startAnimation", mac_leaf)
+        self.assertIn("private static let immediateWebPresentationScript", mac_leaf)
+        self.assertIn("animation: none !important;", mac_leaf)
+        self.assertIn("transition: none !important;", mac_leaf)
+        self.assertIn("const stripGradients", mac_leaf)
+        self.assertNotIn("background-image: none !important;", mac_leaf)
         self.assertIn(': text("Loading sign-in page...", "正在加载登录页面...")', mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didStartProvisionalNavigation", mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didFailProvisionalNavigation", mac_leaf)
-        self.assertIn("let passwordExpression = rememberPassword", mac_leaf)
-        self.assertIn("includePassword: rememberPassword", mac_leaf)
-        self.assertIn("static func backup(accountID: String, includePassword: Bool)", mac_leaf)
-        self.assertIn("password.utf8.count <= 4_096", mac_leaf)
-        self.assertIn("NativeRelayCredentialStore.backup(accountID: accountID, includePassword: rememberPassword)", mac_leaf)
-        self.assertIn("NativeRelayCredentialStore.restore(previousCredentials", mac_leaf)
-        self.assertIn("private let cancelButton = NSButton", mac_leaf)
+        self.assertIn("private var capturedPassword: String?", mac_leaf)
+        self.assertIn("__litellm_menu_relay_password", mac_leaf)
+        self.assertIn("let shouldRememberPassword = rememberPassword", mac_leaf)
+        self.assertIn("let capturedPassword = self.capturedPassword", mac_leaf)
+        self.assertIn("password: shouldRememberPassword ? capturedPassword : nil", mac_leaf)
+        self.assertNotIn("autoLoginAttempt", mac_leaf)
+        self.assertIn("private var automaticCheckProbe: DispatchWorkItem?", mac_leaf)
+        self.assertIn("private var loginFormRevealProbe: DispatchWorkItem?", mac_leaf)
+        self.assertIn("private func scheduleLoginFormReveal()", mac_leaf)
+        self.assertIn("user.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });", mac_leaf)
+        self.assertIn("user.focus({ preventScroll: true })", mac_leaf)
+        self.assertIn("guard statusLabel.stringValue != value else { return }", mac_leaf)
+        self.assertIn("if !automatically {", mac_leaf)
+        self.assertIn("setStatus(waitingForSignInStatus)", mac_leaf)
+        self.assertNotIn('text("Waiting for sign-in; success is detected automatically.', mac_leaf)
+        self.assertIn('text("1 Relay URL  ›  2 Sign in", "1 中转站 URL  ›  2 登录")', mac_leaf)
+        self.assertNotIn("3 Select resources", mac_leaf)
+        self.assertIn("signInButton.isHidden = !showsReloadAction", mac_leaf)
+        self.assertIn("cancelButton.isHidden = !showsPanelActions", mac_leaf)
+        self.assertIn("parent.beginSheet(window)", mac_leaf)
+        self.assertIn("parent.endSheet(window)", mac_leaf)
+        self.assertIn("@objc private func closeEmbeddedWindow", mac_leaf)
+        self.assertIn('self?.close(route: "relay-add")', mac_leaf)
+        self.assertNotIn('text("Check Sign-In", "检查登录")', mac_leaf)
+        self.assertIn('text("No valid sign-in was found.', mac_leaf)
+        self.assertIn('L"Verify Sign-In", L"验证登录"', windows_relay)
+        self.assertIn("LiteLLMTabStopIdentifier", mac_controls)
+        self.assertIn("HandleLiteLLMTabCommand", mac_controls)
         self.assertIn("guard !finished, !checking else { return }", mac_leaf)
         self.assertIn("capturedAccessToken = nil", mac_leaf)
-        self.assertIn("passwordCapture.reset()", mac_leaf)
         self.assertIn("private func beginBrowserFlow()", mac_leaf)
         self.assertIn("beginBrowserFlow()", mac_leaf)
         check_sign_in = mac_leaf.split("@objc private func checkSignIn", 1)[1].split("private func isCurrentCheck", 1)[0]
         self.assertNotIn("capturedPassword = nil", check_sign_in)
-        self.assertNotIn("passwordCapture.reset()", check_sign_in)
         self.assertIn("private final class NativeRelayLoginAttempt", mac_leaf)
         self.assertIn("private var activeCheck: NativeRelayLoginAttempt?", mac_leaf)
         self.assertIn("private func isCurrentCheck(_ attempt: NativeRelayLoginAttempt) -> Bool", mac_leaf)
@@ -888,6 +985,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('"origin", "language", "username"', mac_module)
         self.assertIn('resolve(["revision": result.revision, "loginStatus": "signed_in", "username": result.username])', mac_module)
         self.assertIn('route: "host/relay/login"', mac_core)
+        self.assertIn('payload["password"] = password', mac_core)
         self.assertIn('Set(object.keys) == Set(["protocol_version", "revision", "login_status", "username"])', mac_core)
         self.assertIn('"/v1/host/relay/login"', core_ipc)
 
@@ -899,6 +997,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("ProfileName(ProfileName(state->options.account_id))", windows_relay)
         self.assertIn("CredWriteW", windows_relay)
         self.assertIn("ProbeEndpoint(state->options", windows_relay)
+        self.assertIn("auto_submit_saved_password_pending", windows_relay)
+        self.assertIn("did_auto_submit_saved_password", windows_relay)
+        self.assertIn("auto_login_attempt", windows_relay)
+        self.assertIn("localStorage.getItem('user')", windows_relay)
+        self.assertIn("user.token=access", windows_relay)
+        self.assertIn("userInput.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });", windows_relay)
+        self.assertIn("userInput.focus({ preventScroll: true })", windows_relay)
         self.assertIn("bool UseChinese(WindowsRelayLoginOptions const& options)", windows_relay)
         self.assertIn('options.language == "zh-Hans"', windows_relay)
         self.assertIn('auto prior_password = state->options.remember_password', windows_relay)
@@ -924,6 +1029,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('auto const ui_language = language.value_or("system")', windows_module)
         self.assertIn('HostRequest(L"host/relay/login"', windows_core)
         self.assertIn('HostRequest(L"host/relay/login", body, false, 60000)', windows_core)
+        self.assertIn('payload.SetNamedValue(L"password"', windows_core)
+
+    def test_relay_login_headers_name_the_station_not_the_internal_adapter(self) -> None:
+        mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
+
+        self.assertIn(": (originURL.host ?? originURL.absoluteString)", mac_leaf)
+        self.assertNotIn('accountLabel.stringValue = "\\(type ==', mac_leaf)
+        self.assertIn("account.Text(Utf8ToWide(state->options.origin));", windows_relay)
+        self.assertNotIn("auto const account_type = state->options.account_type", windows_relay)
 
     def test_relay_session_restore_is_native_only_and_does_not_import_provider_models(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
@@ -946,14 +1061,30 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("restoreRelaySession?: (options:", platform)
         self.assertIn("native.restoreRelaySession", relay_ui)
         self.assertIn("username: account.username || undefined", relay_ui)
-        self.assertIn('translate("relay.checkSession")', relay_ui)
+        self.assertIn("const refreshLoginState = async (account: RelayAccount, automatic = false): Promise<void> => {", relay_ui)
+        self.assertIn("const restored = await restoreSavedSession(account);", relay_ui)
+        self.assertIn('if (restored === "signed_in")', relay_ui)
+        self.assertNotIn('translate("relay.lastUpdated"', relay_ui)
+        self.assertNotIn("accountAvatar", relay_ui)
+        self.assertNotIn("native.showActionMenu", relay_ui)
+        self.assertNotIn("NativeToggle", relay_ui)
+        self.assertIn('symbol={resource.enabled ? "power-off" : "power-on"}', relay_ui)
+        self.assertIn('native.copySecret({', relay_ui)
+        self.assertIn('domain="relay_accounts" field="api_key"', relay_ui)
+        self.assertIn('copySecret(options:', types)
+        self.assertIn('copySecret(domain: "relay_accounts", field: "api_key", target: string)', bridge)
+        self.assertIn('copySecret?: (domain: "relay_accounts", field: "api_key", target: string)', platform)
+        self.assertIn('@objc(copySecret:field:target:resolver:rejecter:)', mac_module)
+        self.assertIn('copySecret:(NSString *)domain field:(NSString *)field target:(NSString *)target', mac_bridge)
+        self.assertIn('REACT_METHOD(CopySecret, L"copySecret")', windows_header)
+        self.assertIn('void WinUI3NativeLeafModule::CopySecret(', windows_module)
         self.assertIn("@objc(restoreRelaySession:resolver:rejecter:)", mac_module)
         self.assertIn("restoreRelaySession:(NSDictionary *)options", mac_bridge)
         self.assertIn("func restoreRelaySession(", mac_leaf)
         self.assertIn("presetUsername: username?.trimmingCharacters(in: .whitespacesAndNewlines)", mac_leaf)
         self.assertIn("NativeRelaySessionProbe.verify", mac_leaf)
         self.assertIn("sawAuthenticationRejection && !sawNonAuthenticationFailure", mac_leaf)
-        self.assertIn("NativeRelayCredentialStore.writeSession(refreshedSession, accountID: accountID)", mac_leaf)
+        self.assertIn("NativeRelaySessionMemoryStore.writeSession(refreshedSession, accountID: accountID)", mac_leaf)
         usage_logs = logs_ui.split("const openRelayUsageLogs", 1)[1].split("return <View style={styles.logsWindow}", 1)[0]
         self.assertLess(usage_logs.index("native.restoreRelaySession"), usage_logs.index("native.openRelayLogs"))
         self.assertIn('session?.loginStatus !== "signed_in"', usage_logs)
@@ -983,9 +1114,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("clearRelayCredentials?: (accountId: string) => Promise<void>", platform)
         self.assertIn("if (!leaf.clearRelayCredentials)", platform)
         self.assertIn("func clearRelayCredentials(accountID: String) -> Bool", mac_leaf)
-        self.assertIn("NativeRelayCredentialStore.clear(accountID: accountID)", mac_leaf)
-        self.assertIn("let passwordRemoved = delete(service: passwordService", mac_leaf)
-        self.assertIn("let sessionRemoved = delete(service: sessionService", mac_leaf)
+        self.assertIn("NativeRelaySessionMemoryStore.clear(accountID: accountID)", mac_leaf)
+        self.assertNotIn("NativeRelayCredentialStore", mac_leaf)
+        self.assertNotIn("import Security", mac_leaf)
+        self.assertNotIn("SecItem", mac_leaf)
+        self.assertNotIn("kSec", mac_leaf)
         self.assertIn("@objc(clearRelayCredentials:resolver:rejecter:)", mac_module)
         self.assertIn("clearRelayCredentials:(NSString *)accountID", mac_bridge)
         self.assertIn('REACT_METHOD(ClearRelayCredentials, L"clearRelayCredentials")', windows_header)
@@ -1101,7 +1234,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertIn("onSecretState", spec)
         self.assertIn("NSSecureTextField *_field", mac)
         self.assertIn("NSTextField *_plainField", mac)
-        self.assertIn("loadProviderAPIKeyForTarget", mac)
+        self.assertIn("loadPlainTextSecretForGeneration", mac)
         self.assertIn("void ConfigureSingleLineTextField(NSTextField *field)", mac)
         self.assertIn("field.usesSingleLineMode = YES", mac)
         self.assertIn("field.lineBreakMode = NSLineBreakByTruncatingTail", mac)
@@ -1109,6 +1242,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("cell.scrollable = YES", mac)
         self.assertIn("ConfigureSingleLineTextField(_field);", mac)
         self.assertIn("ConfigureSingleLineTextField(_plainField);", mac)
+        self.assertEqual(2, mac.count("[self addCursorRect:self.bounds cursor:NSCursor.iBeamCursor];"))
         self.assertIn("stageSecretForDomain", mac)
         self.assertIn("stageSecretForDomain(", mac_core)
         self.assertIn("PasswordBox password_box_", windows)
@@ -1123,7 +1257,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         )
         self.assertIn("PasswordRevealMode::Hidden", windows)
         self.assertIn("PasswordRevealMode::Visible", windows)
-        self.assertIn("IsPlainTextProviderKey", windows)
+        self.assertIn("IsPlainTextAutoCommitField", windows)
         self.assertIn("CreateSecretCapability(", windows)
         self.assertIn("StageSecret(capability->token, secret, false)", windows)
         self.assertNotIn("onChangeText", windows_codegen)
@@ -1139,12 +1273,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
 
         self.assertIn('route in {"/v1/host/secret/read-capability", "/v1/host/secret/read"}', ipc)
-        self.assertIn('if (name, field_name) != ("providers_models", "api_key"):', service)
+        self.assertIn("_PLAINTEXT_SECRET_FIELDS", service)
+        self.assertIn('(\"codex\", \"api_key\")', service)
+        self.assertIn('(\"claude\", \"deployment_token\")', service)
         self.assertIn("_SecretReadCapability", ipc)
         self.assertIn("read_secret_capability", ipc)
-        self.assertIn("readProviderAPIKeyForTarget", mac)
-        self.assertIn("ReadProviderAPIKey", windows_header)
-        self.assertIn("ReadProviderAPIKey", windows)
+        self.assertIn("readPlainTextSecretForDomain", mac)
+        self.assertIn("ReadPlainTextSecret", windows_header)
+        self.assertIn("ReadPlainTextSecret", windows)
         self.assertNotIn("secret/read", (SHARED / "platform" / "nativeBridge.ts").read_text(encoding="utf-8"))
 
     def test_provider_api_key_uses_native_plaintext_auto_commit(self) -> None:
@@ -1167,10 +1303,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertIn("autoCommit?: WithDefault<boolean, false>;", spec)
         self.assertIn("_field.action = @selector(submitSecret:);", mac)
         self.assertIn("controlTextDidEndEditing", mac)
-        self.assertIn("loadProviderAPIKeyForTarget", mac)
-        self.assertIn("readProviderAPIKey", mac_core)
+        self.assertIn("loadPlainTextSecretForGeneration", mac)
+        self.assertIn("readPlainTextSecret", mac_core)
         self.assertIn("host/secret/read", mac_core)
-        self.assertIn("ReadProviderAPIKey", windows_core)
+        self.assertIn("ReadPlainTextSecret", windows_core)
 
     def test_secure_input_is_registered_in_both_fabric_hosts(self) -> None:
         mac_package = (ROOT / "rn/apps/macos/package.json").read_text(encoding="utf-8")
@@ -1256,7 +1392,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "NSPopUpButton",
             "NSSegmentedControl",
             "NSTextField",
-            "NSSwitch",
+            "LiteLLMTabSwitch",
         ):
             self.assertIn(native_class, controls)
 
@@ -1295,7 +1431,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_scrollView.verticalScrollElasticity = NSScrollElasticityNone", controls)
         self.assertIn("@interface LiteLLMTableScrollView : NSScrollView", controls)
         self.assertIn("- (void)scrollWheel:(NSEvent *)event", controls)
-        self.assertIn("if (!_acceptsVerticalScroll && !_acceptsHorizontalScroll)", controls)
+        self.assertIn("BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL acceptsVerticalScroll, BOOL acceptsHorizontalScroll);", controls)
+        self.assertIn("BOOL ForwardWheelToParent(NSView *view, NSEvent *event);", controls)
+        self.assertIn("if (TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll))", controls)
+        self.assertIn("if (ForwardWheelToParent(self, event)) return;", controls)
         self.assertIn("_scrollView.acceptsVerticalScroll = NO", controls)
         self.assertIn("@interface LiteLLMTableClipView : NSClipView", controls)
         self.assertIn("_clipView.acceptsVerticalScroll = NO", controls)
@@ -1304,9 +1443,17 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("constrainBoundsRect", controls)
         self.assertIn("@interface LiteLLMTableView : NSTableView", controls)
         self.assertIn("_tableView.acceptsVerticalScroll = NO", controls)
-        self.assertIn("column.minWidth = MIN(96, width);", controls)
+        self.assertIn("NSScrollView *owner = ParentScrollView(self);", controls)
+        self.assertIn("TableScrollViewCanConsume(owner, event", controls)
+        self.assertIn("BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event", controls)
+        self.assertIn("const NSRect visible = [scrollView.documentView convertRect:scrollView.contentView.bounds fromView:scrollView.contentView];", controls)
+        self.assertIn("column.minWidth = 1;", controls)
         self.assertIn("column.maxWidth = CGFLOAT_MAX;", controls)
-        self.assertIn("const bool dataChanged = columnsChanged || compactChanged || nextDataSignature != _dataSignature;", controls)
+        self.assertIn("const bool rowsChanged = oldViewProps.rowKeys != newViewProps.rowKeys ||", controls)
+        self.assertIn("oldViewProps.cells != newViewProps.cells ||", controls)
+        self.assertIn("overflowBehaviorChanged || alternatingRowsChanged || rowsChanged;", controls)
+        self.assertNotIn("_dataSignature", controls)
+        self.assertNotIn("nextDataSignature", controls)
         self.assertIn("- (void)updateScrollerVisibility", controls)
         self.assertIn("const CGFloat headerHeight = _tableView.headerView == nil ? 0 : NSHeight(_tableView.headerView.frame);", controls)
         self.assertIn("const CGFloat dataViewportHeight = MAX(0, NSHeight(_scrollView.contentView.bounds) - headerHeight);", controls)
@@ -1314,16 +1461,50 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NSMaxY([_tableView rectOfRow:rowCount - 1])", controls)
         self.assertNotIn("_tableView.numberOfRows * _tableView.rowHeight", controls)
         self.assertIn("const BOOL needsVerticalScroller = rowsHeight > dataViewportHeight;", controls)
-        self.assertIn("const CGFloat horizontalChromeWidth = MAX(", controls)
-        self.assertIn("const CGFloat availableColumnWidth = NSWidth(visibleBounds) + horizontalChromeWidth;", controls)
-        self.assertIn("const BOOL needsHorizontalScroller = contentWidth > availableColumnWidth + 0.5;", controls)
-        self.assertIn("_automaticLastColumnFill = _scrollView.hasHorizontalScroller", controls)
+        self.assertIn("- (void)updateColumnMinimumWidths", controls)
+        self.assertIn("if (!viewProps.scrollTrailingColumnOverflow || columnCount == 0", controls)
+        self.assertIn("if (newViewProps.scrollTrailingColumnOverflow) {\n      [self updateColumnMinimumWidths];", controls)
+        self.assertIn("const CGFloat textWidth = ceil([value sizeWithAttributes:@{NSFontAttributeName: TableCellFont()}].width)", controls)
+        self.assertIn("MIN(_requestedColumnWidths[index], minimumWidths[index])", controls)
+        self.assertIn("const CGFloat availableColumnWidth = NSWidth(visibleBounds);", controls)
+        self.assertIn("const auto minimumContentWidth = [&]()", controls)
+        self.assertIn("const BOOL needsHorizontalScroller = minimumContentWidth() > availableColumnWidth + 0.5 ||", controls)
+        self.assertIn("preferredContentWidth > availableColumnWidth + 0.5", controls)
+        self.assertIn("std::vector<CGFloat> laidOutColumnWidths = _requestedColumnWidths;", controls)
+        self.assertIn("laidOutColumnWidths[index] = MAX(laidOutColumnWidths[index], _tableView.tableColumns[index].minWidth);", controls)
+        self.assertIn("const CGFloat reduction = MIN(deficit, MAX(0, laidOutColumnWidths[index] - minimumWidth));", controls)
+        self.assertIn("_automaticColumnAdjustments[index] = width - _requestedColumnWidths[index];", controls)
+        self.assertNotIn("contentWidth > availableColumnWidth + 0.5", controls)
+        self.assertIn("cellHorizontalPadding?: WithDefault<Float, 8>;", (SHARED / "ui" / "macos" / "NativeTableNativeComponent.ts").read_text(encoding="utf-8"))
+        self.assertIn("firstColumnHorizontalPadding?: WithDefault<Float, 8>;", (SHARED / "ui" / "macos" / "NativeTableNativeComponent.ts").read_text(encoding="utf-8"))
+        self.assertIn("scrollTrailingColumnOverflow?: WithDefault<boolean, false>;", (SHARED / "ui" / "macos" / "NativeTableNativeComponent.ts").read_text(encoding="utf-8"))
+        self.assertIn("cellHorizontalPadding={0}", (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8"))
+        self.assertIn("firstColumnHorizontalPadding={0}", (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8"))
+        self.assertIn("scrollTrailingColumnOverflow", (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8"))
+        self.assertIn("std::vector<CGFloat> _measuredColumnWidths;", controls)
+        self.assertIn("std::vector<bool> _userResizedColumns;", controls)
+        self.assertIn("_measuredColumnWidths = minimumWidths;", controls)
+        self.assertIn("_userResizedColumns[resizedColumn] = true;", controls)
+        self.assertIn("const CGFloat trailingContentInset = viewProps.scrollTrailingColumnOverflow ? 10 : 0;", controls)
+        self.assertIn(
+            "_requestedColumnWidths[resizedColumn] = MAX(_tableView.tableColumns[resizedColumn].minWidth, width);",
+            controls,
+        )
+        self.assertIn("_measuredColumnWidths.back() + trailingContentInset", controls)
         self.assertIn("MAX(dataViewportHeight, rowsHeight));", controls)
         self.assertIn("_scrollView.acceptsVerticalScroll = needsVerticalScroller;", controls)
         self.assertIn("_tableView.acceptsVerticalScroll = needsVerticalScroller;", controls)
+        self.assertIn("headerFrame.size.height = newViewProps.compact ? 24 : 28;", controls)
         self.assertIn("if (selectionChanged && _scrollView.hasVerticalScroller)", controls)
         self.assertIn("_tableView.action = @selector(handleRowClick:);", controls)
         self.assertIn("- (void)handleRowClick", controls)
+        table_start = controls.index("@implementation LiteLLMAppKitTableComponentView")
+        table_end = controls.index("Class<RCTComponentViewProtocol> LiteLLMAppKitTableCls", table_start)
+        table = controls[table_start:table_end]
+        self.assertIn("- (void)prepareForRecycle", table)
+        self.assertIn("_props = defaultProps;", table)
+        self.assertIn("[_tableView reloadData];", table)
+        self.assertIn("_hasLoadedData = NO;", table)
 
     def test_macos_menu_autostart_fallback_uses_localization(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -1386,13 +1567,17 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (titleChanged || symbolChanged || linkChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
         self.assertIn('symbolName = @"pause.fill";', controls)
         self.assertIn('symbolName = @"play.fill";', controls)
+        self.assertIn('symbolName = @"minus";', controls)
         self.assertIn('symbolName = @"trash";', controls)
         self.assertIn("_button.imagePosition = symbolImage == nil ? NSNoImage : NSImageOnly;", button)
 
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         self.assertIn('const auto symbol = props.symbol.value_or("");', windows)
         self.assertIn('icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));', windows)
-        self.assertIn('symbol == "pause" ? L"\\xE769" : symbol == "play" ? L"\\xE768" : L"\\xE74D"', windows)
+        self.assertIn('if (symbol == "check")', windows)
+        self.assertIn('else if (symbol == "power-on" || symbol == "power-off")', windows)
+        self.assertIn('else if (symbol == "copy")', windows)
+        self.assertIn('else if (symbol == "edit")', windows)
 
     def test_native_boolean_controls_skip_unrelated_prop_rewrites(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
@@ -1402,7 +1587,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (selectionChanged || _tableView.selectedRow != selectedIndex)", mac)
         self.assertIn("if (selectionChanged && _scrollView.hasVerticalScroller) {\n      [_tableView scrollRowToVisible:selectedIndex];", mac)
         self.assertIn("BOOL TableIsFollowingBottom(NSScrollView *scrollView, NSTableView *tableView)", mac)
-        self.assertIn("const BOOL initialDataLoad = _dataSignature.empty();", mac)
+        self.assertIn("const BOOL initialDataLoad = !_hasLoadedData;", mac)
         self.assertIn("(initialDataLoad || TableIsFollowingBottom(_scrollView, _tableView))", mac)
         self.assertIn("const BOOL wasFollowingBottom = newViewProps.followBottom && dataChanged", mac)
         self.assertIn("newViewProps.followBottom && dataChanged && wasFollowingBottom", mac)
@@ -1416,7 +1601,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("const bool value_changed = !old_props || old_props->value != props.value;", checkbox)
         self.assertIn("if (value_changed) checkbox_.IsChecked(props.value.value_or(false));", checkbox)
         self.assertIn("ApplyProps(old_props);", switch)
-        self.assertIn("if (value_changed) {\n      syncing_ = true;\n      toggle_.IsOn(props.value.value_or(false));", switch)
+        self.assertIn("if (value_changed) {\n      syncing_ = true;\n      value_ = props.value.value_or(false);\n      UpdateGlyph();", switch)
 
         table = windows.split("struct TableComponentView final", 1)[1].split(
             "struct TextEditorComponentView final", 1
@@ -1507,6 +1692,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
     def test_macos_split_view_gives_fabric_the_same_controlled_pane_geometry(self) -> None:
         native_controls = (SHARED / "ui" / "NativeControls.tsx").read_text(encoding="utf-8")
 
+        self.assertIn("if (!paneOpen)", native_controls)
+        self.assertIn(
+            'return <View style={[styles.splitFallback, style]}><View style={styles.splitTrailing}>{trailing}</View></View>;',
+            native_controls,
+        )
         macos = native_controls.rsplit('if (Platform.OS === "macos")', 1)[1].split(
             'return <View style={[styles.splitFallback, style]}>', 1
         )[0]
@@ -1526,9 +1716,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "ComboBox",
             "ToggleButton",
             "TextBox",
-            "ToggleSwitch",
+            "TextBlock",
         ):
             self.assertIn(native_class, controls)
+        self.assertNotIn("ToggleSwitch", controls)
         for component in (
             "RegisterLiteLLMWinUIButtonNativeComponent",
             "RegisterLiteLLMWinUISegmentedControlNativeComponent",
@@ -1601,8 +1792,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # viewport behavior is still covered by the settings editors above;
         # the log surface must not regress to a giant raw text editor.
         self.assertNotIn('documentKey={`logs:${selected}`}', ui)
-        self.assertIn("const columns = fitLogColumns(logColumns(selected, translate), tableWidth);", ui)
-        self.assertIn('<NativeTable columns={columns.map(({ label, width }) => ({ label, width }))}', ui)
+        self.assertIn("() => fitLogColumns(logColumns(selected, translate), tableWidth)", ui)
+        self.assertIn("const nativeTableColumns = useMemo(", ui)
+        self.assertIn("<NativeTable columns={nativeTableColumns}", ui)
         self.assertIn("REACT_FIELD(documentKey)", windows_codegen)
 
 

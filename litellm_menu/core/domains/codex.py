@@ -183,7 +183,15 @@ class CodexSettingsDomain:
             raise _safe_problem(exc, "Codex settings are invalid") from None
         if not isinstance(result, Mapping) or not isinstance(result.get("config_text"), str) or not isinstance(result.get("auth_text"), str):
             raise LegacyDomainError("Codex settings are invalid")
-        return copy.deepcopy(dict(result))
+        synced = copy.deepcopy(dict(result))
+        # ``sync_editor`` validates and rewrites an in-memory draft without
+        # touching CODEX_HOME, so its payload intentionally has no filesystem
+        # existence fields. Those fields describe the loaded disk baseline,
+        # not whether the draft contains text, and must survive every staged
+        # structured/raw edit until Apply or Reload establishes a new baseline.
+        synced["config_exists"] = bool(self._raw.get("config_exists"))
+        synced["auth_exists"] = bool(self._raw.get("auth_exists"))
+        return synced
 
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
         name = _action_name(action)
@@ -231,6 +239,15 @@ class CodexSettingsDomain:
             raise LegacyDomainError("The requested secret field is unavailable")
         structured = self._draft.get("structured", {})
         return isinstance(structured, Mapping) and bool(structured.get("api_key"))
+
+    def trusted_secret_value(self, field: str, target: str | None = None) -> str:
+        if field != "api_key" or target is not None:
+            raise LegacyDomainError("The requested secret field is unavailable")
+        structured = self._draft.get("structured", {})
+        value = structured.get("api_key", "") if isinstance(structured, Mapping) else ""
+        if not isinstance(value, str):
+            raise LegacyDomainError("The requested secret field is unavailable")
+        return value
 
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
         if field != "api_key" or target is not None:

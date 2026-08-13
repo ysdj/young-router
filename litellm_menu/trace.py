@@ -38,13 +38,14 @@ from .base import (
     _STREAM_FALLBACK_METADATA_KEY,
     _STREAM_IDLE_TIMEOUT_METADATA_KEY,
     _STREAM_START_TIMEOUT_METADATA_KEY,
-    _SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
     _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY,
     _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY,
     _SUPPORTS_RESPONSES_WEB_SEARCH_KEY,
     _SUPPORTS_WEB_SEARCH_KEY,
-    _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
+    _UPSTREAM_PROTOCOL_MODE_KEY,
+    _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _UPSTREAM_URL_SURFACE_KEY,
+    _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
@@ -551,6 +552,8 @@ def _trace_requested_endpoint(request_kwargs: Optional[dict]) -> Optional[str]:
         lowered = value.lower()
         if "/v1/images/generations" in lowered:
             return "/v1/images/generations"
+        if "/v1/messages" in lowered:
+            return "/v1/messages"
         if "/v1/responses" in lowered:
             return "/v1/responses"
         if "/v1/chat/completions" in lowered:
@@ -571,8 +574,15 @@ def _trace_client_surface(request_kwargs: Optional[dict]) -> str:
         return "image_generation"
     if endpoint == "/v1/responses" or _responses_request_module._request_is_responses_api(request_kwargs):
         return "responses"
+    if endpoint == "/v1/messages":
+        return "messages"
     if endpoint in {"/v1/chat/completions", "/v1/completions"}:
         return "chat"
+    call_type_value = str(call_type or "").strip().lower()
+    if call_type_value in {"messages", "amessages", "anthropic", "anthropic_messages"}:
+        return "messages"
+    if call_type_value in {"responses", "aresponses", "response"}:
+        return "responses"
     if request_kwargs.get("input") is not None:
         return "responses"
     if request_kwargs.get("messages") is not None:
@@ -584,6 +594,13 @@ def _trace_effective_upstream_surface(request_kwargs: Optional[dict]) -> str:
     request_kwargs = request_kwargs or {}
     if _trace_client_surface(request_kwargs) == "image_generation":
         return "image_generation"
+    current_surface = _routing_module._request_current_upstream_surface(request_kwargs)
+    if current_surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
+        return "messages"
+    if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_CHAT:
+        return "chat"
+    if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+        return "responses"
     if request_kwargs.get("use_chat_completions_api") is True:
         return "chat"
     metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
@@ -595,7 +612,9 @@ def _trace_effective_upstream_surface(request_kwargs: Optional[dict]) -> str:
     surface = model_info.get(_UPSTREAM_URL_SURFACE_KEY)
     if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
         return "responses"
-    if surface in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
+    if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
+        return "messages"
+    if surface == _UPSTREAM_URL_SURFACE_OPENAI_CHAT:
         return "chat"
     return _trace_client_surface(request_kwargs)
 
@@ -613,7 +632,6 @@ def _trace_interface_summary(
     method_value = method_name if method_name is not None else None
     if method_value is None:
         method_value = _trace_function_name(request_kwargs.get("original_generic_function"))
-    supported_surfaces = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
     return {
         "client_surface": _trace_client_surface(request_kwargs),
         "effective_upstream_surface": _trace_effective_upstream_surface(request_kwargs),
@@ -629,7 +647,7 @@ def _trace_interface_summary(
         "use_chat_completions_api": request_kwargs.get("use_chat_completions_api") is True,
         "api_base_host": _responses_request_module._api_base_host(api_base),
         "upstream_url_surface": model_info.get(_UPSTREAM_URL_SURFACE_KEY),
-        "supported_upstream_url_surfaces": _trace_limited_value(supported_surfaces, limit=120),
+        "upstream_protocol_mode": model_info.get(_UPSTREAM_PROTOCOL_MODE_KEY, "fallback"),
         "supports_responses_image_input": model_info.get(_RESPONSES_IMAGE_INPUT_SUPPORT_KEY),
         "supports_responses_hosted_tools": model_info.get(
             _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY

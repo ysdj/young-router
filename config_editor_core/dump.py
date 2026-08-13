@@ -20,14 +20,16 @@ from .schema import (
     MENU_MODEL_ENABLED_KEY,
     MENU_ROUTE_KEY,
     RANDOM_DEPLOYMENT_ID_RE,
-    SUPPORTED_UPSTREAM_URL_SURFACES_KEY,
+    UPSTREAM_PROTOCOL_MODE_KEY,
     UPSTREAM_URL_SURFACE_KEY,
     _as_dict,
     _as_list,
     _bool_value,
     _string_value,
-    _upstream_url_surfaces,
+    _upstream_protocol_mode,
+    _upstream_url_surface,
     canonical_litellm_model,
+    infer_upstream_fallback_surface,
 )
 
 def _parse_scalar(text: str) -> Any:
@@ -247,12 +249,18 @@ def _entry_from_editor(
     enabled = effective_enabled
     provider_name = str(provider.get("name", "")).strip()
     model_name = str(model.get("model_name", "")).strip()
-    supported_upstream_url_surfaces = _upstream_url_surfaces(
-        model.get("supported_upstream_url_surfaces")
+    raw_upstream_url_surface = model.get("upstream_url_surface")
+    upstream_url_surface = (
+        _upstream_url_surface(raw_upstream_url_surface)
+        if raw_upstream_url_surface is not None
+        else infer_upstream_fallback_surface(model.get("litellm_model"))
+    )
+    upstream_protocol_mode = _upstream_protocol_mode(
+        model.get("upstream_protocol_mode")
     )
     litellm_model = canonical_litellm_model(
         model.get("litellm_model", ""),
-        supported_upstream_url_surfaces,
+        upstream_url_surface,
     )
 
     if not provider_name:
@@ -320,9 +328,8 @@ def _entry_from_editor(
     )
     if supports_responses_image_tool_present or supports_responses_image_tool:
         model_info["supports_responses_image_generation_tool"] = supports_responses_image_tool
-    upstream_url_surface = supported_upstream_url_surfaces[0]
     model_info[UPSTREAM_URL_SURFACE_KEY] = upstream_url_surface
-    model_info[SUPPORTED_UPSTREAM_URL_SURFACES_KEY] = supported_upstream_url_surfaces
+    model_info[UPSTREAM_PROTOCOL_MODE_KEY] = upstream_protocol_mode
 
     if params:
         entry["litellm_params"] = params

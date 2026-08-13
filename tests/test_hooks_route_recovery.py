@@ -752,6 +752,54 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         self.assertEqual(chunks[-1]["type"], "response.completed")
 
+    async def test_route_recovery_replays_statusless_connection_closed_request(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        async def recovered_stream():
+            yield {"type": "response.output_text.delta", "delta": "recovered"}
+            yield {"type": "response.completed", "response": {"id": "resp-recovered"}}
+
+        class ReadError(Exception):
+            pass
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def aresponses(self, **payload):
+                calls.append(payload.copy())
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue after tool output."}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                ReadError("connection closed."),
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"], request_data["input"])
+        self.assertTrue(
+            calls[0]["litellm_metadata"][hooks._ROUTE_RECOVERY_POLL_METADATA_KEY]
+        )
+        self.assertIn(
+            {"type": "response.output_text.delta", "delta": "recovered"},
+            chunks,
+        )
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+
     async def test_route_recovery_poll_keepalive_does_not_cancel_pending_stream_read(self) -> None:
         hooks, _proxy_server = load_hook_module()
         attempts = []

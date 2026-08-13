@@ -351,6 +351,24 @@ class CoreOperationsTests(unittest.TestCase):
             controller.autostart_disable()
             self.assertEqual("disabled", controller.autostart_status())
 
+    def test_snapshot_status_reuses_recent_probe_but_health_forces_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            with mock.patch.object(controller, "_pid", side_effect=[4819, None]) as pid, mock.patch.object(
+                controller, "_health", side_effect=[True, False]
+            ) as health, mock.patch.object(
+                controller, "_recorded_proxy_is_orphaned", return_value=None
+            ):
+                first = controller.dispatch("status")
+                cached = controller.dispatch("status")
+                refreshed = controller.dispatch("health")
+
+            self.assertEqual("running", first["state"])
+            self.assertEqual(first, cached)
+            self.assertEqual("stopped", refreshed["state"])
+            self.assertEqual(2, pid.call_count)
+            self.assertEqual(2, health.call_count)
+
     def test_controller_status_exposes_the_configured_port_only_while_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -466,9 +484,7 @@ class CoreOperationsTests(unittest.TestCase):
             root = Path(directory)
             (root / "runtime-settings.env").write_text(
                 "LITELLM_PORT=49173\n"
-                "LITELLM_MENU_WEB_SEARCH_READ_RESULTS=1\n"
-                "LITELLM_MENU_BALANCE_REFRESH_MINUTES=5\n"
-                "LITELLM_BROWSER_BILLING=1\n",
+                "LITELLM_MENU_WEB_SEARCH_READ_RESULTS=1\n",
                 encoding="utf-8",
             )
 
@@ -476,8 +492,6 @@ class CoreOperationsTests(unittest.TestCase):
 
             self.assertEqual("49173", environment["LITELLM_PORT"])
             self.assertNotIn("LITELLM_MENU_WEB_SEARCH_READ_RESULTS", environment)
-            self.assertNotIn("LITELLM_MENU_BALANCE_REFRESH_MINUTES", environment)
-            self.assertNotIn("LITELLM_BROWSER_BILLING", environment)
 
     def test_proxy_environment_loads_bundled_callback_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

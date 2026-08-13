@@ -24,18 +24,21 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('INSTALL_COMPLETE=1', installer)
         self.assertIn('RESTART_ARMED=0', installer)
         self.assertIn('RESTART_ARMED=1', installer)
-        self.assertIn('[[ -n "$(installed_pids)" ]] || open -n "$DESTINATION"', installer)
+        self.assertIn('[[ -n "$(installed_pids)" ]] || open -g "$DESTINATION"', installer)
+        self.assertNotIn("open -n", installer)
         self.assertNotIn('tell application id "menu.litellm.menu" to quit', installer)
         self.assertIn("stop_installed_app", installer)
         self.assertIn("pids_are_alive()", installer)
         self.assertIn('kill -TERM "$pid"', installer)
         self.assertIn('while pids_are_alive "$bundle_pids"; do', installer)
         self.assertIn('done <<<"$bundle_pids"', installer)
-        self.assertIn('index(line, bundle "/Contents/") > 0', installer)
+        self.assertIn('line ~ /\\/LiteLLM ?Menu[^\\/]*\\.app\\/Contents\\/MacOS\\/LiteLLMMenu$/', installer)
+        self.assertIn('*/LiteLLM*Menu*.app/Contents/MacOS/LiteLLMMenu', installer)
         self.assertIn('START_TIMEOUT_SECONDS="${LITELLM_MENU_START_TIMEOUT_SECONDS:-70}"', installer)
         self.assertIn('STOP_TIMEOUT_SECONDS="${LITELLM_MENU_STOP_TIMEOUT_SECONDS:-20}"', installer)
         self.assertIn('STOP_GRACE_POLLS=20', installer)
         self.assertIn('REQUIRED_HEALTH_CHECKS=3', installer)
+        self.assertIn('LAUNCH_RETRY_SECONDS=1', installer)
         self.assertNotIn("preserved_proxy_port", installer)
         self.assertNotIn("refuse_running_install", installer)
         build_replacement = installer.index('LITELLM_MENU_MACOS_OUTPUT="$STAGED_APP"')
@@ -51,7 +54,8 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('cp -ac "$source/." "$destination/"', installer)
         self.assertIn('copy_tree "$STAGED_APP" "$INSTALL_STAGE"', installer)
         self.assertIn('codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"', installer)
-        self.assertIn('open -n "$DESTINATION"', installer)
+        self.assertIn('open -g "$DESTINATION" >/dev/null 2>&1 || true', installer)
+        self.assertIn('if [[ -z "$candidate_pid" && $SECONDS -ge $next_launch_at ]]; then', installer)
         self.assertIn('start_installed_app "$OLD_PIDS"', installer)
         self.assertNotIn('sleep 1', installer)
         self.assertNotIn('codesign --verify --deep --strict --verbose=2 "$DESTINATION"', installer)
@@ -111,6 +115,37 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("Resources/Core/(\\.venv|venv)", script)
         self.assertNotIn("mac_menu/build.sh", script)
         self.assertNotRegex(script, r"(?m)^\s*(?:npm|npx)\b")
+
+    def test_every_artifact_build_updates_litellm_before_packaging(self) -> None:
+        installer = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(
+            encoding="utf-8"
+        )
+        macos = (ROOT / "rn" / "scripts" / "build-macos.sh").read_text(
+            encoding="utf-8"
+        )
+        windows = (ROOT / "rn" / "scripts" / "build-windows.ps1").read_text(
+            encoding="utf-8"
+        )
+        release = (ROOT / "scripts" / "package-release.sh").read_text(
+            encoding="utf-8"
+        )
+
+        installer_update = installer.index('"$ROOT/scripts/update-litellm.sh"')
+        self.assertLess(installer_update, installer.index('INSTALLED_RUNTIME="$DESTINATION'))
+        self.assertLess(
+            installer_update,
+            installer.index('LITELLM_MENU_MACOS_OUTPUT="$STAGED_APP"'),
+        )
+
+        macos_update = macos.index('"$PROJECT_ROOT/scripts/update-litellm.sh"')
+        self.assertLess(macos_update, macos.index("node scripts/bootstrap-rnmacos-085.mjs"))
+        self.assertLess(macos_update, macos.index("build-macos --project-path macos"))
+
+        windows_update = windows.index('scripts\\update_litellm.py')
+        self.assertLess(windows_update, windows.index("pnpm run build"))
+        self.assertLess(windows_update, windows.index("uv pip install"))
+
+        self.assertIn("pnpm run build:macos", release)
 
     def test_ci_builds_both_react_native_hosts(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -219,6 +254,9 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("PYTHONDONTWRITEBYTECODE=0", script)
         self.assertIn("from litellm import run_server", script)
         self.assertIn("The bundled Core startup bytecode could not be generated.", script)
+        final_cache_cleanup = script.rindex('find "$CORE"')
+        self.assertGreater(final_cache_cleanup, script.index('copy_tree "$CORE" "$PORTABLE_SMOKE"'))
+        self.assertLess(final_cache_cleanup, script.index('codesign --force --deep --sign - "$APP"'))
         self.assertIn("export LITELLM_LOCAL_MODEL_COST_MAP=true", script)
         self.assertIn("copy_tree()", script)
         self.assertIn('cp -ac "$source/." "$destination/"', script)

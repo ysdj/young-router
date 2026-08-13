@@ -36,6 +36,7 @@ type NativeModule = {
     field: string,
     target: string | undefined,
   ) => Promise<{ revision: number; present: boolean } | undefined>;
+  copySecret?: (domain: "relay_accounts", field: "api_key", target: string) => Promise<boolean>;
   relayLogin?: (options: {
     accountId: string;
     type: "newapi" | "sub2api";
@@ -130,6 +131,7 @@ const nativeBridge: NativeLeafBridge = {
   editSecureDocument: async (editorToken, language, title) => leaf.editSecureDocument?.(editorToken, language, title),
   editSecret: async (domain, field, target, title, allowClear) => leaf.editSecret?.(domain, field, target, title, allowClear),
   clearSecret: async (domain, field, target) => leaf.clearSecret?.(domain, field, target),
+  copySecret: async (domain, field, target) => leaf.copySecret?.(domain, field, target) ?? false,
   relayLogin: async (options) => leaf.relayLogin?.(options),
   openRelayLogs: async (options) => { await leaf.openRelayLogs?.(options); },
   restoreRelaySession: async (options) => leaf.restoreRelaySession?.(options),
@@ -165,6 +167,10 @@ native.menuBar.setActions(routeActions);
 
 const ipc = createIpcClient(createNativeIpcTransport(ipcBridge));
 
+// Start the single shared Core read while React Native is mounting. New route
+// windows can then use this cached snapshot synchronously on their first frame.
+void ipc.snapshot().catch(() => undefined);
+
 registerLiteLLMMenu("LiteLLMMenu", {
   ipc,
   native,
@@ -177,4 +183,4 @@ registerLiteLLMMenu("LiteLLMMenu", {
   },
 });
 
-export const DESKTOP_ROUTES: readonly AppRoute[] = ["home", "providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "relay-accounts", "logs"];
+export const DESKTOP_ROUTES: readonly AppRoute[] = ["home", "providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "relay-accounts", "relay-add", "logs"];

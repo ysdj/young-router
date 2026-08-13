@@ -3,7 +3,6 @@ import {
   Platform,
   Pressable,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
   View,
@@ -38,11 +37,11 @@ import WinUISelectableRow from "./windows/NativeSelectableRowNativeComponent";
 import WinUISplitView from "./windows/NativeSplitViewNativeComponent";
 import WinUITable from "./windows/NativeTableNativeComponent";
 import WinUITextEditor from "./windows/NativeTextEditorNativeComponent";
-import { UI_FONT_SIZE } from "./typography";
+import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type ButtonProps = {
   title: string;
-  symbol?: "pause" | "play" | "trash";
+  symbol?: "check" | "close" | "copy" | "edit" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "trash";
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;
@@ -90,17 +89,27 @@ type CheckboxProps = {
   style?: StyleProp<ViewStyle>;
 };
 
-// Fabric lays out an opaque native component before AppKit/WinUI has an
-// opportunity to report the checkbox title's intrinsic size.  Without an
-// explicit minimum, a row-direction parent can therefore allocate only the
-// checkmark square and clip the label.  Keep the sizing policy shared so a
-// translated label is visible on both desktop hosts.
-function nativeCheckboxMinimumWidth(label: string): number {
-  const textWidth = Array.from(label).reduce((width, character) => {
+function nativeControlTextWidth(label: string): number {
+  return Array.from(label).reduce((width, character) => {
     if (/\s/u.test(character)) return width + 4;
     return width + (/[^\u0000-\u024f]/u.test(character) ? 13 : 7.5);
   }, 0);
+}
+
+// Fabric lays out opaque native controls before AppKit/WinUI can report their
+// intrinsic content size. Give translated labels enough shared layout width so
+// buttons and checkboxes do not turn complete actions into truncated fragments.
+function nativeButtonMinimumWidth(title: string, compact = false): number {
+  return Math.ceil((compact ? 22 : 28) + Math.max(24, nativeControlTextWidth(title)));
+}
+
+function nativeCheckboxMinimumWidth(label: string): number {
+  const textWidth = nativeControlTextWidth(label);
   return Math.ceil(26 + Math.max(24, textWidth));
+}
+
+function StaticBooleanIndicator({ value }: { value: boolean }): React.JSX.Element {
+  return <View style={[styles.staticBooleanIndicator, value && styles.staticBooleanIndicatorChecked]}><Text style={styles.staticBooleanIndicatorText}>{value ? "x" : ""}</Text></View>;
 }
 
 type PickerProps = {
@@ -131,6 +140,9 @@ type TableProps = {
   alternatingRows?: boolean;
   compact?: boolean;
   followBottom?: boolean;
+  cellHorizontalPadding?: number;
+  firstColumnHorizontalPadding?: number;
+  scrollTrailingColumnOverflow?: boolean;
   disabledRowKeys?: string[];
   secondaryCellKeys?: string[];
   onSelectionChange?: (key: string, index: number) => void;
@@ -195,12 +207,15 @@ type SplitViewProps = {
 };
 
 const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeButtonWithRef(props, ref): React.JSX.Element {
-  const style = [props.link ? styles.linkButton : styles.button, props.style];
+  const compact = props.compact ?? true;
+  const buttonProps = { ...props, compact };
+  const contentWidth = !props.link && !props.symbol ? { minWidth: nativeButtonMinimumWidth(props.title, compact) } : undefined;
+  const style = [props.link ? styles.linkButton : styles.button, contentWidth, props.style];
   if (Platform.OS === "windows") {
-    return <WinUIButton {...props} ref={ref as never} onPress={() => props.onPress?.()} style={style} />;
+    return <WinUIButton {...buttonProps} ref={ref as never} onPress={() => props.onPress?.()} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitButton {...props} ref={ref as never} />;
+    return <AppKitButton {...buttonProps} ref={ref as never} style={[contentWidth, props.style]} />;
   }
     return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={style} accessibilityRole={props.link ? "link" : "button"}><Text style={styles.controlText}>{props.title}</Text></Pressable>;
 });
@@ -211,7 +226,7 @@ export function NativeButton(props: ButtonProps & { ref?: React.Ref<any> }): Rea
   return <NativeButtonWithRef {...props} ref={props.ref} />;
 }
 
-const NativeSegmentedControlWithRef = React.forwardRef<any, SegmentedProps>(function NativeSegmentedControlWithRef({ labels, selectedValue, disabled, compact, onChange, style }, ref): React.JSX.Element {
+const NativeSegmentedControlWithRef = React.forwardRef<any, SegmentedProps>(function NativeSegmentedControlWithRef({ labels, selectedValue, disabled, compact = true, onChange, style }, ref): React.JSX.Element {
   if (Platform.OS === "windows") {
     return <WinUISegmented ref={ref as never} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={(event) => onChange?.({ ...event, nativeEvent: event.nativeEvent })} style={[styles.segmented, style]} />;
   }
@@ -242,7 +257,7 @@ export function NativeToggle({ value, disabled, onValueChange, style, accessibil
   if (Platform.OS === "macos") {
     return <AppKitToggle value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
   }
-  return <Switch value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
+  return <Pressable style={[styles.toggleFallback, style]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="switch" accessibilityLabel={accessibilityLabel} accessibilityState={{ checked: value, disabled }}><StaticBooleanIndicator value={value} /></Pressable>;
 }
 
 export function NativeSelectableRow({ title, detail, selected, disabled, onPress, style }: SelectableRowProps): React.JSX.Element {
@@ -263,7 +278,7 @@ export function NativeCheckbox({ label, value, disabled, compact = true, labelVi
   if (Platform.OS === "macos") {
     return <AppKitCheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={sizedStyle} />;
   }
-  return <Pressable style={[styles.checkboxFallback, sizedStyle]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="checkbox" accessibilityLabel={label} accessibilityState={{ checked: value, disabled }}><Switch value={value} disabled={disabled} pointerEvents="none" />{labelVisible ? <Text style={styles.controlText}>{label}</Text> : null}</Pressable>;
+  return <Pressable style={[styles.checkboxFallback, sizedStyle]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="checkbox" accessibilityLabel={label} accessibilityState={{ checked: value, disabled }}><StaticBooleanIndicator value={value} />{labelVisible ? <Text style={styles.controlText}>{label}</Text> : null}</Pressable>;
 }
 
 export function NativePicker({ labels, selectedValue, disabled, compact = true, onChange, style }: PickerProps): React.JSX.Element {
@@ -277,7 +292,7 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
 }
 
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = false, followBottom = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style }: TableProps): React.JSX.Element {
   const stripedRows = striped && (alternatingRows || rows.length > 0);
   const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);
   const nativeProps = {
@@ -297,13 +312,13 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, a
     return <WinUITable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitTable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
+    return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
   return <View style={[styles.tableFallback, style]}>{rows.map((row, index) => {
     const selected = row.key === selectedKey;
     const stripe = stripedRows && !selected && index % 2 === 1 ? styles.tableFallbackStripe : undefined;
     if (row.spanning) {
-      return <View key={row.key} style={[styles.tableFallbackGroupRow, stripe]}><Text numberOfLines={1} style={styles.tableFallbackGroupText}>{row.cells[0] ?? ""}</Text></View>;
+      return <View key={row.key} style={[styles.tableFallbackGroupRow, stripe]}><Text numberOfLines={1} style={[styles.selectableTitle, styles.tableFallbackGroupText]}>{row.cells[0] ?? ""}</Text></View>;
     }
     return <Pressable key={row.key} onPress={() => onSelectionChange?.(row.key, index)} onLongPress={() => onRowDoublePress?.(row.key, index)}><NativeSelectableRow title={row.cells[0] ?? ""} detail={row.cells.slice(1).join(" | ")} selected={selected} style={stripe} /></Pressable>;
   })}</View>;
@@ -344,6 +359,9 @@ export function NativeSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpe
   const panes = React.Children.toArray(children);
   const leading = panes[0];
   const trailing = panes[1];
+  if (!paneOpen) {
+    return <View style={[styles.splitFallback, style]}><View style={styles.splitTrailing}>{trailing}</View></View>;
+  }
   if (Platform.OS === "windows") {
     return <View style={[styles.splitFallback, style]}><View style={[styles.splitLeading, { width: paneWidth }]}>{leading}</View><WinUISplitView paneWidth={paneWidth} minPaneWidth={minPaneWidth} maxPaneWidth={maxPaneWidth} paneOpen={paneOpen} disabled={disabled} onPaneWidthChange={(event) => onPaneWidthChange?.(event.nativeEvent.width)} style={styles.splitter} /><View style={styles.splitTrailing}>{trailing}</View></View>;
   }
@@ -354,12 +372,16 @@ export function NativeSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpe
 }
 
 const styles = StyleSheet.create({
-  button: { minWidth: 72, height: 28 },
+  button: { minWidth: 72, height: 24 },
   controlText: { fontSize: UI_FONT_SIZE },
   linkButton: { minWidth: 72, minHeight: 22 },
-  segmented: { minHeight: 28 },
-  checkboxFallback: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8 },
-  selectableRow: { minHeight: 44, justifyContent: "center", paddingHorizontal: 10 },
+  segmented: { minHeight: 24 },
+  toggleFallback: { minWidth: 24, minHeight: 24, justifyContent: "center" },
+  checkboxFallback: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 },
+  staticBooleanIndicator: { width: 16, height: 16, borderWidth: 1, borderColor: "#71717a", alignItems: "center", justifyContent: "center", backgroundColor: "#ffffff" },
+  staticBooleanIndicatorChecked: { backgroundColor: "#dbeafe", borderColor: "#1d4ed8" },
+  staticBooleanIndicatorText: { fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, color: "#111827", fontWeight: "700" },
+  selectableRow: { minHeight: 28, justifyContent: "center", paddingHorizontal: 8 },
   selectableRowSelected: { backgroundColor: "#dbeafe" },
   selectableText: { gap: 2 },
   selectableTitle: { fontSize: UI_FONT_SIZE },
@@ -370,8 +392,8 @@ const styles = StyleSheet.create({
   // table, even when all rows fit.
   tableFallback: { minHeight: 120, borderWidth: 1, borderColor: "#d4d4d8", overflow: "hidden" },
   tableFallbackStripe: { backgroundColor: "#f1f1f3" },
-  tableFallbackGroupRow: { minHeight: 32, justifyContent: "center", paddingHorizontal: 8 },
-  tableFallbackGroupText: { fontSize: UI_FONT_SIZE },
+  tableFallbackGroupRow: { minHeight: 26, justifyContent: "center", paddingHorizontal: 8 },
+  tableFallbackGroupText: { fontWeight: "400" },
   editor: { minHeight: 160 },
   editorFallback: { minHeight: 160, textAlignVertical: "top", fontSize: UI_FONT_SIZE },
   secureEditorUnavailable: { minHeight: 160, justifyContent: "center", alignItems: "center" },

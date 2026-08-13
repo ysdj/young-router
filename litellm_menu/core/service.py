@@ -43,9 +43,19 @@ _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("providers_models", "api_key"): True,
     ("codex", "api_key"): False,
     ("claude", "deployment_token"): False,
+    ("claude", "desktop_gateway_api_key"): False,
     ("claude", "auto_memory_directory"): False,
     ("runtime", "setting"): True,
     ("webdav", "password"): False,
+    ("relay_accounts", "api_key"): True,
+}
+
+_PLAINTEXT_SECRET_FIELDS = {
+    ("providers_models", "api_key"),
+    ("codex", "api_key"),
+    ("claude", "deployment_token"),
+    ("claude", "desktop_gateway_api_key"),
+    ("relay_accounts", "api_key"),
 }
 
 _DOMAIN_ALIASES = {
@@ -345,6 +355,11 @@ def _adapter_persistence_paths(adapter: DomainAdapter) -> tuple[Path, ...]:
     if delegate is not None:
         adapter = delegate
     paths: list[Path] = []
+    owned_paths = getattr(adapter, "persistence_paths", None)
+    if callable(owned_paths):
+        for value in owned_paths():
+            if isinstance(value, (str, Path)):
+                paths.append(Path(value).expanduser())
     for attribute in ("config_path", "runtime_config_path", "settings_path", "preference_path", "enabled_path", "status_path", "model_catalog_path"):
         value = getattr(adapter, attribute, None)
         if isinstance(value, (str, Path)):
@@ -997,9 +1012,11 @@ class CoreStore:
         name = _canonical_domain(domain)
         if name not in {"codex", "claude"}:
             raise CoreError("invalid_editor", "The requested editor is unavailable")
-        if document not in {"config", "auth", "settings"}:
+        if document not in {"config", "auth", "settings", "desktop", "developer"}:
             raise CoreError("invalid_editor", "The requested editor is unavailable")
-        if (name == "codex" and document not in {"config", "auth"}) or (name == "claude" and document != "settings"):
+        if (name == "codex" and document not in {"config", "auth"}) or (
+            name == "claude" and document not in {"settings", "desktop", "developer"}
+        ):
             raise CoreError("invalid_editor", "The requested editor is unavailable")
         adapter = self._domains.get(name)
         if adapter is None:
@@ -1029,7 +1046,7 @@ class CoreStore:
                     text = raw.get(key) if isinstance(raw, Mapping) else None
                 else:
                     raw_text = getattr(adapter, "raw_text", None)
-                    text = raw_text(include_sensitive=True) if callable(raw_text) else None
+                    text = raw_text(include_sensitive=True, document=document) if callable(raw_text) else None
             except CoreError:
                 raise
             except Exception as exc:
@@ -1048,7 +1065,7 @@ class CoreStore:
         if name == "codex":
             payload = {"document": document, "text": text}
         else:
-            payload = {"raw_json": text}
+            payload = {"document": document, "raw_json": text}
         return self.dispatch(
             {"domain": name, "type": "set_raw", "payload": payload},
             expected_revision=revision,
@@ -1090,26 +1107,34 @@ class CoreStore:
             }
 
     def trusted_secret_descriptor(self, domain: str, field: str, target: object | None = None) -> dict[str, Any]:
-        """Validate the sole plaintext-native secret slot.
+        """Validate one explicitly plaintext-native credential field.
 
-        Only ``providers_models/api_key`` can be read back, and only through
-        the Core IPC server's short-lived native read capability.  It is never
-        included in snapshots or the normal React request protocol.
+        These values are read only through a short-lived native capability.
+        They are never included in snapshots or the React request protocol.
         """
 
         with self._lock:
             name = _canonical_domain(domain)
             field_name = field.strip() if isinstance(field, str) else ""
-            if (name, field_name) != ("providers_models", "api_key"):
+            descriptor_key = (name, field_name)
+            if descriptor_key not in _PLAINTEXT_SECRET_FIELDS:
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            if not isinstance(target, str) or not target or len(target.encode("utf-8")) > 256:
+            target_required = _SECRET_FIELDS[descriptor_key]
+            if target_required and (
+                not isinstance(target, str)
+                or not target
+                or len(target.encode("utf-8")) > 256
+            ):
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            if not target_required and target not in (None, ""):
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            target_value = target if target_required else None
             adapter = self._domains.get(name)
             reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
             if not callable(reader):
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
             try:
-                value = reader(field_name, target)
+                value = reader(field_name, target_value)
             except Exception:
                 raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
             if (
@@ -1121,7 +1146,7 @@ class CoreStore:
             return {
                 "domain": name,
                 "field": field_name,
-                "target": target,
+                "target": target_value,
                 "revision": self._revision,
                 "present": bool(value.strip()),
             }
@@ -1134,7 +1159,7 @@ class CoreStore:
         *,
         revision: int,
     ) -> str:
-        """Read a provider API key via an already-authorized native lease."""
+        """Read one plaintext field via an already-authorized native lease."""
 
         with self._lock:
             self._check_revision(revision)
@@ -1260,11 +1285,12 @@ class CoreStore:
         cookie: object = "",
         access_token: object = "",
         refresh_token: object = "",
+        password: object = "",
     ) -> dict[str, Any]:
         """Accept one native browser session and expose only public account state."""
 
         known_secrets = tuple(
-            value for value in (cookie, access_token, refresh_token) if isinstance(value, str) and value
+            value for value in (cookie, access_token, refresh_token, password) if isinstance(value, str) and value
         )
         with self._lock:
             relay = self._domains.get("relay_accounts")
@@ -1315,6 +1341,7 @@ class CoreStore:
                     cookie=str(cookie) if isinstance(cookie, str) else "",
                     access_token=str(access_token) if isinstance(access_token, str) else "",
                     refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
+                    password=str(password) if isinstance(password, str) else "",
                 )
                 # Login is the durable browser-session boundary. Resource
                 # discovery is a separate explicit action so a station API
@@ -1440,7 +1467,14 @@ class CoreStore:
             relay = self._domains.get("relay_accounts")
             accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
             status_setter = getattr(relay, "set_login_status", None) if relay is not None else None
-            if not callable(accepter) or not callable(status_setter):
+            session_restorer = getattr(relay, "restore_saved_session", None) if relay is not None else None
+            password_restorer = getattr(relay, "restore_saved_password", None) if relay is not None else None
+            if (
+                not callable(accepter)
+                or not callable(status_setter)
+                or not callable(session_restorer)
+                or not callable(password_restorer)
+            ):
                 raise CoreError("relay_restore_failed", "Relay account is unavailable")
             current = self._adapter_snapshot("relay_accounts")
             accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
@@ -1464,7 +1498,20 @@ class CoreStore:
                         cookie=str(cookie) if isinstance(cookie, str) else "",
                         access_token=str(access_token) if isinstance(access_token, str) else "",
                         refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
+                        preserve_resources=True,
                     )
+                elif login_status in {"signed_out", "expired"} and matching.get("remember_password") is True:
+                    public = None
+                    if login_status == "signed_out":
+                        try:
+                            public = session_restorer(str(account_id))
+                        except Exception:
+                            public = None
+                    if public is None:
+                        try:
+                            public = password_restorer(str(account_id))
+                        except Exception:
+                            public = status_setter(str(account_id), str(login_status))
                 elif login_status in {"signed_out", "expired"}:
                     public = status_setter(str(account_id), str(login_status))
                 else:
@@ -1478,7 +1525,7 @@ class CoreStore:
                     base_revision=self._revision,
                 )
                 self._last_actions["relay_accounts"] = {
-                    "session_restored": login_status == "signed_in",
+                    "session_restored": public.get("login_status") == "signed_in",
                     "account_id": str(account_id),
                     "login_status": str(public.get("login_status", login_status)),
                 }
@@ -1499,23 +1546,6 @@ class CoreStore:
 
     @staticmethod
     def _providers_summary(states: Mapping[str, object]) -> dict[str, Any]:
-        def optional_text(value: object) -> str | None:
-            projected = _safe_public(value)
-            if projected in (None, "", [], {}):
-                return None
-            if isinstance(projected, str):
-                return safe_error_message(projected)
-            if isinstance(projected, (int, float)) and not isinstance(projected, bool):
-                return str(projected)
-            if isinstance(projected, (Mapping, Sequence)) and not isinstance(projected, (str, bytes, bytearray)):
-                try:
-                    return safe_error_message(
-                        json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-                    )
-                except (TypeError, ValueError):
-                    return None
-            return None
-
         value = states.get("providers_models", {})
         if not isinstance(value, Mapping):
             return {"providers": [], "revision": 0}
@@ -1559,10 +1589,6 @@ class CoreStore:
                         "enabled": model.get("model_enabled", model.get("enabled", True)) is not False,
                         "order": order,
                     }
-                    for optional_key in ("billing", "multiplier"):
-                        optional_value = optional_text(model.get(optional_key))
-                        if optional_value is not None:
-                            summary[optional_key] = optional_value
                     models.append(summary)
             model_count = item.get("model_count", len(models))
             try:
@@ -1653,56 +1679,6 @@ class CoreStore:
         if base_revision is not None:
             record["base_revision"] = base_revision
 
-    def _dispatch_provider_multiplier_refresh(self, expected_revision: object | None) -> dict[str, Any]:
-        name = "providers_models"
-        with self._lock:
-            self._check_revision(expected_revision)
-            adapter = self._domains.get(name)
-            if adapter is None:
-                raise DomainNotFound(name)
-            prepare = getattr(adapter, "prepare_multiplier_refresh", None)
-            perform = getattr(adapter, "perform_multiplier_refresh", None)
-            commit = getattr(adapter, "commit_multiplier_refresh", None)
-            if not all(callable(method) for method in (prepare, perform, commit)):
-                raise CoreError("domain_error", "Provider multiplier refresh is unavailable")
-            try:
-                prepared = prepare()
-            except Exception as exc:
-                raise CoreError("domain_error", safe_exception_message(exc)) from None
-
-        try:
-            payload = perform(prepared)
-        except Exception as exc:
-            raise CoreError("domain_error", safe_exception_message(exc)) from None
-
-        with self._lock:
-            if self._domains.get(name) is not adapter:
-                raise DomainNotFound(name)
-            try:
-                result, changed = commit(prepared, payload)
-            except Exception as exc:
-                raise CoreError("domain_error", safe_exception_message(exc)) from None
-            if not changed:
-                return {"revision": self._revision}
-            if isinstance(result, Mapping):
-                safe_result = _safe_public(result)
-                if isinstance(safe_result, Mapping):
-                    self._last_actions[name] = dict(safe_result)
-            dirty = self._adapter_draft_state(name) != self._baselines.get(name)
-            self._revision += 1
-            self._mark_domain(
-                name,
-                dirty=dirty,
-                base_revision=(
-                    self._drafts.get(name, {}).get("base_revision", self._revision)
-                    if dirty
-                    else self._revision
-                ),
-            )
-            self._persist_metadata()
-            self._emit()
-            return {"revision": self._revision}
-
     def _dispatch_codex_model_catalog_toggle(self, enabled: bool, expected_revision: object | None) -> dict[str, Any]:
         name = "codex"
         with self._lock:
@@ -1781,14 +1757,6 @@ class CoreStore:
             raise CoreError("invalid_action", "A Core action is required")
         domain_value = data.get("domain")
         normalized_action = action_type.replace("-", "_").replace(".", "_").lower()
-        if (
-            domain_value is not None
-            and _canonical_domain(domain_value) == "providers_models"
-            and normalized_action == "providers_refresh_multiplier"
-        ):
-            return self._dispatch_provider_multiplier_refresh(
-                expected_revision if expected_revision is not None else data.get("expected_revision")
-            )
         if (
             domain_value is not None
             and _canonical_domain(domain_value) == "codex"
@@ -1951,9 +1919,8 @@ class CoreStore:
                 self._service["state"] = state
         if isinstance(payload.get("detail"), str):
             self._service["detail"] = safe_error_message(payload["detail"])
-        # Health polling is deliberately frequent.  A probe which projects the
-        # same public status is not a state transition, so do not make every
-        # settings surface redraw just to carry an identical service snapshot.
+        # A manual health check which projects the same public status is not a
+        # state transition, so it does not redraw every settings surface.
         if self._service != previous_service:
             self._revision += 1
             self._persist_metadata()

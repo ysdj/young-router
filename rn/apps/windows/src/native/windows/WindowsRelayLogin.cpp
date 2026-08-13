@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "WindowsRelayLogin.h"
 #include "CoreIPCBridge.h"
+#include "WinUIControls.h"
 #include "WinUI3NativeLeaf.h"
 
 #include <wincred.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cwctype>
 #include <filesystem>
 #include <map>
@@ -38,6 +40,71 @@ constexpr size_t kMaxPasswordBytes = 4096;
 constexpr size_t kCredentialChunkBytes = 2400;
 constexpr size_t kMaxCredentialChunks = 48;
 constexpr wchar_t kCredentialRoot[] = L"LiteLLM Menu/relay/";
+constexpr wchar_t kImmediateWebPresentationScript[] = LR"JS((() => {
+  const styleID = '__litellm_menu_immediate_presentation';
+  const gradientPattern = /gradient[(]/i;
+  const imageProperties = ['background-image', 'border-image-source', 'mask-image'];
+  const splitImageLayers = (value) => {
+    const layers = [];
+    let depth = 0;
+    let start = 0;
+    for (let index = 0; index < value.length; index += 1) {
+      const character = value[index];
+      if (character === '(') depth += 1;
+      else if (character === ')') depth = Math.max(0, depth - 1);
+      else if (character === ',' && depth === 0) {
+        layers.push(value.slice(start, index).trim());
+        start = index + 1;
+      }
+    }
+    layers.push(value.slice(start).trim());
+    return layers;
+  };
+  const stripGradients = (root = document.documentElement) => {
+    const elements = root instanceof Element
+      ? [root, ...root.querySelectorAll('*')]
+      : [...document.querySelectorAll('*')];
+    for (const element of elements) {
+      const computed = getComputedStyle(element);
+      for (const property of imageProperties) {
+        const image = computed.getPropertyValue(property);
+        if (!gradientPattern.test(image)) continue;
+        const retained = splitImageLayers(image).filter((layer) => !gradientPattern.test(layer));
+        element.style.setProperty(property, retained.length ? retained.join(', ') : 'none', 'important');
+      }
+    }
+  };
+  const install = () => {
+    if (document.getElementById(styleID)) return;
+    const style = document.createElement('style');
+    style.id = styleID;
+    style.textContent = `
+      html { scroll-behavior: auto !important; }
+      *, *::before, *::after {
+        animation: none !important;
+        transition: none !important;
+        scroll-behavior: auto !important;
+        view-transition-name: none !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  };
+  install();
+  stripGradients();
+  document.addEventListener('DOMContentLoaded', () => { install(); stripGradients(); }, { once: true });
+  new MutationObserver((records) => {
+    install();
+    records.forEach((record) => {
+      if (record.type === 'attributes') stripGradients(record.target);
+      else record.addedNodes.forEach((node) => { if (node.nodeType === Node.ELEMENT_NODE) stripGradients(node); });
+    });
+  }).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['class', 'style'],
+    childList: true,
+    subtree: true,
+  });
+})())JS";
 constexpr double kUIFontSize = 13.0;
 
 std::wstring Utf8ToWide(std::string const& value) {
@@ -560,6 +627,7 @@ std::wstring ProfileName(std::string const& account_id) {
 bool RunOwnedWindow(xaml::Window const& dialog, HWND owner, std::atomic_bool& finished) {
   HWND handle = nullptr;
   winrt::check_hresult(dialog.as<::IWindowNative>()->get_WindowHandle(&handle));
+  DisableWindowTransitions(handle);
   bool disable_owner = owner != nullptr && IsWindow(owner);
   if (disable_owner) {
     SetWindowLongPtrW(handle, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
@@ -657,6 +725,9 @@ struct LoginState {
   std::atomic_bool canceled{false};
   std::atomic_bool checking{false};
   bool auto_probe_pending = false;
+  bool auto_submit_saved_password_pending = false;
+  bool did_auto_submit_saved_password = false;
+  bool auto_login_attempt = false;
   bool dialog_closed_during_commit = false;
   std::shared_ptr<RelayLoginAttempt> active_attempt;
 };
@@ -693,11 +764,13 @@ winrt::fire_and_forget ProbeLogin(
     co_return;
   }
   state->check.IsEnabled(false);
-  state->status.Text(Text(state->options, L"Checking sign-in...", L"正在检查登录..."));
+  state->status.Text(Text(state->options, L"Verifying sign-in...", L"正在验证登录..."));
   auto dispatcher = state->dialog.DispatcherQueue();
   try {
     std::wstring script = LR"JS((() => {
-      const access = (localStorage.getItem('auth_token') || localStorage.getItem('access_token') || '').slice(0,32768);
+      let userToken = '';
+      try { const user = JSON.parse(localStorage.getItem('user') || 'null'); userToken = typeof user?.token === 'string' ? user.token : ''; } catch {}
+      const access = (localStorage.getItem('auth_token') || localStorage.getItem('access_token') || userToken).slice(0,32768);
       const refresh = (localStorage.getItem('refresh_token') || '').slice(0,32768);
       const password = )JS" + std::wstring(state->options.remember_password
           ? L"(document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || '').slice(0,4096)"
@@ -773,7 +846,8 @@ winrt::fire_and_forget ProbeLogin(
         state->options.account_id, state->options.account_type, state->options.label,
         state->options.origin, verified->username,
         verified->cookie.empty() ? std::nullopt : std::optional<std::string>(verified->cookie),
-        verified->access_token, verified->refresh_token) : std::nullopt;
+        verified->access_token, verified->refresh_token,
+        state->options.remember_password ? password : std::nullopt) : std::nullopt;
     // Once Core accepted the login, preserve the matching native credentials
     // even if the user closed the dialog while that synchronous IPC call ran.
     if (credentials_saved && !accepted) {
@@ -795,11 +869,17 @@ winrt::fire_and_forget ProbeLogin(
           state->finished.store(true);
           return;
         }
+        if (state->auto_login_attempt) {
+          state->auto_login_attempt = false;
+          state->finished.store(true);
+          try { state->dialog.Close(); } catch (...) {}
+          return;
+        }
         state->check.IsEnabled(true);
         state->cancel.IsEnabled(true);
         state->status.Text(Text(state->options,
-          L"No active sign-in was found. Complete login in the page and try again.",
-          L"未检测到有效登录。请在页面内完成登录后重试。"));
+          L"No valid sign-in was found. Complete sign-in in the page and try again.",
+          L"未检测到有效登录状态。请完成登录后重试。"));
         return;
       }
       attempt->Finish();
@@ -834,11 +914,17 @@ winrt::fire_and_forget ProbeLogin(
         state->finished.store(true);
         return;
       }
+      if (state->auto_login_attempt) {
+        state->auto_login_attempt = false;
+        state->finished.store(true);
+        try { state->dialog.Close(); } catch (...) {}
+        return;
+      }
       state->check.IsEnabled(true);
       state->cancel.IsEnabled(true);
       state->status.Text(Text(state->options,
-          L"No active sign-in was found. Complete login in the page and try again.",
-          L"未检测到有效登录。请在页面内完成登录后重试。"));
+          L"No valid sign-in was found. Complete sign-in in the page and try again.",
+          L"未检测到有效登录状态。请完成登录后重试。"));
     })) {
       attempt->Finish();
       state->active_attempt.reset();
@@ -875,6 +961,7 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
     core.Settings().AreDevToolsEnabled(false);
     core.Settings().IsPasswordAutosaveEnabled(false);
     core.NewWindowRequested([](auto const&, web::CoreWebView2NewWindowRequestedEventArgs const& args) { args.Handled(true); });
+    co_await core.AddScriptToExecuteOnDocumentCreatedAsync(kImmediateWebPresentationScript);
     if (state->options.remember_password) {
       core.WebMessageReceived([weak = std::weak_ptr<LoginState>(state)](auto const&, web::CoreWebView2WebMessageReceivedEventArgs const& args) {
         auto current = weak.lock();
@@ -888,7 +975,7 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
             auto value = message.substr(sizeof(prefix) - 1);
             if (!value.empty() && value.size() <= kMaxPasswordBytes) current->captured_password = std::move(value);
           }
-        } catch (...) {}
+        } catch {}
       });
       co_await core.AddScriptToExecuteOnDocumentCreatedAsync(LR"JS((() => {
         const capture = (node) => { const value=node?.value; if (typeof value==='string' && value.length) chrome.webview.postMessage(`relay-password:${value.slice(0,4096)}`); };
@@ -924,6 +1011,7 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
 std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
     HWND owner,
     WindowsRelayLoginOptions const& input_options) {
+  ConfigureImmediateXamlPresentation();
   if (!ValidAccountID(input_options.account_id) ||
       (input_options.account_type != "newapi" && input_options.account_type != "sub2api") ||
       input_options.label.empty() || input_options.label.size() > 160 ||
@@ -966,16 +1054,13 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
   labels.Children().Append(title);
   controls::TextBlock account;
   account.FontSize(kUIFontSize);
-  auto const account_type = state->options.account_type == "newapi"
-      ? Text(state->options, L"New API  |  ", L"NewAPI  |  ")
-      : std::wstring(L"Sub2API  |  ");
-  account.Text(account_type + Utf8ToWide(state->options.origin));
+  account.Text(Utf8ToWide(state->options.origin));
   account.TextTrimming(xaml::TextTrimming::CharacterEllipsis);
   labels.Children().Append(account);
   controls::TextBlock status;
   status.FontSize(kUIFontSize);
   state->status = status;
-  status.Text(Text(state->options, L"Enter your account and password in the page, then select Check Sign-In.", L"请在页面中输入账号和密码完成登录，然后选择“检查登录”。"));
+  status.Text(Text(state->options, L"Complete sign-in in the page; then select Verify Sign-In.", L"请在页面中完成登录，然后选择“验证登录”。"));
   status.TextWrapping(xaml::TextWrapping::Wrap);
   labels.Children().Append(status);
   header.Children().Append(labels);
@@ -988,7 +1073,7 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
   controls::Button check;
   check.FontSize(kUIFontSize);
   state->check = check;
-  check.Content(winrt::box_value(Text(state->options, L"Check Sign-In", L"检查登录")));
+  check.Content(winrt::box_value(Text(state->options, L"Verify Sign-In", L"验证登录")));
   check.IsEnabled(false);
   controls::Button cancel;
   cancel.FontSize(kUIFontSize);
@@ -1020,23 +1105,68 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
     auto password = current->restored_password.value_or("");
     auto access = current->restored_session ? current->restored_session->access_token : "";
     auto refresh = current->restored_session ? current->restored_session->refresh_token : "";
+    bool auto_submit_saved_password = current->options.remember_password && !password.empty() &&
+        !current->auto_submit_saved_password_pending && !current->did_auto_submit_saved_password;
+    if (auto_submit_saved_password) current->auto_submit_saved_password_pending = true;
     auto password_assignment = current->options.remember_password
         ? (L"set(document.querySelector('input[type=password],input[autocomplete=current-password]'), " + JsonLiteral(password) + L");")
         : std::wstring{};
     std::wstring script = LR"JS((() => {
       const set = (node,value) => { if (!node || !value || node.value) return; const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set; setter?.call(node,value); node.dispatchEvent(new Event('input',{bubbles:true})); node.dispatchEvent(new Event('change',{bubbles:true})); };
-      set(document.querySelector('input[type=email],input[name=email],input[name=username],input[autocomplete=username]'), )JS" + JsonLiteral(username) + LR"JS();
+      const userInput = document.querySelector('input[type=email],input[type=text],input:not([type]),input[name=email],input[name=username],input[autocomplete=username],input[placeholder*="用户名"],input[placeholder*="email" i]');
+      const passwordInput = document.querySelector('input[type=password],input[autocomplete=current-password]');
+      if (!userInput) {
+        const signIn = Array.from(document.querySelectorAll('a,button')).find(node => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
+        if (signIn instanceof HTMLElement) signIn.click();
+      }
+      set(userInput, )JS" + JsonLiteral(username) + LR"JS();
       )JS" + password_assignment + LR"JS(
+      if (userInput instanceof HTMLElement) {
+        userInput.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+        const active = document.activeElement;
+        if (!active || active === document.body || !(active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement || active.isContentEditable)) {
+          try { userInput.focus({ preventScroll: true }); } catch { userInput.focus(); }
+        }
+      }
       const access=)JS" + JsonLiteral(access) + LR"JS(; const refresh=)JS" + JsonLiteral(refresh) + LR"JS(;
-      if (access) { localStorage.setItem('auth_token',access); localStorage.setItem('access_token',access); }
+      const username=)JS" + JsonLiteral(state->options.username.value_or("")) + LR"JS(;
+      if (access) {
+        localStorage.setItem('auth_token',access); localStorage.setItem('access_token',access);
+        try {
+          const current=JSON.parse(localStorage.getItem('user')||'null');
+          const user=current&&typeof current==='object'&&!Array.isArray(current)?current:{};
+          user.token=access; if (username && !user.username) user.username=username;
+          localStorage.setItem('user',JSON.stringify(user));
+        } catch {}
+      }
       if (refresh) localStorage.setItem('refresh_token',refresh);
+      const hasCredentials = Boolean(userInput?.value && passwordInput?.value);
+      if (hasCredentials && )JS" + std::wstring(auto_submit_saved_password ? L"true" : L"false") + LR"JS() {
+        const form = passwordInput?.form;
+        const submit = form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])')
+          ?? Array.from(document.querySelectorAll('button')).find(node => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
+        if (submit instanceof HTMLElement) submit.click();
+        else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
+      }
+      return hasCredentials;
     })())JS";
-    auto after = [current, script = std::move(script)]() -> winrt::fire_and_forget {
-      try { co_await current->webview.ExecuteScriptAsync(script); } catch (...) {}
+    auto after = [current, script = std::move(script), auto_submit_saved_password]() -> winrt::fire_and_forget {
+      bool submitted_saved_password = false;
+      try {
+        auto result = co_await current->webview.ExecuteScriptAsync(script);
+        submitted_saved_password = auto_submit_saved_password && result == L"true";
+      } catch (...) {}
+      if (auto_submit_saved_password) {
+        current->auto_submit_saved_password_pending = false;
+        current->did_auto_submit_saved_password = submitted_saved_password;
+      }
       if (current->canceled.load() || current->finished.load()) co_return;
       current->check.IsEnabled(true);
-      if (current->auto_probe_pending) {
+      if (submitted_saved_password) co_await winrt::resume_after(std::chrono::milliseconds(1200));
+      if (current->canceled.load() || current->finished.load()) co_return;
+      if (current->auto_probe_pending || submitted_saved_password) {
         current->auto_probe_pending = false;
+        current->auto_login_attempt = submitted_saved_password;
         StartLoginCheck(current);
       }
     };

@@ -38,6 +38,10 @@ struct NativeMenuAnchor {
 // size required by AppWindow::Resize for a particular native window.
 POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height);
 
+// Applies the Win32 half of the immediate-presentation policy to an owned
+// window, including future route and modal windows.
+void DisableWindowTransitions(HWND window) noexcept;
+
 class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
  public:
   static std::shared_ptr<WinUI3NativeLeaf> Shared();
@@ -96,7 +100,8 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   std::wstring RouteTitle(std::wstring_view route) const;
   std::wstring VersionText() const;
 
-  std::wstring status_title_;
+  std::wstring status_title_ = L"Status: Starting";
+  bool status_title_is_bootstrap_ = true;
   std::wstring active_route_;
   HWND window_handle_ = nullptr;
   NOTIFYICONDATAW tray_{};

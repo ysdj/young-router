@@ -19,6 +19,7 @@
 
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.Primitives.h>
+#include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
@@ -59,7 +60,6 @@ using winrt::Microsoft::UI::Xaml::Controls::StackPanel;
 using winrt::Microsoft::UI::Xaml::Controls::TextBox;
 using winrt::Microsoft::UI::Xaml::Controls::TextBlock;
 using winrt::Microsoft::UI::Xaml::Controls::ToolTipService;
-using winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::Thumb;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::ToggleButton;
 using winrt::Microsoft::UI::Xaml::Media::SolidColorBrush;
@@ -232,7 +232,16 @@ struct ButtonComponentView final
       auto icon = FontIcon{};
       icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
       icon.FontSize(kUIFontSize);
-      icon.Glyph(symbol == "pause" ? L"\xE769" : symbol == "play" ? L"\xE768" : L"\xE74D");
+      if (symbol == "check") icon.Glyph(L"\xE73E");
+      else if (symbol == "close") icon.Glyph(L"\xE711");
+      else if (symbol == "copy") icon.Glyph(L"\xE8C8");
+      else if (symbol == "edit") icon.Glyph(L"\xE70F");
+      else if (symbol == "power-on" || symbol == "power-off") icon.Glyph(L"\xE7E8");
+      else if (symbol == "minus") icon.Glyph(L"\xE738");
+      else if (symbol == "pause") icon.Glyph(L"\xE769");
+      else if (symbol == "play") icon.Glyph(L"\xE768");
+      else if (symbol == "plus") icon.Glyph(L"\xE710");
+      else icon.Glyph(L"\xE74D");
       button_.Content(icon);
     }
     hyperlink_.Content(winrt::box_value(ToHString(props.title)));
@@ -694,7 +703,6 @@ struct TableComponentView final
           auto label = TextBlock{};
           label.FontSize(kUIFontSize);
           label.FontWeight(winrt::Windows::UI::Text::FontWeights::Normal());
-          label.Foreground(SecondaryTextBrush());
           label.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
           if (!label.Text().empty()) ToolTipService::SetToolTip(label, winrt::box_value(label.Text()));
           const double vertical_margin = props.compact.value_or(false) ? 4.0 : 7.0;
@@ -1651,15 +1659,24 @@ struct SecureTextInputComponentView final
         lifecycle_->generation.load(std::memory_order_acquire) == generation;
   }
 
-  bool IsPlainTextProviderKey(
+  bool IsPlainTextAutoCommitField(
       winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps const& props) const noexcept {
-    return props.plainText.value_or(false) && props.autoCommit.value_or(false) &&
-        props.domain == "providers_models" &&
-        props.field == "api_key" && !props.target.empty();
+    if (!props.plainText.value_or(false) || !props.autoCommit.value_or(false)) return false;
+    if (props.domain == "providers_models") {
+      return props.field == "api_key" && !props.target.empty();
+    }
+    if (props.domain == "relay_accounts") {
+      return props.field == "api_key" && !props.target.empty();
+    }
+    if (props.domain == "codex") {
+      return props.field == "api_key" && props.target.empty();
+    }
+    return props.domain == "claude" && props.target.empty() &&
+        (props.field == "deployment_token" || props.field == "desktop_gateway_api_key");
   }
 
-  bool IsPlainTextProviderKey() const noexcept {
-    return Props() && IsPlainTextProviderKey(*Props());
+  bool IsPlainTextAutoCommitField() const noexcept {
+    return Props() && IsPlainTextAutoCommitField(*Props());
   }
 
   void SetPassword(winrt::hstring const& value) noexcept {
@@ -1678,7 +1695,7 @@ struct SecureTextInputComponentView final
     const bool plain_key_mode_changed = !old_props ||
         old_props->plainText != props.plainText || old_props->autoCommit != props.autoCommit;
     const bool reset_identity = identity_changed || plain_key_mode_changed;
-    const bool should_load_plaintext_provider_key = reset_identity && IsPlainTextProviderKey(props);
+    const bool should_load_plaintext = reset_identity && IsPlainTextAutoCommitField(props);
     const bool placeholder_changed = !old_props || old_props->placeholder != props.placeholder;
     const bool plain_text_changed = !old_props || old_props->plainText != props.plainText;
     const bool label_changed = !old_props || old_props->label != props.label;
@@ -1725,15 +1742,15 @@ struct SecureTextInputComponentView final
     if ((!old_props || old_props->commitRequest != props.commitRequest) && commit_request != last_commit_request_) {
       StageForRequest(commit_request, false);
     }
-    if (should_load_plaintext_provider_key) {
-      LoadProviderApiKey();
+    if (should_load_plaintext) {
+      LoadPlainTextSecret();
     }
   }
 
   void MarkDirty() noexcept {
     if (syncing_ || !lifecycle_ || lifecycle_->staging.load(std::memory_order_acquire)) return;
     try {
-      if (password_box_.Password().empty() && !IsPlainTextProviderKey()) return;
+      if (password_box_.Password().empty() && !IsPlainTextAutoCommitField()) return;
       dirty_ = true;
       EmitState(last_revision_, last_present_, "dirty", "", last_commit_request_);
     } catch (...) {
@@ -1742,12 +1759,12 @@ struct SecureTextInputComponentView final
   }
 
   void StageOnBlur() noexcept {
-    if (!IsPlainTextProviderKey() || !dirty_) return;
+    if (!IsPlainTextAutoCommitField() || !dirty_) return;
     StageForRequest(NextAutoCommitRequest(), true);
   }
 
   void StageOnSubmit() noexcept {
-    if (!IsPlainTextProviderKey() || !dirty_) return;
+    if (!IsPlainTextAutoCommitField() || !dirty_) return;
     StageForRequest(NextAutoCommitRequest(), true);
   }
 
@@ -1775,7 +1792,7 @@ struct SecureTextInputComponentView final
     }
     if (active_domain_.empty() || active_field_.empty()) {
       SetPassword(winrt::hstring{});
-      if (IsPlainTextProviderKey()) dirty_ = true;
+      if (IsPlainTextAutoCommitField()) dirty_ = true;
       last_commit_request_ = std::max(last_commit_request_, requested_commit);
       EmitState(last_revision_, last_present_, "error", "invalid_secret", last_commit_request_);
       return;
@@ -1786,13 +1803,13 @@ struct SecureTextInputComponentView final
     } catch (...) {
       secret.reset();
     }
-    const bool preserve_input = IsPlainTextProviderKey();
+    const bool preserve_input = IsPlainTextAutoCommitField();
     if (!preserve_input) {
       SetPassword(winrt::hstring{});
     }
     if (!secret || secret->size() > 16 * 1024) {
       last_commit_request_ = std::max(last_commit_request_, requested_commit);
-      if (IsPlainTextProviderKey()) dirty_ = true;
+      if (IsPlainTextAutoCommitField()) dirty_ = true;
       EmitState(last_revision_, last_present_, "error", "invalid_secret", last_commit_request_);
       return;
     }
@@ -1829,7 +1846,7 @@ struct SecureTextInputComponentView final
     } catch (...) {
       lifecycle_->staging.store(false, std::memory_order_release);
       password_box_.IsEnabled(!disabled);
-      if (IsPlainTextProviderKey()) dirty_ = true;
+      if (IsPlainTextAutoCommitField()) dirty_ = true;
       EmitState(last_revision_, last_present_, "error", "stage_failed", last_commit_request_);
     }
   }
@@ -1844,25 +1861,27 @@ struct SecureTextInputComponentView final
     if (!result || result->revision < 0 || result->revision > std::numeric_limits<int32_t>::max() ||
         std::floor(result->revision) != result->revision) {
       EmitState(last_revision_, last_present_, "error", "stage_failed", last_commit_request_);
-      if (IsPlainTextProviderKey()) dirty_ = true;
+      if (IsPlainTextAutoCommitField()) dirty_ = true;
       return;
     }
     EmitState(static_cast<int32_t>(result->revision), result->present, "saved", "", last_commit_request_);
   }
 
-  void LoadProviderApiKey() noexcept {
-    if (!IsPlainTextProviderKey() || !lifecycle_ || !dispatcher_) return;
+  void LoadPlainTextSecret() noexcept {
+    if (!IsPlainTextAutoCommitField() || !lifecycle_ || !dispatcher_ || !Props()) return;
     const auto generation = lifecycle_->generation.load(std::memory_order_acquire);
     const bool disabled = Props()->disabled.value_or(false);
-    const auto target = active_target_;
+    const auto domain = active_domain_;
+    const auto field = active_field_;
+    const auto target = active_target_.empty() ? std::nullopt : std::optional<std::string>{active_target_};
     auto lifecycle = lifecycle_;
     auto dispatcher = dispatcher_;
     auto weak_self = get_weak();
     loading_ = true;
     password_box_.IsEnabled(false);
     try {
-      std::thread([lifecycle, dispatcher, weak_self, generation, disabled, target] {
-        auto value = LiteLLMMenu::CoreIPCBridge::Shared().ReadProviderAPIKey(target);
+      std::thread([lifecycle, dispatcher, weak_self, generation, disabled, domain, field, target] {
+        auto value = LiteLLMMenu::CoreIPCBridge::Shared().ReadPlainTextSecret(domain, field, target);
         if (!lifecycle->alive.load(std::memory_order_acquire) ||
             lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
           return;
@@ -1872,7 +1891,7 @@ struct SecureTextInputComponentView final
               lifecycle->generation.load(std::memory_order_acquire) != generation) {
             return;
           }
-          if (auto self = weak_self.get()) self->FinishProviderApiKeyLoad(generation, disabled, std::move(value));
+          if (auto self = weak_self.get()) self->FinishPlainTextSecretLoad(generation, disabled, std::move(value));
         });
       }).detach();
     } catch (...) {
@@ -1882,13 +1901,17 @@ struct SecureTextInputComponentView final
     }
   }
 
-  void FinishProviderApiKeyLoad(
+  void FinishPlainTextSecretLoad(
       uint64_t generation,
       bool disabled,
       std::optional<std::string> value) noexcept {
-    if (!Current(generation) || !IsPlainTextProviderKey()) return;
+    if (!Current(generation) || !IsPlainTextAutoCommitField()) return;
     loading_ = false;
-    SetPassword(value ? ToHString(*value) : winrt::hstring{});
+    auto display_value = value.value_or("");
+    if (active_domain_ == "relay_accounts" && active_field_ == "api_key" && display_value.size() > 12) {
+      display_value = display_value.substr(0, 12) + "\xE2\x80\xA6";
+    }
+    SetPassword(ToHString(display_value));
     dirty_ = false;
     password_box_.IsEnabled(!disabled);
     if (!value) {
@@ -1945,14 +1968,23 @@ struct SwitchComponentView final
       winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISwitch<SwitchComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
-    toggle_ = ToggleSwitch{};
-    toggle_.OnContent(nullptr);
-    toggle_.OffContent(nullptr);
-    toggle_.Toggled([this](auto const&, auto const&) {
+    toggle_ = Button{};
+    toggle_.Width(24.0);
+    toggle_.Height(24.0);
+    toggle_.Padding(winrt::Microsoft::UI::Xaml::Thickness{0});
+    glyph_ = TextBlock{};
+    glyph_.FontSize(kUIFontSize);
+    glyph_.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center);
+    glyph_.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+    toggle_.Content(glyph_);
+    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle_, L"Toggle");
+    toggle_.Click([this](auto const&, auto const&) {
       if (syncing_) return;
+      value_ = !value_;
+      UpdateGlyph();
       if (auto emitter = EventEmitter()) {
         winrt::LiteLLMMenu::Codegen::LiteLLMWinUISwitchEventEmitter::OnValueChange args;
-        args.value = toggle_.IsOn();
+        args.value = value_;
         emitter->onValueChange(std::move(args));
       }
     });
@@ -1978,15 +2010,22 @@ struct SwitchComponentView final
     const bool disabled_changed = !old_props || old_props->disabled != props.disabled;
     if (value_changed) {
       syncing_ = true;
-      toggle_.IsOn(props.value.value_or(false));
+      value_ = props.value.value_or(false);
+      UpdateGlyph();
       syncing_ = false;
     }
     if (disabled_changed) toggle_.IsEnabled(Enabled(props.disabled));
   }
 
+  void UpdateGlyph() noexcept {
+    glyph_.Text(value_ ? L"x" : L"");
+  }
+
   bool syncing_ = false;
+  bool value_ = false;
   winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
-  ToggleSwitch toggle_{nullptr};
+  Button toggle_{nullptr};
+  TextBlock glyph_{nullptr};
 };
 
 struct SelectableRowComponentView final
@@ -2057,6 +2096,7 @@ void RegisterComponent(
         std::function<void(winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const&)>)) noexcept {
   register_component(package_builder, [](winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const& builder) {
     builder.SetContentIslandComponentViewInitializer([](ContentIslandComponentView const& island_view) noexcept {
+      LiteLLMMenu::ConfigureImmediateXamlPresentation();
       auto user_data = winrt::make_self<TComponent>();
       user_data->InitializeContentIsland(island_view);
       island_view.UserData(*user_data);
@@ -2067,6 +2107,22 @@ void RegisterComponent(
 }  // namespace
 
 namespace LiteLLMMenu {
+
+void ConfigureImmediateXamlPresentation() noexcept {
+  try {
+    auto application = winrt::Microsoft::UI::Xaml::Application::Current();
+    if (!application) return;
+    auto resources = application.Resources();
+    const auto zero = winrt::box_value(
+        winrt::Microsoft::UI::Xaml::DurationHelper::FromTimeSpan(
+            winrt::Windows::Foundation::TimeSpan{0}));
+    resources.Insert(winrt::box_value(L"ControlNormalAnimationDuration"), zero);
+    resources.Insert(winrt::box_value(L"ControlFastAnimationDuration"), zero);
+    resources.Insert(winrt::box_value(L"ControlFastAnimationAfterDuration"), zero);
+    resources.Insert(winrt::box_value(L"ControlFasterAnimationDuration"), zero);
+  } catch (...) {
+  }
+}
 
 void RegisterWinUIControls(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
@@ -2116,6 +2172,8 @@ void RegisterWinUIControls(
 #else
 
 namespace LiteLLMMenu {
+
+void ConfigureImmediateXamlPresentation() noexcept {}
 
 void RegisterWinUIControls(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const&) noexcept {}

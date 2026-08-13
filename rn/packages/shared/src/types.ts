@@ -21,6 +21,7 @@ export type AppRoute =
   | "runtime-settings"
   | "webdav-settings"
   | "relay-accounts"
+  | "relay-add"
   | "logs";
 
 export type LogTab =
@@ -135,11 +136,11 @@ export interface ProviderModelSummary {
   upstream_model: string;
   enabled: boolean;
   order: number | string;
-  billing?: string;
+  upstream_protocol_mode?: "fallback" | "fixed";
+  upstream_url_surface?: ProbeSurfaceName;
   probe?: {
     available: boolean;
     recommended_surface?: ProbeSurfaceName | null;
-    recommended_order?: ProbeSurfaceName[];
     summary?: ProbeSummary;
     checked_at?: string;
     surfaces?: Record<string, Omit<ProbeSurfaceResult, "surface">>;
@@ -194,7 +195,7 @@ export interface DispatchAction {
 export interface IpcParams {
   snapshot: Record<string, never>;
   logs: { tab: LogTab; revision?: number };
-  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" };
+  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer" };
   dispatch: { action: DispatchAction; revision?: number };
   subscribe: { topics?: string[] };
   validate: { domain: ConfigDomain; revision?: number };
@@ -208,7 +209,7 @@ export interface IpcParams {
 export interface IpcResults {
   snapshot: { snapshot: CoreSnapshot };
   logs: { changed: boolean; revision: number; log: LogView | null };
-  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings"; editor_token: string; revision: number };
+  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; editor_token: string; revision: number };
   dispatch: { revision: number };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
@@ -222,7 +223,6 @@ export interface IpcResults {
     provider_id?: string;
     model_id?: string;
     recommended_surface?: "openai/responses" | "openai/chat" | "anthropic" | null;
-    recommended_order?: ("openai/responses" | "openai/chat" | "anthropic")[];
     summary?: { available_surfaces: string[]; unavailable_surfaces: string[]; statuses: Record<string, string> };
     surfaces?: { surface: string; available: boolean; status?: string; original_request?: { method: string; url: string; headers: Record<string, string>; body: Record<string, unknown> } }[];
   };
@@ -270,9 +270,11 @@ export interface IpcTransport {
 
 export interface IpcClient {
   readonly endpoint?: IpcEndpoint;
+  /** The newest snapshot already received by this shared desktop runtime. */
+  latestSnapshot(): CoreSnapshot | undefined;
   snapshot(): Promise<CoreSnapshot>;
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
-  editor(domain: "codex" | "claude", document: "config" | "auth" | "settings"): Promise<IpcResults["editor"]>;
+  editor(domain: "codex" | "claude", document: "config" | "auth" | "settings" | "desktop" | "developer"): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<{ revision: number }>;
   subscribe(listener: (event: IpcEvent) => void, topics?: string[]): () => void;
   validate(domain: ConfigDomain, revision?: number): Promise<ValidationSummary>;
@@ -369,6 +371,7 @@ export interface NativeLocalization {
   routeRuntimeSettings: string;
   routeWebdavSettings: string;
   routeRelayAccounts: string;
+  routeRelayAdd: string;
   routeLogs: string;
   modelChooserTitle: string;
   modelChooserHeading: string;
@@ -422,6 +425,11 @@ export interface NativeLeafAdapter {
     field: string;
     target?: string;
   }): Promise<{ revision: number; present: boolean } | undefined>;
+  copySecret(options: {
+    domain: "relay_accounts";
+    field: "api_key";
+    target: string;
+  }): Promise<boolean>;
   relayLogin(options: {
     accountId: string;
     type: "newapi" | "sub2api";
@@ -430,6 +438,7 @@ export interface NativeLeafAdapter {
     language: LanguagePreference;
     username?: string;
     rememberPassword: boolean;
+    embedded?: boolean;
   }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   restoreRelaySession(options: {
     accountId: string;

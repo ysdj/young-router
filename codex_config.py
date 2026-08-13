@@ -1245,8 +1245,21 @@ def _apply_permissions_patch(text: str, value: object) -> str:
     if mode == "profiles":
         text = remove_top_level_value(text, "sandbox_mode")
         text = _remove_sandbox_workspace_write(text)
+        # Switching the mode is itself a complete structured edit.  Do not
+        # leave the config in ``unset`` merely because the caller did not also
+        # edit the profile name; the segmented mode control sends only this
+        # selector.  ``:workspace`` is Codex's built-in profile and is the
+        # only safe default when no profile is configured yet.
+        if "default_permissions" not in patch:
+            current = parse_toml_text(text).get("default_permissions")
+            profile = current if isinstance(current, str) and current.strip() else ":workspace"
+            text = set_top_level_value(text, "default_permissions", profile)
     elif mode in {"legacy", "unset"}:
         text = remove_top_level_value(text, "default_permissions")
+        if mode == "legacy" and "sandbox_mode" not in patch:
+            current = parse_toml_text(text).get("sandbox_mode")
+            sandbox_mode = current if isinstance(current, str) and current.strip() else "workspace-write"
+            text = set_top_level_value(text, "sandbox_mode", sandbox_mode)
     if mode == "unset":
         text = remove_top_level_value(text, "sandbox_mode")
         text = _remove_sandbox_workspace_write(text)
@@ -1516,6 +1529,11 @@ def apply_structured_patch(
         )
         updated_auth, auth_changed = _set_auth_api_key(updated_auth, local_api_key(runtime_config))
 
+    # Provider rows must exist before an atomic provider switch/rename updates
+    # the selected direct endpoint. The structured UI can therefore keep the
+    # provider table and model_provider reference consistent in one patch.
+    if "providers" in patch_data:
+        result = _apply_provider_patch(result, patch_data["providers"])
     if "direct_connection" in patch_data:
         result = _apply_direct_connection_patch(result, patch_data["direct_connection"])
 
@@ -1559,8 +1577,6 @@ def apply_structured_patch(
         result = _apply_features_patch(result, patch_data["features"])
     if "permissions" in patch_data:
         result = _apply_permissions_patch(result, patch_data["permissions"])
-    if "providers" in patch_data:
-        result = _apply_provider_patch(result, patch_data["providers"])
     if "mcp_servers" in patch_data:
         result = _apply_mcp_patch(result, patch_data["mcp_servers"])
     if "plugins" in patch_data:

@@ -80,8 +80,8 @@ export function AppKitSelectableRow({ title, detail, selected, disabled, onPress
   return <NativeAppKitSelectableRow title={title} detail={detail} selected={selected} disabled={disabled} onPress={() => onPress?.()} style={[styles.selectableRow, style]} />;
 }
 
-export function AppKitTable({ columnLabels, columnWidths, rowKeys, cells, selectedKey, alternatingRows, compact, followBottom, disabledRowKeys, secondaryCellKeys, spanningRowKeys, onSelectionChange, onRowDoublePress, style }: { columnLabels: string[]; columnWidths: number[]; rowKeys: string[]; cells: string[]; selectedKey: string; alternatingRows?: boolean; compact?: boolean; followBottom?: boolean; disabledRowKeys?: string[]; secondaryCellKeys?: string[]; spanningRowKeys?: string[]; onSelectionChange?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; onRowDoublePress?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  return <NativeAppKitTable columnLabels={columnLabels} columnWidths={columnWidths} rowKeys={rowKeys} cells={cells} selectedKey={selectedKey} alternatingRows={alternatingRows} compact={compact} followBottom={followBottom} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} spanningRowKeys={spanningRowKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} style={[styles.table, style]} />;
+export function AppKitTable({ columnLabels, columnWidths, rowKeys, cells, selectedKey, alternatingRows, compact, followBottom, cellHorizontalPadding, firstColumnHorizontalPadding, scrollTrailingColumnOverflow, disabledRowKeys, secondaryCellKeys, spanningRowKeys, onSelectionChange, onRowDoublePress, style }: { columnLabels: string[]; columnWidths: number[]; rowKeys: string[]; cells: string[]; selectedKey: string; alternatingRows?: boolean; compact?: boolean; followBottom?: boolean; cellHorizontalPadding?: number; firstColumnHorizontalPadding?: number; scrollTrailingColumnOverflow?: boolean; disabledRowKeys?: string[]; secondaryCellKeys?: string[]; spanningRowKeys?: string[]; onSelectionChange?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; onRowDoublePress?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <NativeAppKitTable columnLabels={columnLabels} columnWidths={columnWidths} rowKeys={rowKeys} cells={cells} selectedKey={selectedKey} alternatingRows={alternatingRows} compact={compact} followBottom={followBottom} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} spanningRowKeys={spanningRowKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} style={[styles.table, style]} />;
 }
 
 export function AppKitTextEditor({ value, documentKey, readOnly, wrap, onChangeText, style }: { value: string; documentKey?: string; readOnly?: boolean; wrap?: boolean; onChangeText?: (text: string) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
@@ -115,13 +115,13 @@ export function AppKitSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpe
 }
 
 const styles = StyleSheet.create({
-  button: { minWidth: 72, height: 28 },
+  button: { minWidth: 72, height: 24 },
   linkButton: { minWidth: 72, minHeight: 22 },
-  segmented: { width: 224, height: 28 },
-  picker: { minWidth: 160, height: 26 },
-  checkbox: { minHeight: 22 },
-  textField: { minHeight: 26 },
-  selectableRow: { minHeight: 44 },
+  segmented: { width: 224, height: 24 },
+  picker: { minWidth: 160, height: 24 },
+  checkbox: { minHeight: 20 },
+  textField: { minHeight: 24 },
+  selectableRow: { minHeight: 28 },
   table: { minHeight: 120 },
   editor: { minHeight: 160 },
   splitView: { minHeight: 120 },

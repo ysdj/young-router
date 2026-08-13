@@ -86,6 +86,55 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertTrue(target_config.exists())
             self.assertEqual(result["manifest"]["summary"]["active_models"], 1)
 
+    def test_relay_accounts_and_plaintext_password_round_trip_with_the_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            source = temp / "source"
+            target = temp / "target"
+            source.mkdir()
+            target.mkdir()
+            source_config = self.write_config(source)
+            relay_path = source / ".litellm-runtime" / "relay-accounts.json"
+            relay_path.parent.mkdir()
+            relay_payload = {
+                "version": 1,
+                "accounts": [
+                    {
+                        "id": "relay-one",
+                        "type": "sub2api",
+                        "label": "Relay One",
+                        "origin": "https://relay.example.test",
+                        "username": "person@example.test",
+                        "login_status": "unknown",
+                        "remember_password": True,
+                        "password": "replace-password",
+                        "session": {
+                            "cookie": "session=replace-cookie",
+                            "access_token": "replace-access-token",
+                            "refresh_token": "",
+                        },
+                        "balance": 12.5,
+                        "last_updated_at": "",
+                        "resource_status": "idle",
+                        "resource_error": "none",
+                        "resources": [],
+                    }
+                ],
+                "pending_credential_cleanups": [],
+            }
+            relay_path.write_text(json.dumps(relay_payload), encoding="utf-8")
+            relay_path.chmod(0o600)
+
+            bundle, _manifest = webdav_core.create_bundle(source_config)
+            self.assertIn(b"replace-password", bundle)
+            self.assertIn(b"replace-cookie", bundle)
+            result = webdav_core.install_bundle(bundle, target / "config.yaml")
+
+            installed_relay = target / ".litellm-runtime" / "relay-accounts.json"
+            self.assertIn(str(installed_relay), result["installed"])
+            self.assertEqual(relay_payload, json.loads(installed_relay.read_text(encoding="utf-8")))
+            self.assertEqual(0o600, installed_relay.stat().st_mode & 0o777)
+
     def test_tar_bundle_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target_config = Path(temp_dir) / "config.yaml"

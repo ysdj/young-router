@@ -54,111 +54,6 @@ future_top_level:
 
 
 class ProvidersModelsDomainTests(unittest.TestCase):
-    def test_multiplier_refresh_is_a_read_only_overlay_without_balance_or_usage(self) -> None:
-        payload = {
-            "providers": [
-                {
-                    "name": "primary",
-                    "models": [
-                        {
-                            "deployment_id": "00000071",
-                            "status": "ok",
-                            "detail": "Live provider multiplier is available.",
-                            "source": "sub2api-key-billing",
-                            "multiplier": {"status": "ok", "value": 0.25},
-                        }
-                    ],
-                }
-            ],
-            "summary": {
-                "providers": 1,
-                "models": 1,
-                "available_models": 1,
-                "unavailable_models": 0,
-            },
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.yaml"
-            source = textwrap.dedent(PROVIDER_CONFIG).lstrip()
-            path.write_text(source, encoding="utf-8")
-            core = CoreStore(domains=[ProvidersModelsDomain(path)])
-
-            with mock.patch("provider_billing.collect_billing", return_value=payload) as collect:
-                result = core.dispatch(
-                    {"domain": "providers_models", "type": "providers.refresh_multiplier"},
-                    expected_revision=core.revision,
-                )
-
-            snapshot = core.snapshot()
-            model = snapshot["domains"]["providers_models"]["providers"][0]["models"][0]
-            self.assertEqual(result["revision"], snapshot["revision"])
-            self.assertFalse(snapshot["drafts"]["providers_models"]["dirty"])
-            self.assertEqual(0.25, model["multiplier"]["value"])
-            self.assertNotIn("balance", model["billing"])
-            self.assertNotIn("usage", model)
-            self.assertEqual(source, path.read_text(encoding="utf-8"))
-            collect.assert_called_once_with(path, timeout=5.0)
-
-    def test_multiplier_network_read_does_not_block_provider_edits(self) -> None:
-        payload = {
-            "providers": [
-                {
-                    "name": "primary",
-                    "models": [
-                        {
-                            "deployment_id": "00000071",
-                            "status": "ok",
-                            "detail": "Live provider multiplier is available.",
-                            "source": "sub2api-key-billing",
-                            "multiplier": {"status": "ok", "value": 0.25},
-                        }
-                    ],
-                }
-            ],
-            "summary": {"providers": 1, "models": 1, "available_models": 1, "unavailable_models": 0},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.yaml"
-            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
-            core = CoreStore(domains=[ProvidersModelsDomain(path)])
-            multiplier_started = threading.Event()
-            release_multiplier = threading.Event()
-            refresh_result: dict[str, int] = {}
-
-            def collect(*_args: object, **_kwargs: object) -> dict[str, object]:
-                multiplier_started.set()
-                self.assertTrue(release_multiplier.wait(2))
-                return payload
-
-            def refresh() -> None:
-                refresh_result.update(core.dispatch(
-                    {"domain": "providers_models", "type": "providers.refresh_multiplier"},
-                    expected_revision=core.revision,
-                ))
-
-            with mock.patch("provider_billing.collect_billing", side_effect=collect):
-                refresh_thread = threading.Thread(target=refresh)
-                refresh_thread.start()
-                self.assertTrue(multiplier_started.wait(1))
-
-                edited = core.dispatch(
-                    {
-                        "domain": "providers_models",
-                        "type": "provider.patch",
-                        "payload": {"provider_id": "primary", "changes": {"enabled": False}},
-                    },
-                    expected_revision=core.revision,
-                )
-                release_multiplier.set()
-                refresh_thread.join(2)
-
-            self.assertFalse(refresh_thread.is_alive())
-            self.assertEqual(edited["revision"], refresh_result["revision"])
-            snapshot = core.snapshot()
-            self.assertTrue(snapshot["drafts"]["providers_models"]["dirty"])
-            model = snapshot["domains"]["providers_models"]["providers"][0]["models"][0]
-            self.assertIsNone(model["multiplier"])
-
     def test_canonical_actions_stage_and_apply_without_exposing_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
@@ -199,6 +94,19 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 provider["key_states"],
             )
             self.assertNotIn("replace-me-secret", json.dumps(snapshot))
+
+    def test_provider_model_contract_has_no_upstream_billing_state_or_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+
+            model = domain.snapshot()["providers"][0]["models"][0]
+
+            self.assertNotIn("billing", model)
+            self.assertNotIn("multiplier", model)
+            with self.assertRaisesRegex(LegacyDomainError, "action is unavailable"):
+                domain.dispatch("providers.refresh_multiplier")
 
     def test_model_api_key_configured_requires_the_selected_named_key_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -294,7 +202,8 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             model = next(item for item in domain.snapshot()["providers"] if not item["name"])["models"][0]
 
             self.assertEqual(first, moved["id"])
-            self.assertTrue(model["id"].startswith("model-"))
+            self.assertTrue(model["editor_id"].startswith("model-"))
+            self.assertRegex(model["id"], r"^[0-9a-f]{8}$")
             self.assertEqual(2, model["order"])
 
     def test_provider_and_model_editor_ids_survive_in_place_edits(self) -> None:
@@ -355,6 +264,57 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             applied = domain.snapshot()["providers"][0]
             self.assertEqual(provider_id, applied["editor_id"])
             self.assertIn(added_id, [model["editor_id"] for model in applied["models"]])
+
+    def test_new_claude_model_defaults_to_anthropic_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "claude-sonnet-4-5",
+                        "upstream_model": "claude-sonnet-4-5",
+                        "api_key_name": "default",
+                        "order": 2,
+                        "enabled": True,
+                    },
+                },
+            )
+
+            model = domain.snapshot()["providers"][0]["models"][1]
+            self.assertEqual("anthropic", model["upstream_url_surface"])
+            self.assertEqual("claude-sonnet-4-5", model["upstream_model"])
+            self.assertEqual("anthropic/claude-sonnet-4-5", model["litellm_model"])
+
+    def test_new_non_claude_model_defaults_to_responses_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "gpt-5",
+                        "upstream_model": "gpt-5",
+                        "api_key_name": "default",
+                        "order": 2,
+                        "enabled": True,
+                    },
+                },
+            )
+
+            model = domain.snapshot()["providers"][0]["models"][1]
+            self.assertEqual("openai/responses", model["upstream_url_surface"])
+            self.assertEqual("openai/gpt-5", model["litellm_model"])
 
     def test_upstream_model_is_displayed_without_prefix_and_saved_canonically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -505,7 +465,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
             domain.apply()
             saved = path.read_text(encoding="utf-8")
-            self.assertNotIn("fallback", saved)
+            self.assertNotIn("name: fallback", saved)
             self.assertIn("replace-me-secret", saved)
 
     def test_provider_import_link_is_staged_only_through_native_secret_input(self) -> None:
@@ -734,7 +694,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
-    def test_model_probe_checks_all_protocols_and_multiplier_in_one_action(self) -> None:
+    def test_model_probe_checks_all_protocols_in_one_action(self) -> None:
         requests: list[tuple[str, str, str]] = []
 
         class Handler(BaseHTTPRequestHandler):
@@ -774,32 +734,17 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 path = Path(directory) / "config.yaml"
                 path.write_text(textwrap.dedent(config).lstrip(), encoding="utf-8")
                 domain = ProvidersModelsDomain(path)
-                billing = {
-                    "status": "ok",
-                    "detail": "Live provider multiplier is available.",
-                    "source": "sub2api-key-billing",
-                    "multiplier": {"status": "ok", "value": 0.25},
-                }
-                with mock.patch("provider_billing.probe_model", return_value=billing) as multiplier_probe:
-                    result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
                 model = domain.snapshot()["providers"][0]["models"][0]
 
             self.assertTrue(result["available"])
-            self.assertEqual("openai/responses", result["recommended_surface"])
+            self.assertEqual("openai/chat", result["recommended_surface"])
             self.assertEqual(["openai/responses", "openai/chat", "anthropic"], result["protocols"])
             self.assertTrue(model["probe"]["available"])
             self.assertTrue(model["probe"]["surfaces"]["openai/responses"]["available"])
             self.assertTrue(model["model_enabled"])
-            self.assertEqual(["openai/responses"], model["supported_upstream_url_surfaces"])
-            self.assertNotIn("balance", model["billing"])
-            self.assertNotIn("usage", model)
-            self.assertEqual(0.25, model["multiplier"]["value"])
-            multiplier_probe.assert_called_once()
-            multiplier_target = multiplier_probe.call_args.args[0]
-            self.assertEqual(f"http://127.0.0.1:{port}/v1", multiplier_target.api_base)
-            self.assertEqual("replace-me-secret", multiplier_target.api_key)
-            self.assertEqual("openai/default-chat", multiplier_target.upstream_model)
-            self.assertEqual(5.0, multiplier_probe.call_args.kwargs["timeout"])
+            self.assertEqual("openai/responses", model["upstream_url_surface"])
+            self.assertNotIn("supported_upstream_url_surfaces", model)
             self.assertEqual(
                 [
                     ("/v1/chat/completions", "Bearer replace-me-secret", "default-chat"),
@@ -828,7 +773,6 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                     "changes": {
                         "model_enabled": False,
                         "upstream_url_surface": "openai/chat",
-                        "supported_upstream_url_surfaces": ["openai/chat"],
                     },
                 },
             )
@@ -839,10 +783,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
                 return {"surface": surface, "available": surface == "openai/responses", "status": "ok" if surface == "openai/responses" else "unsupported"}
 
-            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch(
-                "provider_billing.probe_model",
-                return_value={"status": "unsupported", "detail": "Billing unavailable"},
-            ):
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe):
                 result = core.probe(
                     {"provider_id": "primary", "model_id": "00000071"},
                     domain="providers_models",
@@ -853,7 +794,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual("openai/responses", result["recommended_surface"])
             self.assertFalse(model["model_enabled"])
             self.assertEqual("openai/chat", model["upstream_url_surface"])
-            self.assertEqual(["openai/chat"], model["supported_upstream_url_surfaces"])
+            self.assertNotIn("supported_upstream_url_surfaces", model)
             self.assertFalse(core.snapshot()["drafts"]["providers_models"]["dirty"])
             self.assertEqual(saved_before_probe, path.read_text(encoding="utf-8"))
 
@@ -874,7 +815,6 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                         "upstream_model": "second-chat",
                         "order": 2,
                         "upstream_url_surface": "openai/responses",
-                        "supported_upstream_url_surfaces": ["openai/responses"],
                     },
                 },
             )
@@ -904,10 +844,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                     domain="providers_models",
                 )
 
-            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch(
-                "provider_billing.probe_model",
-                return_value={"status": "unsupported", "detail": "Billing unavailable"},
-            ):
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe):
                 first_thread = threading.Thread(target=run_probe, args=("first", first_model_id), daemon=True)
                 second_thread = threading.Thread(target=run_probe, args=("second", second_model_id), daemon=True)
                 first_thread.start()
@@ -946,20 +883,56 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
                 return {"surface": surface, "available": True, "status": "ok"}
 
-            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch(
-                "provider_billing.probe_model",
-                return_value={"status": "unsupported", "detail": "Billing unavailable"},
-            ):
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe):
                 result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
 
             model = domain.snapshot()["providers"][0]["models"][0]
             self.assertEqual("anthropic", result["recommended_surface"])
             self.assertEqual("anthropic", model["probe"]["recommended_surface"])
             self.assertEqual("openai/responses", model["upstream_url_surface"])
-            self.assertEqual(["openai/responses"], model["supported_upstream_url_surfaces"])
+            self.assertNotIn("supported_upstream_url_surfaces", model)
 
 
 class CodexSettingsDomainTests(unittest.TestCase):
+    def test_staged_edits_preserve_existing_codex_file_presence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "default-chat"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            initial = domain.snapshot()
+            self.assertTrue(initial["config_exists"])
+            self.assertTrue(initial["auth_file_exists"])
+
+            structured = domain.dispatch("patch", {"model_reasoning_effort": "high"})
+            self.assertTrue(structured["config_exists"])
+            self.assertTrue(structured["auth_file_exists"])
+
+            raw = domain.dispatch("set_raw", {"document": "config", "text": 'model = "edited"\n'})
+            self.assertTrue(raw["config_exists"])
+            self.assertTrue(raw["auth_file_exists"])
+
+    def test_missing_codex_file_remains_missing_until_apply_creates_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            staged = domain.dispatch("set_raw", {"document": "config", "text": 'model = "draft"\n'})
+            self.assertFalse(staged["config_exists"])
+            self.assertFalse(staged["auth_file_exists"])
+
+            applied = domain.apply()
+            self.assertTrue(applied["config_exists"])
+            self.assertTrue(applied["auth_file_exists"])
+
     def test_menu_catalog_toggle_preserves_staged_codex_edits_and_tracks_public_models(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1150,6 +1123,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             loaded = module.load_specs()
             self.assertGreater(len(loaded), 20)
             self.assertEqual("4000", loaded["LITELLM_PORT"].default)
+            self.assertEqual("0", loaded["LITELLM_MENU_MCP_AUTO_APPROVE"].default)
 
     def test_bool_auto_uses_checkbox_projection_and_auto_off_storage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

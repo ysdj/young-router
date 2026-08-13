@@ -4,6 +4,56 @@ from hook_test_utils import *
 
 
 class HookPatchTests(HookTestCase):
+    def test_custom_response_headers_omit_values_starlette_cannot_encode(self) -> None:
+        hooks, _ = load_hook_module()
+        module_name = "litellm.proxy.common_request_processing"
+        common_request_processing = types.ModuleType(module_name)
+
+        class ProxyBaseLLMRequestProcessing:
+            @staticmethod
+            def get_custom_headers(**_kwargs):
+                return {
+                    "x-litellm-call-id": "synthetic-call",
+                    "x-litellm-model-name": "synthetic-route-\u6b21",
+                    "x-latin1-value": "caf\u00e9",
+                }
+
+        common_request_processing.ProxyBaseLLMRequestProcessing = (
+            ProxyBaseLLMRequestProcessing
+        )
+        sys.modules[module_name] = common_request_processing
+        self.addCleanup(sys.modules.pop, module_name, None)
+
+        hooks._install_latin1_response_headers_patch()
+        hooks._install_latin1_response_headers_patch()
+
+        headers = ProxyBaseLLMRequestProcessing.get_custom_headers()
+
+        self.assertEqual(
+            headers,
+            {
+                "x-litellm-call-id": "synthetic-call",
+                "x-latin1-value": "caf\u00e9",
+            },
+        )
+
+    async def test_selected_deployment_marker_stream_is_a_real_async_iterator(self) -> None:
+        from collections.abc import AsyncIterator
+
+        hooks, _ = load_hook_module()
+
+        async def source():
+            yield "first"
+            yield "second"
+
+        wrapped = hooks._routing_module._SelectedDeploymentMarkerStream(
+            source(),
+            {"id": "route-a"},
+        )
+
+        self.assertIsInstance(wrapped, AsyncIterator)
+        self.assertEqual([chunk async for chunk in wrapped], ["first", "second"])
+
     async def test_install_all_keeps_large_responses_json_on_native_http_path(self) -> None:
         hooks, _ = load_hook_module()
         received = {}
@@ -137,11 +187,7 @@ class HookPatchTests(HookTestCase):
             "litellm_params": {"model": "openai/vendor/model", "order": 1},
             "model_info": {
                 "id": "three-protocol-route",
-                "supported_upstream_url_surfaces": [
-                    "openai/responses",
-                    "anthropic",
-                    "openai/chat",
-                ],
+                "upstream_url_surface": "openai/responses",
             },
         }
 
@@ -151,10 +197,9 @@ class HookPatchTests(HookTestCase):
             "openai/chat": ("openai/vendor/model", "openai", True),
         }
         for surface, (model, provider, uses_chat) in expected.items():
+            deployment["model_info"]["upstream_url_surface"] = surface
             kwargs = {
                 "model": "default-chat",
-                "_litellm_menu_upstream_url_surface": surface,
-                "_litellm_menu_upstream_url_surface_deployment_id": "three-protocol-route",
             }
             Router()._update_kwargs_with_deployment(deployment, kwargs)
             self.assertEqual(kwargs["model"], model)
@@ -181,11 +226,7 @@ class HookPatchTests(HookTestCase):
             },
             "model_info": {
                 "id": "endpoint-route",
-                "supported_upstream_url_surfaces": [
-                    "openai/responses",
-                    "anthropic",
-                    "openai/chat",
-                ],
+                "upstream_url_surface": "openai/responses",
             },
         }
 
@@ -196,10 +237,9 @@ class HookPatchTests(HookTestCase):
         }
         for surface, expected_api_base in expected_api_bases.items():
             with self.subTest(surface=surface):
+                deployment["model_info"]["upstream_url_surface"] = surface
                 kwargs = {
                     "model": "default-chat",
-                    "_litellm_menu_upstream_url_surface": surface,
-                    "_litellm_menu_upstream_url_surface_deployment_id": "endpoint-route",
                 }
                 Router()._update_kwargs_with_deployment(deployment, kwargs)
                 self.assertEqual(
@@ -1239,7 +1279,6 @@ class HookPatchTests(HookTestCase):
                 "model": "default-chat",
                 "_target_order": 1,
                 "_excluded_deployment_ids": ["primary-a"],
-                "_litellm_menu_upstream_url_surface_deployment_id": "primary-a",
             },
         )
 
@@ -1619,14 +1658,17 @@ class HookPatchTests(HookTestCase):
                 },
             )
 
-    async def test_routing_constraint_patch_uses_request_surface_for_cooldown(self) -> None:
+    async def test_routing_constraint_patch_cools_down_the_deployment(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         router_module = types.ModuleType("litellm.router")
         deployment = {
             "litellm_params": {"model": "openai/default-chat"},
-            "model_info": {"id": "dual-route"},
+            "model_info": {
+                "id": "dual-route",
+                "upstream_url_surface": "openai/responses",
+            },
         }
 
         class Router:
@@ -1650,10 +1692,7 @@ class HookPatchTests(HookTestCase):
                 "_litellm_menu_upstream_url_surface": "openai/responses",
                 "model_info": {
                     "id": "dual-route",
-                    "supported_upstream_url_surfaces": [
-                        "openai/responses",
-                        "openai/chat",
-                    ],
+                    "upstream_url_surface": "openai/responses",
                 },
             },
         )
@@ -1674,7 +1713,9 @@ class HookPatchTests(HookTestCase):
         )
 
         self.assertEqual(responses, [])
-        self.assertEqual(chat, [deployment])
+        self.assertEqual(chat, [])
+        self.assertIn("id:dual-route", hooks._DEPLOYMENT_COOLDOWNS)
+        self.assertFalse(any("|surface:" in key for key in hooks._DEPLOYMENT_COOLDOWNS))
 
     async def test_order_peer_failover_patch_runs_same_order_before_larger_order(self) -> None:
         hooks, _ = load_hook_module()
