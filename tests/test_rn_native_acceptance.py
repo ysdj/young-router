@@ -1713,6 +1713,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('((LiteLLMNavigationLinkButton *)_button).linkMode = NO;', recycle)
         self.assertIn('_button.keyEquivalent = @"";', recycle)
         self.assertIn('[_button.window setDefaultButtonCell:nil];', button)
+        self.assertIn('if (!link && !newViewProps.primary) {', button)
         self.assertIn("_button.hasDestructiveAction = NO;", recycle)
         self.assertIn("_button.contentTintColor = nil;", recycle)
         self.assertIn("_button.enabled = YES;", recycle)
