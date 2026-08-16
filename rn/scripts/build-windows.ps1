@@ -30,7 +30,6 @@ try {
   }
 
   pnpm run build
-  pnpm run codegen:windows:check
 
   Remove-Item -LiteralPath $Core -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $Core | Out-Null

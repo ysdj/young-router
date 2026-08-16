@@ -20,7 +20,7 @@ from ..model_catalog import (
 from ..model_contexts import ModelContextRegistry, default_context_cache_path
 from ..security import redact
 from ._shared import (
-    LegacyDomainError,
+    DomainError,
     _action_name,
     _default_provider_config_path,
     _mapping,
@@ -34,7 +34,7 @@ _CODEX_ENVIRONMENT_LOCK = threading.RLock()
 def _codex_environment(runtime_config_path: Path, codex_home: Path | None) -> Iterator[None]:
     """Use codex_config's public functions without leaking env changes.
 
-    The legacy module intentionally discovers CODEX_HOME at call time.  A
+    The configuration adapter discovers CODEX_HOME at call time.  A
     narrow process-global lock makes an explicit Core test/host path safe
     without keeping a divergent implementation of its editor protocol.
     """
@@ -99,11 +99,11 @@ class CodexSettingsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Codex settings could not be loaded") from None
         if not isinstance(payload, Mapping):
-            raise LegacyDomainError("Codex settings are invalid")
+            raise DomainError("Codex settings are invalid")
         config_text = payload.get("config_text", "")
         auth_text = payload.get("auth_text", "{}\n")
         if not isinstance(config_text, str) or not isinstance(auth_text, str):
-            raise LegacyDomainError("Codex settings are invalid")
+            raise DomainError("Codex settings are invalid")
         return copy.deepcopy(dict(payload))
 
     def _is_catalog_enabled(self, payload: Mapping[str, Any]) -> bool:
@@ -119,7 +119,7 @@ class CodexSettingsDomain:
     def _require_catalog_model_names(self, payload: Mapping[str, Any]) -> list[str]:
         names = self._catalog_model_names(payload)
         if not names:
-            raise LegacyDomainError("Select a Codex model before enabling the model catalog")
+            raise DomainError("Select a Codex model before enabling the model catalog")
         return names
 
     def _queue_catalog_restart(self, reason: str) -> None:
@@ -182,7 +182,7 @@ class CodexSettingsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Codex settings are invalid") from None
         if not isinstance(result, Mapping) or not isinstance(result.get("config_text"), str) or not isinstance(result.get("auth_text"), str):
-            raise LegacyDomainError("Codex settings are invalid")
+            raise DomainError("Codex settings are invalid")
         synced = copy.deepcopy(dict(result))
         # ``sync_editor`` validates and rewrites an in-memory draft without
         # touching CODEX_HOME, so its payload intentionally has no filesystem
@@ -199,7 +199,7 @@ class CodexSettingsDomain:
         config_text = self._draft.get("config_text", "")
         auth_text = self._draft.get("auth_text", "{}\n")
         if not isinstance(config_text, str) or not isinstance(auth_text, str):
-            raise LegacyDomainError("Codex settings are invalid")
+            raise DomainError("Codex settings are invalid")
         if name in {"acknowledge_model_catalog_restart", "acknowledgemodelcatalogrestart"}:
             self._catalog_restart_required = False
             self._catalog_change_reason = None
@@ -213,49 +213,49 @@ class CodexSettingsDomain:
             if document in {"auth", "auth.json", "json"} and isinstance(text, str):
                 next_auth = text
             if not isinstance(next_config, str) or not isinstance(next_auth, str):
-                raise LegacyDomainError("Codex editor text must be text")
+                raise DomainError("Codex editor text must be text")
             self._draft = self._sync(next_config, next_auth)
-        elif name in {"set", "patch", "edit", "select_model", "selectmodel"}:
+        elif name in {"patch", "select_model"}:
             if "config_text" in data or "auth_text" in data or "raw_toml" in data or "raw_json" in data:
                 next_config = data.get("config_text", data.get("raw_toml", config_text))
                 next_auth = data.get("auth_text", data.get("raw_json", auth_text))
                 if not isinstance(next_config, str) or not isinstance(next_auth, str):
-                    raise LegacyDomainError("Codex editor text must be text")
+                    raise DomainError("Codex editor text must be text")
                 self._draft = self._sync(next_config, next_auth)
             else:
-                patch = data.get("patch", data.get("structured", data))
-                if name in {"select_model", "selectmodel"} and "litellm_model" not in _mapping(patch):
-                    patch = {"litellm_model": data.get("model", data.get("selection"))}
+                patch = data
+                if name == "select_model":
+                    patch = {"litellm_model": data.get("selection")}
                 self._draft = self._sync(config_text, auth_text, patch)
         elif name in {"reset", "cancel", "reload", "restore_defaults"}:
             self._draft = copy.deepcopy(self._raw)
         else:
-            raise LegacyDomainError("The requested Codex action is unavailable")
+            raise DomainError("The requested Codex action is unavailable")
         self.revision += 1
         return self.snapshot()
 
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if field != "api_key" or target is not None:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         structured = self._draft.get("structured", {})
         return isinstance(structured, Mapping) and bool(structured.get("api_key"))
 
     def trusted_secret_value(self, field: str, target: str | None = None) -> str:
         if field != "api_key" or target is not None:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         structured = self._draft.get("structured", {})
         value = structured.get("api_key", "") if isinstance(structured, Mapping) else ""
         if not isinstance(value, str):
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         return value
 
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
         if field != "api_key" or target is not None:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         config_text = self._draft.get("config_text", "")
         auth_text = self._draft.get("auth_text", "{}\n")
         if not isinstance(config_text, str) or not isinstance(auth_text, str):
-            raise LegacyDomainError("Codex settings are invalid")
+            raise DomainError("Codex settings are invalid")
         self._draft = self._sync(config_text, auth_text, {"api_key": value or None})
         self.revision += 1
 
@@ -268,8 +268,8 @@ class CodexSettingsDomain:
             if not isinstance(config_text, str) or not isinstance(auth_text, str):
                 return {"valid": False, "errors": ["Codex editor text must be text"]}
             try:
-                draft = self._sync(config_text, auth_text, data.get("patch", data.get("structured")))
-            except LegacyDomainError:
+                draft = self._sync(config_text, auth_text, data.get("patch"))
+            except DomainError:
                 return {"valid": False, "errors": ["Codex settings are invalid"]}
         errors = draft.get("validation_errors", [])
         return {"valid": not bool(errors), "errors": list(errors) if isinstance(errors, list) else ["Codex settings are invalid"]}
@@ -283,10 +283,10 @@ class CodexSettingsDomain:
                 self.dispatch("set_raw", data)
         validation = self.validate()
         if not validation["valid"]:
-            raise LegacyDomainError("Codex settings are invalid")
+            raise DomainError("Codex settings are invalid")
         current = self._load_editor()
         if (current.get("config_text"), current.get("auth_text")) != self._baseline:
-            raise LegacyDomainError("Codex settings changed on disk; reload before applying")
+            raise DomainError("Codex settings changed on disk; reload before applying")
         was_enabled = self._is_catalog_enabled(self._raw)
         will_be_enabled = self._is_catalog_enabled(self._draft)
         catalog_models = self._require_catalog_model_names(self._draft) if will_be_enabled else None
@@ -327,12 +327,12 @@ class CodexSettingsDomain:
         """Toggle only the managed catalog, preserving unrelated staged edits."""
 
         if not isinstance(enabled, bool):
-            raise LegacyDomainError("The Codex model catalog switch is invalid")
+            raise DomainError("The Codex model catalog switch is invalid")
         import codex_config
 
         current = self._load_editor()
         if (current.get("config_text"), current.get("auth_text")) != self._baseline:
-            raise LegacyDomainError("Codex settings changed on disk; reload before applying")
+            raise DomainError("Codex settings changed on disk; reload before applying")
         was_enabled = self._is_catalog_enabled(self._raw)
         catalog_models = self._require_catalog_model_names(self._raw) if enabled else None
         self._context_registry.refresh_if_due()
@@ -352,7 +352,7 @@ class CodexSettingsDomain:
                     draft_auth,
                     {"model_catalog_json": str(self.model_catalog_path) if enabled else None},
                 )
-            except LegacyDomainError:
+            except DomainError:
                 # A raw editor may intentionally contain an invalid draft. Keep
                 # that draft intact while the menu action updates the applied
                 # document below.

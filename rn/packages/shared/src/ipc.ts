@@ -82,6 +82,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     },
     logs: async (tab, revision) => call("logs", revision === undefined ? { tab } : { tab, revision }),
     editor: async (domain, document): Promise<IpcResults["editor"]> => call("editor", { domain, document }),
+    stageEditor: async (editorToken, text): Promise<IpcResults["editor"]> => call("editor", { editor_token: editorToken, text }),
     dispatch: async (action: DispatchAction, revision?: number): Promise<{ revision: number }> => call("dispatch", revision === undefined ? { action } : { action, revision }),
     subscribe: (listener: (event: IpcEvent) => void, topics?: string[]): (() => void) => {
       snapshotListeners.add(listener);
@@ -111,6 +112,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
       ...(modelId === undefined ? {} : { model_id: modelId }),
     }),
     export: async (sections: ConfigDomain[], destinationToken: string): Promise<IpcResults["export"]> => call("export", { sections, destination_token: destinationToken }),
-    import: async (sourceToken: string, revision: number, sections?: ConfigDomain[]): Promise<IpcResults["import"]> => call("import", sections === undefined ? { source_token: sourceToken, revision } : { source_token: sourceToken, sections, revision }),
+    previewImport: async (sourceToken: string, revision: number): Promise<IpcResults["import_preview"]> => call("import_preview", { source_token: sourceToken, revision }),
+    importPlan: async (importPlanToken: string, revision: number, sections: ConfigDomain[]): Promise<IpcResults["import"]> => call("import", { import_plan_token: importPlanToken, sections, revision }),
   };
 }

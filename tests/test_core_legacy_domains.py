@@ -13,13 +13,11 @@ import threading
 import unittest
 from unittest import mock
 
-from litellm_menu.core.domains.legacy import (
-    CodexSettingsDomain,
-    LegacyDomainError,
-    ProvidersModelsDomain,
-    RuntimeSettingsDomain,
-    WebDAVSettingsDomain,
-)
+from litellm_menu.core.domains import DomainError
+from litellm_menu.core.domains.codex import CodexSettingsDomain
+from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
+from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
 from litellm_menu.core.service import CoreStore
 from runtime_settings_io import RuntimeSettingSpec
 
@@ -105,7 +103,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
             self.assertNotIn("billing", model)
             self.assertNotIn("multiplier", model)
-            with self.assertRaisesRegex(LegacyDomainError, "action is unavailable"):
+            with self.assertRaisesRegex(DomainError, "action is unavailable"):
                 domain.dispatch("providers.refresh_multiplier")
 
     def test_model_api_key_configured_requires_the_selected_named_key_value(self) -> None:
@@ -144,7 +142,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             domain.dispatch("provider.patch", {"provider_id": "primary", "changes": {"enabled": False}})
             path.write_text(source + "external_change: true\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(LegacyDomainError, "changed on disk"):
+            with self.assertRaisesRegex(DomainError, "changed on disk"):
                 domain.apply()
 
     def test_first_apply_creates_private_config_and_rejects_concurrent_target(self) -> None:
@@ -167,7 +165,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             domain.dispatch("provider.add", {"provider": {"name": "primary", "models": []}})
             path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
 
-            with self.assertRaisesRegex(LegacyDomainError, "changed on disk"):
+            with self.assertRaisesRegex(DomainError, "changed on disk"):
                 domain.apply()
 
     def test_new_provider_gets_a_core_owned_blank_named_key_slot(self) -> None:
@@ -205,6 +203,37 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertTrue(model["editor_id"].startswith("model-"))
             self.assertRegex(model["id"], r"^[0-9a-f]{8}$")
             self.assertEqual(2, model["order"])
+
+    def test_new_models_default_to_zero_order_and_fetch_batches_share_one_add_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "manual", "upstream_model": "manual", "api_key_name": "default"},
+                },
+            )
+            batch = domain.dispatch(
+                "model.add_many",
+                {
+                    "provider_id": provider_id,
+                    "models": [
+                        {"name": "fetched-one", "upstream_model": "fetched-one", "api_key_name": "default"},
+                        {"name": "fetched-two", "upstream_model": "fetched-two", "api_key_name": "default"},
+                    ],
+                },
+            )
+
+            models = batch["providers"][0]["models"]
+            added = [model for model in models if model["name"] in {"manual", "fetched-one", "fetched-two"}]
+            self.assertEqual(3, len(added))
+            self.assertEqual([0, 0, 0], [model["order"] for model in added])
+            self.assertEqual(3, len({model["editor_id"] for model in added}))
 
     def test_provider_and_model_editor_ids_survive_in_place_edits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -455,8 +484,8 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             )
             provider = deleted["providers"][0]
             self.assertEqual(["default"], provider["api_key_names"])
-            self.assertEqual("default", provider["models"][0]["api_key_name"])
-            with self.assertRaisesRegex(LegacyDomainError, "retain at least one"):
+            self.assertEqual([], provider["models"])
+            with self.assertRaisesRegex(DomainError, "retain at least one"):
                 domain.dispatch(
                     "provider.key_delete",
                     {"provider_id": "primary", "name": "default"},
@@ -466,6 +495,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             domain.apply()
             saved = path.read_text(encoding="utf-8")
             self.assertNotIn("name: fallback", saved)
+            self.assertNotIn("model_name: default-chat", saved)
             self.assertIn("replace-me-secret", saved)
 
     def test_provider_import_link_is_staged_only_through_native_secret_input(self) -> None:
@@ -510,9 +540,9 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             provider = snapshot["providers"][0]
             self.assertEqual("fallback", provider["models"][0]["api_key_name"])
             self.assertTrue(domain.secret_present("api_key", "primary\x1ffallback"))
-            with self.assertRaisesRegex(LegacyDomainError, "unavailable"):
+            with self.assertRaisesRegex(DomainError, "unavailable"):
                 domain.secret_present("api_key", "primary\x1fsecondary")
-            with self.assertRaisesRegex(LegacyDomainError, "already in use"):
+            with self.assertRaisesRegex(DomainError, "already in use"):
                 domain.dispatch(
                     "provider.key_patch",
                     {"provider_id": "primary", "old_name": "fallback", "name": "default"},
@@ -682,7 +712,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 self.assertEqual("secondary", fetched["api_key_name"])
                 self.assertEqual(["model-a"], fetched["models"])
                 self.assertNotIn("replace-me-secondary-secret", json.dumps(fetched))
-                with self.assertRaisesRegex(LegacyDomainError, "selected API key is unavailable"):
+                with self.assertRaisesRegex(DomainError, "selected API key is unavailable"):
                     domain.dispatch(
                         "providers.fetch_models",
                         {"provider_id": "primary", "api_key_name": "missing"},
@@ -1261,7 +1291,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             self.assertTrue(cleared["will_clear"])
             path.write_text("LITELLM_PORT=4200\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(LegacyDomainError, "changed on disk"):
+            with self.assertRaisesRegex(DomainError, "changed on disk"):
                 domain.apply()
 
 
@@ -1286,6 +1316,7 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
             )
 
             snapshot = domain.snapshot()
+            self.assertEqual("https://example.test/webdav/", snapshot["url"])
             self.assertTrue(snapshot["password_configured"])
             self.assertNotIn("replace-me-secret", json.dumps(snapshot))
             domain.apply()
@@ -1297,6 +1328,14 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
             self.assertTrue(enabled.exists())
             self.assertEqual(0o600, stat.S_IMODE(settings.stat().st_mode))
             self.assertEqual(0o600, stat.S_IMODE(enabled.stat().st_mode))
+
+    def test_webdav_snapshot_preserves_url_credentials_for_local_editing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = WebDAVSettingsDomain(Path(directory) / "webdav.json")
+            url = "https://editor-user:editor-token@example.test/webdav/?folder=menu"
+            domain.dispatch("patch", {"url": url})
+
+            self.assertEqual(url, domain.snapshot()["url"])
 
     def test_probe_uses_existing_webdav_client_without_echoing_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

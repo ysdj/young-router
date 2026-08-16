@@ -92,7 +92,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
                 }
             )
 
-        with patch("remote_usage_logs._isolated_http_opener") as opener_factory:
+        with patch("remote_usage_logs.isolated_http_opener") as opener_factory:
             opener_factory.return_value.open.side_effect = opener
             output = remote_usage_logs.render(path, 1)
 
@@ -114,7 +114,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
         def opener(request, timeout):
             raise HTTPError(request.full_url, 404, "not found", {}, io.BytesIO())
 
-        with patch("remote_usage_logs._isolated_http_opener") as opener_factory:
+        with patch("remote_usage_logs.isolated_http_opener") as opener_factory:
             opener_factory.return_value.open.side_effect = opener
             output = remote_usage_logs.render(path, 1)
 
@@ -143,7 +143,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
                 }
             )
 
-        with patch("remote_usage_logs._isolated_http_opener") as opener_factory:
+        with patch("remote_usage_logs.isolated_http_opener") as opener_factory:
             opener_factory.return_value.open.side_effect = opener
             output = remote_usage_logs.render(path, 1)
 
@@ -188,7 +188,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
                 )
             raise HTTPError(request.full_url, 404, "not found", {}, io.BytesIO())
 
-        with patch("remote_usage_logs._isolated_http_opener") as opener_factory:
+        with patch("remote_usage_logs.isolated_http_opener") as opener_factory:
             opener_factory.return_value.open.side_effect = opener
             source, rows = remote_usage_logs.fetch_target(target, 1)
 

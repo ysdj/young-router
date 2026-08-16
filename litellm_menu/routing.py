@@ -39,6 +39,13 @@ from .base import (
     _DEPLOYMENT_COOLDOWN_ORDINARY_DEFAULT_ENABLED,
     _DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED_ENV,
     _DEPLOYMENT_COOLDOWN_SECONDS_ENV,
+    _IMAGE_GENERATION_TOOL_ALL_UNSUPPORTED_ATTR,
+    _IMAGE_GENERATION_TOOL_CAPABILITY_UNSUPPORTED_ATTR,
+    _IMAGE_GENERATION_TOOL_UNSUPPORTED,
+    _IMAGE_GENERATION_TOOL_UNSUPPORTED_DEFAULT_TTL_SECONDS,
+    _IMAGE_GENERATION_TOOL_UNSUPPORTED_LOCK,
+    _IMAGE_GENERATION_TOOL_UNSUPPORTED_METADATA_KEY,
+    _IMAGE_GENERATION_TOOL_UNSUPPORTED_TTL_SECONDS_ENV,
     _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
     _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
     _PROTOCOL_FALLBACK_DEFAULT_TTL_SECONDS,
@@ -529,6 +536,8 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     error is transient. A deployment-specific 400 is still deterministic until
     a protocol/input compatibility bridge fixes it.
     """
+    if _is_image_generation_all_deployments_unsupported_error(exception):
+        return _RECOVERY_POLICY_ERROR
     preserved = getattr(exception, _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR, None)
     if preserved in _RECOVERY_POLICY_VALUES:
         return preserved
@@ -577,11 +586,7 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_ERROR,
         )
 
-    if status_code is None and getattr(
-        exception,
-        "responses_stream_incomplete",
-        False,
-    ):
+    if status_code is None and getattr(exception, "stream_incomplete", False):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
             _RECOVERY_POLICY_COOLDOWN,
@@ -740,7 +745,7 @@ def _is_route_recovery_poll_payload(request_kwargs: Optional[dict]) -> bool:
         metadata = _request_context_module._request_metadata_dict(
             request_kwargs,
             metadata_key,
-        )
+        ) or {}
         if isinstance(metadata, dict) and metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True:
             return True
     litellm_params = request_kwargs.get("litellm_params")
@@ -767,7 +772,12 @@ def _should_return_route_recovery_stream(
         return False
     if request_kwargs.get("stream") is not True:
         return False
-    if not _streaming_module._request_is_responses_stream(request_kwargs):
+    # Route recovery is a routing decision.  The stream adapter selects the
+    # wire method later, but the recovery/cooldown policy must not depend on
+    # the client-facing protocol.
+    if not _streaming_module._request_supports_streaming_error_fallback(
+        request_kwargs
+    ):
         return False
     if not _is_route_recovery_poll_error(exception):
         return False
@@ -946,6 +956,300 @@ def _deployment_cooldown_update_shared(callback: Any) -> Any:
         return _state_module._locked_json_state_update(path, update)
     except OSError:
         return None
+
+
+def _image_generation_tool_unsupported_ttl_seconds() -> float:
+    value = os.getenv(_IMAGE_GENERATION_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "").strip()
+    if not value:
+        return _IMAGE_GENERATION_TOOL_UNSUPPORTED_DEFAULT_TTL_SECONDS
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _IMAGE_GENERATION_TOOL_UNSUPPORTED_DEFAULT_TTL_SECONDS
+    return max(0.0, parsed)
+
+
+def _image_generation_tool_unsupported_state_map(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    payload.setdefault("schema_version", 1)
+    states = payload.setdefault("image_tool_unsupported", {})
+    if not isinstance(states, dict):
+        states = {}
+        payload["image_tool_unsupported"] = states
+    return states
+
+
+def _clean_image_generation_tool_unsupported_state(
+    state: Any,
+    *,
+    now: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(state, dict):
+        return None
+    try:
+        expires_at = float(state.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    if expires_at <= 0 or (now is not None and expires_at <= now):
+        return None
+    cleaned = dict(state)
+    cleaned["expires_at"] = expires_at
+    try:
+        cleaned["detected_at"] = float(cleaned.get("detected_at") or 0.0)
+    except (TypeError, ValueError):
+        cleaned["detected_at"] = 0.0
+    return cleaned
+
+
+def _sync_image_generation_tool_unsupported_from_shared_locked(
+    states: dict[str, Any],
+    now: float,
+) -> None:
+    shared: dict[str, dict[str, Any]] = {}
+    for cache_key, state in list(states.items()):
+        cleaned = _clean_image_generation_tool_unsupported_state(state, now=now)
+        if cleaned is None:
+            states.pop(cache_key, None)
+            continue
+        shared[cache_key] = cleaned
+        if cleaned is not state:
+            states[cache_key] = cleaned
+    with _IMAGE_GENERATION_TOOL_UNSUPPORTED_LOCK:
+        _IMAGE_GENERATION_TOOL_UNSUPPORTED.clear()
+        _IMAGE_GENERATION_TOOL_UNSUPPORTED.update(
+            {key: value.copy() for key, value in shared.items()}
+        )
+
+
+def _image_generation_tool_unsupported_update_shared(callback: Any) -> Any:
+    path = _deployment_cooldown_file_path()
+    if not path:
+        return None
+
+    def update(payload: dict[str, Any]) -> Any:
+        now = time.time()
+        states = _image_generation_tool_unsupported_state_map(payload)
+        _sync_image_generation_tool_unsupported_from_shared_locked(states, now)
+        result = callback(states, now)
+        _sync_image_generation_tool_unsupported_from_shared_locked(states, now)
+        return result, now
+
+    try:
+        return _state_module._locked_json_state_update(path, update)
+    except OSError:
+        return None
+
+
+def _image_generation_tool_unsupported_key_for_deployment(
+    deployment: Any,
+) -> Optional[str]:
+    return _deployment_cooldown_key_from_deployment(deployment)
+
+
+def _image_generation_tool_unsupported_metadata_keys(
+    request_kwargs: Optional[dict],
+) -> set[str]:
+    keys: set[str] = set()
+    for metadata_key in ("litellm_metadata", "metadata"):
+        metadata = _request_context_module._request_metadata_dict(
+            request_kwargs,
+            metadata_key,
+        ) or {}
+        values = metadata.get(_IMAGE_GENERATION_TOOL_UNSUPPORTED_METADATA_KEY)
+        if isinstance(values, str) and values.strip():
+            keys.add(values.strip())
+        elif isinstance(values, list):
+            keys.update(
+                value.strip()
+                for value in values
+                if isinstance(value, str) and value.strip()
+            )
+    return keys
+
+
+def _image_generation_tool_unsupported_cached_keys() -> set[str]:
+    now = time.time()
+
+    def read(states: dict[str, Any], current_time: float) -> set[str]:
+        return {
+            cache_key
+            for cache_key, state in states.items()
+            if _clean_image_generation_tool_unsupported_state(
+                state,
+                now=current_time,
+            )
+            is not None
+        }
+
+    result = _image_generation_tool_unsupported_update_shared(read)
+    if isinstance(result, tuple) and isinstance(result[0], set):
+        return result[0]
+    with _IMAGE_GENERATION_TOOL_UNSUPPORTED_LOCK:
+        return {
+            cache_key
+            for cache_key, state in _IMAGE_GENERATION_TOOL_UNSUPPORTED.items()
+            if _clean_image_generation_tool_unsupported_state(state, now=now)
+            is not None
+        }
+
+
+def _with_active_image_generation_tool_unsupported(
+    deployments: List[dict],
+    *,
+    request_kwargs: Optional[dict] = None,
+) -> tuple[List[dict], list[dict[str, Any]], bool]:
+    if (
+        not deployments
+        or not _tools_module._request_has_image_generation_tool(request_kwargs)
+        or _image_generation_tool_unsupported_ttl_seconds() <= 0
+    ):
+        return deployments, [], False
+
+    def filter_active(
+        states: dict[str, Any],
+        now: float,
+    ) -> tuple[List[dict], list[dict[str, Any]], bool]:
+        available: list[dict] = []
+        unsupported: list[dict[str, Any]] = []
+        for deployment in deployments:
+            cache_key = _image_generation_tool_unsupported_key_for_deployment(
+                deployment
+            )
+            state = (
+                _clean_image_generation_tool_unsupported_state(
+                    states.get(cache_key),
+                    now=now,
+                )
+                if cache_key
+                else None
+            )
+            if state is None:
+                available.append(deployment)
+                continue
+            trace_entry = _trace_deployment(deployment)
+            trace_entry["image_tool_unsupported_key"] = cache_key
+            trace_entry["image_tool_unsupported_remaining_seconds"] = round(
+                max(0.0, float(state.get("expires_at") or 0.0) - now),
+                3,
+            )
+            trace_entry["image_tool_unsupported_expires_at"] = round(
+                float(state.get("expires_at") or 0.0),
+                3,
+            )
+            unsupported.append(trace_entry)
+        return available, unsupported, bool(unsupported)
+
+    result = _image_generation_tool_unsupported_update_shared(filter_active)
+    if isinstance(result, tuple) and isinstance(result[0], tuple):
+        return result[0]
+    with _IMAGE_GENERATION_TOOL_UNSUPPORTED_LOCK:
+        return filter_active(_IMAGE_GENERATION_TOOL_UNSUPPORTED, time.time())
+
+
+def _record_image_generation_tool_unsupported(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    if not _tools_module._request_has_image_generation_tool(request_kwargs):
+        return False
+    if not _is_image_generation_tool_capability_error(exception):
+        return False
+    deployment_id = (
+        _deployment_id_from_request(request_kwargs)
+        or _responses_execution_module._failed_deployment_id(exception)
+    )
+    route_key = (
+        _deployment_route_key_from_request(request_kwargs)
+        or _responses_execution_module._failed_deployment_route_key(exception)
+    )
+    cache_key = _deployment_cooldown_key(
+        deployment_id=deployment_id,
+        route_key=route_key,
+    )
+    if not cache_key:
+        return False
+
+    metadata = (
+        _request_context_module._request_metadata_dict(
+            request_kwargs,
+            "litellm_metadata",
+        )
+        or {}
+    )
+    unsupported_keys = _image_generation_tool_unsupported_metadata_keys(request_kwargs)
+    unsupported_keys.add(cache_key)
+    updated_metadata = metadata.copy()
+    updated_metadata[_IMAGE_GENERATION_TOOL_UNSUPPORTED_METADATA_KEY] = sorted(
+        unsupported_keys
+    )
+    request_kwargs["litellm_metadata"] = updated_metadata
+    try:
+        setattr(exception, _IMAGE_GENERATION_TOOL_CAPABILITY_UNSUPPORTED_ATTR, True)
+    except Exception:
+        pass
+
+    ttl = _image_generation_tool_unsupported_ttl_seconds()
+    if ttl <= 0:
+        return True
+    now = time.time()
+    expires_at = now + ttl
+    def record(states: dict[str, Any], _now: float) -> None:
+        states[cache_key] = {
+            "deployment_id": deployment_id,
+            "route_key": route_key,
+            "detected_at": now,
+            "expires_at": expires_at,
+        }
+
+    result = _image_generation_tool_unsupported_update_shared(record)
+    if result is None:
+        with _IMAGE_GENERATION_TOOL_UNSUPPORTED_LOCK:
+            _IMAGE_GENERATION_TOOL_UNSUPPORTED[cache_key] = {
+                "deployment_id": deployment_id,
+                "route_key": route_key,
+                "detected_at": now,
+                "expires_at": expires_at,
+            }
+    _trace_module._route_trace(
+        "image_generation_tool_unsupported_recorded",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=deployment_id,
+        route_key=route_key,
+        ttl_seconds=ttl,
+        expires_at=expires_at,
+        exception=_trace_exception(exception),
+    )
+    return True
+
+
+def _image_generation_tool_all_deployments_unsupported(
+    deployments: List[dict],
+    request_kwargs: Optional[dict],
+) -> bool:
+    if (
+        not deployments
+        or not _tools_module._request_has_image_generation_tool(request_kwargs)
+    ):
+        return False
+    candidate_keys = {
+        cache_key
+        for cache_key in (
+            _image_generation_tool_unsupported_key_for_deployment(deployment)
+            for deployment in deployments
+        )
+        if cache_key
+    }
+    if not candidate_keys:
+        return False
+    unsupported_keys = _image_generation_tool_unsupported_metadata_keys(request_kwargs)
+    if _image_generation_tool_unsupported_ttl_seconds() > 0:
+        unsupported_keys.update(_image_generation_tool_unsupported_cached_keys())
+    return candidate_keys.issubset(unsupported_keys)
 
 
 def _protocol_fallback_ttl_seconds() -> float:
@@ -2291,7 +2595,9 @@ def _trace_session_context(request_kwargs: Optional[dict]) -> dict[str, Any]:
 def _trace_exception(exception: Exception) -> dict[str, Any]:
     status_code = _exception_status_code(exception)
     text = _exception_text(exception)
-    if _is_no_deployments_available_error(exception):
+    if _is_image_generation_all_deployments_unsupported_error(exception):
+        reason = "image-generation-tool-all-deployments-unsupported"
+    elif _is_no_deployments_available_error(exception):
         reason = "no-available-deployment"
     elif type(exception).__name__ == "ProxyModelNotFoundError":
         reason = "model-not-configured"
@@ -2303,13 +2609,15 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "upstream-auth-or-balance"
     elif _is_upstream_gateway_bad_request_error(exception):
         reason = "upstream-gateway-bad-request"
+    elif _is_upstream_request_body_storage_capacity_error(exception):
+        reason = "upstream-request-body-capacity"
     elif _is_responses_schema_unsupported_error(exception):
         reason = "responses-schema-unsupported"
     elif _is_image_parameter_or_capability_bad_request_error(exception):
         reason = "image-parameter-or-capability-bad-request"
     elif _is_deployment_compatible_bad_request_error(exception):
         reason = "upstream-compatible-bad-request"
-    elif getattr(exception, "responses_stream_incomplete", False) and status_code is None:
+    elif getattr(exception, "stream_incomplete", False) and status_code is None:
         reason = "upstream-stream-incomplete"
     elif _exception_indicates_network_connectivity_error(exception):
         reason = "upstream-network-connectivity"
@@ -2642,6 +2950,87 @@ def _is_image_generation_tool_runtime_fallback_error(exception: Exception) -> bo
     return getattr(exception, "image_generation_tool_runtime_fallback", False) is True
 
 
+def _is_image_generation_tool_capability_error(exception: Exception) -> bool:
+    if getattr(
+        exception,
+        _IMAGE_GENERATION_TOOL_CAPABILITY_UNSUPPORTED_ATTR,
+        False,
+    ) is True:
+        return True
+    if _exception_status_code(exception) not in (400, 404, 422):
+        return False
+    if _is_terminal_prompt_or_policy_error(exception):
+        return False
+    if _is_responses_schema_unsupported_error(exception):
+        return False
+    text = _exception_text(exception)
+    if not text:
+        return False
+    mentions_image_tool = any(
+        marker in text
+        for marker in (
+            "image_generation",
+            "image generation",
+            "image_generation_tool",
+            "image generation tool",
+            "imagegen",
+            "gpt-image",
+        )
+    )
+    if not mentions_image_tool:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "unsupported tool",
+            "unsupported tool type",
+            "unsupported_tool",
+            "tool not supported",
+            "tool is not supported",
+            "tool unsupported",
+            "unknown tool",
+            "invalid tool type",
+            "tool type is invalid",
+            "not available",
+            "isn't available",
+            "is not available",
+            "not directly exposed",
+            "does not support",
+            "doesn't support",
+            "not support image",
+            "requires an image model",
+            "no access to",
+            "without access to",
+        )
+    )
+
+
+def _is_image_generation_all_deployments_unsupported_error(
+    exception: Exception,
+) -> bool:
+    return getattr(
+        exception,
+        _IMAGE_GENERATION_TOOL_ALL_UNSUPPORTED_ATTR,
+        False,
+    ) is True
+
+
+def _mark_image_generation_all_deployments_unsupported(
+    exception: Exception,
+) -> None:
+    message = (
+        "All configured deployments for this model rejected the "
+        "image_generation tool."
+    )
+    try:
+        setattr(exception, _IMAGE_GENERATION_TOOL_ALL_UNSUPPORTED_ATTR, True)
+        setattr(exception, "status_code", 400)
+        setattr(exception, "message", message)
+        exception.args = (message,)
+    except Exception:
+        pass
+
+
 def _is_terminal_prompt_or_policy_error(exception: Exception) -> bool:
     status_code = _exception_status_code(exception)
     if status_code is not None and status_code < 400:
@@ -2827,6 +3216,39 @@ def _is_upstream_gateway_bad_request_error(exception: Exception) -> bool:
         return True
     return all(
         marker in text for marker in _LITELLM_MODEL_GROUP_FALLBACK_EXHAUSTED_MARKERS
+    )
+
+
+def _is_upstream_request_body_storage_capacity_error(exception: Exception) -> bool:
+    """Recognize the route-local gateway capacity rejection seen on large bodies."""
+    if _exception_status_code(exception) not in {400, 413}:
+        return False
+    return "request body storage capacity exhausted" in _exception_text(exception)
+
+
+def _is_structured_codex_compaction_body_capacity_error(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> bool:
+    """A signed compaction body may be too large for one gateway, not the model."""
+    return (
+        _responses_request_module._request_has_structured_codex_compaction(
+            request_kwargs
+        )
+        and _is_upstream_request_body_storage_capacity_error(exception)
+    )
+
+
+def _is_request_scoped_priority_deployment_failover_error(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> bool:
+    """Allow only the known compaction storage rejection to advance routes."""
+    return _is_priority_deployment_failover_error(
+        exception
+    ) or _is_structured_codex_compaction_body_capacity_error(
+        exception,
+        request_kwargs,
     )
 
 
@@ -3058,6 +3480,7 @@ def _mark_exception_for_deployment_failover(
     _apply_current_selected_deployment_to_request(request_kwargs)
     deployment_id = _deployment_id_from_request(request_kwargs)
     route_key = _deployment_route_key_from_request(request_kwargs)
+    _record_image_generation_tool_unsupported(exception, request_kwargs)
     if deployment_id and not getattr(exception, "failed_deployment_id", None):
         try:
             exception.failed_deployment_id = deployment_id  # type: ignore[attr-defined]
@@ -3170,11 +3593,13 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         return False
     if _is_terminal_prompt_or_policy_error(exception):
         return False
+    if _is_image_generation_all_deployments_unsupported_error(exception):
+        return False
     if _is_image_generation_tool_runtime_fallback_error(exception):
         return True
     if _is_upstream_surface_failover_error(exception):
         return True
-    if getattr(exception, "responses_stream_incomplete", False):
+    if getattr(exception, "stream_incomplete", False):
         return True
     if _is_upstream_deployment_failover_error(exception):
         return True
@@ -3296,13 +3721,14 @@ def _record_deployment_failure_for_cooldown(
     except Exception:
         pass
 
-    # An upstream Responses stream that terminates without `response.completed`
-    # has already forced Codex to reconnect.  Unlike an ordinary transient
-    # request error, a second attempt through that route would surface another
-    # user-visible stream failure, so quarantine it after the first occurrence.
+    # An upstream stream that terminates before its protocol terminal event
+    # has already forced the client to reconnect. Unlike an ordinary
+    # transient request error, another attempt through that route would
+    # surface another user-visible stream failure, so quarantine it after the
+    # first occurrence regardless of the client protocol.
     threshold = (
         1
-        if getattr(exception, "responses_stream_incomplete", False)
+        if getattr(exception, "stream_incomplete", False)
         else _deployment_cooldown_failure_threshold()
     )
     cooldown_seconds = _deployment_cooldown_seconds()

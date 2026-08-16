@@ -7,6 +7,7 @@ from litellm_menu.api_base import (
     apply_surface_api_base,
     is_unversioned_anthropic_messages_endpoint,
     normalize_configured_api_base,
+    service_root,
 )
 
 
@@ -96,6 +97,23 @@ class APIBaseTests(unittest.TestCase):
             with self.subTest(path=path):
                 source = f"https://api.example.test/{path}"
                 self.assertEqual(normalize_configured_api_base(source), f"{source}/v1")
+
+    def test_service_root_strips_versions_and_known_endpoints(self) -> None:
+        cases = {
+            "https://api.example.test": "https://api.example.test",
+            "https://api.example.test/v1": "https://api.example.test",
+            "https://api.example.test/gateway/v1/models": "https://api.example.test/gateway",
+            "https://api.example.test/api/v1/responses": "https://api.example.test/api",
+            "https://api.example.test/messages": "https://api.example.test",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(service_root(source), expected)
+
+    def test_service_root_rejects_non_http_and_embedded_credentials(self) -> None:
+        self.assertIsNone(service_root("api.example.test/v1"))
+        self.assertIsNone(service_root("file:///tmp/api"))
+        self.assertIsNone(service_root("https://user:password@api.example.test/v1"))
 
 
 

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { AppRegistry } from "react-native";
+import { canonicalWindowRoute, DESKTOP_ROUTES, LOG_TABS } from "./routes";
 import { LiteLLMMenuApp } from "./ui/LiteLLMMenuApp";
 import type { AppRoute, IpcClient, LogTab, NativeLeafAdapter } from "./types";
 
@@ -41,11 +42,4 @@ export function registerLiteLLMMenu(componentName: string, dependencies: Desktop
     }, [isPrimaryHost, nativeAction, props.initialRoute]);
     return <LiteLLMMenuApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} nativeAction={nativeAction} />;
   });
-}
-
-const DESKTOP_ROUTES: readonly AppRoute[] = ["home", "providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "relay-accounts", "relay-add", "logs"];
-const LOG_TABS: readonly LogTab[] = ["requests", "service", "menu", "route-trace", "recovery", "online-usage"];
-
-function canonicalWindowRoute(route: AppRoute): AppRoute {
-  return route === "claude-settings" ? "codex-settings" : route;
 }

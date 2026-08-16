@@ -163,6 +163,57 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
 
             self.assertEqual(["model-new", "model-primary"], snapshot["desktop"]["model_names"])
 
+    def test_claude_package_round_trips_all_three_drafts_without_public_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            settings = root / "settings.json"
+            settings.write_text(
+                '{"env":{"ANTHROPIC_AUTH_TOKEN":"replace-claude-token"}}\n',
+                encoding="utf-8",
+            )
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(
+                desktop_root,
+                {
+                    "inferenceProvider": "gateway",
+                    "inferenceGatewayBaseUrl": "https://gateway.example.test",
+                    "inferenceGatewayApiKey": "replace-desktop-token",
+                },
+            )
+            developer = root / "developer_settings.json"
+            developer.write_text('{"allowDevTools":true}\n', encoding="utf-8")
+            source = ClaudeSettingsDomain(
+                settings,
+                desktop_config_library_path=desktop_root,
+                developer_settings_path=developer,
+            )
+
+            trusted = source.export(include_sensitive=True)
+            public = source.export()
+            self.assertIn("replace-claude-token", json.dumps(trusted))
+            self.assertIn("replace-desktop-token", json.dumps(trusted))
+            self.assertNotIn("replace-claude-token", json.dumps(public))
+            self.assertNotIn("replace-desktop-token", json.dumps(public))
+
+            target_root = root / "target"
+            target_desktop = target_root / "configLibrary"
+            _write_desktop_config(target_desktop, {})
+            target_developer = target_root / "developer_settings.json"
+            target_developer.parent.mkdir(parents=True, exist_ok=True)
+            target_developer.write_text("{}\n", encoding="utf-8")
+            target = ClaudeSettingsDomain(
+                target_root / "settings.json",
+                desktop_config_library_path=target_desktop,
+                developer_settings_path=target_developer,
+            )
+
+            target.import_package(trusted)
+
+            imported = target.export(include_sensitive=True)
+            self.assertEqual(trusted["settings"], imported["settings"])
+            self.assertEqual(trusted["desktop"]["config"], imported["desktop"]["config"])
+            self.assertEqual(trusted["developer"], imported["developer"])
+
 
 if __name__ == "__main__":
     unittest.main()

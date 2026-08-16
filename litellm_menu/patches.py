@@ -694,7 +694,10 @@ def _install_selected_deployment_marker_patch() -> None:
                 )
             elif (
                 marker is not None
-                and _routing_module._is_priority_deployment_failover_error(exc)
+                and _routing_module._is_request_scoped_priority_deployment_failover_error(
+                    exc,
+                    kwargs,
+                )
                 and not _routing_module._should_retry_with_browser_compatible_headers(exc, marker)
             ):
                 _routing_module._mark_exception_for_deployment_failover(exc, marker)
@@ -782,7 +785,10 @@ def _install_order_peer_failover_patch() -> None:
                     exception=_routing_module._trace_exception(e),
                 )
                 return await run_async_fallback(*args, **peer_kwargs)
-        if _routing_module._is_priority_deployment_failover_error(e):
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            e,
+            kwargs,
+        ):
             _routing_module._mark_same_deployment_retry_exhausted(e)
             _routing_module._mark_exception_for_deployment_failover(e, kwargs)
         _routing_module._sync_failed_deployment_exclusions(kwargs, e)
@@ -819,7 +825,10 @@ def _install_order_peer_failover_patch() -> None:
                 )
                 return await run_async_fallback(*args, **peer_kwargs)
 
-        if _routing_module._is_priority_deployment_failover_error(e):
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            e,
+            kwargs,
+        ):
             _trace_module._route_trace(
                 "ordered_deployment_fallback_exhausted",
                 request_id=_routing_module._trace_request_id(kwargs),
@@ -964,7 +973,10 @@ def _install_generic_deployment_failover_patch() -> None:
                         exception=_routing_module._trace_exception(exc),
                     )
                     continue
-                if _routing_module._is_priority_deployment_failover_error(exc):
+                if _routing_module._is_request_scoped_priority_deployment_failover_error(
+                    exc,
+                    kwargs,
+                ):
                     _routing_module._mark_exception_for_deployment_failover(exc, kwargs)
                 _trace_module._route_trace(
                     "generic_fallback_helper_error",

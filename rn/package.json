@@ -9,10 +9,11 @@
   },
   "scripts": {
     "bootstrap:rnmacos": "node scripts/bootstrap-rnmacos-085.mjs",
+    "code-editor:build": "node scripts/build-code-editor.mjs",
     "verify:rnmacos": "node scripts/verify-rnmacos-085.mjs",
     "codegen:windows": "react-native-windows-codegen --files packages/shared/src/ui/windows/*NativeComponent.ts --componentsWindows --libraryName LiteLLMMenu --namespace winrt::LiteLLMMenu::Codegen --outputDirectory apps/windows/windows/LiteLLMMenu/codegen",
     "codegen:windows:check": "pnpm run codegen:windows --test",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "pnpm run code-editor:build && tsc --noEmit",
     "contract-check": "node scripts/check-contract.mjs",
     "test": "node ../tests/test_rn_contract.mjs && node --no-warnings --experimental-strip-types ../tests/test_rn_tooltip.mjs && node --no-warnings --experimental-strip-types ../tests/test_rn_relay_origin.mjs",
     "check:macos": "pnpm run test && pnpm run contract-check && pnpm run typecheck",
@@ -21,6 +22,14 @@
     "build:windows": "pwsh ./scripts/build-windows.ps1"
   },
   "dependencies": {
+    "@codemirror/commands": "6.10.4",
+    "@codemirror/lang-json": "6.0.2",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/legacy-modes": "6.5.3",
+    "@codemirror/merge": "6.12.2",
+    "@codemirror/state": "6.7.1",
+    "@codemirror/view": "6.43.8",
+    "codemirror": "6.0.2",
     "react": "19.2.3",
     "react-native": "0.85.3",
     "react-native-windows": "0.85.0-preview.1"
@@ -30,6 +39,7 @@
     "@react-native/babel-preset": "0.85.3",
     "@react-native/metro-config": "0.85.3",
     "@types/react": "19.2.3",
+    "esbuild": "0.25.8",
     "typescript": "5.7.2"
   }
 }

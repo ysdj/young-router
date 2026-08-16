@@ -12,13 +12,13 @@ from ..persistence import PersistenceError, read_bytes
 from ..security import safe_exception_message
 
 
-class LegacyDomainError(ValueError):
-    """A deliberately source-safe error from a legacy-backed Core domain."""
+class DomainError(ValueError):
+    """A deliberately source-safe error from a staged Core domain."""
 
 
 def _mapping(value: object, label: str = "payload") -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise LegacyDomainError(f"{label} must be an object")
+        raise DomainError(f"{label} must be an object")
     return dict(value)
 
 
@@ -28,21 +28,21 @@ def _copy_mapping(value: object, label: str = "payload") -> dict[str, Any]:
 
 def _action_name(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise LegacyDomainError("A settings action is required")
+        raise DomainError("A settings action is required")
     return value.strip().replace("-", "_").replace("/", "_").replace(".", "_").lower()
 
 
-def _safe_problem(_: BaseException, fallback: str) -> LegacyDomainError:
+def _safe_problem(_: BaseException, fallback: str) -> DomainError:
     """Never pass source parser output (which can contain credentials) on."""
 
-    return LegacyDomainError(fallback)
+    return DomainError(fallback)
 
 
 def _file_bytes(path: Path) -> bytes | None:
     try:
         return read_bytes(path)
     except PersistenceError as exc:
-        raise LegacyDomainError(safe_exception_message(exc)) from None
+        raise DomainError(safe_exception_message(exc)) from None
 
 
 def _same_file(path: Path, expected: bytes | None) -> bool:
@@ -90,14 +90,14 @@ def _selected_identifier(data: Mapping[str, Any], *keys: str) -> object:
 
 def _index(value: object, length: int, label: str) -> int:
     if type(value) is not int or value < 0 or value >= length:
-        raise LegacyDomainError(f"The selected {label} is unavailable")
+        raise DomainError(f"The selected {label} is unavailable")
     return value
 
 
 def _move(values: list[Any], source: object, destination: object, label: str) -> None:
     source_index = _index(source, len(values), label)
     if type(destination) is not int or destination < 0 or destination >= len(values):
-        raise LegacyDomainError(f"The selected {label} destination is unavailable")
+        raise DomainError(f"The selected {label} destination is unavailable")
     item = values.pop(source_index)
     values.insert(destination, item)
 
@@ -111,4 +111,4 @@ def _direction_destination(source: int, length: int, data: Mapping[str, Any]) ->
         return max(0, source - 1)
     if direction == "down":
         return min(length - 1, source + 1)
-    raise LegacyDomainError("A move destination is required")
+    raise DomainError("A move destination is required")

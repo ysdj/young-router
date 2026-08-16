@@ -3,8 +3,9 @@ import { AppState, Dimensions, FlatList, Platform, PlatformColor, Pressable, Scr
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, codexFeatureLabel, localizeCodexValidationMessage, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
-import { LOG_TABS, ROUTES } from "../routes";
-import { NativeButton, NativeCheckbox, NativePicker, NativeSecureTextEditor, NativeSecureTextInput, NativeSegmentedControl, NativeSplitView, NativeTable, NativeTextEditor, NativeTextField } from "./NativeControls";
+import { canonicalWindowRoute, LOG_TABS, routeMenuActions, ROUTES } from "../routes";
+import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeSplitView, NativeTable, NativeTextField } from "./NativeControls";
+import { CODE_EDITOR_HTML, CodeEditorWebView } from "./code-editor/CodeEditorWebView";
 import { normalizeRelayOrigin, RelayAccountManager, stationOriginKey } from "./RelayAccountManager";
 import { screenBoundedTooltipText } from "./tooltip";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
@@ -42,7 +43,25 @@ type PendingFieldRegistry = {
 type ServiceOperation = "start" | "stop" | "restart" | "reload" | "health";
 type AssistantSettingsDomain = "codex" | "claude";
 type EditableDiskDomain = AssistantSettingsDomain | "providers_models" | "runtime" | "webdav";
+type RawEditorConflictResolution = "reload" | "keep";
+type RawEditorConflictHandler = (domain: AssistantSettingsDomain, document: RawEditorDocument) => Promise<RawEditorConflictResolution>;
+type RawEditorDocument = "config" | "auth" | "settings" | "desktop" | "developer";
 type ClaudeDeploymentDraft = { model: string; base_url: string };
+type DataManagementTab = "import" | "export" | "webdav";
+type WebDavSyncAction = "sync" | "push" | "pull";
+
+const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
+  { domain: "providers_models", labelKey: "dataManagement.section.providersModels" },
+  { domain: "runtime", labelKey: "dataManagement.section.runtime" },
+  { domain: "relay_accounts", labelKey: "dataManagement.section.relayAccounts" },
+  { domain: "codex", labelKey: "dataManagement.section.codex" },
+  { domain: "claude", labelKey: "dataManagement.section.claude" },
+  { domain: "webdav", labelKey: "dataManagement.section.webdavSettings" },
+  { domain: "language", labelKey: "dataManagement.section.language" },
+];
+const DATA_PACKAGE_DOMAINS = DATA_PACKAGE_SECTIONS.map(({ domain }) => domain);
+const DATA_MANAGEMENT_DIRTY_DOMAINS: readonly ConfigDomain[] = DATA_PACKAGE_DOMAINS;
+const WEBDAV_SYNC_DOMAINS: readonly ConfigDomain[] = ["providers_models", "relay_accounts"];
 
 const PendingFieldContext = createContext<PendingFieldRegistry | undefined>(undefined);
 const TranslationContext = createContext<Translate | undefined>(undefined);
@@ -66,12 +85,20 @@ const compactStyles = StyleSheet.create({
   picker: { height: 24 },
   nativeSecretControl: { minHeight: 24, gap: 4 },
 });
+
 // Core subscriptions carry ordinary state changes. These timers only watch
 // files edited by another process, so a low-frequency check avoids waking the
 // Core and native table surfaces continuously while retaining bounded pickup.
 const SETTINGS_DISK_POLL_MS = 5_000;
 const LOG_VIEW_POLL_MS = 5_000;
 const ONLINE_USAGE_POLL_MS = 15_000;
+const ROUTE_TRACE_REQUEST_ROW_HEIGHT = 70;
+const ROUTE_TRACE_SCROLL_IDLE_MS = 150;
+const ROUTE_TRACE_TIMELINE_MIN_WIDTH = 400;
+const ROUTE_TRACE_SCROLLBAR_MIN_THUMB_WIDTH = 32;
+const SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH = 420;
+const WEBDAV_FORM_LABEL_WIDTH = 108;
+const SETTINGS_STRUCTURED_SCROLLBAR_GUTTER = 18;
 
 function sameDiskState(left: DiskState | undefined, right: DiskState | undefined): boolean {
   return left?.changed === right?.changed
@@ -151,6 +178,11 @@ function errorMessage(reason: unknown, translate: Translate): string {
   return translate(keyByCode[code] ?? "error.generic");
 }
 
+function isEditorCapabilityConflict(reason: unknown): boolean {
+  const code = stringValue(asRecord(reason).code);
+  return code === "invalid_editor" || code === "revision_conflict";
+}
+
 function domainState(snapshot: CoreSnapshot | undefined, domain: ConfigDomain): UnknownRecord {
   const record = asRecord(snapshot?.domains[domain]);
   const state = asRecord(record.state);
@@ -167,7 +199,6 @@ function domainForRoute(route: AppRoute): ConfigDomain | undefined {
     case "codex-settings": return "codex";
     case "claude-settings": return "claude";
     case "runtime-settings": return "runtime";
-    case "webdav-settings": return "webdav";
     case "logs": return "logs";
     default: return undefined;
   }
@@ -178,14 +209,7 @@ function isAssistantSettingsRoute(route: AppRoute): boolean {
 }
 
 function isSettingsRoute(route: AppRoute): boolean {
-  return route === "providers-models" || route === "codex-settings" || route === "claude-settings" || route === "runtime-settings" || route === "webdav-settings";
-}
-
-// Codex and Claude are tabs in one native settings window. Keep the original
-// Claude route as a deep-link compatibility target, but never let it create a
-// second host window for the same workspace.
-function nativeWindowRoute(route: AppRoute): AppRoute {
-  return route === "claude-settings" ? "codex-settings" : route;
+  return route === "providers-models" || route === "codex-settings" || route === "claude-settings" || route === "runtime-settings";
 }
 
 function isEditableDiskDomain(value: ConfigDomain | undefined): value is EditableDiskDomain {
@@ -207,10 +231,6 @@ function ensureSelectedOption(options: AssistantSettingOption[], value: string):
   // the first candidate makes the control claim that another model/provider
   // is active, which is especially dangerous for the deployment picker.
   return [{ value, label: value }, ...options];
-}
-
-function statusLabel(status: ServiceStatus, translate: Translate): string {
-  return translate(`service.${status.state}`);
 }
 
 function logTitle(tab: string, translate: Translate): string {
@@ -250,16 +270,6 @@ function containsPrivateMarker(value: unknown): boolean {
 
 function editableRecord(value: UnknownRecord): UnknownRecord {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => !containsPrivateMarker(item)));
-}
-
-function displayValue(value: unknown, fallback: string): string {
-  if (value === undefined || value === null || value === "") return fallback;
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return fallback;
-  }
 }
 
 export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialSnapshot, routeRequest, routeRequestSequence, logTabRequest, nativeAction, isPrimaryHost = true, isWindowManagerHost = false }: LiteLLMMenuAppProps): React.JSX.Element {
@@ -358,7 +368,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
       routeHome: translate("route.home"), routeProvidersModels: translate("card.providersModels"),
       routeCodexSettings: translate("menu.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
-      routeWebdavSettings: translate("card.webdavSettings"), routeRelayAccounts: translate("route.relayAccounts"), routeRelayAdd: translate("relay.addAccount"), routeLogs: translate("card.logs"),
+      routeDataManagement: translate("card.dataManagement"), routeRelayAccounts: translate("route.relayAccounts"), routeRelayAdd: translate("relay.addAccount"), routeLogs: translate("card.logs"),
       modelChooserTitle: translate("modelChooser.title"), modelChooserHeading: translate("modelChooser.heading"),
       modelChooserProvider: translate("modelChooser.provider"), modelChooserKey: translate("modelChooser.key"),
       modelChooserSearch: translate("modelChooser.search"), modelChooserAll: translate("modelChooser.all"),
@@ -412,7 +422,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
     if (!routeRequest) return;
     if (isWindowManagerHost) {
       if (routeRequest !== "home") {
-        const windowRoute = nativeWindowRoute(routeRequest);
+        const windowRoute = canonicalWindowRoute(routeRequest);
         native.window.open(windowRoute);
         native.window.focus(windowRoute);
       }
@@ -420,7 +430,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
     }
     setRoute(routeRequest);
     if (isPrimaryHost && routeRequest !== "home") {
-      const windowRoute = nativeWindowRoute(routeRequest);
+      const windowRoute = canonicalWindowRoute(routeRequest);
       native.window.open(windowRoute);
       native.window.focus(windowRoute);
     }
@@ -547,12 +557,9 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
     const actions = [
       { id: "toggle-autostart", title: translate("menu.autoStart"), enabled: true, checked: snapshot.service.auto_start_state === "enabled" },
       ...(Platform.OS === "macos" ? [{ id: "toggle-codex-model-catalog", title: translate("menu.codexModelCatalog"), enabled: true, checked: booleanValue(catalog.enabled) }] : []),
-      { id: "open-providers-models", title: translate("menu.providers"), enabled: true },
-      { id: "open-runtime-settings", title: translate("menu.runtime"), enabled: true },
-      { id: "open-codex-settings", title: translate("menu.codex"), enabled: true },
-      { id: "open-relay-accounts", title: translate("menu.relay"), enabled: true },
+      ...routeMenuActions(translate).filter(({ id }) => id !== "open-data-management" && id !== "open-logs"),
       { id: "webdav-status", title: `${translate("webdav.label")}: ${webdavMenuStatus(snapshot.service.webdav, snapshot.webdav.enabled, translate)}`, enabled: false },
-      { id: "open-webdav-settings", title: translate("menu.webdav"), enabled: true },
+      ...routeMenuActions(translate).filter(({ id }) => id === "open-data-management"),
       { id: "open-logs", title: recoveryLogMenuTitle(snapshot.service, translate), enabled: true },
       { id: "service-start", title: translate("service.start"), enabled: serviceStartAvailable },
       { id: "service-stop", title: translate("service.stop"), enabled: !serviceOperationPending && serviceActive },
@@ -582,8 +589,8 @@ function WindowTitle({ title, validation }: { title: string; validation?: string
   return <View style={styles.windowTitleBlock}><Text style={styles.windowTitle}>{title}</Text>{validation ? <Text style={styles.validationText}>{validation}</Text> : null}</View>;
 }
 
-function DialogFooter({ status, leading, children }: { status?: string; leading?: React.ReactNode; children: React.ReactNode }): React.JSX.Element {
-  return <View style={styles.footer}>{leading ?? (status ? <Text numberOfLines={1} style={styles.footerStatus}>{status}</Text> : <View />)}<View style={styles.footerSpacer} /><View style={styles.footerButtons}>{children}</View></View>;
+function DialogFooter({ status, leading, children, compact = false }: { status?: string; leading?: React.ReactNode; children: React.ReactNode; compact?: boolean }): React.JSX.Element {
+  return <View style={[styles.footer, compact && styles.footerCompact]}>{leading ?? (status ? <Text numberOfLines={1} style={styles.footerStatus}>{status}</Text> : <View />)}<View style={styles.footerSpacer} /><View style={styles.footerButtons}>{children}</View></View>;
 }
 
 function IconButton({ label, symbol, title, disabled, onPress }: { label: string; symbol?: "pause" | "play" | "trash"; title: string; disabled?: boolean; onPress: () => void }): React.JSX.Element {
@@ -603,17 +610,21 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const claudeDeploymentDraftRef = useRef<ClaudeDeploymentDraft | undefined>(undefined);
   const domain = settingsRoute ? settingsTab : domainForRoute(route);
   const [busy, setBusy] = useState(false);
+  const [webDavOperationBusy, setWebDavOperationBusy] = useState(false);
   const [result, setResult] = useState<string>();
   const [issues, setIssues] = useState<ValidationSummary["issues"]>([]);
   const [settingsRawReloadToken, setSettingsRawReloadToken] = useState(0);
+  const [settingsRawBaselineToken, setSettingsRawBaselineToken] = useState(0);
   const [keptDiskGeneration, setKeptDiskGeneration] = useState<Partial<Record<EditableDiskDomain, number>>>({});
   const promptedDiskGeneration = useRef<Partial<Record<EditableDiskDomain, number>>>({});
   const diskPromptInFlight = useRef(false);
   const activeRuns = useRef(0);
+  const webDavOperationInFlight = useRef(false);
   const revision = useRef<number | undefined>(snapshot?.revision);
   const latestSnapshot = useRef<CoreSnapshot | undefined>(snapshot);
   const dispatchQueue = useRef<Promise<void>>(Promise.resolve());
   const probedSurfaceApplyQueue = useRef<Promise<void>>(Promise.resolve());
+  const importPlanToken = useRef<string | undefined>(undefined);
   const lastDispatchError = useRef<unknown>(undefined);
   const pendingFields = useRef(new Map<symbol, PendingField>());
   const [, forcePendingFieldDirtyRender] = useState(0);
@@ -623,6 +634,23 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(currentSnapshot),
     claudeDeploymentFromSnapshot(currentSnapshot),
   );
+  // Relay account metadata is persisted by its own domain actions. Resource
+  // import is different: it stages provider/model entries and must be
+  // committed from this route's window-level Apply action. Keep that mapping
+  // explicit so the footer and the close/discard path operate on the same
+  // domain instead of silently treating the relay route as clean.
+  const stagedDomainsForRoute = (currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {
+    if (settingsRoute) {
+      return (["codex", "claude"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);
+    }
+    if (route === "data-management") {
+      return DATA_MANAGEMENT_DIRTY_DOMAINS.filter((name) => currentSnapshot?.drafts[name]?.dirty);
+    }
+    if (route === "relay-accounts") {
+      return currentSnapshot?.drafts.providers_models?.dirty ? ["providers_models"] : [];
+    }
+    return domain && currentSnapshot?.drafts[domain]?.dirty ? [domain] : [];
+  };
   const setPendingFieldDirty = useCallback((id: symbol, dirty: boolean): void => {
     const current = pendingFieldDirtyIdsRef.current;
     if (current.has(id) === dirty) return;
@@ -697,6 +725,19 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     } finally {
       activeRuns.current -= 1;
       if (!keepControlsEnabled && activeRuns.current === 0) setBusy(false);
+    }
+  };
+  const runWebDavOperation = async (operation: () => Promise<unknown>, message: string): Promise<void> => {
+    if (webDavOperationInFlight.current) return;
+    webDavOperationInFlight.current = true;
+    setWebDavOperationBusy(true);
+    try {
+      // Core and WebDAV work is already asynchronous. Keep the route's
+      // navigation and close path available while this form waits for it.
+      await run(operation, message, true);
+    } finally {
+      webDavOperationInFlight.current = false;
+      setWebDavOperationBusy(false);
     }
   };
   const enqueueDispatch = (type: string, payload: UnknownRecord = {}, targetDomain = domain): Promise<{ revision: number }> => {
@@ -807,7 +848,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
           }
           const priorGeneration = snapshot?.disk[diskDomain]?.generation ?? 0;
           if ((next.disk[diskDomain]?.generation ?? 0) > priorGeneration && !next.disk[diskDomain]?.changed && (diskDomain === "codex" || diskDomain === "claude")) {
-            setSettingsRawReloadToken((current) => current + 1);
+            setSettingsRawBaselineToken((current) => current + 1);
           }
         }
       } catch {
@@ -842,10 +883,9 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     return run(async () => {
       const reloaded = await ipc.reload(reloadDomain, revision.current);
       revision.current = reloaded.revision;
-      // Core invalidates the native editor capabilities when a domain reloads.
-      // Make both raw Codex editors fetch fresh capabilities and disk text only
-      // after that reload has succeeded.
-      if (reloadDomain === "codex" || reloadDomain === "claude") setSettingsRawReloadToken((current) => current + 1);
+      // Core invalidates editor revisions when a domain reloads. Make both raw
+      // Codex editors fetch fresh documents only after that reload succeeds.
+      if (reloadDomain === "codex" || reloadDomain === "claude") setSettingsRawBaselineToken((current) => current + 1);
       if (reloadDomain === "claude") {
         claudeDeploymentDraftRef.current = undefined;
         setClaudeDeploymentDraft(undefined);
@@ -856,23 +896,45 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       return reloaded;
     }, "common.applied");
   };
-  const validate = (): Promise<void> => {
-    if (!domain) return Promise.resolve();
-    return run(async () => {
-      await flushPendingFields();
-      return ipc.validate(domain, revision.current);
-    }, "common.applied");
-  };
+  const resolveRawEditorConflict = useCallback<RawEditorConflictHandler>(async (editorDomain, _document) => {
+    const refreshed = await ipc.snapshot();
+    revision.current = Math.max(revision.current ?? -1, refreshed.revision);
+    latestSnapshot.current = refreshed;
+    onSnapshot(refreshed);
+    const diskState = refreshed.disk[editorDomain];
+    const diskChanged = diskState?.changed === true;
+    const useLatest = await native.showConfirmation({
+      title: translate(diskChanged ? "settings.diskChangedTitle" : "settings.editorChangedTitle"),
+      message: translate(diskChanged ? "settings.diskChangedBody" : "settings.editorChangedBody"),
+      confirmLabel: translate("menu.reload"),
+    });
+    if (useLatest) {
+      if (diskChanged) {
+        const reloaded = await ipc.reload(editorDomain, refreshed.revision);
+        revision.current = reloaded.revision;
+        const after = await ipc.snapshot();
+        revision.current = Math.max(revision.current ?? -1, after.revision);
+        latestSnapshot.current = after;
+        onSnapshot(after);
+        setKeptDiskGeneration((current) => ({ ...current, [editorDomain]: undefined }));
+        promptedDiskGeneration.current = { ...promptedDiskGeneration.current, [editorDomain]: undefined };
+      }
+      return "reload";
+    }
+    if (diskChanged && diskState?.generation !== undefined) {
+      promptedDiskGeneration.current = { ...promptedDiskGeneration.current, [editorDomain]: diskState.generation };
+      setKeptDiskGeneration((current) => ({ ...current, [editorDomain]: diskState.generation }));
+    }
+    return "keep";
+  }, [ipc, native, onSnapshot, translate]);
   const apply = (): Promise<void> => {
-    if (!domain || domain === "logs") return Promise.resolve();
+    if ((route !== "relay-accounts" && !domain) || domain === "logs") return Promise.resolve();
     return run(async () => {
       await flushPendingFields();
       const refreshed = await ipc.snapshot();
       revision.current = refreshed.revision;
       onSnapshot(refreshed);
-      const domains = settingsRoute
-        ? (["codex", "claude"] as const).filter((name) => refreshed.drafts[name]?.dirty)
-        : refreshed.drafts[domain]?.dirty ? [domain] : [];
+      const domains = stagedDomainsForRoute(refreshed);
       if (domains.length === 0) return { cancelled: true };
       const risks = domains.includes("claude") ? riskCodes(refreshed, "claude") : [];
       const diskConflicts = domains.filter((name) => refreshed.disk[name]?.changed);
@@ -886,10 +948,15 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
         if (!accepted) return { cancelled: true };
       }
       const confirmations = [...risks, ...diskConflicts.map((name) => `overwrite_external_${name}`)];
-      const result = settingsRoute
+      const result = settingsRoute || route === "relay-accounts"
         ? await ipc.applyDomains([...domains], refreshed.revision, confirmations.length > 0 ? confirmations : undefined)
-        : await ipc.apply(domain, refreshed.revision, confirmations.length > 0 ? confirmations : undefined);
-      if (domains.includes("providers_models") && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
+        : domain === undefined
+          ? await ipc.applyDomains([...domains], refreshed.revision, confirmations.length > 0 ? confirmations : undefined)
+          : await ipc.apply(domain, refreshed.revision, confirmations.length > 0 ? confirmations : undefined);
+      if (domains.includes("codex") || domains.includes("claude")) {
+        setSettingsRawBaselineToken((current) => current + 1);
+      }
+      if ((domains.includes("providers_models") || domains.includes("runtime")) && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
         const reloaded = await ipc.dispatch({ type: "service.reload" }, result.revision);
         revision.current = reloaded.revision;
       }
@@ -901,6 +968,117 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       return result;
     });
   };
+  const applyDataManagement = (selectedSections: ConfigDomain[]): Promise<void> => run(async () => {
+    await flushPendingFields();
+    const refreshed = await ipc.snapshot();
+    revision.current = refreshed.revision;
+    latestSnapshot.current = refreshed;
+    onSnapshot(refreshed);
+    const domains = selectedSections.filter((name) => refreshed.drafts[name]?.dirty);
+    if (domains.length === 0) return { cancelled: true };
+    const risks = domains.includes("claude") ? riskCodes(refreshed, "claude") : [];
+    const diskConflicts = domains.filter((name) => refreshed.disk[name]?.changed);
+    const unacknowledgedDiskConflicts = diskConflicts.filter((name) => !isEditableDiskDomain(name) || keptDiskGeneration[name] !== refreshed.disk[name]?.generation);
+    if (unacknowledgedDiskConflicts.length > 0) {
+      const accepted = await native.showConfirmation({ title: translate("settings.diskChangedTitle"), message: translate("settings.overwriteDiskConfirm"), confirmLabel: translate("settings.keepDraft") });
+      if (!accepted) return { cancelled: true };
+    }
+    if (risks.length > 0) {
+      const accepted = await native.showConfirmation({ title: translate("claude.confirmation.required"), message: translate("claude.confirmation.required"), confirmLabel: translate("screen.confirm") });
+      if (!accepted) return { cancelled: true };
+    }
+    const confirmations = [...risks, ...diskConflicts.map((name) => `overwrite_external_${name}`)];
+    const applied = await ipc.applyDomains(domains, refreshed.revision, confirmations.length > 0 ? confirmations : undefined);
+    revision.current = applied.revision;
+    if ((domains.includes("providers_models") || domains.includes("runtime")) && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
+      const reloaded = await ipc.dispatch({ type: "service.reload" }, applied.revision);
+      revision.current = reloaded.revision;
+    }
+    if (domains.includes("codex") || domains.includes("claude")) setSettingsRawBaselineToken((current) => current + 1);
+    if (domains.includes("claude")) {
+      claudeDeploymentDraftRef.current = undefined;
+      setClaudeDeploymentDraft(undefined);
+    }
+    if (diskConflicts.length > 0) setKeptDiskGeneration({});
+    return applied;
+  }, "common.applied");
+  const inspectImportDataManagement = async (): Promise<IpcResults["import_preview"] | undefined> => {
+    let inspected: IpcResults["import_preview"] | undefined;
+    await run(async () => {
+      const fileToken = await native.openFilePicker({ purpose: "import" });
+      if (!fileToken) return { cancelled: true };
+      if (revision.current === undefined) await refresh();
+      inspected = await ipc.previewImport(fileToken, revision.current ?? 0);
+      revision.current = inspected.revision;
+      importPlanToken.current = inspected.import_plan_token;
+      return inspected;
+    }, "dataManagement.importInspected");
+    return inspected;
+  };
+  const importDataManagement = async (sections: ConfigDomain[]): Promise<IpcResults["import"] | undefined> => {
+    let imported: IpcResults["import"] | undefined;
+    await run(async () => {
+      const planToken = importPlanToken.current;
+      if (!planToken) throw new Error(translate("dataManagement.importHint"));
+      importPlanToken.current = undefined;
+      imported = await ipc.importPlan(planToken, revision.current ?? 0, sections);
+      revision.current = imported.revision;
+      return imported;
+    }, "dataManagement.imported");
+    return imported;
+  };
+  const confirmImportDraftReplacement = (sections: string[]): Promise<boolean> => native.showConfirmation({
+    title: translate("dataManagement.tab.import"),
+    message: translate("dataManagement.importReplaceDraftWarning", { sections: sections.join(" · ") }),
+    confirmLabel: translate("dataManagement.importSelected"),
+  });
+  const resizeDataManagement = useCallback((width: number, height: number): Promise<boolean> => native.window.setContentSize?.("data-management", width, height) ?? Promise.resolve(false), [native.window]);
+  const exportDataManagement = (sections: ConfigDomain[]): Promise<void> => run(async () => {
+    const fileToken = await native.saveFilePicker({ suggestedName: "litellm-menu-data.json" });
+    if (!fileToken) return { cancelled: true };
+    return ipc.export(sections, fileToken);
+  }, "dataManagement.exported");
+  const probeWebDav = (): Promise<void> => runWebDavOperation(async () => {
+    await flushPendingFields();
+    return ipc.probe(undefined, undefined, "webdav");
+  }, "webdav.probe");
+  const applyWebDav = (): Promise<void> => runWebDavOperation(async () => {
+    await flushPendingFields();
+    const refreshed = await ipc.snapshot();
+    revision.current = refreshed.revision;
+    latestSnapshot.current = refreshed;
+    onSnapshot(refreshed);
+    if (!refreshed.drafts.webdav?.dirty) return { cancelled: true };
+    const diskChanged = refreshed.disk.webdav?.changed === true;
+    if (diskChanged) {
+      const accepted = await native.showConfirmation({ title: translate("settings.diskChangedTitle"), message: translate("settings.overwriteDiskConfirm"), confirmLabel: translate("settings.keepDraft") });
+      if (!accepted) return { cancelled: true };
+    }
+    const applied = await ipc.apply("webdav", refreshed.revision, diskChanged ? ["overwrite_external_webdav"] : undefined);
+    revision.current = applied.revision;
+    if (diskChanged) setKeptDiskGeneration((current) => ({ ...current, webdav: undefined }));
+    return applied;
+  }, "common.applied");
+  const syncWebDav = (action: WebDavSyncAction): Promise<void> => runWebDavOperation(async () => {
+    await flushPendingFields();
+    const refreshed = await ipc.snapshot();
+    revision.current = refreshed.revision;
+    latestSnapshot.current = refreshed;
+    onSnapshot(refreshed);
+    if (refreshed.drafts.webdav?.dirty) {
+      const diskChanged = refreshed.disk.webdav?.changed === true;
+      if (diskChanged) {
+        const accepted = await native.showConfirmation({ title: translate("settings.diskChangedTitle"), message: translate("settings.overwriteDiskConfirm"), confirmLabel: translate("settings.keepDraft") });
+        if (!accepted) return { cancelled: true };
+      }
+      const applied = await ipc.apply("webdav", refreshed.revision, diskChanged ? ["overwrite_external_webdav"] : undefined);
+      revision.current = applied.revision;
+      if (diskChanged) setKeptDiskGeneration((current) => ({ ...current, webdav: undefined }));
+    }
+    const dispatched = await ipc.dispatch({ domain: "webdav", type: action, payload: { sections: [...WEBDAV_SYNC_DOMAINS] } }, revision.current);
+    revision.current = dispatched.revision;
+    return dispatched;
+  }, "dataManagement.synced");
   const applyProbedSurface: ApplyProbedSurface = (providerId, modelId, nextSurface, options) => {
     let applied = false;
     const queued = probedSurfaceApplyQueue.current.catch(() => undefined).then(async () => {
@@ -964,22 +1142,21 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const closeRoute = (): void => {
     // Keep the React route close independent from the native window registry.
     // A stale/missing native window must not strand the route on screen.
+    if (route === "data-management") importPlanToken.current = undefined;
     try {
-      native.window.close(nativeWindowRoute(route));
+      native.window.close(canonicalWindowRoute(route));
     } finally {
       onClose();
     }
   };
   const requestClose = (): void => {
     const restoreWindow = (): void => {
-      const windowRoute = nativeWindowRoute(route);
+      const windowRoute = canonicalWindowRoute(route);
       native.window.open(windowRoute);
       native.window.focus(windowRoute);
     };
     const current = latestSnapshot.current ?? snapshot;
-    const dirtyDomains = settingsRoute
-      ? (["codex", "claude"] as const).filter((name) => current?.drafts[name]?.dirty)
-      : domain && current?.drafts[domain]?.dirty ? [domain] : [];
+    const dirtyDomains = stagedDomainsForRoute(current);
     const needsDiscardConfirmation = hasPendingFieldEdits()
       || dirtyDomains.length > 0
       || (settingsRoute && hasClaudeDeploymentChanges(current));
@@ -1005,7 +1182,15 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
         closeRoute();
         for (const name of dirtyDomains) {
           try {
-            await enqueueDispatch("cancel", {}, name);
+            if (name === "relay_accounts") {
+              const reloaded = await ipc.reload(name, revision.current);
+              revision.current = reloaded.revision;
+            } else if (name === "language") {
+              const reloaded = await ipc.reload(name, revision.current);
+              revision.current = reloaded.revision;
+            } else {
+              await enqueueDispatch("cancel", {}, name);
+            }
           } catch {
             // The user already chose to discard and the window is gone. Core
             // will reconcile the draft on the next open instead of blocking UI.
@@ -1017,7 +1202,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     })();
   };
   useEffect(() => {
-    if (nativeAction?.id !== `request-close-${route}` && nativeAction?.id !== `request-close-${nativeWindowRoute(route)}`) return;
+    if (nativeAction?.id !== `request-close-${route}` && nativeAction?.id !== `request-close-${canonicalWindowRoute(route)}`) return;
     requestClose();
   }, [nativeAction?.sequence]);
   const definition = ROUTES.find((item) => item.id === route);
@@ -1025,19 +1210,19 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     ? translate(settingsTab === "claude" ? "card.claudeSettings" : "card.codexSettings")
     : translate(definition?.titleKey ?? "app.title");
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
-    {route !== "providers-models" && route !== "logs" && route !== "relay-accounts" && route !== "relay-add" ? <WindowTitle title={windowTitle} validation={issues.length > 0 ? `${issues.length} ${translate("common.validationIssues")}` : undefined} /> : null}
-    {route === "providers-models" || settingsRoute || route === "logs" || route === "relay-accounts" || route === "relay-add" || route === "runtime-settings" || route === "webdav-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "providers-models" && styles.providersContent, settingsRoute && styles.settingsContent, route === "logs" && styles.logsContent, (route === "relay-accounts" || route === "relay-add") && styles.relayAccountsContent, route === "runtime-settings" && styles.runtimeContent, route === "webdav-settings" && styles.webDavContent]}>
+    {route !== "providers-models" && route !== "logs" && route !== "relay-accounts" && route !== "relay-add" && route !== "data-management" ? <WindowTitle title={windowTitle} validation={issues.length > 0 ? `${issues.length} ${translate("common.validationIssues")}` : undefined} /> : null}
+    {route === "providers-models" || settingsRoute || route === "logs" || route === "relay-accounts" || route === "relay-add" || route === "runtime-settings" || route === "data-management" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "providers-models" && styles.providersContent, settingsRoute && styles.settingsContent, route === "logs" && styles.logsContent, (route === "relay-accounts" || route === "relay-add") && styles.relayAccountsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} /> : null}
-    {settingsRoute ? <><View style={styles.settingsTabBar}><WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]} selected={settingsTab} disabled={busy} onSelect={(next) => switchSettingsTab(next as AssistantSettingsDomain)} style={styles.settingsTabs} /></View>{settingsTab === "codex" ? <CodexWorkspace snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} rawReloadToken={settingsRawReloadToken} /> : <ClaudeScreen snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} deployment={claudeDeployment} onDeploymentChange={(key, value) => {
+    {settingsRoute ? <><View style={styles.settingsTabBar}><WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]} selected={settingsTab} disabled={busy} onSelect={(next) => switchSettingsTab(next as AssistantSettingsDomain)} style={styles.settingsTabs} /></View>{settingsTab === "codex" ? <CodexWorkspace snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onEditorConflict={resolveRawEditorConflict} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} /> : <ClaudeScreen snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onEditorConflict={resolveRawEditorConflict} deployment={claudeDeployment} onDeploymentChange={(key, value) => {
       const next = { ...(claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(snapshot)), [key]: value };
       claudeDeploymentDraftRef.current = next;
       setClaudeDeploymentDraft(next);
       return enqueueDispatch("patch_deployment", { [key]: value }, "claude").then(() => {
         setSettingsRawReloadToken((current) => current + 1);
       });
-    }} rawReloadToken={settingsRawReloadToken} />}</> : null}
+    }} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} />}</> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
-    {route === "relay-accounts" || route === "relay-add" ? <RelayAccountManager visible setupOnly={route === "relay-add"} snapshot={snapshot} native={native} busy={busy} translate={translate} onClose={closeRoute} dispatch={dispatch} commit={commitRelayMetadata} detectType={async (origin) => {
+    {route === "relay-accounts" || route === "relay-add" ? <RelayAccountManager visible setupOnly={route === "relay-add"} snapshot={snapshot} native={native} busy={busy} translate={translate} onClose={closeRoute} commit={commitRelayMetadata} detectType={async (origin) => {
       const staged = await enqueueDispatch("account.detect_type", { origin }, "relay_accounts");
       revision.current = staged.revision;
       const next = await refresh();
@@ -1107,11 +1292,11 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     }} refreshAccounts={async () => {
       await refresh();
     }} /> : null}
-    {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onSnapshot={onSnapshot} onSecretState={onSecretState} clearSecret={clearSecret} /> : null}
-    {route === "webdav-settings" ? <WebDavWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} /> : null}
+    {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} /> : null}
+    {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} busy={busy} webDavOperationBusy={webDavOperationBusy} status={result} hasPendingChanges={hasPendingFieldEdits()} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onResize={resizeDataManagement} onFlushPendingFields={flushPendingFields} onTabSwitchError={(reason) => setResult(errorMessage(reason, translate))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onApplyImported={applyDataManagement} onProbeWebDav={probeWebDav} onApplyWebDav={applyWebDav} onSyncWebDav={syncWebDav} /> : null}
     {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
     </View> : null}
-    {route !== "logs" && route !== "relay-accounts" && route !== "relay-add" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : route === "webdav-settings" ? <View style={styles.webdavFooterLeading}><ActionButton title={translate("common.test")} disabled={busy} style={styles.wideButton} onPress={() => run(async () => { await flushPendingFields(); return ipc.probe(undefined, undefined, "webdav"); }, "webdav.probe")} /><Text numberOfLines={2} style={styles.webdavProbeStatus}>{snapshot ? webdavMenuStatus(snapshot.service.webdav, snapshot.webdav.enabled, translate) : ""}</Text></View> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" || route === "webdav-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || (settingsRoute ? !(snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()) : domain ? !(snapshot?.drafts[domain]?.dirty || hasPendingFieldEdits()) : false)} style={route === "runtime-settings" || route === "webdav-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
+    {route === "relay-accounts" ? <DialogFooter compact status={result}><ActionButton title={translate("menu.close")} disabled={busy} onPress={requestClose} /><ActionButton primary title={translate("menu.apply")} disabled={busy || stagedDomainsForRoute(snapshot).length === 0} onPress={apply} /></DialogFooter> : route !== "logs" && route !== "relay-add" && route !== "data-management" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || (settingsRoute ? !(snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()) : domain ? !(snapshot?.drafts[domain]?.dirty || hasPendingFieldEdits()) : false)} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -1136,7 +1321,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const [selectedProvider, setSelectedProvider] = useState<string>();
   const pendingProviderIds = useRef<Set<string> | undefined>(undefined);
   const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);
-  const knownModelIdsByProvider = useRef<Map<string, Set<string>> | undefined>(undefined);
   const provider = useMemo(
     () => providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0],
     [providers, selectedProvider],
@@ -1158,7 +1342,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const probingModelKeys = useRef(new Set<string>());
   const [, setProbeActivityRevision] = useState(0);
   const [probeResults, setProbeResults] = useState<Record<string, IpcResults["probe"]>>({});
-  const transferButtonRef = useRef<HostInstance | null>(null);
   const apiKeyNames = useMemo(() => stringList(provider?.api_key_names), [provider?.api_key_names]);
   const fetchKeyOptions = useMemo(
     () => apiKeyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) })),
@@ -1191,29 +1374,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const key = modelProbeKey(targetProviderId, targetModelId);
     return { probing: probingModelKeys.current.has(key), probeResult: probeResults[key] };
   };
-  const modelIdentitySignature = useMemo(
-    () => providers.map((entry) => `${editorIdentifier(entry)}:${asRecords(entry.models).map(editorIdentifier).join(",")}`).join("|"),
-    [providers],
-  );
-  useEffect(() => {
-    if (!snapshot) return;
-    const current = new Map<string, Set<string>>();
-    const added: Array<{ providerId: string; modelId: string }> = [];
-    for (const entry of providers) {
-      const currentProviderId = editorIdentifier(entry);
-      const currentModelIds = new Set(asRecords(entry.models).map(editorIdentifier));
-      const previousModelIds = knownModelIdsByProvider.current?.get(currentProviderId);
-      if (previousModelIds) {
-        for (const modelId of currentModelIds) {
-          if (!previousModelIds.has(modelId)) added.push({ providerId: currentProviderId, modelId });
-        }
-      }
-      current.set(currentProviderId, currentModelIds);
-    }
-    const wasInitialized = knownModelIdsByProvider.current !== undefined;
-    knownModelIdsByProvider.current = current;
-    if (wasInitialized) void Promise.all(added.map(({ providerId: targetProviderId, modelId }) => probeModel(targetProviderId, modelId, { confirmRecommendation: false })));
-  }, [modelIdentitySignature]);
   useEffect(() => {
     const pending = pendingProviderIds.current;
     if (pending) {
@@ -1273,43 +1433,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then((selection) => {
       const selectedModels = (selection ?? []).filter((model, index, all) => candidateSet.has(model) && all.indexOf(model) === index);
       if (selectedModels.length === 0) return;
-      void Promise.all(selectedModels.map((upstreamModel, index) => dispatch("model.add", { provider_id: providerId, model: { name: upstreamModel, upstream_model: upstreamModel, api_key_name: fetchKeyName, enabled: true, order: models.length + index + 1 } })))
-        .catch(() => undefined);
-    }).catch(() => undefined);
-  };
-  const importSelected = async (): Promise<void> => {
-    const fileToken = await native.openFilePicker({ purpose: "import" });
-    if (fileToken) await dispatch("providers.import_selected", { file_token: fileToken });
-  };
-  const exportSelected = async (): Promise<void> => {
-    const fileToken = await native.saveFilePicker({ suggestedName: "providers-models.json" });
-    if (!fileToken) return;
-    const exported = await ipc.export(["providers_models"], fileToken);
-    onSnapshot(await ipc.snapshot());
-    return void exported;
-  };
-  const transferActions = [
-    translate("providers.currentCodex"),
-    translate("providers.currentClaude"),
-    translate("providers.configurationFile"),
-    translate("providers.relay"),
-    translate("providers.exportFile"),
-  ];
-  const selectTransferAction = (index: number): void => {
-    if (index === 0) void dispatch("providers.import_codex_current");
-    else if (index === 1) void dispatch("providers.import_claude_current");
-    else if (index === 2) void importSelected();
-    else if (index === 3) native.window.open("relay-accounts");
-    else if (index === 4) void exportSelected();
-  };
-  const showTransferMenu = (): void => {
-    const button = transferButtonRef.current;
-    if (!button) return;
-    button.measureInWindow((x, y, width, height) => {
-      void native.showActionMenu({ title: translate("providers.transferActions"), items: transferActions, anchor: { x, y, width, height } }).then((index) => {
-        if (index !== undefined) selectTransferAction(index);
+      void dispatch("model.add_many", {
+        provider_id: providerId,
+        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: fetchKeyName, enabled: true, order: 0 })),
       });
-    });
+    }).catch(() => undefined);
   };
   const addProvider = (): void => {
     pendingProviderIds.current = new Set(providers.map(editorIdentifier));
@@ -1319,7 +1447,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!provider) return;
     const knownModelIds = new Set(models.map(editorIdentifier));
     pendingModelIds.current = { providerId, ids: knownModelIds };
-    void dispatch("model.add", { provider_id: providerId, model: { name: "", upstream_model: "", enabled: true, order: models.length + 1 } });
+    void dispatch("model.add", { provider_id: providerId, model: { name: "", upstream_model: "", enabled: true, order: 0 } });
   };
   const fetchModels = (): void => {
     if (!provider || !fetchKeyName) return;
@@ -1407,7 +1535,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     [providers],
   );
   const modelRows = useMemo(
-    () => models.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newModel"))), upstreamModelLabel(item), `${apiKeyDisplayName(item.api_key_name, translate)} / ${numberValue(item.order, 1)}`] })),
+    () => models.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newModel"))), upstreamModelLabel(item), `${apiKeyDisplayName(item.api_key_name, translate)} / ${numberValue(item.order, 0)}`] })),
     [models, translate],
   );
   const disabledModelKeys = useMemo(
@@ -1462,7 +1590,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     <View style={styles.providerLeftColumn}>
       <View style={styles.providerToolbar}>
         <WindowTabs values={[{ id: "providers", title: translate("providers.providers") }, { id: "routes", title: translate("providers.routes") }]} selected={viewMode} onSelect={(value) => chooseViewMode(value as "providers" | "routes")} />
-        <ActionButton ref={transferButtonRef} title={`${translate("providers.importExport")} ▾`} disabled={busy} style={styles.importSourcePicker} onPress={showTransferMenu} />
         <View style={styles.toolbarSpacer} />
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
@@ -1472,16 +1599,16 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
           <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !provider} onPress={confirmDeleteProvider} /></>}>
-            <NativeTable columns={[{ label: translate("providers.provider"), width: 104 }, { label: translate("providers.modelCount"), width: 48 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
+            <NativeTable columns={[{ label: translate("providers.provider"), width: 88 }, { label: translate("providers.modelCount"), width: 64 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
           <TablePane style={styles.modelListPane} title={translate("providers.models")} actions={<><IconButton label="+" title={translate("providers.newModel")} disabled={busy || !provider} onPress={addModel} /><IconButton label="⧉" title={translate("common.copy")} disabled={busy || !model} onPress={duplicateModel} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !model} onPress={confirmDeleteModel} /></>}>
-            <NativeTable columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.apiKeyOrder"), width: 96 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} scrollTrailingColumnOverflow onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
+            <NativeTable columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.apiKeyOrder"), width: 96 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
             <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={selectedFetchLabel} disabled={busy || !provider || apiKeyNames.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyName(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} disabled={busy || !provider || !fetchKeyName} onPress={fetchModels} /></View>
           </TablePane>
         </View>
       </View>}
     </View>
-    <View style={styles.providerInspector}>{viewMode === "routes" ? (activeRoute ? (providerSourceModel ? <ProviderEditor provider={activeRoute.provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} /> : <ModelInspector providers={providers} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector providers={providers} provider={provider} providerId={providerId} model={model} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(providerId, editorIdentifier(model))} {...modelProbeProps(providerId, editorIdentifier(model))} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor provider={provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} /> : <EmptyState translate={translate} />}</View>
+    <View style={styles.providerInspector}>{viewMode === "routes" ? (activeRoute ? (providerSourceModel ? <ProviderEditor provider={activeRoute.provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} /> : <ModelInspector providers={providers} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector providers={providers} provider={provider} providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(providerId, editorIdentifier(model))} {...modelProbeProps(providerId, editorIdentifier(model))} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor provider={provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} /> : <EmptyState translate={translate} />}</View>
   </View>;
 }
 
@@ -1489,7 +1616,7 @@ function TablePane({ title, actions, wide, style, children }: { title: string; a
   return <View style={[styles.tablePane, compactStyles.tablePane, wide && styles.tablePaneWide, style]}><View style={[styles.tableTitleRow, compactStyles.tableTitleRow]}><Text style={styles.tableTitle}>{title}</Text><View style={[styles.tableActions, compactStyles.inlineGap]}>{actions}</View></View>{children}</View>;
 }
 
-function ModelInspector({ providers, provider, providerId, model, native, busy, translate, dispatch, probe, probing, probeResult, onProviderClick, onProviderChange }: { providers: UnknownRecord[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; onProviderClick: () => void; onProviderChange: (providerId: string) => void }): React.JSX.Element {
+function ModelInspector({ providers, provider, providerId, model, busy, translate, dispatch, probe, probing, probeResult, onProviderClick, onProviderChange }: { providers: UnknownRecord[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; onProviderClick: () => void; onProviderChange: (providerId: string) => void }): React.JSX.Element {
   const id = editorIdentifier(model);
   const providerLabels = providers.map((item) => stringValue(item.name, translate("providers.newProvider")));
   const providerIndex = providers.findIndex((item) => editorIdentifier(item) === providerId);
@@ -1499,7 +1626,8 @@ function ModelInspector({ providers, provider, providerId, model, native, busy, 
   const selectedKey = stringValue(model.api_key_name, keyNames[0] ?? "");
   const probePresentation = modelProbePresentation(model, probeResult, translate);
   const probeTooltip = screenBoundedTooltipText(probePresentation.full, Dimensions.get("screen"));
-  return <View style={styles.inspectorContent}><View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{stringValue(model.name, translate("providers.newModel"))}</Text></View><View style={styles.inspectorDivider} /><View style={styles.inspectorBody}><View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} style={styles.inspectorEnableControl} /><ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} disabled={busy || probing} onPress={probe} />{probePresentation.compact ? <TooltipText numberOfLines={2} tooltip={probeTooltip} accessibilityHint={probePresentation.full} style={styles.probeSummary}>{probePresentation.compact}</TooltipText> : null}</View><TextField label={translate("providers.publicModel")} labelWidth={60} value={stringValue(model.name)} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} /><PickerField label={translate("providers.provider")} labelWidth={60} value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers.find((item) => stringValue(item.name, translate("providers.newProvider")) === label); if (next) onProviderChange(editorIdentifier(next)); }} /><PickerField label={translate("providers.keyName")} labelWidth={60} value={selectedKey} values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]} disabled={busy || keyNames.length === 0} onSelect={(api_key_name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { api_key_name } })} /><TextField label={translate("providers.upstream")} labelWidth={60} value={upstreamModelLabel(model)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} /><TextField label={translate("common.order")} labelWidth={60} controlWidth={64} value={String(numberValue(model.order, 1))} keyboardType="numeric" onCommit={(order) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { order: Number(order) || 1 } })} /><ProtocolPicker providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} /></View></View>;
+  const probeReady = Boolean(stringValue(provider.endpoint, stringValue(provider.api_base)).trim() && upstreamModelLabel(model).trim() && booleanValue(model.api_key_configured));
+  return <View style={styles.inspectorContent}><View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{stringValue(model.name, translate("providers.newModel"))}</Text></View><View style={styles.inspectorDivider} /><View style={styles.inspectorBody}><View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} style={styles.inspectorEnableControl} /><ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} disabled={busy || probing || !probeReady} onPress={probe} />{probePresentation.compact ? <TooltipText numberOfLines={2} tooltip={probeTooltip} accessibilityHint={probePresentation.full} style={styles.probeSummary}>{probePresentation.compact}</TooltipText> : null}</View><TextField label={translate("providers.publicModel")} labelWidth={60} value={stringValue(model.name)} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} /><PickerField label={translate("providers.provider")} labelWidth={60} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers.find((item) => stringValue(item.name, translate("providers.newProvider")) === label); if (next) onProviderChange(editorIdentifier(next)); }} /><PickerField label={translate("providers.keyName")} labelWidth={60} allowShrink value={selectedKey} values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]} disabled={busy || keyNames.length === 0} onSelect={(api_key_name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { api_key_name } })} /><TextField label={translate("providers.upstream")} labelWidth={60} value={upstreamModelLabel(model)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} /><TextField label={translate("common.order")} labelWidth={60} controlWidth={64} value={String(numberValue(model.order, 0))} keyboardType="numeric" onCommit={(order) => { const nextOrder = Number(order); return dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { order: Number.isFinite(nextOrder) ? nextOrder : 0 } }); }} /><ProtocolPicker providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} /></View></View>;
 }
 
 function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
@@ -1517,8 +1645,8 @@ function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { prov
   ];
   const fixed = mode === "fixed";
   return <View style={styles.protocolSettings}>
-    <PickerField label={translate("providers.protocolMode")} labelWidth={60} value={fixed ? "fixed" : "fallback"} values={modeOptions} disabled={busy} onSelect={(upstream_protocol_mode) => { void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_protocol_mode } }); }} />
-    <PickerField label={fixed ? translate("providers.fixedProtocol") : translate("providers.fallbackProtocol")} labelWidth={60} value={protocol} values={options} disabled={busy} onSelect={(upstream_url_surface) => { void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_url_surface } }); }} />
+    <PickerField label={translate("providers.protocolMode")} labelWidth={60} allowShrink value={fixed ? "fixed" : "fallback"} values={modeOptions} disabled={busy} onSelect={(upstream_protocol_mode) => { void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_protocol_mode } }); }} />
+    <PickerField label={fixed ? translate("providers.fixedProtocol") : translate("providers.fallbackProtocol")} labelWidth={60} allowShrink value={protocol} values={options} disabled={busy} onSelect={(upstream_url_surface) => { void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_url_surface } }); }} />
     <Text style={styles.protocolHint}>{translate(fixed ? "providers.protocolModeFixedHint" : "providers.protocolModeFallbackHint")}</Text>
   </View>;
 }
@@ -1529,7 +1657,7 @@ function providerRecord(provider: ProviderSummary): UnknownRecord {
 
 function modelRecord(model: UnknownRecord): UnknownRecord {
   const modelEnabled = booleanValue(model.model_enabled, booleanValue(model.enabled, true));
-  return { ...model, id: editorIdentifier(model), name: stringValue(model.name, stringValue(model.display_name, stringValue(model.model))), display_name: stringValue(model.display_name, stringValue(model.name)), enabled: modelEnabled, model_enabled: modelEnabled, order: numberValue(model.order, 1) };
+  return { ...model, id: editorIdentifier(model), name: stringValue(model.name, stringValue(model.display_name, stringValue(model.model))), display_name: stringValue(model.display_name, stringValue(model.name)), enabled: modelEnabled, model_enabled: modelEnabled, order: numberValue(model.order, 0) };
 }
 
 function isProbeSurface(value: string): value is "openai/responses" | "openai/chat" | "anthropic" {
@@ -1567,20 +1695,50 @@ function editorIdentifier(record: UnknownRecord): string {
 
 function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretState, sourceModel, onReturnToModel }: { provider: UnknownRecord; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void }): React.JSX.Element {
   const id = editorIdentifier(provider);
-  const keys = stringList(provider.api_key_names);
+  const keys = useMemo(() => stringList(provider.api_key_names), [provider.api_key_names]);
   const keyStates = asRecords(provider.key_states);
   const [selectedKey, setSelectedKey] = useState<string>(keys[0] ?? "");
-  useEffect(() => { if (!keys.includes(selectedKey)) setSelectedKey(keys[0] ?? ""); }, [keys, selectedKey]);
-  const addKey = (): void => { const name = uniqueKeyName(keys); void dispatch("provider.key_add", { provider_id: id, name }).then(() => setSelectedKey(name)); };
-  const renameKey = (name: string): void => { if (!selectedKey || !name || name === selectedKey) return; void dispatch("provider.key_patch", { provider_id: id, old_name: selectedKey, name }).then(() => setSelectedKey(name)); };
+  const pendingKeySelection = useRef<string | undefined>(undefined);
+  React.useLayoutEffect(() => {
+    const pending = pendingKeySelection.current;
+    if (pending && keys.includes(pending)) {
+      pendingKeySelection.current = undefined;
+      if (selectedKey !== pending) setSelectedKey(pending);
+      return;
+    }
+    if (!keys.includes(selectedKey)) setSelectedKey(keys[0] ?? "");
+  }, [keys, selectedKey]);
+  const addKey = (): void => {
+    const name = uniqueKeyName(keys);
+    pendingKeySelection.current = name;
+    void dispatch("provider.key_add", { provider_id: id, name });
+  };
+  const renameKey = (name: string): void => {
+    if (!selectedKey || !name || name === selectedKey) return;
+    pendingKeySelection.current = name;
+    void dispatch("provider.key_patch", { provider_id: id, old_name: selectedKey, name });
+  };
   const deleteKey = (): void => {
     if (!selectedKey || keys.length <= 1) return;
-    const replacement = keys.find((key) => key !== selectedKey) ?? "";
+    const affectedModelLines = asRecords(provider.models)
+      .filter((model) => stringValue(model.api_key_name).trim() === selectedKey)
+      .map((model, index) => {
+        const publicName = stringValue(model.name, translate("providers.newModel")).trim();
+        const upstreamName = upstreamModelLabel(model).trim();
+        const label = upstreamName && upstreamName !== publicName ? `${publicName} (${upstreamName})` : publicName;
+        return `${index + 1}. ${label}`;
+      });
     void native.showConfirmation({
-      title: translate("providers.deleteApiKey"),
-      message: `${apiKeyDisplayName(selectedKey, translate)} -> ${apiKeyDisplayName(replacement || "default", translate)}`,
+      title: translate("providers.deleteApiKey", { key: apiKeyDisplayName(selectedKey, translate) }),
+      message: affectedModelLines.length > 0
+        ? translate("providers.deleteApiKeyModelsMessage", { models: affectedModelLines.join("\n") })
+        : translate("providers.deleteApiKeyNoModelsMessage"),
       confirmLabel: translate("common.delete"),
-    }).then((confirmed) => confirmed ? dispatch("provider.key_delete", { provider_id: id, name: selectedKey }).then(() => setSelectedKey(replacement)) : undefined);
+    }).then((confirmed) => {
+      if (!confirmed) return undefined;
+      pendingKeySelection.current = undefined;
+      return dispatch("provider.key_delete", { provider_id: id, name: selectedKey });
+    });
   };
   const providerLabel = stringValue(provider.display_name, stringValue(provider.name, translate("providers.newProvider")));
   const sourceModelLabel = sourceModel ? stringValue(sourceModel.name, translate("providers.newModel")) : "";
@@ -1591,31 +1749,27 @@ function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretS
     <View style={styles.providerEditorSection}><View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch("provider.patch", { provider_id: id, changes: { enabled } })} /></View>
     <TextField label={translate("providers.baseUrl")} labelWidth={68} value={stringValue(provider.endpoint, stringValue(provider.api_base))} onCommit={(endpoint) => dispatch("provider.patch", { provider_id: id, changes: { endpoint } })} />
     <TextField label={translate("providers.providerName")} labelWidth={68} value={stringValue(provider.name, stringValue(provider.display_name))} onCommit={(name) => dispatch("provider.patch", { provider_id: id, changes: { name } })} />
-    <View style={[styles.providerKeysEditor, styles.providerKeysEditorCompact]}>
-      <View style={[styles.providerKeysHeader, styles.providerKeysHeaderCompact]}>
+    <View style={styles.providerKeysEditor}>
+      <View style={styles.providerKeysHeader}>
         <Text style={styles.providerKeysHeading}>{translate("providers.apiKeys")}</Text>
+        <View style={styles.providerKeyActions}>
+          <IconButton label="+" title={translate("common.add")} disabled={busy} onPress={addKey} />
+          <IconButton label="−" title={translate("common.delete")} disabled={busy || keys.length <= 1 || !selectedKey} onPress={deleteKey} />
+        </View>
       </View>
-      <View style={[styles.providerKeyGrid, styles.providerKeyGridCompact]}>
-        <View style={[styles.providerKeyList, styles.providerKeyListCompact]}>
-          <NativeTable columns={[{ label: translate("providers.key"), width: 100 }]} rows={keyRows} selectedKey={selectedKey} compact cellHorizontalPadding={0} firstColumnHorizontalPadding={0} onSelectionChange={setSelectedKey} style={styles.providerKeyTable} />
-          <View style={[styles.providerKeyActions, styles.providerKeyActionsCompact]}>
-            <IconButton label="+" title={translate("common.add")} disabled={busy} onPress={addKey} />
-            <IconButton label="−" title={translate("common.delete")} disabled={busy || keys.length <= 1 || !selectedKey} onPress={deleteKey} />
-          </View>
-        </View>
-        <View style={[styles.providerKeyFields, styles.providerKeyFieldsCompact]}>
-          {selectedKey ? <>
-            <TextField label={translate("providers.keyName")} labelWidth={42} value={selectedKey} onCommit={renameKey} />
-            <NativeSecretField plainText autoCommit label={translate("providers.keyValue")} hint={selectedKeyConfigured ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} labelWidth={42} busy={busy || !selectedKey} domain="providers_models" field="api_key" target={`${id}\x1f${selectedKey}`} onSecretState={onSecretState} />
-          </> : <Text style={styles.empty}>{translate("common.notAvailable")}</Text>}
-        </View>
+      <NativeTable columns={[{ label: translate("providers.key"), width: 220 }]} rows={keyRows} selectedKey={selectedKey} compact cellHorizontalPadding={0} firstColumnHorizontalPadding={0} onSelectionChange={setSelectedKey} style={styles.providerKeyTable} />
+      <View style={styles.providerKeyFields}>
+        {selectedKey ? <>
+          <TextField label={translate("providers.keyName")} labelWidth={68} value={selectedKey} onCommit={renameKey} />
+          <NativeSecretField plainText autoCommit label={translate("providers.keyValue")} hint={selectedKeyConfigured ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} labelWidth={68} busy={busy || !selectedKey} domain="providers_models" field="api_key" target={`${id}\x1f${selectedKey}`} onSecretState={onSecretState} />
+        </> : <Text style={styles.empty}>{translate("common.notAvailable")}</Text>}
       </View>
     </View>
     </View>
   </View>;
 }
 
-function CodexWorkspace({ snapshot, ipc, busy, translate, dispatch, onSecretState, rawReloadToken }: { snapshot?: CoreSnapshot; ipc: IpcClient; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; rawReloadToken: number }): React.JSX.Element {
+function CodexWorkspace({ snapshot, ipc, busy, translate, dispatch, onSecretState, onEditorConflict, rawReloadToken, rawBaselineToken }: { snapshot?: CoreSnapshot; ipc: IpcClient; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onEditorConflict: RawEditorConflictHandler; rawReloadToken: number; rawBaselineToken: number }): React.JSX.Element {
   const state = domainState(snapshot, "codex");
   const structured = asRecord(state.structured);
   const permissions = asRecord(structured.permissions);
@@ -1730,17 +1884,19 @@ function CodexWorkspace({ snapshot, ipc, busy, translate, dispatch, onSecretStat
       <TextField label={translate("codex.writableRoots")} value={stringList(permissions.writable_roots).join("\n")} multiline onCommit={(writable_roots) => dispatch("patch", { permissions: { writable_roots: splitLines(writable_roots) } })} />
     </View></Section>
     <Section title={translate("codex.features")}><FeatureToggles value={asRecord(structured.features)} disabled={busy} onChange={(features) => dispatch("patch", { features })} translate={translate} /></Section>
-  </>} raw={<><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("codex.rawToml")} domain="codex" document="config" language="toml" ipc={ipc} busy={busy} translate={translate} reloadToken={rawReloadToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("codex.rawAuth")} domain="codex" document="auth" language="json" ipc={ipc} busy={busy} translate={translate} reloadToken={rawReloadToken} /></>} />;
+  </>} raw={<><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("codex.rawToml")} domain="codex" document="config" language="toml" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("codex.rawAuth")} domain="codex" document="auth" language="json" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /></>} />;
 }
 
 function SettingsWorkspace({ validationStatus, validationStatusStyle, structuredWidth, onStructuredWidthChange, workspaceWidth, onWorkspaceWidthChange, translate, missingMessage, structured, raw }: { validationStatus?: string; validationStatusStyle?: StyleProp<TextStyle>; structuredWidth: number; onStructuredWidthChange: (width: number) => void; workspaceWidth: number; onWorkspaceWidthChange: (width: number) => void; translate: Translate; missingMessage?: string; structured: React.ReactNode; raw: React.ReactNode }): React.JSX.Element {
   const rawPaneMinimum = 344;
   const minStructuredWidth = 360;
+  const [structuredViewportWidth, setStructuredViewportWidth] = useState(0);
   const maxStructuredWidth = workspaceWidth > 0
     ? Math.max(minStructuredWidth, Math.min(680, workspaceWidth - rawPaneMinimum))
     : 470;
   const paneWidth = Math.max(minStructuredWidth, Math.min(structuredWidth, maxStructuredWidth));
-  return <View style={styles.codexWorkspaceFrame} onLayout={({ nativeEvent }) => onWorkspaceWidthChange(nativeEvent.layout.width)}>{validationStatus ? <Text style={[styles.codexValidationStatus, validationStatusStyle]}>{validationStatus}</Text> : null}{missingMessage ? <Text style={styles.settingsMissingMessage}>{missingMessage}</Text> : null}<NativeSplitView paneWidth={paneWidth} minPaneWidth={minStructuredWidth} maxPaneWidth={maxStructuredWidth} onPaneWidthChange={(width) => onStructuredWidthChange(Math.max(minStructuredWidth, Math.min(width, maxStructuredWidth)))} style={styles.codexSplit}><View style={styles.codexStructuredPane}><Text style={styles.paneHeading}>{translate("settings.structured")}</Text><ScrollView style={styles.codexStructuredScroll} contentContainerStyle={styles.codexStructured}>{structured}</ScrollView></View><View style={styles.codexRawPane}><Text style={styles.paneHeading}>{translate("settings.rawLiveDraft")}</Text><View style={styles.codexRawEditors}>{raw}</View></View></NativeSplitView></View>;
+  const hasStructuredHorizontalOverflow = structuredViewportWidth > 0 && structuredViewportWidth < SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH;
+  return <View style={styles.codexWorkspaceFrame} onLayout={({ nativeEvent }) => onWorkspaceWidthChange(nativeEvent.layout.width)}>{validationStatus ? <Text style={[styles.codexValidationStatus, validationStatusStyle]}>{validationStatus}</Text> : null}{missingMessage ? <Text style={styles.settingsMissingMessage}>{missingMessage}</Text> : null}<NativeSplitView paneWidth={paneWidth} minPaneWidth={minStructuredWidth} maxPaneWidth={maxStructuredWidth} onPaneWidthChange={(width) => onStructuredWidthChange(Math.max(minStructuredWidth, Math.min(width, maxStructuredWidth)))} style={styles.codexSplit}><View style={styles.codexStructuredPane}><Text style={styles.paneHeading}>{translate("settings.structured")}</Text><ScrollView style={styles.codexStructuredScroll} contentContainerStyle={[styles.codexStructured, hasStructuredHorizontalOverflow && styles.codexStructuredWithHorizontalScrollbar]} horizontal={false} alwaysBounceHorizontal={false} showsHorizontalScrollIndicator={hasStructuredHorizontalOverflow} showsVerticalScrollIndicator onLayout={({ nativeEvent }) => setStructuredViewportWidth(nativeEvent.layout.width)}><NativePersistentScrollIndicator style={styles.codexStructuredScrollIndicator} />{structured}</ScrollView></View><View style={styles.codexRawPane}><Text style={styles.paneHeading}>{translate("settings.rawLiveDraft")}</Text><View style={styles.codexRawEditors}>{raw}</View></View></NativeSplitView></View>;
 }
 
 function FeatureToggles({ value, disabled, onChange, translate }: { value: UnknownRecord; disabled: boolean; onChange: (features: UnknownRecord) => void; translate: Translate }): React.JSX.Element {
@@ -1757,7 +1913,7 @@ function CompactToggleGrid({ children }: { children: React.ReactNode }): React.J
   return <View style={styles.featureGrid}>{items.map((child, index) => <View key={child && typeof child === "object" && "key" in child && child.key != null ? String(child.key) : String(index)} style={styles.featureGridItem}>{child}</View>)}</View>;
 }
 
-function ClaudeScreen({ snapshot, ipc, busy, translate, dispatch, onSecretState, deployment, onDeploymentChange, rawReloadToken }: { snapshot?: CoreSnapshot; ipc: IpcClient; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; deployment: ClaudeDeploymentDraft; onDeploymentChange: (key: keyof ClaudeDeploymentDraft, value: string) => Promise<void>; rawReloadToken: number }): React.JSX.Element {
+function ClaudeScreen({ snapshot, ipc, busy, translate, dispatch, onSecretState, onEditorConflict, deployment, onDeploymentChange, rawReloadToken, rawBaselineToken }: { snapshot?: CoreSnapshot; ipc: IpcClient; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onEditorConflict: RawEditorConflictHandler; deployment: ClaudeDeploymentDraft; onDeploymentChange: (key: keyof ClaudeDeploymentDraft, value: string) => Promise<void>; rawReloadToken: number; rawBaselineToken: number }): React.JSX.Element {
   const state = domainState(snapshot, "claude");
   const settings = asRecord(state.settings);
   const desktop = asRecord(state.desktop);
@@ -1833,7 +1989,7 @@ function ClaudeScreen({ snapshot, ipc, busy, translate, dispatch, onSecretState,
       {hasBooleanSetting(settings, "disableRemoteControl") ? <ToggleRow label={translate("claude.disableRemoteControl")} value={booleanValue(settings.disableRemoteControl)} disabled={busy} onChange={(disableRemoteControl) => dispatch("patch", { disableRemoteControl })} /> : null}
       {hasBooleanSetting(settings, "disableAllHooks") ? <ToggleRow label={translate("claude.disableAllHooks")} value={booleanValue(settings.disableAllHooks)} disabled={busy} onChange={(disableAllHooks) => dispatch("patch", { disableAllHooks })} /> : null}
     </CompactToggleGrid> : <EmptyState translate={translate} />}</Section>
-  </>} raw={<><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.desktopRawJson")} domain="claude" document="desktop" language="json" ipc={ipc} busy={busy} translate={translate} reloadToken={rawReloadToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.developerRawJson")} domain="claude" document="developer" language="json" ipc={ipc} busy={busy} translate={translate} reloadToken={rawReloadToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.codeRawJson")} domain="claude" document="settings" language="json" ipc={ipc} busy={busy} translate={translate} reloadToken={rawReloadToken} /></>} />;
+  </>} raw={<><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.desktopRawJson")} domain="claude" document="desktop" language="json" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.developerRawJson")} domain="claude" document="developer" language="json" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.codeRawJson")} domain="claude" document="settings" language="json" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /></>} />;
 }
 
 function claudePermissionLabel(value: string, translate: Translate): string {
@@ -1843,24 +1999,168 @@ function claudePermissionLabel(value: string, translate: Translate): string {
 
 const CLAUDE_PERMISSION_MODES = ["default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions", "delegate"];
 
-function RuntimeWorkspace({ snapshot, ipc, native, busy, translate, dispatch, onSnapshot, onSecretState, clearSecret }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSnapshot: (next: CoreSnapshot) => void; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
+function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
   const state = domainState(snapshot, "runtime");
   const settings = asRecords(state.settings).length > 0 ? asRecords(state.settings) : asRecords(state.categories).flatMap((category) => asRecords(category.settings));
   const groups = groupBy(settings, (item) => stringValue(item.category, translate("runtime.categories")));
   const [contentWidth, setContentWidth] = useState(0);
   const oneColumn = contentWidth > 0 && contentWidth < 1_000;
-  const importFile = async (): Promise<void> => {
-    const fileToken = await native.openFilePicker({ purpose: "import" });
-    if (!fileToken || !snapshot) return;
-    await ipc.import(fileToken, snapshot.revision, ["runtime"]);
-    onSnapshot(await ipc.snapshot());
+  return <View style={styles.runtimeWorkspaceFrame}><ScrollView style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace} onLayout={({ nativeEvent }) => setContentWidth(nativeEvent.layout.width)}>{Object.keys(groups).length === 0 ? <EmptyState translate={translate} /> : Object.entries(groups).map(([category, entries]) => <Section key={category} title={runtimeCategoryLabel(category, translate)}><View style={[styles.runtimeTwoColumnForm, oneColumn && styles.runtimeOneColumnForm]}>{entries.map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} />)}</View></Section>)}</ScrollView></View>;
+}
+
+function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, status, hasPendingChanges, translate, dispatch, onSecretState, onResize, onFlushPendingFields, onTabSwitchError, onInspectImport, onImport, onConfirmImportReplace, onExport, onApplyImported, onProbeWebDav, onApplyWebDav, onSyncWebDav }: {
+  snapshot?: CoreSnapshot;
+  busy: boolean;
+  webDavOperationBusy: boolean;
+  status?: string;
+  hasPendingChanges: boolean;
+  translate: Translate;
+  dispatch: Dispatch;
+  onSecretState: (state: SecretState) => void;
+  onResize: (width: number, height: number) => Promise<boolean>;
+  onFlushPendingFields: () => Promise<void>;
+  onTabSwitchError: (reason: unknown) => void;
+  onInspectImport: () => Promise<IpcResults["import_preview"] | undefined>;
+  onImport: (sections: ConfigDomain[]) => Promise<IpcResults["import"] | undefined>;
+  onConfirmImportReplace: (sections: string[]) => Promise<boolean>;
+  onExport: (sections: ConfigDomain[]) => Promise<void>;
+  onApplyImported: (sections: ConfigDomain[]) => Promise<void>;
+  onProbeWebDav: () => Promise<void>;
+  onApplyWebDav: () => Promise<void>;
+  onSyncWebDav: (action: WebDavSyncAction) => Promise<void>;
+}): React.JSX.Element {
+  const [tab, setTab] = useState<DataManagementTab>("import");
+  const [importPreview, setImportPreview] = useState<IpcResults["import_preview"]>();
+  const [importSections, setImportSections] = useState<ConfigDomain[]>([]);
+  const [stagedSections, setStagedSections] = useState<ConfigDomain[]>([]);
+  const [exportSections, setExportSections] = useState<ConfigDomain[]>([...DATA_PACKAGE_DOMAINS]);
+  const [syncAction, setSyncAction] = useState<WebDavSyncAction>("sync");
+  const detectedImportSections = useMemo(() => DATA_PACKAGE_DOMAINS.filter((domain) => importPreview?.detected_sections.includes(domain)), [importPreview]);
+  const importedDirty = stagedSections.some((domain) => snapshot?.drafts[domain]?.dirty);
+  const importReviewReady = importPreview !== undefined && stagedSections.length === 0;
+  const replacingDraftSections = importSections.filter((domain) => importPreview?.preview[domain]?.will_replace_draft === true);
+  const windows = Platform.OS === "windows";
+  const importItemCount = stagedSections.length || detectedImportSections.length;
+  const importHeight = importItemCount === 0
+    ? windows ? 112 : 96
+    : importItemCount <= 2
+      ? windows ? (replacingDraftSections.length > 0 ? 210 : 180) : (replacingDraftSections.length > 0 ? 195 : 160)
+      : windows ? (replacingDraftSections.length > 0 ? 250 : 220) : (replacingDraftSections.length > 0 ? 235 : 195);
+  useEffect(() => {
+    // Use compact, content-sized utility windows while leaving enough room
+    // for native single-column preference rows. The short import landing pane
+    // stays small; review panes grow without switching to a dense card grid.
+    const size = tab === "webdav"
+      ? { width: windows ? 620 : 590, height: windows ? 480 : 410 }
+      : tab === "export"
+        ? { width: windows ? 560 : 540, height: windows ? 240 : 225 }
+        : importItemCount === 0
+          ? { width: windows ? 520 : 500, height: importHeight }
+          : importItemCount <= 2
+            ? { width: windows ? 540 : 520, height: importHeight }
+            : { width: windows ? 560 : 540, height: importHeight };
+    void onResize(size.width, size.height);
+  }, [detectedImportSections.length, importHeight, onResize, stagedSections.length, tab]);
+  const switchDataManagementTab = (next: DataManagementTab): void => {
+    if (next === tab) return;
+    // Keep navigation immediate even if Core is slow or unavailable. Pending
+    // field writes finish in the background and report their own failure.
+    const pending = onFlushPendingFields();
+    setTab(next);
+    void pending.catch((reason: unknown) => {
+      onTabSwitchError(reason);
+    });
   };
-  const exportFile = async (): Promise<void> => {
-    const fileToken = await native.saveFilePicker({ suggestedName: "runtime-settings.json" });
-    if (!fileToken) return;
-    await ipc.export(["runtime"], fileToken);
+  const toggleSection = (setter: React.Dispatch<React.SetStateAction<ConfigDomain[]>>, domain: ConfigDomain, enabled: boolean): void => setter((current) => enabled
+    ? DATA_PACKAGE_DOMAINS.filter((item) => item === domain || current.includes(item))
+    : current.filter((item) => item !== domain));
+  const sectionList = (available: readonly ConfigDomain[], selected: readonly ConfigDomain[], disabled: boolean, onToggle: (domain: ConfigDomain, enabled: boolean) => void): React.JSX.Element => {
+    const sections = DATA_PACKAGE_SECTIONS.filter(({ domain }) => available.includes(domain));
+    return <View style={styles.dataManagementSectionPicker}>{sections.map(({ domain, labelKey }) => <NativeCheckbox key={domain} label={translate(labelKey)} value={selected.includes(domain)} disabled={disabled} onValueChange={(enabled) => onToggle(domain, enabled)} style={styles.dataManagementSectionControl} />)}</View>;
   };
-  return <View style={styles.runtimeWorkspaceFrame}><View style={styles.runtimeFileToolbar}><ActionButton title={translate("runtime.importFile")} disabled={busy} onPress={() => { void importFile(); }} /><ActionButton title={translate("runtime.exportFile")} disabled={busy} onPress={() => { void exportFile(); }} /></View><ScrollView style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace} onLayout={({ nativeEvent }) => setContentWidth(nativeEvent.layout.width)}>{Object.keys(groups).length === 0 ? <EmptyState translate={translate} /> : Object.entries(groups).map(([category, entries]) => <Section key={category} title={runtimeCategoryLabel(category, translate)}><View style={[styles.runtimeTwoColumnForm, oneColumn && styles.runtimeOneColumnForm]}>{entries.map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} />)}</View></Section>)}</ScrollView></View>;
+  const chooseImportFile = async (): Promise<void> => {
+    const inspected = await onInspectImport();
+    if (!inspected) return;
+    const detected = DATA_PACKAGE_DOMAINS.filter((domain) => inspected.detected_sections.includes(domain));
+    setImportPreview(inspected);
+    setImportSections(detected);
+    setStagedSections([]);
+  };
+  const importSelected = async (): Promise<void> => {
+    if (!importPreview || importSections.length === 0) return;
+    if (replacingDraftSections.length > 0) {
+      const labels = DATA_PACKAGE_SECTIONS.filter(({ domain }) => replacingDraftSections.includes(domain)).map(({ labelKey }) => translate(labelKey));
+      if (!await onConfirmImportReplace(labels)) return;
+    }
+    const imported = await onImport(importSections);
+    if (!imported) {
+      setImportPreview(undefined);
+      setImportSections([]);
+      setStagedSections([]);
+      return;
+    }
+    setStagedSections(DATA_PACKAGE_DOMAINS.filter((domain) => imported.draft_domains.includes(domain)));
+  };
+  const hasWebDavChanges = snapshot?.drafts.webdav?.dirty === true;
+  const syncOptions: Array<{ id: WebDavSyncAction; title: string }> = [
+    { id: "sync", title: translate("dataManagement.syncSmart") },
+    { id: "push", title: translate("dataManagement.syncPush") },
+    { id: "pull", title: translate("dataManagement.syncPull") },
+  ];
+  const selectedSyncLabel = syncOptions.find(({ id }) => id === syncAction)?.title ?? syncOptions[0].title;
+  const selectionTool = (selectedCount: number, availableCount: number, onSelectAll: () => void, onDeselectAll: () => void): React.JSX.Element => {
+    const allSelected = availableCount > 0 && selectedCount === availableCount;
+    return <ActionButton title={translate(allSelected ? "dataManagement.deselectAll" : "dataManagement.selectAll")} disabled={busy || availableCount === 0} onPress={allSelected ? onDeselectAll : onSelectAll} />;
+  };
+  return <View style={styles.dataManagementWorkspace}>
+    <View style={styles.dataManagementTabBar}><WindowTabs values={[
+      { id: "import", title: translate("dataManagement.tab.import") },
+      { id: "export", title: translate("dataManagement.tab.export") },
+      { id: "webdav", title: translate("dataManagement.tab.webdav") },
+    ]} selected={tab} onSelect={(next) => switchDataManagementTab(next as DataManagementTab)} style={styles.dataManagementTabs} /></View>
+    {tab === "import" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={styles.dataManagementPaneScrollContent}>
+      {!importPreview ? <DataManagementGroup style={styles.dataManagementImportIntro}><View style={styles.dataManagementInlineActions}><ActionButton title={translate("dataManagement.chooseImportFile")} disabled={busy} onPress={() => { void chooseImportFile(); }} /></View></DataManagementGroup> : null}
+      {importReviewReady ? <>
+        <DataManagementGroup>
+          <View style={styles.dataManagementSelectionBar}><Text style={styles.dataManagementSelectionCount}>{translate("dataManagement.importDetectedCount", { count: detectedImportSections.length })} · {translate("dataManagement.selectedCount", { count: importSections.length })}</Text><View style={styles.dataManagementToolbarButtons}><ActionButton title={translate("dataManagement.changeImportFile")} disabled={busy} onPress={() => { void chooseImportFile(); }} />{selectionTool(importSections.length, detectedImportSections.length, () => setImportSections([...detectedImportSections]), () => setImportSections([]))}<ActionButton title={translate("dataManagement.importSelected")} disabled={busy || importSections.length === 0} onPress={() => { void importSelected(); }} /></View></View>
+          {sectionList(detectedImportSections, importSections, busy, (domain, enabled) => toggleSection(setImportSections, domain, enabled))}
+          {replacingDraftSections.length > 0 ? <Text numberOfLines={2} style={styles.dataManagementSensitiveHint}>{translate("dataManagement.importReplaceDraftWarning", { sections: DATA_PACKAGE_SECTIONS.filter(({ domain }) => replacingDraftSections.includes(domain)).map(({ labelKey }) => translate(labelKey)).join(" · ") })}</Text> : null}
+        </DataManagementGroup>
+      </> : null}
+      {stagedSections.length > 0 ? <DataManagementGroup>
+        <View style={styles.dataManagementSelectionBar}><Text style={styles.dataManagementSelectionCount}>{translate("dataManagement.selectedCount", { count: stagedSections.length })}</Text>{importedDirty ? <ActionButton title={translate("menu.apply")} disabled={busy} onPress={() => { void onApplyImported(stagedSections); }} /> : null}</View>
+          {sectionList(stagedSections, stagedSections, true, () => undefined)}
+      </DataManagementGroup> : null}
+      {status ? <Text style={styles.dataManagementStatus}>{status}</Text> : null}
+    </ScrollView> : null}
+    {tab === "export" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={styles.dataManagementPaneScrollContent}>
+      <DataManagementGroup>
+        <View style={styles.dataManagementSelectionBar}><Text style={styles.dataManagementSelectionCount}>{translate("dataManagement.selectedCount", { count: exportSections.length })}</Text><View style={styles.dataManagementToolbarButtons}>{selectionTool(exportSections.length, DATA_PACKAGE_DOMAINS.length, () => setExportSections([...DATA_PACKAGE_DOMAINS]), () => setExportSections([]))}</View></View>
+        {sectionList(DATA_PACKAGE_DOMAINS, exportSections, busy, (domain, enabled) => toggleSection(setExportSections, domain, enabled))}
+      </DataManagementGroup>
+      <View style={styles.dataManagementBottomActions}>
+        <View style={styles.dataManagementBottomMessage}>
+          <Text numberOfLines={2} style={styles.dataManagementSensitiveNote}>{translate("dataManagement.sensitiveHint")}</Text>
+          {status ? <Text style={styles.dataManagementStatus}>{status}</Text> : null}
+        </View>
+        <ActionButton primary title={translate("dataManagement.exportSelected")} disabled={busy || exportSections.length === 0} onPress={() => { void onExport(exportSections); }} />
+      </View>
+    </ScrollView> : null}
+    {tab === "webdav" ? <ScrollView style={styles.dataManagementWebDavPane} contentContainerStyle={styles.dataManagementWebDavContent}>
+      <WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} status={status} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={onProbeWebDav} hasChanges={hasWebDavChanges || hasPendingChanges} onApply={onApplyWebDav}>
+        <View style={styles.dataManagementSyncContent}>
+          <View style={styles.dataManagementSyncScope}><Text style={styles.dataManagementSyncScopeLabel}>{translate("dataManagement.webdavScope")}</Text><Text numberOfLines={2} style={styles.dataManagementSyncScopeValue}>{translate("dataManagement.section.providersModels")} · {translate("dataManagement.section.relayAccounts")}</Text></View>
+          <View style={styles.dataManagementDirection}><Text style={styles.dataManagementDirectionLabel}>{translate("dataManagement.syncDirection")}</Text><NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSyncLabel} disabled={busy || webDavOperationBusy} onChange={({ nativeEvent }) => { const option = syncOptions[nativeEvent.index]; if (option) setSyncAction(option.id); }} style={styles.dataManagementDirectionPicker} /><ActionButton title={translate("dataManagement.syncNow")} disabled={busy || webDavOperationBusy || snapshot?.webdav.enabled !== true} onPress={() => { void onSyncWebDav(syncAction); }} /></View>
+        </View>
+      </WebDavWorkspace>
+    </ScrollView> : null}
+  </View>;
+}
+
+function DataManagementGroup({ children, style }: { children?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <View style={[styles.dataManagementGroup, style]}>
+    {children ? <View style={styles.dataManagementGroupBody}>{children}</View> : null}
+  </View>;
 }
 
 function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSecret }: { item: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
@@ -2008,19 +2308,27 @@ function RuntimeValueField({ label, value, keyboardType, onCommit }: { label: st
   return <NativeTextField style={[styles.input, styles.runtimeValueControl]} value={field.draft} onChangeText={field.onChangeText} onBlur={() => { void field.commit().catch(() => undefined); }} onSubmitEditing={() => { void field.commit().catch(() => undefined); }} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />;
 }
 
-function WebDavWorkspace({ snapshot, busy, translate, dispatch, onSecretState }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void }): React.JSX.Element {
+function WebDavWorkspace({ snapshot, busy, status, translate, dispatch, onSecretState, onProbe, hasChanges, onApply, children }: { snapshot?: CoreSnapshot; busy: boolean; status?: string; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onProbe: () => Promise<void>; hasChanges: boolean; onApply: () => Promise<void>; children: React.ReactNode }): React.JSX.Element {
   const state = domainState(snapshot, "webdav");
-  return <View style={styles.webDavForm}><View style={styles.webdavStateRow}><NativeCheckbox label={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => dispatch("patch", { enabled })} style={styles.webdavEnabledControl} /><Text numberOfLines={2} style={styles.webdavInlineStatus}>{snapshot ? webdavMenuStatus(snapshot.service.webdav, snapshot.webdav.enabled, translate) : ""}</Text></View><View style={styles.webdavFormRows}>
-    <TextField label={translate("webdav.url")} value={stringValue(state.url)} labelWidth={94} onCommit={(url) => dispatch("patch", { url })} />
-    <TextField label={translate("webdav.username")} value={stringValue(state.username)} labelWidth={94} onCommit={(username) => dispatch("patch", { username })} />
-    <WebDavPasswordField configured={snapshot?.webdav.password.present === true} busy={busy} translate={translate} onSecretState={onSecretState} />
-    <TextField label={translate("webdav.remoteFile")} value={stringValue(state.remote_name)} labelWidth={94} onCommit={(remote_name) => dispatch("patch", { remote_name })} />
-    <TextField label={translate("webdav.syncEvery")} value={stringValue(state.sync_interval)} labelWidth={94} controlWidth={140} suffix={translate("webdav.minutes")} keyboardType="numeric" onCommit={(sync_interval) => dispatch("patch", { sync_interval })} />
-    <TextField label={translate("webdav.httpTimeout")} value={stringValue(state.timeout)} labelWidth={94} controlWidth={140} suffix={translate("webdav.seconds")} keyboardType="numeric" onCommit={(timeout) => dispatch("patch", { timeout })} />
-  </View></View>;
+  const labelAlign = "left";
+  return <DataManagementGroup style={styles.webDavForm}>
+    <View style={styles.webdavFormBody}>
+      <View style={styles.webdavStateRow}><NativeCheckbox label={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => dispatch("patch", { enabled })} style={styles.webdavEnabledControl} /><View style={styles.webdavStateSpacer} /><Text numberOfLines={1} style={styles.webdavStateStatus}>{snapshot ? webdavMenuStatus(snapshot.service.webdav, snapshot.webdav.enabled, translate) : ""}</Text></View>
+      <View style={styles.webdavFormRows}>
+        <TextField label={translate("webdav.url")} value={stringValue(state.url)} labelWidth={WEBDAV_FORM_LABEL_WIDTH} labelAlign={labelAlign} onCommit={(url) => dispatch("patch", { url })} />
+        <TextField label={translate("webdav.username")} value={stringValue(state.username)} labelWidth={WEBDAV_FORM_LABEL_WIDTH} labelAlign={labelAlign} onCommit={(username) => dispatch("patch", { username })} />
+        <WebDavPasswordField labelWidth={WEBDAV_FORM_LABEL_WIDTH} labelAlign={labelAlign} configured={snapshot?.webdav.password.present === true} busy={busy} translate={translate} onSecretState={onSecretState} />
+        <TextField label={translate("webdav.remoteFile")} value={stringValue(state.remote_name)} labelWidth={WEBDAV_FORM_LABEL_WIDTH} labelAlign={labelAlign} onCommit={(remote_name) => dispatch("patch", { remote_name })} />
+        <TextField label={translate("webdav.syncEvery")} value={stringValue(state.sync_interval)} labelWidth={WEBDAV_FORM_LABEL_WIDTH} labelAlign={labelAlign} controlWidth={150} suffix={translate("webdav.minutes")} keyboardType="numeric" onCommit={(sync_interval) => dispatch("patch", { sync_interval })} />
+        <TextField label={translate("webdav.httpTimeout")} value={stringValue(state.timeout)} labelWidth={WEBDAV_FORM_LABEL_WIDTH} labelAlign={labelAlign} controlWidth={150} suffix={translate("webdav.seconds")} keyboardType="numeric" onCommit={(timeout) => dispatch("patch", { timeout })} />
+      </View>
+      <View style={styles.webdavSyncArea}>{children}</View>
+      <View style={styles.webdavActionRow}><ActionButton title={translate("dataManagement.testConnection")} disabled={busy} onPress={() => { void onProbe(); }} />{status ? <Text numberOfLines={1} style={styles.webdavActionStatus}>{status}</Text> : null}<View style={styles.webdavActionSpacer} /><ActionButton primary title={translate("common.saveAndApply")} disabled={busy || !hasChanges} onPress={() => { void onApply(); }} /></View>
+    </View>
+  </DataManagementGroup>;
 }
 
-function WebDavPasswordField({ configured, busy, translate, onSecretState }: { configured: boolean; busy: boolean; translate: Translate; onSecretState: (state: SecretState) => void }): React.JSX.Element {
+function WebDavPasswordField({ configured, busy, translate, onSecretState, labelWidth = 94, labelAlign = "left", style }: { configured: boolean; busy: boolean; translate: Translate; onSecretState: (state: SecretState) => void; labelWidth?: number; labelAlign?: "left" | "right"; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   const [commitRequest, setCommitRequest] = useState(0);
   const [resetRequest, setResetRequest] = useState(0);
   const [status, setStatus] = useState("ready");
@@ -2051,7 +2359,7 @@ function WebDavPasswordField({ configured, busy, translate, onSecretState }: { c
       registry?.register(fieldId.current);
     };
   }, [registry, requestCommit, reset]);
-  return <View style={styles.formRow}><Text style={[styles.formRowLabel, { width: 94 }]}>{translate("webdav.password")}</Text><View style={styles.formRowControl}><NativeSecureTextInput domain="webdav" field="password" label={translate("webdav.password")} placeholder={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")} disabled={busy || status === "saving"} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(state) => {
+  return <View style={[styles.formRow, compactStyles.formRow, style]}><Text style={[styles.formRowLabel, { width: labelWidth, textAlign: labelAlign }]}>{translate("webdav.password")}</Text><View style={[styles.formRowControl, compactStyles.formRowControl]}><NativeSecureTextInput domain="webdav" field="password" label={translate("webdav.password")} placeholder={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")} disabled={busy || status === "saving"} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(state) => {
     setStatus(state.status);
     if (state.status === "dirty") {
       dirtyRef.current = true;
@@ -2744,19 +3052,66 @@ function routeTraceAttemptIcon(state: RouteTraceAttempt["state"]): string {
 }
 
 function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelect }: { requests: RouteTraceRequest[]; selectedKey: string; native: NativeLeafAdapter; translate: Translate; onSelect: (key: string) => void }): React.JSX.Element {
-  const [hoveredKey, setHoveredKey] = useState<string>();
   const [appActive, setAppActive] = useState(() => AppState.currentState === "active");
-  const selected = requests.find((request) => request.key === selectedKey) ?? requests[0];
+  const [visibleRequests, setVisibleRequests] = useState(requests);
+  const [timelineViewportWidth, setTimelineViewportWidth] = useState(0);
+  const [timelineContentWidth, setTimelineContentWidth] = useState(0);
+  const [timelineHorizontalOffset, setTimelineHorizontalOffset] = useState(0);
+  const [timelineScrollbarTrackWidth, setTimelineScrollbarTrackWidth] = useState(0);
+  const scrolling = useRef(false);
+  const pendingRequests = useRef<RouteTraceRequest[] | undefined>(undefined);
+  const scrollIdleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const timelineScrollRef = useRef<ScrollView>(null);
+  const selected = visibleRequests.find((request) => request.key === selectedKey) ?? visibleRequests[0];
+  const hasTimelineHorizontalOverflow = timelineContentWidth > timelineViewportWidth + 1;
+  const timelineMaximumHorizontalOffset = Math.max(0, timelineContentWidth - timelineViewportWidth);
+  const timelineScrollbarThumbWidth = hasTimelineHorizontalOverflow && timelineScrollbarTrackWidth > 0
+    ? Math.min(timelineScrollbarTrackWidth, Math.max(ROUTE_TRACE_SCROLLBAR_MIN_THUMB_WIDTH, timelineScrollbarTrackWidth * timelineViewportWidth / timelineContentWidth))
+    : 0;
+  const timelineScrollbarTravel = Math.max(0, timelineScrollbarTrackWidth - timelineScrollbarThumbWidth);
+  const timelineScrollbarThumbOffset = timelineMaximumHorizontalOffset > 0
+    ? timelineScrollbarTravel * Math.max(0, Math.min(1, timelineHorizontalOffset / timelineMaximumHorizontalOffset))
+    : 0;
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => setAppActive(state === "active"));
     return () => subscription.remove();
   }, []);
+  const deferLiveRequestRefresh = useCallback((): void => {
+    scrolling.current = true;
+    if (scrollIdleTimer.current !== undefined) clearTimeout(scrollIdleTimer.current);
+    scrollIdleTimer.current = setTimeout(() => {
+      scrolling.current = false;
+      scrollIdleTimer.current = undefined;
+      const pending = pendingRequests.current;
+      pendingRequests.current = undefined;
+      if (pending) setVisibleRequests(pending);
+    }, ROUTE_TRACE_SCROLL_IDLE_MS);
+  }, []);
+  useEffect(() => {
+    if (scrolling.current) {
+      pendingRequests.current = requests;
+      return;
+    }
+    setVisibleRequests(requests);
+  }, [requests]);
+  useEffect(() => () => {
+    if (scrollIdleTimer.current !== undefined) clearTimeout(scrollIdleTimer.current);
+  }, []);
+  const scrollTimelineToIndicatorPosition = useCallback((locationX: number): void => {
+    if (timelineMaximumHorizontalOffset <= 0 || timelineScrollbarTravel <= 0) return;
+    const thumbOffset = Math.max(0, Math.min(timelineScrollbarTravel, locationX - timelineScrollbarThumbWidth / 2));
+    const offset = timelineMaximumHorizontalOffset * thumbOffset / timelineScrollbarTravel;
+    setTimelineHorizontalOffset(offset);
+    timelineScrollRef.current?.scrollTo({ x: offset, animated: false });
+  }, [timelineMaximumHorizontalOffset, timelineScrollbarThumbWidth, timelineScrollbarTravel]);
   const openOriginalRecords = (): void => {
     if (!selected) return;
     void native.showReadOnlyText({
       title: translate("logs.originalRecord"),
       text: selected.rows.map((row) => row.original).join("\n\n"),
       closeLabel: translate("menu.close"),
+      language: "json",
+      html: CODE_EDITOR_HTML,
     });
   };
   return <View style={styles.routeTraceWorkspace}>
@@ -2764,11 +3119,21 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
       <FlatList
         style={styles.routeTraceRequestScroll}
         contentContainerStyle={styles.routeTraceRequestList}
-        data={requests}
+        data={visibleRequests}
         keyExtractor={(request) => request.key}
         initialNumToRender={12}
         maxToRenderPerBatch={12}
         windowSize={7}
+        getItemLayout={(_data, index) => ({
+          length: ROUTE_TRACE_REQUEST_ROW_HEIGHT,
+          offset: ROUTE_TRACE_REQUEST_ROW_HEIGHT * index,
+          index,
+        })}
+        removeClippedSubviews={false}
+        onScrollBeginDrag={deferLiveRequestRefresh}
+        onMomentumScrollBegin={deferLiveRequestRefresh}
+        onScroll={deferLiveRequestRefresh}
+        scrollEventThrottle={16}
         renderItem={({ item: request }) => {
           const isSelected = selected?.key === request.key;
           const selectedTextStyle = isSelected && appActive ? styles.routeTraceRequestTextSelected : null;
@@ -2777,14 +3142,11 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
             key={request.key}
             style={({ pressed }) => [
               styles.routeTraceRequestRow,
-              !isSelected && hoveredKey === request.key && styles.routeTraceRequestRowHovered,
               !isSelected && pressed && styles.routeTraceRequestRowPressed,
               isSelected && (appActive ? styles.routeTraceRequestRowSelected : styles.routeTraceRequestRowSelectedInactive),
             ]}
             onPress={() => onSelect(request.key)}
             onFocus={() => onSelect(request.key)}
-            onHoverIn={() => setHoveredKey(request.key)}
-            onHoverOut={() => setHoveredKey((current) => current === request.key ? undefined : current)}
             focusable
             accessibilityRole="button"
             accessibilityLabel={requestDescription}
@@ -2798,6 +3160,8 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
             <Text style={[styles.routeTraceOutcome, request.outcome === "failed" ? styles.routeTraceOutcomeFailed : request.outcome === "fallback" ? styles.routeTraceOutcomeFallback : styles.routeTraceOutcomeDirect, selectedTextStyle]}>{routeTraceOutcomeLabel(request.outcome, translate, request.attempts.length)}</Text>
           </Pressable>;
         }}
+        alwaysBounceHorizontal={false}
+        showsHorizontalScrollIndicator={false}
         showsVerticalScrollIndicator
       />
     </View>
@@ -2815,7 +3179,19 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
           <Text style={styles.routeTracePathCount}>{translate("logs.routeTrace.routeCount", { count: selected.attempts.length })}</Text>
         </View>
         <Text numberOfLines={2} style={styles.routeTracePathSummary}>{selected.routePath || translate("logs.routeTrace.noRoute")}</Text>
-        <ScrollView style={styles.routeTraceTimelineScroll} contentContainerStyle={styles.routeTraceTimeline} showsVerticalScrollIndicator>
+        <View style={styles.routeTraceTimelineFrame}>
+          <ScrollView
+            ref={timelineScrollRef}
+            style={styles.routeTraceTimelineScroll}
+            contentContainerStyle={[styles.routeTraceTimeline, hasTimelineHorizontalOverflow && styles.routeTraceTimelineWithHorizontalScrollbar]}
+            alwaysBounceHorizontal={false}
+            showsHorizontalScrollIndicator={false}
+            showsVerticalScrollIndicator
+            onLayout={({ nativeEvent }) => setTimelineViewportWidth(nativeEvent.layout.width)}
+            onContentSizeChange={(width) => setTimelineContentWidth(width)}
+            onScroll={({ nativeEvent }) => setTimelineHorizontalOffset((current) => Math.abs(current - nativeEvent.contentOffset.x) < 0.5 ? current : nativeEvent.contentOffset.x)}
+            scrollEventThrottle={16}
+          >
           <View style={styles.routeTraceTimelineRow}>
             <View style={styles.routeTraceTimelineRail}>
               {selected.attempts.length > 0 ? <View style={styles.routeTraceTimelineLine} /> : null}
@@ -2857,7 +3233,17 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
             </View>;
           })}
           {selected.attempts.length === 0 ? <View style={styles.routeTraceNoPath}><Text style={styles.routeTraceNoPathText}>{translate("logs.routeTrace.noPathRecorded")}</Text></View> : null}
-        </ScrollView>
+          </ScrollView>
+          {hasTimelineHorizontalOverflow ? <View
+            style={styles.routeTraceTimelineHorizontalScrollbarTrack}
+            onLayout={({ nativeEvent }) => setTimelineScrollbarTrackWidth(nativeEvent.layout.width)}
+            onStartShouldSetResponder={() => true}
+            onResponderGrant={({ nativeEvent }) => scrollTimelineToIndicatorPosition(nativeEvent.locationX)}
+            onResponderMove={({ nativeEvent }) => scrollTimelineToIndicatorPosition(nativeEvent.locationX)}
+          >
+            <View pointerEvents="none" style={[styles.routeTraceTimelineHorizontalScrollbarThumb, { width: timelineScrollbarThumbWidth, transform: [{ translateX: timelineScrollbarThumbOffset }] }]} />
+          </View> : null}
+        </View>
       </> : <View style={styles.routeTraceNoSelection}><Text style={styles.routeTraceNoSelectionText}>{translate("logs.routeTrace.selectRequest")}</Text></View>}
     </View>
   </View>;
@@ -3081,10 +3467,10 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     }} style={styles.logsTabs} />
     {rows.length > 0 ? selected === "route-trace"
       ? <RouteTraceWorkspace requests={routeTraceRequests} selectedKey={selectedKey} native={native} translate={translate} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} />
-      : <View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
+      : <View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
         const row = rows[index];
         if (!row) return;
-        void native.showReadOnlyText({ title: translate("logs.originalRecord"), text: row.original, closeLabel: translate("menu.close") });
+        void native.showReadOnlyText({ title: translate("logs.originalRecord"), text: row.original, closeLabel: translate("menu.close"), language: "json", html: CODE_EDITOR_HTML });
       }} style={styles.logTable} /></View>
       : <View style={styles.logEmptySurface}><Text style={styles.logEmptyText}>{clearing || active ? translate("logs.empty") : translate("logs.loading")}</Text></View>}
     <View style={styles.logInfoBar}><Text numberOfLines={1} style={[styles.cardHint, selected === "route-trace" && styles.routeTraceInfoText]}>{statusParts.join(" | ")}</Text></View>
@@ -3101,9 +3487,9 @@ const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: ()
   return <NativeButton ref={ref} title={title} disabled={disabled} primary={primary} destructive={danger} onPress={onPress} style={style} />;
 });
 
-function TextField({ label, value, onCommit, hint, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, suffix, disabled }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; hint?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; suffix?: string; disabled?: boolean }): React.JSX.Element {
+function TextField({ label, value, onCommit, hint, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, suffix, disabled, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; hint?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; suffix?: string; disabled?: boolean; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   const field = usePendingTextField(value, onCommit, label);
-  return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text><View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea]} value={field.draft} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={styles.fieldHint}>{hint}</Text> : null}</View>{suffix ? <Text style={styles.fieldHint}>{suffix}</Text> : null}</View>;
+  return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text><View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea]} value={field.draft} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={styles.fieldHint}>{hint}</Text> : null}</View>{suffix ? <Text style={styles.fieldHint}>{suffix}</Text> : null}</View>;
 }
 
 function NativeSecretInputControl({ label, hint, busy, domain, field, target, plainText = false, autoCommit = false, resetToken = 0, onSecretState, setTitle, setBelow, onSetReady, inputMinWidth }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; plainText?: boolean; autoCommit?: boolean; resetToken?: number; onSecretState: (state: SecretState) => void; setTitle?: string; setBelow?: boolean; onSetReady?: (requestSet: () => void, saving: boolean) => void; inputMinWidth?: number }): React.JSX.Element {
@@ -3232,62 +3618,197 @@ function SegmentedField({ label, value, values, onSelect, disabled }: { label: s
   return <View style={[styles.formRow, compactStyles.formRow]}><Text style={styles.formRowLabel}>{label}</Text><NativeSegmentedControl labels={options.map((option) => option.label)} selectedValue={selectedValue} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[styles.formRowControl, compactStyles.formRowControl]} /></View>;
 }
 
-function PickerField({ label, value, values, onSelect, disabled, labelWidth, labelAlign, controlWidth, translate }: { label: string; value: string; values: Array<string | AssistantSettingOption>; onSelect: (value: string) => void; disabled?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; translate?: Translate }): React.JSX.Element {
+function PickerField({ label, value, values, onSelect, disabled, labelWidth, labelAlign, controlWidth, allowShrink = false, translate }: { label: string; value: string; values: Array<string | AssistantSettingOption>; onSelect: (value: string) => void; disabled?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; allowShrink?: boolean; translate?: Translate }): React.JSX.Element {
   const contextualTranslate = useContext(TranslationContext);
   const optionTranslator = translate ?? contextualTranslate;
   const options = ensureSelectedOption(optionTranslator ? assistantSettingOptions(values, optionTranslator) : values.map((option) => typeof option === "string" ? { value: option, label: option } : option), value);
   const selectedLabel = options.find((option) => option.value === value)?.label ?? value;
-  return <View style={[styles.formRow, compactStyles.formRow]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedLabel} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[styles.picker, compactStyles.picker, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]} /></View>;
+  return <View style={[styles.formRow, compactStyles.formRow]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedLabel} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[styles.picker, compactStyles.picker, allowShrink && styles.pickerShrink, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]} /></View>;
 }
 
-function RawEditor({ label, domain, document, language, ipc, busy, translate, showReload = true, codexPane = false, reloadToken = 0, style }: { label: string; domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; language: "toml" | "json"; ipc: IpcClient; busy: boolean; translate: Translate; showReload?: boolean; codexPane?: boolean; reloadToken?: number; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  const [editorToken, setEditorToken] = useState<string>();
+function RawEditor({ label, domain, document, language, ipc, busy, translate, showReload = true, codexPane = false, onConflict, reloadToken = 0, baselineToken = 0, style }: { label: string; domain: "codex" | "claude"; document: RawEditorDocument; language: "toml" | "json"; ipc: IpcClient; busy: boolean; translate: Translate; showReload?: boolean; codexPane?: boolean; onConflict: RawEditorConflictHandler; reloadToken?: number; baselineToken?: number; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  const [documentKey, setDocumentKey] = useState("");
+  const [draft, setDraft] = useState("");
+  const [baseline, setBaseline] = useState("");
+  const [editorRenderRevision, setEditorRenderRevision] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [nativeStatus, setNativeStatus] = useState<string>();
-  const [nativeErrorCode, setNativeErrorCode] = useState<string>();
+  const [status, setStatus] = useState<"ready" | "dirty" | "saving" | "error">("ready");
   const [error, setError] = useState<string>();
   const [reloadNonce, setReloadNonce] = useState(0);
   const registry = useContext(PendingFieldContext);
   const fieldId = useRef(Symbol(`${domain}:${document}:raw`));
-  const nativeStatusRef = useRef<string | undefined>(undefined);
-  const pendingCommit = useRef<{ promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void } | undefined>(undefined);
-  const commit = useCallback((): Promise<void> => {
-    if (nativeStatusRef.current !== "dirty" && nativeStatusRef.current !== "saving") return Promise.resolve();
-    if (pendingCommit.current) return pendingCommit.current.promise;
-    let resolvePromise!: () => void;
-    let rejectPromise!: (reason: Error) => void;
-    const promise = new Promise<void>((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
+  const tokenRef = useRef<string | undefined>(undefined);
+  const draftRef = useRef("");
+  const baselineRef = useRef("");
+  const stagedTextRef = useRef("");
+  const stageTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const stagePromise = useRef<Promise<void> | undefined>(undefined);
+  const mountedRef = useRef(true);
+  const initializedRef = useRef(false);
+  const appliedReloadNonceRef = useRef(reloadNonce);
+  const appliedBaselineTokenRef = useRef(baselineToken);
+
+  const setPending = useCallback((pending: boolean): void => {
+    registry?.setDirty(fieldId.current, pending);
+    if (pending) setStatus((current) => current === "saving" ? current : "dirty");
+    else setStatus("ready");
+  }, [registry]);
+
+  const stageEditorText = useCallback(async (editorToken: string, submitted: string): Promise<IpcResults["editor"]> => {
+    return ipc.stageEditor(editorToken, submitted);
+  }, [ipc]);
+
+  const stageLatest = useCallback((): Promise<void> => {
+    if (stageTimer.current) {
+      clearTimeout(stageTimer.current);
+      stageTimer.current = undefined;
+    }
+    if (stagePromise.current) return stagePromise.current;
+    const run = async (): Promise<void> => {
+      for (;;) {
+        const editorToken = tokenRef.current;
+        const submitted = draftRef.current;
+        if (!editorToken || submitted === stagedTextRef.current) {
+          if (mountedRef.current) {
+            setPending(false);
+            setError(undefined);
+          }
+          return;
+        }
+        if (mountedRef.current) {
+          setStatus("saving");
+          setError(undefined);
+        }
+        try {
+          const staged = await stageEditorText(editorToken, submitted);
+          tokenRef.current = staged.editor_token;
+          stagedTextRef.current = submitted;
+        } catch (reason: unknown) {
+          if (isEditorCapabilityConflict(reason)) {
+            try {
+              // A capability can become stale when unrelated Core state
+              // advances, its previous response is lost, or the WebView
+              // restarts. None of those conditions means this document was
+              // changed elsewhere. Read the actual document first and only
+              // ask the user when its content no longer matches our staged
+              // baseline.
+              let descriptor = await ipc.editor(domain, document);
+              if (descriptor.text === submitted) {
+                tokenRef.current = descriptor.editor_token;
+                stagedTextRef.current = submitted;
+                continue;
+              }
+              if (descriptor.text === stagedTextRef.current) {
+                tokenRef.current = descriptor.editor_token;
+                continue;
+              }
+
+              const resolution = await onConflict(domain, document);
+              if (resolution === "reload") {
+                if (mountedRef.current) {
+                  setPending(false);
+                  setError(undefined);
+                }
+                setReloadNonce((value) => value + 1);
+                return;
+              }
+
+              // The confirmation path may refresh Core state. Acquire a
+              // fresh token before preserving this window's draft.
+              descriptor = await ipc.editor(domain, document);
+              if (descriptor.text === submitted) {
+                stagedTextRef.current = submitted;
+              }
+              tokenRef.current = descriptor.editor_token;
+              continue;
+            } catch (recoveryReason: unknown) {
+              reason = recoveryReason;
+            }
+          }
+          if (mountedRef.current) {
+            setStatus("error");
+            registry?.setDirty(fieldId.current, true);
+            // A real editor conflict was already presented through the native
+            // decision dialog above. If recovering that dialog/read fails,
+            // keep the local draft and surface the transport problem rather
+            // than falsely claiming an outside setting change.
+            setError(isEditorCapabilityConflict(reason) ? translate("error.generic") : errorMessage(reason, translate));
+          }
+          throw reason;
+        }
+      }
+    };
+    const tracked = run().finally(() => {
+      if (stagePromise.current === tracked) stagePromise.current = undefined;
     });
-    pendingCommit.current = { promise, resolve: resolvePromise, reject: rejectPromise };
-    return promise;
-  }, []);
+    stagePromise.current = tracked;
+    return tracked;
+  }, [document, domain, ipc, onConflict, registry, setPending, stageEditorText, translate]);
+
+  const scheduleStage = useCallback((): void => {
+    if (stageTimer.current) clearTimeout(stageTimer.current);
+    stageTimer.current = setTimeout(() => {
+      stageTimer.current = undefined;
+      void stageLatest().catch(() => undefined);
+    }, 450);
+  }, [stageLatest]);
+
   const reset = useCallback((): void => {
-    pendingCommit.current?.resolve();
-    pendingCommit.current = undefined;
-    nativeStatusRef.current = "ready";
+    if (stageTimer.current) {
+      clearTimeout(stageTimer.current);
+      stageTimer.current = undefined;
+    }
+    draftRef.current = baselineRef.current;
+    stagedTextRef.current = baselineRef.current;
+    setDraft(baselineRef.current);
+    setEditorRenderRevision((value) => value + 1);
+    setStatus("ready");
+    setError(undefined);
     registry?.setDirty(fieldId.current, false);
   }, [registry]);
+
   useEffect(() => {
-    registry?.register(fieldId.current, { commit, reset, isDirty: () => nativeStatusRef.current === "dirty" || nativeStatusRef.current === "saving" });
+    mountedRef.current = true;
+    registry?.register(fieldId.current, {
+      commit: stageLatest,
+      reset,
+      isDirty: () => draftRef.current !== stagedTextRef.current || stagePromise.current !== undefined,
+    });
     return () => {
-      pendingCommit.current?.resolve();
-      pendingCommit.current = undefined;
+      mountedRef.current = false;
+      if (stageTimer.current) clearTimeout(stageTimer.current);
       registry?.register(fieldId.current);
     };
-  }, [commit, registry, reset]);
+  }, [registry, reset, stageLatest]);
+
   useEffect(() => {
     let active = true;
-    reset();
-    setEditorToken(undefined);
-    setLoading(true);
-    setNativeStatus(undefined);
-    setNativeErrorCode(undefined);
+    const resetBaseline = !initializedRef.current
+      || reloadNonce !== appliedReloadNonceRef.current
+      || baselineToken !== appliedBaselineTokenRef.current;
+    if (!initializedRef.current) {
+      reset();
+      tokenRef.current = undefined;
+      setLoading(true);
+    }
     setError(undefined);
     void ipc.editor(domain, document).then((descriptor) => {
       if (!active) return;
-      setEditorToken(descriptor.editor_token);
+      tokenRef.current = descriptor.editor_token;
+      draftRef.current = descriptor.text;
+      stagedTextRef.current = descriptor.text;
+      setDraft(descriptor.text);
+      if (resetBaseline) {
+        baselineRef.current = descriptor.text;
+        setBaseline(descriptor.text);
+        if (initializedRef.current) setEditorRenderRevision((value) => value + 1);
+      }
+      if (!initializedRef.current) setDocumentKey([domain, document].join(":"));
+      initializedRef.current = true;
+      appliedReloadNonceRef.current = reloadNonce;
+      appliedBaselineTokenRef.current = baselineToken;
+      registry?.setDirty(fieldId.current, false);
+      setStatus("ready");
       setLoading(false);
     }).catch(() => {
       if (!active) return;
@@ -3295,15 +3816,46 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
       setError(translate("error.coreUnavailable"));
     });
     return () => { active = false; };
-  }, [document, domain, ipc, reloadNonce, reloadToken, reset, translate]);
+  }, [baselineToken, document, domain, ipc, registry, reloadNonce, reloadToken, reset, translate]);
+
   const reloadEditor = (): void => {
-    if (nativeStatus === "dirty" || nativeStatus === "saving" || nativeErrorCode === "stage_failed" || nativeErrorCode === "invalid_text") return;
+    if (draftRef.current !== stagedTextRef.current || status === "saving") return;
     setReloadNonce((value) => value + 1);
   };
-  const nativeLoading = editorToken !== undefined && (nativeStatus === undefined || nativeStatus === "loading");
-  const nativeReadFailed = nativeStatus === "error" && nativeErrorCode !== "stage_failed" && nativeErrorCode !== "invalid_text";
-  const reloadDisabled = busy || loading || nativeLoading || nativeStatus === "dirty" || nativeStatus === "saving" || nativeErrorCode === "stage_failed" || nativeErrorCode === "invalid_text";
-  return <View style={[styles.rawEditor, codexPane && styles.codexRawEditorBase, style]}><View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}><Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text>{showReload ? <ActionButton title={translate("menu.reload")} disabled={reloadDisabled} onPress={reloadEditor} /> : null}</View>{codexPane ? null : <Text style={styles.fieldHint}>{translate("settings.rawProtectedHint")}</Text>}{editorToken ? <View style={styles.rawNativeEditorFrame}><NativeSecureTextEditor editorToken={editorToken} language={language} unavailableLabel={translate("common.secureEditorUnavailable")} style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]} onEditorState={({ status, error: nextNativeErrorCode }) => { nativeStatusRef.current = status; setNativeStatus(status); setNativeErrorCode(nextNativeErrorCode || undefined); const pending = pendingCommit.current; if (status === "dirty" || status === "saving") registry?.setDirty(fieldId.current, true); else { registry?.setDirty(fieldId.current, false); if (pending) { pendingCommit.current = undefined; if (status === "error") pending.reject(new Error(nextNativeErrorCode || "Raw editor could not be staged")); else pending.resolve(); } } if (!nextNativeErrorCode) { setError(undefined); return; } setError(nextNativeErrorCode === "stage_failed" ? translate("common.secureEditorStageFailed") : nextNativeErrorCode === "invalid_text" ? translate("common.invalidText") : translate("common.secureEditorReadFailed")); }} />{nativeLoading ? <View pointerEvents="none" style={styles.rawEditorOverlay}><Text style={styles.cardHint}>{translate("common.secureEditorLoading")}</Text></View> : null}{nativeReadFailed ? <View style={styles.rawEditorOverlay}><Text style={styles.error}>{error ?? translate("common.secureEditorReadFailed")}</Text><ActionButton title={translate("menu.reload")} disabled={busy} onPress={reloadEditor} /></View> : null}</View> : <View style={[styles.rawEditorLoading, codexPane && styles.codexRawEditorLoading]}><Text style={styles.cardHint}>{loading ? translate("common.loading") : translate("error.coreUnavailable")}</Text></View>}{error && editorToken && !nativeReadFailed ? <Text style={styles.error}>{error}</Text> : null}</View>;
+  const reloadDisabled = busy || loading || status === "saving" || draftRef.current !== stagedTextRef.current;
+  return <View style={[styles.rawEditor, codexPane && styles.codexRawEditorBase, style]}>
+    <View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}>
+      <Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        {showReload ? <ActionButton title={translate("menu.reload")} disabled={reloadDisabled} onPress={reloadEditor} /> : null}
+      </View>
+    </View>
+    {documentKey
+      ? <View style={styles.rawNativeEditorFrame}>
+        <CodeEditorWebView
+          documentKey={`${documentKey}:${editorRenderRevision}`}
+          value={draft}
+          baseline={baseline}
+          language={language}
+          readOnly={false}
+          showDiff
+          style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]}
+          onChange={(text) => {
+            draftRef.current = text;
+            const pending = text !== stagedTextRef.current;
+            setPending(pending);
+            if (pending) scheduleStage();
+          }}
+          onError={() => {
+            setStatus("error");
+            setError(translate("common.secureEditorReadFailed"));
+          }}
+        />
+        {loading ? <View pointerEvents="none" style={styles.rawEditorOverlay}><Text style={styles.cardHint}>{translate("common.secureEditorLoading")}</Text></View> : null}
+      </View>
+      : <View style={[styles.rawEditorLoading, codexPane && styles.codexRawEditorLoading]}><Text style={styles.cardHint}>{loading ? translate("common.loading") : translate("error.coreUnavailable")}</Text></View>}
+    {error ? <Text style={styles.error}>{error}</Text> : null}
+  </View>;
 }
 
 function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"] | undefined, translate: Translate): { compact: string; full: string } {
@@ -3370,10 +3922,8 @@ function apiKeyDisplayName(value: unknown, translate: Translate): string {
   if (!name) return translate("common.notAvailable");
   return name === "default" ? translate("providers.defaultKey") : name;
 }
-function emptyToNull(value: string, translate?: Translate): string | null { return value === "(Empty)" || value === translate?.("common.empty") ? null : value; }
 function uniqueKeyName(existing: string[]): string { let suffix = 1; let value = `key-${suffix}`; while (existing.includes(value)) { suffix += 1; value = `key-${suffix}`; } return value; }
 function splitLines(value: string): string[] { return value.split("\n").map((item) => item.trim()).filter(Boolean); }
-function splitCommaLines(value: string): string[] { return value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean); }
 function groupBy(items: UnknownRecord[], key: (item: UnknownRecord) => string): Record<string, UnknownRecord[]> { return items.reduce<Record<string, UnknownRecord[]>>((groups, item) => { const group = key(item); (groups[group] ??= []).push(item); return groups; }, {}); }
 
 function semanticColor(macos: string, windows: string | undefined, fallback: string): ReturnType<typeof PlatformColor> | string {
@@ -3403,8 +3953,7 @@ const styles = StyleSheet.create({
   routeTraceRequestPane: { width: "31%", minWidth: 252, maxWidth: 360, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
   routeTraceRequestScroll: { flex: 1, minHeight: 0 },
   routeTraceRequestList: { flexGrow: 1 },
-  routeTraceRequestRow: { minHeight: 70, paddingHorizontal: 9, paddingVertical: 8, gap: 3, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
-  routeTraceRequestRowHovered: { backgroundColor: systemColors.unemphasizedSelectedContent },
+  routeTraceRequestRow: { height: ROUTE_TRACE_REQUEST_ROW_HEIGHT, paddingHorizontal: 9, paddingVertical: 8, gap: 3, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
   routeTraceRequestRowPressed: { backgroundColor: systemColors.separator },
   routeTraceRequestRowSelected: { backgroundColor: systemColors.selectedContent, borderBottomColor: systemColors.selectedContent },
   routeTraceRequestRowSelectedInactive: { backgroundColor: systemColors.unemphasizedSelectedContent, borderBottomColor: systemColors.unemphasizedSelectedContent },
@@ -3426,8 +3975,12 @@ const styles = StyleSheet.create({
   routeTraceSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   routeTracePathCount: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE },
   routeTracePathSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 14, paddingTop: 5, paddingBottom: 10 },
+  routeTraceTimelineFrame: { flex: 1, minWidth: 0, minHeight: 0, position: "relative" },
   routeTraceTimelineScroll: { flex: 1, minHeight: 0, borderTopWidth: 1, borderTopColor: systemColors.separator },
-  routeTraceTimeline: { flexGrow: 1, paddingHorizontal: 14, paddingVertical: 14, gap: 10 },
+  routeTraceTimeline: { flexGrow: 1, minWidth: ROUTE_TRACE_TIMELINE_MIN_WIDTH, paddingHorizontal: 14, paddingVertical: 14, gap: 10 },
+  routeTraceTimelineWithHorizontalScrollbar: { paddingBottom: 26 },
+  routeTraceTimelineHorizontalScrollbarTrack: { position: "absolute", left: 14, right: 14, bottom: 4, height: 10, borderRadius: 5, backgroundColor: systemColors.separator, overflow: "hidden" },
+  routeTraceTimelineHorizontalScrollbarThumb: { height: 10, borderRadius: 5, backgroundColor: systemColors.secondaryLabel, opacity: 0.85 },
   routeTraceTimelineRow: { flexDirection: "row", minWidth: 0, gap: 10 },
   routeTraceTimelineRail: { width: 22, minHeight: 58, flexShrink: 0, position: "relative", alignItems: "center", paddingTop: 7 },
   routeTraceTimelineLine: { position: "absolute", top: 25, bottom: -17, left: 10, width: 2, backgroundColor: systemColors.separator },
@@ -3466,17 +4019,17 @@ const styles = StyleSheet.create({
   routeTraceInfoText: { color: systemColors.label },
   root: { flex: 1, minWidth: 420, backgroundColor: systemColors.window },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, webDavContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
-  footer: { height: 52, minHeight: 52, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 6 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
+  windowSurface: { flex: 1, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
+  footer: { height: 52, minHeight: 52, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 6 }, footerCompact: { height: 48, minHeight: 48, paddingHorizontal: 14, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.control }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
   providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, settingsTabBar: { minHeight: 36, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsTabs: { alignSelf: "flex-start", width: 250 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
-  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 6 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, importSourcePicker: { width: 152, height: 24 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 154, minWidth: 154, maxWidth: 154, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 280 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 280, minWidth: 280, maxWidth: 280, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingHorizontal: 12, paddingRight: 8, paddingBottom: 12, gap: 6 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, inspectorContent: { paddingTop: 3, paddingHorizontal: 12, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, probeSummary: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyGrid: { flex: 1, minHeight: 164, flexDirection: "row", alignItems: "flex-start", gap: 8 }, providerKeyList: { width: 100, minWidth: 100, maxWidth: 100, flexShrink: 0, gap: 3 }, providerKeyTable: { width: 100, minWidth: 100, maxWidth: 100, height: 136, minHeight: 136, flexShrink: 0 }, providerKeyFields: { flex: 1, minWidth: 0, gap: 4 }, providerKeyActions: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4, flexShrink: 0 },
-  providerKeysEditorCompact: { gap: 4 }, providerKeysHeaderCompact: { minHeight: 22, gap: 4 }, providerKeyGridCompact: { minHeight: 164, gap: 8 }, providerKeyListCompact: { gap: 2 }, providerKeyFieldsCompact: { gap: 4 }, providerKeyActionsCompact: { minHeight: 22, gap: 3 },
-  codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, codexSplit: { flex: 1, minWidth: 0, minHeight: 0 }, codexStructuredPane: { flex: 1, minWidth: 360, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructured: { flexGrow: 1, gap: 14, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 16 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
-  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeFileToolbar: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanControl: { width: 24, minWidth: 24, height: 24, alignSelf: "flex-start" }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 134, paddingTop: 4 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
-  webDavForm: { flex: 1, gap: 14, paddingTop: 0 }, webdavStateRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, paddingBottom: 4, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, webdavEnabledControl: { width: 190, flexGrow: 0, flexShrink: 0 }, webdavInlineStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, webdavFormRows: { gap: 8 }, webdavWideControl: { flex: 1, minWidth: 0 }, webdavPasswordInput: { width: "100%", minHeight: 26 }, webdavFooterLeading: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flex: 1, minWidth: 0 }, webdavProbeStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  relayAccountsContent: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 12 }, logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: "100%", minWidth: 0, height: 28, flexShrink: 0, marginTop: 0, marginBottom: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },
+  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 6 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 154, minWidth: 154, maxWidth: 154, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 240 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 240, minWidth: 240, maxWidth: 240, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingHorizontal: 12, paddingRight: 8, paddingBottom: 12, gap: 6 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, inspectorContent: { paddingTop: 3, paddingHorizontal: 12, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, probeSummary: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
+  codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, codexSplit: { flex: 1, minWidth: 0, minHeight: 0 }, codexStructuredPane: { flex: 1, minWidth: 0, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }, codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch", gap: 14, paddingLeft: 16, paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER, paddingTop: 10, paddingBottom: 16 }, codexStructuredWithHorizontalScrollbar: { paddingBottom: 32 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
+  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanControl: { width: 24, minWidth: 24, height: 24, alignSelf: "flex-start" }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 134, paddingTop: 4 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  dataManagementWorkspace: { flex: 1, minHeight: 0 }, dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, dataManagementTabs: { width: 280, height: 24, alignSelf: "center", flexShrink: 0 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: 10, paddingHorizontal: 4, paddingBottom: 14 }, dataManagementImportIntro: { minHeight: 0, paddingTop: 2 }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementInlineActions: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "flex-start", paddingLeft: 8 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSyncScopeLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementDirectionLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementDirectionPicker: { width: 210, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  webDavForm: { flexGrow: 0, paddingHorizontal: 2 }, webdavFormBody: { gap: 6 }, webdavStateRow: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "flex-start" }, webdavSyncArea: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionRow: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavActionSpacer: { flex: 1 }, webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: "flex-start" }, webdavStateSpacer: { flex: 1 }, webdavStateStatus: { maxWidth: 180, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right", lineHeight: 15 }, webdavFormRows: { gap: 5 }, webdavPasswordInput: { width: "100%", minHeight: 26 },
+  relayAccountsContent: { paddingBottom: 6, gap: 6 }, logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: "100%", minWidth: 0, height: 28, flexShrink: 0, marginTop: 0, marginBottom: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },
   form: { gap: 6 }, structuredForm: { gap: 6 }, featureGrid: { flexDirection: "row", flexWrap: "wrap", columnGap: 12, rowGap: 4 }, featureGridItem: { flexGrow: 1, flexBasis: 180, minWidth: 180 }, field: { gap: 5, minWidth: 220, flexGrow: 1, flexBasis: 300 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, inputWithAction: { flexDirection: "row", alignItems: "center", gap: 6 }, inputFlex: { flex: 1 }, toggleRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, toggleControl: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, toggleNativeControl: { width: "100%", minWidth: 220, minHeight: 22 }, actions: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, nativeSecretSetButton: { minWidth: 42, height: 26 }, action: {}, actionPrimary: {}, actionDanger: {}, actionDisabled: {}, actionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, actionTextPrimary: {}, actionTextDanger: {}, tabStrip: { flexDirection: "row", flexWrap: "wrap", gap: 6 }, tab: {}, tabSelected: {}, inlineMeta: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 6 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, infoPair: { gap: 2, minWidth: 160 }, rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 }, logRecords: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, maxHeight: 360, overflow: "scroll", padding: 10, gap: 6 }, logRecord: { color: systemColors.label, fontFamily: "Menlo", fontSize: UI_FONT_SIZE }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, result: { color: systemColors.green, fontSize: UI_FONT_SIZE }, warning: { color: systemColors.brown, fontSize: UI_FONT_SIZE, backgroundColor: systemColors.control, padding: 8, borderRadius: 4 }, issueBox: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.control, padding: 12, gap: 5 }, issue: { color: systemColors.red, fontSize: UI_FONT_SIZE }, cardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
   secretActionButton: { width: 64, minWidth: 64, height: 26, flexShrink: 0 },
-  formRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, formRowStacked: { alignItems: "flex-start" }, formRowSecretStacked: { alignItems: "flex-start" }, formRowLabel: { width: 112, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, formRowLabelStacked: { paddingTop: 4 }, formRowControl: { flex: 1, minWidth: 0, gap: 3 }, picker: { flex: 1, minWidth: 180, height: 26 },
+  formRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, formRowStacked: { alignItems: "flex-start" }, formRowSecretStacked: { alignItems: "flex-start" }, formRowLabel: { width: 112, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, formRowLabelStacked: { paddingTop: 4 }, formRowControl: { flex: 1, minWidth: 0, gap: 3 }, picker: { flex: 1, minWidth: 180, height: 26 }, pickerShrink: { minWidth: 0 },
 });

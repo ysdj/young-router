@@ -33,6 +33,7 @@ struct LiteLLMWinUITableProps : winrt::implements<LiteLLMWinUITableProps, winrt:
        alternatingRows = cloneFromProps->alternatingRows;
        compact = cloneFromProps->compact;
        followBottom = cloneFromProps->followBottom;
+       borderless = cloneFromProps->borderless;
        disabledRowKeys = cloneFromProps->disabledRowKeys;
        secondaryCellKeys = cloneFromProps->secondaryCellKeys;
        spanningRowKeys = cloneFromProps->spanningRowKeys;
@@ -68,6 +69,9 @@ struct LiteLLMWinUITableProps : winrt::implements<LiteLLMWinUITableProps, winrt:
 
   REACT_FIELD(followBottom)
   std::optional<bool> followBottom{};
+
+  REACT_FIELD(borderless)
+  std::optional<bool> borderless{};
 
   REACT_FIELD(disabledRowKeys)
   std::optional<std::vector<std::string>> disabledRowKeys;

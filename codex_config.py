@@ -91,11 +91,6 @@ SUPPORTED_FEATURE_KEYS = (
     "personality",
 )
 
-# The UI label predates the configuration schema's deliberately verbose name.
-# Keep its short UI key at the protocol boundary and write the canonical TOML
-# feature flag underneath.
-FEATURE_KEY_ALIASES = {"unified_exec": "experimental_use_unified_exec_tool"}
-
 # Codex's built-in provider IDs cannot be overridden through
 # ``model_providers``.  The three locally selectable built-ins are called out
 # explicitly in the configuration schema/product UI; rejecting only these
@@ -572,8 +567,8 @@ def remove_table(text: str, path: tuple[str, ...]) -> str:
     return text[:start] + text[end:]
 
 
-def set_top_levels(text: str, values: dict[str, object]) -> str:
-    """Compatibility helper retained for the legacy selected-model command."""
+def _set_top_level_values(text: str, values: dict[str, object]) -> str:
+    """Update multiple top-level values while preserving unrelated TOML."""
 
     parse_toml_text(text)
     result = text
@@ -641,21 +636,14 @@ def configured_models(config: dict[str, Any]) -> list[dict[str, str]]:
     return result
 
 
-def read_auth(path: pathlib.Path) -> tuple[dict[str, Any], int]:
-    text, exists, mode = _safe_read_text(path, "Codex auth file")
-    if not exists:
-        return {}, 0o600
-    return parse_auth_text(text), mode
-
-
 def _permission_mode(config: dict[str, Any]) -> str:
-    uses_legacy = "sandbox_mode" in config or "sandbox_workspace_write" in config
-    uses_profiles = "default_permissions" in config
-    if uses_legacy and uses_profiles:
+    uses_sandbox = "sandbox_mode" in config or "sandbox_workspace_write" in config
+    uses_profile = "default_permissions" in config
+    if uses_sandbox and uses_profile:
         return "mixed"
-    if uses_profiles:
-        return "profiles"
-    if uses_legacy:
+    if uses_profile:
+        return "profile"
+    if uses_sandbox:
         return "legacy"
     return "unset"
 
@@ -752,44 +740,17 @@ def _provider_auth_mode(provider: dict[str, Any]) -> str:
 
 def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str, Any]:
     structured: dict[str, Any] = {key: _structured_scalar(config, key) for key in CORE_SCALAR_KEYS}
-    # ``api_url`` is a UI-friendly alias for Codex's official
-    # ``openai_base_url`` key.  Both are returned so clients can migrate
-    # without guessing field names.
-    structured["api_url"] = structured["openai_base_url"]
     structured["api_key"] = auth.get("OPENAI_API_KEY") if isinstance(auth.get("OPENAI_API_KEY"), str) else ""
 
     raw_features = _get_mapping(config.get("features"))
-
-    def structured_feature_value(key: str) -> bool | None:
-        value = raw_features.get(key)
-        if isinstance(value, bool):
-            return value
-        # Older drafts can still contain a short UI alias. Read it into the
-        # canonical field, but never expose a second control for that alias.
-        for alias, canonical_key in FEATURE_KEY_ALIASES.items():
-            if canonical_key == key:
-                alias_value = raw_features.get(alias)
-                if isinstance(alias_value, bool):
-                    return alias_value
-        return None
-
-    feature_keys = list(SUPPORTED_FEATURE_KEYS)
-    feature_keys.extend(
-        key
-        for key in raw_features
-        if isinstance(key, str) and key not in feature_keys and key not in FEATURE_KEY_ALIASES
-    )
     structured["features"] = {
-        key: structured_feature_value(key)
-        for key in feature_keys
+        key: raw_features.get(key) if isinstance(raw_features.get(key), bool) else None
+        for key in SUPPORTED_FEATURE_KEYS
     }
-    structured["supported_features"] = list(SUPPORTED_FEATURE_KEYS)
 
     sandbox = _get_mapping(config.get("sandbox_workspace_write"))
     structured["permissions"] = {
-        # Swift's segmented control uses singular ``profile``; keep the
-        # internal plural spelling only as an accepted patch alias.
-        "mode": "profile" if _permission_mode(config) == "profiles" else _permission_mode(config),
+        "mode": _permission_mode(config),
         "sandbox_mode": _get_text(config.get("sandbox_mode")),
         "approval_policy": config.get("approval_policy"),
         "approvals_reviewer": _get_text(config.get("approvals_reviewer")),
@@ -800,11 +761,6 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
         and all(isinstance(item, str) for item in sandbox.get("writable_roots"))
         else None,
     }
-    permission_profiles = _get_mapping(config.get("permissions"))
-    structured["permission_profiles"] = sorted(
-        str(profile_id) for profile_id in permission_profiles
-    )
-
     providers: list[dict[str, Any]] = []
     for provider_id, provider in sorted(_get_mapping(config.get("model_providers")).items()):
         if not isinstance(provider, dict):
@@ -871,11 +827,6 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
     structured["apps"] = enabled_entries("apps")
     structured["agents"] = _get_mapping(config.get("agents"))
     structured["skills"] = sorted(str(key) for key in _get_mapping(config.get("skills")))
-    structured["integrations"] = {
-        "mcp_servers": structured["mcp_servers"],
-        "plugins": structured["plugins"],
-        "apps": structured["apps"],
-    }
     shell_policy = _get_mapping(config.get("shell_environment_policy"))
     history = _get_mapping(config.get("history"))
     agents = _get_mapping(config.get("agents"))
@@ -1109,15 +1060,15 @@ def _apply_provider_patch(text: str, value: object) -> str:
             text = remove_table(text, path)
             continue
         existing = _provider_mapping(text, provider_id)
-        field_aliases = {"name": "name", "base_url": "base_url", "api_base": "base_url", "wire_api": "wire_api", "env_key": "env_key", "requires_openai_auth": "requires_openai_auth"}
-        for source_key, target_key in field_aliases.items():
-            if source_key not in item:
+        fields = ("name", "base_url", "wire_api", "env_key", "requires_openai_auth")
+        for key in fields:
+            if key not in item:
                 continue
-            patch_value = item[source_key]
-            if target_key == "requires_openai_auth":
-                text = _patch_optional_bool(text, path, target_key, patch_value)
+            patch_value = item[key]
+            if key == "requires_openai_auth":
+                text = _patch_optional_bool(text, path, key, patch_value)
             else:
-                text = _patch_optional_string(text, path, target_key, patch_value)
+                text = _patch_optional_string(text, path, key, patch_value)
         # A raw-only bearer provider has no visible command.  Its null is a
         # sentinel meaning “retain the raw token”, whereas a command/other
         # mode may intentionally clear a visible command field.
@@ -1139,14 +1090,10 @@ def _apply_provider_patch(text: str, value: object) -> str:
         # invalid combination after its cleanup pass.
         if "auth_mode" in item and not retain_bearer:
             mode_item = dict(item)
-            # A string command has already been normalized above. Passing it
-            # through the older nested-auth branch a second time rejects the
-            # exact row returned by structured_config.
+            # A string command has already been normalized above.
             if isinstance(mode_item.get("auth_command"), str):
                 mode_item.pop("auth_command", None)
             text = _apply_provider_auth_mode(text, path, provider_id, item["auth_mode"], mode_item)
-        elif "auth_command" not in item and "auth_command_detail" in item:
-            text = _apply_provider_auth_mode(text, path, provider_id, "command", item)
     return text
 
 
@@ -1238,11 +1185,9 @@ def _set_sandbox_workspace_value(text: str, key: str, value: object) -> str:
 def _apply_permissions_patch(text: str, value: object) -> str:
     patch = _require_mapping(value, "permissions")
     mode = patch.get("mode")
+    if mode is not None and mode not in {"legacy", "profile", "unset"}:
+        raise EditorError("permissions.mode must be legacy, profile, or unset")
     if mode == "profile":
-        mode = "profiles"
-    if mode is not None and mode not in {"legacy", "profiles", "unset"}:
-        raise EditorError("permissions.mode must be legacy, profile, profiles, or unset")
-    if mode == "profiles":
         text = remove_top_level_value(text, "sandbox_mode")
         text = _remove_sandbox_workspace_write(text)
         # Switching the mode is itself a complete structured edit.  Do not
@@ -1274,7 +1219,7 @@ def _apply_permissions_patch(text: str, value: object) -> str:
         text = _patch_optional_string(text, None, "approvals_reviewer", patch["approvals_reviewer"])
     if "default_permissions" in patch and mode not in {"legacy", "unset"}:
         text = _patch_optional_string(text, None, "default_permissions", patch["default_permissions"])
-    if "sandbox_mode" in patch and mode not in {"profiles", "unset"}:
+    if "sandbox_mode" in patch and mode not in {"profile", "unset"}:
         sandbox_mode = patch["sandbox_mode"]
         if sandbox_mode is not None and sandbox_mode not in {
             "read-only",
@@ -1283,12 +1228,12 @@ def _apply_permissions_patch(text: str, value: object) -> str:
         }:
             raise EditorError("sandbox_mode must be read-only, workspace-write, danger-full-access, or null")
         text = remove_top_level_value(text, "sandbox_mode") if sandbox_mode is None else set_top_level_value(text, "sandbox_mode", sandbox_mode)
-    if "network_access" in patch and mode not in {"profiles", "unset"}:
+    if "network_access" in patch and mode not in {"profile", "unset"}:
         network_access = patch["network_access"]
         if network_access is not None and not isinstance(network_access, bool):
             raise EditorError("network_access must be true, false, or null")
         text = _set_sandbox_workspace_value(text, "network_access", network_access)
-    if "writable_roots" in patch and mode not in {"profiles", "unset"}:
+    if "writable_roots" in patch and mode not in {"profile", "unset"}:
         writable_roots = patch["writable_roots"]
         if writable_roots is not None and (
             not isinstance(writable_roots, list)
@@ -1302,13 +1247,12 @@ def _apply_permissions_patch(text: str, value: object) -> str:
 def _apply_features_patch(text: str, value: object) -> str:
     features = _require_mapping(value, "features")
     for key, flag in features.items():
-        canonical_key = FEATURE_KEY_ALIASES.get(key, key)
-        if canonical_key not in SUPPORTED_FEATURE_KEYS:
+        if key not in SUPPORTED_FEATURE_KEYS:
             raise EditorError(f"features.{key} is not editable in the structured UI")
         if flag is None:
-            text = remove_table_value(text, ("features",), canonical_key)
+            text = remove_table_value(text, ("features",), key)
         elif isinstance(flag, bool):
-            text = set_table_value(text, ("features",), canonical_key, flag)
+            text = set_table_value(text, ("features",), key, flag)
         else:
             raise EditorError(f"features.{key} must be true, false, or null")
     return text
@@ -1420,7 +1364,7 @@ def _selected_litellm_model(
     selected = _require_mapping(selection, "litellm_model")
     model = selected.get("model")
     provider = selected.get("provider", "")
-    deployment_id = selected.get("deployment_id", selected.get("deploymentId", ""))
+    deployment_id = selected.get("deployment_id", "")
     if not isinstance(model, str) or not model.strip():
         raise EditorError("litellm_model.model must be a non-empty string")
     if not isinstance(provider, str) or not isinstance(deployment_id, str):
@@ -1500,25 +1444,15 @@ def apply_structured_patch(
     parse_toml_text(config_text)
     auth = parse_auth_text(auth_text)
     patch_data = _require_mapping(patch, "patch")
-    # The native Swift client namespaces every editable value below
-    # ``patch.structured``.  Accept the older flat form too so an in-flight
-    # dialog upgrade does not lose a user's staged edit.
-    if "structured" in patch_data:
-        patch_data = _require_mapping(patch_data["structured"], "patch.structured")
     result = config_text
     updated_auth = dict(auth)
     auth_changed = False
 
-    selection = patch_data.get("litellm_model", patch_data.get("selected_model"))
-    connection = patch_data.get("connection")
-    if connection is not None:
-        connection_data = _require_mapping(connection, "connection")
-        if connection_data.get("use_litellm_menu") is True:
-            selection = connection_data.get("model_selection", connection_data.get("litellm_model", selection))
+    selection = patch_data.get("litellm_model")
     if selection is not None:
         selected = _selected_litellm_model(selection, runtime_config_path)
         runtime_config = load_yaml(runtime_config_path)
-        result = set_top_levels(
+        result = _set_top_level_values(
             result,
             {
                 "model_provider": "openai",
@@ -1537,16 +1471,10 @@ def apply_structured_patch(
     if "direct_connection" in patch_data:
         result = _apply_direct_connection_patch(result, patch_data["direct_connection"])
 
-    # Core fields are accepted directly (the exact shape returned in
-    # ``structured``) or below a ``core`` wrapper for non-native callers.
     core_patch: dict[str, Any] = {}
-    if "core" in patch_data:
-        core_patch.update(_require_mapping(patch_data["core"], "core"))
     for key in CORE_SCALAR_KEYS:
         if key in patch_data:
             core_patch[key] = patch_data[key]
-    if "api_url" in patch_data:
-        core_patch["openai_base_url"] = patch_data["api_url"]
     for key, value in core_patch.items():
         if key not in CORE_SCALAR_KEYS:
             raise EditorError(f"{key} is not editable in the structured UI")
@@ -1624,16 +1552,6 @@ def apply_structured_patch(
         for plugin_id in list(_get_mapping(parse_toml_text(result).get("plugins"))):
             if plugin_id not in desired_plugins:
                 result = remove_table(result, ("plugins", str(plugin_id)))
-
-    integrations = patch_data.get("integrations")
-    if integrations is not None:
-        integration_patch = _require_mapping(integrations, "integrations")
-        if "mcp_servers" in integration_patch and "mcp_servers" not in patch_data:
-            result = _apply_mcp_patch(result, integration_patch["mcp_servers"])
-        if "plugins" in integration_patch and "plugins" not in patch_data:
-            result = _apply_enabled_entries_patch(result, "plugins", integration_patch["plugins"])
-        if "apps" in integration_patch and "apps" not in patch_data:
-            result = _apply_enabled_entries_patch(result, "apps", integration_patch["apps"])
 
     parsed = parse_toml_text(result)
     errors = semantic_validation(parsed, updated_auth)
@@ -1812,61 +1730,6 @@ def apply_editor(payload: dict[str, Any], runtime_config_path: pathlib.Path) -> 
     return result
 
 
-def apply_selected_model(
-    config: dict[str, Any],
-    model: str,
-    provider: str = "",
-    deployment_id: str = "",
-) -> dict[str, str]:
-    """Compatibility bridge for callers still using the former chooser."""
-
-    candidates = [item for item in configured_models(config) if item["model"] == model]
-    if provider:
-        candidates = [item for item in candidates if item["provider"] == provider]
-    if deployment_id:
-        candidates = [item for item in candidates if item["deployment_id"] == deployment_id]
-    if len(candidates) != 1:
-        raise EditorError("Select one current LiteLLM provider and model")
-    selected = candidates[0]
-    home = codex_home()
-    config_path = home / "config.toml"
-    auth_path = home / "auth.json"
-    current, _, _ = _safe_read_text(config_path, "Codex config file")
-    auth, _ = read_auth(auth_path)
-    next_config = set_top_levels(
-        current,
-        {
-            "model_provider": "openai",
-            "model": selected["model"],
-            "openai_base_url": local_base_url(),
-            "cli_auth_credentials_store": "file",
-        },
-    )
-    next_auth = dict(auth)
-    next_auth["OPENAI_API_KEY"] = local_api_key(config)
-    atomic_write_editor_files(next_config, json.dumps(next_auth, ensure_ascii=False, indent=2) + "\n")
-    return {
-        "model": selected["model"],
-        "provider": selected["provider"],
-        "config": str(config_path),
-        "auth": str(auth_path),
-    }
-
-
-def status(config: dict[str, Any]) -> dict[str, Any]:
-    home = codex_home()
-    config_path = home / "config.toml"
-    auth_path = home / "auth.json"
-    # Do not read the values here: legacy status is deliberately safe to send
-    # to a menu log and must never include either key material.
-    return {
-        "codex_home": str(home),
-        "models": configured_models(config),
-        "config_exists": config_path.exists() and not config_path.is_symlink(),
-        "auth_file_exists": auth_path.exists() and not auth_path.is_symlink(),
-    }
-
-
 def _read_json_stdin() -> dict[str, Any]:
     try:
         payload = json.loads(sys.stdin.read())
@@ -1879,10 +1742,7 @@ def _read_json_stdin() -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Configure Codex through LiteLLM Menu.")
-    parser.add_argument("command", choices=("status", "apply", "load", "sync", "apply-editor"))
-    parser.add_argument("--model", default="")
-    parser.add_argument("--provider", default="")
-    parser.add_argument("--deployment-id", default="")
+    parser.add_argument("command", choices=("load", "sync", "apply-editor"))
     parser.add_argument("--config", default=str(default_config_path()))
     args = parser.parse_args(argv)
     runtime_config_path = pathlib.Path(args.config).expanduser()
@@ -1893,21 +1753,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "sync":
             print(json.dumps(sync_editor(_read_json_stdin(), runtime_config_path), ensure_ascii=False))
             return 0
-        if args.command == "apply-editor":
-            print(json.dumps(apply_editor(_read_json_stdin(), runtime_config_path), ensure_ascii=False))
-            return 0
-
-        config = load_yaml(runtime_config_path)
-        if args.command == "status":
-            print(json.dumps(status(config), ensure_ascii=False))
-            return 0
-        result = apply_selected_model(
-            config,
-            args.model.strip(),
-            args.provider.strip(),
-            args.deployment_id.strip(),
-        )
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(apply_editor(_read_json_stdin(), runtime_config_path), ensure_ascii=False))
         return 0
     except EditorError as exc:
         print(f"Codex config editor failed: {exc}", file=sys.stderr)

@@ -4,24 +4,42 @@
 
 #include <windows.h>
 #include <dwmapi.h>
+#include <shlobj.h>
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
+#include <filesystem>
 #include <thread>
 #include <winreg.h>
 #include <winver.h>
 #include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Data.Json.h>
 #include <winrt/Microsoft.UI.Interop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
+#include <winrt/Microsoft.Web.WebView2.Core.h>
 
 namespace {
 constexpr UINT kTrayMessage = WM_APP + 31;
 constexpr UINT kQuitMessage = WM_APP + 32;
 constexpr UINT kTrayMenuFirstCommand = 41000;
-constexpr size_t kMaxEditorBytes = 2 * 1024 * 1024;
 constexpr double kUIFontSize = 13.0;
+
+namespace web = winrt::Microsoft::Web::WebView2::Core;
+
+struct ReadOnlyCodeViewerState {
+  winrt::Microsoft::UI::Xaml::Window dialog{nullptr};
+  winrt::Microsoft::UI::Xaml::Controls::WebView2 webview{nullptr};
+  web::CoreWebView2 core{nullptr};
+  winrt::event_token activated_token{};
+  winrt::event_token navigation_completed_token{};
+  winrt::event_token web_message_token{};
+  bool started = false;
+  bool command_sent = false;
+  bool finished = false;
+  bool failed = false;
+};
 
 struct ContentSize {
   LONG width;
@@ -32,12 +50,12 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   // These are the legacy window content sizes in 96-DPI logical pixels. They
   // deliberately live at the native window boundary: React owns the shared
   // page, while Win32 owns frame constraints and DPI conversion.
-  if (route == L"providers-models") return {820, 560};
+  if (route == L"providers-models") return {780, 560};
   if (route == L"relay-accounts") return {760, 500};
   if (route == L"relay-add") return {720, 560};
   if (route == L"codex-settings" || route == L"claude-settings") return {1100, 640};
   if (route == L"runtime-settings") return {800, 520};
-  if (route == L"webdav-settings") return {700, 420};
+  if (route == L"data-management") return {500, 160};
   if (route == L"logs") return {640, 420};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
@@ -45,12 +63,12 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
 }
 
 ContentSize RouteInitialContentSize(std::wstring_view route) {
-  if (route == L"providers-models") return {820, 560};
+  if (route == L"providers-models") return {780, 560};
   if (route == L"relay-accounts") return {920, 620};
   if (route == L"relay-add") return {900, 680};
   if (route == L"codex-settings" || route == L"claude-settings") return {1160, 700};
   if (route == L"runtime-settings") return {1080, 620};
-  if (route == L"webdav-settings") return {720, 440};
+  if (route == L"data-management") return {520, 175};
   if (route == L"logs") return {900, 580};
   return {320, 160};
 }
@@ -106,6 +124,20 @@ std::wstring ModulePath() {
   return length > 0 && length < path.size() ? std::wstring(path.data(), length) : std::wstring{};
 }
 
+std::wstring CodeEditorWebViewDataFolder() {
+  PWSTR folder = nullptr;
+  if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &folder)) || folder == nullptr) {
+    return {};
+  }
+  std::filesystem::path path(folder);
+  CoTaskMemFree(folder);
+  path /= L"LiteLLM Menu";
+  path /= L"CodeEditorWebView2";
+  std::error_code error;
+  std::filesystem::create_directories(path, error);
+  return error ? std::wstring{} : path.wstring();
+}
+
 std::wstring Utf8ToWide(std::string const& value) {
   if (value.empty()) return {};
   int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
@@ -122,20 +154,6 @@ std::string WideToUtf8(std::wstring const& value) {
   std::string result(static_cast<size_t>(count), '\0');
   WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(), count, nullptr, nullptr);
   return result;
-}
-
-void SelectNext(
-    winrt::Microsoft::UI::Xaml::Controls::TextBox const& editor,
-    winrt::Microsoft::UI::Xaml::Controls::TextBox const& find) {
-  std::wstring needle(find.Text());
-  if (needle.empty()) return;
-  std::wstring text(editor.Text());
-  size_t start = static_cast<size_t>(std::max(0, editor.SelectionStart() + editor.SelectionLength()));
-  auto found = text.find(needle, start);
-  if (found == std::wstring::npos) found = text.find(needle);
-  if (found == std::wstring::npos) return;
-  editor.Select(static_cast<int>(found), static_cast<int>(needle.size()));
-  editor.Focus(winrt::Microsoft::UI::Xaml::FocusState::Programmatic);
 }
 
 std::wstring FoldModelSearchText(std::wstring value) {
@@ -183,6 +201,79 @@ bool RunOwnedModalWindow(
   }
   if (message_result == 0) PostQuitMessage(static_cast<int>(message.wParam));
   return finished && message_result >= 0;
+}
+
+void FailReadOnlyCodeViewer(std::weak_ptr<ReadOnlyCodeViewerState> const& weak_state) noexcept {
+  if (auto state = weak_state.lock(); state && !state->finished) {
+    state->failed = true;
+    try {
+      state->dialog.Close();
+    } catch (...) {
+      state->finished = true;
+    }
+  }
+}
+
+winrt::fire_and_forget SendReadOnlyCodeViewerCommand(
+    std::weak_ptr<ReadOnlyCodeViewerState> weak_state,
+    winrt::hstring script) {
+  auto state = weak_state.lock();
+  if (!state || state->finished || !state->webview) co_return;
+  try {
+    co_await state->webview.ExecuteScriptAsync(script);
+  } catch (...) {
+    FailReadOnlyCodeViewer(weak_state);
+  }
+}
+
+winrt::fire_and_forget InitializeReadOnlyCodeViewer(
+    std::weak_ptr<ReadOnlyCodeViewerState> weak_state,
+    winrt::hstring html,
+    winrt::hstring text,
+    winrt::hstring language) {
+  auto state = weak_state.lock();
+  if (!state || state->finished || !state->webview) co_return;
+  try {
+    const auto data_folder = CodeEditorWebViewDataFolder();
+    if (data_folder.empty()) throw winrt::hresult_error(E_FAIL);
+    web::CoreWebView2EnvironmentOptions environment_options;
+    auto environment = co_await web::CoreWebView2Environment::CreateWithOptionsAsync(
+        winrt::hstring{}, winrt::hstring(data_folder), environment_options);
+    state = weak_state.lock();
+    if (!state || state->finished || !state->webview) co_return;
+    auto controller_options = environment.CreateCoreWebView2ControllerOptions();
+    co_await state->webview.EnsureCoreWebView2Async(environment, controller_options);
+    state = weak_state.lock();
+    if (!state || state->finished || !state->webview) co_return;
+
+    state->core = state->webview.CoreWebView2();
+    auto payload = winrt::Windows::Data::Json::JsonObject{};
+    payload.Insert(L"type", winrt::Windows::Data::Json::JsonValue::CreateStringValue(winrt::hstring(L"replace")));
+    payload.Insert(L"documentKey", winrt::Windows::Data::Json::JsonValue::CreateStringValue(winrt::hstring(L"readonly")));
+    payload.Insert(L"value", winrt::Windows::Data::Json::JsonValue::CreateStringValue(text));
+    payload.Insert(L"baseline", winrt::Windows::Data::Json::JsonValue::CreateStringValue(text));
+    payload.Insert(L"language", winrt::Windows::Data::Json::JsonValue::CreateStringValue(language));
+    payload.Insert(L"readOnly", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(true));
+    payload.Insert(L"showDiff", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(false));
+    auto script = winrt::hstring(L"window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(") +
+        payload.Stringify() + L");";
+    state->web_message_token = state->core.WebMessageReceived(
+        [weak_state, script = std::move(script)](auto const&, auto const& args) {
+          auto current = weak_state.lock();
+          if (!current || current->finished || current->command_sent) return;
+          try {
+            auto message = winrt::Windows::Data::Json::JsonObject::Parse(args.TryGetWebMessageAsString());
+            if (message.GetNamedString(L"type", winrt::hstring{}) != L"ready") return;
+            current->command_sent = true;
+            SendReadOnlyCodeViewerCommand(weak_state, script);
+          } catch (...) {
+            FailReadOnlyCodeViewer(weak_state);
+          }
+        });
+    state->webview.NavigateToString(html);
+  } catch (...) {
+    FailReadOnlyCodeViewer(weak_state);
+  }
 }
 }  // namespace
 
@@ -357,10 +448,10 @@ POINT WinUI3NativeLeaf::MinimumTrackSizeForActiveRoute() const {
   return FrameTrackSizeForContent(window_handle_, RouteMinimumContentSize(active_route_));
 }
 
-bool WinUI3NativeLeaf::SetWindowContentSize(double width, double height) {
+bool WinUI3NativeLeaf::SetWindowContentSize(std::wstring_view route, double width, double height) {
   constexpr double kMinimumContentExtent = 128.0;
   constexpr double kMaximumContentExtent = 8192.0;
-  if (window_handle_ == nullptr || !std::isfinite(width) || !std::isfinite(height) ||
+  if (window_handle_ == nullptr || active_route_ != route || !std::isfinite(width) || !std::isfinite(height) ||
       width < kMinimumContentExtent || height < kMinimumContentExtent ||
       width > kMaximumContentExtent || height > kMaximumContentExtent) {
     return false;
@@ -427,11 +518,18 @@ bool WinUI3NativeLeaf::Confirm(
 void WinUI3NativeLeaf::ShowReadOnlyText(
     std::wstring_view title,
     std::wstring_view text,
-    std::wstring_view close_label) {
+    std::wstring_view close_label,
+    std::wstring_view language,
+    std::wstring_view html) {
+  if (html.empty() || html.size() > 4 * 1024 * 1024 ||
+      text.size() > 2 * 1024 * 1024 ||
+      (language != L"json" && language != L"toml" && language != L"text")) return;
   namespace xaml = winrt::Microsoft::UI::Xaml;
   namespace controls = winrt::Microsoft::UI::Xaml::Controls;
 
+  auto state = std::make_shared<ReadOnlyCodeViewerState>();
   xaml::Window dialog;
+  state->dialog = dialog;
   dialog.Title(winrt::hstring(title));
 
   controls::Grid root;
@@ -440,11 +538,15 @@ void WinUI3NativeLeaf::ShowReadOnlyText(
   action_row.Height(xaml::GridLengthHelper::Auto());
   root.RowDefinitions().Append(action_row);
 
-  auto viewer = CreateTextEditor();
-  viewer.Text(winrt::hstring(text));
-  viewer.IsReadOnly(true);
-  viewer.IsSpellCheckEnabled(false);
+  controls::WebView2 viewer;
+  state->webview = viewer;
   viewer.Margin(xaml::Thickness{16, 16, 16, 12});
+  winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(
+      viewer, Localized("logOriginal", L"Original log record"));
+  state->navigation_completed_token = viewer.NavigationCompleted(
+      [weak_state = std::weak_ptr<ReadOnlyCodeViewerState>(state)](auto const&, auto const& args) {
+        if (!args.IsSuccess()) FailReadOnlyCodeViewer(weak_state);
+      });
   root.Children().Append(viewer);
 
   controls::StackPanel actions;
@@ -459,10 +561,51 @@ void WinUI3NativeLeaf::ShowReadOnlyText(
   root.Children().Append(actions);
   dialog.Content(root);
 
-  bool finished = false;
-  close.Click([dialog](auto const&, auto const&) { dialog.Close(); });
-  dialog.Closed([&finished](auto const&, auto const&) { finished = true; });
-  RunOwnedModalWindow(dialog, window_handle_, {760, 520}, finished);
+  auto weak_state = std::weak_ptr<ReadOnlyCodeViewerState>(state);
+  close.Click([weak_state](auto const&, auto const&) {
+    if (auto current = weak_state.lock(); current && !current->finished) current->dialog.Close();
+  });
+  dialog.Closed([weak_state](auto const&, auto const&) {
+    if (auto current = weak_state.lock()) current->finished = true;
+  });
+  const auto viewer_html = winrt::hstring(html);
+  const auto viewer_text = winrt::hstring(text);
+  const auto viewer_language = winrt::hstring(language);
+  state->activated_token = dialog.Activated(
+      [weak_state, viewer_html, viewer_text, viewer_language](auto const&, auto const&) {
+        auto current = weak_state.lock();
+        if (!current || current->finished || current->started) return;
+        current->started = true;
+        InitializeReadOnlyCodeViewer(weak_state, viewer_html, viewer_text, viewer_language);
+      });
+
+  const bool completed = RunOwnedModalWindow(dialog, window_handle_, {760, 520}, state->finished);
+  try {
+    if (state->core && state->web_message_token.value != 0) {
+      state->core.WebMessageReceived(state->web_message_token);
+    }
+  } catch (...) {
+  }
+  try {
+    if (state->webview && state->navigation_completed_token.value != 0) {
+      state->webview.NavigationCompleted(state->navigation_completed_token);
+    }
+  } catch (...) {
+  }
+  try {
+    if (state->dialog && state->activated_token.value != 0) {
+      state->dialog.Activated(state->activated_token);
+    }
+  } catch (...) {
+  }
+  try {
+    if (state->core) state->core.Stop();
+  } catch (...) {
+  }
+  state->core = nullptr;
+  state->webview = nullptr;
+  state->dialog = nullptr;
+  (void)completed;
 }
 
 std::optional<size_t> WinUI3NativeLeaf::ShowActionMenu(
@@ -803,165 +946,6 @@ std::optional<NativeSecretEditResult> WinUI3NativeLeaf::EditSecret(
   return result;
 }
 
-std::optional<std::string> WinUI3NativeLeaf::EditNativeText(
-    std::string const& content,
-    std::string const& language,
-    std::wstring const& title) {
-  if (content.size() > kMaxEditorBytes) return std::nullopt;
-  namespace xaml = winrt::Microsoft::UI::Xaml;
-  namespace controls = winrt::Microsoft::UI::Xaml::Controls;
-
-  xaml::Window dialog;
-  dialog.Title(title.empty() ? Localized("appTitle", L"LiteLLM Menu") : title);
-
-  controls::Grid root;
-  controls::RowDefinition menu_row;
-  menu_row.Height(xaml::GridLengthHelper::Auto());
-  root.RowDefinitions().Append(menu_row);
-  root.RowDefinitions().Append(controls::RowDefinition());
-  controls::RowDefinition action_row;
-  action_row.Height(xaml::GridLengthHelper::Auto());
-  root.RowDefinitions().Append(action_row);
-
-  auto editor = CreateTextEditor();
-  editor.Text(Utf8ToWide(content));
-  editor.MaxLength(static_cast<int>(kMaxEditorBytes));
-
-  auto find = controls::TextBox();
-  find.FontSize(kUIFontSize);
-  find.PlaceholderText(Localized("find", L"Find"));
-  find.Margin(xaml::Thickness{8, 8, 8, 4});
-  auto find_next = controls::Button();
-  find_next.FontSize(kUIFontSize);
-  find_next.Content(winrt::box_value(Localized("findNext", L"Find Next")));
-  find_next.Margin(xaml::Thickness{8, 4, 8, 8});
-  find_next.HorizontalAlignment(xaml::HorizontalAlignment::Stretch);
-  find_next.Click([editor, find](auto const&, auto const&) { SelectNext(editor, find); });
-
-  auto selector = CreateSelector();
-  selector.Header(winrt::box_value(Localized("edit", L"Edit")));
-  selector.Items().Append(winrt::box_value(Utf8ToWide(language)));
-  selector.SelectedIndex(0);
-  selector.Margin(xaml::Thickness{8, 8, 8, 4});
-
-  controls::StackPanel pane;
-  pane.Children().Append(selector);
-  pane.Children().Append(find);
-  pane.Children().Append(find_next);
-
-  auto split = CreateSplitView();
-  split.OpenPaneLength(190);
-  split.CompactPaneLength(48);
-  split.Pane(pane);
-  split.Content(editor);
-  split.Margin(xaml::Thickness{12, 4, 12, 8});
-  split.SetValue(controls::Grid::RowProperty(), winrt::box_value(1));
-  root.Children().Append(split);
-
-  controls::MenuBar menu;
-  controls::MenuBarItem edit_menu;
-  edit_menu.Title(Localized("edit", L"Edit"));
-  auto add_edit_item = [&](std::string const& key, std::wstring_view fallback, auto handler) {
-    controls::MenuFlyoutItem item;
-    item.FontSize(kUIFontSize);
-    item.Text(Localized(key, fallback));
-    item.Click(handler);
-    edit_menu.Items().Append(item);
-  };
-  add_edit_item("undo", L"Undo", [editor](auto const&, auto const&) { editor.Undo(); });
-  add_edit_item("redo", L"Redo", [editor](auto const&, auto const&) { editor.Redo(); });
-  add_edit_item("cut", L"Cut", [editor](auto const&, auto const&) { editor.CutSelectionToClipboard(); });
-  add_edit_item("copy", L"Copy", [editor](auto const&, auto const&) { editor.CopySelectionToClipboard(); });
-  add_edit_item("paste", L"Paste", [editor](auto const&, auto const&) { editor.PasteFromClipboard(); });
-  add_edit_item("selectAll", L"Select All", [editor](auto const&, auto const&) { editor.SelectAll(); });
-  add_edit_item("find", L"Find", [find](auto const&, auto const&) {
-    find.Focus(xaml::FocusState::Programmatic);
-  });
-  add_edit_item("findNext", L"Find Next", [editor, find](auto const&, auto const&) {
-    SelectNext(editor, find);
-  });
-  menu.Items().Append(edit_menu);
-  root.Children().Append(menu);
-
-  controls::StackPanel actions;
-  actions.Orientation(controls::Orientation::Horizontal);
-  actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
-  actions.Spacing(8);
-  actions.Margin(xaml::Thickness{12, 0, 12, 12});
-  actions.SetValue(controls::Grid::RowProperty(), winrt::box_value(2));
-  auto cancel = controls::Button();
-  cancel.FontSize(kUIFontSize);
-  cancel.Content(winrt::box_value(Localized("cancel", L"Cancel")));
-  auto stage = controls::Button();
-  stage.FontSize(kUIFontSize);
-  stage.Content(winrt::box_value(Localized("stage", L"Stage")));
-  actions.Children().Append(cancel);
-  actions.Children().Append(stage);
-  root.Children().Append(actions);
-
-  struct EditorResult {
-    bool finished = false;
-    bool accepted = false;
-    std::string staged;
-  };
-  auto result = std::make_shared<EditorResult>();
-  cancel.Click([dialog](auto const&, auto const&) { dialog.Close(); });
-  stage.Click([dialog, editor, result, this](auto const&, auto const&) {
-    std::wstring value(editor.Text());
-    std::string encoded = WideToUtf8(value);
-    if ((!value.empty() && encoded.empty()) || encoded.size() > kMaxEditorBytes) {
-      auto invalid = controls::ContentDialog();
-      invalid.Title(winrt::box_value(Localized("appTitle", L"LiteLLM Menu")));
-      invalid.Content(winrt::box_value(Localized("invalidText", L"The document is too large or contains invalid text.")));
-      invalid.CloseButtonText(Localized("ok", L"OK"));
-      invalid.XamlRoot(dialog.Content().as<controls::Grid>().XamlRoot());
-      invalid.ShowAsync();
-      return;
-    }
-    result->staged = std::move(encoded);
-    result->accepted = true;
-    dialog.Close();
-  });
-  dialog.Closed([result](auto const&, auto const&) { result->finished = true; });
-  dialog.Content(root);
-
-  HWND dialog_handle = nullptr;
-  winrt::check_hresult(dialog.as<::IWindowNative>()->get_WindowHandle(&dialog_handle));
-  DisableWindowTransitions(dialog_handle);
-  if (window_handle_ != nullptr) {
-    SetWindowLongPtrW(dialog_handle, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(window_handle_));
-    EnableWindow(window_handle_, FALSE);
-  }
-  auto window_id = winrt::Microsoft::UI::GetWindowIdFromWindow(dialog_handle);
-  const auto frame = FrameTrackSizeForContentDips(dialog_handle, 840, 620);
-  winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(window_id).Resize({frame.x, frame.y});
-  dialog.Activate();
-  editor.Focus(xaml::FocusState::Programmatic);
-
-  MSG message{};
-  BOOL message_result = TRUE;
-  while (!result->finished && (message_result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
-    if (message.message == WM_KEYDOWN && GetAncestor(message.hwnd, GA_ROOT) == dialog_handle) {
-      if (GetKeyState(VK_CONTROL) < 0 && (message.wParam == 'F' || message.wParam == 'f')) {
-        find.Focus(xaml::FocusState::Programmatic);
-        continue;
-      }
-      if (message.wParam == VK_F3) {
-        SelectNext(editor, find);
-        continue;
-      }
-    }
-    TranslateMessage(&message);
-    DispatchMessageW(&message);
-  }
-  if (window_handle_ != nullptr) {
-    EnableWindow(window_handle_, TRUE);
-    SetForegroundWindow(window_handle_);
-  }
-  if (message_result == 0) PostQuitMessage(static_cast<int>(message.wParam));
-  return result->accepted ? std::optional<std::string>(std::move(result->staged)) : std::nullopt;
-}
-
 bool WinUI3NativeLeaf::SetLaunchAtLogin(bool enabled) {
   std::wstring executable = ModulePath();
   if (executable.empty()) return false;
@@ -1002,31 +986,6 @@ void WinUI3NativeLeaf::Quit() {
     }
     PostMessageW(window, kQuitMessage, 0, 0);
   }).detach();
-}
-
-winrt::Microsoft::UI::Xaml::Controls::SplitView WinUI3NativeLeaf::CreateSplitView() const {
-  winrt::Microsoft::UI::Xaml::Controls::SplitView view;
-  view.DisplayMode(winrt::Microsoft::UI::Xaml::Controls::SplitViewDisplayMode::Inline);
-  view.IsPaneOpen(true);
-  return view;
-}
-
-winrt::Microsoft::UI::Xaml::Controls::TextBox WinUI3NativeLeaf::CreateTextEditor() const {
-  winrt::Microsoft::UI::Xaml::Controls::TextBox editor;
-  editor.FontSize(kUIFontSize);
-  editor.AcceptsReturn(true);
-  editor.AcceptsTab(true);
-  editor.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-  editor.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Consolas"));
-  editor.HorizontalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
-  editor.VerticalScrollBarVisibility(winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
-  return editor;
-}
-
-winrt::Microsoft::UI::Xaml::Controls::ComboBox WinUI3NativeLeaf::CreateSelector() const {
-  winrt::Microsoft::UI::Xaml::Controls::ComboBox selector;
-  selector.FontSize(kUIFontSize);
-  return selector;
 }
 
 void WinUI3NativeLeaf::EnsureTray() {
@@ -1097,14 +1056,14 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
       continue;
     }
     if (action.id == L"open-providers-models" || action.id == L"webdav-status" ||
-        action.id == L"open-webdav-settings" || action.id == L"open-logs" ||
+        action.id == L"open-data-management" || action.id == L"open-logs" ||
         action.id == L"show-version") {
       add_separator();
     }
     AppendMenuW(menu, flags,
         kTrayMenuFirstCommand + static_cast<UINT>(index), action.title.c_str());
     if (action.id == L"toggle-autostart" ||
-        action.id == L"open-webdav-settings" || action.id == L"open-logs") {
+        action.id == L"open-data-management" || action.id == L"open-logs") {
       needs_separator = true;
     }
   }
@@ -1172,7 +1131,7 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
     return Localized("routeCodexSettings", L"Codex / Claude Settings");
   }
   if (route == L"runtime-settings") return Localized("routeRuntimeSettings", L"Runtime Settings");
-  if (route == L"webdav-settings") return Localized("routeWebdavSettings", L"WebDAV Sync Settings");
+  if (route == L"data-management") return Localized("routeDataManagement", L"Data Management");
   if (route == L"logs") return Localized("routeLogs", L"Logs");
   return Localized("appTitle", L"LiteLLM Menu");
 }

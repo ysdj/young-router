@@ -22,16 +22,6 @@ import Foundation
         let token: String
     }
 
-    struct EditorStageResult {
-        let revision: Int
-        let replacementToken: String
-    }
-
-    private struct EditorIdentity {
-        let domain: String
-        let document: String
-    }
-
     private struct Endpoint {
         let address: String
         let port: Int
@@ -65,8 +55,6 @@ import Foundation
     private var pollCancelled = false
     private var stopping = false
     private var generation = 0
-    private var editorIdentities: [String: EditorIdentity] = [:]
-    private var editorIdentityOrder: [String] = []
 
     private override init() { super.init() }
 
@@ -109,9 +97,6 @@ import Foundation
                       let text = String(data: body, encoding: .utf8) else {
                     _ = self.resetCore(expectedGeneration: requestGeneration)
                     throw BridgeError.invalidResponse
-                }
-                if metadata.method == "editor" {
-                    self.rememberEditorCapability(requestData: data, responseData: body)
                 }
                 self.startPollingIfSubscription(in: text, request: request, method: metadata.method, generation: requestGeneration)
                 if restarted && metadata.method != "subscribe" { self.scheduleSubscriptionRecovery() }
@@ -161,22 +146,37 @@ import Foundation
         }
     }
 
-    /// Exchanges an AppKit panel URL for a one-time opaque Core token. The
-    /// filesystem path never reaches React or a normal error string.
-    func registerFileCapability(_ url: URL, purpose: String) -> String? {
-        guard ["import", "export"].contains(purpose) else { return nil }
-        do {
-            let body = try JSONSerialization.data(withJSONObject: ["purpose": purpose, "path": url.path], options: [])
-            let (data, response, _, restarted) = try performCoreRequest(route: "host/file-capability", method: "POST", body: body)
-            if restarted { scheduleSubscriptionRecovery() }
-            guard response.statusCode == 200,
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  object["protocol_version"] as? Int == 1,
-                  let token = object["token"] as? String,
-                  !token.isEmpty else { return nil }
-            return token
-        } catch {
-            return nil
+    /// File capability exchange is asynchronous: the native file panel must
+    /// never wait on Core or a remote filesystem while AppKit is processing
+    /// window events.
+    func registerFileCapability(
+        _ url: URL,
+        purpose: String,
+        completion: @escaping (String?) -> Void
+    ) {
+        guard ["import", "export"].contains(purpose) else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let token: String?
+            do {
+                let body = try JSONSerialization.data(withJSONObject: ["purpose": purpose, "path": url.path], options: [])
+                let (data, response, _, restarted) = try self.performCoreRequest(route: "host/file-capability", method: "POST", body: body)
+                if restarted { self.scheduleSubscriptionRecovery() }
+                if response.statusCode == 200,
+                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   object["protocol_version"] as? Int == 1,
+                   let value = object["token"] as? String,
+                   !value.isEmpty {
+                    token = value
+                } else {
+                    token = nil
+                }
+            } catch {
+                token = nil
+            }
+            DispatchQueue.main.async { completion(token) }
         }
     }
 
@@ -300,145 +300,6 @@ import Foundation
             loginStatus: restoredStatus,
             username: safeUsername
         )
-    }
-
-    /// Reads an opaque editor capability and returns raw text only to the
-    /// native host. This value must never cross the React Native bridge.
-    func readEditorDocument(_ editorToken: String) throws -> String {
-        guard !editorToken.isEmpty,
-              editorToken.utf8.count <= 256,
-              let body = try? JSONSerialization.data(
-                  withJSONObject: ["editor_token": editorToken],
-                  options: []
-              ) else { throw BridgeError.invalidResponse }
-        let (data, response, requestGeneration, restarted) = try performCoreRequest(
-            route: "host/editor/read",
-            method: "POST",
-            body: body
-        )
-        if restarted { scheduleSubscriptionRecovery() }
-        guard response.statusCode == 200,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              Set(object.keys) == Set(["protocol_version", "text"]),
-              object["protocol_version"] as? Int == 1,
-              let text = object["text"] as? String,
-              text.utf8.count <= 2 * 1024 * 1024 else {
-            if response.statusCode >= 500 {
-                _ = resetCore(expectedGeneration: requestGeneration)
-            }
-            throw BridgeError.invalidResponse
-        }
-        return text
-    }
-
-    /// Stages native editor text through the trusted host route. The
-    /// replacement token is retained only by the native host, while React
-    /// receives at most the revision through a native component event.
-    @nonobjc func stageEditorDocument(_ editorToken: String, text: String) throws -> EditorStageResult {
-        guard !editorToken.isEmpty,
-              editorToken.utf8.count <= 256,
-              text.utf8.count <= 2 * 1024 * 1024,
-              let body = try? JSONSerialization.data(
-                  withJSONObject: ["editor_token": editorToken, "text": text],
-                  options: []
-              ) else { throw BridgeError.invalidResponse }
-        let (data, response, requestGeneration, restarted) = try performCoreRequest(
-            route: "host/editor/stage",
-            method: "POST",
-            body: body
-        )
-        if restarted { scheduleSubscriptionRecovery() }
-        guard response.statusCode == 200,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              Set(object.keys) == Set(["protocol_version", "revision", "editor_token"]),
-              object["protocol_version"] as? Int == 1,
-              let revision = object["revision"] as? NSNumber,
-              revision.doubleValue.rounded(.towardZero) == revision.doubleValue,
-              revision.intValue >= 0,
-              let replacementToken = object["editor_token"] as? String,
-              !replacementToken.isEmpty,
-              replacementToken.utf8.count <= 256 else {
-            if response.statusCode >= 500 {
-                _ = resetCore(expectedGeneration: requestGeneration)
-            }
-            throw BridgeError.invalidResponse
-        }
-        return EditorStageResult(revision: revision.intValue, replacementToken: replacementToken)
-    }
-
-    /// Reissues an expired editor capability without exposing its identity or
-    /// document text to React. The trusted read is part of the handshake: Core
-    /// requires it before the replacement capability may stage native text.
-    @objc(refreshEditorDocument:completion:)
-    public func refreshEditorDocumentAsync(
-        _ editorToken: String,
-        completion: @escaping (String?, String?, String?) -> Void
-    ) {
-        guard let identity = editorIdentity(for: editorToken) else {
-            DispatchQueue.main.async { completion(nil, nil, "refresh_failed") }
-            return
-        }
-        call(method: "editor", params: ["domain": identity.domain, "document": identity.document]) { result in
-            switch result {
-            case .failure:
-                DispatchQueue.main.async { completion(nil, nil, "refresh_failed") }
-            case .success(let payload):
-                guard Set(payload.keys) == Set(["domain", "document", "editor_token", "revision"]),
-                      payload["domain"] as? String == identity.domain,
-                      payload["document"] as? String == identity.document,
-                      let replacementToken = payload["editor_token"] as? String,
-                      !replacementToken.isEmpty,
-                      replacementToken.utf8.count <= 256 else {
-                    DispatchQueue.main.async { completion(nil, nil, "refresh_failed") }
-                    return
-                }
-                DispatchQueue.global(qos: .userInitiated).async {
-                    do {
-                        let text = try self.readEditorDocument(replacementToken)
-                        self.replaceEditorCapability(editorToken, with: replacementToken, identity: identity)
-                        DispatchQueue.main.async { completion(replacementToken, text, nil) }
-                    } catch {
-                        DispatchQueue.main.async { completion(nil, nil, "refresh_failed") }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Objective-C++ component views use these asynchronous wrappers so raw
-    /// editor text stays inside the native host and never crosses the RN bridge.
-    @objc(readEditorDocument:completion:)
-    public func readEditorDocumentAsync(
-        _ editorToken: String,
-        completion: @escaping (String?, String?) -> Void
-    ) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let text = try self.readEditorDocument(editorToken)
-                DispatchQueue.main.async { completion(text, nil) }
-            } catch {
-                DispatchQueue.main.async { completion(nil, "read_failed") }
-            }
-        }
-    }
-
-    @objc(stageEditorDocument:text:completion:)
-    public func stageEditorDocumentAsync(
-        _ editorToken: String,
-        text: String,
-        completion: @escaping (NSNumber?, String?, String?) -> Void
-    ) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let result = try self.stageEditorDocument(editorToken, text: text)
-                self.rotateEditorCapability(editorToken, to: result.replacementToken)
-                DispatchQueue.main.async {
-                    completion(NSNumber(value: result.revision), result.replacementToken, nil)
-                }
-            } catch {
-                DispatchQueue.main.async { completion(nil, nil, "stage_failed") }
-            }
-        }
     }
 
     @nonobjc func createSecretCapability(
@@ -1002,51 +863,6 @@ import Foundation
               let method = object["method"] as? String,
               !method.isEmpty else { return nil }
         return (requestID, method)
-    }
-
-    private func rememberEditorCapability(requestData: Data, responseData: Data) {
-        guard let request = try? JSONSerialization.jsonObject(with: requestData) as? [String: Any],
-              let params = request["params"] as? [String: Any],
-              let domain = params["domain"] as? String,
-              let document = params["document"] as? String,
-              (domain == "codex" && ["config", "auth"].contains(document)) ||
-                  (domain == "claude" && ["settings", "desktop", "developer"].contains(document)),
-              let response = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              response["ok"] as? Bool == true,
-              let result = response["result"] as? [String: Any],
-              result["domain"] as? String == domain,
-              result["document"] as? String == document,
-              let token = result["editor_token"] as? String,
-              !token.isEmpty,
-              token.utf8.count <= 256 else { return }
-        replaceEditorCapability(nil, with: token, identity: EditorIdentity(domain: domain, document: document))
-    }
-
-    private func editorIdentity(for token: String) -> EditorIdentity? {
-        lock.lock()
-        defer { lock.unlock() }
-        return editorIdentities[token]
-    }
-
-    private func rotateEditorCapability(_ oldToken: String, to newToken: String) {
-        guard let identity = editorIdentity(for: oldToken) else { return }
-        replaceEditorCapability(oldToken, with: newToken, identity: identity)
-    }
-
-    private func replaceEditorCapability(_ oldToken: String?, with newToken: String, identity: EditorIdentity) {
-        lock.lock()
-        defer { lock.unlock() }
-        if let oldToken {
-            editorIdentities.removeValue(forKey: oldToken)
-            editorIdentityOrder.removeAll { $0 == oldToken }
-        }
-        editorIdentities[newToken] = identity
-        editorIdentityOrder.removeAll { $0 == newToken }
-        editorIdentityOrder.append(newToken)
-        while editorIdentityOrder.count > 128 {
-            let expired = editorIdentityOrder.removeFirst()
-            editorIdentities.removeValue(forKey: expired)
-        }
     }
 
     private func isValidResponseEnvelope(_ data: Data, requestID: String) -> Bool {

@@ -214,9 +214,6 @@ std::string CoreIPCBridge::Send(std::string const& request_json) {
         std::lock_guard guard(mutex_);
         subscription_request_ = request_json;
       }
-      if (RequestMethod(request_json) == "editor") {
-        RememberEditorCapability(request_json, result.body);
-      }
       StartPollingIfSubscription(result.body, generation);
       bool recover_subscription = false;
       {
@@ -250,108 +247,6 @@ std::optional<std::string> CoreIPCBridge::RegisterFileCapability(std::wstring co
     if (response.GetNamedNumber(L"protocol_version", 0) != 1) return std::nullopt;
     std::wstring token = response.GetNamedString(L"token", L"").c_str();
     return token.empty() ? std::nullopt : std::optional<std::string>(WideToUtf8(token));
-  } catch (...) {
-    return std::nullopt;
-  }
-}
-
-std::optional<std::string> CoreIPCBridge::ReadEditorDocument(std::string const& editor_token) {
-  if (editor_token.empty() || editor_token.size() > 256) return std::nullopt;
-  try {
-    winrt::Windows::Data::Json::JsonObject payload;
-    payload.SetNamedValue(L"editor_token", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(editor_token)));
-    auto result = HostRequest(L"host/editor/read", WideToUtf8(payload.Stringify().c_str()), false);
-    if (!result || result->status != 200 || result->body.empty()) return std::nullopt;
-    auto response = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(result->body));
-    if (response.Size() != 2 || !response.HasKey(L"protocol_version") || !response.HasKey(L"text") ||
-        response.GetNamedNumber(L"protocol_version", 0) != 1) return std::nullopt;
-    std::wstring text = response.GetNamedString(L"text", L"").c_str();
-    std::string utf8_text = WideToUtf8(text);
-    if (utf8_text.size() > 2 * 1024 * 1024) return std::nullopt;
-    return utf8_text;
-  } catch (...) {
-    return std::nullopt;
-  }
-}
-
-std::optional<double> CoreIPCBridge::StageEditorDocument(
-    std::string const& editor_token,
-    std::string const& text) {
-  auto result = StageEditorDocumentWithReplacement(editor_token, text);
-  return result ? std::optional<double>(result->revision) : std::nullopt;
-}
-
-std::optional<CoreIPCBridge::EditorStageResult> CoreIPCBridge::StageEditorDocumentWithReplacement(
-    std::string const& editor_token,
-    std::string const& text) {
-  if (editor_token.empty() || editor_token.size() > 256 || text.size() > 2 * 1024 * 1024) return std::nullopt;
-  try {
-    winrt::Windows::Data::Json::JsonObject payload;
-    payload.SetNamedValue(L"editor_token", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(editor_token)));
-    payload.SetNamedValue(L"text", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(text)));
-    auto result = HostRequest(L"host/editor/stage", WideToUtf8(payload.Stringify().c_str()), false);
-    if (!result || result->status != 200 || result->body.empty()) return std::nullopt;
-    auto response = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(result->body));
-    if (response.Size() != 3 || !response.HasKey(L"protocol_version") || !response.HasKey(L"revision") ||
-        !response.HasKey(L"editor_token") ||
-        response.GetNamedNumber(L"protocol_version", 0) != 1) return std::nullopt;
-    double revision = response.GetNamedNumber(L"revision", -1);
-    if (revision < 0 || revision != floor(revision)) return std::nullopt;
-    std::string replacement_token = WideToUtf8(response.GetNamedString(L"editor_token", L"").c_str());
-    if (replacement_token.empty() || replacement_token.size() > 256) return std::nullopt;
-    RotateEditorCapability(editor_token, replacement_token);
-    RecoverSubscription();
-    return EditorStageResult{revision, std::move(replacement_token)};
-  } catch (...) {
-    return std::nullopt;
-  }
-}
-
-std::optional<CoreIPCBridge::RefreshedEditorDocument> CoreIPCBridge::RefreshEditorDocument(
-    std::string const& editor_token) {
-  if (editor_token.empty() || editor_token.size() > 256) return std::nullopt;
-  auto identity = EditorIdentityFor(editor_token);
-  if (!identity) return std::nullopt;
-  try {
-    winrt::Windows::Data::Json::JsonObject params;
-    params.SetNamedValue(L"domain", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(identity->domain)));
-    params.SetNamedValue(L"document", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(identity->document)));
-    winrt::Windows::Data::Json::JsonObject request;
-    request.SetNamedValue(L"protocol_version", winrt::Windows::Data::Json::JsonValue::CreateNumberValue(1));
-    static std::atomic<unsigned long long> refresh_request_serial{0};
-    std::wstring request_id = L"native-editor-refresh-" + std::to_wstring(GetCurrentProcessId()) +
-        L"-" + std::to_wstring(GetTickCount64()) + L"-" +
-        std::to_wstring(refresh_request_serial.fetch_add(1, std::memory_order_relaxed));
-    request.SetNamedValue(
-        L"request_id",
-        winrt::Windows::Data::Json::JsonValue::CreateStringValue(request_id));
-    request.SetNamedValue(L"method", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"editor"));
-    request.SetNamedValue(L"params", params);
-    auto response_json = Send(WideToUtf8(request.Stringify().c_str()));
-    auto response = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(response_json));
-    if (response.Size() != 4 || !response.HasKey(L"protocol_version") ||
-        !response.HasKey(L"request_id") || !response.HasKey(L"ok") ||
-        !response.HasKey(L"result") || response.GetNamedNumber(L"protocol_version", 0) != 1 ||
-        response.GetNamedString(L"request_id", L"") != request_id ||
-        !response.GetNamedBoolean(L"ok", false)) {
-      return std::nullopt;
-    }
-    auto result = response.GetNamedObject(L"result", nullptr);
-    if (!result || result.Size() != 4 || !result.HasKey(L"domain") ||
-        !result.HasKey(L"document") || !result.HasKey(L"editor_token") ||
-        !result.HasKey(L"revision") ||
-        result.GetNamedString(L"domain", L"") != Utf8ToWide(identity->domain) ||
-        result.GetNamedString(L"document", L"") != Utf8ToWide(identity->document)) {
-      return std::nullopt;
-    }
-    double revision = result.GetNamedNumber(L"revision", -1);
-    if (revision < 0 || revision != std::floor(revision)) return std::nullopt;
-    std::string replacement_token = WideToUtf8(result.GetNamedString(L"editor_token", L"").c_str());
-    if (replacement_token.empty() || replacement_token.size() > 256) return std::nullopt;
-    auto text = ReadEditorDocument(replacement_token);
-    if (!text) return std::nullopt;
-    ReplaceEditorCapability(editor_token, replacement_token, *identity);
-    return RefreshedEditorDocument{std::move(replacement_token), std::move(*text)};
   } catch (...) {
     return std::nullopt;
   }
@@ -1043,72 +938,6 @@ void CoreIPCBridge::TakeCoreLocked(
   process_handle_ = nullptr;
   runtime_directory_.clear();
   InvalidateCoreLocked(preserve_subscription);
-}
-
-void CoreIPCBridge::RememberEditorCapability(
-    std::string const& request_json,
-    std::string const& response_json) {
-  try {
-    auto request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
-    auto params = request.GetNamedObject(L"params", nullptr);
-    if (!params) return;
-    std::string domain = WideToUtf8(params.GetNamedString(L"domain", L"").c_str());
-    std::string document = WideToUtf8(params.GetNamedString(L"document", L"").c_str());
-    const bool valid_identity =
-        (domain == "codex" && (document == "config" || document == "auth")) ||
-        (domain == "claude" && (document == "settings" || document == "desktop" || document == "developer"));
-    if (!valid_identity) return;
-    auto response = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(response_json));
-    if (!response.GetNamedBoolean(L"ok", false)) return;
-    auto result = response.GetNamedObject(L"result", nullptr);
-    if (!result ||
-        result.GetNamedString(L"domain", L"") != Utf8ToWide(domain) ||
-        result.GetNamedString(L"document", L"") != Utf8ToWide(document)) {
-      return;
-    }
-    std::string token = WideToUtf8(result.GetNamedString(L"editor_token", L"").c_str());
-    if (token.empty() || token.size() > 256) return;
-    ReplaceEditorCapability(std::nullopt, token, EditorIdentity{std::move(domain), std::move(document)});
-  } catch (...) {
-  }
-}
-
-std::optional<CoreIPCBridge::EditorIdentity> CoreIPCBridge::EditorIdentityFor(
-    std::string const& editor_token) {
-  std::lock_guard guard(mutex_);
-  auto found = editor_identities_.find(editor_token);
-  if (found == editor_identities_.end()) return std::nullopt;
-  return found->second;
-}
-
-void CoreIPCBridge::ReplaceEditorCapability(
-    std::optional<std::string> const& old_token,
-    std::string const& new_token,
-    EditorIdentity const& identity) {
-  std::lock_guard guard(mutex_);
-  if (old_token) {
-    editor_identities_.erase(*old_token);
-    editor_identity_order_.erase(
-        std::remove(editor_identity_order_.begin(), editor_identity_order_.end(), *old_token),
-        editor_identity_order_.end());
-  }
-  editor_identities_[new_token] = identity;
-  editor_identity_order_.erase(
-      std::remove(editor_identity_order_.begin(), editor_identity_order_.end(), new_token),
-      editor_identity_order_.end());
-  editor_identity_order_.push_back(new_token);
-  while (editor_identity_order_.size() > 128) {
-    auto expired = std::move(editor_identity_order_.front());
-    editor_identity_order_.erase(editor_identity_order_.begin());
-    editor_identities_.erase(expired);
-  }
-}
-
-void CoreIPCBridge::RotateEditorCapability(
-    std::string const& old_token,
-    std::string const& new_token) {
-  auto identity = EditorIdentityFor(old_token);
-  if (identity) ReplaceEditorCapability(old_token, new_token, *identity);
 }
 
 }  // namespace LiteLLMMenu

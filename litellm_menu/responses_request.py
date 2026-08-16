@@ -4,6 +4,7 @@ from . import request_context as _request_context_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import trace as _trace_module
+from . import image_inputs as _image_inputs_module
 
 
 from .base import (
@@ -14,6 +15,7 @@ from .base import (
     _BROWSER_COMPATIBLE_HEADERS,
     _BROWSER_COMPATIBLE_HEADER_HOSTS,
     _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY,
+    _CODEX_VIEW_IMAGE_REFERENCE_MARKER,
     _CHAT_COMPAT_REASONING_EFFORT,
     _FALLBACK_BROWSER_USER_AGENT,
     _MAX_COMPAT_REASONING_EFFORT,
@@ -545,7 +547,10 @@ async def _await_streaming_fallback_candidate_response(
                         saw_chunk=False,
                         buffered_chunks=0,
                     )
-                if _routing_module._is_priority_deployment_failover_error(exc):
+                if _routing_module._is_request_scoped_priority_deployment_failover_error(
+                    exc,
+                    request_kwargs,
+                ):
                     _routing_module._mark_exception_for_deployment_failover(exc, request_kwargs)
                 raise exc
         return response
@@ -565,7 +570,10 @@ async def _await_streaming_fallback_candidate_response(
                 saw_chunk=False,
                 buffered_chunks=0,
             )
-        if _routing_module._is_priority_deployment_failover_error(exc):
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            exc,
+            request_kwargs,
+        ):
             _routing_module._mark_exception_for_deployment_failover(exc, request_kwargs)
         raise exc
 
@@ -909,15 +917,9 @@ def _request_has_structured_codex_compaction(
         return False
 
     input_items = request_kwargs.get("input")
-    if isinstance(input_items, list) and any(
+    return isinstance(input_items, list) and any(
         isinstance(item, dict) and item.get("type") == "compaction_trigger"
         for item in input_items
-    ):
-        return True
-
-    return any(
-        _codex_turn_metadata_is_compaction(value)
-        for value in _codex_turn_metadata_values(request_kwargs)
     )
 
 
@@ -936,6 +938,11 @@ def _request_is_codex_compaction(request_kwargs: Optional[dict]) -> bool:
     if not _request_has_responses_shape(request_kwargs):
         return False
     if _request_has_structured_codex_compaction(request_kwargs):
+        return True
+    if any(
+        _codex_turn_metadata_is_compaction(value)
+        for value in _codex_turn_metadata_values(request_kwargs)
+    ):
         return True
     if _request_has_explicit_codex_turn_kind(request_kwargs):
         return False
@@ -1190,6 +1197,203 @@ def _codex_tool_output_text(output: Any) -> str:
         if isinstance(text, str):
             chunks.append(text)
     return "\n".join(chunks)
+
+
+def _value_has_encrypted_content(value: Any) -> bool:
+    if isinstance(value, dict):
+        encrypted_content = value.get("encrypted_content")
+        if isinstance(encrypted_content, str) and encrypted_content:
+            return True
+        return any(_value_has_encrypted_content(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_value_has_encrypted_content(child) for child in value)
+    return False
+
+
+def _codex_text_tool_output_parts(output: Any) -> Optional[list[str]]:
+    if not isinstance(output, list) or not output:
+        return None
+    chunks: list[str] = []
+    for part in output:
+        if (
+            not isinstance(part, dict)
+            or part.get("type") != "input_text"
+            or not set(part).issubset({"type", "text"})
+            or not isinstance(part.get("text"), str)
+        ):
+            return None
+        chunks.append(part["text"])
+    return chunks
+
+
+_CODEX_VIEW_IMAGE_PATH_LITERAL = re.compile(r'"(?:\\.|[^"\\])*"')
+_CODEX_VIEW_IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+)
+
+
+def _codex_view_image_paths_from_call(item: Any) -> list[str]:
+    if (
+        not isinstance(item, dict)
+        or item.get("type") != "custom_tool_call"
+        or item.get("name") != "exec"
+        or not isinstance(item.get("input"), str)
+    ):
+        return []
+    source = item["input"]
+    if "view_image" not in source:
+        return []
+    paths: list[str] = []
+    for literal in _CODEX_VIEW_IMAGE_PATH_LITERAL.findall(source):
+        try:
+            value = json.loads(literal)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(value, str):
+            continue
+        normalized = value.replace("\\\\", "\\")
+        is_absolute = normalized.startswith("/") or bool(
+            re.match(r"^[A-Za-z]:[\\\\/]", normalized)
+        )
+        if (
+            is_absolute
+            and normalized.lower().endswith(_CODEX_VIEW_IMAGE_EXTENSIONS)
+            and normalized not in paths
+        ):
+            paths.append(normalized)
+    return paths
+
+
+def _codex_view_image_output_parts(output: Any) -> list[dict]:
+    if not isinstance(output, list):
+        return []
+    return [
+        part
+        for part in output
+        if isinstance(part, dict)
+        and part.get("type") == "input_image"
+        and isinstance(part.get("image_url"), str)
+        and part["image_url"].startswith("data:image/")
+    ]
+
+
+def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
+    """Pair mutable ``view_image`` results with paths for on-demand reinspection."""
+
+    if (
+        not _request_has_responses_shape(request_kwargs)
+        or not _request_has_codex_client_evidence(request_kwargs)
+    ):
+        return None
+    input_items = request_kwargs.get("input")
+    if not isinstance(input_items, list):
+        return None
+
+    last_encrypted_index = max(
+        (
+            index
+            for index, item in enumerate(input_items)
+            if _value_has_encrypted_content(item)
+        ),
+        default=-1,
+    )
+    call_paths: dict[str, list[str]] = {}
+    updated_items = list(input_items)
+    changed = False
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "custom_tool_call":
+            call_id = item.get("call_id") or item.get("id")
+            paths = _codex_view_image_paths_from_call(item)
+            if isinstance(call_id, str) and paths:
+                call_paths[call_id] = paths
+            continue
+        if index <= last_encrypted_index or item.get("type") != "custom_tool_call_output":
+            continue
+        output = item.get("output")
+        if not isinstance(output, list) or any(
+            isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+            and _CODEX_VIEW_IMAGE_REFERENCE_MARKER in part["text"]
+            for part in output
+        ):
+            continue
+        call_id = item.get("call_id") or item.get("id")
+        paths = call_paths.get(call_id) if isinstance(call_id, str) else None
+        image_parts = _codex_view_image_output_parts(output)
+        if not paths or len(paths) != len(image_parts):
+            continue
+        references = "\n".join(
+            f"{number}. {path}" for number, path in enumerate(paths, start=1)
+        )
+        reference_part = {
+            "type": "input_text",
+            "text": (
+                f"{_CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
+                "Inline images below are reduced previews. For full detail, call "
+                "view_image again on the matching local path:\n"
+                f"{references}"
+            ),
+        }
+        updated_item = item.copy()
+        updated_item["output"] = [reference_part, *output]
+        updated_items[index] = updated_item
+        changed = True
+
+    if not changed:
+        return None
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = updated_items
+    return modified_kwargs
+
+
+def _with_codex_function_call_output_text(request_kwargs: dict) -> Optional[dict]:
+    """Flatten text-only Codex function results in the mutable replay suffix."""
+
+    if (
+        not _request_has_responses_shape(request_kwargs)
+        or not _request_has_codex_client_evidence(request_kwargs)
+    ):
+        return None
+    input_items = request_kwargs.get("input")
+    if not isinstance(input_items, list):
+        return None
+
+    last_encrypted_index = max(
+        (
+            index
+            for index, item in enumerate(input_items)
+            if _value_has_encrypted_content(item)
+        ),
+        default=-1,
+    )
+    updated_items = list(input_items)
+    changed = False
+    for index in range(last_encrypted_index + 1, len(input_items)):
+        item = input_items[index]
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+        chunks = _codex_text_tool_output_parts(item.get("output"))
+        if chunks is None:
+            continue
+        updated_item = item.copy()
+        updated_item["output"] = "\n".join(chunks)
+        updated_items[index] = updated_item
+        changed = True
+
+    if not changed:
+        return None
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = updated_items
+    return modified_kwargs
 
 
 def _codex_tool_choice_name(tool_choice: Any) -> Optional[str]:

@@ -12,8 +12,9 @@ from typing import Any
 from ..persistence import PersistenceError, atomic_write_json, atomic_write_text
 from ..security import REDACTED, safe_exception_message
 from ._shared import (
-    LegacyDomainError,
+    DomainError,
     _action_name,
+    _default_provider_config_path,
     _default_webdav_enabled_path,
     _default_webdav_status_path,
     _file_bytes,
@@ -33,12 +34,16 @@ class WebDAVSettingsDomain:
         *,
         enabled_path: Path | str | None = None,
         status_path: Path | str | None = None,
+        config_path: Path | str | None = None,
+        state_path: Path | str | None = None,
     ):
         from webdav import core as webdav_core
 
         self.settings_path = Path(settings_path).expanduser() if settings_path else webdav_core.default_settings_file()
         self.enabled_path = Path(enabled_path).expanduser() if enabled_path else _default_webdav_enabled_path(self.settings_path)
         self.status_path = Path(status_path).expanduser() if status_path else _default_webdav_status_path(self.settings_path)
+        self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
+        self.state_path = Path(state_path).expanduser() if state_path else webdav_core.default_state_file()
         self._raw_settings: dict[str, Any] = {}
         self._draft_settings: dict[str, Any] = {}
         self._raw_enabled = False
@@ -66,9 +71,9 @@ class WebDAVSettingsDomain:
         except FileNotFoundError:
             return False
         except OSError:
-            raise LegacyDomainError("WebDAV enablement state is unavailable") from None
+            raise DomainError("WebDAV enablement state is unavailable") from None
         if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
-            raise LegacyDomainError("WebDAV enablement state is unavailable")
+            raise DomainError("WebDAV enablement state is unavailable")
         return True
 
     def _load(self) -> tuple[dict[str, Any], bool, bytes | None]:
@@ -78,7 +83,7 @@ class WebDAVSettingsDomain:
             baseline = _file_bytes(self.settings_path)
             settings = webdav_core.load_settings(self.settings_path)
             enabled = self._enabled()
-        except LegacyDomainError:
+        except DomainError:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "WebDAV settings could not be loaded") from None
@@ -92,6 +97,14 @@ class WebDAVSettingsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "WebDAV settings are invalid") from None
 
+    def sync_settings(self) -> Any:
+        """Return validated private settings only for Core's manual sync path."""
+
+        settings = self._settings()
+        if not settings.configured:
+            raise DomainError("WebDAV is not configured")
+        return settings
+
     def snapshot(self) -> dict[str, Any]:
         settings = self._settings()
         sanitized = settings.sanitized()
@@ -101,7 +114,10 @@ class WebDAVSettingsDomain:
             "revision": self.revision,
             "enabled": self._draft_enabled,
             "configured": bool(settings.configured),
-            "url": sanitized["url"],
+            # This snapshot backs the local settings editor, so the URL must
+            # round-trip exactly instead of using the log-safe redacted form.
+            # Password remains presence-only below.
+            "url": str(self._draft_settings.get("url", "")),
             "username": sanitized["username"],
             "remote_name": sanitized["remote_name"],
             "sync_interval_minutes": sanitized["sync_interval_minutes"],
@@ -132,7 +148,7 @@ class WebDAVSettingsDomain:
         updates = {aliases.get(key, key): value for key, value in updates.items()}
         unknown = set(updates).difference(allowed | {"enabled", "keep_password", "clear_password"})
         if unknown:
-            raise LegacyDomainError("WebDAV settings contain an unsupported field")
+            raise DomainError("WebDAV settings contain an unsupported field")
         draft = copy.deepcopy(self._draft_settings)
         for key in allowed:
             if key not in updates:
@@ -173,18 +189,18 @@ class WebDAVSettingsDomain:
             self._draft_settings = copy.deepcopy(self._raw_settings)
             self._draft_enabled = self._raw_enabled
         else:
-            raise LegacyDomainError("The requested WebDAV action is unavailable")
+            raise DomainError("The requested WebDAV action is unavailable")
         self.revision += 1
         return self.snapshot()
 
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if field != "password" or target is not None:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         return bool(self._draft_settings.get("password"))
 
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
         if field != "password" or target is not None:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         draft = copy.deepcopy(self._draft_settings)
         draft["password"] = value
         self._settings(draft)
@@ -203,8 +219,8 @@ class WebDAVSettingsDomain:
                 enabled = bool(updates.get("enabled", enabled))
             settings = self._settings(raw)
             if enabled and not settings.configured:
-                raise LegacyDomainError("WebDAV URL is required before enabling sync")
-        except LegacyDomainError:
+                raise DomainError("WebDAV URL is required before enabling sync")
+        except DomainError:
             return {"valid": False, "errors": ["WebDAV settings are invalid"]}
         return {"valid": True, "errors": []}
 
@@ -213,20 +229,20 @@ class WebDAVSettingsDomain:
             try:
                 atomic_write_text(self.enabled_path, "1\n")
             except PersistenceError as exc:
-                raise LegacyDomainError(safe_exception_message(exc)) from None
+                raise DomainError(safe_exception_message(exc)) from None
             return
         try:
             details = self.enabled_path.lstat()
         except FileNotFoundError:
             return
         except OSError:
-            raise LegacyDomainError("WebDAV enablement state could not be saved") from None
+            raise DomainError("WebDAV enablement state could not be saved") from None
         if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
-            raise LegacyDomainError("WebDAV enablement state could not be saved")
+            raise DomainError("WebDAV enablement state could not be saved")
         try:
             self.enabled_path.unlink()
         except OSError:
-            raise LegacyDomainError("WebDAV enablement state could not be saved") from None
+            raise DomainError("WebDAV enablement state could not be saved") from None
 
     def apply(self, payload: object | None = None) -> dict[str, Any]:
         from webdav import core as webdav_core
@@ -237,16 +253,16 @@ class WebDAVSettingsDomain:
                 self._patch(data)
         validation = self.validate()
         if not validation["valid"]:
-            raise LegacyDomainError("WebDAV settings are invalid")
+            raise DomainError("WebDAV settings are invalid")
         if not _same_file(self.settings_path, self._baseline_settings) or self._enabled() != self._baseline_enabled:
-            raise LegacyDomainError("WebDAV settings changed on disk; reload before applying")
+            raise DomainError("WebDAV settings changed on disk; reload before applying")
         settings = self._settings()
         try:
-            # Save through the existing module so URL normalization and its
-            # on-disk compatibility remain exactly the same as the old app.
+            # Save through the owning module so URL normalization and the
+            # established on-disk format stay centralized.
             webdav_core.save_settings(self.settings_path, settings)
             self._write_enabled(self._draft_enabled)
-        except LegacyDomainError:
+        except DomainError:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "WebDAV settings could not be saved") from None
@@ -314,7 +330,7 @@ class WebDAVSettingsDomain:
         try:
             settings = self._settings()
             if not settings.configured:
-                raise LegacyDomainError("WebDAV is not configured")
+                raise DomainError("WebDAV is not configured")
             client = webdav_core.WebDAVClient(settings)
             client.try_mkcol(webdav_core.collection_url(settings))
             try:

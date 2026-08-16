@@ -23,7 +23,6 @@ from .base import (
     Dict,
     List,
     Optional,
-    _STREAM_FALLBACK_TEXT_FLUSH_CHARS,
     litellm,
 )
 
@@ -86,6 +85,8 @@ class LiteLLMMenuHook(CustomLogger):
         for update_request in (
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
             _responses_request_module._with_plaintext_agent_message_content_restored,
+            _responses_request_module._with_codex_view_image_output_paths,
+            _responses_request_module._with_codex_function_call_output_text,
             _image_inputs_module._with_bounded_image_inputs,
             _responses_request_module._with_internal_litellm_metadata,
             _responses_request_module._with_mcp_auto_approval,
@@ -157,6 +158,18 @@ class LiteLLMMenuHook(CustomLogger):
             responses_image_input_filtered = False
 
             has_image_generation_tool = _tools_module._request_has_image_generation_tool(request_kwargs)
+            image_tool_unsupported_deployments: list[dict[str, Any]] = []
+            image_tool_unsupported_filtered = False
+
+            if has_image_generation_tool:
+                (
+                    candidate_deployments,
+                    image_tool_unsupported_deployments,
+                    image_tool_unsupported_filtered,
+                ) = _routing_module._with_active_image_generation_tool_unsupported(
+                    candidate_deployments,
+                    request_kwargs=request_kwargs,
+                )
 
             if (
                 not has_image_generation_tool
@@ -186,6 +199,11 @@ class LiteLLMMenuHook(CustomLogger):
                     cooldown_deployments and not after_cooldown
                 ),
                 deployment_cooldown_deployments=cooldown_deployments,
+                image_tool_unsupported_filtered=image_tool_unsupported_filtered,
+                image_tool_unsupported_all_candidates=bool(
+                    image_tool_unsupported_deployments and not candidate_deployments
+                ),
+                image_tool_unsupported_deployments=image_tool_unsupported_deployments,
                 responses_surface_filtered=responses_surface_filtered,
                 image_generation_filtered=image_generation_filtered,
                 web_search_filtered=web_search_filtered,
@@ -254,28 +272,32 @@ class LiteLLMMenuHook(CustomLogger):
             or not _image_generation_module._response_should_trigger_image_generation_fallback(response)
         ):
             return response
-        if (
-            not _image_generation_module._request_forces_image_generation_tool(request_data)
-            and not _responses_request_module._request_already_attempted_streaming_fallback(request_data)
+        if _image_generation_module._response_is_image_generation_policy_refusal(
+            response
         ):
-            fallback_exception = _image_generation_module._image_generation_tool_runtime_fallback_exception()
-            _routing_module._mark_exception_for_deployment_failover(fallback_exception, request_data)
+            return response
+        if not _image_generation_module._request_forces_image_generation_tool(
+            request_data
+        ):
             payload = _streaming_module._build_forced_image_generation_payload(request_data, stream=False)
-            if payload is not None:
-                try:
-                    fallback_response = await _streaming_module._call_forced_image_generation_payload(payload)
-                except Exception:
-                    pass
-                else:
-                    if not _image_generation_module._response_should_trigger_image_generation_fallback(fallback_response):
-                        return fallback_response
-                    raise _image_generation_module._image_generation_tool_runtime_fallback_exception()
-        raise litellm.InternalServerError(
-            message="upstream returned no usable image_generation result while image_generation was available; trying fallback deployment",
-            model=_request_context_module._request_model_for_error(request_data),
-            llm_provider="",
+            if payload is None:
+                raise RuntimeError(
+                    "image_generation forced probe payload could not be built"
+                )
+            fallback_response = await _streaming_module._call_forced_image_generation_payload(
+                payload
+            )
+            if not _image_generation_module._response_should_trigger_image_generation_fallback(
+                fallback_response
+            ):
+                return fallback_response
+            if _image_generation_module._response_is_image_generation_policy_refusal(
+                fallback_response
+            ):
+                return fallback_response
+        raise _image_generation_module._image_generation_tool_runtime_fallback_exception(
+            capability_unsupported=True,
         )
-        return response
 
     async def async_post_call_streaming_iterator_hook(
         self,
@@ -309,8 +331,14 @@ class LiteLLMMenuHook(CustomLogger):
             )
         if (
             not _tools_module._request_has_image_generation_tool(request_data)
-            or _image_generation_module._request_forces_image_generation_tool(request_data)
-            or _responses_request_module._request_already_attempted_streaming_fallback(request_data)
+            or (
+                _image_generation_module._request_forces_image_generation_tool(
+                    request_data
+                )
+                and _responses_request_module._request_already_attempted_streaming_fallback(
+                    request_data
+                )
+            )
         ):
             async for chunk in _streaming_module._yield_start_buffered_stream_with_error_fallback(
                 response,
@@ -351,11 +379,13 @@ class LiteLLMMenuHook(CustomLogger):
                 chunk_text = _responses_output_module._response_text(chunk)
                 if chunk_text:
                     text = f"{text}\n{chunk_text}" if text else chunk_text
+                    if _image_generation_module._response_is_image_generation_policy_refusal(
+                        {"output_text": text}
+                    ):
+                        should_passthrough = True
+                        break
                     if _image_generation_module._response_is_image_generation_unavailable_refusal({"output_text": text}):
                         should_fallback = True
-                        break
-                    if len(text) >= _STREAM_FALLBACK_TEXT_FLUSH_CHARS:
-                        should_passthrough = True
                         break
         except Exception as exc:
             async for fallback_chunk in _streaming_module._yield_streaming_error_fallback_or_raise(
@@ -374,19 +404,42 @@ class LiteLLMMenuHook(CustomLogger):
             should_fallback = True
 
         if should_fallback:
-            fallback_exception = _image_generation_module._image_generation_tool_runtime_fallback_exception()
-            _routing_module._mark_exception_for_deployment_failover(fallback_exception, request_data)
-            payload = _streaming_module._build_forced_image_generation_payload(request_data, stream=True)
-            if payload is not None:
-                yielded_fallback = False
-                try:
-                    async for chunk in _streaming_module._stream_forced_image_generation_payload(payload):
-                        yielded_fallback = True
-                        yield deliver_chunk(chunk)
-                    if yielded_fallback:
-                        return
-                except Exception:
-                    pass
+            if _image_generation_module._request_forces_image_generation_tool(
+                request_data
+            ):
+                fallback_exception = (
+                    _image_generation_module._image_generation_tool_runtime_fallback_exception(
+                        capability_unsupported=True,
+                    )
+                )
+                async for fallback_chunk in _streaming_module._yield_streaming_error_fallback_or_raise(
+                    request_data,
+                    fallback_exception,
+                ):
+                    yield deliver_chunk(fallback_chunk)
+                return
+
+            payload = _streaming_module._build_forced_image_generation_payload(
+                request_data,
+                stream=True,
+            )
+            if payload is None:
+                raise RuntimeError(
+                    "image_generation forced probe payload could not be built"
+                )
+            try:
+                async for chunk in _streaming_module._stream_forced_image_generation_payload(
+                    payload
+                ):
+                    yield deliver_chunk(chunk)
+                return
+            except Exception as exc:
+                async for fallback_chunk in _streaming_module._yield_streaming_error_fallback_or_raise(
+                    request_data,
+                    exc,
+                ):
+                    yield deliver_chunk(fallback_chunk)
+                return
 
         async for chunk in _streaming_module._yield_guarded_original_stream(buffer, _streaming_module._empty_async_iterator(), request_data):
             yield deliver_chunk(chunk)

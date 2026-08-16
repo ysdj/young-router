@@ -1,8 +1,7 @@
 """Bundled Runtime Settings schema used by the Python Core.
 
-The React Native bundles deliberately exclude the legacy ``service/`` shell
-backend.  Keep the display metadata and validation constraints in importable
-Python data so Runtime Settings works identically in a portable Core bundle.
+Keep display metadata and validation constraints in importable Python data so
+Runtime Settings works identically in a portable Core bundle.
 """
 
 from __future__ import annotations
@@ -51,7 +50,7 @@ RUNTIME_SETTINGS_SCHEMA: Final[tuple[dict[str, object], ...]] = (
     {'key': 'LITELLM_MENU_PROTOCOL_FALLBACK_TTL_SECONDS', 'category': 'Fallback', 'label': 'Backup protocol memory', 'unit': 'seconds', 'kind': 'float', 'default': '600', 'minimum': 0, 'maximum': 86400, 'help': 'After a backup protocol succeeds, reuse it for the same deployment and incoming protocol for this long before probing the incoming protocol again. 0 disables the memory.'},
     {'key': 'LITELLM_MENU_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED', 'category': 'Fallback', 'label': 'Ordinary requests write cooldown', 'kind': 'bool', 'default': '1', 'help': 'Whether failed ordinary requests add failures to the shared deployment cooldown pool. Existing cooldowns are still read by every request type.'},
     {'key': 'LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED', 'category': 'Fallback', 'label': 'Compaction requests write cooldown', 'kind': 'bool', 'default': '0', 'help': 'Whether failed structured Codex compaction requests add failures to the shared deployment cooldown pool. Disabled by default so a compaction-specific upstream failure does not cool a route for ordinary work.'},
-    {'key': 'LITELLM_MENU_IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS', 'category': 'Fallback', 'label': 'Image tool attempts', 'unit': 'attempts', 'kind': 'int', 'default': '3', 'minimum': 0, 'maximum': 20, 'help': 'Maximum same-request image-generation tool recovery attempts before returning a safe failure. 0 disables this recovery.'},
+    {'key': 'LITELLM_MENU_IMAGE_TOOL_UNSUPPORTED_TTL_SECONDS', 'category': 'Fallback', 'label': 'Image tool unsupported memory', 'unit': 'seconds', 'kind': 'float', 'default': '600', 'minimum': 0, 'maximum': 86400, 'help': 'How long a deployment is skipped after a deterministic image_generation capability rejection. Parameter errors, timeouts, policy failures, and other upstream errors do not populate this memory. 0 disables cross-request memory.'},
     {'key': 'LITELLM_MENU_COMPUTER_FACADE_BACKEND', 'category': 'Computer Facade', 'label': 'Backend', 'kind': 'enum', 'default': 'auto', 'options': ['auto', 'mcp', 'browser', 'chrome', 'playwright', 'mock'], 'help': 'Executor backend. Explicit choices do not silently fall back to another real backend.'},
     {'key': 'LITELLM_MENU_COMPUTER_FACADE_MODEL', 'category': 'Computer Facade', 'label': 'Planner model', 'kind': 'string', 'default': '', 'help': 'Optional model group or route for the internal JSON planner. Empty uses the request model.'},
     {'key': 'LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS', 'category': 'Computer Facade', 'label': 'Max steps', 'unit': 'steps', 'kind': 'int', 'default': '20', 'minimum': 1, 'maximum': 200, 'help': 'Maximum computer observation/action turns before safe failure.'},

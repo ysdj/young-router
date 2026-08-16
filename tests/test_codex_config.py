@@ -100,242 +100,6 @@ class CodexConfigTests(unittest.TestCase):
             payload["patch"] = patch
         return json.dumps(payload)
 
-    def test_status_lists_all_configured_models_without_secrets(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            runtime_config = temp / "config.yaml"
-            codex_home = temp / "codex"
-            self.write_runtime_config(runtime_config)
-
-            result = self.run_command(runtime_config, codex_home, "status")
-
-            self.assertEqual(0, result.returncode, result.stderr)
-            payload = json.loads(result.stdout)
-            self.assertEqual(
-                ["active-chat", "disabled-chat", "unavailable-chat"],
-                [item["model"] for item in payload["models"]],
-            )
-            self.assertEqual("active", payload["models"][0]["provider"])
-            self.assertNotIn("sk-test-local", result.stdout)
-            self.assertNotIn("replace-me", result.stdout)
-
-    def test_invalid_runtime_yaml_does_not_echo_secret_source_line(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            runtime_config = temp / "config.yaml"
-            codex_home = temp / "codex"
-            marker = "sk-synthetic-leak-marker"
-            runtime_config.write_text(
-                f'providers:\n  primary:\n    value: "{marker}\n',
-                encoding="utf-8",
-            )
-
-            result = self.run_command(runtime_config, codex_home, "status")
-
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("LiteLLM config is not valid YAML", result.stderr)
-            self.assertNotIn(marker, result.stderr)
-
-    def test_apply_updates_only_local_codex_connection_and_auth(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            runtime_config = temp / "config.yaml"
-            codex_home = temp / "codex"
-            codex_home.mkdir()
-            self.write_runtime_config(runtime_config)
-            config_path = codex_home / "config.toml"
-            auth_path = codex_home / "auth.json"
-            config_path.write_text(
-                textwrap.dedent(
-                    """
-                    model = "previous-model"
-                    model_provider = "custom"
-                    personality = "pragmatic"
-
-                    [mcp_servers.example]
-                    command = "example"
-                    """
-                ).lstrip(),
-                encoding="utf-8",
-            )
-            auth_path.write_text(json.dumps({"tokens": {"keep": True}}) + "\n", encoding="utf-8")
-            os.chmod(config_path, 0o644)
-            os.chmod(auth_path, 0o644)
-
-            result = self.run_command(runtime_config, codex_home, "apply", "--model", "active-chat")
-
-            self.assertEqual(0, result.returncode, result.stderr)
-            config = config_path.read_text(encoding="utf-8")
-            auth = json.loads(auth_path.read_text(encoding="utf-8"))
-            self.assertIn('model_provider = "openai"', config)
-            self.assertIn('model = "active-chat"', config)
-            self.assertIn('openai_base_url = "http://127.0.0.1:4000/v1"', config)
-            self.assertIn('cli_auth_credentials_store = "file"', config)
-            self.assertIn('personality = "pragmatic"', config)
-            self.assertIn("[mcp_servers.example]", config)
-            self.assertEqual("sk-test-local", auth["OPENAI_API_KEY"])
-            self.assertEqual({"keep": True}, auth["tokens"])
-            self.assertEqual(0o600, stat.S_IMODE(config_path.stat().st_mode))
-            self.assertEqual(0o600, stat.S_IMODE(auth_path.stat().st_mode))
-            self.assertNotIn("sk-test-local", result.stdout)
-
-    def test_apply_handles_quoted_top_level_keys_without_duplicate_toml_keys(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            runtime_config = temp / "config.yaml"
-            codex_home = temp / "codex"
-            codex_home.mkdir()
-            self.write_runtime_config(runtime_config)
-            config_path = codex_home / "config.toml"
-            config_path.write_text(
-                '"model" = "old"\n"model_provider" = "custom"\npersonality = "keep"\n',
-                encoding="utf-8",
-            )
-
-            result = self.run_command(runtime_config, codex_home, "apply", "--model", "active-chat")
-
-            self.assertEqual(0, result.returncode, result.stderr)
-            parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual("active-chat", parsed["model"])
-            self.assertEqual("openai", parsed["model_provider"])
-            self.assertEqual("keep", parsed["personality"])
-
-    def test_structured_features_reads_legacy_alias_without_exposing_duplicate_control(self) -> None:
-        import codex_config
-
-        structured = codex_config.structured_config(
-            {"features": {"unified_exec": True, "fast_mode": False}},
-            {},
-        )
-
-        self.assertTrue(structured["features"]["experimental_use_unified_exec_tool"])
-        self.assertFalse(structured["features"]["fast_mode"])
-        self.assertNotIn("unified_exec", structured["features"])
-        self.assertNotIn("unified_exec", structured["supported_features"])
-
-    def test_apply_does_not_rewrite_assignment_text_inside_multiline_strings(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            runtime_config = temp / "config.yaml"
-            codex_home = temp / "codex"
-            codex_home.mkdir()
-            self.write_runtime_config(runtime_config)
-            config_path = codex_home / "config.toml"
-            original_instructions = 'Keep this literal line:\nmodel = "do not edit"\n'
-            config_path.write_text(
-                'instructions = """Keep this literal line:\nmodel = \\"do not edit\\"\n"""\n'
-                'model = "old"\nmodel_provider = "custom"\n[mcp_servers.example]\ncommand = "keep"\n',
-                encoding="utf-8",
-            )
-
-            result = self.run_command(runtime_config, codex_home, "apply", "--model", "active-chat")
-
-            self.assertEqual(0, result.returncode, result.stderr)
-            parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
-            self.assertEqual("active-chat", parsed["model"])
-            self.assertEqual(original_instructions, parsed["instructions"])
-            self.assertEqual("keep", parsed["mcp_servers"]["example"]["command"])
-
-    def test_apply_rejects_unknown_or_ambiguous_model_without_writing(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            runtime_config = temp / "config.yaml"
-            codex_home = temp / "codex"
-            codex_home.mkdir()
-            self.write_runtime_config(runtime_config)
-            config_path = codex_home / "config.toml"
-            config_path.write_text('personality = "keep"\n', encoding="utf-8")
-
-            result = self.run_command(runtime_config, codex_home, "apply", "--model", "missing-chat")
-
-            self.assertNotEqual(0, result.returncode)
-            self.assertEqual('personality = "keep"\n', config_path.read_text(encoding="utf-8"))
-            self.assertFalse((codex_home / "auth.json").exists())
-
-    def test_apply_restores_auth_when_config_write_fails(self) -> None:
-        import codex_config
-
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            runtime_config = temp / "config.yaml"
-            codex_home = temp / "codex"
-            codex_home.mkdir()
-            self.write_runtime_config(runtime_config)
-            config_path = codex_home / "config.toml"
-            auth_path = codex_home / "auth.json"
-            original_config = 'personality = "keep"\n'
-            original_auth = json.dumps({"tokens": {"keep": True}}) + "\n"
-            config_path.write_text(original_config, encoding="utf-8")
-            auth_path.write_text(original_auth, encoding="utf-8")
-
-            real_atomic_write = codex_config.atomic_write
-
-            def fail_config_write(path: Path, data: str, mode: int = 0o600) -> None:
-                if path == config_path and 'model_provider = "openai"' in data:
-                    raise OSError("synthetic config write failure")
-                real_atomic_write(path, data, mode)
-
-            with mock.patch.dict(
-                os.environ,
-                {"CODEX_HOME": str(codex_home)},
-                clear=False,
-            ), mock.patch.object(codex_config, "atomic_write", side_effect=fail_config_write):
-                with self.assertRaisesRegex(OSError, "synthetic config write failure"):
-                    codex_config.apply_selected_model(
-                        codex_config.load_yaml(runtime_config),
-                        "active-chat",
-                    )
-
-            self.assertEqual(original_config, config_path.read_text(encoding="utf-8"))
-            self.assertEqual(original_auth, auth_path.read_text(encoding="utf-8"))
-
-    def test_apply_uses_exact_provider_and_deployment_when_public_models_repeat(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            temp = Path(directory)
-            runtime_config = temp / "config.yaml"
-            codex_home = temp / "codex"
-            codex_home.mkdir()
-            runtime_config.write_text(
-                textwrap.dedent(
-                    """
-                    providers:
-                      alpha:
-                        api_base: https://alpha.example.test/v1
-                      beta:
-                        api_base: https://beta.example.test/v1
-                    model_list:
-                      - model_name: shared-chat
-                        litellm_params: {model: openai/alpha-chat}
-                        model_info: {id: alpha0001, provider: alpha, upstream_url_surface: openai/responses, supported_upstream_url_surfaces: [openai/responses]}
-                      - model_name: shared-chat
-                        litellm_params: {model: openai/beta-chat}
-                        model_info: {id: beta0002, provider: beta, upstream_url_surface: openai/responses, supported_upstream_url_surfaces: [openai/responses]}
-                    general_settings: {master_key: sk-test-local}
-                    """
-                ).lstrip(),
-                encoding="utf-8",
-            )
-            config_path = codex_home / "config.toml"
-            config_path.write_text('personality = "keep"\n', encoding="utf-8")
-
-            ambiguous = self.run_command(runtime_config, codex_home, "apply", "--model", "shared-chat")
-            self.assertNotEqual(0, ambiguous.returncode)
-            self.assertEqual('personality = "keep"\n', config_path.read_text(encoding="utf-8"))
-
-            selected = self.run_command(
-                runtime_config,
-                codex_home,
-                "apply",
-                "--model",
-                "shared-chat",
-                "--provider",
-                "beta",
-                "--deployment-id",
-                "beta0002",
-            )
-            self.assertEqual(0, selected.returncode, selected.stderr)
-            self.assertIn('model = "shared-chat"', config_path.read_text(encoding="utf-8"))
-
     def test_editor_load_reports_existing_permission_conflict_without_hiding_draft(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
@@ -390,7 +154,7 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual('personality = "disk"\n', config_path.read_text(encoding="utf-8"))
             self.assertEqual('{"OPENAI_API_KEY": "disk-key"}\n', auth_path.read_text(encoding="utf-8"))
 
-    def test_editor_sync_accepts_exact_swift_structured_wrapper_and_round_trips_fields(self) -> None:
+    def test_editor_sync_round_trips_structured_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             runtime_config = temp / "config.yaml"
@@ -411,7 +175,7 @@ class CodexConfigTests(unittest.TestCase):
                 """
             ).lstrip()
             raw_auth = '{"tokens": {"keep": true}}\n'
-            swift_structured = {
+            structured_patch = {
                 "model": "new-model",
                 "review_model": "review-model",
                 "model_provider": "custom-provider",
@@ -433,7 +197,7 @@ class CodexConfigTests(unittest.TestCase):
                     "fast_mode": True,
                     "goals": True,
                     "js_repl": True,
-                    "unified_exec": True,
+                    "experimental_use_unified_exec_tool": True,
                     "shell_snapshot": False,
                     "shell_tool": True,
                     "skill_mcp_dependency_install": False,
@@ -483,7 +247,7 @@ class CodexConfigTests(unittest.TestCase):
                 runtime_config,
                 codex_home,
                 "sync",
-                input_text=self.editor_request(raw_config, raw_auth, {"structured": swift_structured}),
+                input_text=self.editor_request(raw_config, raw_auth, structured_patch),
             )
 
             self.assertEqual(0, result.returncode, result.stderr)
@@ -507,7 +271,6 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual("get-custom-token", parsed["model_providers"]["custom-provider"]["auth"]["command"])
             self.assertEqual("project-mcp", parsed["mcp_servers"]["project-tools"]["command"])
             self.assertTrue(parsed["features"]["experimental_use_unified_exec_tool"])
-            self.assertNotIn("unified_exec", parsed["features"])
             self.assertEqual("sk-swift-editor-key", json.loads(payload["auth_text"])["OPENAI_API_KEY"])
 
     def test_editor_apply_returns_raw_text_and_writes_both_files_0600(self) -> None:
@@ -612,20 +375,18 @@ class CodexConfigTests(unittest.TestCase):
                 """
             ).lstrip()
             request = {
-                "structured": {
-                    "providers": [
-                        {
-                            "id": "bearer",
-                            "name": "Updated label",
-                            "base_url": "https://upstream.example.test/v1",
-                            "wire_api": "responses",
-                            "env_key": "",
-                            "requires_openai_auth": False,
-                            "auth_mode": "bearer",
-                            "auth_command": None,
-                        }
-                    ]
-                }
+                "providers": [
+                    {
+                        "id": "bearer",
+                        "name": "Updated label",
+                        "base_url": "https://upstream.example.test/v1",
+                        "wire_api": "responses",
+                        "env_key": "",
+                        "requires_openai_auth": False,
+                        "auth_mode": "bearer",
+                        "auth_command": None,
+                    }
+                ]
             }
 
             result = self.run_command(
@@ -672,7 +433,7 @@ class CodexConfigTests(unittest.TestCase):
                 input_text=self.editor_request(
                     config_text,
                     "{}\n",
-                    {"structured": {"model": "direct-model"}},
+                    {"model": "direct-model"},
                 ),
             )
 
@@ -717,12 +478,10 @@ class CodexConfigTests(unittest.TestCase):
                     legacy,
                     "{}\n",
                     {
-                        "structured": {
-                            "permissions": {
-                                "mode": "profile",
-                                "default_permissions": ":workspace",
-                                "approval_policy": "never",
-                            }
+                        "permissions": {
+                            "mode": "profile",
+                            "default_permissions": ":workspace",
+                            "approval_policy": "never",
                         }
                     },
                 ),
@@ -743,14 +502,12 @@ class CodexConfigTests(unittest.TestCase):
                     profile_text,
                     "{}\n",
                     {
-                        "structured": {
-                            "permissions": {
-                                "mode": "legacy",
-                                "sandbox_mode": "workspace-write",
-                                "approval_policy": "never",
-                                "network_access": True,
-                                "writable_roots": ["/tmp"],
-                            }
+                        "permissions": {
+                            "mode": "legacy",
+                            "sandbox_mode": "workspace-write",
+                            "approval_policy": "never",
+                            "network_access": True,
+                            "writable_roots": ["/tmp"],
                         }
                     },
                 ),
@@ -780,7 +537,7 @@ class CodexConfigTests(unittest.TestCase):
                 input_text=self.editor_request(
                     legacy,
                     "{}\n",
-                    {"structured": {"permissions": {"mode": "profile"}}},
+                    {"permissions": {"mode": "profile"}},
                 ),
             )
             self.assertEqual(0, to_profile.returncode, to_profile.stderr)
@@ -795,7 +552,7 @@ class CodexConfigTests(unittest.TestCase):
                 input_text=self.editor_request(
                     json.loads(to_profile.stdout)["config_text"],
                     "{}\n",
-                    {"structured": {"permissions": {"mode": "legacy"}}},
+                    {"permissions": {"mode": "legacy"}},
                 ),
             )
             self.assertEqual(0, to_legacy.returncode, to_legacy.stderr)
@@ -831,11 +588,9 @@ class CodexConfigTests(unittest.TestCase):
                     config_text,
                     "{}\n",
                     {
-                        "structured": {
-                            "direct_connection": {
-                                "provider": "relay",
-                                "base_url": "https://new-relay.example.test/v1",
-                            }
+                        "direct_connection": {
+                            "provider": "relay",
+                            "base_url": "https://new-relay.example.test/v1",
                         }
                     },
                 ),
@@ -856,11 +611,9 @@ class CodexConfigTests(unittest.TestCase):
                     json.loads(custom.stdout)["config_text"],
                     "{}\n",
                     {
-                        "structured": {
-                            "direct_connection": {
-                                "provider": "openai",
-                                "base_url": "https://new-openai.example.test/v1",
-                            }
+                        "direct_connection": {
+                            "provider": "openai",
+                            "base_url": "https://new-openai.example.test/v1",
                         }
                     },
                 ),
@@ -899,22 +652,20 @@ class CodexConfigTests(unittest.TestCase):
                     config_text,
                     "{}\n",
                     {
-                        "structured": {
-                            "providers": [
-                                {
-                                    "id": "renamed-relay",
-                                    "name": "Relay",
-                                    "base_url": "https://new-relay.example.test/v1",
-                                    "wire_api": "responses",
-                                    "auth_mode": "none",
-                                }
-                            ],
-                            "direct_connection": {
-                                "provider": "renamed-relay",
+                        "providers": [
+                            {
+                                "id": "renamed-relay",
+                                "name": "Relay",
                                 "base_url": "https://new-relay.example.test/v1",
-                            },
-                            "model_provider": "renamed-relay",
-                        }
+                                "wire_api": "responses",
+                                "auth_mode": "none",
+                            }
+                        ],
+                        "direct_connection": {
+                            "provider": "renamed-relay",
+                            "base_url": "https://new-relay.example.test/v1",
+                        },
+                        "model_provider": "renamed-relay",
                     },
                 ),
             )

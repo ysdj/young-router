@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
+import hashlib
 import json
 import math
 import os
@@ -23,7 +24,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from ..persistence import AtomicJSONStore, PersistenceError
+from ..persistence import AtomicJSONStore, PersistenceError, read_bytes
 from ..security import safe_exception_message
 
 
@@ -827,22 +828,50 @@ class RelayAccountsDomain:
         # A native browser-session erase can fail after account deletion. Keep
         # only an opaque tombstone so the UI can retry after a restart.
         self._pending_credential_cleanups: list[dict[str, str]] = []
+        # Ordinary relay-account changes retain their historical immediate
+        # persistence contract.  A configuration-package import is the one
+        # exception: it replaces this in-memory view first and is committed
+        # only by Core's explicit Apply transaction.
+        self._import_staged = False
+        self._baseline_bytes: bytes | None = None
         self.revision = 0
         self.reload()
 
-    def _persist(self) -> None:
+    def _stored_payload(self) -> dict[str, Any]:
+        """Return the complete durable relay document, including opt-in secrets.
+
+        This value is deliberately private: callers must use ``snapshot`` for
+        the IPC-safe view.  It is shared by persistence and trusted package
+        export so the package cannot accidentally omit remembered sessions or
+        passwords that are required to restore a selected relay account.
+        """
+
+        return {
+            "version": 3,
+            "stations": [copy.deepcopy(station) for station in self._stations],
+            "accounts": [_stored_account(account) for account in self._accounts],
+            "pending_credential_cleanups": [
+                _public_pending_cleanup(cleanup)
+                for cleanup in self._pending_credential_cleanups
+            ],
+        }
+
+    def _read_storage_bytes(self) -> bytes | None:
         try:
-            self._store.write(
-                {
-                    "version": 3,
-                    "stations": [copy.deepcopy(station) for station in self._stations],
-                    "accounts": [_stored_account(account) for account in self._accounts],
-                    "pending_credential_cleanups": [
-                        _public_pending_cleanup(cleanup)
-                        for cleanup in self._pending_credential_cleanups
-                    ],
-                }
-            )
+            return read_bytes(self.storage_path)
+        except PersistenceError as exc:
+            raise RelayAccountsError(safe_exception_message(exc)) from None
+
+    def _persist(self, *, force: bool = False) -> None:
+        # A package import must remain reversible until the shared Core Apply
+        # transaction crosses the persistence boundary.  Existing account
+        # operations still call this method normally and therefore continue
+        # to persist immediately outside that staged-import state.
+        if self._import_staged and not force:
+            return
+        try:
+            self._store.write(self._stored_payload())
+            self._baseline_bytes = self._read_storage_bytes()
         except PersistenceError as exc:
             raise RelayAccountsError(safe_exception_message(exc)) from None
 
@@ -855,6 +884,8 @@ class RelayAccountsDomain:
             "session_secrets": copy.deepcopy(self._session_secrets),
             "resource_secret_cache": copy.deepcopy(self._resource_secret_cache),
             "pending_credential_cleanups": copy.deepcopy(self._pending_credential_cleanups),
+            "import_staged": self._import_staged,
+            "baseline_bytes": self._baseline_bytes,
             "revision": self.revision,
         }
 
@@ -864,6 +895,8 @@ class RelayAccountsDomain:
         secrets = checkpoint.get("session_secrets")
         resource_secrets = checkpoint.get("resource_secret_cache")
         pending_cleanups = checkpoint.get("pending_credential_cleanups")
+        import_staged = checkpoint.get("import_staged")
+        baseline_bytes = checkpoint.get("baseline_bytes")
         revision = checkpoint.get("revision")
         if (
             not isinstance(stations, list)
@@ -872,6 +905,8 @@ class RelayAccountsDomain:
             or not isinstance(secrets, Mapping)
             or not isinstance(resource_secrets, Mapping)
             or not isinstance(pending_cleanups, list)
+            or type(import_staged) is not bool
+            or (baseline_bytes is not None and not isinstance(baseline_bytes, bytes))
             or type(revision) is not int
         ):
             raise RelayAccountsError("Relay account rollback failed")
@@ -880,6 +915,8 @@ class RelayAccountsDomain:
         self._session_secrets = copy.deepcopy(dict(secrets))
         self._resource_secret_cache = copy.deepcopy(dict(resource_secrets))
         self._pending_credential_cleanups = copy.deepcopy(pending_cleanups)
+        self._import_staged = import_staged
+        self._baseline_bytes = baseline_bytes
         self.revision = revision
 
     def _index(self, value: object) -> int:
@@ -976,9 +1013,11 @@ class RelayAccountsDomain:
         }
 
     def draft_state(self) -> object:
-        # Relay-account operations persist immediately; this domain has no
-        # unapplied draft state for the shared Apply/Cancel lifecycle.
-        return {}
+        # Relay-account operations persist immediately, except an imported
+        # package.  Returning the private durable payload only while that
+        # import is staged lets Core track it as a normal dirty draft without
+        # ever putting it in the public snapshot.
+        return self._stored_payload() if self._import_staged else {}
 
     def _migration_station(
         self,
@@ -1006,15 +1045,16 @@ class RelayAccountsDomain:
             fallback_name=_station_display_name(origin),
         )
 
-    def reload(self) -> dict[str, Any]:
-        try:
-            loaded = self._store.read(
-                default={"version": 1, "accounts": [], "pending_credential_cleanups": []}
-            )
-        except PersistenceError as exc:
-            raise RelayAccountsError(safe_exception_message(exc)) from None
+    def _decode_storage(
+        self,
+        loaded: Mapping[str, Any],
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]], list[dict[str, str]], bool]:
+        """Validate one durable relay document without mutating disk or state."""
+
         if not isinstance(loaded, Mapping):
             raise RelayAccountsError("Relay account storage is invalid")
+        if loaded.get("version", 1) not in {1, 3}:
+            raise RelayAccountsError("Relay account storage version is unsupported")
         raw_accounts = loaded.get("accounts", [])
         if not isinstance(raw_accounts, list) or len(raw_accounts) > MAX_ACCOUNTS:
             raise RelayAccountsError("Relay account storage is invalid")
@@ -1107,9 +1147,6 @@ class RelayAccountsDomain:
             or has_invalid_cleanup_owner
         ):
             raise RelayAccountsError("Relay cleanup storage is invalid")
-        self._stations = stations
-        self._accounts = accounts
-        self._pending_credential_cleanups = pending_cleanups
         migrated = (
             loaded.get("version") != 3
             or "stations" not in loaded
@@ -1118,8 +1155,50 @@ class RelayAccountsDomain:
             or any(not isinstance(item.get("station_id"), str) or not item.get("station_id") for item in raw_accounts if isinstance(item, Mapping))
             or len(stations) != len(raw_stations)
         )
+        return stations, accounts, pending_cleanups, migrated
+
+    def _replace_storage_state(self, loaded: Mapping[str, Any]) -> bool:
+        stations, accounts, pending_cleanups, migrated = self._decode_storage(loaded)
+        self._stations = stations
+        self._accounts = accounts
+        self._pending_credential_cleanups = pending_cleanups
+        # A reload or package replacement invalidates every process-local
+        # credential. Reusing an account id from another file must never reuse
+        # the previous file's browser session or API-key cache.
+        self._session_secrets = {}
+        self._resource_secret_cache = {}
+        return migrated
+
+    def persistence_paths(self) -> tuple[Path, ...]:
+        return (self.storage_path,)
+
+    def external_disk_state(self) -> dict[str, bool]:
+        current = self._read_storage_bytes()
+        return {"changed": current != self._baseline_bytes, "exists": current is not None}
+
+    def external_disk_identity(self) -> str:
+        current = self._read_storage_bytes()
+        return "missing" if current is None else hashlib.sha256(b"present\0" + current).hexdigest()
+
+    def rebase_external_disk(self) -> dict[str, Any]:
+        self._baseline_bytes = self._read_storage_bytes()
+        self.revision += 1
+        return self.snapshot()
+
+    def reload(self) -> dict[str, Any]:
+        try:
+            loaded = self._store.read(
+                default={"version": 1, "accounts": [], "pending_credential_cleanups": []}
+            )
+        except PersistenceError as exc:
+            raise RelayAccountsError(safe_exception_message(exc)) from None
+        if not isinstance(loaded, Mapping):
+            raise RelayAccountsError("Relay account storage is invalid")
+        migrated = self._replace_storage_state(loaded)
+        self._import_staged = False
+        self._baseline_bytes = self._read_storage_bytes()
         if migrated:
-            self._persist()
+            self._persist(force=True)
         self.revision += 1
         return self.snapshot()
 
@@ -1452,7 +1531,43 @@ class RelayAccountsDomain:
 
     def apply(self, payload: object | None = None) -> dict[str, Any]:
         del payload
+        if not self._import_staged:
+            return self.snapshot()
+        if self._read_storage_bytes() != self._baseline_bytes:
+            raise RelayAccountsError("Relay accounts changed on disk; reload before applying")
+        self._persist(force=True)
+        self._import_staged = False
+        self.revision += 1
         return self.snapshot()
+
+    def export(self, *, include_sensitive: bool = False) -> dict[str, Any]:
+        """Export a package-ready durable relay document.
+
+        ``include_sensitive`` is used exclusively when Core writes a selected
+        local package. The normal result intentionally stays equivalent to the
+        public snapshot, so account passwords and browser sessions never cross
+        the IPC boundary.
+        """
+
+        if include_sensitive:
+            return {"domain": self.name, "storage": self._stored_payload()}
+        return self.snapshot()
+
+    def import_package(self, payload: object) -> None:
+        """Stage a complete relay-store replacement without writing to disk."""
+
+        if not isinstance(payload, Mapping):
+            raise RelayAccountsError("Relay account package is invalid")
+        data = dict(payload)
+        domain = data.get("domain")
+        if domain is not None and domain != self.name:
+            raise RelayAccountsError("Relay account package is invalid")
+        if set(data).difference({"domain", "storage"}) or not isinstance(data.get("storage"), Mapping):
+            raise RelayAccountsError("Relay account package is invalid")
+        # Validate and replace only after parsing the entire durable document.
+        self._replace_storage_state(dict(data["storage"]))
+        self._import_staged = True
+        self.revision += 1
 
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if target is None:
@@ -2283,7 +2398,7 @@ class RelayAccountsDomain:
                         "api_key": key,
                         "enabled": True,
                         "model_enabled": True,
-                        "order": 1,
+                        "order": 0,
                         "deployment_id": uuid.uuid4().hex[:8],
                         "upstream_url_surface": "openai/responses",
                     }
@@ -2308,23 +2423,6 @@ class RelayAccountsDomain:
             "model_count": imported_models,
             "providers": snapshot,
         }
-
-    def import_into(self, account_id: str, providers_domain: object) -> dict[str, Any]:
-        """Compatibility wrapper for the one-resource programmatic import path."""
-
-        index = self._index(account_id)
-        account = self._accounts[index]
-        if account.get("resource_status") != "ready":
-            self.refresh_resources(account_id)
-            account = self._accounts[index]
-        resources = account.get("resources", [])
-        if not isinstance(resources, list) or not resources:
-            raise RelayAccountsError("Relay has no available API resources")
-        resource = next((item for item in resources if isinstance(item, Mapping) and item.get("enabled") is not False), None)
-        if resource is None:
-            raise RelayAccountsError("Relay has no available API resources")
-        return self.import_resources(account_id, [resource["id"]], providers_domain)
-
 
 __all__ = [
     "ACCOUNT_TYPES",

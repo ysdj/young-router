@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
+import urllib.request
 
 
 _KNOWN_API_ENDPOINT_SUFFIXES = (
@@ -18,6 +20,51 @@ _KNOWN_API_ENDPOINT_SUFFIXES = (
     ("messages",),
     ("models",),
 )
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        fp: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def isolated_http_opener() -> urllib.request.OpenerDirector:
+    """Build an opener that cannot redirect credential-bearing requests."""
+
+    handlers: list[Any] = [_NoRedirect()]
+    if os.environ.get("LITELLM_USE_SYSTEM_PROXIES") != "1":
+        handlers.insert(0, urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(*handlers)
+
+
+def service_root(value: Any) -> Optional[str]:
+    """Return the HTTP service root behind a configured API base or endpoint."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    suffix = _matched_endpoint_suffix(parts)
+    if suffix is not None:
+        parts = parts[: -len(suffix)]
+    elif parts and parts[-1].lower() == "v1":
+        parts.pop()
+    return _url_with_path(parsed, parts).rstrip("/")
 
 
 def _split_api_url(value: Any) -> Optional[tuple[Any, list[str]]]:

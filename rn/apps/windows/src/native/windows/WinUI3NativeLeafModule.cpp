@@ -162,13 +162,14 @@ void WinUI3NativeLeafModule::FocusWindow(std::wstring const& route) noexcept {
 }
 
 void WinUI3NativeLeafModule::SetWindowContentSize(
+    std::wstring const& route,
     double width,
     double height,
     winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept {
   try {
     auto leaf = leaf_;
-    context_.UIDispatcher().Post([leaf, width, height, promise] {
-      promise.Resolve(leaf->SetWindowContentSize(width, height));
+    context_.UIDispatcher().Post([leaf, route, width, height, promise] {
+      promise.Resolve(leaf->SetWindowContentSize(route, width, height));
     });
   } catch (...) {
     promise.Resolve(false);
@@ -295,17 +296,34 @@ void WinUI3NativeLeafModule::ShowReadOnlyText(
     std::wstring const& title,
     std::wstring const& text,
     std::wstring const& close_label,
+    std::wstring const& language,
+    std::wstring const& html,
     winrt::Microsoft::ReactNative::ReactPromise<void> const& promise) noexcept {
+  if (html.empty() || html.size() > 4 * 1024 * 1024 ||
+      text.size() > 2 * 1024 * 1024 ||
+      (language != L"json" && language != L"toml" && language != L"text")) {
+    promise.Reject("The read-only text viewer input is invalid.");
+    return;
+  }
   try {
     auto leaf = leaf_;
     auto js_dispatcher = context_.JSDispatcher();
-    context_.UIDispatcher().Post([leaf, title, text, close_label, promise, js_dispatcher] {
+    context_.UIDispatcher().Post([
+        leaf,
+        title,
+        text,
+        close_label,
+        language,
+        html,
+        promise,
+        js_dispatcher] {
       try {
-        leaf->ShowReadOnlyText(title, text, close_label);
-        js_dispatcher.Post([promise] { promise.Resolve(); });
+        leaf->ShowReadOnlyText(title, text, close_label, language, html);
       } catch (...) {
         js_dispatcher.Post([promise] { promise.Reject("The read-only text viewer could not be opened."); });
+        return;
       }
+      js_dispatcher.Post([promise] { promise.Resolve(); });
     });
   } catch (...) {
     promise.Reject("The read-only text viewer could not be opened.");
@@ -402,67 +420,6 @@ void WinUI3NativeLeafModule::ChooseModelsToAdd(
     });
   } catch (...) {
     promise.Resolve(std::nullopt);
-  }
-}
-
-void WinUI3NativeLeafModule::EditSecureDocument(
-    std::string const& editor_token,
-    std::string const& language,
-    std::wstring const& title,
-    winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept {
-  // RN supplies only an opaque Core-issued editor token. Raw settings text is
-  // fetched, edited, and staged exclusively in this native/Core path.
-  if (editor_token.empty() || editor_token.size() > 256) {
-    promise.Reject("The native editor token is invalid.");
-    return;
-  }
-  try {
-    auto ui_dispatcher = context_.UIDispatcher();
-    auto js_dispatcher = context_.JSDispatcher();
-    auto leaf = leaf_;
-    std::thread([leaf, editor_token, language, title, promise, ui_dispatcher, js_dispatcher] {
-      auto text = CoreIPCBridge::Shared().ReadEditorDocument(editor_token);
-      if (!text) {
-        js_dispatcher.Post([promise] { promise.Reject("The local Core could not read the document."); });
-        return;
-      }
-      ui_dispatcher.Post([
-          leaf,
-          editor_token,
-          language,
-          title,
-          text = std::move(*text),
-          promise,
-          js_dispatcher]() mutable {
-        std::optional<std::string> edited;
-        try {
-          edited = leaf->EditNativeText(text, language, title);
-        } catch (...) {
-        }
-        if (!edited) {
-          js_dispatcher.Post([promise] { promise.Resolve(std::nullopt); });
-          return;
-        }
-        try {
-          std::thread([
-              editor_token,
-              edited = std::move(*edited),
-              promise,
-              js_dispatcher]() mutable {
-            // Never place raw editor content in an event, promise, or diagnostic.
-            auto revision = CoreIPCBridge::Shared().StageEditorDocument(editor_token, edited);
-            js_dispatcher.Post([promise, revision] {
-              if (revision) promise.Resolve(revision);
-              else promise.Reject("The local Core could not stage the document.");
-            });
-          }).detach();
-        } catch (...) {
-          js_dispatcher.Post([promise] { promise.Reject("The local Core could not stage the document."); });
-        }
-      });
-    }).detach();
-  } catch (...) {
-    promise.Reject("The local Core could not open the native editor.");
   }
 }
 

@@ -78,7 +78,7 @@ const zh: Record<string, RuntimeCopy> = {
   LITELLM_MENU_PROTOCOL_FALLBACK_TTL_SECONDS: { label: "备用协议记忆", help: "某部署的备用协议成功后，在此时长内，同一种客户端协议直接复用该备用协议，不再重试原协议。设为 0 可关闭记忆。" },
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED: { label: "普通请求写入冷却", help: "普通请求失败时是否向共享部署冷却池累计失败。所有请求类型仍会读取已有冷却状态。" },
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED: { label: "压缩请求写入冷却", help: "结构化 Codex 压缩失败时是否向共享部署冷却池累计失败。默认关闭，避免仅压缩时的上游失败让普通工作路由进入冷却。" },
-  LITELLM_MENU_IMAGE_TOOL_FALLBACK_MAX_ATTEMPTS: { label: "图像工具尝试次数", help: "同一请求中，图像生成工具在返回安全失败前允许的最大恢复尝试次数。设为 0 可关闭此恢复。" },
+  LITELLM_MENU_IMAGE_TOOL_UNSUPPORTED_TTL_SECONDS: { label: "图像工具不支持记忆", help: "某部署明确拒绝 image_generation 工具后，在此时长内跳过它。参数错误、超时、策略拒绝和其他上游错误不会写入该记忆；设为 0 可关闭跨请求记忆。" },
   LITELLM_MENU_COMPUTER_FACADE_BACKEND: { label: "后端", help: "执行器后端。明确选择后不会静默回退到其他真实后端。" },
   LITELLM_MENU_COMPUTER_FACADE_MODEL: { label: "规划模型", help: "内部 JSON 规划器可选的模型组或路由。留空时使用请求模型。" },
   LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS: { label: "最大步骤数", help: "在安全失败前，允许计算机观察 / 操作的最大轮数。" },

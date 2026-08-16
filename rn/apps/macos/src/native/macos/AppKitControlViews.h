@@ -29,7 +29,10 @@ NS_ASSUME_NONNULL_BEGIN
 @interface LiteLLMAppKitTextEditorComponentView : RCTViewComponentView
 @end
 
-@interface LiteLLMAppKitSecureTextEditorComponentView : RCTViewComponentView
+@interface LiteLLMAppKitCodeWebViewComponentView : RCTViewComponentView
+@end
+
+@interface LiteLLMAppKitPersistentScrollIndicatorComponentView : RCTViewComponentView
 @end
 
 @interface LiteLLMAppKitSecureTextInputComponentView : RCTViewComponentView

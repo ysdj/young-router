@@ -50,6 +50,9 @@ OWNER_TOKEN_BYTES = 32
 MACOS_DEFAULT_WORKERS = "16"
 PROXY_STOP_GRACE_SECONDS = 2.0
 SERVICE_STATUS_CACHE_SECONDS = 10.0
+_RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
+    {"LITELLM_MENU_CODEX_DESCENDANT_CLEANUP"}
+)
 
 
 @dataclass(frozen=True)
@@ -375,21 +378,31 @@ class CoreServiceController:
                 pass
 
     def _configured_runtime_values(self, *, strict: bool) -> dict[str, str]:
-        """Read only explicitly persisted, schema-validated environment values."""
+        """Read schema-validated values owned by Runtime Settings."""
 
         try:
             source = read_text(self.paths.settings)
-            if source is None:
-                return {}
-            from runtime_settings_io import load_specs, read_configured_settings_file
+            from runtime_settings_io import (
+                load_specs,
+                normalize_payload_value,
+                read_configured_settings_file,
+            )
 
             specs = load_specs()
-            with tempfile.TemporaryDirectory(prefix="litellm-core-runtime-env-") as directory:
-                candidate = Path(directory) / "runtime-settings.env"
-                atomic_write_text(candidate, source)
-                # The authoritative parser validates every line and all
-                # cross-field constraints before any values enter a process.
-                return read_configured_settings_file(candidate, specs)
+            configured: dict[str, str] = {}
+            if source is not None:
+                with tempfile.TemporaryDirectory(prefix="litellm-core-runtime-env-") as directory:
+                    candidate = Path(directory) / "runtime-settings.env"
+                    atomic_write_text(candidate, source)
+                    # The authoritative parser validates every line and all
+                    # cross-field constraints before any values enter a process.
+                    configured = read_configured_settings_file(candidate, specs)
+            for key in _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS:
+                spec = specs.get(key)
+                if spec is None:
+                    raise RuntimeError("Runtime settings schema is unavailable")
+                configured.setdefault(key, normalize_payload_value(spec, spec.default))
+            return configured
         except Exception:
             if strict:
                 raise RuntimeError("Runtime settings are invalid") from None
@@ -801,7 +814,7 @@ class ConfigurationPackageAdapter:
         self.settings_path = settings_path
 
     @staticmethod
-    def _legacy_sections(sections: Sequence[str]) -> tuple[str, ...]:
+    def _package_sections(sections: Sequence[str]) -> tuple[str, ...]:
         selected = set(sections)
         valid = {"providers_models", "runtime"}
         if not selected or selected - valid:
@@ -816,7 +829,7 @@ class ConfigurationPackageAdapter:
     def export(self, *, sections: Sequence[str], destination: Path) -> tuple[str, ...]:
         import configuration_package
 
-        translated = self._legacy_sections(sections)
+        translated = self._package_sections(sections)
         return configuration_package.export_package(
             sections=translated,
             config_path=self.config_path if "providers_models" in translated else None,

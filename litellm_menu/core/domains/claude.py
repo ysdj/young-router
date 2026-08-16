@@ -1643,7 +1643,60 @@ class ClaudeSettingsDomain:
 
     def export(self, *, include_sensitive: bool = False) -> dict[str, Any]:
         settings = copy.deepcopy(self._draft)
-        return {"domain": self.name, "settings": settings if include_sensitive else redact(settings)}
+        result: dict[str, Any] = {
+            "domain": self.name,
+            "settings": settings if include_sensitive else redact(settings),
+        }
+        if self._desktop is not None:
+            result["desktop"] = (
+                self._desktop.draft_state()
+                if include_sensitive
+                else redact(self._desktop.draft_state())
+            )
+        if self._developer is not None:
+            result["developer"] = (
+                self._developer.draft_state()
+                if include_sensitive
+                else redact(self._developer.draft_state())
+            )
+        return result
+
+    def import_package(self, payload: object) -> None:
+        if not isinstance(payload, Mapping):
+            raise ClaudeSettingsError("Claude Settings package is invalid")
+        data = copy.deepcopy(dict(payload))
+        if data.get("domain", self.name) != self.name or set(data).difference(
+            {"domain", "settings", "desktop", "developer"}
+        ):
+            raise ClaudeSettingsError("Claude Settings package is invalid")
+        settings = data.get("settings")
+        if not isinstance(settings, Mapping) or validate_settings(settings):
+            raise ClaudeSettingsError("Claude Settings package is invalid")
+        desktop = data.get("desktop")
+        if desktop is not None:
+            if self._desktop is None or not isinstance(desktop, Mapping):
+                raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+            config = desktop.get("config")
+            if not isinstance(config, Mapping):
+                raise ClaudeSettingsError("Claude Settings package is invalid")
+            try:
+                self._desktop.set_raw_text(
+                    json.dumps(dict(config), ensure_ascii=False, sort_keys=True)
+                )
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+        developer = data.get("developer")
+        if developer is not None:
+            if self._developer is None or not isinstance(developer, Mapping):
+                raise ClaudeSettingsError("Claude Desktop developer settings are unavailable")
+            try:
+                self._developer.set_raw_text(
+                    json.dumps(dict(developer), ensure_ascii=False, sort_keys=True)
+                )
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+        self._draft = copy.deepcopy(dict(settings))
+        self._revision += 1
 
 
 def create_domain(*args: Any, **kwargs: Any) -> ClaudeSettingsDomain:

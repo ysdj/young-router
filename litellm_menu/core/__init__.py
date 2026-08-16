@@ -1,8 +1,7 @@
 """Shared Python Core/IPC implementation used by both native shells.
 
-The top-level ``litellm_menu`` package remains the legacy LiteLLM hook.  This
-submodule is deliberately side-effect free: importing it does not start a
-service, inspect user files, or import LiteLLM.  Native hosts can construct a
+This submodule is deliberately side-effect free: importing it does not start a
+service, inspect user files, or import LiteLLM. Native hosts can construct a
 ``CoreStore`` and register only the domains they are ready to expose.
 """
 
@@ -18,9 +17,7 @@ from .protocol import (
     load_protocol_schema,
 )
 from .service import (
-    Core,
     CoreError,
-    CoreService,
     CoreStore,
     ConfirmationNeeded,
     DomainAdapter,
@@ -31,11 +28,9 @@ from .service import (
 )
 
 __all__ = [
-    "Core",
     "CoreError",
     "CoreIPCClient",
     "CoreIPCServer",
-    "CoreService",
     "CoreStore",
     "ConfirmationNeeded",
     "DomainAdapter",

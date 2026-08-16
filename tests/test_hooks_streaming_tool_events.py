@@ -1228,6 +1228,233 @@ class HookStreamingToolEventTests(HookTestCase):
             self.assertEqual(events[-1]["response"]["status"], "completed")
             self.assertEqual(events[-1]["response"]["output"], [events[-2]["item"]])
 
+    async def test_guarded_responses_stream_completes_done_custom_tool_when_stream_stops(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def upstream_stream(*, fail_after_tool: bool):
+            yield {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_exec",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_exec",
+                    "summary": [],
+                    "content": [],
+                    "status": "completed",
+                },
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_exec",
+                    "call_id": "call_exec",
+                    "name": "exec",
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            }
+            yield {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_exec",
+                "output_index": 1,
+                "arguments": '{"input":"text(await tools.exec_command({\\"cmd\\":\\"true\\"}));"}',
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_exec",
+                    "call_id": "call_exec",
+                    "name": "exec",
+                    "arguments": '{"input":"text(await tools.exec_command({\\"cmd\\":\\"true\\"}));"}',
+                    "status": "completed",
+                },
+            }
+            if fail_after_tool:
+                raise TimeoutError("upstream stalled after completed custom tool")
+
+        request_data = {
+            "model": "default-chat",
+            "input": "run a command",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec",
+                    "parameters": {"type": "object"},
+                    hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY: True,
+                }
+            ],
+        }
+
+        for fail_after_tool in (False, True):
+            events = [
+                jsonable_stream_chunk(chunk)
+                async for chunk in hooks._yield_guarded_original_stream(
+                    [],
+                    upstream_stream(fail_after_tool=fail_after_tool),
+                    request_data.copy(),
+                )
+            ]
+
+            self.assertEqual(events[-1]["type"], "response.completed")
+            self.assertEqual(events[-1]["response"]["status"], "completed")
+            self.assertEqual(
+                [item["type"] for item in events[-1]["response"]["output"]],
+                ["reasoning", "custom_tool_call"],
+            )
+            self.assertEqual(
+                [event["type"] for event in events].count("response.output_item.done"),
+                2,
+            )
+
+    async def test_guarded_responses_stream_completes_image_result_when_upstream_omits_terminal_event(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def upstream_stream():
+            yield {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_image",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "ig_image",
+                    "type": "image_generation_call",
+                    "status": "generating",
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "ig_image",
+                    "type": "image_generation_call",
+                    "status": "generating",
+                    "result": "base64-image",
+                },
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": "generate an image",
+            "stream": True,
+        }
+
+        events = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [],
+                upstream_stream(),
+                request_data,
+            )
+        ]
+
+        self.assertEqual(events[-1]["type"], "response.completed")
+        self.assertEqual(events[-1]["response"]["status"], "completed")
+        self.assertEqual(events[-1]["response"]["output"][0]["type"], "image_generation_call")
+        self.assertEqual(events[-1]["response"]["output"][0]["status"], "completed")
+        self.assertEqual(events[-1]["response"]["output"][0]["result"], "base64-image")
+        done_events = [event for event in events if event.get("type") == "response.output_item.done"]
+        self.assertEqual(done_events[-1]["item"]["status"], "completed")
+
+    async def test_guarded_responses_stream_completes_image_result_before_stream_error(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def upstream_stream():
+            yield {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_image_error",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "ig_image_error",
+                    "type": "image_generation_call",
+                    "status": "generating",
+                    "result": "base64-image",
+                },
+            }
+            raise TimeoutError("stream ended after completed image output")
+
+        events = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [],
+                upstream_stream(),
+                {
+                    "model": "default-chat",
+                    "input": "generate an image",
+                    "stream": True,
+                },
+            )
+        ]
+
+        self.assertEqual(events[-1]["type"], "response.completed")
+        self.assertEqual(events[-1]["response"]["output"][0]["status"], "completed")
+
+    async def test_guarded_responses_stream_normalizes_image_result_in_sse_frames(self) -> None:
+        hooks, _ = load_hook_module()
+
+        def frame(payload: dict) -> str:
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        async def upstream_stream():
+            yield frame(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "ig_image_sse",
+                        "type": "image_generation_call",
+                        "status": "generating",
+                        "result": "base64-image",
+                    },
+                }
+            )
+
+        events = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [],
+                upstream_stream(),
+                {
+                    "model": "default-chat",
+                    "input": "generate an image",
+                    "stream": True,
+                },
+            )
+        ]
+
+        done_events = [event for event in events if event.get("type") == "response.output_item.done"]
+        self.assertEqual(done_events[-1]["item"]["status"], "completed")
+        self.assertEqual(events[-1]["type"], "response.completed")
+        self.assertEqual(events[-1]["response"]["output"][0]["status"], "completed")
+
     def test_completed_stream_output_does_not_duplicate_custom_tool_call_events(self) -> None:
         hooks, _ = load_hook_module()
         seen_item_ids: set[str] = set()
@@ -1410,7 +1637,7 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertNotIn("api_base", calls[0])
         self.assertNotIn("provider", calls[0])
 
-    async def test_nonstreaming_refusal_excludes_current_deployment_and_preserves_edit_image(self) -> None:
+    async def test_nonstreaming_refusal_forces_current_deployment_and_preserves_edit_image(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
 
@@ -1455,14 +1682,18 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["input"], request_data["input"])
         self.assertEqual(calls[0]["tool_choice"], {"type": "image_generation"})
-        self.assertEqual(calls[0]["_excluded_deployment_ids"], ["route-a"])
-        self.assertNotIn("_target_order", calls[0])
+        self.assertNotIn("_excluded_deployment_ids", calls[0])
+        self.assertEqual(calls[0]["_target_order"], 1)
+        self.assertEqual(
+            calls[0][hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY],
+            ["route-a"],
+        )
         self.assertEqual(
             calls[0]["litellm_metadata"][hooks._IMAGE_GENERATION_TOOL_FALLBACK_ATTEMPTS_METADATA_KEY],
             1,
         )
 
-    async def test_nonstreaming_refusal_respects_image_tool_fallback_max_attempts(self) -> None:
+    async def test_nonstreaming_refusal_runs_one_forced_probe_despite_prior_counter(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
 
@@ -1485,10 +1716,14 @@ class HookStreamingToolEventTests(HookTestCase):
         }
         original = {"output_text": "IMAGEGEN_RESULT status=FAIL blocker=IMAGEGEN_TOOL_UNAVAILABLE"}
 
-        with self.assertRaises(Exception):
-            await hook.async_post_call_success_deployment_hook(request_data, original, call_type=None)
+        response = await hook.async_post_call_success_deployment_hook(
+            request_data,
+            original,
+            call_type=None,
+        )
 
-        self.assertEqual(calls, [])
+        self.assertEqual(response["output"][0]["type"], "image_generation_call")
+        self.assertEqual(len(calls), 1)
 
     async def test_streaming_refusal_retries_same_model_with_forced_tool_choice(self) -> None:
         hooks, proxy_server = load_hook_module()

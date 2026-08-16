@@ -2,7 +2,7 @@
 
 The native host starts this server and injects its endpoint into React Native.
 Core binds an ephemeral loopback port by default; no UI code knows or assumes
-the legacy LiteLLM API port.  A short-lived bootstrap credential is accepted
+the proxy API port. A short-lived bootstrap credential is accepted
 once at ``/v1/hello`` and exchanged for an in-memory session credential. A
 current session can renew itself before it expires without restarting Core.
 
@@ -15,6 +15,7 @@ JavaScript backend.  The JSON envelope itself is validated by
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import hmac
 import http.server
 import json
@@ -41,7 +42,7 @@ from .protocol import (
     validate_method_result,
 )
 from .security import safe_exception_message
-from .service import ConfirmationNeeded, CoreError, CoreStore
+from .service import ConfirmationNeeded, CoreError, CoreStore, PreparedImport, RevisionConflict
 
 
 BOOTSTRAP_TOKEN_TTL_SECONDS = 120.0
@@ -56,6 +57,8 @@ MAX_SECRET_CAPABILITIES = 32
 # editor.  Its read lease is intentionally much shorter than a write lease.
 SECRET_READ_CAPABILITY_TTL_SECONDS = 30.0
 MAX_SECRET_READ_CAPABILITIES = 32
+IMPORT_PLAN_TTL_SECONDS = 10 * 60.0
+MAX_IMPORT_PLANS = 16
 # ``socketserver.BaseServer.serve_forever`` otherwise checks its shutdown
 # request only every 0.5 seconds. This is the Core's final local teardown
 # step after the managed proxy has stopped, so keep it responsive without
@@ -121,6 +124,7 @@ class _EditorCapability:
     document: str
     revision: int
     expires_at: float
+    text_digest: str = ""
     read: bool = False
     staging: bool = False
 
@@ -144,6 +148,16 @@ class _SecretReadCapability:
     field: str
     target: str | None
     revision: int
+    expires_at: float
+
+
+@dataclass(frozen=True, repr=False)
+class _ImportPlanCapability:
+    """One-use, session-bound lease for a parsed import package."""
+
+    token: str
+    session_token: str
+    prepared: PreparedImport = field(repr=False)
     expires_at: float
 
 
@@ -366,39 +380,6 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 self._send_error(400, code="invalid_secret", message="The requested secret field is unavailable")
             return
-        if route in {"/v1/host/editor/read", "/v1/host/editor/stage"}:
-            token = self._authorization()
-            if not self._owner._valid_session(token):
-                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
-                return
-            try:
-                data = decode_message(self._read_body())
-                if route.endswith("/read"):
-                    if set(data) != {"editor_token"}:
-                        raise CoreError("invalid_editor", "The requested editor is unavailable")
-                    text = self._owner.read_editor_capability(
-                        data.get("editor_token"), session_token=token
-                    )
-                    self._send(200, {"protocol_version": PROTOCOL_VERSION, "text": text})
-                else:
-                    if set(data) != {"editor_token", "text"} or not isinstance(data.get("text"), str):
-                        raise CoreError("invalid_editor", "The editor document is invalid")
-                    result = self._owner.stage_editor_capability(
-                        data.get("editor_token"), data["text"], session_token=token
-                    )
-                    self._send(
-                        200,
-                        {
-                            "protocol_version": PROTOCOL_VERSION,
-                            "revision": result["revision"],
-                            "editor_token": result["editor_token"],
-                        },
-                    )
-            except (CoreError, ProtocolError) as exc:
-                self._send_error(400, code=exc.code, message=exc.message, retryable=exc.code == "revision_conflict")
-            except Exception:
-                self._send_error(400, code="invalid_editor", message="The requested editor is unavailable")
-            return
         if route != "/v1":
             self._send_error(404, code="not_found", message="Core IPC route is unavailable")
             return
@@ -471,6 +452,7 @@ class CoreIPCServer:
         self._editor_capabilities: dict[str, _EditorCapability] = {}
         self._secret_capabilities: dict[str, _SecretCapability] = {}
         self._secret_read_capabilities: dict[str, _SecretReadCapability] = {}
+        self._import_plans: dict[str, _ImportPlanCapability] = {}
         self._lock = threading.RLock()
 
     @property
@@ -515,7 +497,8 @@ class CoreIPCServer:
         return self.core.file_capabilities.register(path, purpose)
 
     def register_editor_capability(self, domain: str, document: str, *, session_token: str) -> dict[str, Any]:
-        descriptor = self.core.editor_descriptor(domain, document)
+        descriptor = self.core.editor_document(domain, document)
+        text = str(descriptor["text"])
         token = secrets.token_urlsafe(32)
         capability = _EditorCapability(
             token=token,
@@ -524,6 +507,10 @@ class CoreIPCServer:
             document=str(descriptor["document"]),
             revision=int(descriptor["revision"]),
             expires_at=time.monotonic() + EDITOR_CAPABILITY_TTL_SECONDS,
+            text_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            # The Core supplied the text and revision atomically above, so
+            # this newly minted lease is ready to stage immediately.
+            read=True,
         )
         with self._lock:
             now = time.monotonic()
@@ -704,19 +691,6 @@ class CoreIPCServer:
                 raise CoreError("invalid_editor", "The requested editor is unavailable")
             return capability
 
-    def read_editor_capability(self, token: object, *, session_token: str) -> str:
-        capability = self._editor_capability(token, session_token=session_token)
-        text = self.core.trusted_editor_text(
-            capability.domain,
-            capability.document,
-            revision=capability.revision,
-        )
-        with self._lock:
-            current = self._editor_capabilities.get(capability.token)
-            if current is capability:
-                current.read = True
-        return text
-
     def stage_editor_capability(self, token: object, text: str, *, session_token: str) -> dict[str, Any]:
         capability = self._editor_capability(token, session_token=session_token)
         with self._lock:
@@ -729,6 +703,7 @@ class CoreIPCServer:
                 capability.document,
                 text,
                 revision=capability.revision,
+                expected_text_digest=capability.text_digest,
             )
         except Exception:
             with self._lock:
@@ -744,7 +719,8 @@ class CoreIPCServer:
             document=capability.document,
             revision=int(result["revision"]),
             expires_at=time.monotonic() + EDITOR_CAPABILITY_TTL_SECONDS,
-            # The native editor already owns the text it just staged. Requiring
+            text_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            # The active editor already owns the text it just staged. Requiring
             # it to read the same document again would reset selection/undo.
             read=True,
         )
@@ -769,7 +745,13 @@ class CoreIPCServer:
                     and not sibling.staging
                 ):
                     sibling.revision = replacement.revision
-        return {**result, "editor_token": replacement_token}
+        return {
+            **result,
+            "domain": replacement.domain,
+            "document": replacement.document,
+            "editor_token": replacement_token,
+            "text": text,
+        }
 
     def start(self) -> IpcEndpoint:
         with self._lock:
@@ -807,6 +789,7 @@ class CoreIPCServer:
             self._editor_capabilities.clear()
             self._secret_capabilities.clear()
             self._secret_read_capabilities.clear()
+            self._import_plans.clear()
             self._bootstrap_token = ""
             self._bootstrap_consumed = True
         if unsubscribe is not None:
@@ -851,8 +834,8 @@ class CoreIPCServer:
                     expires_at=now + self.session_ttl_seconds,
                 )
             elif valid_session and session is not None:
-                # Keep the credential stable: subscriptions and native-only
-                # editor capabilities are intentionally bound to this session.
+                # Keep the credential stable: subscriptions and editor
+                # revisions are intentionally bound to this session.
                 session.expires_at = now + self.session_ttl_seconds
                 session_token = session.token
             else:
@@ -889,6 +872,11 @@ class CoreIPCServer:
                     for key, item in self._secret_read_capabilities.items()
                     if not hmac.compare_digest(item.session_token, token)
                 }
+                self._import_plans = {
+                    key: item
+                    for key, item in self._import_plans.items()
+                    if not hmac.compare_digest(item.session_token, token)
+                }
                 return False
             if not hmac.compare_digest(session.token, token):
                 return False
@@ -897,6 +885,71 @@ class CoreIPCServer:
             # reaped solely because its host has been idle in the foreground.
             session.expires_at = now + self.session_ttl_seconds
             return True
+
+    def _register_import_plan(self, prepared: PreparedImport, *, session_token: str) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            now = time.monotonic()
+            self._import_plans = {
+                key: item
+                for key, item in self._import_plans.items()
+                if item.expires_at >= now and item.session_token in self._sessions
+            }
+            session_items = [
+                item
+                for item in self._import_plans.values()
+                if hmac.compare_digest(item.session_token, session_token)
+            ]
+            if len(session_items) >= MAX_IMPORT_PLANS:
+                oldest = min(session_items, key=lambda item: item.expires_at)
+                self._import_plans.pop(oldest.token, None)
+            self._import_plans[token] = _ImportPlanCapability(
+                token=token,
+                session_token=session_token,
+                prepared=prepared,
+                expires_at=now + IMPORT_PLAN_TTL_SECONDS,
+            )
+        return token
+
+    def _consume_import_plan(
+        self,
+        token: object,
+        *,
+        session_token: str,
+        expected_revision: int | None = None,
+        sections: Sequence[object] | None = None,
+    ) -> PreparedImport:
+        """Validate and consume one import plan for its owning session.
+
+        Revision and subset checks happen before the one-use lease is removed.
+        A stale UI therefore gets a deterministic conflict without consuming a
+        still-valid preview, while a client from another authenticated session
+        can never pop the owner's plan.
+        """
+
+        if not isinstance(token, str) or not token or len(token.encode("utf-8")) > 256:
+            raise CoreError("invalid_import_plan", "Choose the import file again")
+        with self._lock:
+            capability = self._import_plans.get(token)
+            now = time.monotonic()
+            if capability is None:
+                raise CoreError("invalid_import_plan", "Choose the import file again")
+            if capability.expires_at < now:
+                self._import_plans.pop(token, None)
+                raise CoreError("invalid_import_plan", "Choose the import file again")
+            if not hmac.compare_digest(capability.session_token, session_token):
+                raise CoreError("invalid_import_plan", "Choose the import file again")
+            if expected_revision is not None:
+                if expected_revision != capability.prepared.revision or self.core.revision != capability.prepared.revision:
+                    raise RevisionConflict(capability.prepared.revision, self.core.revision)
+            if sections is not None:
+                if isinstance(sections, (str, bytes, bytearray)) or not isinstance(sections, Sequence) or not sections:
+                    raise CoreError("invalid_sections", "Choose at least one detected configuration section")
+                requested = tuple(sections)
+                if len(set(requested)) != len(requested) or not set(requested).issubset(capability.prepared.detected_sections):
+                    raise CoreError("invalid_sections", "Choose only sections detected in the selected file")
+            self._import_plans.pop(token, None)
+            return capability.prepared
 
     def _publish(self, event: dict[str, Any]) -> None:
         with self._lock:
@@ -950,13 +1003,22 @@ class CoreIPCServer:
                     known_revision if type(known_revision) is int else None,
                 )
             elif request.method == "editor":
-                domain = params.get("domain")
-                document = params.get("document")
-                if not isinstance(domain, str) or not isinstance(document, str):
-                    raise CoreError("invalid_editor", "The requested editor is unavailable")
-                result = self.register_editor_capability(
-                    domain, document, session_token=session_token
-                )
+                if set(params) == {"domain", "document"}:
+                    domain = params.get("domain")
+                    document = params.get("document")
+                    if not isinstance(domain, str) or not isinstance(document, str):
+                        raise CoreError("invalid_editor", "The requested editor is unavailable")
+                    result = self.register_editor_capability(
+                        domain, document, session_token=session_token
+                    )
+                else:
+                    editor_token = params.get("editor_token")
+                    text = params.get("text")
+                    if not isinstance(editor_token, str) or not isinstance(text, str):
+                        raise CoreError("invalid_editor", "The editor document is invalid")
+                    result = self.stage_editor_capability(
+                        editor_token, text, session_token=session_token
+                    )
             elif request.method == "dispatch":
                 action = params.get("action")
                 expected = params.get("revision")
@@ -1015,17 +1077,42 @@ class CoreIPCServer:
                     raise CoreError("invalid_file_capability", "The selected file is unavailable")
                 result = self.core.export(sections, destination_token=destination)
                 result.pop("package", None)
-            elif request.method == "import":
+            elif request.method == "import_preview":
                 source = params.get("source_token")
-                if source is not None and not isinstance(source, str):
+                if not isinstance(source, str):
                     raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                prepared = self.core.prepare_import(
+                    source_token=source,
+                    revision=params["revision"],
+                )
+                result = {
+                    "revision": prepared.revision,
+                    "import_plan_token": self._register_import_plan(
+                        prepared,
+                        session_token=session_token,
+                    ),
+                    "detected_sections": list(prepared.detected_sections),
+                    "preview": dict(prepared.preview),
+                }
+            elif request.method == "import":
                 sections = params.get("sections")
                 if sections is not None and (not isinstance(sections, Sequence) or isinstance(sections, (str, bytes, bytearray))):
                     raise CoreError("invalid_sections", "Configuration sections are invalid")
-                result = self.core.import_package(
-                    source_token=source,
+                import_plan_token = params.get("import_plan_token")
+                if not isinstance(import_plan_token, str):
+                    raise CoreError("invalid_import_plan", "Choose the import file again")
+                if sections is None:
+                    raise CoreError("invalid_sections", "Choose at least one detected configuration section")
+                prepared = self._consume_import_plan(
+                    import_plan_token,
+                    session_token=session_token,
+                    expected_revision=params["revision"],
                     sections=sections,
-                    revision=params["revision"],
+                )
+                result = self.core.import_package(
+                    package=prepared.package,
+                    sections=sections,
+                    revision=prepared.revision,
                 )
             else:  # defensive; RequestEnvelope already checks this.
                 raise CoreError("unsupported_method", "Unsupported Core operation")
@@ -1159,56 +1246,6 @@ class CoreIPCClient:
         if not isinstance(capability, str) or not capability:
             raise IPCError("Core IPC returned an invalid response")
         return capability
-
-    def read_editor(self, editor_token: str) -> str:
-        """Exercise the trusted native-host editor read path."""
-
-        self._ensure_session()
-        status, body, _headers = self._http(
-            "/v1/host/editor/read",
-            payload=encode_message({"editor_token": editor_token}),
-            token=self._session_token,
-        )
-        if status != 200:
-            raise IPCError("The requested editor is unavailable")
-        try:
-            response = decode_message(body)
-        except ProtocolError:
-            raise IPCError("Core IPC returned an invalid response") from None
-        if set(response) != {"protocol_version", "text"} or response.get("protocol_version") != PROTOCOL_VERSION:
-            raise IPCError("Core IPC returned an invalid response")
-        text = response.get("text")
-        if not isinstance(text, str):
-            raise IPCError("Core IPC returned an invalid response")
-        return text
-
-    def stage_editor(self, editor_token: str, text: str) -> int:
-        """Exercise the trusted native-host editor stage path."""
-
-        self._ensure_session()
-        status, body, _headers = self._http(
-            "/v1/host/editor/stage",
-            payload=encode_message({"editor_token": editor_token, "text": text}),
-            token=self._session_token,
-        )
-        if status != 200:
-            raise IPCError("The editor document could not be staged")
-        try:
-            response = decode_message(body)
-        except ProtocolError:
-            raise IPCError("Core IPC returned an invalid response") from None
-        if set(response) != {"protocol_version", "revision", "editor_token"} or response.get("protocol_version") != PROTOCOL_VERSION:
-            raise IPCError("Core IPC returned an invalid response")
-        revision = response.get("revision")
-        replacement_token = response.get("editor_token")
-        if (
-            type(revision) is not int
-            or revision < 0
-            or not isinstance(replacement_token, str)
-            or not replacement_token
-        ):
-            raise IPCError("Core IPC returned an invalid response")
-        return revision
 
     def subscribe(self, callback: Callable[[dict[str, Any]], None], *, topics: Sequence[str] | None = None) -> Callable[[], None]:
         result = self.call("subscribe", {"topics": list(topics)} if topics is not None else {})

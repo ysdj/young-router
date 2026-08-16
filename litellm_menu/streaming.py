@@ -40,7 +40,9 @@ from .base import (
     _STREAM_FALLBACK_METADATA_KEY,
     _STREAM_IDLE_TIMEOUT_METADATA_KEY,
     _STREAM_START_TIMEOUT_METADATA_KEY,
+    _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
+    _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _normalize_response_completed_event_usage,
     asyncio,
     copy,
@@ -296,7 +298,7 @@ def _normalize_sse_response_completed_block(
     *,
     input_token_upper_bound: Optional[int] = None,
 ) -> str:
-    if "data:" not in block or "response.completed" not in block:
+    if "data:" not in block:
         return block + delimiter
     line_separator = "\r\n" if "\r\n" in block else "\n"
     data_values: list[str] = []
@@ -314,12 +316,17 @@ def _normalize_sse_response_completed_block(
         payload = json.loads(payload_text)
     except Exception:
         return block + delimiter
-    if not isinstance(payload, dict) or payload.get("type") != "response.completed":
+    if not isinstance(payload, dict):
         return block + delimiter
-    _normalize_response_completed_event_usage(
-        payload,
-        input_token_upper_bound=input_token_upper_bound,
-    )
+    original_payload = copy.deepcopy(payload)
+    if payload.get("type") == "response.completed":
+        _normalize_response_completed_event_usage(
+            payload,
+            input_token_upper_bound=input_token_upper_bound,
+        )
+    _image_generation_module._normalize_image_generation_result_status(payload)
+    if payload == original_payload:
+        return block + delimiter
     normalized_data = json.dumps(payload, ensure_ascii=False)
     next_lines: list[str] = []
     replaced_data = False
@@ -338,7 +345,13 @@ def _normalize_sse_response_completed_text(
     *,
     input_token_upper_bound: Optional[int] = None,
 ) -> str:
-    if "data:" not in text or "response.completed" not in text:
+    if (
+        "data:" not in text
+        or (
+            "response.completed" not in text
+            and "image_generation_call" not in text
+        )
+    ):
         return text
     output: list[str] = []
     index = 0
@@ -403,6 +416,7 @@ def _responses_stream_chunk_for_delivery(
 ) -> Any:
     input_token_upper_bound = _codex_request_input_token_upper_bound(request_data)
     if isinstance(chunk, _JSONStreamEvent):
+        _image_generation_module._normalize_image_generation_result_status(chunk)
         _normalize_response_completed_event_usage(
             chunk,
             input_token_upper_bound=input_token_upper_bound,
@@ -419,6 +433,7 @@ def _responses_stream_chunk_for_delivery(
         return chunk
     json_chunk = _jsonable(chunk)
     if isinstance(json_chunk, dict):
+        _image_generation_module._normalize_image_generation_result_status(json_chunk)
         _normalize_response_completed_event_usage(
             json_chunk,
             input_token_upper_bound=input_token_upper_bound,
@@ -428,6 +443,9 @@ def _responses_stream_chunk_for_delivery(
 
 
 def _stream_chunk_error_payload(chunk: Any) -> Any:
+    sse_payload = _sse_stream_chunk_payload(chunk)
+    if sse_payload is not None:
+        return _stream_chunk_error_payload(sse_payload)
     if isinstance(chunk, dict):
         error = chunk.get("error")
         if error is not None:
@@ -510,6 +528,12 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
         in lowered
     ):
         status_code = 400
+    elif status_code is None and error_type == "rate_limit_error":
+        status_code = 429
+    elif status_code is None and error_type == "overloaded_error":
+        status_code = 529
+    elif status_code is None and error_type == "api_error":
+        status_code = 500
     elif status_code is None and error_code in {
         "upstream_compaction_failure",
         "upstream_route_failure",
@@ -531,11 +555,21 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
     return exception
 
 
-def _stream_chunk_priority_error_exception(chunk: Any) -> Optional[Exception]:
+def _stream_chunk_priority_error_exception(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> Optional[Exception]:
     exception = _stream_chunk_error_exception(chunk)
     if exception is None:
         return None
-    return exception if _routing_module._is_priority_deployment_failover_error(exception) else None
+    return (
+        exception
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            exception,
+            request_data,
+        )
+        else None
+    )
 
 
 def _is_structured_codex_compaction_failure_chunk(chunk: Any) -> bool:
@@ -552,6 +586,9 @@ def _is_structured_codex_compaction_failure_chunk(chunk: Any) -> bool:
 def _stream_chunk_dump(chunk: Any) -> dict[str, Any]:
     if isinstance(chunk, dict):
         return chunk
+    sse_payload = _sse_stream_chunk_payload(chunk)
+    if sse_payload is not None:
+        return sse_payload
     if hasattr(chunk, "model_dump"):
         try:
             dumped = chunk.model_dump()
@@ -559,6 +596,40 @@ def _stream_chunk_dump(chunk: Any) -> dict[str, Any]:
             return {}
         return dumped if isinstance(dumped, dict) else {}
     return {}
+
+
+def _sse_stream_chunk_payload(chunk: Any) -> Optional[dict[str, Any]]:
+    """Decode an SSE frame only for local classification, never delivery."""
+
+    if isinstance(chunk, bytes):
+        try:
+            text = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    elif isinstance(chunk, str):
+        text = chunk
+    else:
+        return None
+    event_type: Optional[str] = None
+    data_lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("event:"):
+            value = line.split(":", 1)[1].strip()
+            event_type = value or None
+        elif line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].strip())
+    if not data_lines:
+        return None
+    try:
+        payload = json.loads("\n".join(data_lines))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if event_type and not isinstance(payload.get("type"), str):
+        payload = payload.copy()
+        payload["type"] = event_type
+    return payload
 
 
 def _stream_chunk_type(chunk: Any) -> str:
@@ -1066,6 +1137,7 @@ def _synthesized_completed_response_event(
         ]
         response["output_text"] = text
     response["status"] = "completed"
+    _image_generation_module._normalize_image_generation_result_status(response)
     response = _responses_web_search_bridge_module._sanitize_response_web_search_call_items(response)
     completed_event: dict[str, Any] = {
         "type": "response.completed",
@@ -1111,6 +1183,15 @@ def _synthesized_failed_response_event(
             else "server_error"
         )
         error_code = "upstream_compaction_failure"
+    elif _routing_module._is_image_generation_all_deployments_unsupported_error(
+        exception
+    ):
+        message = (
+            "All configured deployments for this model rejected the "
+            "image_generation tool."
+        )
+        error_type = "invalid_request_error"
+        error_code = "image_generation_tool_unavailable"
     else:
         message = "The upstream model route failed before a final assistant response was available."
         error_type = "server_error"
@@ -1165,6 +1246,10 @@ def _responses_incomplete_stream_exception(
     exception = candidate
     try:
         exception.responses_stream_incomplete = True  # type: ignore[attr-defined]
+        # Routing and cooldown must treat an incomplete stream the same way
+        # regardless of the client-facing protocol.  Preserve the Responses
+        # marker above for its event-specific compatibility paths.
+        exception.stream_incomplete = True  # type: ignore[attr-defined]
     except Exception:
         pass
     try:
@@ -1240,7 +1325,7 @@ def _responses_incomplete_terminal_summary(chunk: Any) -> dict[str, Any]:
 
 
 def _is_responses_incomplete_stream_error(exception: Exception) -> bool:
-    if getattr(exception, "responses_stream_incomplete", False):
+    if getattr(exception, "stream_incomplete", False):
         return True
     return "responses stream incomplete" in _routing_module._exception_text(exception)
 
@@ -1869,11 +1954,45 @@ def _request_is_responses_stream(request_data: Optional[dict]) -> bool:
     return _responses_request_module._request_is_responses_api(request_data) or "input" in (request_data or {})
 
 
+def _request_supports_streaming_error_fallback(request_data: Optional[dict]) -> bool:
+    """Whether this is a streaming request with a route-replay payload.
+
+    This deliberately does not inspect the client or upstream protocol.  The
+    selected adapter decides which LiteLLM method emits the replay; routing,
+    retry, recovery and cooldown all share this eligibility rule.
+    """
+
+    if not isinstance(request_data, dict) or request_data.get("stream") is not True:
+        return False
+    return request_data.get("input") is not None or request_data.get("messages") is not None
+
+
+def _request_is_anthropic_messages_stream(request_data: Optional[dict]) -> bool:
+    if not _request_supports_streaming_error_fallback(request_data):
+        return False
+    if _request_is_responses_stream(request_data):
+        return False
+    return (
+        _routing_module._request_client_surface(request_data)
+        == _UPSTREAM_URL_SURFACE_ANTHROPIC
+    )
+
+
+def _request_uses_native_event_stream(request_data: Optional[dict]) -> bool:
+    """Return true when recovery must preserve a non-Responses SSE wire form."""
+
+    return _request_supports_streaming_error_fallback(
+        request_data
+    ) and not _request_is_responses_stream(request_data)
+
+
 def _streaming_error_fallback_method_name(request_data: Optional[dict]) -> Optional[str]:
     request_data = request_data or {}
     if _request_is_responses_stream(request_data):
         return "aresponses"
     if "messages" in request_data:
+        if _request_is_anthropic_messages_stream(request_data):
+            return "anthropic_messages"
         return "acompletion"
     return None
 
@@ -1922,14 +2041,6 @@ def _build_streaming_error_fallback_payload(
         "tool_choice",
         "temperature",
         "top_p",
-        "parallel_tool_calls",
-        "reasoning",
-        "user",
-        "service_tier",
-        "seed",
-        "stop",
-        "response_format",
-        "stream_options",
         "stream_timeout",
         "api_base",
         "api_key",
@@ -1951,20 +2062,50 @@ def _build_streaming_error_fallback_payload(
         "previous_response_id",
         "client_metadata",
         "prompt_cache_key",
+        "parallel_tool_calls",
+        "reasoning",
+        "user",
+        "service_tier",
+        "seed",
+        "stop",
+        "response_format",
+        "stream_options",
     )
     chat_completion_keys = (
         "messages",
         "max_tokens",
         "max_completion_tokens",
+        "parallel_tool_calls",
+        "reasoning",
+        "user",
+        "service_tier",
+        "seed",
+        "stop",
+        "response_format",
+        "stream_options",
         "functions",
         "function_call",
         "modalities",
         "audio",
     )
-
-    allowed_keys = common_keys + (
-        responses_keys if method_name == "aresponses" else chat_completion_keys
+    anthropic_messages_keys = (
+        "messages",
+        "max_tokens",
+        "stop_sequences",
+        "system",
+        "thinking",
+        "container",
+        "top_k",
+        "metadata",
     )
+
+    if method_name == "aresponses":
+        method_keys = responses_keys
+    elif method_name == "anthropic_messages":
+        method_keys = anthropic_messages_keys
+    else:
+        method_keys = chat_completion_keys
+    allowed_keys = common_keys + method_keys
     payload: Dict[str, Any] = {}
     for key in allowed_keys:
         if key not in request_data:
@@ -1972,7 +2113,7 @@ def _build_streaming_error_fallback_payload(
         value = _jsonable(request_data.get(key))
         if value is not None:
             payload[key] = value
-    if "service_tier" not in payload:
+    if method_name != "anthropic_messages" and "service_tier" not in payload:
         default_service_tier = (
             _codex_fast_tier_module._codex_fast_default_service_tier(request_data)
         )
@@ -2033,14 +2174,19 @@ def _build_streaming_error_fallback_payload(
         return None
     if method_name == "aresponses" and "input" not in payload:
         return None
-    if method_name == "acompletion" and "messages" not in payload:
+    if method_name in {"acompletion", "anthropic_messages"} and "messages" not in payload:
+        return None
+    if method_name == "anthropic_messages" and "max_tokens" not in payload:
         return None
 
     metadata = _request_context_module._request_metadata_dict(request_data, "metadata")
     merged_litellm_metadata = litellm_metadata.copy()
     if metadata is not None:
         merged_litellm_metadata.update(metadata)
-        if _responses_request_module._request_allows_upstream_metadata(request_data):
+        if (
+            method_name == "anthropic_messages"
+            or _responses_request_module._request_allows_upstream_metadata(request_data)
+        ):
             payload["metadata"] = metadata.copy()
     for trace_key in ("request_id", "litellm_call_id", "call_id"):
         trace_value = request_data.get(trace_key)
@@ -2051,6 +2197,8 @@ def _build_streaming_error_fallback_payload(
     payload["stream"] = True
     if method_name == "aresponses":
         payload.setdefault("call_type", "aresponses")
+    elif method_name == "anthropic_messages":
+        payload.setdefault("call_type", "anthropic_messages")
     descendant_cleanup_payload = (
         _responses_request_module._with_codex_descendant_cleanup_instruction(payload)
     )
@@ -2191,7 +2339,10 @@ async def _streaming_error_fallback_response(
     ):
         return None
     if not (
-        _routing_module._is_priority_deployment_failover_error(exception)
+        _routing_module._is_request_scoped_priority_deployment_failover_error(
+            exception,
+            request_data,
+        )
         or _routing_module._is_no_deployments_available_error(exception)
     ):
         return None
@@ -2200,12 +2351,15 @@ async def _streaming_error_fallback_response(
     if method_name is None:
         return None
 
-    if getattr(exception, "responses_stream_incomplete", False):
+    if getattr(exception, "stream_incomplete", False):
         # The stream itself consumed this deployment attempt.  It is not an
         # additional same-route retry, so proceed to the next ordered route.
         _routing_module._mark_same_deployment_retry_exhausted(exception)
     if (
-        _routing_module._is_priority_deployment_failover_error(exception)
+        _routing_module._is_request_scoped_priority_deployment_failover_error(
+            exception,
+            request_data,
+        )
         and not _routing_module._should_retry_same_deployment_before_fallback(exception)
     ):
         _routing_module._mark_exception_for_deployment_failover(exception, request_data)
@@ -2246,7 +2400,7 @@ async def _streaming_error_fallback_response(
         route_recovery_poll=route_recovery_poll,
     )
     retry_surface = _routing_module._request_current_upstream_surface(payload)
-    if retry_surface in {
+    if method_name == "aresponses" and retry_surface in {
         "openai/chat",
         "anthropic",
     }:
@@ -2321,7 +2475,10 @@ async def _streaming_error_fallback_response(
                 buffered_chunks=0,
             )
         _routing_module._mark_no_deployments_for_order_exhaustion(fallback_exception, payload)
-        if _routing_module._is_priority_deployment_failover_error(fallback_exception):
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            fallback_exception,
+            payload,
+        ):
             _routing_module._mark_exception_for_deployment_failover(fallback_exception, payload)
         _trace_module._route_trace(
             "streaming_error_fallback_error",
@@ -2374,12 +2531,20 @@ async def _stream_streaming_error_fallback_round(
             fallback_response,
             selected_deployment_box,
         )
-        async for chunk in _yield_guarded_original_stream(
-            [],
-            guarded_fallback_response,
-            fallback_payload,
-            synthesize_completed_on_clean_eof_after_visible_output=True,
-        ):
+        if _request_uses_native_event_stream(fallback_payload):
+            guarded_chunks = _yield_native_stream_after_terminal(
+                guarded_fallback_response,
+                fallback_payload,
+                selected_deployment_box=selected_deployment_box,
+            )
+        else:
+            guarded_chunks = _yield_guarded_original_stream(
+                [],
+                guarded_fallback_response,
+                fallback_payload,
+                synthesize_completed_on_clean_eof_after_visible_output=True,
+            )
+        async for chunk in guarded_chunks:
             if _routing_module._apply_current_selected_deployment_to_request(
                 fallback_payload,
                 selected_box=selected_deployment_box,
@@ -2401,16 +2566,13 @@ async def _stream_streaming_error_fallback_round(
             update_top_level=False,
         )
         if (
-            _routing_module._is_priority_deployment_failover_error(
-                fallback_exception
+            _routing_module._is_request_scoped_priority_deployment_failover_error(
+                fallback_exception,
+                fallback_payload if "fallback_payload" in locals() else request_data,
             )
             and (
                 route_recovery_poll
-                or getattr(
-                    fallback_exception,
-                    "responses_stream_incomplete",
-                    False,
-                )
+                or getattr(fallback_exception, "stream_incomplete", False)
                 or _routing_module._same_deployment_retries() <= 0
             )
         ):
@@ -2422,7 +2584,10 @@ async def _stream_streaming_error_fallback_round(
                 fallback_exception
             )
         if (
-            _routing_module._is_priority_deployment_failover_error(fallback_exception)
+            _routing_module._is_request_scoped_priority_deployment_failover_error(
+                fallback_exception,
+                fallback_payload if "fallback_payload" in locals() else request_data,
+            )
             and not _routing_module._should_retry_same_deployment_before_fallback(fallback_exception)
         ):
             failed_deployment_id = (
@@ -2584,8 +2749,8 @@ async def _stream_streaming_error_fallback(
     request_data: dict,
     exception: Exception,
 ) -> AsyncIterator[Any]:
-    # Streaming follows the same explicit same-route budget as ordinary
-    # Responses calls.  A failed fallback stream that has not delivered
+    # Streaming follows the same explicit same-route budget regardless of
+    # client protocol. A failed fallback stream that has not delivered
     # visible output or a terminal event is a completed route attempt, not a
     # same-route retry; keep advancing while each failure adds a new excluded
     # deployment.  The configured deployment pool therefore bounds the loop.
@@ -2609,7 +2774,7 @@ async def _stream_streaming_error_fallback(
                 allow_repeated_attempt=allow_repeated_attempt,
             ):
                 if is_responses_stream and not started_delivery:
-                    deliverable = (
+                    deliverable = bool(
                         _stream_chunk_has_visible_output(chunk)
                         or _responses_completed_chunk_has_usable_output(
                             chunk,
@@ -2634,7 +2799,13 @@ async def _stream_streaming_error_fallback(
                 _routing_module._mark_same_deployment_retry_exhausted(exc)
                 _routing_module._sync_failed_deployment_exclusions(request_data, exc)
                 raise
-            if not _routing_module._is_no_deployments_available_error(exc) and not _routing_module._is_priority_deployment_failover_error(exc):
+            if (
+                not _routing_module._is_no_deployments_available_error(exc)
+                and not _routing_module._is_request_scoped_priority_deployment_failover_error(
+                    exc,
+                    request_data,
+                )
+            ):
                 raise
             excluded_after = (
                 _responses_request_module._request_excluded_deployment_ids(
@@ -2652,7 +2823,7 @@ async def _stream_streaming_error_fallback(
             remaining_deployment_ids = (
                 configured_deployment_ids - excluded_after
             )
-            route_attempt_consumed = is_responses_stream and bool(
+            route_attempt_consumed = bool(
                 newly_excluded & configured_deployment_ids
             )
             if route_attempt_consumed:
@@ -2964,6 +3135,338 @@ async def _stream_route_recovery_poll_attempt(
             pass
 
 
+def _chat_completions_stream_chunk_is_terminal(
+    chunk: Any,
+    finished_choice_indices: set[int],
+    *,
+    expected_choices: int,
+) -> bool:
+    dumped = _stream_chunk_dump(chunk)
+    choices = dumped.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for offset, choice in enumerate(choices):
+        if not isinstance(choice, dict) or choice.get("finish_reason") is None:
+            continue
+        index = choice.get("index")
+        finished_choice_indices.add(index if isinstance(index, int) else offset)
+    return len(finished_choice_indices) >= expected_choices
+
+
+def _anthropic_messages_stream_chunk_is_terminal(chunk: Any) -> bool:
+    return _stream_chunk_type(chunk) == "message_stop"
+
+
+def _native_stream_chunk_is_terminal(
+    chunk: Any,
+    request_data: dict,
+    finished_choice_indices: set[int],
+) -> bool:
+    if _request_is_anthropic_messages_stream(request_data):
+        return _anthropic_messages_stream_chunk_is_terminal(chunk)
+    requested_choices = request_data.get("n")
+    expected_choices = (
+        requested_choices
+        if isinstance(requested_choices, int) and requested_choices > 0
+        else 1
+    )
+    return _chat_completions_stream_chunk_is_terminal(
+        chunk,
+        finished_choice_indices,
+        expected_choices=expected_choices,
+    )
+
+
+def _native_stream_incomplete_exception(
+    request_data: dict,
+    *,
+    buffered_chunks: int,
+    selected_deployment_box: Optional[dict[str, Any]] = None,
+) -> Exception:
+    is_anthropic = _request_is_anthropic_messages_stream(request_data)
+    protocol_name = "Anthropic Messages" if is_anthropic else "Chat Completions"
+    terminal_name = "message_stop" if is_anthropic else "finish_reason"
+    reason = (
+        "anthropic_messages_stream_incomplete"
+        if is_anthropic
+        else "chat_completions_stream_incomplete"
+    )
+    exception = RuntimeError(
+        f"{protocol_name} stream ended before a terminal {terminal_name}"
+    )
+    exception.status_code = 503  # type: ignore[attr-defined]
+    exception.stream_incomplete = True  # type: ignore[attr-defined]
+    exception.body = {  # type: ignore[attr-defined]
+        "reason": reason,
+        "buffered_chunks": buffered_chunks,
+    }
+    failure_request = request_data.copy()
+    _routing_module._apply_current_selected_deployment_to_request(
+        failure_request,
+        selected_box=selected_deployment_box,
+    )
+    _routing_module._mark_exception_for_deployment_failover(
+        exception,
+        failure_request,
+    )
+    return exception
+
+
+async def _yield_native_stream_after_terminal(
+    response: Any,
+    request_data: dict,
+    *,
+    selected_deployment_box: Optional[dict[str, Any]] = None,
+) -> AsyncIterator[Any]:
+    """Validate a native SSE fallback before committing it to the client.
+
+    Chat Completions and Anthropic Messages use different terminal frames, but
+    both can be buffered until their own terminal frame. That preserves the
+    same routing opportunity as Responses without exposing a partial replay.
+    """
+
+    buffered_chunks: List[Any] = []
+    finished_choice_indices: set[int] = set()
+    saw_terminal = False
+    try:
+        async for chunk in _stream_with_idle_timeout(response, request_data):
+            chunk_exception = _stream_chunk_error_exception(chunk)
+            if chunk_exception is not None:
+                failure_request = request_data.copy()
+                _routing_module._apply_current_selected_deployment_to_request(
+                    failure_request,
+                    selected_box=selected_deployment_box,
+                )
+                _routing_module._mark_exception_for_deployment_failover(
+                    chunk_exception,
+                    failure_request,
+                )
+                raise chunk_exception
+            buffered_chunks.append(chunk)
+            saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
+                chunk,
+                request_data,
+                finished_choice_indices,
+            )
+            if not saw_terminal:
+                continue
+            success_request = request_data.copy()
+            _routing_module._apply_current_selected_deployment_to_request(
+                success_request,
+                selected_box=selected_deployment_box,
+            )
+            _routing_module._record_deployment_success_for_cooldown(success_request)
+            for buffered_chunk in buffered_chunks:
+                yield buffered_chunk
+            return
+    except Exception:
+        raise
+
+    raise _native_stream_incomplete_exception(
+        request_data,
+        buffered_chunks=len(buffered_chunks),
+        selected_deployment_box=selected_deployment_box,
+    )
+
+
+async def _stream_native_route_recovery_poll_attempt(
+    request_data: dict,
+    exception: Exception,
+    *,
+    attempt: int,
+    deadline: Optional[float] = None,
+) -> AsyncIterator[Any]:
+    selected_deployment_box: dict[str, Any] = {}
+    fallback_iterator = _stream_streaming_error_fallback_round(
+        request_data,
+        exception,
+        allow_repeated_attempt=True,
+        route_recovery_poll=True,
+    ).__aiter__()
+    buffered_chunks: List[Any] = []
+    finished_choice_indices: set[int] = set()
+    saw_terminal = False
+    next_chunk_task = None
+    configured_timeout_seconds = (
+        _routing_module._stream_start_timeout_seconds_for_request(request_data)
+    )
+    request_timeout_seconds = configured_timeout_seconds
+    if deadline is not None and attempt > 1:
+        remaining_poll_seconds = max(0.0, deadline - time.monotonic())
+        if remaining_poll_seconds <= 0:
+            raise _stream_start_timeout_exception(
+                request_data,
+                start_seconds=configured_timeout_seconds,
+                saw_chunk=False,
+                buffered_chunks=0,
+            )
+        if request_timeout_seconds > 0:
+            request_timeout_seconds = min(
+                request_timeout_seconds,
+                remaining_poll_seconds,
+            )
+        else:
+            request_timeout_seconds = remaining_poll_seconds
+    attempt_deadline = (
+        time.monotonic() + request_timeout_seconds
+        if request_timeout_seconds > 0
+        else None
+    )
+
+    async def cancel_pending_read() -> None:
+        nonlocal next_chunk_task
+        task = next_chunk_task
+        next_chunk_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, StopAsyncIteration):
+            pass
+        except Exception:
+            pass
+
+    def record_success() -> None:
+        success_request = request_data.copy()
+        _routing_module._apply_current_selected_deployment_to_request(
+            success_request,
+            selected_box=selected_deployment_box,
+        )
+        _routing_module._record_deployment_success_for_cooldown(success_request)
+
+    async def yield_completed_attempt() -> AsyncIterator[Any]:
+        record_success()
+        for buffered_chunk in buffered_chunks:
+            yield buffered_chunk
+
+    try:
+        while True:
+            if next_chunk_task is None:
+                selected_deployment_box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(
+                    selected_deployment_box
+                )
+                try:
+                    next_chunk_task = asyncio.create_task(
+                        fallback_iterator.__anext__()
+                    )
+                finally:
+                    _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(
+                        selected_deployment_box_token
+                    )
+            try:
+                wait_seconds = _ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS
+                if attempt_deadline is not None:
+                    remaining_seconds = attempt_deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        await cancel_pending_read()
+                        if saw_terminal:
+                            async for chunk in yield_completed_attempt():
+                                yield chunk
+                            return
+                        raise _stream_route_recovery_wait_timeout_exception(
+                            request_data,
+                            buffered_chunks=len(buffered_chunks),
+                            timeout_seconds=configured_timeout_seconds,
+                            selected_deployment_box=selected_deployment_box,
+                        ) from None
+                    wait_seconds = min(wait_seconds, remaining_seconds)
+                chunk = await asyncio.wait_for(
+                    asyncio.shield(next_chunk_task),
+                    timeout=wait_seconds,
+                )
+                next_chunk_task = None
+            except StopAsyncIteration:
+                next_chunk_task = None
+                if not saw_terminal:
+                    raise _native_stream_incomplete_exception(
+                        request_data,
+                        buffered_chunks=len(buffered_chunks),
+                        selected_deployment_box=selected_deployment_box,
+                    )
+                async for chunk in yield_completed_attempt():
+                    yield chunk
+                return
+            except asyncio.TimeoutError:
+                if next_chunk_task is not None and next_chunk_task.done():
+                    completed_task = next_chunk_task
+                    next_chunk_task = None
+                    try:
+                        chunk = completed_task.result()
+                    except StopAsyncIteration:
+                        if not saw_terminal:
+                            raise _native_stream_incomplete_exception(
+                                request_data,
+                                buffered_chunks=len(buffered_chunks),
+                                selected_deployment_box=selected_deployment_box,
+                            )
+                        async for completed_chunk in yield_completed_attempt():
+                            yield completed_chunk
+                        return
+                    except Exception:
+                        if saw_terminal:
+                            async for completed_chunk in yield_completed_attempt():
+                                yield completed_chunk
+                            return
+                        raise
+                elif attempt_deadline is not None and time.monotonic() >= attempt_deadline:
+                    await cancel_pending_read()
+                    if saw_terminal:
+                        async for completed_chunk in yield_completed_attempt():
+                            yield completed_chunk
+                        return
+                    raise _stream_route_recovery_wait_timeout_exception(
+                        request_data,
+                        buffered_chunks=len(buffered_chunks),
+                        timeout_seconds=configured_timeout_seconds,
+                        selected_deployment_box=selected_deployment_box,
+                    ) from None
+                else:
+                    yield _route_recovery_sse_keepalive(
+                        attempt,
+                        request_data=request_data,
+                        phase="attempt",
+                    )
+                    continue
+            except Exception:
+                if saw_terminal:
+                    async for completed_chunk in yield_completed_attempt():
+                        yield completed_chunk
+                    return
+                raise
+
+            chunk_exception = _stream_chunk_error_exception(chunk)
+            if chunk_exception is not None:
+                if saw_terminal:
+                    async for completed_chunk in yield_completed_attempt():
+                        yield completed_chunk
+                    return
+                failure_request = request_data.copy()
+                _routing_module._apply_current_selected_deployment_to_request(
+                    failure_request,
+                    selected_box=selected_deployment_box,
+                )
+                _routing_module._mark_exception_for_deployment_failover(
+                    chunk_exception,
+                    failure_request,
+                )
+                raise chunk_exception
+
+            buffered_chunks.append(chunk)
+            saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
+                chunk,
+                request_data,
+                finished_choice_indices,
+            )
+    finally:
+        await cancel_pending_read()
+        try:
+            await fallback_iterator.aclose()
+        except Exception:
+            pass
+
+
 def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     if _routing_module._is_upstream_model_not_found_error(exception):
         return False
@@ -3125,7 +3628,10 @@ async def _external_web_search_non_stream_synthesis_recovery(
             recovery_exception,
             payload,
         )
-        if _routing_module._is_priority_deployment_failover_error(recovery_exception):
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            recovery_exception,
+            payload,
+        ):
             _routing_module._mark_exception_for_deployment_failover(
                 recovery_exception,
                 payload,
@@ -3155,11 +3661,15 @@ def _route_recovery_sse_keepalive(
     *,
     request_data: Optional[dict] = None,
     phase: str = "poll",
-) -> _JSONStreamEvent:
+) -> Any:
     if request_data is not None:
         _state_module._touch_route_recovery_state(
             _route_recovery_state_key(request_data)
         )
+    if _request_uses_native_event_stream(request_data):
+        return (
+            f": litellm_menu route_recovery phase={phase} attempt={attempt}\n\n"
+        ).encode("utf-8")
     return _JSONStreamEvent(
         {
             "type": "response.metadata",
@@ -3173,6 +3683,10 @@ def _route_recovery_sse_keepalive(
 
 
 def _is_route_recovery_sse_keepalive(chunk: Any) -> bool:
+    if isinstance(chunk, bytes):
+        return chunk.startswith(b": litellm_menu route_recovery ")
+    if isinstance(chunk, str):
+        return chunk.startswith(": litellm_menu route_recovery ")
     dumped = _stream_chunk_dump(chunk)
     if dumped.get("type") != "response.metadata":
         return False
@@ -3219,9 +3733,8 @@ async def _stream_route_recovery_poll(
     request_data: dict,
     exception: Exception,
 ) -> AsyncIterator[Any]:
-    if _responses_request_module._request_has_structured_codex_compaction(
-        request_data
-    ):
+    uses_native_event_stream = _request_uses_native_event_stream(request_data)
+    if _responses_request_module._request_is_codex_compaction(request_data):
         _trace_module._route_trace(
             "codex_compaction_route_recovery_blocked",
             request_id=_routing_module._trace_request_id(request_data),
@@ -3450,7 +3963,10 @@ async def _stream_route_recovery_poll(
             attempt += 1
             attempt_started_at = now
             if (
-                _routing_module._is_priority_deployment_failover_error(last_exception)
+                _routing_module._is_request_scoped_priority_deployment_failover_error(
+                    last_exception,
+                    request_data,
+                )
                 and (
                     not _routing_module._should_retry_same_deployment_before_fallback(last_exception)
                     or _routing_module._is_local_stream_start_timeout_error(last_exception)
@@ -3538,7 +4054,12 @@ async def _stream_route_recovery_poll(
 
             try:
                 yielded = False
-                async for chunk in _stream_route_recovery_poll_attempt(
+                poll_attempt = (
+                    _stream_native_route_recovery_poll_attempt
+                    if uses_native_event_stream
+                    else _stream_route_recovery_poll_attempt
+                )
+                async for chunk in poll_attempt(
                     request_data,
                     last_exception,
                     attempt=attempt,
@@ -3548,7 +4069,10 @@ async def _stream_route_recovery_poll(
                         yield chunk
                         continue
                     yielded = True
-                    yield _responses_stream_chunk_for_delivery(chunk)
+                    if uses_native_event_stream:
+                        yield chunk
+                    else:
+                        yield _responses_stream_chunk_for_delivery(chunk)
                 if yielded:
                     _trace_module._route_trace(
                         "route_recovery_poll_success",
@@ -3687,6 +4211,16 @@ async def _stream_route_recovery_poll(
             ):
                 yield keepalive
 
+        if uses_native_event_stream:
+            if _routing_module._should_sanitize_final_upstream_route_error(
+                last_exception
+            ):
+                _routing_module._raise_sanitized_upstream_route_failure(
+                    _responses_execution_module._request_model_group(request_data),
+                    last_exception,
+                    request_data,
+                )
+            raise last_exception
         yield _synthesized_failed_response_event(request_data, last_exception)
     finally:
         _route_recovery_state_remove(recovery_state_key)
@@ -3800,6 +4334,7 @@ def _build_forced_image_generation_payload(request_data: dict, *, stream: bool) 
         "stream_timeout",
         "_target_order",
         "_excluded_deployment_ids",
+        _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     )
     payload: Dict[str, Any] = {}
     for key in allowed_keys:
@@ -3810,9 +4345,6 @@ def _build_forced_image_generation_payload(request_data: dict, *, stream: bool) 
             payload[key] = value
 
     if not payload.get("model") or not _tools_module._request_has_image_generation_tool(payload):
-        return None
-
-    if not _image_generation_module._request_can_attempt_image_generation_tool_fallback(request_data):
         return None
 
     attempts = _image_generation_module._with_incremented_image_generation_tool_fallback_attempts(request_data)
@@ -3828,6 +4360,15 @@ def _build_forced_image_generation_payload(request_data: dict, *, stream: bool) 
     payload["litellm_metadata"] = merged_litellm_metadata
     payload["stream"] = stream
     payload["tool_choice"] = {"type": "image_generation"}
+    selected_deployment_id = _routing_module._deployment_id_from_request(request_data)
+    excluded_deployment_ids = _responses_request_module._request_excluded_deployment_ids(
+        request_data
+    )
+    if selected_deployment_id and selected_deployment_id not in excluded_deployment_ids:
+        payload[_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY] = [selected_deployment_id]
+        selected_order = _routing_module._deployment_order_from_request(request_data)
+        if selected_order is not None:
+            payload["_target_order"] = selected_order
     return payload
 
 
@@ -3845,6 +4386,7 @@ async def _stream_forced_image_generation_payload(payload: dict) -> AsyncIterato
     buffer: List[Any] = []
     text = ""
     released = False
+    policy_refusal = False
     async for chunk in _stream_with_idle_timeout(fallback_response, payload):
         if released:
             yield chunk
@@ -3859,11 +4401,24 @@ async def _stream_forced_image_generation_payload(payload: dict) -> AsyncIterato
         chunk_text = _responses_output_module._response_text(chunk)
         if chunk_text:
             text = f"{text}\n{chunk_text}" if text else chunk_text
+            if _image_generation_module._response_is_image_generation_policy_refusal(
+                {"output_text": text}
+            ):
+                policy_refusal = True
+                break
             if _image_generation_module._response_is_image_generation_unavailable_refusal({"output_text": text}):
-                raise _image_generation_module._image_generation_tool_runtime_fallback_exception()
+                raise _image_generation_module._image_generation_tool_runtime_fallback_exception(
+                    capability_unsupported=True,
+                )
     if not released:
+        if policy_refusal:
+            for chunk in buffer:
+                yield chunk
+            return
         if _image_generation_module._response_should_trigger_image_generation_fallback({"output_text": text}):
-            raise _image_generation_module._image_generation_tool_runtime_fallback_exception()
+            raise _image_generation_module._image_generation_tool_runtime_fallback_exception(
+                capability_unsupported=True,
+            )
         for chunk in buffer:
             yield chunk
 
@@ -4304,7 +4859,10 @@ async def _yield_validated_structured_codex_compaction_stream(
             events.append(sanitized_chunk)
             completion_state.remember(sanitized_chunk)
             return "failed"
-        chunk_exception = _stream_chunk_priority_error_exception(sanitized_chunk)
+        chunk_exception = _stream_chunk_priority_error_exception(
+            sanitized_chunk,
+            request_data,
+        )
         if chunk_exception is not None:
             raise chunk_exception
         events.append(sanitized_chunk)
@@ -4390,14 +4948,63 @@ async def _yield_guarded_original_stream(
     synthesize_completed_on_clean_eof_after_visible_output: bool = False,
 ) -> AsyncIterator[Any]:
     if not _request_is_responses_stream(request_data):
-        async for chunk in _yield_original_stream(
-            buffer,
-            response,
-            request_data,
-            stream_started_at=stream_started_at,
-            saw_visible_output=saw_visible_output,
-        ):
-            yield chunk
+        finished_choice_indices: set[int] = set()
+        saw_terminal = False
+        success_recorded = False
+        native_chunk_count = 0
+
+        def inspect_native_chunk(chunk: Any) -> bool:
+            nonlocal saw_terminal, success_recorded, native_chunk_count
+            chunk_exception = _stream_chunk_error_exception(chunk)
+            if chunk_exception is not None:
+                if saw_terminal:
+                    return False
+                raise chunk_exception
+            native_chunk_count += 1
+            saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
+                chunk,
+                request_data,
+                finished_choice_indices,
+            )
+            if saw_terminal and not success_recorded:
+                _routing_module._record_deployment_success_for_cooldown(
+                    request_data
+                )
+                success_recorded = True
+            return True
+
+        try:
+            for chunk in buffer:
+                if not inspect_native_chunk(chunk):
+                    return
+                yield chunk
+            async for chunk in _stream_with_idle_timeout(
+                response,
+                request_data,
+                stream_started_at=stream_started_at,
+                saw_visible_output=saw_visible_output,
+                initial_chunk_count=len(buffer),
+            ):
+                if not inspect_native_chunk(chunk):
+                    return
+                yield chunk
+        except Exception as exception:
+            if saw_terminal:
+                return
+            if _routing_module._is_request_scoped_priority_deployment_failover_error(
+                exception,
+                request_data,
+            ):
+                _routing_module._mark_exception_for_deployment_failover(
+                    exception,
+                    request_data,
+                )
+            raise
+        if not saw_terminal:
+            raise _native_stream_incomplete_exception(
+                request_data,
+                buffered_chunks=native_chunk_count,
+            )
         return
 
     if _responses_request_module._request_has_structured_codex_compaction(
@@ -5206,10 +5813,29 @@ async def _yield_guarded_original_stream(
         )
         return completed
 
+    def completed_image_generation_terminal_event(
+        reason: str,
+    ) -> Optional[_JSONStreamEvent]:
+        if not _image_generation_module._response_has_image_generation_result_payload(
+            list(completed_output_items.values())
+        ):
+            return None
+        return completed_terminal_event(reason, allow_tool_call_only=True)
+
     def completed_custom_tool_terminal_events() -> list[_JSONStreamEvent]:
         if completed_output_has_visible_assistant_text() or synthesized_text().strip():
             return []
-        if not pending_tool_items:
+        completed_custom_tool_items = [
+            item
+            for item in completed_output_items.values()
+            if item.get("type") == "custom_tool_call"
+        ]
+        if not pending_tool_items and not completed_custom_tool_items:
+            return []
+        if any(
+            item.get("type") not in {"reasoning", "custom_tool_call"}
+            for item in completed_output_items.values()
+        ):
             return []
         for _output_index, item in pending_tool_items.values():
             if item.get("type") != "custom_tool_call":
@@ -5219,12 +5845,20 @@ async def _yield_guarded_original_stream(
                 for item_id in _stream_output_item_identity_keys(item)
             ):
                 return []
-        events = _synthesized_pending_tool_completion_events(
-            pending_tool_items,
-            completed_output_items,
-            completion_state.created_response,
-            completion_state.model,
-        )
+        if pending_tool_items:
+            events = _synthesized_pending_tool_completion_events(
+                pending_tool_items,
+                completed_output_items,
+                completion_state.created_response,
+                completion_state.model,
+            )
+        else:
+            completed = _synthesized_completed_response_event(
+                completed_output_items,
+                completion_state.created_response,
+                completion_state.model,
+            )
+            events = [completed] if completed is not None else []
         if events:
             _trace_module._route_trace(
                 "responses_active_stream_synthesized_completed_event",
@@ -5242,7 +5876,10 @@ async def _yield_guarded_original_stream(
         # stream could duplicate a tool call or visible output.  Keep the
         # terminal failure for this response, but quarantine the route before
         # Codex reconnects so the next attempt selects a healthy deployment.
-        if _routing_module._is_priority_deployment_failover_error(failure):
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            failure,
+            request_data,
+        ):
             _routing_module._mark_exception_for_deployment_failover(
                 failure,
                 request_data,
@@ -5380,10 +6017,19 @@ async def _yield_guarded_original_stream(
             chunk = normalize_tool_bridge_chunk(sanitized_chunk)
             if chunk is None:
                 continue
-            chunk_exception = _stream_chunk_priority_error_exception(chunk)
+            chunk_exception = _stream_chunk_priority_error_exception(
+                chunk,
+                request_data,
+            )
             if chunk_exception is not None:
                 if saw_image_generation_activity:
-                    return
+                    completed = completed_image_generation_terminal_event(
+                        "stream error after completed image generation output"
+                    )
+                    if completed is not None:
+                        remember(completed)
+                        yield completed
+                        return
                 if missing_answer_after_web_search():
                     async for recovered_chunk in yield_recovered_search_tool_answer(
                         "stream error after web_search-only output",
@@ -5493,7 +6139,13 @@ async def _yield_guarded_original_stream(
             yield _responses_stream_chunk_for_delivery(chunk)
     except Exception as exc:
         if saw_image_generation_activity:
-            return
+            completed = completed_image_generation_terminal_event(
+                "stream error after completed image generation output"
+            )
+            if completed is not None:
+                remember(completed)
+                yield completed
+                return
         if missing_answer_after_web_search():
             async for recovered_chunk in yield_recovered_search_tool_answer(
                 "stream error after web_search-only output",
@@ -5513,6 +6165,12 @@ async def _yield_guarded_original_stream(
         raise
 
     if not saw_responses_completed and saw_image_generation_activity:
+        completed = completed_image_generation_terminal_event(
+            "image generation output without response.completed"
+        )
+        if completed is not None:
+            remember(completed)
+            yield completed
         return
 
     if not saw_responses_completed:
@@ -5526,6 +6184,14 @@ async def _yield_guarded_original_stream(
             return
 
     prune_internal_bridge_items()
+
+    if not saw_responses_completed:
+        terminal_events = completed_custom_tool_terminal_events()
+        for synthetic_chunk in terminal_events:
+            remember(synthetic_chunk)
+            yield synthetic_chunk
+        if terminal_events:
+            return
 
     if not saw_responses_completed and pending_tool_items:
         if missing_answer_after_web_search():
@@ -5591,6 +6257,9 @@ async def _yield_streaming_error_fallback_or_raise(
     exception: Exception,
 ) -> AsyncIterator[Any]:
     is_responses_stream = _request_is_responses_stream(request_data)
+    supports_streaming_fallback = _request_supports_streaming_error_fallback(
+        request_data
+    )
     litellm_metadata = _request_context_module._request_metadata_dict(
         request_data,
         "litellm_metadata",
@@ -5677,7 +6346,7 @@ async def _yield_streaming_error_fallback_or_raise(
             yield chunk
 
     if (
-        is_responses_stream
+        supports_streaming_fallback
         and not route_recovery_poll_payload
         and _routing_module._recovery_max_seconds_for_request(request_data) > 0
         # A normal priority failover still needs its ordinary one-shot router
@@ -5734,13 +6403,13 @@ async def _yield_streaming_error_fallback_or_raise(
     except Exception as exc:
         if yielded_fallback:
             if (
-                is_responses_stream
+                supports_streaming_fallback
                 and not fallback_delivered_terminal_or_visible
                 and _routing_module._recovery_max_seconds_for_request(request_data) > 0
                 and _external_web_search_recovery_poll_error(exc)
             ):
                 _trace_module._route_trace(
-                    "responses_stream_fallback_route_recovery_poll",
+                    "stream_fallback_route_recovery_poll",
                     request_id=_routing_module._trace_request_id(request_data),
                     session=_routing_module._trace_session_context(request_data),
                     model_group=_responses_execution_module._request_model_group(request_data),
@@ -5784,7 +6453,7 @@ async def _yield_streaming_error_fallback_or_raise(
         return
     final_exception = fallback_exception or exception
     if (
-        is_responses_stream
+        supports_streaming_fallback
         and _routing_module._recovery_max_seconds_for_request(request_data) > 0
         and _external_web_search_recovery_poll_error(final_exception)
     ):
@@ -5803,9 +6472,15 @@ async def _yield_streaming_error_fallback_or_raise(
         if recovery_exception is not None:
             final_exception = recovery_exception
     if is_responses_stream and (
-        _routing_module._is_priority_deployment_failover_error(final_exception)
+        _routing_module._is_request_scoped_priority_deployment_failover_error(
+            final_exception,
+            request_data,
+        )
         or _routing_module._is_no_deployments_available_error(final_exception)
-        or _routing_module._is_priority_deployment_failover_error(exception)
+        or _routing_module._is_request_scoped_priority_deployment_failover_error(
+            exception,
+            request_data,
+        )
         or _routing_module._is_no_deployments_available_error(exception)
     ):
         if route_recovery_poll_payload:
@@ -5868,7 +6543,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
             ):
                 yield chunk
         except Exception as exception:
-            if _routing_module._is_priority_deployment_failover_error(exception):
+            if _routing_module._is_request_scoped_priority_deployment_failover_error(
+                exception,
+                request_data,
+            ):
                 _routing_module._mark_exception_for_deployment_failover(
                     exception,
                     request_data,
@@ -5925,7 +6603,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 and not str(_stream_chunk_dump(chunk).get("delta") or "").strip()
             ):
                 continue
-            chunk_exception = _stream_chunk_priority_error_exception(chunk)
+            chunk_exception = _stream_chunk_priority_error_exception(
+                chunk,
+                request_data,
+            )
             if chunk_exception is not None:
                 async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
                     request_data,
@@ -6061,7 +6742,10 @@ async def _yield_start_buffered_stream_with_error_fallback(
             yield completed_compat
             await _close_async_iterator_safely(response)
             return
-        if _routing_module._is_priority_deployment_failover_error(exc):
+        if _routing_module._is_request_scoped_priority_deployment_failover_error(
+            exc,
+            request_data,
+        ):
             _routing_module._mark_exception_for_deployment_failover(
                 exc,
                 request_data,
@@ -6095,6 +6779,28 @@ async def _yield_start_buffered_stream_with_error_fallback(
         ):
             yield fallback_chunk
         return
+
+    if not is_responses_stream and stream_exhausted:
+        finished_choice_indices: set[int] = set()
+        saw_native_terminal = any(
+            _native_stream_chunk_is_terminal(
+                chunk,
+                request_data,
+                finished_choice_indices,
+            )
+            for chunk in buffer
+        )
+        if not saw_native_terminal:
+            incomplete_exception = _native_stream_incomplete_exception(
+                request_data,
+                buffered_chunks=len(buffer),
+            )
+            async for fallback_chunk in _yield_streaming_error_fallback_or_raise(
+                request_data,
+                incomplete_exception,
+            ):
+                yield fallback_chunk
+            return
 
     async for chunk in _yield_guarded_original_stream(
         buffer,

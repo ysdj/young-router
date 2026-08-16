@@ -22,7 +22,7 @@ export interface NativeLeafBridge {
   openWindow(route: AppRoute): void;
   closeWindow(route?: AppRoute): void;
   focusWindow(route: AppRoute): void;
-  setWindowContentSize?(width: number, height: number): Promise<boolean>;
+  setWindowContentSize?(route: AppRoute, width: number, height: number): Promise<boolean>;
   setMenuBarStatus(status: ServiceStatus): void;
   setMenuBarActions(actions: NativeMenuAction[]): void;
   setTrayStatus(status: ServiceStatus): void;
@@ -31,10 +31,9 @@ export interface NativeLeafBridge {
   saveFilePicker(suggestedName: string): Promise<string | undefined>;
   showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor): Promise<number | undefined>;
   showConfirmation(title: string, message: string, confirmLabel: string): Promise<boolean>;
+  showReadOnlyText(title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string): Promise<void>;
   showCodexRestartConfirmation(title: string, message: string, restartLabel: string, laterLabel: string): Promise<"restart" | "later" | undefined>;
-  showReadOnlyText(title: string, text: string, closeLabel: string): Promise<void>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
-  editSecureDocument(editorToken: string, language: "toml" | "json", title: string): Promise<number | undefined>;
   editSecret(
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav",
     field: string,
@@ -106,7 +105,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
       close: (route) => bridge.closeWindow(route),
       focus: (route) => bridge.focusWindow(route),
       setContentSize: bridge.setWindowContentSize
-        ? (width, height) => bridge.setWindowContentSize!(width, height)
+        ? (route, width, height) => bridge.setWindowContentSize!(route, width, height)
         : undefined,
     },
     menuBar: {
@@ -121,10 +120,9 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     saveFilePicker: ({ suggestedName }) => bridge.saveFilePicker(suggestedName),
     showActionMenu: ({ title, items, anchor }) => bridge.showActionMenu(title, items, anchor),
     showConfirmation: ({ title, message, confirmLabel }) => bridge.showConfirmation(title, message, confirmLabel),
+    showReadOnlyText: ({ title, text, closeLabel, language, html }) => bridge.showReadOnlyText(title, text, closeLabel, language, html),
     showCodexRestartConfirmation: ({ title, message, restartLabel, laterLabel }) => bridge.showCodexRestartConfirmation(title, message, restartLabel, laterLabel),
-    showReadOnlyText: ({ title, text, closeLabel }) => bridge.showReadOnlyText(title, text, closeLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
-    editSecureDocument: ({ editorToken, language, title }) => bridge.editSecureDocument(editorToken, language, title),
     editSecret: ({ domain, field, target, title, allowClear }) => bridge.editSecret(domain, field, target, title, allowClear),
     clearSecret: ({ domain, field, target }) => bridge.clearSecret(domain, field, target),
     copySecret: ({ domain, field, target }) => bridge.copySecret(domain, field, target),

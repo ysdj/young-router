@@ -6,6 +6,210 @@ from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    async def test_chat_completions_clean_eof_before_terminal_falls_back(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        calls = []
+
+        async def incomplete_stream():
+            yield {
+                "id": "chatcmpl-incomplete",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+
+        async def recovered_stream():
+            yield {
+                "id": "chatcmpl-recovered",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "Recovered."},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield {
+                "id": "chatcmpl-recovered",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ],
+            }
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "chat-original"},
+                    },
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "chat-recovered"},
+                    },
+                ]
+
+            async def acompletion(self, **payload):
+                calls.append(payload)
+                hooks._remember_selected_deployment(
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "chat-recovered", "order": 1},
+                    }
+                )
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+            "model_info": {"id": "chat-original", "order": 1},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=incomplete_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["_excluded_deployment_ids"], ["chat-original"])
+        self.assertEqual(chunks[0]["id"], "chatcmpl-recovered")
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertNotIn("chatcmpl-incomplete", json.dumps(chunks))
+        self.assertIn("id:chat-original", hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_anthropic_clean_eof_before_message_stop_falls_back(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        calls = []
+        incomplete_start = (
+            b'event: message_start\n'
+            b'data: {"type":"message_start","message":{"id":"msg-incomplete"}}\n\n'
+        )
+        recovered_chunks = [
+            (
+                b'event: message_start\n'
+                b'data: {"type":"message_start","message":{"id":"msg-recovered"}}\n\n'
+            ),
+            (
+                b'event: content_block_delta\n'
+                b'data: {"type":"content_block_delta","delta":'
+                b'{"type":"text_delta","text":"Recovered."}}\n\n'
+            ),
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        async def incomplete_stream():
+            yield incomplete_start
+
+        async def recovered_stream():
+            for chunk in recovered_chunks:
+                yield chunk
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "messages-original"},
+                    },
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "messages-recovered"},
+                    },
+                ]
+
+            async def anthropic_messages(self, **payload):
+                calls.append(payload)
+                hooks._remember_selected_deployment(
+                    {
+                        "litellm_params": {"model": "provider/default-chat"},
+                        "model_info": {"id": "messages-recovered", "order": 1},
+                    }
+                )
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "max_tokens": 64,
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/messages"},
+            "model_info": {"id": "messages-original", "order": 1},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=incomplete_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["_excluded_deployment_ids"], ["messages-original"])
+        self.assertEqual(chunks, recovered_chunks)
+        self.assertNotIn(incomplete_start, chunks)
+        self.assertIn("id:messages-original", hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_native_stream_partial_output_without_terminal_cools_route(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+            "model_info": {"id": "partial-chat-route", "order": 1},
+        }
+
+        async def incomplete_stream():
+            yield {
+                "id": "chatcmpl-partial",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "Partial"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+
+        delivered = []
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Chat Completions stream ended before a terminal finish_reason",
+        ):
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=incomplete_stream(),
+                request_data=request_data,
+            ):
+                delivered.append(chunk)
+
+        self.assertEqual(delivered[0]["choices"][0]["delta"]["content"], "Partial")
+        self.assertIn("id:partial-chat-route", hooks._DEPLOYMENT_COOLDOWNS)
+
     async def test_incomplete_responses_stream_after_tool_activity_cools_route_immediately(self) -> None:
         hooks, _proxy_server = load_hook_module()
         hooks._DEPLOYMENT_COOLDOWNS.clear()

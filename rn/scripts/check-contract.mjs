@@ -15,7 +15,7 @@ const ipc = fs.readFileSync(path.join(root, "packages/shared/src/ipc.ts"), "utf8
 const source = ts.createSourceFile(typesPath, types, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 const printer = ts.createPrinter({ removeComments: true });
 
-const requiredRoutes = ["providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "logs"];
+const requiredRoutes = ["providers-models", "codex-settings", "claude-settings", "runtime-settings", "data-management", "logs"];
 
 function fail(message) {
   throw new Error(message);
@@ -157,7 +157,12 @@ for (const method of methods) {
   const contract = coreSchema["x-method-contracts"]?.[method];
   if (!contract?.params || !contract?.result) fail(`schema contract is missing: ${method}`);
   const params = definition(contract.params);
-  if (params.additionalProperties !== false) fail(`strict IPC params schema is missing: ${method}`);
+  const strictAlternatives = Array.isArray(params.oneOf)
+    && params.oneOf.length > 0
+    && params.oneOf.every((choice) => definition(choice)?.additionalProperties === false);
+  if (params.additionalProperties !== false && !strictAlternatives) {
+    fail(`strict IPC params schema is missing: ${method}`);
+  }
 }
 assertMethodTypeMap("IpcParams", "params");
 assertMethodTypeMap("IpcResults", "result");

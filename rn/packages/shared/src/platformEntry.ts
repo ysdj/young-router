@@ -2,8 +2,9 @@ import { I18nManager, NativeEventEmitter, NativeModules } from "react-native";
 import { createTranslator } from "./i18n";
 import { createIpcClient } from "./ipc";
 import { createNativeIpcTransport, createNativeLeafBridgeAdapter, type NativeIpcBridge, type NativeLeafBridge } from "./platform/nativeBridge";
+import { routeMenuActions } from "./routes";
 import { registerLiteLLMMenu } from "./bootstrap";
-import type { AppRoute, LanguagePreference, LogTab, NativeLocalization, NativeMenuAction, NativeMenuAnchor, ServiceStatus } from "./types";
+import type { LanguagePreference, NativeLocalization, NativeMenuAction, NativeMenuAnchor, ServiceStatus } from "./types";
 
 type NativeModule = {
   send?: (request: string) => Promise<string>;
@@ -11,7 +12,7 @@ type NativeModule = {
   openWindow?: (route: string) => void;
   closeWindow?: (route?: string) => void;
   focusWindow?: (route: string) => void;
-  setWindowContentSize?: (width: number, height: number) => Promise<boolean>;
+  setWindowContentSize?: (route: string, width: number, height: number) => Promise<boolean>;
   setMenuBarStatus?: (title: string, running: boolean) => void;
   setMenuBarActions?: (actions: NativeMenuAction[]) => void;
   setTrayStatus?: (title: string, running: boolean) => void;
@@ -20,10 +21,9 @@ type NativeModule = {
   saveFilePicker?: (suggestedName: string) => Promise<string | undefined>;
   showActionMenu?: (title: string, items: string[], anchor: NativeMenuAnchor) => Promise<number | undefined>;
   showConfirmation?: (title: string, message: string, confirmLabel: string) => Promise<boolean>;
+  showReadOnlyText?: (title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string) => Promise<void>;
   showCodexRestartConfirmation?: (title: string, message: string, restartLabel: string, laterLabel: string) => Promise<"restart" | "later" | undefined>;
-  showReadOnlyText?: (title: string, text: string, closeLabel: string) => Promise<void>;
   chooseModelsToAdd?: (models: string[], providerName: string, keyName: string) => Promise<string[] | undefined>;
-  editSecureDocument?: (editorToken: string, language: "toml" | "json", title: string) => Promise<number | undefined>;
   editSecret?: (
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav",
     field: string,
@@ -112,7 +112,7 @@ const nativeBridge: NativeLeafBridge = {
   closeWindow: (route) => call("closeWindow", route),
   focusWindow: (route) => call("focusWindow", route),
   setWindowContentSize: leaf.setWindowContentSize
-    ? (width, height) => leaf.setWindowContentSize!(width, height)
+    ? (route, width, height) => leaf.setWindowContentSize!(route, width, height)
     : undefined,
   setMenuBarStatus: (status) => call("setMenuBarStatus", statusTitle(status), status.state === "running"),
   setMenuBarActions: (actions) => call("setMenuBarActions", actions),
@@ -122,13 +122,12 @@ const nativeBridge: NativeLeafBridge = {
   saveFilePicker: async (suggestedName) => leaf.saveFilePicker?.(suggestedName),
   showActionMenu: async (title, items, anchor) => leaf.showActionMenu?.(title, items, anchor),
   showConfirmation: async (title, message, confirmLabel) => leaf.showConfirmation?.(title, message, confirmLabel) ?? false,
-  showCodexRestartConfirmation: async (title, message, restartLabel, laterLabel) => leaf.showCodexRestartConfirmation?.(title, message, restartLabel, laterLabel),
-  showReadOnlyText: async (title, text, closeLabel) => {
-    if (!leaf.showReadOnlyText) throw new Error("The native read-only text viewer is unavailable.");
-    await leaf.showReadOnlyText(title, text, closeLabel);
+  showReadOnlyText: async (title, text, closeLabel, language, html) => {
+    if (!leaf.showReadOnlyText) throw new Error("The native code viewer is unavailable.");
+    await leaf.showReadOnlyText(title, text, closeLabel, language, html);
   },
+  showCodexRestartConfirmation: async (title, message, restartLabel, laterLabel) => leaf.showCodexRestartConfirmation?.(title, message, restartLabel, laterLabel),
   chooseModelsToAdd: async (models, providerName, keyName) => leaf.chooseModelsToAdd?.(models, providerName, keyName),
-  editSecureDocument: async (editorToken, language, title) => leaf.editSecureDocument?.(editorToken, language, title),
   editSecret: async (domain, field, target, title, allowClear) => leaf.editSecret?.(domain, field, target, title, allowClear),
   clearSecret: async (domain, field, target) => leaf.clearSecret?.(domain, field, target),
   copySecret: async (domain, field, target) => leaf.copySecret?.(domain, field, target) ?? false,
@@ -156,11 +155,7 @@ const nativeBridge: NativeLeafBridge = {
 };
 
 const bootstrapTranslate = createTranslator("system", systemLocale);
-const routeActions: NativeMenuAction[] = [
-  ["providers-models", "menu.providers"], ["codex-settings", "menu.codex"],
-  ["runtime-settings", "menu.runtime"], ["relay-accounts", "menu.relay"], ["webdav-settings", "menu.webdav"],
-  ["logs", "menu.logs"],
-].map(([route, key]) => ({ id: `open-${route}`, title: bootstrapTranslate(key), enabled: true }));
+const routeActions: NativeMenuAction[] = routeMenuActions(bootstrapTranslate);
 
 const native = createNativeLeafBridgeAdapter(nativeBridge);
 native.menuBar.setActions(routeActions);
@@ -182,5 +177,3 @@ registerLiteLLMMenu("LiteLLMMenu", {
     return () => subscription.remove();
   },
 });
-
-export const DESKTOP_ROUTES: readonly AppRoute[] = ["home", "providers-models", "codex-settings", "claude-settings", "runtime-settings", "webdav-settings", "relay-accounts", "relay-add", "logs"];

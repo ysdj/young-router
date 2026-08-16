@@ -23,7 +23,8 @@
         "LiteLLMAppKitSelectableRow": "LiteLLMAppKitSelectableRowComponentView",
         "LiteLLMAppKitTable": "LiteLLMAppKitTableComponentView",
         "LiteLLMAppKitTextEditor": "LiteLLMAppKitTextEditorComponentView",
-        "LiteLLMAppKitSecureTextEditor": "LiteLLMAppKitSecureTextEditorComponentView",
+        "LiteLLMAppKitCodeWebView": "LiteLLMAppKitCodeWebViewComponentView",
+        "LiteLLMAppKitPersistentScrollIndicator": "LiteLLMAppKitPersistentScrollIndicatorComponentView",
         "LiteLLMAppKitSecureTextInput": "LiteLLMAppKitSecureTextInputComponentView",
         "LiteLLMAppKitSplitView": "LiteLLMAppKitSplitViewComponentView"
       }

@@ -4,6 +4,40 @@ from hook_test_utils import *
 
 
 class HookRoutingTests(HookTestCase):
+    async def test_encrypted_history_continuation_keeps_eligible_routes(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        deployments = [
+            {"model_info": {"id": "route-low", "order": 1}},
+            {"model_info": {"id": "route-target", "order": 2}},
+        ]
+        replay = {
+            "call_type": "aresponses",
+            "input": [
+                {
+                    "type": "compaction",
+                    "id": "cmp-existing",
+                    "encrypted_content": "opaque-history",
+                },
+                {"type": "message", "role": "user", "content": "continue"},
+            ],
+            "client_metadata": {
+                "session_id": "thread-encrypted-history",
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "_target_order": 2,
+        }
+
+        selected = await hooks.LiteLLMMenuHook().async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=None,
+            request_kwargs=replay,
+        )
+
+        self.assertEqual(
+            [item["model_info"]["id"] for item in selected], ["route-target"]
+        )
+
     def test_recovery_diagnostic_classifies_user_actionable_failures_without_error_text(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
@@ -84,6 +118,57 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
         self.assertFalse(hooks._is_route_recovery_poll_error(error))
+
+    def test_structured_compaction_body_capacity_error_uses_only_route_failover(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        error = RuntimeError(
+            "OpenAIException - invalid request: request body storage capacity exhausted"
+        )
+        error.status_code = 400
+        structured_compaction_request = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        ordinary_request = {
+            **structured_compaction_request,
+            "input": structured_compaction_request["input"][:-1],
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+        }
+
+        self.assertTrue(hooks._is_upstream_request_body_storage_capacity_error(error))
+        self.assertFalse(hooks._is_priority_deployment_failover_error(error))
+        self.assertTrue(
+            hooks._is_request_scoped_priority_deployment_failover_error(
+                error,
+                structured_compaction_request,
+            )
+        )
+        self.assertFalse(
+            hooks._is_request_scoped_priority_deployment_failover_error(
+                error,
+                ordinary_request,
+            )
+        )
+        self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
+        self.assertFalse(
+            hooks._should_return_route_recovery_stream(
+                error,
+                structured_compaction_request,
+            )
+        )
+        self.assertEqual(
+            hooks._trace_exception(error)["reason"],
+            "upstream-request-body-capacity",
+        )
 
     def test_unknown_custom_tool_type_is_not_a_deployment_failover(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -359,6 +444,79 @@ class HookRoutingTests(HookTestCase):
             request_kwargs={},
         )
         self.assertEqual(filtered, deployments[1:])
+
+    def test_deployment_cooldown_is_shared_across_client_protocols(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        with tempfile.TemporaryDirectory() as directory:
+            self.set_env(
+                hooks._DEPLOYMENT_COOLDOWN_FILE_ENV,
+                str(Path(directory) / "deployment-cooldowns.json"),
+            )
+            deployment = {
+                "litellm_params": {"model": "provider/default-route"},
+                "model_info": {"id": "shared-route"},
+            }
+            failed_request = {
+                "model": "default-chat",
+                "input": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "proxy_server_request": {"path": "/v1/responses"},
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            }
+            failure = RuntimeError("temporary upstream failure")
+            failure.status_code = 503
+
+            hooks._mark_exception_for_deployment_failover(failure, failed_request)
+
+            requests = {
+                "responses": {
+                    "model": "default-chat",
+                    "input": [{"role": "user", "content": "Continue."}],
+                    "stream": True,
+                    "proxy_server_request": {"path": "/v1/responses"},
+                },
+                "chat_completions": {
+                    "model": "default-chat",
+                    "messages": [{"role": "user", "content": "Continue."}],
+                    "stream": True,
+                    "proxy_server_request": {"path": "/v1/chat/completions"},
+                },
+                "anthropic_messages": {
+                    "model": "default-chat",
+                    "messages": [{"role": "user", "content": "Continue."}],
+                    "max_tokens": 64,
+                    "stream": True,
+                    "proxy_server_request": {"path": "/v1/messages"},
+                },
+            }
+            for protocol, request_data in requests.items():
+                with self.subTest(protocol=protocol):
+                    available, cooled, filtered = hooks._with_active_deployment_cooldowns(
+                        [deployment],
+                        request_kwargs=request_data,
+                    )
+                    self.assertEqual(available, [])
+                    self.assertEqual(len(cooled), 1)
+                    self.assertTrue(filtered)
+
+            successful_messages_request = {
+                **requests["anthropic_messages"],
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            }
+            hooks._record_deployment_success_for_cooldown(
+                successful_messages_request
+            )
+            available, cooled, filtered = hooks._with_active_deployment_cooldowns(
+                [deployment],
+                request_kwargs=requests["responses"],
+            )
+            self.assertEqual(available, [deployment])
+            self.assertEqual(cooled, [])
+            self.assertFalse(filtered)
 
     async def test_deployment_cooldown_defaults_to_two_failures(self) -> None:
         hooks, _ = load_hook_module()
@@ -1437,6 +1595,8 @@ class HookRoutingTests(HookTestCase):
 
     def test_protocol_fallback_stays_on_the_same_deployment(self) -> None:
         hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployment = {
             "litellm_params": {"model": "openai/kimi-k3", "order": 1},
             "model_info": {
@@ -1476,6 +1636,7 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(
             request["_litellm_menu_protocol_fallback_from_surface"], "anthropic"
         )
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
 
     def test_successful_protocol_fallback_is_remembered_for_runtime_ttl(self) -> None:
         hooks, _ = load_hook_module()
@@ -2165,7 +2326,7 @@ class HookRoutingTests(HookTestCase):
         self.assertFalse(hooks._should_sanitize_final_upstream_route_error(exc))
         self.assertFalse(hooks._should_retry_same_deployment_before_fallback(exc))
 
-    def test_image_generation_tool_runtime_fallback_attempt_limit(self) -> None:
+    def test_image_generation_tool_runtime_fallback_uses_remaining_route_once(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
         class FakeRouter:
@@ -2189,7 +2350,125 @@ class HookRoutingTests(HookTestCase):
 
         entry = hooks._ordered_deployment_fallback_entry(FakeRouter(), exc, request_kwargs)
 
+        self.assertEqual(
+            entry,
+            {
+                "model": "default-chat",
+                "_target_order": 1,
+                "_excluded_deployment_ids": ["route-a"],
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["route-b"],
+            },
+        )
+
+    async def test_image_tool_capability_rejection_is_cached_across_workers(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        self.set_env(hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "600")
+        hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED.clear()
+        self.addCleanup(hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED.clear)
+        deployments = [
+            {"model_info": {"id": "image-route-a", "order": 1}},
+            {"model_info": {"id": "image-route-b", "order": 2}},
+        ]
+        request_data = {
+            "model": "default-chat",
+            "tools": [{"type": "image_generation"}],
+            "model_info": {"id": "image-route-a", "order": 1},
+        }
+        error = RuntimeError("invalid_request_error: unsupported tool type image_generation")
+        error.status_code = 422
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.set_env(
+                hooks._DEPLOYMENT_COOLDOWN_FILE_ENV,
+                str(Path(temp_dir) / "deployment-cooldowns.json"),
+            )
+            hooks._mark_exception_for_deployment_failover(error, request_data)
+            self.assertIn("id:image-route-a", hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED)
+            hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED.clear()
+
+            filtered = await hook.async_filter_deployments(
+                "default-chat",
+                deployments,
+                messages=None,
+                request_kwargs={
+                    "model": "default-chat",
+                    "tools": [{"type": "image_generation"}],
+                },
+            )
+
+        self.assertEqual(filtered, [deployments[1]])
+
+    def test_image_tool_memory_ignores_parameter_and_transient_errors(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "600")
+        hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED.clear()
+        self.addCleanup(hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED.clear)
+        request_data = {
+            "model": "default-chat",
+            "tools": [{"type": "image_generation"}],
+            "model_info": {"id": "image-route-a", "order": 1},
+        }
+        parameter_error = RuntimeError(
+            "invalid_request_error: unsupported image size 1792x1024"
+        )
+        parameter_error.status_code = 400
+        timeout_error = RuntimeError("gateway timeout while generating image")
+        timeout_error.status_code = 504
+
+        self.assertFalse(
+            hooks._is_image_generation_tool_capability_error(parameter_error)
+        )
+        self.assertFalse(
+            hooks._is_image_generation_tool_capability_error(timeout_error)
+        )
+        hooks._mark_exception_for_deployment_failover(parameter_error, request_data)
+        hooks._mark_exception_for_deployment_failover(timeout_error, request_data)
+
+        self.assertEqual(hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED, {})
+
+    def test_all_image_tool_routes_unsupported_returns_terminal_client_error(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {"model_info": {"id": "image-route-a", "order": 1}},
+                    {"model_info": {"id": "image-route-b", "order": 2}},
+                ]
+
+        error = RuntimeError("invalid_request_error: unsupported tool type image_generation")
+        error.status_code = 422
+        error.failed_deployment_id = "image-route-b"
+        error.failed_deployment_order = 2
+        request_data = {
+            "model": "default-chat",
+            "stream": True,
+            "tools": [{"type": "image_generation"}],
+            "litellm_metadata": {
+                hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED_METADATA_KEY: [
+                    "id:image-route-a",
+                    "id:image-route-b",
+                ]
+            },
+        }
+
+        entry = hooks._ordered_deployment_fallback_entry(
+            FakeRouter(),
+            error,
+            request_data,
+        )
+        event = hooks._synthesized_failed_response_event(request_data, error)
+
         self.assertIsNone(entry)
+        self.assertTrue(
+            hooks._is_image_generation_all_deployments_unsupported_error(error)
+        )
+        self.assertEqual(event["response"]["error"]["type"], "invalid_request_error")
+        self.assertEqual(
+            event["response"]["error"]["code"],
+            "image_generation_tool_unavailable",
+        )
 
     def test_prompt_policy_error_is_not_fallback_eligible(self) -> None:
         hooks, _proxy_server = load_hook_module()

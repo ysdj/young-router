@@ -15,7 +15,9 @@
     "windows": {
       "namespace": "winrt::LiteLLMMenu::Codegen",
       "outputDirectory": "windows/LiteLLMMenu/codegen",
-      "generators": ["componentsWindows"]
+      "generators": [
+        "componentsWindows"
+      ]
     }
   }
 }

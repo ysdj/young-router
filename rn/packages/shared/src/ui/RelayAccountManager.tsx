@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Platform, PlatformColor, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Platform, PlatformColor, ScrollView, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter } from "../types";
-import { NativeButton, NativeCheckbox, NativePicker, NativeSecureTextInput, NativeSplitView, NativeTable, NativeTextField } from "./NativeControls";
+import { NativeButton, NativeCheckbox, NativePicker, NativeSecureTextInput, NativeTable, NativeTextField } from "./NativeControls";
 import { normalizeRelayOrigin, suggestedRelayStationName } from "./relayOrigin";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
@@ -34,11 +34,7 @@ type RelayGroup = {
   multiplier: number | null;
 };
 
-/**
- * A station is the durable grouping identity for one or more relay accounts.
- * The parser below also derives stations from the legacy flat account list so
- * the UI remains usable while older Core snapshots are migrated.
- */
+/** A station is the durable grouping identity for relay accounts. */
 type RelayStation = {
   id: string;
   name: string;
@@ -354,68 +350,73 @@ function SetupProgress({ step, translate }: { step: AddStep; translate: Translat
   </View>;
 }
 
-function ResourceColumnHeader({ translate }: { translate: Translate }): React.JSX.Element {
-  return <View style={[styles.resourceColumnHeader, compactStyles.resourceColumnHeader]}>
-    <View style={styles.resourceColumnCheckbox} />
-    <Text style={[styles.resourceColumnLabel, styles.resourceColumnName]}>{translate("common.name")}</Text>
-    <Text style={[styles.resourceColumnLabel, styles.resourceColumnModels]}>{translate("providers.models")}</Text>
-    <Text style={[styles.resourceColumnLabel, styles.resourceColumnGroup]}>{translate("relay.apiKeyGroup")}</Text>
-    <Text style={[styles.resourceColumnLabel, styles.resourceColumnValue]}>{translate("relay.apiKeyValue")}</Text>
-    <Text style={[styles.resourceColumnLabel, styles.resourceColumnActions]}>{translate("relay.apiKeyActions")}</Text>
-  </View>;
-}
-
-function ResourceRow({ account, resource, selected, disabled, editing, editableName, canSetGroup, nameValue, onNameChange, onToggle, onCancelEdit, onSaveEdit, onEdit, onDelete, onEnabledChange, onGroupChange, onCopy, translate }: {
+function ResourceInspector({ account, resource, disabled, nameValue, resourceGroups, selectedResourceGroupLabel, selectedForImport, onNameChange, onSaveName, onGroupChange, onEnabledChange, onImportChange, onCopy, translate }: {
   account: RelayAccount;
   resource: RelayResource;
-  selected: boolean;
   disabled: boolean;
-  editing: boolean;
-  editableName: boolean;
-  canSetGroup: boolean;
   nameValue: string;
+  resourceGroups: RelayGroup[];
+  selectedResourceGroupLabel: string;
+  selectedForImport: boolean;
   onNameChange: (value: string) => void;
-  onToggle: () => void;
-  onCancelEdit: () => void;
-  onSaveEdit: () => void;
-  onEdit: () => void;
-  onDelete: () => void;
-  onEnabledChange: (enabled: boolean) => void;
+  onSaveName: () => void;
   onGroupChange: (groupID: string) => void;
+  onEnabledChange: (enabled: boolean) => void;
+  onImportChange: (selected: boolean) => void;
   onCopy: () => void;
   translate: Translate;
 }): React.JSX.Element {
-  const rowDisabled = !resource.enabled;
-  const groups = useMemo(() => {
-    const current = resource.groupID;
-    const options = account.groups.filter((group) => group.id !== "");
-    if (current && !options.some((group) => group.id === current)) options.push({ id: current, name: resource.groupName || current, multiplier: null });
-    return account.type === "newapi" ? [{ id: "", name: translate("relay.apiKeyUngrouped"), multiplier: null }, ...options] : options;
-  }, [account.groups, account.type, resource.groupID, resource.groupName, translate]);
-  const groupLabels = groups.map(groupLabel);
-  const selectedGroup = groups.find((group) => group.id === resource.groupID);
-  const selectedGroupLabel = selectedGroup ? groupLabel(selectedGroup) : resource.groupName ?? "";
-  const secretTarget = `${account.id}:${resource.id}`;
+  const groupLabels = resourceGroups.map(groupLabel);
   const canRevealKey = account.loginStatus === "signed_in" && !disabled;
-  return <View style={[styles.resourceRow, compactStyles.resourceRow, rowDisabled && styles.resourceRowDisabled]}>
-    <NativeCheckbox label={resource.apiName} labelVisible={false} value={selected} disabled={disabled || rowDisabled} onValueChange={onToggle} style={styles.resourceCheckbox} />
-    <View style={styles.resourceNameCell}>
-      {editing && editableName ? <><NativeTextField value={nameValue} placeholder={translate("relay.apiKeyNamePlaceholder")} editable={!disabled} accessibilityLabel={`${translate("relay.apiKeyName")}: ${resource.apiName}`} onChangeText={onNameChange} style={[styles.resourceNameInput, compactStyles.control]} /><NativeButton title={translate("common.save")} symbol="check" compact primary disabled={disabled || !nameValue.trim()} toolTip={translate("common.save")} accessibilityLabel={translate("common.save")} onPress={onSaveEdit} style={styles.resourceIconButton} /><NativeButton title={translate("menu.cancel")} symbol="close" compact disabled={disabled} toolTip={translate("menu.cancel")} accessibilityLabel={translate("menu.cancel")} onPress={onCancelEdit} style={styles.resourceIconButton} /></> : <><Text selectable numberOfLines={1} style={[styles.resourceName, rowDisabled && styles.resourceTextDisabled]}>{resource.apiName}</Text>{editableName ? <NativeButton title={translate("relay.apiKeyEdit")} symbol="edit" compact disabled={disabled} toolTip={translate("relay.apiKeyEdit")} accessibilityLabel={`${translate("relay.apiKeyEdit")}: ${resource.apiName}`} onPress={onEdit} style={styles.resourceIconButton} /> : null}</>}
+  const secretTarget = `${account.id}:${resource.id}`;
+  return <ScrollView style={styles.resourceInspectorScroll} contentContainerStyle={styles.resourceInspectorContent}>
+    <View style={styles.resourceInspectorHeader}>
+      <View style={styles.resourceInspectorHeading}>
+        <Text numberOfLines={1} style={styles.resourceInspectorTitle}>{resource.apiName}</Text>
+        <Text numberOfLines={1} style={styles.resourceInspectorSubtitle}>{selectedResourceGroupLabel}</Text>
+      </View>
     </View>
-    <Text selectable numberOfLines={1} style={[styles.resourceModelNames, rowDisabled && styles.resourceTextDisabled]}>{resourceModelsSummary(resource, translate)}</Text>
-    <View style={styles.resourceGroupCell}>
-      {groupLabels.length > 0 ? <NativePicker labels={groupLabels} selectedValue={selectedGroupLabel} disabled={disabled || !canSetGroup} onChange={({ nativeEvent }) => { const group = groups[nativeEvent.index]; if (group) onGroupChange(group.id); }} style={styles.resourceGroupPicker} /> : <Text numberOfLines={1} style={[styles.resourceGroupUnavailable, rowDisabled && styles.resourceTextDisabled]}>{translate("common.none")}</Text>}
+    <View style={styles.resourceInspectorDivider} />
+    <View style={styles.resourceInspectorForm}>
+      <View style={styles.resourceInspectorToggleRow}>
+        <NativeCheckbox label={resource.enabled ? translate("common.enable") : translate("common.disable")} value={resource.enabled} disabled={disabled} onValueChange={onEnabledChange} />
+        <NativeCheckbox label={translate("relay.apiKeyImport")} value={selectedForImport} disabled={disabled || !resource.enabled} onValueChange={onImportChange} />
+      </View>
+      <View style={styles.resourceInspectorRow}>
+        <Text style={styles.resourceInspectorLabel}>{translate("common.name")}</Text>
+        <View style={styles.resourceInspectorControlRow}>
+          <NativeTextField value={nameValue} placeholder={translate("relay.apiKeyNamePlaceholder")} editable={!disabled} accessibilityLabel={`${translate("relay.apiKeyName")}: ${resource.apiName}`} onChangeText={onNameChange} style={styles.resourceInspectorTextInput} />
+          <NativeButton title={translate("common.save")} symbol="check" compact primary disabled={disabled || !nameValue.trim() || nameValue.trim() === resource.name} toolTip={translate("common.save")} accessibilityLabel={translate("common.save")} onPress={onSaveName} style={styles.resourceInspectorAction} />
+        </View>
+      </View>
+      <View style={styles.resourceInspectorRow}>
+        <Text style={styles.resourceInspectorLabel}>{translate("relay.apiKeyGroup")}</Text>
+        {groupLabels.length > 0 ? <NativePicker labels={groupLabels} selectedValue={selectedResourceGroupLabel} disabled={disabled} onChange={({ nativeEvent }) => { const group = resourceGroups[nativeEvent.index]; if (group) onGroupChange(group.id); }} style={styles.resourceInspectorPicker} /> : <Text style={styles.resourceInspectorReadOnly}>{translate("common.none")}</Text>}
+      </View>
+      <View style={styles.resourceInspectorRow}>
+        <Text style={styles.resourceInspectorLabel}>{translate("providers.models")}</Text>
+        <Text selectable numberOfLines={3} style={styles.resourceInspectorModels}>{resourceModelsSummary(resource, translate)}</Text>
+      </View>
+      <View style={[styles.resourceInspectorRow, styles.resourceInspectorKeyRow]}>
+        <Text style={styles.resourceInspectorLabel}>{translate("relay.apiKeyValue")}</Text>
+        <View style={styles.resourceInspectorControlRow}>
+          {canRevealKey
+            ? <NativeSecureTextInput domain="relay_accounts" field="api_key" target={secretTarget} label={`${translate("relay.apiKeyValue")}: ${resource.apiName}`} placeholder={resource.keyHint ? translate("relay.resourceKeyConfigured") : translate("common.none")} plainText autoCommit disabled style={styles.resourceInspectorSecureInput} />
+            : <NativeTextField value="" placeholder={resource.keyHint ? translate("relay.resourceKeyConfigured") : translate("common.none")} editable={false} accessibilityLabel={`${translate("relay.apiKeyValue")}: ${resource.apiName}`} style={styles.resourceInspectorSecureInput} />}
+          <NativeButton title={translate("relay.apiKeyCopy")} symbol="copy" compact disabled={disabled || !resource.keyHint} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={`${translate("relay.apiKeyCopy")}: ${resource.apiName}`} onPress={onCopy} style={styles.resourceInspectorAction} />
+        </View>
+      </View>
     </View>
-    <View style={styles.resourceKeyCell}>
-      {canRevealKey
-        ? <NativeSecureTextInput domain="relay_accounts" field="api_key" target={secretTarget} label={`${translate("relay.apiKeyValue")}: ${resource.apiName}`} placeholder={resource.keyHint ? translate("relay.resourceKeyConfigured") : translate("common.none")} plainText autoCommit disabled style={styles.resourceKeyInput} />
-        : <NativeTextField value="" placeholder={resource.keyHint ? translate("relay.resourceKeyConfigured") : translate("common.none")} editable={false} accessibilityLabel={`${translate("relay.apiKeyValue")}: ${resource.apiName}`} style={styles.resourceKeyInput} />}
-      <NativeButton title={translate("relay.apiKeyCopy")} symbol="copy" compact disabled={disabled || !resource.keyHint} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={`${translate("relay.apiKeyCopy")}: ${resource.apiName}`} onPress={onCopy} style={styles.resourceIconButton} />
+  </ScrollView>;
+}
+
+function RelayTablePane({ title, actions, style, children }: { title: string; actions: React.ReactNode; style?: StyleProp<ViewStyle>; children: React.ReactNode }): React.JSX.Element {
+  return <View style={[styles.tablePane, style]}>
+    <View style={styles.tableTitleRow}>
+      <Text style={styles.tableTitle}>{title}</Text>
+      <View style={styles.tableActions}>{actions}</View>
     </View>
-    <View style={styles.resourceItemActions}>
-      <NativeButton title={resource.enabled ? translate("common.disable") : translate("common.enable")} symbol={resource.enabled ? "power-off" : "power-on"} compact disabled={disabled} toolTip={resource.enabled ? translate("common.disable") : translate("common.enable")} accessibilityLabel={`${resource.enabled ? translate("common.disable") : translate("common.enable")}: ${resource.apiName}`} onPress={() => onEnabledChange(!resource.enabled)} style={styles.resourceIconButton} />
-      <NativeButton title={translate("relay.apiKeyDelete")} symbol="trash" compact destructive disabled={disabled} toolTip={translate("relay.apiKeyDelete")} accessibilityLabel={`${translate("relay.apiKeyDelete")}: ${resource.apiName}`} onPress={onDelete} style={styles.resourceIconButton} />
-    </View>
+    {children}
   </View>;
 }
 
@@ -427,7 +428,6 @@ export function RelayAccountManager({
   busy,
   translate,
   onClose,
-  dispatch,
   commit,
   detectType,
   refreshResources,
@@ -436,11 +436,7 @@ export function RelayAccountManager({
   addAccount,
   refreshAccounts,
 }: {
-  /**
-   * Kept optional while callers migrate from the old provider-page overlay.
-   * RN macOS has no Modal host implementation, so this component must remain
-   * in the ordinary route tree.
-   */
+  /** RN macOS renders this component in the ordinary route tree. */
   visible?: boolean;
   setupOnly?: boolean;
   snapshot?: CoreSnapshot;
@@ -448,7 +444,6 @@ export function RelayAccountManager({
   busy: boolean;
   translate: Translate;
   onClose?: () => void;
-  dispatch: (type: string, payload?: UnknownRecord, domain?: "relay_accounts") => Promise<void>;
   commit: (type: string, payload?: UnknownRecord, domain?: "relay_accounts") => Promise<void>;
   detectType: (origin: string) => Promise<RelayType | undefined>;
   refreshResources: (accountId: string) => Promise<"ready" | "unavailable">;
@@ -472,9 +467,9 @@ export function RelayAccountManager({
   const [typeDetection, setTypeDetection] = useState<RelayTypeDetection>();
   const [manualType, setManualType] = useState<RelayType>();
   const [selectedResources, setSelectedResources] = useState<string[]>([]);
+  const [selectedResourceID, setSelectedResourceID] = useState<string>();
   const [rememberPasswordDrafts, setRememberPasswordDrafts] = useState<Record<string, boolean>>({});
   const [apiKeyNameDrafts, setApiKeyNameDrafts] = useState<Record<string, string>>({});
-  const [editingResourceID, setEditingResourceID] = useState<string>();
   const [formBusy, setFormBusy] = useState(false);
   const [loginBusy, setLoginBusy] = useState(false);
   const [restoreBusy, setRestoreBusy] = useState(false);
@@ -485,7 +480,6 @@ export function RelayAccountManager({
   const [stationOriginDraft, setStationOriginDraft] = useState("");
   const [stationTypeDraft, setStationTypeDraft] = useState<RelayType>();
   const [stationFormBusy, setStationFormBusy] = useState(false);
-  const [accountPaneWidth, setAccountPaneWidth] = useState(240);
   const [loginFailureIDs, setLoginFailureIDs] = useState<Set<string>>(() => new Set());
   const rememberPasswordRef = useRef(false);
   const rememberPasswordWriteVersion = useRef(new Map<string, number>());
@@ -496,6 +490,26 @@ export function RelayAccountManager({
   const controlsBusy = busy || formBusy || loginBusy || restoreBusy || resourceBusy || cleanupBusy || stationFormBusy;
   const passwordStorageAvailable = true;
   const selected = selectedStationID ? undefined : accounts.find((account) => account.id === selectedID) ?? accounts[0];
+  const resourceTableRows = useMemo(() => selected?.resources.map((resource) => ({
+    key: resource.id,
+    cells: [resource.apiName, resource.groupName || resource.groupID || translate("relay.apiKeyUngrouped")],
+  })) ?? [], [selected?.resources, translate]);
+  const resourceSecondaryCellKeys = useMemo(() => selected?.resources.flatMap((resource) => !resource.enabled
+    ? [`${resource.id}\x1f0`, `${resource.id}\x1f1`]
+    : []) ?? [], [selected?.resources]);
+  const selectedResource = selected?.resources.find((resource) => resource.id === selectedResourceID) ?? selected?.resources[0];
+  const resourceGroups = useMemo(() => {
+    if (!selected || !selectedResource) return [];
+    const groups = selected.groups.filter((group) => group.id !== "");
+    if (selectedResource.groupID && !groups.some((group) => group.id === selectedResource.groupID)) {
+      groups.push({ id: selectedResource.groupID, name: selectedResource.groupName || selectedResource.groupID, multiplier: null });
+    }
+    return groups;
+  }, [selected?.groups, selectedResource?.groupID, selectedResource?.groupName]);
+  const selectedResourceGroup = resourceGroups.find((group) => group.id === selectedResource?.groupID);
+  const selectedResourceGroupLabel = selectedResourceGroup
+    ? groupLabel(selectedResourceGroup)
+    : selectedResource?.groupName || translate("relay.apiKeyUngrouped");
   const selectedRememberPassword = selected ? rememberPasswordDrafts[selected.id] ?? selected.rememberPassword : false;
   const selectedStation = stations.find((station) => station.id === selectedStationID)
     ?? (selected ? stations.find((station) => station.accountIDs.includes(selected.id)) : undefined)
@@ -512,9 +526,10 @@ export function RelayAccountManager({
   const relayTableRows = useMemo(() => stations.flatMap((station) => {
     const children = stationAccounts(station);
     const stationLabel = stationDisplayName(station, translate);
-    const rows: Array<{ key: string; cells: string[] }> = [{
+    const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [{
       key: `station:${station.id}`,
       cells: [stationLabel, ""],
+      spanning: true,
     }];
     for (const account of children) {
       rows.push({
@@ -544,7 +559,7 @@ export function RelayAccountManager({
   useEffect(() => {
     if (!selected) {
       setApiKeyNameDrafts({});
-      setEditingResourceID(undefined);
+      setSelectedResourceID(undefined);
       return;
     }
     setApiKeyNameDrafts((current) => {
@@ -552,7 +567,7 @@ export function RelayAccountManager({
       for (const resource of selected.resources) next[resource.id] = current[resource.id] ?? resource.name;
       return next;
     });
-    setEditingResourceID(undefined);
+    setSelectedResourceID((current) => selected.resources.some((resource) => resource.id === current) ? current : selected.resources[0]?.id);
   }, [selected?.id, selected?.resources]);
   useEffect(() => {
     setRememberPasswordDrafts((current) => {
@@ -850,11 +865,13 @@ export function RelayAccountManager({
     setFormBusy(true);
     setFeedback(undefined);
     try {
-      if (kind === "create") await apiKeyActions?.create?.(selected.id);
+      if (kind === "create") {
+        await apiKeyActions?.create?.(selected.id);
+      }
       else if (kind === "update") {
         const resource = selected.resources.find((item) => item.id === resourceID);
         const name = (apiKeyNameDrafts[resourceID as string] ?? resource?.name ?? "").trim();
-        if (!name) return;
+        if (!name || name === resource?.name) return;
         await apiKeyActions?.update?.(selected.id, resourceID as string, name);
       }
       else if (kind === "setEnabled") await apiKeyActions?.setEnabled?.(selected.id, resourceID as string, value as boolean);
@@ -865,6 +882,7 @@ export function RelayAccountManager({
       // list after the remote write so the new name/group/count is visible
       // without ever placing the raw key in the ordinary snapshot.
       await refreshAccountResources(selected);
+      if (kind === "remove" && resourceID === selectedResourceID) setSelectedResourceID(undefined);
       const feedbackKey = kind === "create"
         ? "relay.apiKeyCreated"
         : kind === "remove"
@@ -966,6 +984,7 @@ export function RelayAccountManager({
     setSelectedStationID(undefined);
     setAdding(false);
     setSelectedResources([]);
+    setSelectedResourceID(undefined);
     setFeedback(undefined);
   };
   const selectStation = (stationID: string): void => {
@@ -979,6 +998,7 @@ export function RelayAccountManager({
     }
     setAdding(false);
     setSelectedResources([]);
+    setSelectedResourceID(undefined);
     setFeedback(undefined);
   };
   const selectRelayTableRow = (key: string): void => {
@@ -1006,25 +1026,25 @@ export function RelayAccountManager({
 
   return <View style={styles.workspace} accessibilityLabel={translate("relay.title")}>
     {!setupOnly && pendingCleanups.length > 0 ? <ScrollView style={styles.pendingCleanupList} contentContainerStyle={styles.pendingCleanupListContent}>{pendingCleanups.map((cleanup) => <View key={`${cleanup.accountID}:${cleanup.kind}`} style={styles.pendingCleanup}><Text style={styles.pendingCleanupText}>{translate("relay.credentialsCleanupPending", { label: cleanup.label })}</Text><NativeButton title={translate("relay.retryCleanup")} compact disabled={controlsBusy} onPress={() => { void retryCredentialCleanup(cleanup); }} /></View>)}</ScrollView> : null}
-    <NativeSplitView paneWidth={setupOnly ? 0 : accountPaneWidth} minPaneWidth={setupOnly ? 0 : 240} maxPaneWidth={setupOnly ? 0 : 240} paneOpen={!setupOnly} disabled={controlsBusy} onPaneWidthChange={setupOnly ? undefined : setAccountPaneWidth} style={styles.splitView}>
-      {setupOnly ? <View style={styles.hidden} /> : <View style={styles.sidebar}>
-        <View style={styles.sidebarHeader}>
-          <Text style={styles.sidebarTitle}>{translate("relay.accounts")}</Text>
-        </View>
-        {stations.length > 0 ? <NativeTable
-          columns={[{ label: translate("relay.accounts"), width: 150 }, { label: translate("relay.balance"), width: 76 }]}
+    <View style={styles.relayLayout}>
+      {!setupOnly ? <RelayTablePane title={translate("relay.accounts")} style={styles.sidebar} actions={<>
+        <NativeButton title={translate("relay.addAccount")} symbol="plus" toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} compact disabled={controlsBusy} onPress={beginAdding} style={styles.sidebarAddButton} />
+        <NativeButton title={translate("relay.delete")} symbol="minus" toolTip={translate("relay.delete")} accessibilityLabel={translate("relay.delete")} destructive compact disabled={controlsBusy || !selected || adding} onPress={remove} style={styles.sidebarIconButton} />
+      </>}>
+        {stations.length > 0 ? <View style={styles.sidebarTableFrame}><NativeTable
+          columns={[{ label: translate("relay.accounts"), width: 122 }, { label: translate("relay.balance"), width: 78 }]}
           rows={relayTableRows}
           selectedKey={relayTableSelection}
           disabledRowKeys={controlsBusy ? relayTableRows.map((row) => row.key) : []}
+          compact
+          striped
+          firstColumnHorizontalPadding={8}
+          scrollTrailingColumnOverflow={false}
           onSelectionChange={selectRelayTableRow}
           style={styles.nativeRelayTable}
-        /> : <View style={styles.sidebarEmpty}><Text style={styles.sidebarEmptyText}>{translate("relay.empty")}</Text></View>}
-        <View style={styles.sidebarFooter}>
-          <NativeButton title={translate("relay.addAccount")} symbol="plus" toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} compact disabled={controlsBusy} onPress={beginAdding} style={styles.sidebarIconButton} />
-          <NativeButton title={translate("relay.delete")} symbol="minus" toolTip={translate("relay.delete")} accessibilityLabel={translate("relay.delete")} destructive compact disabled={controlsBusy || !selected || adding} onPress={remove} style={styles.sidebarIconButton} />
-        </View>
-      </View>}
-      <View style={styles.detail}>
+        /></View> : <View style={styles.sidebarEmpty}><Text style={styles.sidebarEmptyText}>{translate("relay.empty")}</Text></View>}
+      </RelayTablePane> : null}
+      <View style={[styles.detail, setupOnly && styles.setupDetail]}>
         {adding ? addStep === "sign-in" ? <View style={styles.detailWorkspace}>
           <ScrollView style={styles.detailScroll} contentContainerStyle={[styles.detailContent, compactStyles.detailContent, setupOnly && styles.setupContent]}>
             <View style={setupOnly ? styles.setupSurface : undefined}>
@@ -1101,44 +1121,86 @@ export function RelayAccountManager({
             </View>
           </ScrollView>
         </View> : !setupOnly && selected ? <View style={styles.detailWorkspace}>
-          <ScrollView style={styles.detailScroll} contentContainerStyle={[styles.detailContent, compactStyles.detailContent]}>
-            <View style={styles.detailHeader}>
-              <View style={styles.detailHeading}>
-                <Text numberOfLines={1} style={styles.detailTitle}>{accountDetailTitle(selected, translate)}</Text>
-                <Text numberOfLines={1} style={styles.detailSubtitle}>· {accountStationLabel(selected)}</Text>
+          <View style={styles.accountDetailContent}>
+            <View style={styles.accountHeader}>
+              <View style={styles.accountToolbar}>
+                <View style={[styles.detailHeader, styles.accountDetailHeader]}>
+                  <View style={[styles.detailHeading, styles.accountDetailHeading]}>
+                  <Text numberOfLines={1} style={styles.detailTitle}>{accountDetailTitle(selected, translate)}</Text>
+                  <Text numberOfLines={1} style={styles.detailSubtitle}>{accountStationLabel(selected)}</Text>
+                  </View>
+                  <View style={styles.detailHeaderActions}>
+                    <View style={styles.statusLine}><View style={[styles.statusDot, effectiveLoginStatus(selected) === "signed_in" ? styles.statusDotOnline : styles.statusDotExpired]} /><Text style={styles.statusText}>{translate(statusKey(effectiveLoginStatus(selected)))}</Text></View>
+                    <NativeButton title={translate("common.refresh")} compact disabled={controlsBusy} onPress={() => { void refreshLoginState(selected); }} />
+                  </View>
+                </View>
               </View>
-              <View style={styles.detailHeaderActions}>
-                <View style={styles.statusLine}><View style={[styles.statusDot, effectiveLoginStatus(selected) === "signed_in" ? styles.statusDotOnline : styles.statusDotExpired]} /><Text style={styles.statusText}>{translate(statusKey(effectiveLoginStatus(selected)))}</Text></View>
-                <NativeButton title={translate("common.refresh")} compact disabled={controlsBusy} onPress={() => { void refreshLoginState(selected); }} />
-                {apiKeyActions?.create ? <NativeButton title={translate("relay.apiKeyCreate")} compact primary disabled={controlsBusy} onPress={() => { void runApiKeyAction("create"); }} /> : null}
+              <View style={styles.accountMetadata}>
+                <View style={styles.metaItem}><Text style={styles.metaLabel}>{translate("relay.balance")}</Text><Text selectable numberOfLines={1} style={styles.metaValue}>{balanceLabel(selected, translate)}</Text></View>
+                <View style={styles.metaItem}><Text style={styles.metaLabel}>{translate("relay.type")}</Text><Text numberOfLines={1} style={styles.metaValue}>{relayTypeLabel(selected.type, translate)}</Text></View>
+                {passwordStorageAvailable ? <View style={[styles.metaItem, styles.metaPreference]}><Text style={styles.metaLabel}>{translate("relay.rememberPassword")}</Text><NativeCheckbox label={selectedRememberPassword ? translate("common.enable") : translate("common.disable")} value={selectedRememberPassword} disabled={controlsBusy} onValueChange={(next) => { void updateRememberPassword(next); }} style={styles.metaCheckbox} /></View> : <Text style={styles.formHint}>{translate("relay.passwordNotSaved")}</Text>}
               </View>
-            </View>
-            <View style={styles.compactMeta}>
-              <View style={styles.metaItem}><Text style={styles.metaLabel}>{translate("relay.balance")}</Text><Text selectable numberOfLines={1} style={styles.readOnlyValue}>{balanceLabel(selected, translate)}</Text></View>
-              <View style={styles.metaItem}><Text style={styles.metaLabel}>{translate("relay.type")}</Text><Text numberOfLines={1} style={styles.readOnlyValue}>{relayTypeLabel(selected.type, translate)}</Text></View>
-              {passwordStorageAvailable ? <NativeCheckbox label={translate("relay.rememberPassword")} value={selectedRememberPassword} disabled={controlsBusy} onValueChange={(next) => { void updateRememberPassword(next); }} style={styles.metaCheckbox} /> : <Text style={styles.formHint}>{translate("relay.passwordNotSaved")}</Text>}
             </View>
             <View style={[styles.resourcesSection, compactStyles.resourcesSection]}>
-              <View style={[styles.resourcesHeader, compactStyles.resourcesHeader]}>
-                <View style={styles.resourcesHeading}><Text style={styles.resourcesTitle}>{translate("relay.apiKeysTitle")}</Text></View>
-                <View style={styles.resourceHeaderActions}>{selected.resources.length > 0 ? <Text style={styles.resourceCount}>{translate("relay.resourceCount", { count: selected.resources.length })}</Text> : null}<NativeButton title={translate("relay.selectAllResources")} compact disabled={controlsBusy || selected.resources.every((resource) => !resource.enabled)} onPress={selectAllResources} />{selectedResources.length > 0 ? <NativeButton title={translate("relay.clearResourceSelection")} compact disabled={controlsBusy} onPress={clearResourceSelection} /> : null}</View>
-              </View>
-              {feedback ? <Text accessibilityLiveRegion="polite" style={styles.resourcesFeedback}>{feedback}</Text> : null}
-              {selected.resources.length > 0 ? <>
-                <View style={styles.resourceList}>
-                  <ResourceColumnHeader translate={translate} />
-                  {selected.resources.map((resource) => <ResourceRow key={resource.id} account={selected} resource={resource} selected={selectedResources.includes(resource.id)} disabled={controlsBusy} editing={editingResourceID === resource.id} editableName={Boolean(apiKeyActions?.update)} canSetGroup={Boolean(apiKeyActions?.setGroup)} nameValue={apiKeyNameDrafts[resource.id] ?? resource.name} onNameChange={(value) => setApiKeyNameDrafts((current) => ({ ...current, [resource.id]: value }))} onToggle={() => toggleResource(resource.id)} onCancelEdit={() => setEditingResourceID(undefined)} onSaveEdit={() => { setEditingResourceID(undefined); void runApiKeyAction("update", resource.id); }} onEdit={() => setEditingResourceID(resource.id)} onDelete={() => { void runApiKeyAction("remove", resource.id); }} onEnabledChange={(enabled) => { if (!enabled) setSelectedResources((current) => current.filter((value) => value !== resource.id)); void runApiKeyAction("setEnabled", resource.id, enabled); }} onGroupChange={(groupID) => { void runApiKeyAction("setGroup", resource.id, groupID); }} onCopy={() => { void copyApiKey(resource); }} translate={translate} />)}
+              <View style={styles.resourcePane}>
+                <View style={[styles.resourceToolbar, compactStyles.resourceToolbar]}>
+                  <View style={styles.resourceToolbarHeading}>
+                    <Text style={styles.resourceToolbarTitle}>{translate("relay.apiKeysTitle")}</Text>
+                    {selected.resources.length > 0 ? <Text style={styles.resourceCount}>{translate("relay.resourceCount", { count: selected.resources.length })}</Text> : null}
+                    <View style={styles.resourceToolbarCrud}>
+                      <NativeButton title={translate("relay.apiKeyCreate")} symbol="plus" compact disabled={controlsBusy || !apiKeyActions?.create} toolTip={translate("relay.apiKeyCreate")} accessibilityLabel={translate("relay.apiKeyCreate")} onPress={() => { void runApiKeyAction("create"); }} style={styles.resourceToolbarCrudButton} />
+                      <NativeButton title={translate("relay.apiKeyDelete")} symbol="minus" compact destructive disabled={controlsBusy || !apiKeyActions?.remove || !selectedResource} toolTip={translate("relay.apiKeyDelete")} accessibilityLabel={selectedResource ? `${translate("relay.apiKeyDelete")}: ${selectedResource.apiName}` : translate("relay.apiKeyDelete")} onPress={() => { if (selectedResource) void runApiKeyAction("remove", selectedResource.id); }} style={styles.resourceToolbarCrudButton} />
+                    </View>
+                  </View>
+                  <View style={styles.resourceToolbarActions}>
+                    {selectedResources.length > 0 ? <Text numberOfLines={1} style={styles.resourceSelectionCount}>{translate("relay.selectedCount", { count: selectedResources.length })}</Text> : null}
+                    <NativeButton title={translate("relay.selectAllResources")} compact disabled={controlsBusy || selected.resources.every((resource) => !resource.enabled)} onPress={selectAllResources} />
+                    {selectedResources.length > 0 ? <NativeButton title={translate("relay.clearResourceSelection")} compact disabled={controlsBusy} onPress={clearResourceSelection} /> : null}
+                    {selectedResources.length > 0 ? <NativeButton primary title={translate("relay.importSelected")} disabled={controlsBusy} onPress={() => { void importSelectedResources(); }} /> : null}
+                  </View>
                 </View>
-              </> : <View style={styles.resourceEmptyFrame}><ResourceColumnHeader translate={translate} /><View style={styles.resourceEmpty}><Text style={styles.resourceEmptyTitle}>{translate(selected.resourceError === "no_api_keys" && !resourceBusy && !restoreBusy ? "relay.resourcesEmptyTitle" : "relay.resources")}</Text><Text style={styles.resourceEmptyText}>{resourceBusy || restoreBusy ? translate("relay.resourcesChecking") : resourceHint(selected, translate)}</Text></View></View>}
+                {feedback ? <Text accessibilityLiveRegion="polite" style={styles.resourcesFeedback}>{feedback}</Text> : null}
+                <View style={styles.resourceBody}>
+                  <View style={styles.resourceColumns}>
+                    <View style={styles.resourceListPane}>
+                      <NativeTable
+                        columns={[{ label: translate("common.name"), width: 122 }, { label: translate("relay.apiKeyGroup"), width: 124 }]}
+                        rows={resourceTableRows}
+                        selectedKey={selectedResourceID ?? ""}
+                        secondaryCellKeys={resourceSecondaryCellKeys}
+                        compact
+                        striped
+                        cellHorizontalPadding={6}
+                        firstColumnHorizontalPadding={8}
+                        scrollTrailingColumnOverflow={false}
+                        onSelectionChange={setSelectedResourceID}
+                        style={styles.resourceNativeTable}
+                      />
+                    </View>
+                    <View style={styles.resourceInspectorPane}>{selectedResource ? <ResourceInspector
+                      account={selected}
+                      resource={selectedResource}
+                      disabled={controlsBusy}
+                      nameValue={apiKeyNameDrafts[selectedResource.id] ?? selectedResource.name}
+                      resourceGroups={resourceGroups}
+                      selectedResourceGroupLabel={selectedResourceGroupLabel}
+                      selectedForImport={selectedResources.includes(selectedResource.id)}
+                      onNameChange={(value) => setApiKeyNameDrafts((current) => ({ ...current, [selectedResource.id]: value }))}
+                      onSaveName={() => { void runApiKeyAction("update", selectedResource.id); }}
+                      onGroupChange={(groupID) => { void runApiKeyAction("setGroup", selectedResource.id, groupID); }}
+                      onEnabledChange={(enabled) => { if (!enabled) setSelectedResources((current) => current.filter((value) => value !== selectedResource.id)); void runApiKeyAction("setEnabled", selectedResource.id, enabled); }}
+                      onImportChange={() => toggleResource(selectedResource.id)}
+                      onCopy={() => { void copyApiKey(selectedResource); }}
+                      translate={translate}
+                    /> : <View style={styles.resourceEmpty}><Text style={styles.resourceEmptyTitle}>{translate(selected.resourceError === "no_api_keys" && !resourceBusy && !restoreBusy ? "relay.resourcesEmptyTitle" : "relay.resources")}</Text><Text style={styles.resourceEmptyText}>{resourceBusy || restoreBusy ? translate("relay.resourcesChecking") : resourceHint(selected, translate)}</Text></View>}</View>
+                  </View>
+                </View>
+              </View>
             </View>
-          </ScrollView>
-          {selectedResources.length > 0 ? <View style={[styles.bottomBar, compactStyles.bottomBar]}>
-            <Text accessibilityLiveRegion="polite" numberOfLines={1} style={styles.bottomTitle}>{translate("relay.selectedCount", { count: selectedResources.length })}</Text>
-            <View style={styles.bottomActions}><NativeButton primary title={translate("relay.importSelected")} disabled={controlsBusy} onPress={() => { void importSelectedResources(); }} /></View>
-          </View> : null}
+          </View>
         </View> : <View style={styles.blank}><Text style={styles.empty}>{translate("relay.empty")}</Text><NativeButton title={translate("relay.add")} primary disabled={controlsBusy} onPress={beginAdding} /></View>}
       </View>
-    </NativeSplitView>
+    </View>
   </View>;
 }
 
@@ -1155,36 +1217,39 @@ const colors = {
 };
 
 const compactStyles = StyleSheet.create({
-  detailContent: { paddingHorizontal: 14, paddingTop: 8, paddingBottom: 8, gap: 6 },
-  formRow: { minHeight: 28, gap: 4 },
-  formValue: { minHeight: 24, gap: 3 },
-  control: { height: 24 },
-  stationSettings: { gap: 8 },
-  stationSettingsForm: { gap: 6 },
-  stationSettingsRow: { minHeight: 28, gap: 8 },
-  resourcesSection: { gap: 4, paddingTop: 2 },
-  resourcesHeader: { minHeight: 24, gap: 4 },
-  resourceColumnHeader: { minHeight: 22, gap: 4 },
-  resourceRow: { minHeight: 34, paddingVertical: 1, gap: 4 },
-  bottomBar: { minHeight: 36, paddingHorizontal: 10, paddingVertical: 4, gap: 6 },
+  detailContent: { paddingHorizontal: 12, paddingTop: 6, paddingBottom: 12, gap: 8 },
+  formRow: { minHeight: 30, gap: 5 },
+  formValue: { minHeight: 26, gap: 4 },
+  control: { height: 26 },
+  stationSettings: { gap: 6 },
+  stationSettingsForm: { gap: 4 },
+  stationSettingsRow: { minHeight: 26, gap: 6 },
+  resourcesSection: { gap: 4, paddingTop: 0 },
+  resourceToolbar: { minHeight: 24, gap: 6 },
+  bottomBar: { minHeight: 38, paddingHorizontal: 12, paddingVertical: 6, gap: 6 },
 });
 
 const styles = StyleSheet.create({
   hidden: { display: "none" },
   workspace: { flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", backgroundColor: colors.window },
-  splitView: { flex: 1, minHeight: 0, minWidth: 0 },
-  sidebar: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.panel },
-  sidebarHeader: { minHeight: 40, paddingHorizontal: 12, paddingVertical: 9, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: colors.separator },
-  sidebarTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "700" },
-  sidebarEmpty: { flex: 1, minHeight: 120, justifyContent: "center", padding: 12 },
+  relayLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 },
+  setupDetail: { width: "100%" },
+  tablePane: { minWidth: 0, minHeight: 0, gap: 6 },
+  tableTitleRow: { height: 24, minHeight: 24, paddingHorizontal: 16, flexDirection: "row", alignItems: "center" },
+  tableTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  tableActions: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 6 },
+  sidebar: { width: 220, minWidth: 220, maxWidth: 220, flexGrow: 0, flexShrink: 0 },
+  sidebarTableFrame: { flex: 1, minWidth: 0, minHeight: 0 },
+  sidebarEmpty: { flex: 1, minHeight: 120, justifyContent: "center", padding: 16, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel },
   sidebarEmptyText: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 17 },
   nativeRelayTable: { flex: 1, minWidth: 0, minHeight: 0 },
-  sidebarFooter: { minHeight: 38, paddingHorizontal: 8, paddingVertical: 4, flexDirection: "row", alignItems: "center", gap: 5, borderTopWidth: 1, borderTopColor: colors.separator },
-  sidebarIconButton: { width: 28, minWidth: 28 },
+  sidebarAddButton: { width: 22, minWidth: 22, height: 22 },
+  sidebarIconButton: { width: 22, minWidth: 22, height: 22 },
   detail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.window },
   detailWorkspace: { flex: 1, minWidth: 0, minHeight: 0 },
   detailScroll: { flex: 1, minWidth: 0 },
-  detailContent: { flexGrow: 1, minWidth: 0, paddingHorizontal: 20, paddingTop: 12, paddingBottom: 20, gap: 12 },
+  detailContent: { flexGrow: 1, minWidth: 0, paddingHorizontal: 20, paddingTop: 16, paddingBottom: 20, gap: 14 },
+  accountDetailContent: { flex: 1, minWidth: 0, minHeight: 0 },
   setupContent: { justifyContent: "center", alignItems: "center", paddingHorizontal: 28, paddingTop: 18, paddingBottom: 18 },
   setupSurface: { width: "100%", maxWidth: 560, minWidth: 0, gap: 18 },
   setupProgress: { width: "100%", flexDirection: "row", alignItems: "center", minHeight: 26 },
@@ -1200,34 +1265,40 @@ const styles = StyleSheet.create({
   setupProgressLabelCurrent: { color: colors.text, fontWeight: "600" },
   setupHeader: { paddingBottom: 0, gap: 6 },
   setupFormSection: { maxWidth: 560, paddingVertical: 0, gap: 16 },
-  stationDetailHeader: { minHeight: 58, paddingHorizontal: 20, paddingTop: 14, paddingBottom: 10, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 16, borderBottomWidth: 1, borderBottomColor: colors.separator },
+  stationDetailHeader: { minHeight: 30, paddingHorizontal: 12, paddingTop: 3, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 },
   stationDetailScroll: { flex: 1, minWidth: 0 },
-  stationDetailContent: { flexGrow: 1, minWidth: 0, paddingHorizontal: 24, paddingTop: 24, paddingBottom: 24, alignItems: "flex-start" },
-  stationSettings: { width: "100%", maxWidth: 560, minWidth: 0, gap: 12 },
-  stationSettingsTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
-  stationSettingsForm: { width: "100%", gap: 10 },
-  stationSettingsRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 14 },
+  stationDetailContent: { flexGrow: 1, minWidth: 0, paddingTop: 3, paddingHorizontal: 12, paddingRight: 8, paddingBottom: 12, alignItems: "flex-start" },
+  stationSettings: { width: "100%", minWidth: 0, gap: 6 },
+  stationSettingsTitle: { color: colors.secondary, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  stationSettingsForm: { width: "100%", gap: 4, paddingTop: 3, borderTopWidth: 1, borderTopColor: colors.separator },
+  stationSettingsRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
   stationSettingsLastRow: {},
-  stationSettingsLabel: { width: 104, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
-  stationSettingsControl: { flex: 1, minWidth: 220, height: 30 },
+  stationSettingsLabel: { width: 72, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
+  stationSettingsControl: { flex: 1, minWidth: 220, height: 26 },
   stationSettingsFeedback: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 17 },
-  detailHeader: { minHeight: 34, paddingBottom: 10, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10, borderBottomWidth: 1, borderBottomColor: colors.separator },
-  detailHeading: { flexGrow: 1, flexShrink: 1, flexBasis: 150, minWidth: 0, flexDirection: "row", alignItems: "baseline", gap: 7 },
-  detailTitle: { flexShrink: 1, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18, fontWeight: "700" },
+  accountHeader: { minWidth: 0, backgroundColor: colors.window },
+  accountToolbar: { minHeight: 42, paddingHorizontal: 16, paddingVertical: 4, justifyContent: "center", backgroundColor: colors.window },
+  detailHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 },
+  detailHeading: { flexGrow: 1, flexShrink: 1, minWidth: 0, flexDirection: "row", alignItems: "baseline", gap: 5 },
+  accountDetailHeader: { minHeight: 34 },
+  accountDetailHeading: { flexDirection: "column", alignItems: "flex-start", gap: 1 },
+  detailTitle: { flexShrink: 1, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18, fontWeight: "600" },
   detailSubtitle: { flexShrink: 1, color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
-  detailHeaderActions: { flexShrink: 0, flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end", gap: 8 },
-  statusLine: { flexDirection: "row", alignItems: "center", gap: 6 },
-  statusText: { color: colors.text, fontSize: UI_FONT_SIZE },
+  detailHeaderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 },
+  statusLine: { minHeight: 22, flexDirection: "row", alignItems: "center", gap: 5 },
+  statusText: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE },
   statusDot: { width: 7, height: 7, borderRadius: 4 },
   statusDotOnline: { backgroundColor: colors.success },
   statusDotExpired: { backgroundColor: colors.warning },
   control: { width: "100%", minWidth: 0, height: 32 },
   typeSelector: { width: "100%", minWidth: 0, maxWidth: 520, alignSelf: "stretch" },
-  formSection: { width: "100%", maxWidth: 720, minWidth: 0, paddingVertical: 3, gap: 12 },
-  compactMeta: { minHeight: 48, paddingBottom: 10, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 18, borderBottomWidth: 1, borderBottomColor: colors.separator },
-  metaItem: { minWidth: 120, maxWidth: 260, gap: 1 },
-  metaLabel: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE },
-  metaCheckbox: { flexGrow: 1, minWidth: 190 },
+  formSection: { width: "100%", maxWidth: 720, minWidth: 0, paddingVertical: 4, gap: 8, borderTopWidth: 1, borderTopColor: colors.separator, backgroundColor: colors.window },
+  accountMetadata: { minHeight: 34, paddingHorizontal: 16, paddingVertical: 4, flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 20, rowGap: 3, backgroundColor: colors.window },
+  metaItem: { minWidth: 108, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 7 },
+  metaPreference: { minWidth: 160 },
+  metaLabel: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  metaValue: { color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18, fontWeight: "500" },
+  metaCheckbox: { minWidth: 0 },
   formRow: { width: "100%", minHeight: 34, flexDirection: "column", alignItems: "stretch", gap: 6 },
   checkboxFormRow: { width: "100%", minHeight: 32, justifyContent: "center" },
   formLabel: { width: "100%", minWidth: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, fontWeight: "600" },
@@ -1235,42 +1306,45 @@ const styles = StyleSheet.create({
   formHint: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 17, paddingVertical: 5 },
   signInWaiting: { minHeight: 160, alignItems: "center", justifyContent: "center", paddingHorizontal: 20 },
   readOnlyValue: { color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18 },
-  resourcesSection: { minWidth: 0, gap: 7, paddingTop: 2 },
-  resourcesHeader: { minHeight: 28, flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 9 },
-  resourcesHeading: { flex: 1, minWidth: 110 },
-  resourcesTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "700" },
-  resourceHeaderActions: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 },
-  resourceCount: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, paddingTop: 2 },
-  resourcesFeedback: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
-  resourceList: { width: "100%", borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.window },
-  resourceColumnHeader: { minHeight: 24, paddingHorizontal: 6, flexDirection: "row", alignItems: "center", gap: 4, borderBottomWidth: 1, borderBottomColor: colors.separator, backgroundColor: colors.panel },
-  resourceColumnCheckbox: { width: 20, minWidth: 20 },
-  resourceColumnLabel: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
-  resourceColumnName: { width: 108, minWidth: 108 },
-  resourceColumnModels: { flex: 0.85, minWidth: 92 },
-  resourceColumnGroup: { width: 180, minWidth: 180 },
-  resourceColumnValue: { flex: 1, minWidth: 112 },
-  resourceColumnActions: { width: 50, minWidth: 50, textAlign: "right" },
-  resourceRow: { minHeight: 34, paddingHorizontal: 6, paddingVertical: 1, flexDirection: "row", alignItems: "center", gap: 4, borderBottomWidth: 1, borderBottomColor: colors.separator, backgroundColor: colors.window },
-  resourceRowDisabled: { backgroundColor: colors.panel, opacity: 0.68 },
-  resourceCheckbox: { width: 20, minWidth: 20, height: 20 },
-  resourceNameCell: { width: 108, minWidth: 108, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 1 },
-  resourceNameInput: { flex: 1, minWidth: 56, height: 24 },
-  resourceName: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 17 },
-  resourceModelNames: { flex: 0.85, minWidth: 92, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 17 },
-  resourceGroupCell: { width: 180, minWidth: 180, minHeight: 22, justifyContent: "center" },
-  resourceGroupPicker: { width: 180, height: 22 },
-  resourceGroupUnavailable: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
-  resourceKeyCell: { flex: 1, minWidth: 112, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 2 },
-  resourceKeyInput: { flex: 1, minWidth: 72, height: 24 },
-  resourceTextDisabled: { color: colors.secondary },
-  resourceItemActions: { width: 50, minWidth: 50, flexDirection: "row", justifyContent: "flex-end", alignItems: "center", gap: 2 },
-  resourceIconButton: { width: 24, minWidth: 24, height: 22 },
-  resourceEmptyFrame: { marginTop: 3, borderBottomWidth: 1, borderBottomColor: colors.separator, backgroundColor: colors.window },
-  resourceEmpty: { minHeight: 138, paddingHorizontal: 24, paddingVertical: 18, alignItems: "center", justifyContent: "center", gap: 5, backgroundColor: colors.window },
+  resourcesSection: { flex: 1, minWidth: 0, minHeight: 0 },
+  resourcePane: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.window },
+  resourceToolbar: { minHeight: 24, paddingHorizontal: 16, flexDirection: "row", alignItems: "center", gap: 8 },
+  resourceToolbarHeading: { flex: 1, minWidth: 110, flexDirection: "row", alignItems: "baseline", gap: 6 },
+  resourceToolbarTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  resourceToolbarCrud: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4, marginLeft: 2 },
+  resourceToolbarCrudButton: { width: 22, minWidth: 22, height: 22 },
+  resourceToolbarActions: { marginLeft: "auto", flexShrink: 1, flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end", gap: 6 },
+  resourceCount: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  resourceSelectionCount: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  resourcesFeedback: { paddingHorizontal: 16, paddingVertical: 4, color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16, backgroundColor: colors.window },
+  resourceBody: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.window },
+  resourceColumns: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 },
+  resourceListPane: { width: 260, minWidth: 220, maxWidth: 320, flexGrow: 0, flexShrink: 1, minHeight: 0 },
+  resourceNativeTable: { flex: 1, minWidth: 0, minHeight: 0 },
+  resourceInspectorPane: { flex: 1, minWidth: 0, minHeight: 0 },
+  resourceInspectorScroll: { flex: 1, minWidth: 0, backgroundColor: colors.window },
+  resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 0, paddingHorizontal: 16, paddingRight: 12, paddingBottom: 10, gap: 5 },
+  resourceInspectorHeader: { height: 24, minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 },
+  resourceInspectorHeading: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "baseline", gap: 5 },
+  resourceInspectorTitle: { flexShrink: 1, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18, fontWeight: "600" },
+  resourceInspectorSubtitle: { flexShrink: 1, color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  resourceInspectorDivider: { height: 1, backgroundColor: colors.separator },
+  resourceInspectorForm: { minWidth: 0, gap: 6 },
+  resourceInspectorToggleRow: { minHeight: 26, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 10 },
+  resourceInspectorRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 },
+  resourceInspectorKeyRow: { alignItems: "center" },
+  resourceInspectorLabel: { width: 68, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
+  resourceInspectorControlRow: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 },
+  resourceInspectorTextInput: { flex: 1, minWidth: 90, height: 26 },
+  resourceInspectorPicker: { flex: 1, minWidth: 120, height: 26 },
+  resourceInspectorReadOnly: { flex: 1, minWidth: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18 },
+  resourceInspectorModels: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18 },
+  resourceInspectorSecureInput: { flex: 1, minWidth: 100, height: 26 },
+  resourceInspectorAction: { width: 22, minWidth: 22, height: 22 },
+  resourceEmpty: { flex: 1, minWidth: 0, minHeight: 138, paddingHorizontal: 24, paddingVertical: 18, alignItems: "center", justifyContent: "center", gap: 5, backgroundColor: colors.window },
   resourceEmptyTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600", lineHeight: 19, textAlign: "center" },
   resourceEmptyText: { maxWidth: 500, color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 18, textAlign: "center" },
-  bottomBar: { minHeight: 42, paddingHorizontal: 14, paddingVertical: 6, flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 8, borderTopWidth: 1, borderTopColor: colors.separator, backgroundColor: colors.panel },
+  bottomBar: { minHeight: 38, paddingHorizontal: 12, paddingVertical: 6, flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 6, borderTopWidth: 1, borderTopColor: colors.separator, backgroundColor: colors.panel },
   setupBottomBar: { minHeight: 58, paddingHorizontal: 28, paddingVertical: 12, borderTopWidth: 0, backgroundColor: colors.window },
   bottomStatus: { flex: 1, flexBasis: 220, minWidth: 0, color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   bottomTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },

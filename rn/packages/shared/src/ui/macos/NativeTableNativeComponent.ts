@@ -19,9 +19,11 @@ export interface NativeTableProps extends ViewProps {
   alternatingRows?: WithDefault<boolean, false>;
   compact?: WithDefault<boolean, false>;
   followBottom?: WithDefault<boolean, false>;
+  borderless?: WithDefault<boolean, false>;
   cellHorizontalPadding?: WithDefault<Float, 8>;
   firstColumnHorizontalPadding?: WithDefault<Float, 8>;
-  scrollTrailingColumnOverflow?: WithDefault<boolean, false>;
+  preserveColumnWidths?: WithDefault<boolean, false>;
+  scrollTrailingColumnOverflow?: WithDefault<boolean, true>;
   disabledRowKeys?: ReadonlyArray<string>;
   secondaryCellKeys?: ReadonlyArray<string>;
   spanningRowKeys?: ReadonlyArray<string>;

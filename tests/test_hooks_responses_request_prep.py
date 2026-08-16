@@ -730,6 +730,304 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertNotIn("additional_tools", json.dumps(modified["input"]))
 
+    async def test_pre_call_flattens_text_only_wait_output_after_encrypted_history(self) -> None:
+        hooks, _ = load_hook_module()
+        encrypted_reasoning = {
+            "type": "reasoning",
+            "encrypted_content": "opaque-encrypted-reasoning",
+        }
+        prior_output = {
+            "type": "function_call_output",
+            "call_id": "call-prior",
+            "output": [{"type": "input_text", "text": "signed prefix"}],
+        }
+        current_output = {
+            "type": "function_call_output",
+            "call_id": "call-wait",
+            "output": [
+                {"type": "input_text", "text": "Script completed\n"},
+                {"type": "input_text", "text": "first draft ready\n"},
+                {"type": "input_text", "text": "second draft ready\n"},
+            ],
+        }
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                prior_output,
+                encrypted_reasoning,
+                {
+                    "type": "function_call",
+                    "call_id": "call-wait",
+                    "name": "wait",
+                    "arguments": '{"cell_id":"running-cell"}',
+                },
+                current_output,
+            ],
+            "tools": [{"type": "function", "name": "wait"}],
+            "tool_choice": "auto",
+        }
+
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertIs(modified["input"][0], prior_output)
+        self.assertEqual(modified["input"][0]["output"], prior_output["output"])
+        self.assertIs(modified["input"][1], encrypted_reasoning)
+        self.assertEqual(
+            modified["input"][3]["output"],
+            "Script completed\n\nfirst draft ready\n\nsecond draft ready\n",
+        )
+        self.assertEqual(current_output["output"][0]["type"], "input_text")
+
+    def test_codex_function_output_patch_preserves_non_text_parts(self) -> None:
+        hooks, _ = load_hook_module()
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-image",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,abc",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        self.assertIsNone(hooks._with_codex_function_call_output_text(original))
+
+    def test_codex_view_image_output_keeps_reopenable_paths(self) -> None:
+        hooks, _ = load_hook_module()
+        paths = [
+            "/Users/example/project/qa/first.png",
+            "/Users/example/project/qa/second.png",
+        ]
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-images",
+                    "name": "exec",
+                    "input": (
+                        "const paths = [\"/Users/example/project/qa/first.png\","
+                        " \"/Users/example/project/qa/second.png\"];"
+                        " const results = await Promise.all(paths.map(path => "
+                        "tools.view_image({path, detail:\"high\"})));"
+                        " for (const result of results) image(result.image_url);"
+                    ),
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-images",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,abc",
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,def",
+                        },
+                    ],
+                },
+            ],
+        }
+
+        modified = hooks._with_codex_view_image_output_paths(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        output = modified["input"][1]["output"]
+        self.assertEqual(output[1:], original["input"][1]["output"])
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, output[0]["text"])
+        for path in paths:
+            self.assertIn(path, output[0]["text"])
+        self.assertEqual(original["input"][1]["output"][0]["image_url"], "data:image/png;base64,abc")
+
+    def test_codex_view_image_path_patch_skips_signed_prefix(self) -> None:
+        hooks, _ = load_hook_module()
+        signed_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-signed",
+            "output": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,signed-bytes",
+                }
+            ],
+        }
+        signed_call = {
+            "type": "custom_tool_call",
+            "call_id": "call-signed",
+            "name": "exec",
+            "input": 'await tools.view_image({path:"/tmp/signed.png"});',
+        }
+        encrypted = {
+            "type": "reasoning",
+            "encrypted_content": "opaque-signed-history",
+        }
+        mutable_call = {
+            "type": "custom_tool_call",
+            "call_id": "call-mutable",
+            "name": "exec",
+            "input": 'await tools.view_image({path:"/tmp/mutable.png"});',
+        }
+        mutable_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-mutable",
+            "output": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,mutable-bytes",
+                }
+            ],
+        }
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [signed_call, signed_output, encrypted, mutable_call, mutable_output],
+        }
+
+        modified = hooks._with_codex_view_image_output_paths(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["input"][0], signed_call)
+        self.assertEqual(modified["input"][1], signed_output)
+        mutable_parts = modified["input"][4]["output"]
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, mutable_parts[0]["text"])
+        self.assertIn("/tmp/mutable.png", mutable_parts[0]["text"])
+        self.assertEqual(mutable_parts[1], mutable_output["output"][0])
+
+    async def test_pre_call_view_image_output_uses_path_backed_preview_budget(self) -> None:
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        hooks, _ = load_hook_module()
+        image = Image.frombytes("RGB", (900, 900), os.urandom(900 * 900 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        original_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-image",
+                    "name": "exec",
+                    "input": (
+                        "const preview = await tools.view_image({path:"
+                        "\"/Users/example/project/qa/preview.png\", detail:\"high\"});"
+                        " image(preview.image_url);"
+                    ),
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-image",
+                    "output": [
+                        {"type": "input_image", "image_url": original_url},
+                    ],
+                },
+            ],
+        }
+
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        output = modified["input"][1]["output"]
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, output[0]["text"])
+        self.assertLessEqual(
+            hooks._image_data_url_size(output[1]["image_url"]),
+            hooks._CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES,
+        )
+        self.assertEqual(original["input"][1]["output"][0]["image_url"], original_url)
+
+    async def test_pre_call_does_not_inject_truncation_for_oversized_signed_image_history(self) -> None:
+        import base64
+
+        hooks, _ = load_hook_module()
+        old_image = "data:image/png;base64," + base64.b64encode(
+            b"x" * (hooks._INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES + 1)
+        ).decode("ascii")
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-old-preview",
+                    "name": "exec",
+                    "input": 'await tools.view_image({path:"/tmp/old-preview.png"});',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-old-preview",
+                    "output": [
+                        {"type": "input_image", "image_url": old_image},
+                    ],
+                },
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "opaque-signed-history",
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue."}],
+                },
+            ],
+        }
+
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertNotIn("truncation", modified)
+        self.assertIs(modified["input"], original["input"])
+        self.assertEqual(
+            modified["input"][1]["output"][0]["image_url"],
+            old_image,
+        )
+
     async def test_pre_call_preserves_unavailable_request_user_input_history(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()

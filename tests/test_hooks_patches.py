@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from hook_test_utils import *
 
 
@@ -537,6 +539,96 @@ class HookPatchTests(HookTestCase):
         self.assertNotIn("_target_order", attempts[0])
         self.assertEqual(attempts[1]["_target_order"], 3)
         self.assertEqual(attempts[1]["_excluded_deployment_ids"], ["backup_provider-x-plus"])
+
+    async def test_generic_helper_fails_over_compaction_body_capacity_error(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        router_attempts = []
+        upstream_attempts = []
+        deployments = [
+            {
+                "litellm_params": {"model": "openai/default-chat", "order": 1},
+                "model_info": {
+                    "id": "small-body-route",
+                    "order": 1,
+                    "route_key": "provider-a / openai/default-chat / key=small / order=1",
+                },
+            },
+            {
+                "litellm_params": {"model": "openai/default-chat", "order": 2},
+                "model_info": {
+                    "id": "large-body-route",
+                    "order": 2,
+                    "route_key": "provider-b / openai/default-chat / key=large / order=2",
+                },
+            },
+        ]
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                router_attempts.append(copy.deepcopy(kwargs))
+                excluded_ids = set(kwargs.get("_excluded_deployment_ids") or [])
+                target_order = kwargs.get("_target_order")
+                selected = next(
+                    deployment
+                    for deployment in deployments
+                    if deployment["model_info"]["id"] not in excluded_ids
+                    and (
+                        target_order is None
+                        or deployment["litellm_params"]["order"] == target_order
+                    )
+                )
+                selected_kwargs = kwargs.copy()
+                selected_kwargs["model_info"] = selected["model_info"].copy()
+                return await original_generic_function(**selected_kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            upstream_attempts.append(copy.deepcopy(kwargs))
+            if kwargs["model_info"]["id"] == "small-body-route":
+                error = RuntimeError(
+                    "OpenAIException - invalid request: request body storage capacity exhausted"
+                )
+                error.status_code = 400
+                raise error
+            return "compaction-complete"
+
+        result = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            call_type="aresponses",
+            input=[
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            stream=True,
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        )
+
+        self.assertEqual(result, "compaction-complete")
+        self.assertEqual(
+            [attempt["model_info"]["id"] for attempt in upstream_attempts],
+            ["small-body-route", "large-body-route"],
+        )
+        self.assertEqual(len(router_attempts), 2)
+        self.assertEqual(router_attempts[1]["_target_order"], 2)
+        self.assertEqual(
+            router_attempts[1]["_excluded_deployment_ids"],
+            ["small-body-route"],
+        )
 
     def test_responses_tool_search_bridge_patch_restores_custom_tool_calls(self) -> None:
         hooks, _ = load_hook_module()

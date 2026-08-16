@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config_editor_core.load import load_config
+from litellm_menu.api_base import isolated_http_opener, service_root
 
 
 MAX_TARGETS = 4
@@ -37,27 +38,6 @@ MAX_RESPONSE_BYTES = 256 * 1024
 
 class UsageConfigError(ValueError):
     """The current LiteLLM configuration could not be read safely."""
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(
-        self,
-        request: urllib.request.Request,
-        fp: Any,
-        code: int,
-        message: str,
-        headers: Any,
-        newurl: str,
-    ) -> None:
-        return None
-
-
-def _isolated_http_opener() -> urllib.request.OpenerDirector:
-    handlers: list[Any] = [_NoRedirect()]
-    if os.environ.get("LITELLM_USE_SYSTEM_PROXIES") != "1":
-        handlers.insert(0, urllib.request.ProxyHandler({}))
-    return urllib.request.build_opener(*handlers)
-
 
 def _string(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
@@ -130,41 +110,6 @@ def default_config_path() -> pathlib.Path:
     return pathlib.Path.home() / ".litellm-menu" / "config.yaml"
 
 
-def _service_root(api_base: str) -> str | None:
-    try:
-        parsed = urllib.parse.urlsplit(api_base)
-    except ValueError:
-        return None
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None
-    if parsed.username is not None or parsed.password is not None:
-        return None
-
-    parts = [part for part in parsed.path.split("/") if part]
-    lower = [part.lower() for part in parts]
-    suffixes = (
-        ("v1", "chat", "completions"),
-        ("v1", "images", "generations"),
-        ("v1", "completions"),
-        ("v1", "responses"),
-        ("v1", "messages"),
-        ("v1", "models"),
-        ("chat", "completions"),
-        ("images", "generations"),
-        ("completions",),
-        ("responses",),
-        ("messages",),
-        ("models",),
-        ("v1",),
-    )
-    for suffix in suffixes:
-        if len(lower) >= len(suffix) and tuple(lower[-len(suffix) :]) == suffix:
-            parts = parts[: -len(suffix)]
-            break
-    path = f"/{'/'.join(parts)}" if parts else ""
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
-
-
 def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
     """Return one safe read target for each configured model credential."""
     try:
@@ -191,7 +136,7 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
                 continue
             api_base = _string(raw_model.get("api_base")) or provider_base
             api_key = _credential_for_model(raw_provider, raw_model)
-            root = _service_root(api_base)
+            root = service_root(api_base)
             if not root or not api_key:
                 continue
             key = (root, api_key)
@@ -211,12 +156,12 @@ def _control_api_root(api_base: str) -> str | None:
     """Return the installed control-plane prefix without duplicating `/api`.
 
     A normal OpenAI base URL ends in `/v1`, while a reverse proxy can expose
-    the same API below `/api/v1`.  `_service_root` deliberately retains that
+    the same API below `/api/v1`.  `service_root` deliberately retains that
     deployment prefix, so append the control-plane `/api` segment only when it
     is not already part of the root.
     """
 
-    root = _service_root(api_base)
+    root = service_root(api_base)
     if root is None:
         return None
     path = urllib.parse.urlsplit(root).path.rstrip("/").lower()
@@ -225,7 +170,7 @@ def _control_api_root(api_base: str) -> str | None:
 
 def _endpoint_candidates(api_base: str) -> list[tuple[str, str, str]]:
     control_root = _control_api_root(api_base)
-    root = _service_root(api_base)
+    root = service_root(api_base)
     if control_root is None or root is None:
         return []
     return [
@@ -257,7 +202,7 @@ def _fetch_json(
         method="GET",
     )
     try:
-        with _isolated_http_opener().open(request, timeout=timeout) as response:
+        with isolated_http_opener().open(request, timeout=timeout) as response:
             status = int(getattr(response, "status", response.getcode()))
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:

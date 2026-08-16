@@ -61,7 +61,7 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   // WM_GETMINMAXINFO uses physical frame pixels.  Keep the route specifications
   // in 96-DPI content DIPs and convert them at the native window boundary.
   POINT MinimumTrackSizeForActiveRoute() const;
-  bool SetWindowContentSize(double width, double height);
+  bool SetWindowContentSize(std::wstring_view route, double width, double height);
   bool Confirm(
       std::wstring_view title,
       std::wstring_view message,
@@ -69,7 +69,9 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   void ShowReadOnlyText(
       std::wstring_view title,
       std::wstring_view text,
-      std::wstring_view close_label);
+      std::wstring_view close_label,
+      std::wstring_view language,
+      std::wstring_view html);
   std::optional<size_t> ShowActionMenu(std::wstring_view title, std::vector<std::wstring> const& items, NativeMenuAnchor anchor);
   std::optional<std::vector<std::wstring>> ChooseModelsToAdd(
       std::vector<std::wstring> models,
@@ -79,16 +81,9 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       std::wstring_view title,
       bool allow_clear,
       bool present);
-  std::optional<std::string> EditNativeText(
-      std::string const& content,
-      std::string const& language,
-      std::wstring const& title);
   bool SetLaunchAtLogin(bool enabled);
   void ShowVersion() const;
   void Quit();
-  winrt::Microsoft::UI::Xaml::Controls::SplitView CreateSplitView() const;
-  winrt::Microsoft::UI::Xaml::Controls::TextBox CreateTextEditor() const;
-  winrt::Microsoft::UI::Xaml::Controls::ComboBox CreateSelector() const;
 
  private:
   void EnsureTray();

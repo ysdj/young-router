@@ -6,6 +6,124 @@ from hook_test_utils import *
 
 
 class HookStreamingCompactionTests(HookTestCase):
+    async def test_local_checkpoint_compaction_accepts_plain_message_output(self) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": (
+                        "You are performing a CONTEXT CHECKPOINT COMPACTION. "
+                        "Create a handoff summary for another LLM."
+                    ),
+                }
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        self.assertFalse(
+            hooks._request_has_structured_codex_compaction(request_data)
+        )
+        self.assertTrue(hooks._request_is_codex_compaction(request_data))
+
+        async def original_stream():
+            message_item = {
+                "id": "msg-checkpoint",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Checkpoint summary.",
+                        "annotations": [],
+                    }
+                ],
+            }
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-checkpoint", "status": "in_progress"},
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": message_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-checkpoint",
+                    "status": "completed",
+                    "output": [message_item],
+                },
+            }
+
+        class UnexpectedRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("plain checkpoint output must not route-fallback")
+
+        proxy_server.llm_router = UnexpectedRouter()
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0]["content"][0]["text"],
+            "Checkpoint summary.",
+        )
+
+    async def test_local_checkpoint_compaction_does_not_enter_route_recovery(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": (
+                        "You are performing a CONTEXT CHECKPOINT COMPACTION. "
+                        "Create a handoff summary for another LLM."
+                    ),
+                }
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        calls = []
+
+        class UnexpectedRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                raise AssertionError("checkpoint compaction must not poll routes")
+
+        proxy_server.llm_router = UnexpectedRouter()
+        failure = RuntimeError("upstream stream ended before response.completed")
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._stream_route_recovery_poll(request_data, failure)
+        ]
+
+        self.assertEqual(calls, [])
+        self.assertEqual([chunk["type"] for chunk in chunks], ["response.failed"])
+        self.assertEqual(
+            chunks[0]["response"]["error"]["code"],
+            "upstream_route_failure",
+        )
+
     def test_structured_compaction_synthetic_failure_preserves_upstream_status(self) -> None:
         hooks, _proxy_server = load_hook_module()
         request_data = {
@@ -821,7 +939,8 @@ class HookStreamingCompactionTests(HookTestCase):
                         "Create a compact handoff summary for resuming this Codex session. "
                         "Target at most 20000 tokens. Preserve only unresolved work."
                     ),
-                }
+                },
+                {"type": "compaction_trigger", "id": "compact-native-shape"},
             ],
             "stream": True,
             "reasoning": {"effort": "medium"},

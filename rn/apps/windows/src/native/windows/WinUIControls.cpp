@@ -6,8 +6,8 @@
 
 #include "codegen/react/components/LiteLLMMenu/LiteLLMWinUIButton.g.h"
 #include "codegen/react/components/LiteLLMMenu/LiteLLMWinUICheckbox.g.h"
+#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUICodeWebView.g.h"
 #include "codegen/react/components/LiteLLMMenu/LiteLLMWinUIPicker.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISecureTextEditor.g.h"
 #include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISecureTextInput.g.h"
 #include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISegmentedControl.g.h"
 #include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISelectableRow.g.h"
@@ -17,21 +17,25 @@
 #include "codegen/react/components/LiteLLMMenu/LiteLLMWinUITextEditor.g.h"
 #include "codegen/react/components/LiteLLMMenu/LiteLLMWinUITextInput.g.h"
 
+#include <shlobj.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <winrt/Microsoft.Web.WebView2.Core.h>
+#include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.UI.h>
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <deque>
+#include <filesystem>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -60,19 +64,33 @@ using winrt::Microsoft::UI::Xaml::Controls::StackPanel;
 using winrt::Microsoft::UI::Xaml::Controls::TextBox;
 using winrt::Microsoft::UI::Xaml::Controls::TextBlock;
 using winrt::Microsoft::UI::Xaml::Controls::ToolTipService;
+using winrt::Microsoft::UI::Xaml::Controls::WebView2;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::Thumb;
 using winrt::Microsoft::UI::Xaml::Controls::Primitives::ToggleButton;
 using winrt::Microsoft::UI::Xaml::Media::SolidColorBrush;
 using winrt::Microsoft::UI::Xaml::Media::FontFamily;
 using winrt::Microsoft::UI::Xaml::Thickness;
 
-constexpr size_t kSecureEditorMaximumBytes = 2 * 1024 * 1024;
-constexpr auto kSecureEditorDebounce = std::chrono::milliseconds{450};
-constexpr int32_t kSecureEditorInitialRevision = 0;
+namespace web = winrt::Microsoft::Web::WebView2::Core;
+
 constexpr double kUIFontSize = 13.0;
 
 winrt::hstring ToHString(std::string const& value) {
   return winrt::to_hstring(value);
+}
+
+std::wstring CodeEditorWebViewDataFolder() {
+  PWSTR folder = nullptr;
+  if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &folder)) || folder == nullptr) {
+    return {};
+  }
+  std::filesystem::path path(folder);
+  CoTaskMemFree(folder);
+  path /= L"LiteLLM Menu";
+  path /= L"CodeEditorWebView2";
+  std::error_code error;
+  std::filesystem::create_directories(path, error);
+  return error ? std::wstring{} : path.wstring();
 }
 
 bool Enabled(std::optional<bool> const& disabled) {
@@ -154,16 +172,6 @@ void ApplyKeyboardType(TextBox const& text_box, std::optional<std::string> const
   scope.Names().Append(name);
   text_box.InputScope(scope);
 }
-
-struct SecureEditorLifecycle final {
-  std::atomic<bool> alive{true};
-  std::atomic<bool> attached{true};
-  std::atomic<uint64_t> generation{0};
-  std::atomic<uint64_t> edit_serial{0};
-  std::atomic<uint64_t> debounce_serial{0};
-  std::atomic<bool> staging{false};
-  std::atomic<bool> terminal{false};
-};
 
 struct SecureInputLifecycle final {
   std::atomic<bool> alive{true};
@@ -653,6 +661,8 @@ struct TableComponentView final
   void ApplyProps() noexcept {
     if (!root_ || !Props()) return;
     auto const& props = *Props();
+    table_frame_.BorderThickness(
+        props.borderless.value_or(false) ? Thickness{0, 0, 0, 0} : Thickness{1, 1, 1, 1});
     const auto disabled_row_keys = props.disabledRowKeys.value_or(std::vector<std::string>{});
     const auto secondary_cell_keys = props.secondaryCellKeys.value_or(std::vector<std::string>{});
     const auto spanning_row_keys = props.spanningRowKeys.value_or(std::vector<std::string>{});
@@ -929,496 +939,340 @@ struct TextEditorComponentView final
   TextBox editor_{nullptr};
 };
 
-struct SecureTextEditorComponentView final
-    : winrt::implements<SecureTextEditorComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISecureTextEditor<SecureTextEditorComponentView> {
-  SecureTextEditorComponentView() = default;
-
-  ~SecureTextEditorComponentView() {
-    InvalidateLifecycle();
-    try {
-      if (editor_) {
-        if (text_changed_token_.value != 0) editor_.TextChanged(text_changed_token_);
-        if (loaded_token_.value != 0) editor_.Loaded(loaded_token_);
-        if (unloaded_token_.value != 0) editor_.Unloaded(unloaded_token_);
-      }
-    } catch (...) {
-    }
+struct CodeWebViewComponentView final
+    : winrt::implements<CodeWebViewComponentView, winrt::IInspectable>,
+      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView> {
+  ~CodeWebViewComponentView() {
+    ReleaseWebView();
   }
 
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     try {
       island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
-      editor_ = TextBox{};
-      editor_.FontSize(kUIFontSize);
-      editor_.AcceptsReturn(true);
-      editor_.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Consolas"));
-      editor_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-      editor_.HorizontalScrollBarVisibility(
-          winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
-      editor_.VerticalScrollBarVisibility(
-          winrt::Microsoft::UI::Xaml::Controls::ScrollBarVisibility::Auto);
-      editor_.MaxLength(static_cast<int32_t>(kSecureEditorMaximumBytes));
-      editor_.IsReadOnly(true);
-      dispatcher_ = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
-      auto weak_self = get_weak();
-      text_changed_token_ = editor_.TextChanged([weak_self](auto const&, auto const&) {
-        if (auto self = weak_self.get(); self && !self->syncing_) self->ScheduleStage();
-      });
-      loaded_token_ = editor_.Loaded([weak_self](auto const&, auto const&) {
-        if (auto self = weak_self.get()) self->ResumeAfterLoad();
-      });
-      unloaded_token_ = editor_.Unloaded([weak_self](auto const&, auto const&) {
-        if (auto self = weak_self.get()) self->SuspendForUnload();
-      });
-      island_.Content(editor_);
+      webview_ = WebView2{};
+      auto weak = get_weak();
+      navigation_completed_token_ = webview_.NavigationCompleted(
+          [weak](auto const&, auto const& args) {
+            if (!args.IsSuccess()) {
+              if (auto current = weak.get(); current && !current->disposed_) {
+                current->RecoverEditorPage("page_load_failed");
+              }
+            }
+          });
+      island_.Content(webview_);
       island_view.Connect(island_.ContentIsland());
+      InitializeBrowser();
     } catch (...) {
-      EmitState(kSecureEditorInitialRevision, "error", "initialize_failed");
+      EmitEditorError("initialize_failed");
     }
   }
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextEditorProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextEditorProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISecureTextEditor<SecureTextEditorComponentView>::UpdateProps(
+      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewProps> const& props,
+      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewProps> const& old_props) noexcept override {
+    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateProps(
         view, props, old_props);
     ApplyProps(old_props);
   }
 
-  void UpdateEventEmitter(
-      std::shared_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextEditorEventEmitter> const& emitter) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISecureTextEditor<SecureTextEditorComponentView>::UpdateEventEmitter(
-        emitter);
-    if (emitter && !last_status_.empty()) EmitState(last_revision_, last_status_, last_error_);
-  }
-
-  void SuspendForUnload() noexcept {
-    if (!lifecycle_) return;
-    if (!active_editor_token_.empty() && !lifecycle_->terminal.load(std::memory_order_acquire) &&
-        last_status_ != "loading") {
-      try {
-        loaded_document_ = winrt::to_string(editor_.Text());
-      } catch (...) {
-        lifecycle_->terminal.store(true, std::memory_order_release);
-        EmitState(last_revision_, "error", "invalid_text");
-      }
-    }
-    lifecycle_->attached.store(false, std::memory_order_release);
-    lifecycle_->debounce_serial.fetch_add(1, std::memory_order_acq_rel);
-    try {
-      if (editor_) editor_.IsReadOnly(true);
-    } catch (...) {
-    }
+  void PrepareForRecycle(
+      winrt::Microsoft::ReactNative::ComponentView const& view) noexcept {
+    if (disposed_) return;
+    disposed_ = true;
+    ReleaseWebView();
+    std::deque<std::string>{}.swap(emitted_editor_texts_);
+    auto old_props = Props();
+    winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewProps> empty_props;
+    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateProps(
+        view, empty_props, old_props);
+    std::shared_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewEventEmitter> empty_emitter;
+    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateEventEmitter(
+        empty_emitter);
   }
 
  private:
-  void ResumeAfterLoad() noexcept {
-    if (!lifecycle_ || !lifecycle_->alive.load(std::memory_order_acquire)) return;
-    lifecycle_->attached.store(true, std::memory_order_release);
+  static int32_t BoundedCount(
+      winrt::Windows::Data::Json::JsonObject const& values,
+      wchar_t const* name) noexcept {
     try {
-      if (!editor_) return;
-      if (loaded_document_ && !PresentLoadedDocument()) return;
-      const bool can_edit = loaded_document_.has_value() && !active_editor_token_.empty() &&
-          !lifecycle_->terminal.load(std::memory_order_acquire) && last_status_ != "loading";
-      editor_.IsReadOnly(!can_edit);
-      if (can_edit && last_status_ == "dirty" &&
-          !lifecycle_->staging.load(std::memory_order_acquire)) {
-        BeginStage(lifecycle_->generation.load(std::memory_order_acquire));
-      } else if (!last_status_.empty()) {
-        EmitState(last_revision_, last_status_, last_error_);
-      }
+      const auto value = values.GetNamedNumber(name, 0.0);
+      if (!std::isfinite(value)) return 0;
+      return static_cast<int32_t>(std::clamp(
+          value,
+          0.0,
+          static_cast<double>(std::numeric_limits<int32_t>::max())));
     } catch (...) {
+      return 0;
     }
   }
 
-  void InvalidateLifecycle() noexcept {
-    if (!lifecycle_) return;
-    lifecycle_->attached.store(false, std::memory_order_release);
-    lifecycle_->alive.store(false, std::memory_order_release);
-    lifecycle_->generation.fetch_add(1, std::memory_order_acq_rel);
-    lifecycle_->edit_serial.fetch_add(1, std::memory_order_acq_rel);
-    lifecycle_->debounce_serial.fetch_add(1, std::memory_order_acq_rel);
-  }
-
-  bool IsCurrent(
-      std::shared_ptr<SecureEditorLifecycle> const& lifecycle,
-      uint64_t generation) const noexcept {
-    return lifecycle &&
-        lifecycle->alive.load(std::memory_order_acquire) &&
-        lifecycle->generation.load(std::memory_order_acquire) == generation;
-  }
-
-  bool PresentLoadedDocument() noexcept {
-    if (!lifecycle_->attached.load(std::memory_order_acquire) || !loaded_document_) return true;
-    try {
-      auto wide_text = ToHString(*loaded_document_);
-      syncing_ = true;
-      if (editor_.Text() != wide_text) editor_.Text(wide_text);
-      syncing_ = false;
-      editor_.IsReadOnly(false);
-      return true;
-    } catch (...) {
-      syncing_ = false;
-      lifecycle_->terminal.store(true, std::memory_order_release);
+  void InitializeBrowser() noexcept {
+    auto weak = get_weak();
+    [weak]() -> winrt::fire_and_forget {
+      auto self = weak.get();
+      if (!self || self->disposed_) co_return;
       try {
-        editor_.IsReadOnly(true);
+        const auto data_folder = CodeEditorWebViewDataFolder();
+        if (data_folder.empty()) throw winrt::hresult_error(E_FAIL);
+        web::CoreWebView2EnvironmentOptions environment_options;
+        auto environment = co_await web::CoreWebView2Environment::CreateWithOptionsAsync(
+            winrt::hstring{}, winrt::hstring(data_folder), environment_options);
+        self = weak.get();
+        if (!self || self->disposed_ || !self->webview_) co_return;
+        auto controller_options = environment.CreateCoreWebView2ControllerOptions();
+        co_await self->webview_.EnsureCoreWebView2Async(environment, controller_options);
+        self = weak.get();
+        if (!self || self->disposed_ || !self->webview_) co_return;
+        self->core_ = self->webview_.CoreWebView2();
+        self->web_message_token_ = self->core_.WebMessageReceived(
+            [weak](auto const&, auto const& args) {
+              if (auto current = weak.get()) current->HandleWebMessage(args);
+            });
+        self->browser_ready_ = true;
+        self->NavigateToCurrentHtml();
       } catch (...) {
+        if (auto current = weak.get(); current && !current->disposed_) {
+          current->EmitEditorError("webview_initialization_failed");
+        }
       }
-      EmitState(kSecureEditorInitialRevision, "error", "read_failed");
-      return false;
-    }
+    }();
   }
 
   void ApplyProps(
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextEditorProps> const& old_props) noexcept {
-    if (!editor_ || !Props()) return;
+      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewProps> const& old_props) noexcept {
+    if (disposed_ || !Props()) return;
     auto const& props = *Props();
-    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(
-        editor_, ToHString(props.language.empty() ? "Source editor" : props.language + " source editor"));
-    const bool token_changed = !old_props || old_props->editorToken != props.editorToken;
-    if (!token_changed) return;
-
-    lifecycle_->debounce_serial.fetch_add(1, std::memory_order_acq_rel);
-    const auto generation = lifecycle_->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-    lifecycle_->edit_serial.store(0, std::memory_order_release);
-    lifecycle_->staging.store(false, std::memory_order_release);
-    lifecycle_->terminal.store(false, std::memory_order_release);
-    load_recovery_attempted_ = false;
-    stage_recovery_attempted_ = false;
-    active_editor_token_ = props.editorToken;
-    loaded_document_.reset();
-    last_revision_ = 0;
-
-    if (lifecycle_->attached.load(std::memory_order_acquire)) {
-      syncing_ = true;
-      editor_.Text(L"");
-      syncing_ = false;
-      editor_.IsReadOnly(true);
-    }
-
-    if (props.editorToken.empty() || props.editorToken.size() > 256) {
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      EmitState(kSecureEditorInitialRevision, "error", "invalid_token");
+    if (props.html.empty() || props.documentKey.empty() ||
+        (props.language != "json" && props.language != "toml" && props.language != "text") ||
+        props.html.size() > 4 * 1024 * 1024 ||
+        props.value.size() > 2 * 1024 * 1024 ||
+        props.baseline.size() > 2 * 1024 * 1024) {
+      EmitEditorError("editor_document_too_large");
       return;
     }
-
-    EmitState(kSecureEditorInitialRevision, "loading", "");
-    auto lifecycle = lifecycle_;
-    auto dispatcher = dispatcher_;
-    auto weak_self = get_weak();
-    auto token = active_editor_token_;
     try {
-      std::thread([lifecycle, dispatcher, weak_self, generation, token = std::move(token)]() mutable {
-        if (!lifecycle->alive.load(std::memory_order_acquire) ||
-            lifecycle->generation.load(std::memory_order_acquire) != generation) {
-          return;
-        }
-        auto text = LiteLLMMenu::CoreIPCBridge::Shared().ReadEditorDocument(token);
-        if (!lifecycle->alive.load(std::memory_order_acquire) ||
-            lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
-          return;
-        }
-        dispatcher.TryEnqueue([lifecycle, weak_self, generation, text = std::move(text)]() mutable {
-          if (!lifecycle->alive.load(std::memory_order_acquire) ||
-              lifecycle->generation.load(std::memory_order_acquire) != generation) {
-            return;
-          }
-          if (auto self = weak_self.get()) self->FinishRead(generation, std::move(text));
-        });
-      }).detach();
+      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(
+          webview_, ToHString(props.language.empty() ? "Source editor" : props.language + " source editor"));
     } catch (...) {
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      EmitState(kSecureEditorInitialRevision, "error", "read_failed");
     }
-  }
 
-  void FinishRead(uint64_t generation, std::optional<std::string> text) noexcept {
-    if (!IsCurrent(lifecycle_, generation)) return;
-    if (!text) {
-      RecoverInitialRead(generation, active_editor_token_);
+    const bool html_changed = !old_props || old_props->html != props.html;
+    const bool document_changed = !old_props || old_props->documentKey != props.documentKey;
+    const bool value_changed = !old_props || old_props->value != props.value;
+    auto echoed_editor_text = false;
+    if (value_changed && !document_changed) {
+      auto match = std::find(emitted_editor_texts_.begin(), emitted_editor_texts_.end(), props.value);
+      if (match != emitted_editor_texts_.end()) {
+        echoed_editor_text = true;
+        emitted_editor_texts_.erase(match);
+      }
+    }
+    if (document_changed) {
+      emitted_editor_texts_.clear();
+    }
+    const bool editor_state_changed = document_changed ||
+        (value_changed && !echoed_editor_text) ||
+        !old_props ||
+        old_props->baseline != props.baseline ||
+        old_props->language != props.language ||
+        old_props->readOnly != props.readOnly ||
+        old_props->showDiff != props.showDiff;
+    if (editor_state_changed) {
+      ++editor_state_generation_;
+      pending_sync_ = true;
+    }
+    if (html_changed) {
+      html_state_generation_ = editor_state_generation_;
+      page_recovery_attempts_ = 0;
+      editor_ready_ = false;
+      pending_sync_ = true;
+      NavigateToCurrentHtml();
       return;
     }
-    loaded_document_ = std::move(text);
-    last_revision_ = 0;
-    if (!PresentLoadedDocument()) return;
-    EmitState(kSecureEditorInitialRevision, "ready", "");
+    SynchronizeEditorIfReady();
   }
 
-  void RecoverInitialRead(uint64_t generation, std::string const& failed_token) noexcept {
-    if (!IsCurrent(lifecycle_, generation) || load_recovery_attempted_ ||
-        failed_token != active_editor_token_) {
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(true);
-      EmitState(kSecureEditorInitialRevision, "error", "read_failed");
-      return;
-    }
-    load_recovery_attempted_ = true;
-    auto lifecycle = lifecycle_;
-    auto dispatcher = dispatcher_;
-    auto weak_self = get_weak();
+  void NavigateToCurrentHtml() noexcept {
+    if (disposed_ || !browser_ready_ || !webview_ || !Props()) return;
+    auto const& props = *Props();
+    if (props.html.empty()) return;
     try {
-      std::thread([lifecycle, dispatcher, weak_self, generation, failed_token] {
-        auto refreshed = LiteLLMMenu::CoreIPCBridge::Shared().RefreshEditorDocument(failed_token);
-        if (!lifecycle->alive.load(std::memory_order_acquire) ||
-            lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
-          return;
-        }
-        dispatcher.TryEnqueue([lifecycle, weak_self, generation, failed_token, refreshed = std::move(refreshed)]() mutable {
-          if (!lifecycle->alive.load(std::memory_order_acquire) ||
-              lifecycle->generation.load(std::memory_order_acquire) != generation) {
-            return;
-          }
-          if (auto self = weak_self.get()) {
-            if (!refreshed || failed_token != self->active_editor_token_) {
-              self->lifecycle_->terminal.store(true, std::memory_order_release);
-              if (self->lifecycle_->attached.load(std::memory_order_acquire)) self->editor_.IsReadOnly(true);
-              self->EmitState(kSecureEditorInitialRevision, "error", "read_failed");
-              return;
-            }
-            self->active_editor_token_ = std::move(refreshed->editor_token);
-            self->loaded_document_ = std::move(refreshed->text);
-            self->last_revision_ = 0;
-            if (!self->PresentLoadedDocument()) return;
-            self->EmitState(kSecureEditorInitialRevision, "ready", "");
-          }
-        });
-      }).detach();
+      webview_.NavigateToString(ToHString(props.html));
     } catch (...) {
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(true);
-      EmitState(kSecureEditorInitialRevision, "error", "read_failed");
+      EmitEditorError("page_load_failed");
     }
   }
 
-  void ScheduleStage() noexcept {
-    if (!Props() || !lifecycle_->alive.load(std::memory_order_acquire) ||
-        !lifecycle_->attached.load(std::memory_order_acquire) ||
-        lifecycle_->terminal.load(std::memory_order_acquire)) {
+  void RecoverEditorPage(std::string const& error) noexcept {
+    if (page_recovery_attempts_ >= 1) {
+      EmitEditorError(error);
       return;
     }
-    const auto generation = lifecycle_->generation.load(std::memory_order_acquire);
-    // A successful recovery belongs to the previous edit burst. Allow one
-    // bounded capability refresh for each new user edit burst, while still
-    // preventing an endlessly failing stage from spinning.
-    stage_recovery_attempted_ = false;
-    lifecycle_->edit_serial.fetch_add(1, std::memory_order_acq_rel);
-    const auto serial = lifecycle_->debounce_serial.fetch_add(1, std::memory_order_acq_rel) + 1;
-    EmitState(last_revision_, "dirty", "");
-    auto lifecycle = lifecycle_;
-    auto dispatcher = dispatcher_;
-    auto weak_self = get_weak();
+    ++page_recovery_attempts_;
+    editor_ready_ = false;
+    pending_sync_ = true;
+    NavigateToCurrentHtml();
+  }
+
+  void SynchronizeEditorIfReady() noexcept {
+    if (disposed_ || !browser_ready_ || !editor_ready_ || !pending_sync_ || !Props()) return;
+    auto const& props = *Props();
     try {
-      std::thread([lifecycle, dispatcher, weak_self, generation, serial] {
-        std::this_thread::sleep_for(kSecureEditorDebounce);
-        if (!lifecycle->alive.load(std::memory_order_acquire) ||
-            !lifecycle->attached.load(std::memory_order_acquire) ||
-            lifecycle->generation.load(std::memory_order_acquire) != generation ||
-            lifecycle->debounce_serial.load(std::memory_order_acquire) != serial || !dispatcher) {
-          return;
-        }
-        dispatcher.TryEnqueue([lifecycle, weak_self, generation, serial] {
-          if (!lifecycle->alive.load(std::memory_order_acquire) ||
-              !lifecycle->attached.load(std::memory_order_acquire) ||
-              lifecycle->generation.load(std::memory_order_acquire) != generation ||
-              lifecycle->debounce_serial.load(std::memory_order_acquire) != serial) {
-            return;
-          }
-          if (auto self = weak_self.get()) self->BeginStage(generation);
-        });
-      }).detach();
+      auto payload = winrt::Windows::Data::Json::JsonObject{};
+      payload.Insert(L"type", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"replace"));
+      payload.Insert(L"documentKey", winrt::Windows::Data::Json::JsonValue::CreateStringValue(ToHString(props.documentKey)));
+      payload.Insert(L"value", winrt::Windows::Data::Json::JsonValue::CreateStringValue(ToHString(props.value)));
+      payload.Insert(L"baseline", winrt::Windows::Data::Json::JsonValue::CreateStringValue(ToHString(props.baseline)));
+      payload.Insert(L"language", winrt::Windows::Data::Json::JsonValue::CreateStringValue(ToHString(props.language)));
+      payload.Insert(L"readOnly", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(props.readOnly.value_or(false)));
+      payload.Insert(L"showDiff", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(props.showDiff.value_or(false)));
+      auto script = winrt::hstring(L"window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(") +
+          payload.Stringify() + L");";
+      pending_sync_ = false;
+      ExecuteEditorScript(std::move(script));
     } catch (...) {
-      lifecycle_->terminal.store(false, std::memory_order_release);
-      editor_.IsReadOnly(false);
-      EmitState(last_revision_, "error", "stage_failed");
+      pending_sync_ = false;
+      EmitEditorError("editor_payload_serialization_failed");
     }
   }
 
-  void BeginStage(uint64_t generation) noexcept {
-    if (!IsCurrent(lifecycle_, generation) || !Props() ||
-        !lifecycle_->attached.load(std::memory_order_acquire) ||
-        lifecycle_->terminal.load(std::memory_order_acquire)) {
-      return;
-    }
-    bool expected = false;
-    if (!lifecycle_->staging.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
-    const auto staged_serial = lifecycle_->edit_serial.load(std::memory_order_acquire);
-
-    std::string text;
-    try {
-      text = winrt::to_string(editor_.Text());
-    } catch (...) {
-      lifecycle_->staging.store(false, std::memory_order_release);
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      editor_.IsReadOnly(true);
-      EmitState(last_revision_, "error", "invalid_text");
-      return;
-    }
-    if (text.size() > kSecureEditorMaximumBytes) {
-      lifecycle_->staging.store(false, std::memory_order_release);
-      lifecycle_->terminal.store(true, std::memory_order_release);
-      editor_.IsReadOnly(true);
-      EmitState(last_revision_, "error", "invalid_text");
-      return;
-    }
-    loaded_document_ = text;
-
-    EmitState(last_revision_, "saving", "");
-    auto lifecycle = lifecycle_;
-    auto dispatcher = dispatcher_;
-    auto weak_self = get_weak();
-    auto token = active_editor_token_;
-    try {
-      std::thread([
-          lifecycle,
-          dispatcher,
-          weak_self,
-          generation,
-          staged_serial,
-          token = std::move(token),
-          text = std::move(text)]() mutable {
-        if (!lifecycle->alive.load(std::memory_order_acquire) ||
-            lifecycle->generation.load(std::memory_order_acquire) != generation) {
-          return;
+  void ExecuteEditorScript(winrt::hstring script) noexcept {
+    auto weak = get_weak();
+    [weak, script = std::move(script)]() -> winrt::fire_and_forget {
+      auto self = weak.get();
+      if (!self || self->disposed_ || !self->webview_) co_return;
+      try {
+        co_await self->webview_.ExecuteScriptAsync(script);
+      } catch (...) {
+        if (auto current = weak.get(); current && !current->disposed_) {
+          current->EmitEditorError("javascript_evaluation_failed");
         }
-        auto result = LiteLLMMenu::CoreIPCBridge::Shared().StageEditorDocumentWithReplacement(token, text);
-        if (!lifecycle->alive.load(std::memory_order_acquire) ||
-            lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
-          return;
-        }
-        dispatcher.TryEnqueue([lifecycle, weak_self, generation, staged_serial, result = std::move(result)]() mutable {
-          if (!lifecycle->alive.load(std::memory_order_acquire) ||
-              lifecycle->generation.load(std::memory_order_acquire) != generation) {
-            return;
-          }
-          if (auto self = weak_self.get()) {
-            self->FinishStage(generation, staged_serial, std::move(result));
-          }
-        });
-      }).detach();
-    } catch (...) {
-      lifecycle_->staging.store(false, std::memory_order_release);
-      lifecycle_->terminal.store(false, std::memory_order_release);
-      editor_.IsReadOnly(false);
-      EmitState(last_revision_, "error", "stage_failed");
-    }
+      }
+    }();
   }
 
-  void FinishStage(
-      uint64_t generation,
-      uint64_t staged_serial,
-      std::optional<LiteLLMMenu::CoreIPCBridge::EditorStageResult> result) noexcept {
-    if (!IsCurrent(lifecycle_, generation)) return;
-    lifecycle_->staging.store(false, std::memory_order_release);
-    if (!result || result->revision < 0 ||
-        result->revision > std::numeric_limits<int32_t>::max() ||
-        std::floor(result->revision) != result->revision || result->editor_token.empty() ||
-        result->editor_token.size() > 256) {
-      RecoverStage(generation, active_editor_token_);
-      return;
-    }
-    // Core rotates the capability after each stage. Keep the replacement token
-    // native-only so the user can continue editing without a React re-render.
-    active_editor_token_ = std::move(result->editor_token);
-    last_revision_ = static_cast<int32_t>(result->revision);
-    if (lifecycle_->edit_serial.load(std::memory_order_acquire) != staged_serial) {
-      lifecycle_->debounce_serial.fetch_add(1, std::memory_order_acq_rel);
-      EmitState(last_revision_, "dirty", "");
-      BeginStage(generation);
-    } else {
-      EmitState(last_revision_, "saved", "");
-    }
-  }
-
-  void RecoverStage(uint64_t generation, std::string const& failed_token) noexcept {
-    if (!IsCurrent(lifecycle_, generation) || stage_recovery_attempted_ ||
-        failed_token != active_editor_token_) {
-      lifecycle_->terminal.store(false, std::memory_order_release);
-      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(false);
-      EmitState(last_revision_, "error", "stage_failed");
-      return;
-    }
-    stage_recovery_attempted_ = true;
-    lifecycle_->staging.store(true, std::memory_order_release);
-    EmitState(last_revision_, "saving", "");
-    auto lifecycle = lifecycle_;
-    auto dispatcher = dispatcher_;
-    auto weak_self = get_weak();
+  void HandleWebMessage(
+      winrt::Microsoft::Web::WebView2::Core::CoreWebView2WebMessageReceivedEventArgs const& args) noexcept {
+    if (disposed_) return;
     try {
-      std::thread([lifecycle, dispatcher, weak_self, generation, failed_token] {
-        auto refreshed = LiteLLMMenu::CoreIPCBridge::Shared().RefreshEditorDocument(failed_token);
-        if (!lifecycle->alive.load(std::memory_order_acquire) ||
-            lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
-          return;
-        }
-        dispatcher.TryEnqueue([lifecycle, weak_self, generation, failed_token, refreshed = std::move(refreshed)]() mutable {
-          if (!lifecycle->alive.load(std::memory_order_acquire) ||
-              lifecycle->generation.load(std::memory_order_acquire) != generation) {
-            return;
-          }
-          if (auto self = weak_self.get()) {
-            self->lifecycle_->staging.store(false, std::memory_order_release);
-            if (!refreshed || failed_token != self->active_editor_token_) {
-              self->lifecycle_->terminal.store(false, std::memory_order_release);
-              if (self->lifecycle_->attached.load(std::memory_order_acquire)) self->editor_.IsReadOnly(false);
-              self->EmitState(self->last_revision_, "error", "stage_failed");
-              return;
-            }
-            // The Core read above only authorizes the fresh capability. Do not
-            // assign its disk text: the TextBox is the native owner of edits
-            // made while the prior capability expired.
-            self->active_editor_token_ = std::move(refreshed->editor_token);
-            if (!self->lifecycle_->attached.load(std::memory_order_acquire)) {
-              self->EmitState(self->last_revision_, "dirty", "");
-              return;
-            }
-            self->BeginStage(generation);
-          }
-        });
-      }).detach();
+      auto payload = winrt::Windows::Data::Json::JsonObject::Parse(args.TryGetWebMessageAsString());
+      auto type = winrt::to_string(payload.GetNamedString(L"type", L""));
+      if (type == "ready") {
+        editor_ready_ = true;
+        page_recovery_attempts_ = 0;
+        const auto document_key = winrt::to_string(payload.GetNamedString(L"documentKey", L""));
+        const auto props = Props();
+        const bool initial_document_is_current = props &&
+            document_key == props->documentKey &&
+            html_state_generation_ == editor_state_generation_;
+        pending_sync_ = !initial_document_is_current;
+        SynchronizeEditorIfReady();
+        return;
+      }
+      if (type == "error") {
+        EmitEditorError(winrt::to_string(payload.GetNamedString(L"message", L"editor_error")));
+        return;
+      }
+      if (type != "change") {
+        EmitEditorError("unknown_editor_message");
+        return;
+      }
+
+      const auto text = winrt::to_string(payload.GetNamedString(L"text", L""));
+      if (!payload.HasKey(L"text")) {
+        EmitEditorError("invalid_editor_change");
+        return;
+      }
+      emitted_editor_texts_.push_back(text);
+      if (emitted_editor_texts_.size() > 8) emitted_editor_texts_.pop_front();
+      if (!EventEmitter()) return;
+      winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewEventEmitter::OnEditorChange event;
+      event.text = text;
+      event.added = BoundedCount(payload, L"added");
+      event.changed = BoundedCount(payload, L"changed");
+      event.deleted = BoundedCount(payload, L"deleted");
+      EventEmitter()->onEditorChange(std::move(event));
     } catch (...) {
-      lifecycle_->staging.store(false, std::memory_order_release);
-      lifecycle_->terminal.store(false, std::memory_order_release);
-      if (lifecycle_->attached.load(std::memory_order_acquire)) editor_.IsReadOnly(false);
-      EmitState(last_revision_, "error", "stage_failed");
+      EmitEditorError("invalid_editor_message");
     }
   }
 
-  void EmitState(int32_t revision, std::string status, std::string error) noexcept {
-    if (!lifecycle_->alive.load(std::memory_order_acquire)) return;
-    last_revision_ = revision;
-    last_status_ = status;
-    last_error_ = error;
-    if (!lifecycle_->attached.load(std::memory_order_acquire)) return;
+  void EmitEditorError(std::string message) noexcept {
+    if (disposed_) return;
+    if (auto emitter = EventEmitter()) {
+      winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewEventEmitter::OnEditorError event;
+      event.message = std::move(message);
+      emitter->onEditorError(std::move(event));
+    }
+  }
+
+  void ReleaseWebView() noexcept {
+    browser_ready_ = false;
+    editor_ready_ = false;
+    pending_sync_ = false;
+    editor_state_generation_ = 0;
+    html_state_generation_ = 0;
+    page_recovery_attempts_ = 0;
     try {
-      if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextEditorEventEmitter::OnEditorState args;
-        args.revision = revision;
-        args.status = std::move(status);
-        args.error = std::move(error);
-        emitter->onEditorState(std::move(args));
+      if (core_ && web_message_token_.value != 0) {
+        core_.WebMessageReceived(web_message_token_);
       }
     } catch (...) {
     }
+    web_message_token_ = {};
+    try {
+      if (webview_ && navigation_completed_token_.value != 0) {
+        webview_.NavigationCompleted(navigation_completed_token_);
+      }
+    } catch (...) {
+    }
+    navigation_completed_token_ = {};
+    try {
+      if (core_) core_.Stop();
+    } catch (...) {
+    }
+    try {
+      if (webview_) webview_.NavigateToString(L"");
+    } catch (...) {
+    }
+    try {
+      if (island_) {
+        island_.Content(winrt::Microsoft::UI::Xaml::UIElement{nullptr});
+      }
+    } catch (...) {
+    }
+    core_ = nullptr;
+    webview_ = nullptr;
+    island_ = nullptr;
   }
 
-  bool syncing_ = false;
-  std::shared_ptr<SecureEditorLifecycle> lifecycle_{std::make_shared<SecureEditorLifecycle>()};
-  winrt::Microsoft::UI::Dispatching::DispatcherQueue dispatcher_{nullptr};
+  bool disposed_ = false;
+  bool browser_ready_ = false;
+  bool editor_ready_ = false;
+  bool pending_sync_ = false;
+  uint64_t editor_state_generation_ = 0;
+  uint64_t html_state_generation_ = 0;
+  uint32_t page_recovery_attempts_ = 0;
+  std::deque<std::string> emitted_editor_texts_;
   winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
-  TextBox editor_{nullptr};
-  std::string active_editor_token_;
-  std::optional<std::string> loaded_document_;
-  bool load_recovery_attempted_ = false;
-  bool stage_recovery_attempted_ = false;
-  int32_t last_revision_ = 0;
-  std::string last_status_;
-  std::string last_error_;
-  winrt::event_token text_changed_token_{};
-  winrt::event_token loaded_token_{};
-  winrt::event_token unloaded_token_{};
+  WebView2 webview_{nullptr};
+  winrt::Microsoft::Web::WebView2::Core::CoreWebView2 core_{nullptr};
+  winrt::event_token web_message_token_{};
+  winrt::event_token navigation_completed_token_{};
 };
+
+void RegisterCodeWebViewRecycleHandler(
+    ContentIslandComponentView const& island_view,
+    winrt::com_ptr<CodeWebViewComponentView> const& user_data) noexcept {
+  auto weak = user_data->get_weak();
+  // RNW invokes ContentIslandComponentView::prepareForRecycle immediately before
+  // this Destroying event. Codegen user data has no recycle callback of its own.
+  island_view.Destroying(
+      [weak](auto const&, winrt::Microsoft::ReactNative::ComponentView const& view) noexcept {
+        if (auto current = weak.get()) current->PrepareForRecycle(view);
+      });
+}
 
 struct SplitterComponentView final
     : winrt::implements<SplitterComponentView, winrt::IInspectable>,
@@ -2104,6 +1958,22 @@ void RegisterComponent(
   });
 }
 
+void RegisterCodeWebView(
+    winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
+  winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUICodeWebViewNativeComponent<CodeWebViewComponentView>(
+      package_builder,
+      [](winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const& builder) {
+        builder.SetContentIslandComponentViewInitializer(
+            [](ContentIslandComponentView const& island_view) noexcept {
+              LiteLLMMenu::ConfigureImmediateXamlPresentation();
+              auto user_data = winrt::make_self<CodeWebViewComponentView>();
+              user_data->InitializeContentIsland(island_view);
+              RegisterCodeWebViewRecycleHandler(island_view, user_data);
+              island_view.UserData(*user_data);
+            });
+      });
+}
+
 }  // namespace
 
 namespace LiteLLMMenu {
@@ -2144,9 +2014,7 @@ void RegisterWinUIControls(
   RegisterComponent<TextEditorComponentView>(
       package_builder,
       winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUITextEditorNativeComponent<TextEditorComponentView>);
-  RegisterComponent<SecureTextEditorComponentView>(
-      package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUISecureTextEditorNativeComponent<SecureTextEditorComponentView>);
+  RegisterCodeWebView(package_builder);
   RegisterComponent<SecureTextInputComponentView>(
       package_builder,
       winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUISecureTextInputNativeComponent<SecureTextInputComponentView>);

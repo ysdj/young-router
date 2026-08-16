@@ -36,9 +36,11 @@ trap cleanup EXIT
 copy_tree() {
   local source="$1"
   local destination="$2"
-  mkdir -p "$destination"
-  # On APFS, -c uses clonefile and falls back to a regular copy across volumes.
-  cp -ac "$source/." "$destination/"
+  mkdir -p "$(dirname "$destination")"
+  # Preserve the bundle's nested code signatures and extended attributes when
+  # moving the verified build into the install staging path. `cp -a` can drop
+  # those signatures even when the source bundle itself verifies.
+  ditto --rsrc --extattr --acl "$source" "$destination"
 }
 
 bundle_roots() {

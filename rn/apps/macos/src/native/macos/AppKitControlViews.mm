@@ -4,6 +4,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <React/RCTComponent.h>
 #import <React/RCTUIKit.h>
+#import <WebKit/WebKit.h>
 #import "LiteLLMMenu-Swift.h"
 
 #import <react/renderer/components/LiteLLMMacControls/ComponentDescriptors.h>
@@ -649,6 +650,7 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 // continuous border.
 @interface LiteLLMTableFrameView : NSView
 @property(nonatomic, strong, nullable) NSView *framedContentView;
+@property(nonatomic, assign, getter=isFramed) BOOL framed;
 @end
 
 @implementation LiteLLMTableFrameView
@@ -658,6 +660,7 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
   if (self = [super initWithFrame:frame]) {
     self.wantsLayer = YES;
     self.layer.masksToBounds = YES;
+    _framed = YES;
     self.layer.borderWidth = 1.0;
   }
   return self;
@@ -672,6 +675,16 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 {
   self.layer.backgroundColor = NSColor.clearColor.CGColor;
   self.layer.borderColor = NSColor.separatorColor.CGColor;
+}
+
+- (void)setFramed:(BOOL)framed
+{
+  if (_framed == framed) {
+    return;
+  }
+  _framed = framed;
+  self.layer.borderWidth = framed ? 1.0 : 0.0;
+  [self setNeedsLayout:YES];
 }
 
 - (void)setFramedContentView:(NSView *)framedContentView
@@ -691,7 +704,8 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 - (void)layout
 {
   [super layout];
-  _framedContentView.frame = NSInsetRect(self.bounds, 1.0, 1.0);
+  const CGFloat inset = self.framed ? 1.0 : 0.0;
+  _framedContentView.frame = NSInsetRect(self.bounds, inset, inset);
 }
 
 @end
@@ -862,12 +876,22 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
       compactChanged) {
     _button.bezelStyle = link ? NSBezelStyleInline : NSBezelStyleRounded;
     _button.keyEquivalent = !link && newViewProps.primary ? @"\r" : @"";
+    if ((!newViewProps.primary || link) && _button.window.defaultButtonCell == _button.cell) {
+      [_button.window setDefaultButtonCell:nil];
+    }
     _button.hasDestructiveAction = !link && newViewProps.destructive;
     _button.controlSize = useCompactControl ? NSControlSizeSmall : NSControlSizeRegular;
     _button.font = link
         ? [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightSemibold]
         : [NSFont systemFontOfSize:LiteLLMUIFontSize];
     ((LiteLLMNavigationLinkButton *)_button).linkMode = link;
+  }
+  if (!link && !newViewProps.primary) {
+    _button.keyEquivalent = @"";
+    if (_button.window.defaultButtonCell == _button.cell) {
+      [_button.window setDefaultButtonCell:nil];
+    }
+    _button.contentTintColor = nil;
   }
   if (!link && linkChanged) {
     _button.contentTintColor = nil;
@@ -880,6 +904,31 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
     [_host setNeedsLayout:YES];
   }
   [super updateProps:props oldProps:oldProps];
+}
+
+- (void)prepareForRecycle
+{
+  if (_button.window.defaultButtonCell == _button.cell) {
+    [_button.window setDefaultButtonCell:nil];
+  }
+  [super prepareForRecycle];
+  static const auto defaultProps = std::make_shared<const LiteLLMAppKitButtonProps>();
+  _props = defaultProps;
+  ((LiteLLMNavigationLinkButton *)_button).linkMode = NO;
+  _button.image = nil;
+  _button.imagePosition = NSNoImage;
+  _button.title = @"";
+  _button.toolTip = nil;
+  _button.accessibilityLabel = nil;
+  _button.enabled = YES;
+  _button.bezelStyle = NSBezelStyleRounded;
+  _button.buttonType = NSButtonTypeMomentaryPushIn;
+  _button.keyEquivalent = @"";
+  _button.hasDestructiveAction = NO;
+  _button.controlSize = NSControlSizeRegular;
+  _button.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
+  _button.contentTintColor = nil;
+  [_host setNeedsLayout:YES];
 }
 
 - (void)pressed:(__unused id)sender
@@ -1723,11 +1772,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     _tableView.intercellSpacing = NSZeroSize;
     _tableView.rowHeight = 28;
     _tableView.selectionHighlightStyle = NSTableViewSelectionHighlightStyleRegular;
-    _tableView.usesAlternatingRowBackgroundColors = YES;
+    _tableView.usesAlternatingRowBackgroundColors = NO;
     _tableView.floatsGroupRows = NO;
     // Keep the body as an AppKit list, rather than a boxed spreadsheet.  The
-    // single outer bezel frames the list while row selection and alternating
-    // system fills carry the hierarchy below the header.
+    // optional outer bezel is disabled when a surrounding split view already
+    // owns the structural divider.
     _tableView.gridStyleMask = NSTableViewGridNone;
     _hasLoadedData = NO;
 
@@ -1775,7 +1824,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const bool compactChanged = oldViewProps.compact != newViewProps.compact;
   const bool paddingChanged = oldViewProps.cellHorizontalPadding != newViewProps.cellHorizontalPadding;
   const bool firstColumnPaddingChanged = oldViewProps.firstColumnHorizontalPadding != newViewProps.firstColumnHorizontalPadding;
-  const bool overflowBehaviorChanged = oldViewProps.scrollTrailingColumnOverflow != newViewProps.scrollTrailingColumnOverflow;
+  const bool overflowBehaviorChanged = oldViewProps.preserveColumnWidths != newViewProps.preserveColumnWidths ||
+      oldViewProps.scrollTrailingColumnOverflow != newViewProps.scrollTrailingColumnOverflow;
   const bool rowsChanged = oldViewProps.rowKeys != newViewProps.rowKeys ||
       oldViewProps.cells != newViewProps.cells ||
       oldViewProps.disabledRowKeys != newViewProps.disabledRowKeys ||
@@ -1788,9 +1838,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       ? (initialDataLoad || TableIsFollowingBottom(_scrollView, _tableView))
       : NO;
 
-  if (oldViewProps.alternatingRows != newViewProps.alternatingRows) {
-    _tableView.usesAlternatingRowBackgroundColors = newViewProps.alternatingRows;
-  }
+  _tableView.usesAlternatingRowBackgroundColors = newViewProps.alternatingRows;
+  _frameView.framed = !newViewProps.borderless;
   if (compactChanged) {
     _tableView.rowHeight = newViewProps.compact ? 22 : 28;
     if (_tableView.headerView != nil) {
@@ -1889,6 +1938,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     [_tableView removeTableColumn:_tableView.tableColumns.lastObject];
   }
   [_tableView reloadData];
+  _tableView.usesAlternatingRowBackgroundColors = NO;
   _synchronizingSelection = NO;
   _settingColumnWidths = NO;
   _automaticColumnAdjustments.clear();
@@ -1998,7 +2048,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     const CGFloat availableColumnWidth = NSWidth(visibleBounds);
     const CGFloat preferredContentWidth = requestedContentWidth() + trailingOverflowWidth();
     const BOOL needsHorizontalScroller = minimumContentWidth() > availableColumnWidth + 0.5 ||
-        ((viewProps.scrollTrailingColumnOverflow || hasUserColumnResize()) &&
+        ((viewProps.preserveColumnWidths || viewProps.scrollTrailingColumnOverflow || hasUserColumnResize()) &&
          preferredContentWidth > availableColumnWidth + 0.5);
     if (_scrollView.hasHorizontalScroller != needsHorizontalScroller) {
       _scrollView.hasHorizontalScroller = needsHorizontalScroller;
@@ -2401,320 +2451,497 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextEditorCls(void)
   return LiteLLMAppKitTextEditorComponentView.class;
 }
 
-@interface LiteLLMAppKitSecureTextEditorComponentView () <NSTextViewDelegate, RCTLiteLLMAppKitSecureTextEditorViewProtocol>
+@interface LiteLLMWeakScriptMessageHandler : NSObject <WKScriptMessageHandler>
+@property(nonatomic, weak) id<WKScriptMessageHandler> target;
 @end
 
-@implementation LiteLLMAppKitSecureTextEditorComponentView {
-  NSScrollView *_scrollView;
-  NSTextView *_textView;
-  NSString *_editorToken;
-  BOOL _synchronizingText;
-  BOOL _stageInFlight;
-  BOOL _stageQueued;
-  NSUInteger _lifecycleGeneration;
-  NSUInteger _debounceGeneration;
-  NSUInteger _editGeneration;
-  BOOL _loadRecoveryAttempted;
-  BOOL _stageRecoveryAttempted;
-  NSInteger _lastRevision;
-  NSString *_lastStatus;
-  NSString *_lastError;
+@implementation LiteLLMWeakScriptMessageHandler
+
+- (void)userContentController:(WKUserContentController *)userContentController
+      didReceiveScriptMessage:(WKScriptMessage *)message
+{
+  [self.target userContentController:userContentController didReceiveScriptMessage:message];
+}
+
+@end
+
+// RCTViewComponentView does not participate in AppKit's responder chain on
+// every macOS release.  WKWebView normally accepts the first responder, but
+// the wrapper can otherwise leave the embedded content visible yet unable to
+// receive the first key event.  Keep the code pane explicitly focusable and
+// make a click on its native surface establish the responder before WebKit
+// dispatches the event into the page.
+@interface LiteLLMCodeEditorWebView : WKWebView
+@end
+
+@implementation LiteLLMCodeEditorWebView
+
+- (BOOL)acceptsFirstResponder
+{
+  return YES;
+}
+
+- (void)mouseDown:(NSEvent *)event
+{
+  [self.window makeFirstResponder:self];
+  [super mouseDown:event];
+}
+
+@end
+
+WKProcessPool *LiteLLMCodeEditorProcessPool(void)
+{
+  static WKProcessPool *processPool;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    processPool = [WKProcessPool new];
+  });
+  return processPool;
+}
+
+@interface LiteLLMAppKitCodeWebViewComponentView ()
+    <RCTLiteLLMAppKitCodeWebViewViewProtocol, WKNavigationDelegate, WKScriptMessageHandler>
+- (void)loadEditorHTML:(NSString *)html;
+- (void)recoverEditorPageWithError:(NSString *)error;
+@end
+
+@implementation LiteLLMAppKitCodeWebViewComponentView {
+  WKWebView *_webView;
+  LiteLLMWeakScriptMessageHandler *_messageHandler;
+  WKNavigation *_activeNavigation;
+  NSString *_lastEditorText;
+  BOOL _editorReady;
+  BOOL _pendingSync;
+  NSUInteger _editorStateGeneration;
+  NSUInteger _htmlStateGeneration;
+  NSUInteger _pageRecoveryAttempts;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
 {
-  return concreteComponentDescriptorProvider<LiteLLMAppKitSecureTextEditorComponentDescriptor>();
+  return concreteComponentDescriptorProvider<LiteLLMAppKitCodeWebViewComponentDescriptor>();
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
 {
   if (self = [super initWithFrame:frame]) {
-    static const auto defaultProps = std::make_shared<const LiteLLMAppKitSecureTextEditorProps>();
+    static const auto defaultProps = std::make_shared<const LiteLLMAppKitCodeWebViewProps>();
     _props = defaultProps;
 
-    _textView = [[NSTextView alloc] initWithFrame:NSZeroRect];
-    _textView.allowsUndo = YES;
-    _textView.automaticDashSubstitutionEnabled = NO;
-    _textView.automaticQuoteSubstitutionEnabled = NO;
-    _textView.automaticSpellingCorrectionEnabled = NO;
-    _textView.automaticTextReplacementEnabled = NO;
-    _textView.delegate = self;
-    _textView.editable = NO;
-    _textView.font = [NSFont monospacedSystemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightRegular];
-    _textView.horizontallyResizable = YES;
-    _textView.maxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
-    _textView.minSize = NSZeroSize;
-    _textView.richText = NO;
-    _textView.selectable = YES;
-    _textView.textContainer.containerSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
-    _textView.textContainer.widthTracksTextView = NO;
-    _textView.textContainerInset = NSMakeSize(6, 6);
-    _textView.usesFindPanel = YES;
-    _textView.verticallyResizable = YES;
+    _messageHandler = [LiteLLMWeakScriptMessageHandler new];
+    _messageHandler.target = self;
 
-    _scrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
-    _scrollView.autohidesScrollers = YES;
-    _scrollView.borderType = NSBezelBorder;
-    _scrollView.hasHorizontalScroller = YES;
-    _scrollView.hasVerticalScroller = YES;
-    _scrollView.documentView = _textView;
-    self.contentView = _scrollView;
+    WKUserContentController *userContentController = [WKUserContentController new];
+    [userContentController addScriptMessageHandler:_messageHandler name:@"litellmCodeEditor"];
+    WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
+    configuration.userContentController = userContentController;
+    configuration.processPool = LiteLLMCodeEditorProcessPool();
+    configuration.preferences.javaScriptCanOpenWindowsAutomatically = NO;
+
+    _webView = [[LiteLLMCodeEditorWebView alloc] initWithFrame:NSZeroRect configuration:configuration];
+    _webView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    _webView.navigationDelegate = self;
+    ConfigureImmediateView(_webView);
+    self.contentView = _webView;
   }
   return self;
 }
 
+- (BOOL)acceptsFirstResponder
+{
+  return YES;
+}
+
+- (BOOL)becomeFirstResponder
+{
+  return [_webView becomeFirstResponder] || [super becomeFirstResponder];
+}
+
 - (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps
 {
-  const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitSecureTextEditorProps>(_props);
-  const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitSecureTextEditorProps>(props);
+  const auto &oldViewProps = *std::static_pointer_cast<const LiteLLMAppKitCodeWebViewProps>(_props);
+  const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitCodeWebViewProps>(props);
 
-  if (oldViewProps.language != newViewProps.language) {
-    NSString *language = StringFromStdString(newViewProps.language);
-    _textView.accessibilityLabel = language.length > 0
-        ? [NSString stringWithFormat:@"%@ source editor", language]
-        : @"Source editor";
+  const BOOL documentChanged = oldViewProps.documentKey != newViewProps.documentKey;
+  const BOOL valueChanged = oldViewProps.value != newViewProps.value;
+  const BOOL echoedEditorText = valueChanged && !documentChanged && _lastEditorText != nil &&
+      [_lastEditorText isEqualToString:StringFromStdString(newViewProps.value)];
+  if (documentChanged) {
+    _lastEditorText = nil;
   }
-  if (oldViewProps.editorToken != newViewProps.editorToken) {
-    [self loadEditorToken:StringFromStdString(newViewProps.editorToken)];
+  const BOOL editorStateChanged = documentChanged ||
+      (valueChanged && !echoedEditorText) ||
+      oldViewProps.baseline != newViewProps.baseline ||
+      oldViewProps.language != newViewProps.language ||
+      oldViewProps.readOnly != newViewProps.readOnly ||
+      oldViewProps.showDiff != newViewProps.showDiff;
+  if (editorStateChanged) {
+    _editorStateGeneration += 1;
+    _pendingSync = YES;
+  }
+
+  if (oldViewProps.html != newViewProps.html) {
+    _htmlStateGeneration = _editorStateGeneration;
+    _pageRecoveryAttempts = 0;
+    [self loadEditorHTML:StringFromStdString(newViewProps.html)];
   }
 
   [super updateProps:props oldProps:oldProps];
+  [self synchronizeEditorIfReady];
 }
 
-- (void)updateEventEmitter:(const EventEmitter::Shared &)eventEmitter
+- (void)loadEditorHTML:(NSString *)html
 {
-  [super updateEventEmitter:eventEmitter];
-  if (_lastStatus.length > 0) {
-    [self emitRevision:_lastRevision status:_lastStatus error:_lastError ?: @""];
-  }
+  _editorReady = NO;
+  _pendingSync = YES;
+  _activeNavigation = [_webView loadHTMLString:html baseURL:nil];
 }
 
-- (void)loadEditorToken:(NSString *)editorToken
+- (void)recoverEditorPageWithError:(NSString *)error
 {
-  _lifecycleGeneration += 1;
-  _debounceGeneration += 1;
-  _editGeneration = 0;
-  _loadRecoveryAttempted = NO;
-  _stageRecoveryAttempted = NO;
-  _stageInFlight = NO;
-  _stageQueued = NO;
-  _lastRevision = 0;
-  _editorToken = [editorToken copy];
-  _textView.editable = NO;
-  _synchronizingText = YES;
-  _textView.string = @"";
-  _synchronizingText = NO;
-
-  if (_editorToken.length == 0) {
-    [self emitRevision:0 status:@"error" error:@"invalid_token"];
+  if (_pageRecoveryAttempts >= 1) {
+    [self emitEditorError:error];
     return;
   }
-
-  const NSUInteger generation = _lifecycleGeneration;
-  NSString *requestedToken = [_editorToken copy];
-  [self emitRevision:0 status:@"loading" error:@""];
-  __weak LiteLLMAppKitSecureTextEditorComponentView *weakSelf = self;
-  [CoreIPCBridge.shared readEditorDocument:requestedToken completion:^(NSString *_Nullable text, NSString *_Nullable error) {
-    LiteLLMAppKitSecureTextEditorComponentView *strongSelf = weakSelf;
-    if (strongSelf == nil || generation != strongSelf->_lifecycleGeneration ||
-        ![requestedToken isEqualToString:strongSelf->_editorToken]) {
-      return;
-    }
-    if (error.length > 0 || text == nil) {
-      [strongSelf recoverInitialLoadForGeneration:generation failedToken:requestedToken];
-      return;
-    }
-    strongSelf->_synchronizingText = YES;
-    strongSelf->_textView.string = text;
-    strongSelf->_synchronizingText = NO;
-    strongSelf->_textView.editable = YES;
-    [strongSelf emitRevision:0 status:@"ready" error:@""];
-  }];
-}
-
-- (void)recoverInitialLoadForGeneration:(NSUInteger)generation failedToken:(NSString *)failedToken
-{
-  if (generation != _lifecycleGeneration || _loadRecoveryAttempted ||
-      ![failedToken isEqualToString:_editorToken]) {
-    [self emitRevision:0 status:@"error" error:@"read_failed"];
+  _pageRecoveryAttempts += 1;
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitCodeWebViewProps>(_props);
+  NSString *html = StringFromStdString(viewProps.html);
+  if (html.length == 0) {
+    [self emitEditorError:error];
     return;
   }
-  _loadRecoveryAttempted = YES;
-  __weak LiteLLMAppKitSecureTextEditorComponentView *weakSelf = self;
-  [CoreIPCBridge.shared refreshEditorDocument:failedToken completion:^(NSString *_Nullable replacementToken, NSString *_Nullable text, NSString *_Nullable error) {
-    LiteLLMAppKitSecureTextEditorComponentView *strongSelf = weakSelf;
-    if (strongSelf == nil || generation != strongSelf->_lifecycleGeneration ||
-        ![failedToken isEqualToString:strongSelf->_editorToken]) {
-      return;
-    }
-    if (error.length > 0 || replacementToken.length == 0 || text == nil) {
-      [strongSelf emitRevision:0 status:@"error" error:@"read_failed"];
-      return;
-    }
-    strongSelf->_editorToken = [replacementToken copy];
-    strongSelf->_synchronizingText = YES;
-    strongSelf->_textView.string = text;
-    strongSelf->_synchronizingText = NO;
-    strongSelf->_textView.editable = YES;
-    [strongSelf emitRevision:0 status:@"ready" error:@""];
-  }];
-}
-
-- (void)textDidChange:(NSNotification *)notification
-{
-  if (_synchronizingText || notification.object != _textView || _editorToken.length == 0) {
-    return;
-  }
-  _editGeneration += 1;
-  _stageRecoveryAttempted = NO;
-  [self emitRevision:_lastRevision status:@"dirty" error:@""];
-  [self scheduleStageAfter:0.35];
-}
-
-- (void)scheduleStageAfter:(NSTimeInterval)delay
-{
-  const NSUInteger generation = _lifecycleGeneration;
-  const NSUInteger debounceGeneration = ++_debounceGeneration;
-  __weak LiteLLMAppKitSecureTextEditorComponentView *weakSelf = self;
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-    LiteLLMAppKitSecureTextEditorComponentView *strongSelf = weakSelf;
-    if (strongSelf == nil || generation != strongSelf->_lifecycleGeneration ||
-        debounceGeneration != strongSelf->_debounceGeneration) {
-      return;
-    }
-    [strongSelf stageCurrentTextForGeneration:generation];
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self loadEditorHTML:html];
   });
 }
 
-- (void)stageCurrentTextForGeneration:(NSUInteger)generation
+- (void)synchronizeEditorIfReady
 {
-  if (generation != _lifecycleGeneration || _editorToken.length == 0) {
-    return;
-  }
-  if (_stageInFlight) {
-    _stageQueued = YES;
+  if (!_editorReady || !_pendingSync) {
     return;
   }
 
-  _stageInFlight = YES;
-  NSString *stagedToken = [_editorToken copy];
-  NSString *stagedText = [_textView.string copy];
-  const NSUInteger stagedEditGeneration = _editGeneration;
-  [self emitRevision:_lastRevision status:@"saving" error:@""];
-  __weak LiteLLMAppKitSecureTextEditorComponentView *weakSelf = self;
-  [CoreIPCBridge.shared stageEditorDocument:stagedToken text:stagedText completion:^(NSNumber *_Nullable revision, NSString *_Nullable replacementToken, NSString *_Nullable error) {
-    LiteLLMAppKitSecureTextEditorComponentView *strongSelf = weakSelf;
-    if (strongSelf == nil || generation != strongSelf->_lifecycleGeneration ||
-        ![stagedToken isEqualToString:strongSelf->_editorToken]) {
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitCodeWebViewProps>(_props);
+  NSDictionary<NSString *, id> *payload = @{
+    @"type": @"replace",
+    @"documentKey": StringFromStdString(viewProps.documentKey),
+    @"value": StringFromStdString(viewProps.value),
+    @"baseline": StringFromStdString(viewProps.baseline),
+    @"language": StringFromStdString(viewProps.language),
+    @"readOnly": @(viewProps.readOnly),
+    @"showDiff": @(viewProps.showDiff),
+  };
+  NSError *serializationError = nil;
+  NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&serializationError];
+  if (jsonData == nil) {
+    _pendingSync = NO;
+    [self emitEditorError:serializationError.localizedDescription ?: @"editor_payload_serialization_failed"];
+    return;
+  }
+  NSString *json = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+  NSString *script = [NSString stringWithFormat:
+      @"window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(%@);", json];
+  _pendingSync = NO;
+  __weak LiteLLMAppKitCodeWebViewComponentView *weakSelf = self;
+  [_webView evaluateJavaScript:script completionHandler:^(__unused id result, NSError *error) {
+    LiteLLMAppKitCodeWebViewComponentView *strongSelf = weakSelf;
+    if (strongSelf == nil || error == nil) {
       return;
     }
-
-    strongSelf->_stageInFlight = NO;
-    const BOOL hasNewerText = strongSelf->_stageQueued ||
-        stagedEditGeneration != strongSelf->_editGeneration;
-    strongSelf->_stageQueued = NO;
-    if (error.length > 0 || revision == nil || replacementToken.length == 0 ||
-        replacementToken.length > 256) {
-      [strongSelf recoverStageForGeneration:generation failedToken:stagedToken];
-      return;
-    }
-
-    strongSelf->_lastRevision = MAX(0, revision.integerValue);
-    // The replacement capability is intentionally retained in this native
-    // view. It never becomes a prop or event payload visible to React.
-    strongSelf->_editorToken = [replacementToken copy];
-    if (hasNewerText) {
-      [strongSelf emitRevision:strongSelf->_lastRevision status:@"dirty" error:@""];
-      [strongSelf scheduleStageAfter:0];
-    } else {
-      [strongSelf emitRevision:strongSelf->_lastRevision status:@"saved" error:@""];
-    }
+    [strongSelf emitEditorError:error.localizedDescription ?: @"javascript_evaluation_failed"];
   }];
 }
 
-- (void)recoverStageForGeneration:(NSUInteger)generation failedToken:(NSString *)failedToken
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
 {
-  if (generation != _lifecycleGeneration || _stageRecoveryAttempted ||
-      ![failedToken isEqualToString:_editorToken]) {
-    _textView.editable = YES;
-    [self emitRevision:_lastRevision status:@"error" error:@"stage_failed"];
+  if (webView != _webView || navigation != _activeNavigation) {
     return;
   }
-  _stageRecoveryAttempted = YES;
-  _stageInFlight = YES;
-  [self emitRevision:_lastRevision status:@"saving" error:@""];
-  __weak LiteLLMAppKitSecureTextEditorComponentView *weakSelf = self;
-  [CoreIPCBridge.shared refreshEditorDocument:failedToken completion:^(NSString *_Nullable replacementToken, __unused NSString *_Nullable diskText, NSString *_Nullable error) {
-    LiteLLMAppKitSecureTextEditorComponentView *strongSelf = weakSelf;
-    if (strongSelf == nil || generation != strongSelf->_lifecycleGeneration ||
-        ![failedToken isEqualToString:strongSelf->_editorToken]) {
-      return;
-    }
-    strongSelf->_stageInFlight = NO;
-    if (error.length > 0 || replacementToken.length == 0) {
-      strongSelf->_textView.editable = YES;
-      [strongSelf emitRevision:strongSelf->_lastRevision status:@"error" error:@"stage_failed"];
-      return;
-    }
-    strongSelf->_editorToken = [replacementToken copy];
-    [strongSelf stageCurrentTextForGeneration:generation];
-  }];
 }
 
-- (void)emitRevision:(NSInteger)revision status:(NSString *)status error:(NSString *)error
+- (void)webView:(WKWebView *)webView
+    didFailProvisionalNavigation:(WKNavigation *)navigation
+                       withError:(NSError *)error
 {
-  _lastRevision = MIN(MAX(0, revision), INT32_MAX);
-  _lastStatus = [status copy];
-  _lastError = [error copy];
+  [self handleNavigationFailureForWebView:webView navigation:navigation error:error];
+}
+
+- (void)webView:(WKWebView *)webView
+    didFailNavigation:(WKNavigation *)navigation
+             withError:(NSError *)error
+{
+  [self handleNavigationFailureForWebView:webView navigation:navigation error:error];
+}
+
+- (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView
+{
+  if (webView != _webView) {
+    return;
+  }
+  [self recoverEditorPageWithError:@"web_content_process_terminated"];
+}
+
+- (void)handleNavigationFailureForWebView:(WKWebView *)webView
+                               navigation:(WKNavigation *)navigation
+                                    error:(NSError *)error
+{
+  if (webView != _webView || navigation != _activeNavigation) {
+    return;
+  }
+  [self recoverEditorPageWithError:error.localizedDescription ?: @"page_load_failed"];
+}
+
+- (void)userContentController:(WKUserContentController *)userContentController
+      didReceiveScriptMessage:(WKScriptMessage *)message
+{
+  if (userContentController != _webView.configuration.userContentController ||
+      ![message.name isEqualToString:@"litellmCodeEditor"]) {
+    return;
+  }
+
+  NSDictionary<NSString *, id> *payload = nil;
+  if ([message.body isKindOfClass:NSString.class]) {
+    NSData *json = [(NSString *)message.body dataUsingEncoding:NSUTF8StringEncoding];
+    id parsed = json == nil ? nil : [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+    if ([parsed isKindOfClass:NSDictionary.class]) {
+      payload = (NSDictionary<NSString *, id> *)parsed;
+    }
+  } else if ([message.body isKindOfClass:NSDictionary.class]) {
+    payload = (NSDictionary<NSString *, id> *)message.body;
+  }
+  if (payload == nil) {
+    [self emitEditorError:@"invalid_editor_message"];
+    return;
+  }
+
+  NSString *type = [payload[@"type"] isKindOfClass:NSString.class] ? payload[@"type"] : @"";
+  if ([type isEqualToString:@"ready"]) {
+    _editorReady = YES;
+    _pageRecoveryAttempts = 0;
+    const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitCodeWebViewProps>(_props);
+    NSString *documentKey = [payload[@"documentKey"] isKindOfClass:NSString.class]
+        ? payload[@"documentKey"]
+        : @"";
+    const BOOL initialDocumentIsCurrent =
+        [documentKey isEqualToString:StringFromStdString(viewProps.documentKey)] &&
+        _htmlStateGeneration == _editorStateGeneration;
+    _pendingSync = !initialDocumentIsCurrent;
+    [self synchronizeEditorIfReady];
+    return;
+  }
+  if ([type isEqualToString:@"error"]) {
+    NSString *error = [payload[@"message"] isKindOfClass:NSString.class]
+        ? payload[@"message"]
+        : @"editor_error";
+    [self emitEditorError:error];
+    return;
+  }
+  if (![type isEqualToString:@"change"]) {
+    [self emitEditorError:@"unknown_editor_message"];
+    return;
+  }
+
+  NSString *text = [payload[@"text"] isKindOfClass:NSString.class] ? payload[@"text"] : nil;
+  if (text == nil) {
+    [self emitEditorError:@"invalid_editor_change"];
+    return;
+  }
+  _lastEditorText = [text copy];
   if (!_eventEmitter) {
     return;
   }
-  LiteLLMAppKitSecureTextEditorEventEmitter::OnEditorState event{
-      static_cast<int>(_lastRevision), StdStringFromString(_lastStatus), StdStringFromString(_lastError)};
-  std::static_pointer_cast<const LiteLLMAppKitSecureTextEditorEventEmitter>(_eventEmitter)->onEditorState(event);
+  const auto boundedCount = ^int(id value) {
+    if (![value isKindOfClass:NSNumber.class]) {
+      return 0;
+    }
+    return static_cast<int>(MIN(MAX(0, [(NSNumber *)value integerValue]), INT32_MAX));
+  };
+  LiteLLMAppKitCodeWebViewEventEmitter::OnEditorChange event{
+      StdStringFromString(text),
+      boundedCount(payload[@"added"]),
+      boundedCount(payload[@"changed"]),
+      boundedCount(payload[@"deleted"])};
+  std::static_pointer_cast<const LiteLLMAppKitCodeWebViewEventEmitter>(_eventEmitter)->onEditorChange(event);
+}
+
+- (void)emitEditorError:(NSString *)message
+{
+  if (!_eventEmitter) {
+    return;
+  }
+  LiteLLMAppKitCodeWebViewEventEmitter::OnEditorError event{StdStringFromString(message)};
+  std::static_pointer_cast<const LiteLLMAppKitCodeWebViewEventEmitter>(_eventEmitter)->onEditorError(event);
 }
 
 - (void)prepareForRecycle
 {
   [super prepareForRecycle];
-  _lifecycleGeneration += 1;
-  _debounceGeneration += 1;
-  _editorToken = nil;
-  _stageInFlight = NO;
-  _stageQueued = NO;
-  _lastRevision = 0;
-  _loadRecoveryAttempted = NO;
-  _stageRecoveryAttempted = NO;
-  _lastStatus = nil;
-  _lastError = nil;
-  _synchronizingText = YES;
-  _textView.string = @"";
-  _synchronizingText = NO;
-  _textView.editable = NO;
+  static const auto defaultProps = std::make_shared<const LiteLLMAppKitCodeWebViewProps>();
+  _props = defaultProps;
+  _editorReady = NO;
+  _pendingSync = NO;
+  _editorStateGeneration = 0;
+  _htmlStateGeneration = 0;
+  _pageRecoveryAttempts = 0;
+  _lastEditorText = nil;
+  [_webView stopLoading];
+  _activeNavigation = [_webView loadHTMLString:@"" baseURL:nil];
 }
 
 - (void)invalidate
 {
-  _lifecycleGeneration += 1;
-  _debounceGeneration += 1;
-  _editorToken = nil;
-  _lastStatus = nil;
-  _lastError = nil;
-  _textView.delegate = nil;
+  [_webView stopLoading];
+  _webView.navigationDelegate = nil;
+  [_webView.configuration.userContentController removeScriptMessageHandlerForName:@"litellmCodeEditor"];
+  _messageHandler.target = nil;
+  _activeNavigation = nil;
+  _lastEditorText = nil;
   [super invalidate];
 }
 
 - (NSView *)accessibilityElement
 {
-  return _textView;
+  return _webView;
 }
 
 @end
 
-Class<RCTComponentViewProtocol> LiteLLMAppKitSecureTextEditorCls(void)
+Class<RCTComponentViewProtocol> LiteLLMAppKitCodeWebViewCls(void)
 {
-  return LiteLLMAppKitSecureTextEditorComponentView.class;
+  return LiteLLMAppKitCodeWebViewComponentView.class;
 }
+
+
+@interface LiteLLMAppKitPersistentScrollIndicatorComponentView ()
+    <RCTLiteLLMAppKitPersistentScrollIndicatorViewProtocol>
+@end
+
+@implementation LiteLLMAppKitPersistentScrollIndicatorComponentView {
+  __weak NSScrollView *_managedScrollView;
+  BOOL _enabled;
+}
+
++ (ComponentDescriptorProvider)componentDescriptorProvider
+{
+  return concreteComponentDescriptorProvider<LiteLLMAppKitPersistentScrollIndicatorComponentDescriptor>();
+}
+
+- (instancetype)initWithFrame:(CGRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    static const auto defaultProps =
+        std::make_shared<const LiteLLMAppKitPersistentScrollIndicatorProps>();
+    _props = defaultProps;
+    _enabled = YES;
+    self.accessibilityElement = NO;
+  }
+  return self;
+}
+
+- (NSScrollView *)nearestScrollView
+{
+  for (NSView *view = self.superview; view != nil; view = view.superview) {
+    if ([view isKindOfClass:NSScrollView.class]) {
+      return (NSScrollView *)view;
+    }
+  }
+  return nil;
+}
+
+- (void)restoreManagedScrollView
+{
+  NSScrollView *scrollView = _managedScrollView;
+  if (scrollView == nil) {
+    return;
+  }
+  scrollView.scrollerStyle = NSScrollerStyleOverlay;
+  scrollView.autohidesScrollers = YES;
+  [scrollView tile];
+  _managedScrollView = nil;
+}
+
+- (void)applyPersistentScrollIndicator
+{
+  NSScrollView *scrollView = _enabled ? [self nearestScrollView] : nil;
+  if (_managedScrollView != scrollView) {
+    [self restoreManagedScrollView];
+    _managedScrollView = scrollView;
+  }
+  if (scrollView == nil) {
+    return;
+  }
+  BOOL needsTile = NO;
+  if (!scrollView.hasVerticalScroller) {
+    scrollView.hasVerticalScroller = YES;
+    needsTile = YES;
+  }
+  if (scrollView.scrollerStyle != NSScrollerStyleLegacy) {
+    scrollView.scrollerStyle = NSScrollerStyleLegacy;
+    needsTile = YES;
+  }
+  if (scrollView.autohidesScrollers) {
+    scrollView.autohidesScrollers = NO;
+    needsTile = YES;
+  }
+  if (needsTile) [scrollView tile];
+  scrollView.verticalScroller.hidden = NO;
+  scrollView.verticalScroller.alphaValue = 1;
+}
+
+- (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps
+{
+  const auto &newViewProps =
+      *std::static_pointer_cast<const LiteLLMAppKitPersistentScrollIndicatorProps>(props);
+  _enabled = newViewProps.enabled;
+  [super updateProps:props oldProps:oldProps];
+  [self applyPersistentScrollIndicator];
+}
+
+- (void)viewDidMoveToSuperview
+{
+  [super viewDidMoveToSuperview];
+  [self applyPersistentScrollIndicator];
+  __weak LiteLLMAppKitPersistentScrollIndicatorComponentView *weakSelf = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [weakSelf applyPersistentScrollIndicator];
+  });
+}
+
+- (void)viewDidMoveToWindow
+{
+  [super viewDidMoveToWindow];
+  [self applyPersistentScrollIndicator];
+}
+
+- (void)layout
+{
+  [super layout];
+  [self applyPersistentScrollIndicator];
+}
+
+- (void)prepareForRecycle
+{
+  [self restoreManagedScrollView];
+  [super prepareForRecycle];
+  static const auto defaultProps =
+      std::make_shared<const LiteLLMAppKitPersistentScrollIndicatorProps>();
+  _props = defaultProps;
+  _enabled = YES;
+}
+
+- (void)invalidate
+{
+  [self restoreManagedScrollView];
+  [super invalidate];
+}
+
+@end
+
+Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
+{
+  return LiteLLMAppKitPersistentScrollIndicatorComponentView.class;
+}
+
 
 @interface LiteLLMAppKitSecureTextInputComponentView () <NSTextFieldDelegate, RCTLiteLLMAppKitSecureTextInputViewProtocol>
 - (NSTextField *)activeField;

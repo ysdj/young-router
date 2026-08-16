@@ -12,7 +12,6 @@ from pathlib import Path
 import re
 import tempfile
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
@@ -20,10 +19,11 @@ from typing import Any
 
 from config_editor_core.schema import infer_upstream_fallback_surface
 
+from ...api_base import isolated_http_opener, service_root
 from ..persistence import atomic_write_text
 from ..security import REDACT_TEXT, redact
 from ._shared import (
-    LegacyDomainError,
+    DomainError,
     _action_name,
     _copy_mapping,
     _default_provider_config_path,
@@ -34,62 +34,6 @@ from ._shared import (
     _safe_problem,
     _selected_identifier,
 )
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(
-        self,
-        request: urllib.request.Request,
-        fp: Any,
-        code: int,
-        message: str,
-        headers: Any,
-        newurl: str,
-    ) -> None:
-        return None
-
-
-def _service_root(api_base: str) -> str | None:
-    try:
-        parsed = urllib.parse.urlsplit(api_base)
-    except ValueError:
-        return None
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None
-    if parsed.username is not None or parsed.password is not None:
-        return None
-
-    parts = [part for part in parsed.path.split("/") if part]
-    lower = [part.lower() for part in parts]
-    suffixes = (
-        ("v1", "chat", "completions"),
-        ("v1", "images", "generations"),
-        ("v1", "completions"),
-        ("v1", "responses"),
-        ("v1", "messages"),
-        ("v1", "models"),
-        ("chat", "completions"),
-        ("images", "generations"),
-        ("completions",),
-        ("responses",),
-        ("messages",),
-        ("models",),
-        ("v1",),
-    )
-    for suffix in suffixes:
-        if len(lower) >= len(suffix) and tuple(lower[-len(suffix) :]) == suffix:
-            parts = parts[: -len(suffix)]
-            break
-    path = f"/{'/'.join(parts)}" if parts else ""
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
-
-
-def _isolated_http_opener() -> urllib.request.OpenerDirector:
-    handlers: list[Any] = [_NoRedirect()]
-    if os.environ.get("LITELLM_USE_SYSTEM_PROXIES") != "1":
-        handlers.insert(0, urllib.request.ProxyHandler({}))
-    return urllib.request.build_opener(*handlers)
-
 
 class ProvidersModelsDomain:
     """Staged providers/models editing through ``config_editor_core``."""
@@ -117,7 +61,7 @@ class ProvidersModelsDomain:
 
     @staticmethod
     def _empty_document() -> dict[str, str | None]:
-        # The legacy parser accepts a config with no providers.  Do not create
+        # The config parser accepts a document with no providers. Do not create
         # this document on disk; it merely keeps a missing installation
         # renderable until the user explicitly restores/imports a config.
         return {"config": "model_list: []\n", "disabled": None}
@@ -137,7 +81,7 @@ class ProvidersModelsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Provider/model configuration could not be loaded") from None
         if not isinstance(payload.get("providers"), list) or not isinstance(payload.get("document"), Mapping):
-            raise LegacyDomainError("Provider/model configuration is invalid")
+            raise DomainError("Provider/model configuration is invalid")
         return {
             "providers": copy.deepcopy(payload["providers"]),
             "document": copy.deepcopy(dict(payload["document"])),
@@ -327,7 +271,7 @@ class ProvidersModelsDomain:
                         "api_key_name": model_key_name,
                         "enabled": model_enabled,
                         "model_enabled": model_enabled,
-                        "order": model.get("order", 1),
+                        "order": model.get("order", 0),
                         "ssl_verify": str(model.get("ssl_verify", "")),
                         "ssl_verify_present": bool(model.get("ssl_verify_present")),
                         "deployment_id": str(model.get("deployment_id", "")),
@@ -396,7 +340,7 @@ class ProvidersModelsDomain:
         from config_editor_core.load import load_config_document, normalize_config_document
 
         if not isinstance(providers, list):
-            raise LegacyDomainError("Providers must be an array")
+            raise DomainError("Providers must be an array")
         source = self._draft.get("document", self._empty_document()) if document is None else document
         try:
             normalized = normalize_config_document(source)
@@ -417,7 +361,7 @@ class ProvidersModelsDomain:
             config_text = data.get("config", data.get("config_text", data.get("raw_yaml", data.get("text"))))
             disabled_text = data.get("disabled", data.get("disabled_text"))
             if not isinstance(config_text, str):
-                raise LegacyDomainError("Provider/model YAML must be text")
+                raise DomainError("Provider/model YAML must be text")
             document = {"config": config_text, "disabled": disabled_text}
         try:
             normalized = normalize_config_document(document)
@@ -434,12 +378,12 @@ class ProvidersModelsDomain:
 
         source = data.get("path")
         if not isinstance(source, str) or not source:
-            raise LegacyDomainError("Select a provider configuration file")
+            raise DomainError("Select a provider configuration file")
         try:
             import external_provider_import
 
             self._stage_import_result(external_provider_import.import_explicit(Path(source)))
-        except LegacyDomainError:
+        except DomainError:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "Provider configuration could not be imported") from None
@@ -447,7 +391,7 @@ class ProvidersModelsDomain:
     def _stage_import_result(self, imported: object) -> None:
         providers = imported.get("providers") if isinstance(imported, Mapping) else None
         if not isinstance(providers, list):
-            raise LegacyDomainError("Provider configuration could not be imported")
+            raise DomainError("Provider configuration could not be imported")
         self._replace_draft(providers)
         summary = imported.get("summary", {}) if isinstance(imported, Mapping) else {}
         self._last_operation = {
@@ -460,7 +404,7 @@ class ProvidersModelsDomain:
             import external_provider_import
 
             self._stage_import_result(external_provider_import.import_codex_current())
-        except LegacyDomainError:
+        except DomainError:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "Provider configuration could not be imported") from None
@@ -470,7 +414,7 @@ class ProvidersModelsDomain:
             import external_provider_import
 
             self._stage_import_result(external_provider_import.import_claude_current())
-        except LegacyDomainError:
+        except DomainError:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "Provider configuration could not be imported") from None
@@ -480,7 +424,7 @@ class ProvidersModelsDomain:
             import external_provider_import
 
             self._stage_import_result(external_provider_import.import_link(link))
-        except LegacyDomainError:
+        except DomainError:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "Provider configuration could not be imported") from None
@@ -525,7 +469,7 @@ class ProvidersModelsDomain:
             key_index = cls._api_key_index(keys, selected_name)
             value = credential_value(keys[key_index].get("value"))
             if not value:
-                raise LegacyDomainError("The selected API key has no value")
+                raise DomainError("The selected API key has no value")
             return selected_name, value
 
         direct = credential_value(provider.get("api_key"))
@@ -554,7 +498,7 @@ class ProvidersModelsDomain:
     def _model_endpoint(cls, api_base: str) -> str | None:
         """Normalize an OpenAI-compatible base to its model-list endpoint."""
 
-        root = _service_root(api_base)
+        root = service_root(api_base)
         return f"{root}/v1/models" if isinstance(root, str) and root else None
 
     @classmethod
@@ -614,7 +558,7 @@ class ProvidersModelsDomain:
         try:
             # Keep credential-bearing requests isolated from ambient proxies
             # and reject redirects before an Authorization header can travel.
-            with _isolated_http_opener().open(request, timeout=self._MODEL_LIST_TIMEOUT_SECONDS) as response:
+            with isolated_http_opener().open(request, timeout=self._MODEL_LIST_TIMEOUT_SECONDS) as response:
                 status = getattr(response, "status", None)
                 if status is None:
                     status = response.getcode()
@@ -668,7 +612,7 @@ class ProvidersModelsDomain:
         index = self._provider_index(data)
         provider = self._draft["providers"][index]
         if not isinstance(provider, Mapping):
-            raise LegacyDomainError("The selected provider is unavailable")
+            raise DomainError("The selected provider is unavailable")
         api_key_name = self._api_key_name(data["api_key_name"]) if "api_key_name" in data else None
         summary = self._fetch_provider_models(
             provider,
@@ -716,7 +660,7 @@ class ProvidersModelsDomain:
         credential: str,
         model_name: str,
     ) -> dict[str, Any]:
-        root = _service_root(api_base)
+        root = service_root(api_base)
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -779,7 +723,7 @@ class ProvidersModelsDomain:
             method="POST",
         )
         try:
-            with _isolated_http_opener().open(
+            with isolated_http_opener().open(
                 request,
                 timeout=cls._MODEL_PROBE_TIMEOUT_SECONDS,
             ) as response:
@@ -933,7 +877,7 @@ class ProvidersModelsDomain:
                     self._editor_id(provider),
                 }:
                     return index
-        raise LegacyDomainError("The selected provider is unavailable")
+        raise DomainError("The selected provider is unavailable")
 
     @staticmethod
     def _changes(data: Mapping[str, Any], key: str) -> dict[str, Any]:
@@ -946,7 +890,7 @@ class ProvidersModelsDomain:
     def _model_index(self, provider: Mapping[str, Any], data: Mapping[str, Any]) -> int:
         models = provider.get("models", [])
         if not isinstance(models, list):
-            raise LegacyDomainError("The selected model is unavailable")
+            raise DomainError("The selected model is unavailable")
         direct = _selected_identifier(data, "model_id", "deployment_id", "model_name", "model", "index")
         if type(direct) is int:
             return _index(direct, len(models), "model")
@@ -962,7 +906,7 @@ class ProvidersModelsDomain:
                     self._editor_id(model, model=True),
                 }:
                     return index
-        raise LegacyDomainError("The selected model is unavailable")
+        raise DomainError("The selected model is unavailable")
 
     @classmethod
     def _api_key_name(cls, value: object) -> str:
@@ -973,7 +917,7 @@ class ProvidersModelsDomain:
             or cls._API_KEY_TARGET_SEPARATOR in name
             or any(char in name for char in "\x00\r\n")
         ):
-            raise LegacyDomainError("An API key name is required")
+            raise DomainError("An API key name is required")
         return name
 
     @staticmethod
@@ -982,11 +926,11 @@ class ProvidersModelsDomain:
         if raw_keys is None:
             return []
         if not isinstance(raw_keys, list):
-            raise LegacyDomainError("Provider API keys are invalid")
+            raise DomainError("Provider API keys are invalid")
         keys: list[dict[str, Any]] = []
         for item in raw_keys:
             if not isinstance(item, Mapping):
-                raise LegacyDomainError("Provider API keys are invalid")
+                raise DomainError("Provider API keys are invalid")
             keys.append(copy.deepcopy(dict(item)))
         return keys
 
@@ -1001,7 +945,7 @@ class ProvidersModelsDomain:
         for index, item in enumerate(keys):
             if str(item.get("name", "")).strip() == name:
                 return index
-        raise LegacyDomainError("The selected API key is unavailable")
+        raise DomainError("The selected API key is unavailable")
 
     def _dispatch_provider_key(self, action: str, data: Mapping[str, Any]) -> None:
         providers = self._draft["providers"]
@@ -1012,7 +956,7 @@ class ProvidersModelsDomain:
         if action == "provider_key_add":
             name = self._api_key_name(data.get("name"))
             if any(str(item.get("name", "")).strip() == name for item in keys):
-                raise LegacyDomainError("The API key name is already in use")
+                raise DomainError("The API key name is already in use")
             # The value is filled only through the native secret capability.
             # Validation remains false until that secure staging step finishes.
             keys.append({"name": name, "value": ""})
@@ -1023,7 +967,7 @@ class ProvidersModelsDomain:
             if name != old_name and any(
                 str(item.get("name", "")).strip() == name for item in keys
             ):
-                raise LegacyDomainError("The API key name is already in use")
+                raise DomainError("The API key name is already in use")
             keys[key_index]["name"] = name
             models = provider.get("models", [])
             if isinstance(models, list):
@@ -1034,28 +978,32 @@ class ProvidersModelsDomain:
             name = self._api_key_name(data.get("name"))
             key_index = self._api_key_index(keys, name)
             if len(keys) <= 1:
-                raise LegacyDomainError("A provider must retain at least one API key")
+                raise DomainError("A provider must retain at least one API key")
             keys.pop(key_index)
-            replacement_name = str(keys[0].get("name", "")).strip()
             models = provider.get("models", [])
             if isinstance(models, list):
+                provider_name = str(provider.get("name", "")).strip()
+                remaining_models: list[Any] = []
                 for model in models:
-                    if isinstance(model, dict) and str(model.get("api_key_name", "")).strip() == name:
-                        model["api_key_name"] = replacement_name
+                    if isinstance(model, Mapping) and str(model.get("api_key_name", "")).strip() == name:
+                        self._probe_overlay.get(provider_name, {}).pop(self._probe_model_key(model), None)
+                    else:
+                        remaining_models.append(model)
+                provider["models"] = remaining_models
         else:
-            raise LegacyDomainError("The requested provider action is unavailable")
+            raise DomainError("The requested provider action is unavailable")
 
         self._sync_primary_api_key(provider, keys)
         providers[provider_index] = provider
 
     def _secret_target(self, target: str) -> tuple[int, str | None]:
         if target.count(self._API_KEY_TARGET_SEPARATOR) > 1:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         if self._API_KEY_TARGET_SEPARATOR not in target:
             return self._provider_index({"provider_id": target}), None
         provider_id, key_name = target.split(self._API_KEY_TARGET_SEPARATOR, 1)
         if not provider_id or not key_name:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         index = self._provider_index({"provider_id": provider_id})
         return index, self._api_key_name(key_name)
 
@@ -1147,7 +1095,40 @@ class ProvidersModelsDomain:
                 source = self._provider_index(data)
             _move(providers, source, _direction_destination(source, len(providers), data), "provider")
             return
-        raise LegacyDomainError("The requested provider action is unavailable")
+        raise DomainError("The requested provider action is unavailable")
+
+    def _new_model(
+        self,
+        provider: Mapping[str, Any],
+        value: object,
+        used_deployment_ids: set[str],
+    ) -> dict[str, Any]:
+        model = _copy_mapping(value, "model")
+        if "name" in model and "model_name" not in model:
+            model["model_name"] = model.pop("name")
+        if "upstream_model" in model and "litellm_model" not in model:
+            model["litellm_model"] = model.pop("upstream_model")
+        if "model_enabled" in model:
+            model["enabled"] = model["model_enabled"]
+        elif "enabled" in model:
+            model["model_enabled"] = model["enabled"]
+        if "order" not in model:
+            model["order"] = 0
+        if not str(model.get("upstream_url_surface", "")).strip():
+            model["upstream_url_surface"] = self._default_upstream_surface(provider, model)
+        if not str(model.get("upstream_protocol_mode", "")).strip():
+            model["upstream_protocol_mode"] = "fallback"
+        if "litellm_model" in model:
+            model["litellm_model"] = self._canonical_upstream_model(model["litellm_model"], model)
+        deployment_id = str(model.get("deployment_id", "")).strip().lower()
+        if not deployment_id:
+            deployment_id = uuid.uuid4().hex[:8]
+            while deployment_id in used_deployment_ids:
+                deployment_id = uuid.uuid4().hex[:8]
+            model["deployment_id"] = deployment_id
+        used_deployment_ids.add(deployment_id)
+        self._editor_id(model, model=True)
+        return model
 
     def _dispatch_model(self, action: str, data: Mapping[str, Any]) -> None:
         providers = self._draft["providers"]
@@ -1219,43 +1200,25 @@ class ProvidersModelsDomain:
             self._model_editor_ids[id(model)] = "model-" + uuid.uuid4().hex
             providers[provider_index] = provider
             return
-        if action in {"model_add", "add_model"}:
-            value = data.get("model", data.get("value", {}))
-            model = _copy_mapping(value, "model")
-            if "name" in model and "model_name" not in model:
-                model["model_name"] = model.pop("name")
-            if "upstream_model" in model and "litellm_model" not in model:
-                model["litellm_model"] = model.pop("upstream_model")
-            if "model_enabled" in model:
-                model["enabled"] = model["model_enabled"]
-            elif "enabled" in model:
-                model["model_enabled"] = model["enabled"]
-            if not str(model.get("upstream_url_surface", "")).strip():
-                model["upstream_url_surface"] = self._default_upstream_surface(
-                    provider,
-                    model,
-                )
-            if not str(model.get("upstream_protocol_mode", "")).strip():
-                model["upstream_protocol_mode"] = "fallback"
-            if "litellm_model" in model:
-                model["litellm_model"] = self._canonical_upstream_model(model["litellm_model"], model)
-            if not str(model.get("deployment_id", "")).strip():
-                used_ids: set[str] = set()
-                for candidate_provider in providers:
-                    if not isinstance(candidate_provider, Mapping):
-                        continue
-                    candidate_models = candidate_provider.get("models", [])
-                    if not isinstance(candidate_models, list):
-                        continue
-                    for candidate in candidate_models:
-                        if isinstance(candidate, Mapping):
-                            used_ids.add(str(candidate.get("deployment_id", "")).strip().lower())
-                deployment_id = uuid.uuid4().hex[:8]
-                while deployment_id in used_ids:
-                    deployment_id = uuid.uuid4().hex[:8]
-                model["deployment_id"] = deployment_id
-            models.append(model)
-            self._editor_id(model, model=True)
+        if action in {"model_add", "add_model", "model_add_many", "add_models"}:
+            values: list[object]
+            if action in {"model_add_many", "add_models"}:
+                supplied = data.get("models")
+                if not isinstance(supplied, Sequence) or isinstance(supplied, (str, bytes, bytearray)):
+                    raise DomainError("Models must be a list")
+                values = list(supplied)
+            else:
+                values = [data.get("model", data.get("value", {}))]
+            used_deployment_ids = {
+                str(candidate.get("deployment_id", "")).strip().lower()
+                for candidate_provider in providers
+                if isinstance(candidate_provider, Mapping)
+                for candidate in candidate_provider.get("models", [])
+                if isinstance(candidate, Mapping)
+                and str(candidate.get("deployment_id", "")).strip()
+            }
+            for value in values:
+                models.append(self._new_model(provider, value, used_deployment_ids))
         elif action in {"model_patch", "patch_model"}:
             index = self._model_index(provider, data)
             model = self._copy_model_for_edit(models[index])
@@ -1273,13 +1236,13 @@ class ProvidersModelsDomain:
             elif "enabled" in changes:
                 changes["model_enabled"] = changes["enabled"]
             if "supported_upstream_url_surfaces" in changes:
-                raise LegacyDomainError(
+                raise DomainError(
                     "Protocol lists are unavailable; choose a protocol mode and backup protocol"
                 )
             if "upstream_protocol_mode" in changes:
                 mode = str(changes["upstream_protocol_mode"] or "").strip().lower()
                 if mode not in {"fallback", "fixed"}:
-                    raise LegacyDomainError("Protocol mode must be fallback or fixed")
+                    raise DomainError("Protocol mode must be fallback or fixed")
                 changes["upstream_protocol_mode"] = mode
             effective_mode = str(
                 changes.get(
@@ -1318,7 +1281,7 @@ class ProvidersModelsDomain:
                 source = self._model_index(provider, data)
             _move(models, source, _direction_destination(source, len(models), data), "model")
         else:
-            raise LegacyDomainError("The requested model action is unavailable")
+            raise DomainError("The requested model action is unavailable")
         providers[provider_index] = provider
 
     def _reorder_route_group(self, data: Mapping[str, Any]) -> None:
@@ -1327,10 +1290,10 @@ class ProvidersModelsDomain:
         public_model = str(data.get("public_model", "")).strip()
         route_ids = data.get("route_ids")
         if not public_model or not isinstance(route_ids, list) or not route_ids:
-            raise LegacyDomainError("The route order is invalid")
+            raise DomainError("The route order is invalid")
         requested = [str(value).strip() for value in route_ids]
         if any(not value for value in requested) or len(set(requested)) != len(requested):
-            raise LegacyDomainError("The route order is invalid")
+            raise DomainError("The route order is invalid")
         matched: dict[str, tuple[int, int]] = {}
         for provider_index, provider in enumerate(self._draft["providers"]):
             if not isinstance(provider, Mapping):
@@ -1347,7 +1310,7 @@ class ProvidersModelsDomain:
                     continue
                 matched[route_id] = (provider_index, model_index)
         if set(matched) != set(requested):
-            raise LegacyDomainError("The route order changed; refresh and try again")
+            raise DomainError("The route order changed; refresh and try again")
         changed_providers: dict[int, dict[str, Any]] = {}
         for order, deployment_id in enumerate(requested, start=1):
             provider_index, model_index = matched[deployment_id]
@@ -1357,7 +1320,7 @@ class ProvidersModelsDomain:
                 changed_providers[provider_index] = provider
             models = provider.get("models", [])
             if not isinstance(models, list):
-                raise LegacyDomainError("The selected model is unavailable")
+                raise DomainError("The selected model is unavailable")
             model = self._copy_model_for_edit(models[model_index])
             model["order"] = order
             models[model_index] = model
@@ -1394,7 +1357,7 @@ class ProvidersModelsDomain:
         elif name.startswith("model_") or name in {"add_model", "patch_model", "delete_model", "move_model"}:
             self._dispatch_model(name, data)
         else:
-            raise LegacyDomainError("The requested provider/model action is unavailable")
+            raise DomainError("The requested provider/model action is unavailable")
         self.revision += 1
         result = self.snapshot()
         if hasattr(self, "_last_operation"):
@@ -1405,7 +1368,7 @@ class ProvidersModelsDomain:
         if field == "import_link" and target is None:
             return False
         if field != "api_key" or not isinstance(target, str):
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         index, key_name = self._secret_target(target)
         provider = self._draft["providers"][index]
         if not isinstance(provider, Mapping):
@@ -1429,29 +1392,29 @@ class ProvidersModelsDomain:
         """
 
         if field != "api_key" or not isinstance(target, str):
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         index, key_name = self._secret_target(target)
         provider = self._draft["providers"][index]
         if not isinstance(provider, Mapping):
-            raise LegacyDomainError("The selected provider is unavailable")
+            raise DomainError("The selected provider is unavailable")
         keys = self._provider_api_keys(provider)
         if key_name is None:
             value = keys[0].get("value", "") if keys else provider.get("api_key", "")
         else:
             value = keys[self._api_key_index(keys, key_name)].get("value", "")
         if not isinstance(value, str):
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         return value
 
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
         if field == "import_link" and target is None:
             if not value:
-                raise LegacyDomainError("The provider import link is unavailable")
+                raise DomainError("The provider import link is unavailable")
             self._import_link(value)
             self.revision += 1
             return
         if field != "api_key" or not isinstance(target, str):
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         index, key_name = self._secret_target(target)
         self._stage_provider_secret(index, key_name, value)
         self.revision += 1
@@ -1482,13 +1445,13 @@ class ProvidersModelsDomain:
                 source = _mapping(document, "document")
                 config_text = source.get("config")
                 if not isinstance(config_text, str):
-                    raise LegacyDomainError("Provider/model configuration is invalid")
+                    raise DomainError("Provider/model configuration is invalid")
                 atomic_write_text(target, config_text)
                 disabled = source.get("disabled")
                 if isinstance(disabled, str):
                     atomic_write_text(target.with_name("config.disabled-models.yaml"), disabled)
                 config_api.save_config(copy.deepcopy(providers), target, document=source)
-        except LegacyDomainError:
+        except DomainError:
             raise
         except Exception:
             return {"valid": False, "errors": ["Provider/model configuration is invalid"]}
@@ -1522,7 +1485,7 @@ class ProvidersModelsDomain:
                 self._replace_draft(data.get("providers", self._draft.get("providers", [])), data.get("document"))
         validation = self._validate()
         if not validation["valid"]:
-            raise LegacyDomainError("Provider/model configuration is invalid")
+            raise DomainError("Provider/model configuration is invalid")
         try:
             config_api.save_config(
                 copy.deepcopy(self._draft["providers"]),
@@ -1533,7 +1496,7 @@ class ProvidersModelsDomain:
         except Exception as exc:
             message = str(exc)
             if "changed on disk" in message:
-                raise LegacyDomainError("Provider/model configuration changed on disk; reload before applying") from None
+                raise DomainError("Provider/model configuration changed on disk; reload before applying") from None
             raise _safe_problem(exc, "Provider/model configuration could not be saved") from None
         self.reload()
         return {"applied": True, **self.snapshot()}
@@ -1566,7 +1529,7 @@ class ProvidersModelsDomain:
         try:
             encoded = json.dumps(current, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         except (TypeError, ValueError):
-            raise LegacyDomainError("Provider/model configuration could not be inspected") from None
+            raise DomainError("Provider/model configuration could not be inspected") from None
         return hashlib.sha256(encoded).hexdigest()
 
     def rebase_external_disk(self) -> dict[str, Any]:
@@ -1622,14 +1585,14 @@ class ProvidersModelsDomain:
             provider_index = self._provider_index(data)
             provider = providers[provider_index]
             if not isinstance(provider, Mapping):
-                raise LegacyDomainError("The selected provider is unavailable")
+                raise DomainError("The selected provider is unavailable")
             models = provider.get("models", [])
             if not isinstance(models, list):
-                raise LegacyDomainError("The selected model is unavailable")
+                raise DomainError("The selected model is unavailable")
             model_index = self._model_index(provider, data)
             model = models[model_index]
             if not isinstance(model, Mapping):
-                raise LegacyDomainError("The selected model is unavailable")
+                raise DomainError("The selected model is unavailable")
             return {
                 "kind": "model",
                 "provider": copy.deepcopy(dict(provider)),
@@ -1680,7 +1643,7 @@ class ProvidersModelsDomain:
             }
         targets = prepared.get("providers", [])
         if not isinstance(targets, list):
-            raise LegacyDomainError("The selected provider is unavailable")
+            raise DomainError("The selected provider is unavailable")
         probes: list[dict[str, Any]] = []
         all_models: list[str] = []
         seen_models: set[str] = set()
@@ -1722,17 +1685,17 @@ class ProvidersModelsDomain:
         provider_index = self._provider_index({"provider_id": prepared.get("provider_id")})
         provider = self._draft["providers"][provider_index]
         if not isinstance(provider, Mapping):
-            raise LegacyDomainError("The selected provider is unavailable")
+            raise DomainError("The selected provider is unavailable")
         model_index = self._model_index(provider, {"model_id": prepared.get("model_id")})
         models = provider.get("models", [])
         if not isinstance(models, list) or not isinstance(models[model_index], Mapping):
-            raise LegacyDomainError("The selected model is unavailable")
+            raise DomainError("The selected model is unavailable")
         model = models[model_index]
         provider_name = str(provider.get("name", "")).strip()
         probe_key = self._probe_model_key(model)
         probe = overlay.get("probe")
         if not isinstance(probe, Mapping):
-            raise LegacyDomainError("The model probe returned invalid state")
+            raise DomainError("The model probe returned invalid state")
         self._probe_overlay.setdefault(provider_name, {})[probe_key] = copy.deepcopy(dict(probe))
         self.revision += 1
         return result, True

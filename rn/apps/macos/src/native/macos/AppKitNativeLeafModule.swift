@@ -12,8 +12,8 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
 
     override init() {
         super.init()
-        leaf.fileCapabilityRegistrar = { url, purpose in
-            CoreIPCBridge.shared.registerFileCapability(url, purpose: purpose)
+        leaf.fileCapabilityRegistrar = { url, purpose, completion in
+            CoreIPCBridge.shared.registerFileCapability(url, purpose: purpose, completion: completion)
         }
         leaf.menuActionHandler = { [weak self] action in
             DispatchQueue.main.async {
@@ -65,14 +65,15 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         leaf.open(route: route)
     }
 
-    @objc(setWindowContentSize:height:resolver:rejecter:)
+    @objc(setWindowContentSize:width:height:resolver:rejecter:)
     func setWindowContentSize(
+        _ route: String,
         _ width: NSNumber,
         height: NSNumber,
         resolver resolve: RCTPromiseResolveBlock,
         rejecter reject: RCTPromiseRejectBlock
     ) {
-        resolve(leaf.setWindowContentSize(width: width.doubleValue, height: height.doubleValue))
+        resolve(leaf.setWindowContentSize(route: route, width: width.doubleValue, height: height.doubleValue))
     }
 
     @objc func setMenuBarStatus(_ title: String, running: Bool) {
@@ -91,16 +92,15 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         leaf.setMenuActions(actions)
     }
 
-    @objc func openFilePicker(_ purpose: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+    @objc func openFilePicker(_ purpose: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
         DispatchQueue.main.async {
-            let token = self.leaf.chooseImportFile(purpose: purpose)
-            resolve(token)
+            self.leaf.chooseImportFile(purpose: purpose) { token in resolve(token) }
         }
     }
 
-    @objc func saveFilePicker(_ suggestedName: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+    @objc func saveFilePicker(_ suggestedName: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
         DispatchQueue.main.async {
-            resolve(self.leaf.chooseExportFile(suggestedName: suggestedName))
+            self.leaf.chooseExportFile(suggestedName: suggestedName) { token in resolve(token) }
         }
     }
 
@@ -130,10 +130,25 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
-    @objc func showReadOnlyText(_ title: String, text: String, closeLabel: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: RCTPromiseRejectBlock) {
+    @objc(showReadOnlyText:text:closeLabel:language:html:resolver:rejecter:)
+    func showReadOnlyText(
+        _ title: String,
+        text: String,
+        closeLabel: String,
+        language: String,
+        html: String,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
         DispatchQueue.main.async {
-            self.leaf.showReadOnlyText(title: title, text: text, closeTitle: closeLabel)
-            resolve(nil)
+            self.leaf.showReadOnlyText(
+                title: title,
+                text: text,
+                closeTitle: closeLabel,
+                language: language,
+                html: html,
+                completion: { resolve(nil) }
+            )
         }
     }
 
@@ -164,42 +179,6 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
 
     @objc func setLocalization(_ strings: [String: String]) {
         leaf.setLocalization(strings)
-    }
-
-    @objc func editSecureDocument(_ editorToken: String, language: String, title: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
-        guard !editorToken.isEmpty, editorToken.utf8.count <= 256 else {
-            reject("E_NATIVE_EDITOR_TOKEN", "The native editor token is invalid.", nil)
-            return
-        }
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let content = try CoreIPCBridge.shared.readEditorDocument(editorToken)
-                DispatchQueue.main.async {
-                    guard let staged = self.leaf.editText(content: content, language: language, title: title) else {
-                        resolve(nil)
-                        return
-                    }
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        let revision: Int?
-                        do {
-                            revision = try CoreIPCBridge.shared.stageEditorDocument(editorToken, text: staged).revision
-                        } catch {
-                            DispatchQueue.main.async {
-                                reject("E_NATIVE_EDITOR_STAGE", "The local Core could not stage the document.", nil)
-                            }
-                            return
-                        }
-                        DispatchQueue.main.async {
-                            resolve(revision)
-                        }
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    reject("E_NATIVE_EDITOR_READ", "The local Core could not read the document.", nil)
-                }
-            }
-        }
     }
 
     @objc(editSecret:field:target:title:allowClear:resolver:rejecter:)

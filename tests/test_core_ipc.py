@@ -15,6 +15,7 @@ from litellm_menu.core import (
     CoreIPCClient,
     CoreIPCServer,
     CoreStore,
+    IPCError,
     MemoryDomain,
     ProtocolError,
     RequestEnvelope,
@@ -123,7 +124,7 @@ class CoreProtocolTests(unittest.TestCase):
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])
         self.assertEqual(
-            ["snapshot", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import"],
+            ["snapshot", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
             schema["methods"],
         )
         typescript = (
@@ -170,7 +171,8 @@ class CoreProtocolTests(unittest.TestCase):
             "reload": {"domain": "language", "revision": 0},
             "probe": {"domain": "providers_models", "provider_id": "primary", "model_id": "default-chat"},
             "export": {"sections": ["language"], "destination_token": "destination"},
-            "import": {"source_token": "source", "sections": ["language"], "revision": 0},
+            "import_preview": {"source_token": "source", "revision": 0},
+            "import": {"import_plan_token": "plan", "sections": ["language"], "revision": 0},
         }
         invalid = {
             "snapshot": {"stale": True},
@@ -183,7 +185,8 @@ class CoreProtocolTests(unittest.TestCase):
             "reload": {"revision": -1},
             "probe": {"domain": "runtime"},
             "export": {"sections": ["language", "language"], "destination_token": "destination"},
-            "import": {"source_token": "source"},
+            "import_preview": {"source_token": "source"},
+            "import": {"import_plan_token": "plan", "sections": ["language"]},
         }
 
         self.assertEqual(set(valid), set(load_protocol_schema()["methods"]))
@@ -192,6 +195,28 @@ class CoreProtocolTests(unittest.TestCase):
                 RequestEnvelope.from_mapping(
                     {"protocol_version": 1, "request_id": f"valid-{method}", "method": method, "params": params}
                 )
+        RequestEnvelope.from_mapping(
+            {
+                "protocol_version": 1,
+                "request_id": "valid-editor-stage",
+                "method": "editor",
+                "params": {"editor_token": "token", "text": "{}\n"},
+            }
+        )
+        with self.assertRaisesRegex(ProtocolError, r"^editor params do not match"):
+            RequestEnvelope.from_mapping(
+                {
+                    "protocol_version": 1,
+                    "request_id": "invalid-editor-mixed-operation",
+                    "method": "editor",
+                    "params": {
+                        "domain": "codex",
+                        "document": "config",
+                        "editor_token": "token",
+                        "text": "{}\n",
+                    },
+                }
+            )
         for method, params in invalid.items():
             with self.subTest(method=method, case="invalid"):
                 with self.assertRaisesRegex(ProtocolError, rf"^{method} params do not match"):
@@ -203,7 +228,7 @@ class CoreProtocolTests(unittest.TestCase):
         valid = {
             "snapshot": {"snapshot": {}},
             "logs": {"changed": True, "revision": 1, "log": {"tab": "requests", "available": False, "paused": False, "line_count": 0, "records": [], "filter": "", "limit": 10000}},
-            "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0},
+            "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0, "text": "model = \"example\"\n"},
             "dispatch": {"revision": 0},
             "subscribe": {"subscription_id": "subscription"},
             "validate": {"validate": {}},
@@ -211,12 +236,13 @@ class CoreProtocolTests(unittest.TestCase):
             "reload": {"revision": 0},
             "probe": {"ok": False, "protocols": []},
             "export": {"revision": 0, "section_count": 0, "sections": ["language"]},
+            "import_preview": {"revision": 0, "import_plan_token": "plan", "detected_sections": ["language"], "preview": {}},
             "import": {"revision": 0, "draft_domains": ["language"], "preview": {}},
         }
         invalid = {
             "snapshot": {"snapshot": []},
             "logs": {"changed": "yes", "revision": 1, "log": None},
-            "editor": {"domain": "runtime", "document": "config", "editor_token": "token", "revision": 0},
+            "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0},
             "dispatch": {"revision": -1},
             "subscribe": {"subscription_id": 1},
             "validate": {"validate": []},
@@ -224,6 +250,7 @@ class CoreProtocolTests(unittest.TestCase):
             "reload": {"revision": "0"},
             "probe": {"ok": True, "protocols": [1]},
             "export": {"revision": 0, "section_count": -1},
+            "import_preview": {"revision": 0, "import_plan_token": "plan", "detected_sections": [], "preview": {}},
             "import": {"revision": 0, "draft_domains": ["unknown"], "preview": {}},
         }
 
@@ -438,6 +465,43 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         self.assertEqual(["runtime"], result["draft_domains"])
         self.assertFalse(core.snapshot()["drafts"]["runtime"]["dirty"])
 
+    def test_import_rejects_sections_not_detected_by_preview(self) -> None:
+        core = CoreStore(
+            domains=[
+                MemoryDomain("providers_models", {"value": "saved"}),
+                MemoryDomain("runtime", {"value": "saved"}),
+            ]
+        )
+        package = {
+            "format": "litellm-menu-core-package",
+            "version": 1,
+            "sections": {"providers_models": {"value": "imported"}},
+        }
+
+        result = core.import_package(package=package, sections=["providers_models"], revision=core.revision)
+        self.assertEqual(["providers_models"], result["draft_domains"])
+        with self.assertRaises(Exception) as raised:
+            core.import_package(
+                package=package,
+                sections=["runtime", "relay_accounts"],
+                revision=core.revision,
+            )
+        self.assertEqual("invalid_sections", raised.exception.code)
+
+    def test_language_package_export_and_import_are_selectable(self) -> None:
+        from litellm_menu.core.domains.language import LanguageSettingsDomain
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "language.json"
+            source = LanguageSettingsDomain(path)
+            source.dispatch("set", {"language": "zh-Hans"})
+            exported = source.export(include_sensitive=True)
+            target = LanguageSettingsDomain(Path(directory) / "target-language.json")
+
+            target.import_package(exported)
+
+            self.assertEqual({"domain": "language", "choice": "zh-Hans"}, target.export())
+
     def test_provider_model_summary_matches_the_typescript_contract(self) -> None:
         class ProviderDomain(MemoryDomain):
             def snapshot(self) -> dict[str, object]:
@@ -490,7 +554,8 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertEqual(1, result["section_count"])
             self.assertEqual(0o600, stat.S_IMODE(output.stat().st_mode))
             source_token = core.file_capabilities.register(output, "import")
-            imported = core.import_package(source_token=source_token, sections=["language"], revision=core.revision)
+            prepared = core.prepare_import(source_token=source_token, revision=core.revision)
+            imported = core.import_package(package=prepared.package, sections=["language"], revision=prepared.revision)
             self.assertEqual(["language"], imported["draft_domains"])
 
     def test_import_preview_reports_only_preexisting_drafts(self) -> None:
@@ -592,7 +657,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertEqual(before_metadata, metadata.read_bytes())
             self.assertEqual([], events)
 
-    def test_sensitive_editor_uses_an_opaque_native_host_capability(self) -> None:
+    def test_editor_returns_plaintext_and_stages_through_the_versioned_ipc_method(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = Path(directory) / "settings.json"
             settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"synthetic-token"}}\n', encoding="utf-8")
@@ -611,15 +676,20 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             editor = client.call("editor", {"domain": "claude", "document": "settings"})
             self.assertEqual("settings", editor["document"])
             self.assertIn("editor_token", editor)
-            self.assertNotIn("text", editor)
-            self.assertNotIn("synthetic-token", json.dumps(editor))
-            self.assertIn("synthetic-token", client.read_editor(editor["editor_token"]))
+            self.assertIn("synthetic-token", editor["text"])
 
-            revision = client.stage_editor(editor["editor_token"], '{"model":"updated"}\n')
-            self.assertGreater(revision, editor["revision"])
+            staged = client.call(
+                "editor",
+                {"editor_token": editor["editor_token"], "text": '{"model":"updated"}\n'},
+            )
+            self.assertEqual("claude", staged["domain"])
+            self.assertEqual("settings", staged["document"])
+            self.assertEqual('{"model":"updated"}\n', staged["text"])
+            self.assertNotEqual(editor["editor_token"], staged["editor_token"])
+            self.assertGreater(staged["revision"], editor["revision"])
             self.assertEqual("updated", core.snapshot()["domains"]["claude"]["settings"]["model"])
             with self.assertRaises(Exception):
-                client.read_editor(editor["editor_token"])
+                client.call("editor", {"editor_token": editor["editor_token"], "text": "{}\n"})
 
     def test_claude_desktop_developer_and_code_raw_editors_stage_their_own_documents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -664,27 +734,36 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             desktop_editor = client.call("editor", {"domain": "claude", "document": "desktop"})
             developer_editor = client.call("editor", {"domain": "claude", "document": "developer"})
             code_editor = client.call("editor", {"domain": "claude", "document": "settings"})
-            desktop_text = client.read_editor(desktop_editor["editor_token"])
-            developer_text = client.read_editor(developer_editor["editor_token"])
-            code_text = client.read_editor(code_editor["editor_token"])
-            self.assertIn("synthetic-desktop-key", desktop_text)
-            self.assertIn("allowDevTools", developer_text)
-            self.assertIn("skipWorkflowUsageWarning", code_text)
+            self.assertIn("synthetic-desktop-key", desktop_editor["text"])
+            self.assertIn("allowDevTools", developer_editor["text"])
+            self.assertIn("skipWorkflowUsageWarning", code_editor["text"])
             self.assertNotIn("synthetic-desktop-key", json.dumps(core.snapshot()))
 
-            client.stage_editor(
-                desktop_editor["editor_token"],
-                '{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"http://127.0.0.1:4100","inferenceGatewayApiKey":"synthetic-desktop-key"}\n',
+            desktop_staged = client.call(
+                "editor",
+                {
+                    "editor_token": desktop_editor["editor_token"],
+                    "text": '{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"http://127.0.0.1:4100","inferenceGatewayApiKey":"synthetic-desktop-key"}\n',
+                },
             )
-            client.stage_editor(developer_editor["editor_token"], '{"allowDevTools":false}\n')
-            client.stage_editor(code_editor["editor_token"], '{"model":"claude-code-model"}\n')
+            developer_staged = client.call(
+                "editor",
+                {"editor_token": developer_editor["editor_token"], "text": '{"allowDevTools":false}\n'},
+            )
+            code_staged = client.call(
+                "editor",
+                {"editor_token": code_editor["editor_token"], "text": '{"model":"claude-code-model"}\n'},
+            )
+            self.assertNotEqual(desktop_editor["editor_token"], desktop_staged["editor_token"])
+            self.assertNotEqual(developer_editor["editor_token"], developer_staged["editor_token"])
+            self.assertNotEqual(code_editor["editor_token"], code_staged["editor_token"])
             snapshot = core.snapshot()["domains"]["claude"]
             self.assertEqual("http://127.0.0.1:4100", snapshot["desktop"]["gateway_url"])
             self.assertFalse(snapshot["developer"]["developer_mode_enabled"])
             self.assertEqual("claude-code-model", snapshot["settings"]["model"])
             self.assertNotIn("synthetic-desktop-key", json.dumps(snapshot))
 
-    def test_editor_capability_is_session_bound_and_requires_read_before_stage(self) -> None:
+    def test_editor_capability_is_session_bound_and_rejects_a_stale_revision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             from litellm_menu.core.domains.claude import ClaudeSettingsDomain
 
@@ -696,14 +775,6 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.addCleanup(client.close)
             editor = client.call("editor", {"domain": "claude", "document": "settings"})
 
-            with self.assertRaises(Exception):
-                client.stage_editor(editor["editor_token"], "{}\n")
-            with self.assertRaises(Exception):
-                server.read_editor_capability(
-                    editor["editor_token"], session_token="another-session"
-                )
-
-            client.read_editor(editor["editor_token"])
             client.call(
                 "dispatch",
                 {
@@ -715,9 +786,63 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                 },
             )
             with self.assertRaises(Exception):
-                client.stage_editor(editor["editor_token"], "{}\n")
+                client.call(
+                    "editor",
+                    {"editor_token": editor["editor_token"], "text": "{}\n"},
+                )
 
-    def test_editor_stage_rotates_the_capability_for_continuous_native_editing(self) -> None:
+    def test_editor_open_remains_stageable_when_an_unrelated_revision_follows_its_read(self) -> None:
+        """An editor lease owns an atomic document/revision baseline.
+
+        A status or another settings surface can advance Core immediately
+        after the raw document is read. That must not turn an unchanged raw
+        editor into a false outside-change conflict.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+
+            core = CoreStore(
+                domains=[
+                    ClaudeSettingsDomain(Path(directory) / "settings.json"),
+                    MemoryDomain("language", {"choice": "system"}),
+                ]
+            )
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            original_editor_document = core.editor_document
+            advanced = False
+
+            def read_then_advance(domain: str, document: str) -> dict[str, object]:
+                nonlocal advanced
+                descriptor = original_editor_document(domain, document)
+                if not advanced:
+                    advanced = True
+                    core.dispatch(
+                        {
+                            "domain": "language",
+                            "type": "patch",
+                            "payload": {"choice": "en"},
+                        },
+                        expected_revision=core.revision,
+                    )
+                return descriptor
+
+            with mock.patch.object(core, "editor_document", side_effect=read_then_advance):
+                editor = client.call("editor", {"domain": "claude", "document": "settings"})
+
+            staged = client.call(
+                "editor",
+                {"editor_token": editor["editor_token"], "text": '{"model":"stable"}\n'},
+            )
+            self.assertEqual('{"model":"stable"}\n', staged["text"])
+            self.assertGreater(staged["revision"], editor["revision"])
+
+    def test_editor_stage_rotates_the_capability_for_continuous_editing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             from litellm_menu.core.domains.claude import ClaudeSettingsDomain
 
@@ -729,46 +854,36 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.addCleanup(client.close)
             editor = client.call("editor", {"domain": "claude", "document": "settings"})
             original_token = editor["editor_token"]
-            client.read_editor(original_token)
-
-            status, body, _headers = client._http(
-                "/v1/host/editor/stage",
-                payload=encode_message(
-                    {"editor_token": original_token, "text": '{"model":"first"}\n'}
-                ),
-                token=client._session_token,
+            first = client.call(
+                "editor",
+                {"editor_token": original_token, "text": '{"model":"first"}\n'},
             )
-            self.assertEqual(200, status)
-            staged = decode_message(body)
             self.assertEqual(
-                {"protocol_version", "revision", "editor_token"}, set(staged)
+                {"domain", "document", "revision", "editor_token", "text"}, set(first)
             )
-            replacement_token = staged["editor_token"]
+            self.assertEqual("claude", first["domain"])
+            self.assertEqual("settings", first["document"])
+            self.assertEqual('{"model":"first"}\n', first["text"])
+            replacement_token = first["editor_token"]
             self.assertNotEqual(original_token, replacement_token)
             with self.assertRaises(Exception):
-                server.read_editor_capability(
-                    original_token, session_token=client._session_token
+                client.call(
+                    "editor",
+                    {"editor_token": original_token, "text": '{"model":"stale"}\n'},
                 )
-            with self.assertRaises(Exception):
-                server.stage_editor_capability(
-                    replacement_token,
-                    '{"model":"wrong-session"}\n',
-                    session_token="another-session",
-                )
-
-            second = server.stage_editor_capability(
-                replacement_token,
-                '{"model":"second"}\n',
-                session_token=client._session_token,
+            second = client.call(
+                "editor",
+                {"editor_token": replacement_token, "text": '{"model":"second"}\n'},
             )
-            self.assertGreater(second["revision"], staged["revision"])
+            self.assertGreater(second["revision"], first["revision"])
             self.assertNotEqual(replacement_token, second["editor_token"])
+            self.assertEqual('{"model":"second"}\n', second["text"])
             self.assertEqual(
                 "second", core.snapshot()["domains"]["claude"]["settings"]["model"]
             )
 
     def test_editor_capability_can_be_reacquired_after_core_capability_loss(self) -> None:
-        """Native recovery must read a replacement token before staging its draft."""
+        """The React editor can reload a document and continue staging after token loss."""
 
         with tempfile.TemporaryDirectory() as directory:
             from litellm_menu.core.domains.claude import ClaudeSettingsDomain
@@ -781,23 +896,67 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.addCleanup(client.close)
 
             original = client.call("editor", {"domain": "claude", "document": "settings"})
-            client.read_editor(original["editor_token"])
             with server._lock:
                 server._editor_capabilities.clear()
             with self.assertRaises(Exception):
-                client.read_editor(original["editor_token"])
+                client.call(
+                    "editor",
+                    {"editor_token": original["editor_token"], "text": '{"model":"stale"}\n'},
+                )
 
             replacement = client.call("editor", {"domain": "claude", "document": "settings"})
             self.assertNotEqual(original["editor_token"], replacement["editor_token"])
-            # The read handshake authorizes a native host to stage the text it
-            # kept in memory; the recovered disk content must not overwrite it.
-            client.read_editor(replacement["editor_token"])
-            client.stage_editor(replacement["editor_token"], '{"model":"recovered"}\n')
+            self.assertEqual(original["text"], replacement["text"])
+            staged = client.call(
+                "editor",
+                {"editor_token": replacement["editor_token"], "text": '{"model":"recovered"}\n'},
+            )
+            self.assertEqual('{"model":"recovered"}\n', staged["text"])
             self.assertEqual("recovered", core.snapshot()["domains"]["claude"]["settings"]["model"])
+
+    def test_editor_reacquisition_acknowledges_a_stage_whose_reply_was_lost(self) -> None:
+        """A replacement descriptor exposes an edit Core already accepted.
+
+        The editor token is one-use. If native transport loses the successful
+        stage response, React retries with its now-invalid original token and
+        then reacquires the descriptor. Its text must prove the original edit
+        succeeded instead of being treated as a competing outside change.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+
+            core = CoreStore(domains=[ClaudeSettingsDomain(Path(directory) / "settings.json")])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            original = client.call("editor", {"domain": "claude", "document": "settings"})
+            accepted_text = '{\n  "model": "accepted"\n}\n'
+            # Model a successful Core write whose IPC response never reaches
+            # the embedded editor. The original token has been consumed.
+            server.stage_editor_capability(
+                original["editor_token"], accepted_text, session_token=client._session_token
+            )
+            with self.assertRaises(Exception):
+                client.call(
+                    "editor",
+                    {"editor_token": original["editor_token"], "text": accepted_text},
+                )
+
+            reacquired = client.call("editor", {"domain": "claude", "document": "settings"})
+            self.assertEqual(accepted_text, reacquired["text"])
+            continued = client.call(
+                "editor",
+                {"editor_token": reacquired["editor_token"], "text": '{\n  "model": "continued"\n}\n'},
+            )
+            self.assertEqual('{\n  "model": "continued"\n}\n', continued["text"])
 
     def test_codex_raw_editors_remain_valid_when_the_sibling_document_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            from litellm_menu.core.domains.legacy import CodexSettingsDomain
+            from litellm_menu.core.domains.codex import CodexSettingsDomain
 
             root = Path(directory)
             config = root / "config.yaml"
@@ -815,29 +974,29 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
             config_editor = client.call("editor", {"domain": "codex", "document": "config"})
             auth_editor = client.call("editor", {"domain": "codex", "document": "auth"})
-            self.assertIn("model", client.read_editor(config_editor["editor_token"]))
-            self.assertIn("kind", client.read_editor(auth_editor["editor_token"]))
+            self.assertIn("model", config_editor["text"])
+            self.assertIn("kind", auth_editor["text"])
 
-            staged = server.stage_editor_capability(
-                config_editor["editor_token"],
-                'model = "second"\n',
-                session_token=client._session_token,
+            staged = client.call(
+                "editor",
+                {"editor_token": config_editor["editor_token"], "text": 'model = "second"\n'},
             )
             self.assertGreater(staged["revision"], config_editor["revision"])
             codex_after_config = core.snapshot()["domains"]["codex"]
             self.assertTrue(codex_after_config["config_exists"])
             self.assertTrue(codex_after_config["auth_file_exists"])
-            next_auth = server.stage_editor_capability(
-                auth_editor["editor_token"],
-                '{"kind":"second"}\n',
-                session_token=client._session_token,
+            next_auth = client.call(
+                "editor",
+                {"editor_token": auth_editor["editor_token"], "text": '{"kind":"second"}\n'},
             )
             self.assertGreater(next_auth["revision"], staged["revision"])
             codex_after_auth = core.snapshot()["domains"]["codex"]
             self.assertTrue(codex_after_auth["config_exists"])
             self.assertTrue(codex_after_auth["auth_file_exists"])
-            self.assertIn("second", core.trusted_editor_text("codex", "config", revision=next_auth["revision"]))
-            self.assertIn("second", core.trusted_editor_text("codex", "auth", revision=next_auth["revision"]))
+            refreshed_config = client.call("editor", {"domain": "codex", "document": "config"})
+            refreshed_auth = client.call("editor", {"domain": "codex", "document": "auth"})
+            self.assertIn("second", refreshed_config["text"])
+            self.assertIn("second", refreshed_auth["text"])
 
     def test_claude_plaintext_dispatch_requires_native_capabilities(self) -> None:
         from litellm_menu.core.domains.claude import ClaudeSettingsDomain
@@ -877,7 +1036,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertTrue(core.snapshot()["domains"]["claude"]["settings"]["token_configured"])
             self.assertTrue(core.snapshot()["domains"]["claude"]["settings"]["autoMemoryDirectoryConfigured"])
 
-    def test_claude_snapshot_hides_command_and_permission_rule_text_but_trusted_editor_keeps_it(self) -> None:
+    def test_claude_snapshot_hides_command_and_permission_rule_text_but_editor_ipc_returns_it(self) -> None:
         from litellm_menu.core.domains.claude import ClaudeSettingsDomain
 
         with tempfile.TemporaryDirectory() as directory:
@@ -897,9 +1056,14 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             public_snapshot = json.dumps(core.snapshot())
             self.assertNotIn("/private/ipc-synthetic-path", public_snapshot)
             self.assertNotIn("ipc-synthetic-token", public_snapshot)
-            raw = core.trusted_editor_text("claude", "settings", revision=core.revision)
-            self.assertIn("/private/ipc-synthetic-path", raw)
-            self.assertIn("ipc-synthetic-token", raw)
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+            editor = client.call("editor", {"domain": "claude", "document": "settings"})
+            self.assertIn("/private/ipc-synthetic-path", editor["text"])
+            self.assertIn("ipc-synthetic-token", editor["text"])
 
     def test_secret_capability_is_allowlisted_session_bound_and_one_time(self) -> None:
         class SecretDomain(MemoryDomain):
@@ -954,7 +1118,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             )
 
     def test_secret_capability_rejects_stale_revision_and_http_response_is_presence_only(self) -> None:
-        from litellm_menu.core.domains.legacy import WebDAVSettingsDomain
+        from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
 
         with tempfile.TemporaryDirectory() as directory:
             settings = Path(directory) / "webdav.json"
@@ -1170,6 +1334,155 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                     server.stop()
 
 class CoreIPCTests(unittest.TestCase):
+    def test_import_preview_is_non_mutating_and_plan_is_one_use(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            package_path = Path(directory) / "configuration.json"
+            source = CoreStore(
+                domains=[
+                    MemoryDomain("language", {"choice": "zh-Hans"}),
+                    MemoryDomain("runtime", {"port": "4100"}),
+                ]
+            )
+            source.export(
+                ["language", "runtime"],
+                destination_token=source.file_capabilities.register(package_path, "export"),
+            )
+            language = MemoryDomain("language", {"choice": "system"})
+            runtime = MemoryDomain("runtime", {"port": "4000"})
+            target = CoreStore(domains=[language, runtime])
+            target.dispatch({"domain": "language", "type": "set", "payload": {"choice": "en"}})
+            server = CoreIPCServer(target)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            source_token = client.register_file_capability(str(package_path), "import")
+            before = target.snapshot()
+            preview = client.call("import_preview", {"source_token": source_token, "revision": target.revision})
+
+            self.assertEqual(before, target.snapshot())
+            self.assertEqual(["language", "runtime"], preview["detected_sections"])
+            self.assertTrue(preview["preview"]["language"]["will_replace_draft"])
+            self.assertFalse(preview["preview"]["runtime"]["will_replace_draft"])
+
+            # A different authenticated session must not be able to consume
+            # the owner's one-use plan merely by presenting its token.
+            with self.assertRaises(Exception) as crossed:
+                server._consume_import_plan(preview["import_plan_token"], session_token="synthetic-other-session")
+            self.assertEqual("invalid_import_plan", crossed.exception.code)
+
+            # A cross-session presentation must not consume the owner's plan.
+            self.assertIn(preview["import_plan_token"], server._import_plans)
+
+            # A request outside the detected set is invalid without consuming
+            # the plan, so the owner may correct its selection.
+            with self.assertRaises(Exception) as invalid_subset:
+                server._consume_import_plan(
+                    preview["import_plan_token"],
+                    session_token=client._session_token,
+                    expected_revision=preview["revision"],
+                    sections=["codex"],
+                )
+            self.assertEqual("invalid_sections", invalid_subset.exception.code)
+            self.assertIn(preview["import_plan_token"], server._import_plans)
+
+            # Even if Core has not changed, an execution request carrying a
+            # different revision cannot consume a preview-bound plan.
+            with self.assertRaises(Exception) as wrong_revision:
+                server._consume_import_plan(
+                    preview["import_plan_token"],
+                    session_token=client._session_token,
+                    expected_revision=preview["revision"] + 1,
+                    sections=["runtime"],
+                )
+            self.assertEqual("revision_conflict", wrong_revision.exception.code)
+            self.assertIn(preview["import_plan_token"], server._import_plans)
+
+            staged = client.call(
+                "import",
+                {
+                    "import_plan_token": preview["import_plan_token"],
+                    "sections": ["runtime"],
+                    "revision": preview["revision"],
+                },
+            )
+            self.assertEqual(["runtime"], staged["draft_domains"])
+            self.assertEqual("en", language.draft_state()["choice"])
+            self.assertEqual("4100", runtime.draft_state()["port"])
+            with self.assertRaises(IPCError):
+                client.call(
+                    "import",
+                    {
+                        "import_plan_token": preview["import_plan_token"],
+                        "sections": ["runtime"],
+                        "revision": staged["revision"],
+                    },
+                )
+
+    def test_import_plan_rejects_state_changes_after_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            package_path = Path(directory) / "configuration.json"
+            source = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+            source.export(
+                ["language"],
+                destination_token=source.file_capabilities.register(package_path, "export"),
+            )
+            language = MemoryDomain("language", {"choice": "en"})
+            target = CoreStore(domains=[language])
+            server = CoreIPCServer(target)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            source_token = client.register_file_capability(str(package_path), "import")
+            preview = client.call("import_preview", {"source_token": source_token, "revision": target.revision})
+            target.dispatch({"domain": "language", "type": "set", "payload": {"choice": "zh-Hans"}})
+            before = target.snapshot()
+
+            with self.assertRaises(IPCError):
+                client.call(
+                    "import",
+                    {
+                        "import_plan_token": preview["import_plan_token"],
+                        "sections": ["language"],
+                        "revision": target.revision,
+                    },
+                )
+
+            self.assertEqual(before, target.snapshot())
+            self.assertEqual("zh-Hans", language.draft_state()["choice"])
+
+            # Revision validation precedes one-use consumption. The stale
+            # attempt leaves the owner's plan available for a fresh preview or
+            # a retry if the caller still has the matching revision.
+            self.assertIn(preview["import_plan_token"], server._import_plans)
+
+    def test_import_plan_expiry_consumes_only_the_expired_lease(self) -> None:
+        from litellm_menu.core.service import PreparedImport
+
+        target = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(target)
+        prepared = PreparedImport(
+            package={
+                "format": "litellm-menu-core-package",
+                "version": 1,
+                "sections": {"language": {"state": {"choice": "en"}}},
+            },
+            detected_sections=("language",),
+            preview={"language": {"available": True, "will_replace_draft": False}},
+            revision=target.revision,
+        )
+        with mock.patch("litellm_menu.core.ipc.IMPORT_PLAN_TTL_SECONDS", -1):
+            token = server._register_import_plan(prepared, session_token="owner-session")
+
+        with self.assertRaises(Exception) as expired:
+            server._consume_import_plan(token, session_token="owner-session")
+
+        self.assertEqual("invalid_import_plan", expired.exception.code)
+        self.assertNotIn(token, server._import_plans)
+
     def test_invalid_core_result_becomes_a_safe_failure_response(self) -> None:
         secret = "synthetic-invalid-result-secret"
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])

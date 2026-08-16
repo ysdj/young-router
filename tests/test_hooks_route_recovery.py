@@ -6,6 +6,62 @@ from hook_test_utils import *
 
 
 class HookRouteRecoveryTests(HookTestCase):
+    def test_stream_route_recovery_eligibility_is_protocol_neutral(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        retryable = RuntimeError("temporary upstream failure")
+        retryable.status_code = 503
+        terminal = RuntimeError("invalid request")
+        terminal.status_code = 400
+        requests = {
+            "responses": {
+                "model": "default-chat",
+                "input": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "proxy_server_request": {"path": "/v1/responses"},
+            },
+            "chat_completions": {
+                "model": "default-chat",
+                "messages": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "proxy_server_request": {"path": "/v1/chat/completions"},
+            },
+            "anthropic_messages": {
+                "model": "default-chat",
+                "messages": [{"role": "user", "content": "Continue."}],
+                "max_tokens": 64,
+                "stream": True,
+                "proxy_server_request": {"path": "/v1/messages"},
+            },
+        }
+        expected_methods = {
+            "responses": "aresponses",
+            "chat_completions": "acompletion",
+            "anthropic_messages": "anthropic_messages",
+        }
+
+        for protocol, request_data in requests.items():
+            with self.subTest(protocol=protocol):
+                self.assertTrue(
+                    hooks._request_supports_streaming_error_fallback(request_data)
+                )
+                self.assertEqual(
+                    hooks._streaming_error_fallback_method_name(request_data),
+                    expected_methods[protocol],
+                )
+                self.assertTrue(
+                    hooks._should_return_route_recovery_stream(
+                        retryable,
+                        request_data,
+                    )
+                )
+                self.assertFalse(
+                    hooks._should_return_route_recovery_stream(
+                        terminal,
+                        request_data,
+                    )
+                )
+
     def test_top_level_responses_error_preserves_invalid_request_and_stops_polling(self) -> None:
         hooks, _proxy_server = load_hook_module()
         terminal = {
@@ -1925,6 +1981,290 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn({"type": "response.output_text.delta", "delta": "router recovered"}, chunks)
         self.assertIn({"type": "response.completed", "response": {"id": "resp-router-recovered"}}, chunks)
+
+    async def test_chat_completions_stream_enters_route_recovery_without_responses_events(
+        self,
+    ) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        router_module = types.ModuleType("litellm.router")
+        calls = []
+
+        async def recovered_stream():
+            yield {
+                "id": "chatcmpl-recovered",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "default-chat",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "Recovered."},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield {
+                "id": "chatcmpl-recovered",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "default-chat",
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ],
+            }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def acompletion(self, **payload):
+                calls.append(payload)
+                return recovered_stream()
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        class ServiceUnavailableError(Exception):
+            status_code = 503
+
+        async def original_generic_function(**kwargs):
+            raise ServiceUnavailableError("upstream temporarily unavailable")
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+        router = Router()
+        proxy_server.llm_router = router
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+            "model_info": {"id": "first-route", "order": 1},
+        }
+
+        response = await router._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            **{key: value for key, value in request_data.items() if key != "model"},
+        )
+        chunks = [
+            chunk
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=response,
+                request_data=request_data,
+            )
+        ]
+
+        self.assertTrue(hooks._is_route_recovery_stream_response(response))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["messages"], request_data["messages"])
+        self.assertTrue(calls[0]["stream"])
+        self.assertTrue(calls[0]["litellm_metadata"][hooks._ROUTE_RECOVERY_POLL_METADATA_KEY])
+        self.assertEqual(chunks[0]["object"], "chat.completion.chunk")
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertFalse(
+            any(
+                isinstance(chunk, dict) and chunk.get("type") == "response.metadata"
+                for chunk in chunks
+            )
+        )
+        keepalive = hooks._route_recovery_sse_keepalive(
+            1,
+            request_data=request_data,
+            phase="cooldown",
+        )
+        self.assertEqual(
+            keepalive,
+            b": litellm_menu route_recovery phase=cooldown attempt=1\n\n",
+        )
+
+    async def test_anthropic_messages_stream_enters_route_recovery_with_native_sse(
+        self,
+    ) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        router_module = types.ModuleType("litellm.router")
+        calls = []
+        expected_chunks = [
+            (
+                b'event: message_start\n'
+                b'data: {"type":"message_start","message":{"id":"msg-recovered"}}\n\n'
+            ),
+            (
+                b'event: content_block_delta\n'
+                b'data: {"type":"content_block_delta","delta":'
+                b'{"type":"text_delta","text":"Recovered."}}\n\n'
+            ),
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        async def recovered_stream():
+            for chunk in expected_chunks:
+                yield chunk
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def anthropic_messages(self, **payload):
+                calls.append(payload)
+                return recovered_stream()
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        class ServiceUnavailableError(Exception):
+            status_code = 503
+
+        async def original_generic_function(**kwargs):
+            raise ServiceUnavailableError("upstream temporarily unavailable")
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+        router = Router()
+        proxy_server.llm_router = router
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "system": "Answer concisely.",
+            "max_tokens": 64,
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/messages"},
+            "model_info": {"id": "first-route", "order": 1},
+        }
+
+        response = await router._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            **{key: value for key, value in request_data.items() if key != "model"},
+        )
+        chunks = [
+            chunk
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=response,
+                request_data=request_data,
+            )
+        ]
+
+        self.assertTrue(hooks._is_route_recovery_stream_response(response))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_type"], "anthropic_messages")
+        self.assertEqual(calls[0]["messages"], request_data["messages"])
+        self.assertEqual(calls[0]["system"], request_data["system"])
+        self.assertEqual(calls[0]["max_tokens"], request_data["max_tokens"])
+        self.assertNotIn("max_completion_tokens", calls[0])
+        self.assertTrue(calls[0]["stream"])
+        self.assertTrue(
+            calls[0]["litellm_metadata"][hooks._ROUTE_RECOVERY_POLL_METADATA_KEY]
+        )
+        self.assertEqual(chunks, expected_chunks)
+        self.assertEqual(
+            hooks._route_recovery_sse_keepalive(
+                1,
+                request_data=request_data,
+                phase="cooldown",
+            ),
+            b": litellm_menu route_recovery phase=cooldown attempt=1\n\n",
+        )
+
+    async def test_chat_completions_route_recovery_waits_for_shared_cooldown(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "0.04")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.15")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.005")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.set_env(
+                hooks._ROUTE_RECOVERY_STATE_FILE_ENV,
+                str(Path(temp_dir) / "route-recovery-state.json"),
+            )
+            deployments = [
+                {
+                    "litellm_params": {"model": "openai/default-chat"},
+                    "model_info": {"id": "chat-route"},
+                }
+            ]
+
+            class Router:
+                def _get_all_deployments(self, model_name, team_id=None):
+                    return deployments if model_name == "default-chat" else []
+
+            proxy_server.llm_router = Router()
+            failure_request = {
+                "model": "default-chat",
+                "messages": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "model_info": {"id": "chat-route"},
+            }
+            failure = RuntimeError("temporary upstream failure")
+            failure.status_code = 503
+            hooks._mark_exception_for_deployment_failover(failure, failure_request)
+            self.assertTrue(
+                hooks._route_recovery_poll_cooldown_wait(
+                    failure_request,
+                    ignore_constraints=True,
+                )
+            )
+
+            calls = []
+
+            async def recovered_stream():
+                yield {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "after cooldown"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+
+            async def acompletion(**payload):
+                calls.append(payload)
+                return recovered_stream()
+
+            proxy_server.llm_router.acompletion = acompletion
+            failure_request["proxy_server_request"] = {
+                "path": "/v1/chat/completions"
+            }
+            failure_request["_route_recovery_ignore_local_constraints"] = True
+            chunks = []
+            stream = hooks._stream_route_recovery_poll(failure_request, failure)
+            first_chunk = await anext(stream)
+            self.assertEqual(
+                first_chunk,
+                b": litellm_menu route_recovery phase=cooldown attempt=0\n\n",
+            )
+            self.assertEqual(calls, [])
+            chunks.extend([first_chunk])
+            chunks.extend([chunk async for chunk in stream])
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                chunks[-1]["choices"][0]["finish_reason"],
+                "stop",
+            )
+            self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
 
     async def test_route_recovery_poll_normalizes_completed_usage_for_codex(self) -> None:
         hooks, _proxy_server = load_hook_module()

@@ -13,7 +13,8 @@ in unit tests and from the local IPC server without importing LiteLLM itself.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
 import inspect
 import json
 import os
@@ -26,6 +27,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
+from .log_tabs import LOG_TABS
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
 from .protocol import PROTOCOL_VERSION, ProtocolError, make_event
 from .security import REDACTED, redact, safe_exception_message, safe_error_message
@@ -58,6 +60,9 @@ _PLAINTEXT_SECRET_FIELDS = {
     ("relay_accounts", "api_key"),
 }
 
+# Keep the Core's direct and legacy IPC callers tolerant of route-shaped
+# domain names.  The unified UI emits canonical names, but older native
+# clients may still send the settings route ids.
 _DOMAIN_ALIASES = {
     "providers-models": "providers_models",
     "providers_models": "providers_models",
@@ -76,13 +81,18 @@ _DOMAIN_ALIASES = {
 }
 
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
-LOG_TABS = (
-    "requests",
-    "service",
-    "menu",
-    "route-trace",
-    "recovery",
-    "online-usage",
+
+# Import previews identify only settings that have a Core-owned adapter. Logs
+# are a read-only projection and must never become a staged configuration
+# section just because a package contains a similarly named key.
+IMPORTABLE_DOMAINS = (
+    "providers_models",
+    "codex",
+    "claude",
+    "runtime",
+    "webdav",
+    "language",
+    "relay_accounts",
 )
 
 
@@ -149,6 +159,21 @@ class FileCapability:
     token: str
     path: Path
     purpose: str
+
+
+@dataclass(frozen=True, repr=False)
+class PreparedImport:
+    """Parsed package held by an authenticated IPC import-preview lease.
+
+    The package is intentionally not part of the wire result.  ``CoreIPCServer``
+    stores this object behind a session-bound opaque token until the user
+    submits a subset of ``detected_sections`` for staging.
+    """
+
+    package: Mapping[str, Any] = field(repr=False)
+    detected_sections: tuple[str, ...]
+    preview: Mapping[str, Mapping[str, bool]]
+    revision: int
 
 
 class FileCapabilityRegistry:
@@ -252,7 +277,7 @@ def _as_mapping(value: object, label: str = "payload") -> dict[str, Any]:
 
 
 def _validation_summary(value: object) -> dict[str, Any]:
-    """Normalize legacy adapter validation into the shared TS shape."""
+    """Normalize domain validation into the shared TypeScript shape."""
 
     if not isinstance(value, Mapping):
         return {
@@ -321,11 +346,18 @@ def _mapping_contains_key(value: object, keys: set[str]) -> bool:
 def _checkpoint_adapter(adapter: DomainAdapter, *, error_code: str = "import_failed") -> dict[str, Any]:
     """Capture one adapter before a transaction mutates it."""
 
+    checkpoint = getattr(adapter, "transaction_checkpoint", None)
+    restore = getattr(adapter, "restore_transaction", None)
+    if callable(checkpoint) and callable(restore):
+        try:
+            return {"kind": "transaction", "value": copy.deepcopy(checkpoint())}
+        except Exception:
+            raise CoreError(error_code, "Settings could not be prepared for a transaction") from None
     state = getattr(adapter, "__dict__", None)
     if not isinstance(state, dict):
         raise CoreError(error_code, "Settings could not be prepared for a transaction")
     try:
-        return copy.deepcopy(state)
+        return {"kind": "state", "value": copy.deepcopy(state)}
     except Exception:
         raise CoreError(error_code, "Settings could not be prepared for a transaction") from None
 
@@ -333,11 +365,21 @@ def _checkpoint_adapter(adapter: DomainAdapter, *, error_code: str = "import_fai
 def _restore_adapter(adapter: DomainAdapter, checkpoint: Mapping[str, Any]) -> None:
     """Restore the same adapter instance so no caller observes partial state."""
 
+    kind = checkpoint.get("kind")
+    value = checkpoint.get("value")
+    if kind == "transaction":
+        restore = getattr(adapter, "restore_transaction", None)
+        if not callable(restore) or not isinstance(value, Mapping):
+            raise RuntimeError("Configuration package adapter cannot be restored")
+        restore(copy.deepcopy(value))
+        return
+    if kind != "state" or not isinstance(value, Mapping):
+        raise RuntimeError("Configuration package adapter cannot be restored")
     state = getattr(adapter, "__dict__", None)
     if not isinstance(state, dict):
         raise RuntimeError("Configuration package adapter cannot be restored")
     state.clear()
-    state.update(checkpoint)
+    state.update(value)
 
 
 @dataclass(frozen=True)
@@ -653,93 +695,73 @@ class CoreStore:
         host can still open the remaining settings windows.
         """
 
+        from .domains._shared import _default_runtime_settings_path
+        from .domains.claude import ClaudeSettingsDomain
+        from .domains.codex import CodexSettingsDomain
+        from .domains.language import LanguageSettingsDomain
+        from .domains.logs import LogsDomain
+        from .domains.providers_models import ProvidersModelsDomain
+        from .domains.relay_accounts import RelayAccountsDomain
+        from .domains.runtime import RuntimeSettingsDomain
+        from .domains.webdav import WebDAVSettingsDomain
+
+        resolved_runtime_settings_path = (
+            Path(runtime_settings_path).expanduser()
+            if runtime_settings_path is not None
+            else _default_runtime_settings_path()
+        )
         adapters: list[DomainAdapter] = []
-        try:
-            from .domains.codex import CodexSettingsDomain
-            from .domains.providers_models import ProvidersModelsDomain
-            from .domains.runtime import RuntimeSettingsDomain
-            from .domains.webdav import WebDAVSettingsDomain
-            from .domains._shared import _default_runtime_settings_path
-
-            resolved_runtime_settings_path = (
-                Path(runtime_settings_path).expanduser()
-                if runtime_settings_path is not None
-                else _default_runtime_settings_path()
-            )
-
-            legacy_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
-                ("providers_models", lambda: ProvidersModelsDomain(config_path)),
-                (
-                    "codex",
-                    lambda: CodexSettingsDomain(
-                        config_path,
-                        codex_home=codex_home,
-                        runtime_settings_path=resolved_runtime_settings_path,
-                    ),
+        settings_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
+            ("providers_models", lambda: ProvidersModelsDomain(config_path)),
+            (
+                "codex",
+                lambda: CodexSettingsDomain(
+                    config_path,
+                    codex_home=codex_home,
+                    runtime_settings_path=resolved_runtime_settings_path,
                 ),
-                ("runtime", lambda: RuntimeSettingsDomain(resolved_runtime_settings_path)),
-                (
-                    "webdav",
-                    lambda: WebDAVSettingsDomain(
-                        webdav_settings_path,
-                        enabled_path=webdav_enabled_path,
-                    ),
+            ),
+            ("runtime", lambda: RuntimeSettingsDomain(resolved_runtime_settings_path)),
+            (
+                "webdav",
+                lambda: WebDAVSettingsDomain(
+                    webdav_settings_path,
+                    enabled_path=webdav_enabled_path,
+                    config_path=config_path,
                 ),
-            )
-        except Exception:
-            legacy_factories = ()
-        loaded_legacy: set[str] = set()
-        for name, factory in legacy_factories:
+            ),
+        )
+        for name, factory in settings_factories:
             try:
                 adapters.append(factory())
             except Exception:
                 # Never claim Apply succeeded against a placeholder when the
                 # user's real source is malformed.
                 adapters.append(UnavailableDomain(name))
-            loaded_legacy.add(name)
-        for name in ("providers_models", "codex", "runtime", "webdav"):
-            if name not in loaded_legacy:
-                adapters.append(MemoryDomain(name, _default_domain_state(name)))
-        adapters.append(MemoryDomain("logs", _default_domain_state("logs")))
+        claude_factory: Callable[[], DomainAdapter] = lambda: ClaudeSettingsDomain(claude_settings_path)
         try:
-            from .domains.claude import ClaudeSettingsDomain
-
-            claude_factory: Callable[[], DomainAdapter] = lambda: ClaudeSettingsDomain(claude_settings_path)
-            try:
-                adapters.append(claude_factory())
-            except Exception:
-                adapters.append(RecoverableDomain("claude", claude_factory))
+            adapters.append(claude_factory())
         except Exception:
-            adapters.append(UnavailableDomain("claude"))
-        try:
-            from .domains.logs import LogsDomain
-
-            adapters = [adapter for adapter in adapters if getattr(adapter, "name", "") != "logs"]
-            adapters.append(
-                LogsDomain(
-                    runtime_root,
-                    config_path=config_path,
-                    runtime_settings_path=runtime_settings_path,
-                )
+            adapters.append(RecoverableDomain("claude", claude_factory))
+        adapters.append(
+            LogsDomain(
+                runtime_root,
+                config_path=config_path,
+                runtime_settings_path=runtime_settings_path,
             )
-        except Exception:
-            # A log directory can be unavailable during early startup; retain
-            # the neutral summary adapter so the rest of the UI still opens.
-            pass
+        )
+        language_factory: Callable[[], DomainAdapter] = lambda: LanguageSettingsDomain(language_path)
         try:
-            from .domains.language import LanguageSettingsDomain
-
-            language_factory: Callable[[], DomainAdapter] = lambda: LanguageSettingsDomain(language_path)
-            try:
-                adapters.append(language_factory())
-            except Exception:
-                adapters.append(RecoverableDomain("language", language_factory))
+            adapters.append(language_factory())
         except Exception:
-            adapters.append(UnavailableDomain("language"))
+            adapters.append(RecoverableDomain("language", language_factory))
         try:
-            from .domains.relay_accounts import RelayAccountsDomain
+            relay_path = None
+            if config_path is not None:
+                from webdav import core as webdav_core
 
-            adapters.append(RelayAccountsDomain(runtime_root))
+                relay_path = webdav_core.relay_accounts_path(Path(config_path).expanduser())
+            adapters.append(RelayAccountsDomain(runtime_root, storage_path=relay_path))
         except Exception:
             adapters.append(UnavailableDomain("relay_accounts"))
         from .operations import CoreServiceController
@@ -1023,54 +1045,99 @@ class CoreStore:
             raise DomainNotFound(name)
         return name, adapter
 
-    def editor_descriptor(self, domain: str, document: str) -> dict[str, Any]:
-        """Describe a native editor without returning its sensitive text."""
+    def editor_document(self, domain: str, document: str) -> dict[str, Any]:
+        """Read one versioned editor document as a single Core operation.
+
+        The editor lease is derived from both the document text and its Core
+        revision.  Reading those separately leaves a small race where an
+        unrelated state update can advance the revision after the descriptor
+        is created but before its text is read, producing a false conflict.
+        Keep them under the same lock so a newly opened editor always receives
+        a self-consistent capability baseline.
+        """
 
         with self._lock:
             name, _adapter = self._editor_adapter(domain, document)
-            return {"domain": name, "document": document, "revision": self._revision}
+            return {
+                "domain": name,
+                "document": document,
+                "revision": self._revision,
+                "text": self._trusted_editor_text_unlocked(domain, document),
+            }
+
+    def _trusted_editor_text_unlocked(self, domain: str, document: str) -> str:
+        """Read one editor document while the caller holds ``self._lock``."""
+
+        name, adapter = self._editor_adapter(domain, document)
+        try:
+            if name == "codex":
+                exporter = getattr(adapter, "export", None)
+                if not callable(exporter):
+                    raise CoreError("invalid_editor", "The requested editor is unavailable")
+                raw = exporter(include_sensitive=True)
+                key = "config_text" if document == "config" else "auth_text"
+                text = raw.get(key) if isinstance(raw, Mapping) else None
+            else:
+                raw_text = getattr(adapter, "raw_text", None)
+                text = raw_text(include_sensitive=True, document=document) if callable(raw_text) else None
+        except CoreError:
+            raise
+        except Exception as exc:
+            raise CoreError("editor_unavailable", safe_exception_message(exc)) from None
+        if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
+            raise CoreError("editor_unavailable", "The requested editor is unavailable")
+        return text
+
+    @staticmethod
+    def _editor_text_digest(text: str) -> str:
+        """Return an opaque editor-content identity for capability rebasing."""
+
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def trusted_editor_text(self, domain: str, document: str, *, revision: int) -> str:
-        """Read raw text only for the authenticated native-host editor path."""
+        """Read raw text for the authenticated, versioned editor path."""
 
         with self._lock:
             self._check_revision(revision)
-            name, adapter = self._editor_adapter(domain, document)
-            try:
-                if name == "codex":
-                    exporter = getattr(adapter, "export", None)
-                    if not callable(exporter):
-                        raise CoreError("invalid_editor", "The requested editor is unavailable")
-                    raw = exporter(include_sensitive=True)
-                    key = "config_text" if document == "config" else "auth_text"
-                    text = raw.get(key) if isinstance(raw, Mapping) else None
-                else:
-                    raw_text = getattr(adapter, "raw_text", None)
-                    text = raw_text(include_sensitive=True, document=document) if callable(raw_text) else None
-            except CoreError:
-                raise
-            except Exception as exc:
-                raise CoreError("editor_unavailable", safe_exception_message(exc)) from None
-            if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
-                raise CoreError("editor_unavailable", "The requested editor is unavailable")
-            return text
+            return self._trusted_editor_text_unlocked(domain, document)
 
-    def stage_editor_text(self, domain: str, document: str, text: str, *, revision: int) -> dict[str, Any]:
-        """Stage one native-editor result without exposing it to React."""
+    def stage_editor_text(
+        self,
+        domain: str,
+        document: str,
+        text: str,
+        *,
+        revision: int,
+        expected_text_digest: str | None = None,
+    ) -> dict[str, Any]:
+        """Stage one versioned CodeMirror editor document."""
 
         if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
             raise CoreError("invalid_editor", "The editor document is invalid")
-        name, _adapter = self._editor_adapter(domain, document)
-        payload: dict[str, Any]
-        if name == "codex":
-            payload = {"document": document, "text": text}
-        else:
-            payload = {"document": document, "raw_json": text}
-        return self.dispatch(
-            {"domain": name, "type": "set_raw", "payload": payload},
-            expected_revision=revision,
-            _trusted_native_capability=True,
-        )
+        with self._lock:
+            name, _adapter = self._editor_adapter(domain, document)
+            # Global Core revisions also advance for unrelated operations such
+            # as status/menu telemetry. A raw editor must not turn one of
+            # those into a false "changed outside this window" conflict. When
+            # the document the capability originally read is still identical,
+            # safely rebase only that trusted capability onto the current Core
+            # revision. A real change to this document continues to reject.
+            self._refresh_external_disk_state()
+            if expected_text_digest is not None and revision != self._revision:
+                if self._editor_text_digest(self._trusted_editor_text_unlocked(domain, document)) != expected_text_digest:
+                    raise RevisionConflict(revision, self._revision)
+                revision = self._revision
+            self._check_revision(revision)
+            payload: dict[str, Any]
+            if name == "codex":
+                payload = {"document": document, "text": text}
+            else:
+                payload = {"document": document, "raw_json": text}
+            return self.dispatch(
+                {"domain": name, "type": "set_raw", "payload": payload},
+                expected_revision=revision,
+                _trusted_native_capability=True,
+            )
 
     def secret_descriptor(self, domain: str, field: str, target: object | None = None) -> dict[str, Any]:
         """Validate one native-only secret slot without returning its value."""
@@ -1576,11 +1643,11 @@ class CoreStore:
                     upstream_model = model.get("upstream_model", model.get("litellm_model", ""))
                     if isinstance(upstream_model, str) and "/" in upstream_model:
                         upstream_model = upstream_model.split("/", 1)[1]
-                    order_value = model.get("order", 1)
+                    order_value = model.get("order", 0)
                     try:
-                        order = int(order_value) if not isinstance(order_value, bool) else 1
+                        order = int(order_value) if not isinstance(order_value, bool) else 0
                     except (TypeError, ValueError, OverflowError):
-                        order = 1
+                        order = 0
                     summary = {
                         "id": str(model_id),
                         "display_name": str(model_display_name),
@@ -1740,6 +1807,196 @@ class CoreStore:
             self._emit()
             return {"revision": self._revision, "result": _safe_public(result)}
 
+    @staticmethod
+    def _webdav_sync_sections(payload: object) -> tuple[str, str]:
+        data = _as_mapping(payload)
+        if set(data).difference({"sections"}):
+            raise CoreError("invalid_sections", "WebDAV sync options are invalid")
+        sections = data.get("sections")
+        if sections is None:
+            return ("providers_models", "relay_accounts")
+        if isinstance(sections, (str, bytes, bytearray)) or not isinstance(sections, Sequence):
+            raise CoreError("invalid_sections", "WebDAV sync sections are invalid")
+        try:
+            selected = tuple(dict.fromkeys(_canonical_domain(value) for value in sections))
+        except CoreError:
+            raise CoreError("invalid_sections", "WebDAV sync sections are invalid") from None
+        required = {"providers_models", "relay_accounts"}
+        if set(selected) != required:
+            raise CoreError(
+                "invalid_sections",
+                "WebDAV sync requires Providers & Models and Relay Accounts together",
+            )
+        return ("providers_models", "relay_accounts")
+
+    def _dispatch_webdav_sync(
+        self,
+        operation: str,
+        payload: object,
+        expected_revision: object | None,
+    ) -> dict[str, Any]:
+        """Run one explicit legacy-bundle WebDAV operation transactionally."""
+
+        sections = self._webdav_sync_sections(payload)
+        from webdav import core as webdav_core
+        from webdav import operations as webdav_operations
+
+        with self._lock:
+            self._refresh_external_disk_state()
+            self._check_revision(expected_revision)
+            webdav = self._domains.get("webdav")
+            providers = self._domains.get("providers_models")
+            relay = self._domains.get("relay_accounts")
+            if webdav is None or providers is None or relay is None:
+                raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
+            if any(self._drafts.get(name, {}).get("dirty") for name in ("webdav", *sections)):
+                raise CoreError("webdav_sync_conflict", "Apply or discard selected local drafts before WebDAV sync")
+            if any(self._disk.get(name, {}).get("changed") for name in ("webdav", *sections)):
+                raise CoreError("webdav_sync_conflict", "Reload changed local files before WebDAV sync")
+
+            settings_getter = getattr(webdav, "sync_settings", None)
+            if not callable(settings_getter):
+                raise CoreError("webdav_sync_failed", "WebDAV sync is unavailable")
+            try:
+                settings = settings_getter()
+            except Exception:
+                raise CoreError("webdav_sync_failed", "WebDAV is not configured") from None
+            config_value = getattr(providers, "config_path", None)
+            relay_value = getattr(relay, "storage_path", None)
+            state_value = getattr(webdav, "state_path", None)
+            status_value = getattr(webdav, "status_path", None)
+            if not all(isinstance(value, (str, Path)) for value in (config_value, relay_value, state_value, status_value)):
+                raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
+            config_path = Path(config_value).expanduser()
+            relay_path = Path(relay_value).expanduser()
+            state_path = Path(state_value).expanduser()
+            status_path = Path(status_value).expanduser()
+            if not _same_path(relay_path, webdav_core.relay_accounts_path(config_path)):
+                raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
+
+            adapter_checkpoints = {
+                name: _checkpoint_adapter(adapter, error_code="webdav_sync_failed")
+                for name, adapter in (("providers_models", providers), ("relay_accounts", relay))
+            }
+            core_checkpoint = {
+                "revision": self._revision,
+                "drafts": copy.deepcopy(self._drafts),
+                "last_actions": copy.deepcopy(self._last_actions),
+                "baselines": copy.deepcopy(self._baselines),
+                "disk": copy.deepcopy(self._disk),
+                "disk_identities": copy.deepcopy(self._disk_identities),
+                "service": copy.deepcopy(self._service),
+            }
+            persistence_paths = [
+                config_path,
+                webdav_core.disabled_models_path(config_path),
+                relay_path,
+                state_path,
+            ]
+            if self._metadata_store is not None:
+                persistence_paths.append(self._metadata_store.path)
+            try:
+                file_checkpoints = _checkpoint_files(persistence_paths)
+            except CoreError:
+                raise CoreError("webdav_sync_failed", "WebDAV sync could not prepare local files") from None
+
+            pulled = False
+            outcome = operation
+            try:
+                client = webdav_core.WebDAVClient(settings)
+                if operation == "push":
+                    webdav_operations.push_bundle(client, settings, config_path, state_path, "push")
+                elif operation == "pull":
+                    webdav_operations.pull_bundle(client, settings, config_path, state_path, "pull")
+                    pulled = True
+                else:
+                    local_manifest = webdav_core.build_manifest(config_path)
+                    remote_manifest = webdav_operations.read_remote_manifest(client, settings)
+                    base_manifest = webdav_core.baseline_manifest(state_path)
+                    if remote_manifest is None:
+                        webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
+                        outcome = "push"
+                    elif webdav_core.manifests_match(local_manifest, remote_manifest):
+                        webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
+                        outcome = "unchanged"
+                    elif base_manifest is None:
+                        raise webdav_core.SyncError("WebDAV sync conflict")
+                    else:
+                        local_changed = not webdav_core.manifests_match(local_manifest, base_manifest)
+                        remote_changed = not webdav_core.manifests_match(remote_manifest, base_manifest)
+                        if local_changed and not remote_changed:
+                            webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
+                            outcome = "push"
+                        elif remote_changed and not local_changed:
+                            webdav_operations.pull_bundle(client, settings, config_path, state_path, "sync-pull")
+                            pulled = True
+                            outcome = "pull"
+                        elif local_changed and remote_changed:
+                            raise webdav_core.SyncError("WebDAV sync conflict")
+                        else:
+                            webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
+                            outcome = "unchanged"
+
+                if pulled:
+                    for name, adapter in (("providers_models", providers), ("relay_accounts", relay)):
+                        adapter.reload()
+                        self._baselines[name] = self._adapter_draft_state(name)
+                        self._disk[name] = {
+                            "changed": False,
+                            "generation": int(self._disk.get(name, {}).get("generation", 0)),
+                            "keep_draft": False,
+                        }
+                        self._disk_identities[name] = self._external_disk_identity(adapter)
+                        self._mark_domain(
+                            name,
+                            dirty=False,
+                            validation={"valid": True, "issues": []},
+                            base_revision=self._revision + 1,
+                        )
+                webdav_core.save_sync_status(status_path, operation, True)
+                self._last_actions["webdav"] = {
+                    "action": operation,
+                    "ok": True,
+                    "outcome": outcome,
+                    "sections": list(sections),
+                }
+                self._revision += 1
+                self._persist_metadata()
+                status_handler = self._service_handlers.get("status")
+                if status_handler is not None:
+                    try:
+                        service_result = status_handler("health")
+                    except Exception:
+                        service_result = None
+                    if isinstance(service_result, Mapping):
+                        self._set_service_from_result(service_result, increment=False)
+            except Exception as exc:
+                rollback_failed = False
+                try:
+                    _restore_files(file_checkpoints)
+                    for name, adapter in (("providers_models", providers), ("relay_accounts", relay)):
+                        _restore_adapter(adapter, adapter_checkpoints[name])
+                except Exception:
+                    rollback_failed = True
+                self._revision = int(core_checkpoint["revision"])
+                self._drafts = core_checkpoint["drafts"]
+                self._last_actions = core_checkpoint["last_actions"]
+                self._baselines = core_checkpoint["baselines"]
+                self._disk = core_checkpoint["disk"]
+                self._disk_identities = core_checkpoint["disk_identities"]
+                self._service = core_checkpoint["service"]
+                try:
+                    webdav_core.save_sync_status(status_path, operation, False)
+                except Exception:
+                    pass
+                if rollback_failed:
+                    raise CoreError("webdav_sync_failed", "WebDAV sync could not roll back local files") from None
+                if isinstance(exc, CoreError):
+                    raise
+                raise CoreError("webdav_sync_failed", "WebDAV sync failed") from None
+            self._emit()
+            return {"revision": self._revision}
+
     def dispatch(
         self,
         action: Mapping[str, Any],
@@ -1770,6 +2027,21 @@ class CoreStore:
                 enabled,
                 expected_revision if expected_revision is not None else data.get("expected_revision"),
             )
+        if domain_value is not None and _canonical_domain(domain_value) == "webdav":
+            webdav_operation = {
+                "push": "push",
+                "webdav_push": "push",
+                "pull": "pull",
+                "webdav_pull": "pull",
+                "sync": "sync",
+                "webdav_sync": "sync",
+            }.get(normalized_action)
+            if webdav_operation is not None:
+                return self._dispatch_webdav_sync(
+                    webdav_operation,
+                    data.get("payload"),
+                    expected_revision if expected_revision is not None else data.get("expected_revision"),
+                )
         with self._lock:
             self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
             previous_revision = self._revision
@@ -1817,8 +2089,8 @@ class CoreStore:
                 except ConfirmationNeeded:
                     raise
                 except Exception as exc:
-                    # Domain exceptions are authored to be safe, but still
-                    # normalize a third-party/legacy exception defensively.
+                    # Domain exceptions are authored to be safe; normalize
+                    # them into the stable Core protocol error shape.
                     raise CoreError("domain_error", safe_exception_message(exc)) from None
                 after = self._adapter_draft_state(name)
                 if isinstance(result, Mapping):
@@ -1862,7 +2134,7 @@ class CoreStore:
         elif name == "codex":
             forbidden = {"api_key", "auth_text", "raw_json"}
             if normalized in {"set_raw", "setraw"}:
-                raise CoreError("secret_requires_native", "Use the native secure editor for this document")
+                raise CoreError("secret_requires_native", "Use the versioned code editor for this document")
         elif name == "claude":
             forbidden = {
                 "env",
@@ -1876,7 +2148,7 @@ class CoreStore:
                 "raw_json",
             }
             if normalized in {"set_raw", "setraw"}:
-                raise CoreError("secret_requires_native", "Use the native secure editor for this document")
+                raise CoreError("secret_requires_native", "Use the versioned code editor for this document")
         elif name == "webdav":
             forbidden = {"password"}
             if normalized in {"clear_password", "clearpassword"}:
@@ -1894,7 +2166,7 @@ class CoreStore:
             ):
                 raise CoreError("secret_requires_native", "Use the native secure input for this secret field")
             if normalized in {"set_raw", "setraw"}:
-                raise CoreError("secret_requires_native", "Use the native secure editor for this document")
+                raise CoreError("secret_requires_native", "Use the versioned code editor for this document")
         if forbidden and _mapping_contains_key(payload, forbidden):
             raise CoreError("secret_requires_native", "Use the native secure input for this secret field")
 
@@ -2140,7 +2412,7 @@ class CoreStore:
             return {"revision": self._revision}
 
     def probe(self, payload: Mapping[str, Any] | None = None, *, domain: str | None = None) -> dict[str, Any]:
-        name = _canonical_domain(domain or "providers-models")
+        name = _canonical_domain(domain or "providers_models")
         data = dict(payload or {})
         with self._lock:
             adapter = self._domains.get(name)
@@ -2300,7 +2572,7 @@ class CoreStore:
                         # A trusted, explicitly selected destination may carry
                         # credentials, but the response sent back to RN must
                         # remain redacted.  Domain adapters that support this
-                        # opt in with ``include_sensitive=True``; legacy
+                        # opt in with ``include_sensitive=True``; other
                         # adapters keep their safe no-argument export.
                         try:
                             parameters = inspect.signature(method).parameters
@@ -2327,99 +2599,171 @@ class CoreStore:
             result["package"] = safe_package
             return result
 
-    def import_package(
-        self,
-        *,
-        source_token: str | None = None,
-        package: Mapping[str, Any] | None = None,
-        sections: Sequence[str] | None = None,
-        revision: int | None = None,
-    ) -> dict[str, Any]:
-        # Reject an already-stale picker result before consuming its opaque
-        # capability.  The check under the staging lock below closes the race
-        # while the selected package is read and parsed.
-        with self._lock:
-            self._check_revision(revision)
-        if package is None:
-            if source_token is None:
-                raise CoreError("invalid_package", "A configuration package is required")
-            path = self.file_capabilities.resolve(source_token, "import")
+    def _read_import_package(self, path: Path) -> Mapping[str, Any]:
+        """Parse one selected file without using any preselected UI sections."""
+
+        try:
+            from .operations import ConfigurationPackageAdapter
+
             try:
-                from .operations import ConfigurationPackageAdapter
+                selected_json: dict[str, Any] | None = read_json(path)
+            except PersistenceError:
+                selected_json = None
+
+            if selected_json is not None and selected_json.get("format") == DOMAIN_FILE_FORMAT:
+                if set(selected_json) != {"format", "version", "domain", "settings"}:
+                    raise CoreError("invalid_package", "Settings file has an unsupported shape")
+                name = _canonical_domain(selected_json.get("domain"))
+                if (
+                    selected_json.get("version") != DOMAIN_FILE_VERSION
+                    or name not in {"providers_models", "runtime"}
+                    or not isinstance(selected_json.get("settings"), Mapping)
+                ):
+                    raise CoreError("invalid_package", "Settings file version is unsupported")
+                return {
+                    "format": PACKAGE_FORMAT,
+                    "version": PACKAGE_VERSION,
+                    "sections": {name: copy.deepcopy(dict(selected_json["settings"]))},
+                }
+
+            if selected_json is not None and selected_json.get("format") == PACKAGE_FORMAT:
+                return selected_json
+
+            if (
+                selected_json is not None
+                and selected_json.get("format") == "litellm-menu-configuration-package"
+            ):
+                from .domains.providers_models import ProvidersModelsDomain
+                from .domains.runtime import RuntimeSettingsDomain
 
                 provider = self._domains.get("providers_models")
                 runtime = self._domains.get("runtime")
-                config_path = getattr(provider, "config_path", None)
-                settings_path = getattr(runtime, "settings_path", None)
-                requested = None if sections is None else [_canonical_domain(section) for section in sections]
-                try:
-                    selected_json: dict[str, Any] | None = read_json(path)
-                except PersistenceError:
-                    selected_json = None
-                if selected_json is not None and selected_json.get("format") == DOMAIN_FILE_FORMAT:
-                    if set(selected_json) != {"format", "version", "domain", "settings"}:
-                        raise CoreError("invalid_package", "Settings file has an unsupported shape")
-                    name = _canonical_domain(selected_json.get("domain"))
-                    if (
-                        selected_json.get("version") != DOMAIN_FILE_VERSION
-                        or name not in {"providers_models", "runtime"}
-                        or not isinstance(selected_json.get("settings"), Mapping)
-                    ):
-                        raise CoreError("invalid_package", "Settings file version is unsupported")
-                    if requested is not None and requested != [name]:
-                        raise CoreError("invalid_package", "Settings file does not contain the selected section")
-                    package = {
-                        "format": PACKAGE_FORMAT,
-                        "version": PACKAGE_VERSION,
-                        "sections": {name: copy.deepcopy(dict(selected_json["settings"]))},
-                    }
-                elif selected_json is not None and selected_json.get("format") == PACKAGE_FORMAT:
-                    package = selected_json
-                elif requested == ["providers_models"]:
-                    import external_provider_import
+                if not isinstance(provider, ProvidersModelsDomain) or not isinstance(runtime, RuntimeSettingsDomain):
+                    raise CoreError("invalid_package", "Configuration package sources are unavailable")
+                adapter = ConfigurationPackageAdapter(
+                    config_path=Path(provider.config_path),
+                    settings_path=Path(runtime.settings_path),
+                )
+                loaded = adapter.load(path)
+                return {
+                    "format": PACKAGE_FORMAT,
+                    "version": PACKAGE_VERSION,
+                    "sections": ConfigurationPackageAdapter.core_sections(loaded, None),
+                }
 
-                    imported = external_provider_import.import_explicit(path)
-                    providers = imported.get("providers") if isinstance(imported, Mapping) else None
-                    if not isinstance(providers, list):
-                        raise CoreError("invalid_package", "Provider configuration could not be imported")
-                    package = {
-                        "format": PACKAGE_FORMAT,
-                        "version": PACKAGE_VERSION,
-                        "sections": {"providers_models": {"providers": copy.deepcopy(providers)}},
-                    }
-                elif requested == ["runtime"]:
-                    raise CoreError("invalid_package", "Runtime settings import requires a Runtime Settings JSON file")
-                elif config_path is not None and settings_path is not None:
-                    adapter = ConfigurationPackageAdapter(
-                        config_path=Path(config_path),
-                        settings_path=Path(settings_path),
-                    )
-                    loaded = adapter.load(path)
-                    package_sections = adapter.core_sections(loaded, sections)
-                    package = {
-                        "format": PACKAGE_FORMAT,
-                        "version": PACKAGE_VERSION,
-                        "sections": package_sections,
-                    }
-                else:
-                    package = selected_json if selected_json is not None else read_json(path)
-            except (PersistenceError, ValueError) as exc:
-                raise CoreError("invalid_package", safe_exception_message(exc)) from None
-            except Exception as exc:
-                raise CoreError("invalid_package", safe_exception_message(exc)) from None
+            # All other supported JSON/TOML/YAML/SQL shapes are existing
+            # provider/model imports. Detection happens only after the native
+            # picker has returned the file; no checkbox hint influences it.
+            import external_provider_import
+
+            imported = external_provider_import.import_explicit(path)
+            providers = imported.get("providers") if isinstance(imported, Mapping) else None
+            if not isinstance(providers, list):
+                raise CoreError("invalid_package", "Provider configuration could not be imported")
+            return {
+                "format": PACKAGE_FORMAT,
+                "version": PACKAGE_VERSION,
+                "sections": {"providers_models": {"providers": copy.deepcopy(providers)}},
+            }
+        except CoreError:
+            raise
+        except (PersistenceError, ValueError) as exc:
+            raise CoreError("invalid_package", safe_exception_message(exc)) from None
+        except Exception as exc:
+            raise CoreError("invalid_package", safe_exception_message(exc)) from None
+
+    def _validated_import_package(
+        self, package: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], tuple[str, ...]]:
         if not isinstance(package, Mapping) or set(package) != {"format", "version", "sections"}:
             raise CoreError("invalid_package", "Configuration package has an unsupported shape")
-        if package.get("format") != PACKAGE_FORMAT or package.get("version") != PACKAGE_VERSION or not isinstance(package.get("sections"), Mapping):
+        if (
+            package.get("format") != PACKAGE_FORMAT
+            or package.get("version") != PACKAGE_VERSION
+            or not isinstance(package.get("sections"), Mapping)
+        ):
             raise CoreError("invalid_package", "Configuration package version is unsupported")
         raw_sections = package["sections"]
-        selected = list(raw_sections) if sections is None else [_canonical_domain(section) for section in sections]
+        if not raw_sections:
+            raise CoreError("invalid_package", "Configuration package does not contain settings")
+        normalized: dict[str, Any] = {}
+        for raw_name, payload in raw_sections.items():
+            name = _canonical_domain(raw_name)
+            if name != raw_name or name not in IMPORTABLE_DOMAINS:
+                raise CoreError("invalid_package", "Configuration package contains an unsupported section")
+            if name in normalized:
+                raise CoreError("invalid_package", "Configuration package contains a repeated section")
+            if self._domains.get(name) is None:
+                raise DomainNotFound(name)
+            normalized[name] = copy.deepcopy(payload)
+        return (
+            {"format": PACKAGE_FORMAT, "version": PACKAGE_VERSION, "sections": normalized},
+            tuple(normalized),
+        )
+
+    def prepare_import(
+        self,
+        *,
+        source_token: str,
+        revision: int | None = None,
+    ) -> PreparedImport:
+        """Consume a picker capability and prepare a non-mutating import plan."""
+
+        with self._lock:
+            self._check_revision(revision)
+        path = self.file_capabilities.resolve(source_token, "import")
+        package, detected = self._validated_import_package(self._read_import_package(path))
+        with self._lock:
+            # Parsing may be expensive. Bind the plan to the exact state whose
+            # existing drafts are described by this preview.
+            self._check_revision(revision)
+            preview = {
+                name: {
+                    "available": True,
+                    "will_replace_draft": bool(self._drafts.get(name, {}).get("dirty")),
+                }
+                for name in detected
+            }
+            return PreparedImport(
+                package=package,
+                detected_sections=detected,
+                preview=preview,
+                revision=self._revision,
+            )
+
+    def import_package(
+        self,
+        *,
+        package: Mapping[str, Any],
+        sections: Sequence[str] | None = None,
+        revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Stage a package previously parsed by :meth:`prepare_import`.
+
+        File capabilities are accepted only by ``prepare_import``.  Import
+        execution receives the parsed package held by the session-bound IPC
+        plan, so a caller cannot bypass preview detection or submit another
+        path at staging time.
+        """
+
+        package, detected = self._validated_import_package(package)
+        if sections is None:
+            selected = list(detected)
+        else:
+            if isinstance(sections, (str, bytes, bytearray)) or not isinstance(sections, Sequence) or not sections:
+                raise CoreError("invalid_sections", "Choose at least one detected configuration section")
+            requested = list(dict.fromkeys(_canonical_domain(section) for section in sections))
+            if len(requested) != len(sections):
+                raise CoreError("invalid_sections", "Choose only sections detected in the selected file")
+            if not set(requested).issubset(detected):
+                raise CoreError("invalid_sections", "Choose only sections detected in the selected file")
+            selected = requested
+        raw_sections = package["sections"]
         with self._lock:
             self._check_revision(revision)
             pending: list[tuple[str, DomainAdapter, object]] = []
             preview: dict[str, dict[str, bool]] = {}
             for name in selected:
-                if name not in raw_sections:
-                    raise CoreError("invalid_package", "Configuration package does not contain the selected section")
                 adapter = self._domains.get(name)
                 if adapter is None:
                     raise DomainNotFound(name)
@@ -2481,11 +2825,6 @@ class CoreStore:
             self._emit()
             return {"revision": self._revision, "draft_domains": staged, "preview": preview}
 
-    # Python cannot use ``import`` as a method name, but keeping this alias
-    # makes direct callers mirror the wire method exactly.
-    def import_(self, **kwargs: Any) -> dict[str, Any]:
-        return self.import_package(**kwargs)
-
     def set_service_status(
         self,
         state: str,
@@ -2522,16 +2861,9 @@ class CoreStore:
             self._revision += 1
             self._emit()
 
-
-CoreService = CoreStore
-Core = CoreStore
-
-
 __all__ = [
     "CORE_METADATA_VERSION",
-    "Core",
     "CoreError",
-    "CoreService",
     "CoreStore",
     "ConfirmationNeeded",
     "DomainAdapter",

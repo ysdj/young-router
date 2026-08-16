@@ -13,7 +13,10 @@ import unittest
 from unittest import mock
 
 from litellm_menu.core import CoreStore
-from litellm_menu.core.domains.legacy import ProvidersModelsDomain, RuntimeSettingsDomain, WebDAVSettingsDomain
+from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
+from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
+from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
 from litellm_menu.core.operations import CoreServiceController
 from litellm_menu.core.persistence import PersistenceError
 
@@ -30,6 +33,27 @@ model_list: []
 
 
 class CoreOperationsTests(unittest.TestCase):
+    @staticmethod
+    def _configured_webdav_domain(root: Path, config: Path) -> WebDAVSettingsDomain:
+        domain = WebDAVSettingsDomain(
+            root / "webdav.json",
+            enabled_path=root / "webdav.enabled",
+            status_path=root / "webdav-status.json",
+            config_path=config,
+            state_path=root / "webdav-state.json",
+        )
+        domain.stage_secret("password", None, "replace-webdav-password")
+        domain.dispatch(
+            "patch",
+            {
+                "url": "https://webdav.example.test/config/",
+                "username": "person",
+                "remote_name": "menu-config.json",
+            },
+        )
+        domain.apply()
+        return domain
+
     def test_reload_restarts_the_managed_service(self) -> None:
         controller = CoreServiceController("/tmp/unused-runtime")
         expected = {"state": "running"}
@@ -479,6 +503,24 @@ class CoreOperationsTests(unittest.TestCase):
             with mock.patch.object(controller, "_health", return_value=True):
                 self.assertEqual("unknown", controller.status()["state"])
 
+    def test_codex_descendant_cleanup_uses_runtime_settings_value(self) -> None:
+        key = "LITELLM_MENU_CODEX_DESCENDANT_CLEANUP"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RuntimeSettingsDomain(root / "runtime-settings.env")
+            domain.dispatch("set_setting", {"key": key, "value": "0"})
+            domain.apply()
+
+            saved_off = CoreServiceController(root, environment={key: "1"})
+            self.assertEqual("0", saved_off._runtime_env()[key])
+
+            domain.dispatch("set_setting", {"key": key, "value": "1"})
+            domain.apply()
+
+            restored_default = CoreServiceController(root, environment={key: "0"})
+            self.assertEqual("1", restored_default._runtime_env()[key])
+            self.assertNotIn(key, (root / "runtime-settings.env").read_text(encoding="utf-8"))
+
     def test_controller_ignores_removed_persisted_runtime_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -820,14 +862,146 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(2, exported["section_count"])
             self.assertNotIn("replace-me-secret", json.dumps(exported))
             import_token = core.file_capabilities.register(package, "import")
+            prepared = core.prepare_import(source_token=import_token, revision=core.revision)
             imported = core.import_package(
-                source_token=import_token,
+                package=prepared.package,
                 sections=["providers_models", "runtime"],
-                revision=core.revision,
+                revision=prepared.revision,
             )
             self.assertEqual(["providers_models", "runtime"], imported["draft_domains"])
             self.assertFalse(imported["preview"]["providers_models"]["will_replace_draft"])
             self.assertFalse(imported["preview"]["runtime"]["will_replace_draft"])
+
+    def test_preview_detects_a_single_domain_file_before_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            settings = root / "runtime-settings.env"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            settings.write_text("LITELLM_PORT=4100\n", encoding="utf-8")
+            core = CoreStore(domains=[ProvidersModelsDomain(config), RuntimeSettingsDomain(settings)])
+            provider_file = root / "providers.json"
+            core.export(
+                ["providers_models"],
+                destination_token=core.file_capabilities.register(provider_file, "export"),
+            )
+
+            import_token = core.file_capabilities.register(provider_file, "import")
+            prepared = core.prepare_import(source_token=import_token, revision=core.revision)
+            result = core.import_package(
+                package=prepared.package,
+                sections=["providers_models"],
+                revision=prepared.revision,
+            )
+
+            self.assertEqual(["providers_models"], result["draft_domains"])
+
+    def test_manual_webdav_push_uses_selected_bundle_sections_and_records_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            with mock.patch("webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "webdav.operations.push_bundle",
+                return_value=(32, {"files": []}),
+            ) as pushed:
+                result = core.dispatch(
+                    {
+                        "domain": "webdav",
+                        "type": "push",
+                        "payload": {"sections": ["providers_models", "relay_accounts"]},
+                    },
+                    expected_revision=core.revision,
+                )
+
+            self.assertEqual({"revision"}, set(result))
+            pushed.assert_called_once()
+            status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
+            self.assertEqual({"action": "push", "ok": True}, {key: status[key] for key in ("action", "ok")})
+            summary = core.snapshot()["action_summaries"]["webdav"]
+            self.assertEqual(["providers_models", "relay_accounts"], summary["sections"])
+            self.assertNotIn("replace-webdav-password", json.dumps(core.snapshot()))
+
+    def test_manual_webdav_sync_rejects_partial_sections_and_dirty_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            with self.assertRaises(Exception) as partial:
+                core.dispatch(
+                    {
+                        "domain": "webdav",
+                        "type": "sync",
+                        "payload": {"sections": ["providers_models"]},
+                    },
+                    expected_revision=core.revision,
+                )
+            self.assertEqual("invalid_sections", partial.exception.code)
+
+            core.dispatch(
+                {
+                    "domain": "webdav",
+                    "type": "patch",
+                    "payload": {"remote_name": "other-config.json"},
+                },
+                expected_revision=core.revision,
+            )
+            with self.assertRaises(Exception) as dirty_webdav:
+                core.dispatch(
+                    {"domain": "webdav", "type": "push", "payload": {}},
+                    expected_revision=core.revision,
+                )
+            self.assertEqual("webdav_sync_conflict", dirty_webdav.exception.code)
+
+            core.reload("webdav", revision=core.revision)
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.patch",
+                    "payload": {"provider_id": "primary", "changes": {"enabled": False}},
+                },
+                expected_revision=core.revision,
+            )
+            with self.assertRaises(Exception) as dirty_providers:
+                core.dispatch(
+                    {"domain": "webdav", "type": "pull", "payload": {}},
+                    expected_revision=core.revision,
+                )
+            self.assertEqual("webdav_sync_conflict", dirty_providers.exception.code)
+
+    def test_manual_webdav_failure_records_failed_status_without_leaking_details(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            with mock.patch("webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "webdav.operations.push_bundle",
+                side_effect=RuntimeError("replace-webdav-password /private/config.yaml"),
+            ), self.assertRaises(Exception) as raised:
+                core.dispatch(
+                    {"domain": "webdav", "type": "push", "payload": {}},
+                    expected_revision=core.revision,
+                )
+
+            self.assertEqual("webdav_sync_failed", raised.exception.code)
+            self.assertEqual("WebDAV sync failed", str(raised.exception))
+            status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
+            self.assertEqual({"action": "push", "ok": False}, {key: status[key] for key in ("action", "ok")})
 
     def test_single_domain_files_are_json_and_provider_yaml_remains_importable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -849,10 +1023,12 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(1, result["section_count"])
             self.assertNotIn("replace-me-secret", json.dumps(result))
             self.assertIn("replace-me-secret", json.dumps(payload))
+            provider_token = core.file_capabilities.register(provider_json, "import")
+            provider_plan = core.prepare_import(source_token=provider_token, revision=core.revision)
             imported = core.import_package(
-                source_token=core.file_capabilities.register(provider_json, "import"),
+                package=provider_plan.package,
                 sections=["providers_models"],
-                revision=core.revision,
+                revision=provider_plan.revision,
             )
             self.assertEqual(["providers_models"], imported["draft_domains"])
 
@@ -864,16 +1040,20 @@ class CoreOperationsTests(unittest.TestCase):
             runtime_payload = json.loads(runtime_json.read_text(encoding="utf-8"))
             self.assertEqual("runtime", runtime_payload["domain"])
             self.assertEqual("4100", runtime_payload["settings"]["values"]["LITELLM_PORT"])
+            runtime_token = core.file_capabilities.register(runtime_json, "import")
+            runtime_plan = core.prepare_import(source_token=runtime_token, revision=core.revision)
             core.import_package(
-                source_token=core.file_capabilities.register(runtime_json, "import"),
+                package=runtime_plan.package,
                 sections=["runtime"],
-                revision=core.revision,
+                revision=runtime_plan.revision,
             )
 
+            yaml_token = core.file_capabilities.register(config, "import")
+            yaml_plan = core.prepare_import(source_token=yaml_token, revision=core.revision)
             yaml_import = core.import_package(
-                source_token=core.file_capabilities.register(config, "import"),
+                package=yaml_plan.package,
                 sections=["providers_models"],
-                revision=core.revision,
+                revision=yaml_plan.revision,
             )
             self.assertEqual(["providers_models"], yaml_import["draft_domains"])
 

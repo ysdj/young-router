@@ -11,6 +11,7 @@ export type IpcMethod =
   | "reload"
   | "probe"
   | "export"
+  | "import_preview"
   | "import";
 
 export type AppRoute =
@@ -19,7 +20,7 @@ export type AppRoute =
   | "codex-settings"
   | "claude-settings"
   | "runtime-settings"
-  | "webdav-settings"
+  | "data-management"
   | "relay-accounts"
   | "relay-add"
   | "logs";
@@ -195,7 +196,9 @@ export interface DispatchAction {
 export interface IpcParams {
   snapshot: Record<string, never>;
   logs: { tab: LogTab; revision?: number };
-  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer" };
+  editor:
+    | { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer" }
+    | { editor_token: string; text: string };
   dispatch: { action: DispatchAction; revision?: number };
   subscribe: { topics?: string[] };
   validate: { domain: ConfigDomain; revision?: number };
@@ -203,13 +206,14 @@ export interface IpcParams {
   reload: { domain?: ConfigDomain; revision?: number };
   probe: { domain?: "providers_models" | "webdav"; provider_id?: string; model_id?: string };
   export: { sections: ConfigDomain[]; destination_token: string };
-  import: { source_token: string; sections?: ConfigDomain[]; revision: number };
+  import_preview: { source_token: string; revision: number };
+  import: { import_plan_token: string; sections: ConfigDomain[]; revision: number };
 }
 
 export interface IpcResults {
   snapshot: { snapshot: CoreSnapshot };
   logs: { changed: boolean; revision: number; log: LogView | null };
-  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; editor_token: string; revision: number };
+  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; editor_token: string; revision: number; text: string };
   dispatch: { revision: number };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
@@ -227,6 +231,7 @@ export interface IpcResults {
     surfaces?: { surface: string; available: boolean; status?: string; original_request?: { method: string; url: string; headers: Record<string, string>; body: Record<string, unknown> } }[];
   };
   export: { revision: number; section_count: number; sections?: ConfigDomain[] };
+  import_preview: { revision: number; import_plan_token: string; detected_sections: ConfigDomain[]; preview: Partial<Record<ConfigDomain, { available: boolean; will_replace_draft: boolean }>> };
   import: {
     revision: number;
     draft_domains: ConfigDomain[];
@@ -275,6 +280,7 @@ export interface IpcClient {
   snapshot(): Promise<CoreSnapshot>;
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
   editor(domain: "codex" | "claude", document: "config" | "auth" | "settings" | "desktop" | "developer"): Promise<IpcResults["editor"]>;
+  stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<{ revision: number }>;
   subscribe(listener: (event: IpcEvent) => void, topics?: string[]): () => void;
   validate(domain: ConfigDomain, revision?: number): Promise<ValidationSummary>;
@@ -283,14 +289,15 @@ export interface IpcClient {
   reload(domain?: ConfigDomain, revision?: number): Promise<{ revision: number }>;
   probe(providerId?: string, modelId?: string, domain?: "providers_models" | "webdav"): Promise<IpcResults["probe"]>;
   export(sections: ConfigDomain[], destinationToken: string): Promise<IpcResults["export"]>;
-  import(sourceToken: string, revision: number, sections?: ConfigDomain[]): Promise<IpcResults["import"]>;
+  previewImport(sourceToken: string, revision: number): Promise<IpcResults["import_preview"]>;
+  importPlan(importPlanToken: string, revision: number, sections: ConfigDomain[]): Promise<IpcResults["import"]>;
 }
 
 export interface NativeWindow {
   open(route: AppRoute): void;
   close(route?: AppRoute): void;
   focus(route: AppRoute): void;
-  setContentSize?(width: number, height: number): Promise<boolean>;
+  setContentSize?(route: AppRoute, width: number, height: number): Promise<boolean>;
 }
 
 export interface NativeMenuBar {
@@ -369,7 +376,7 @@ export interface NativeLocalization {
   routeCodexSettings: string;
   routeClaudeSettings: string;
   routeRuntimeSettings: string;
-  routeWebdavSettings: string;
+  routeDataManagement: string;
   routeRelayAccounts: string;
   routeRelayAdd: string;
   routeLogs: string;
@@ -400,19 +407,18 @@ export interface NativeLeafAdapter {
   saveFilePicker(options: { suggestedName: string }): Promise<string | undefined>;
   showActionMenu(options: { title: string; items: string[]; anchor: NativeMenuAnchor }): Promise<number | undefined>;
   showConfirmation(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
+  showReadOnlyText(options: { title: string; text: string; closeLabel: string; language: "json" | "toml" | "text"; html: string }): Promise<void>;
   showCodexRestartConfirmation(options: {
     title: string;
     message: string;
     restartLabel: string;
     laterLabel: string;
   }): Promise<"restart" | "later" | undefined>;
-  showReadOnlyText(options: { title: string; text: string; closeLabel: string }): Promise<void>;
   chooseModelsToAdd(options: {
     models: string[];
     providerName: string;
     keyName: string;
   }): Promise<string[] | undefined>;
-  editSecureDocument(options: { editorToken: string; language: "toml" | "json"; title: string }): Promise<number | undefined>;
   editSecret(options: {
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
     field: string;

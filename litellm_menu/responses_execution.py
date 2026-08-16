@@ -1371,7 +1371,10 @@ def _wrap_generic_function_for_deployment_failover(
                     error_event="responses_chat_bridge_retry_error",
                 )
             if (
-                _routing_module._is_priority_deployment_failover_error(exc)
+                _routing_module._is_request_scoped_priority_deployment_failover_error(
+                    exc,
+                    kwargs,
+                )
                 and not _routing_module._should_retry_with_browser_compatible_headers(exc, kwargs)
             ):
                 # This wrapper has completed the selected deployment call. It
@@ -1635,18 +1638,6 @@ def _ordered_deployment_fallback_entry(
         )
     )
     if is_image_tool_runtime_probe:
-        if not _image_generation_module._request_can_attempt_image_generation_tool_fallback(request_kwargs):
-            _trace_module._route_trace(
-                "image_generation_tool_runtime_fallback_exhausted",
-                request_id=_routing_module._trace_request_id(request_kwargs),
-                session=_routing_module._trace_session_context(request_kwargs),
-                model_group=_request_model_group(request_kwargs),
-                request=_trace_module._trace_request_summary(request_kwargs),
-                exception=_routing_module._trace_exception(exception),
-                attempts=_image_generation_module._request_image_generation_tool_fallback_attempts(request_kwargs),
-                max_attempts=_image_generation_module._image_generation_tool_fallback_max_attempts(),
-            )
-            return None
         attempts = _image_generation_module._with_incremented_image_generation_tool_fallback_attempts(request_kwargs)
         _trace_module._route_trace(
             "image_generation_tool_runtime_fallback_next",
@@ -1656,8 +1647,12 @@ def _ordered_deployment_fallback_entry(
             request=_trace_module._trace_request_summary(request_kwargs),
             exception=_routing_module._trace_exception(exception),
             attempts=attempts,
-            max_attempts=_image_generation_module._image_generation_tool_fallback_max_attempts(),
         )
+
+    _routing_module._record_image_generation_tool_unsupported(
+        exception,
+        request_kwargs,
+    )
 
     failed_id = _failed_deployment_id(exception)
     failed_route_key = _failed_deployment_route_key(exception)
@@ -1665,7 +1660,39 @@ def _ordered_deployment_fallback_entry(
     if failed_order is None and _routing_module._is_no_deployments_available_error(exception):
         failed_order = _responses_request_module._request_target_order(request_kwargs)
     model_group = _request_model_group(request_kwargs)
-    if failed_order is None or model_group is None:
+    if model_group is None:
+        return None
+
+    try:
+        metadata = _request_context_module._request_metadata_dict(request_kwargs, "metadata") or {}
+        team_id = metadata.get("user_api_key_team_id")
+        all_deployments = _routing_module._router_configured_deployments(
+            router,
+            model_group,
+            team_id=team_id,
+        )
+    except Exception:
+        return None
+    if _routing_module._image_generation_tool_all_deployments_unsupported(
+        list(all_deployments or []),
+        request_kwargs,
+    ):
+        _routing_module._mark_image_generation_all_deployments_unsupported(
+            exception
+        )
+        _trace_module._route_trace(
+            "image_generation_tool_all_deployments_unsupported",
+            request_id=_routing_module._trace_request_id(request_kwargs),
+            session=_routing_module._trace_session_context(request_kwargs),
+            model_group=model_group,
+            request=_trace_module._trace_request_summary(request_kwargs),
+            exception=_routing_module._trace_exception(exception),
+            attempts=_image_generation_module._request_image_generation_tool_fallback_attempts(
+                request_kwargs
+            ),
+        )
+        return None
+    if failed_order is None:
         return None
 
     excluded_ids = _responses_request_module._request_excluded_deployment_ids(request_kwargs)
@@ -1736,17 +1763,6 @@ def _ordered_deployment_fallback_entry(
     if failed_id is not None:
         excluded_ids.add(failed_id)
 
-    try:
-        metadata = _request_context_module._request_metadata_dict(request_kwargs, "metadata") or {}
-        team_id = metadata.get("user_api_key_team_id")
-        all_deployments = _routing_module._router_configured_deployments(
-            router,
-            model_group,
-            team_id=team_id,
-        )
-    except Exception:
-        return None
-
     cooldown_candidates, cooldown_deployments, cooldown_filtered = (
         _routing_module._with_active_deployment_cooldowns(
             list(all_deployments or []),
@@ -1764,9 +1780,30 @@ def _ordered_deployment_fallback_entry(
             cooldown_deployments=cooldown_deployments,
         )
 
+    (
+        image_tool_candidates,
+        image_tool_unsupported_deployments,
+        image_tool_unsupported_filtered,
+    ) = _routing_module._with_active_image_generation_tool_unsupported(
+        cooldown_candidates,
+        request_kwargs=request_kwargs,
+    )
+    if image_tool_unsupported_deployments:
+        _trace_module._route_trace(
+            "fallback_image_generation_tool_unsupported_filter",
+            request_id=_routing_module._trace_request_id(request_kwargs),
+            session=_routing_module._trace_session_context(request_kwargs),
+            model_group=model_group,
+            image_tool_unsupported_filtered=image_tool_unsupported_filtered,
+            image_tool_unsupported_all_candidates=bool(
+                image_tool_unsupported_deployments and not image_tool_candidates
+            ),
+            image_tool_unsupported_deployments=image_tool_unsupported_deployments,
+        )
+
     available_deployments = [
         deployment
-        for deployment in cooldown_candidates
+        for deployment in image_tool_candidates
         if _responses_request_module._deployment_id(deployment) not in excluded_ids
     ]
     constrained_no_deployments = no_deployments_available and any(

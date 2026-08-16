@@ -135,6 +135,30 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(relay_payload, json.loads(installed_relay.read_text(encoding="utf-8")))
             self.assertEqual(0o600, installed_relay.stat().st_mode & 0o777)
 
+    def test_current_version_three_relay_document_is_accepted_by_the_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.write_config(root)
+            relay_path = root / ".litellm-runtime" / "relay-accounts.json"
+            relay_path.parent.mkdir()
+            relay_path.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "stations": [],
+                        "accounts": [],
+                        "pending_credential_cleanups": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            bundle, manifest = webdav_core.create_bundle(config)
+
+            self.assertGreater(len(bundle), 0)
+            relay_entry = next(item for item in manifest["files"] if item["path"] == "relay-accounts.json")
+            self.assertTrue(relay_entry["present"])
+
     def test_tar_bundle_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target_config = Path(temp_dir) / "config.yaml"

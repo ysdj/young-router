@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import os
+import json
 from typing import Any, Optional
 
 from . import responses_output as _responses_output_module
 from . import request_context as _request_context_module
 
 from .base import (
+    _IMAGE_GENERATION_TOOL_CAPABILITY_UNSUPPORTED_ATTR,
     _IMAGE_GENERATION_TOOL_FALLBACK_ATTEMPTS_METADATA_KEY,
-    _IMAGE_GENERATION_TOOL_FALLBACK_DEFAULT_MAX_ATTEMPTS,
-    _IMAGE_GENERATION_TOOL_FALLBACK_MAX_ATTEMPTS_ENV,
 )
 
 
@@ -21,17 +20,6 @@ def _request_forces_image_generation_tool(request_kwargs: Optional[dict]) -> boo
     if isinstance(tool_choice, dict) and tool_choice.get("type") == "image_generation":
         return True
     return False
-
-
-def _image_generation_tool_fallback_max_attempts() -> int:
-    value = os.getenv(_IMAGE_GENERATION_TOOL_FALLBACK_MAX_ATTEMPTS_ENV, "").strip()
-    if not value:
-        return _IMAGE_GENERATION_TOOL_FALLBACK_DEFAULT_MAX_ATTEMPTS
-    try:
-        parsed = int(value)
-    except ValueError:
-        return _IMAGE_GENERATION_TOOL_FALLBACK_DEFAULT_MAX_ATTEMPTS
-    return max(0, parsed)
 
 
 def _request_image_generation_tool_fallback_attempts(request_kwargs: Optional[dict]) -> int:
@@ -48,13 +36,6 @@ def _request_image_generation_tool_fallback_attempts(request_kwargs: Optional[di
     return max_attempts
 
 
-def _request_can_attempt_image_generation_tool_fallback(request_kwargs: Optional[dict]) -> bool:
-    return (
-        _request_image_generation_tool_fallback_attempts(request_kwargs)
-        < _image_generation_tool_fallback_max_attempts()
-    )
-
-
 def _with_incremented_image_generation_tool_fallback_attempts(request_kwargs: dict) -> int:
     attempts = _request_image_generation_tool_fallback_attempts(request_kwargs) + 1
     litellm_metadata = (
@@ -69,10 +50,18 @@ def _with_incremented_image_generation_tool_fallback_attempts(request_kwargs: di
     return attempts
 
 
-def _image_generation_tool_runtime_fallback_exception() -> Exception:
+def _image_generation_tool_runtime_fallback_exception(
+    *,
+    capability_unsupported: bool = False,
+) -> Exception:
     exception = RuntimeError("image_generation runtime fallback")
     try:
         exception.image_generation_tool_runtime_fallback = True  # type: ignore[attr-defined]
+        setattr(
+            exception,
+            _IMAGE_GENERATION_TOOL_CAPABILITY_UNSUPPORTED_ATTR,
+            capability_unsupported,
+        )
     except Exception:
         pass
     return exception
@@ -87,10 +76,96 @@ def _deployment_supports_responses_image_generation_tool(deployment: Any) -> boo
     return model_info.get("supports_responses_image_generation_tool") is True
 
 def _response_has_image_generation_result(response: Any) -> bool:
+    if isinstance(response, (str, bytes)):
+        try:
+            text = response.decode("utf-8") if isinstance(response, bytes) else response
+        except UnicodeDecodeError:
+            return False
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            payload_text = line.split(":", 1)[1].strip()
+            if payload_text == "[DONE]":
+                continue
+            try:
+                payload = json.loads(payload_text)
+            except (TypeError, ValueError):
+                continue
+            if _response_has_image_generation_result(payload):
+                return True
+        return False
     return "image_generation_call" in _responses_output_module._response_types(response)
 
 
+def _image_generation_result_is_present(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (bytes, bytearray)):
+        return bool(value)
+    return value is not None
+
+
+def _response_has_image_generation_result_payload(response: Any) -> bool:
+    def walk(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, list):
+            return any(walk(item) for item in value)
+        if isinstance(value, dict):
+            if (
+                value.get("type") == "image_generation_call"
+                and _image_generation_result_is_present(value.get("result"))
+            ):
+                return True
+            return any(walk(item) for item in value.values())
+        if hasattr(value, "model_dump"):
+            try:
+                return walk(value.model_dump())
+            except Exception:
+                return False
+        return False
+
+    return walk(response)
+
+
+def _normalize_image_generation_result_status(value: Any) -> None:
+    """Mark image output items complete once their result payload is present."""
+
+    if isinstance(value, list):
+        for item in value:
+            _normalize_image_generation_result_status(item)
+        return
+    if not isinstance(value, dict):
+        return
+    if (
+        value.get("type") == "image_generation_call"
+        and _image_generation_result_is_present(value.get("result"))
+        and str(value.get("status") or "").lower() in {"generating", "in_progress"}
+    ):
+        value["status"] = "completed"
+    for item in value.values():
+        _normalize_image_generation_result_status(item)
+
+
 def _response_has_image_generation_activity(response: Any) -> bool:
+    if isinstance(response, (str, bytes)):
+        try:
+            text = response.decode("utf-8") if isinstance(response, bytes) else response
+        except UnicodeDecodeError:
+            return False
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            payload_text = line.split(":", 1)[1].strip()
+            if payload_text == "[DONE]":
+                continue
+            try:
+                payload = json.loads(payload_text)
+            except (TypeError, ValueError):
+                continue
+            if _response_has_image_generation_activity(payload):
+                return True
+        return False
     return any(
         "image_generation_call" in item_type
         for item_type in _responses_output_module._response_types(response)
@@ -161,8 +236,39 @@ def _response_is_image_generation_unavailable_refusal(response: Any) -> bool:
     return unavailable
 
 
-def _response_should_trigger_image_generation_fallback(response: Any) -> bool:
-    return (
-        _responses_output_module._response_is_effectively_empty(response)
-        or _response_is_image_generation_unavailable_refusal(response)
+def _response_is_image_generation_policy_refusal(response: Any) -> bool:
+    if _response_has_image_generation_result(response):
+        return False
+    text = _responses_output_module._response_text(response).lower()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "content_policy",
+            "content policy",
+            "content-policy",
+            "contentpolicy",
+            "policy_violation",
+            "policy violation",
+            "safety policy",
+            "safety violation",
+            "violates our policy",
+            "violates the policy",
+            "blocked by safety",
+            "blocked due to safety",
+            "unsafe prompt",
+            "unsafe content",
+            "disallowed content",
+            "disallowed prompt",
+            "high risk",
+            "high-risk request",
+            "违反政策",
+            "安全策略",
+            "不符合政策",
+        )
     )
+
+
+def _response_should_trigger_image_generation_fallback(response: Any) -> bool:
+    return not _response_has_image_generation_result(response)

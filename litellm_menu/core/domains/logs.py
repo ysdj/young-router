@@ -13,19 +13,12 @@ from datetime import datetime, timezone
 from collections.abc import Mapping
 from typing import Any
 
+from ..log_tabs import LOG_TABS
 from ..security import REDACT_TEXT
 from ...log_rotation import append_bounded_log
 
 
 DOMAIN_NAME = "logs"
-LOG_TABS = (
-    "requests",
-    "service",
-    "menu",
-    "route-trace",
-    "recovery",
-    "online-usage",
-)
 MAX_READ_BYTES = 16 * 1024 * 1024
 # The local IPC transport caps one JSON message at 4 MiB. Leave headroom for
 # the response envelope while still returning the newest useful log rows.
@@ -41,7 +34,7 @@ MENU_ACTIONS = frozenset(
         "open-codex-settings",
         "open-claude-settings",
         "open-relay-accounts",
-        "open-webdav-settings",
+        "open-data-management",
         "open-logs",
         "toggle-autostart",
         "service-start",

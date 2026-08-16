@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from litellm_menu.core.domains.legacy import ProvidersModelsDomain
+from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
 from litellm_menu.core.domains.relay_accounts import (
     DETECTION_TIMEOUT_SECONDS,
     RelayAccountsDomain,
@@ -75,6 +75,121 @@ class FakeRelayHTTPClient:
 
 
 class RelayAccountsDomainTests(unittest.TestCase):
+    @staticmethod
+    def _remembered_relay_package() -> dict[str, object]:
+        return {
+            "domain": "relay_accounts",
+            "storage": {
+                "version": 3,
+                "stations": [
+                    {
+                        "id": "station-transfer",
+                        "name": "Transfer Station",
+                        "origin": "https://relay.example.test",
+                        "type": "sub2api",
+                    }
+                ],
+                "accounts": [
+                    {
+                        "id": "account-transfer",
+                        "station_id": "station-transfer",
+                        "type": "sub2api",
+                        "label": "Transfer Account",
+                        "origin": "https://relay.example.test",
+                        "username": "person@example.test",
+                        "login_status": "signed_in",
+                        "remember_password": True,
+                        "password": "replace-package-password",
+                        "session": {
+                            "cookie": "session=replace-package-cookie",
+                            "access_token": "replace-package-token",
+                            "refresh_token": "",
+                        },
+                        "balance": None,
+                        "last_updated_at": "",
+                        "resource_status": "idle",
+                        "resource_error": "none",
+                        "resources": [],
+                        "groups": [],
+                    }
+                ],
+                "pending_credential_cleanups": [],
+            },
+        }
+
+    def test_trusted_package_export_stages_private_relay_state_until_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            relay = RelayAccountsDomain(directory)
+            storage = relay.storage_path
+            before = storage.read_bytes()
+            core = CoreStore(domains=[relay])
+
+            imported = core.import_package(
+                package={
+                    "format": "litellm-menu-core-package",
+                    "version": 1,
+                    "sections": {"relay_accounts": self._remembered_relay_package()},
+                },
+                sections=["relay_accounts"],
+                revision=core.revision,
+            )
+
+            self.assertEqual(["relay_accounts"], imported["draft_domains"])
+            self.assertEqual(before, storage.read_bytes())
+            safe_snapshot = json.dumps(core.snapshot())
+            self.assertNotIn("replace-package-password", safe_snapshot)
+            self.assertNotIn("replace-package-cookie", safe_snapshot)
+            trusted = relay.export(include_sensitive=True)
+            self.assertIn("replace-package-password", json.dumps(trusted))
+
+            core.apply("relay_accounts", revision=core.revision)
+            persisted = storage.read_text(encoding="utf-8")
+            self.assertIn("replace-package-password", persisted)
+            self.assertIn("replace-package-cookie", persisted)
+            self.assertFalse(core.snapshot()["drafts"]["relay_accounts"]["dirty"])
+
+    def test_failed_multisection_import_restores_relay_transaction_without_writing(self) -> None:
+        class FailingImportDomain:
+            name = "runtime"
+
+            def __init__(self) -> None:
+                self.revision = 0
+
+            def draft_state(self) -> object:
+                return {"value": "saved"}
+
+            def snapshot(self) -> dict[str, object]:
+                return {"domain": self.name, "revision": self.revision}
+
+            def dispatch(self, _action: str, _payload: object = None) -> dict[str, object]:
+                return self.snapshot()
+
+            def import_package(self, _payload: object) -> None:
+                raise ValueError("synthetic failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            relay = RelayAccountsDomain(directory)
+            before_file = relay.storage_path.read_bytes()
+            before_checkpoint = relay.transaction_checkpoint()
+            core = CoreStore(domains=[relay, FailingImportDomain()])
+
+            with self.assertRaises(CoreError):
+                core.import_package(
+                    package={
+                        "format": "litellm-menu-core-package",
+                        "version": 1,
+                        "sections": {
+                            "relay_accounts": self._remembered_relay_package(),
+                            "runtime": {"value": "fails"},
+                        },
+                    },
+                    sections=["relay_accounts", "runtime"],
+                    revision=core.revision,
+                )
+
+            self.assertEqual(before_file, relay.storage_path.read_bytes())
+            self.assertEqual(before_checkpoint, relay.transaction_checkpoint())
+
     def test_newapi_balance_uses_the_station_quota_unit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake = FakeRelayHTTPClient(
@@ -1040,7 +1155,12 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             providers = ProvidersModelsDomain(root / "config.yaml")
 
-            result = domain.import_into(account_id, providers)
+            resources = domain.refresh_resources(account_id)["resources"]
+            result = domain.import_resources(
+                account_id,
+                [resource["id"] for resource in resources],
+                providers,
+            )
 
             self.assertEqual(2, result["model_count"])
             self.assertEqual(
@@ -1132,7 +1252,12 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             providers = ProvidersModelsDomain(root / "config.yaml")
 
-            result = domain.import_into(account_id, providers)
+            resources = domain.refresh_resources(account_id)["resources"]
+            result = domain.import_resources(
+                account_id,
+                [resource["id"] for resource in resources],
+                providers,
+            )
 
             self.assertEqual(1, result["model_count"])
             self.assertTrue(all(headers == {"Cookie": "session=replace-cookie"} for _, _, headers in fake.requests))

@@ -1,7 +1,6 @@
 import React from "react";
 import {
   StyleSheet,
-  type HostInstance,
   type NativeSyntheticEvent,
   type StyleProp,
   type TextInputProps,
@@ -16,7 +15,7 @@ import NativeAppKitTextField from "./macos/NativeTextFieldNativeComponent";
 import NativeAppKitSwitch from "./macos/NativeToggleNativeComponent";
 import NativeAppKitTable from "./macos/NativeTableNativeComponent";
 import NativeAppKitTextEditor from "./macos/NativeTextEditorNativeComponent";
-import NativeAppKitSecureTextEditor from "./macos/NativeSecureTextEditorNativeComponent";
+import NativeAppKitPersistentScrollIndicator from "./macos/NativePersistentScrollIndicatorNativeComponent";
 import NativeAppKitSecureTextInput from "./macos/NativeSecureTextInputNativeComponent";
 import NativeAppKitSplitView from "./macos/NativeSplitViewNativeComponent";
 
@@ -80,22 +79,16 @@ export function AppKitSelectableRow({ title, detail, selected, disabled, onPress
   return <NativeAppKitSelectableRow title={title} detail={detail} selected={selected} disabled={disabled} onPress={() => onPress?.()} style={[styles.selectableRow, style]} />;
 }
 
-export function AppKitTable({ columnLabels, columnWidths, rowKeys, cells, selectedKey, alternatingRows, compact, followBottom, cellHorizontalPadding, firstColumnHorizontalPadding, scrollTrailingColumnOverflow, disabledRowKeys, secondaryCellKeys, spanningRowKeys, onSelectionChange, onRowDoublePress, style }: { columnLabels: string[]; columnWidths: number[]; rowKeys: string[]; cells: string[]; selectedKey: string; alternatingRows?: boolean; compact?: boolean; followBottom?: boolean; cellHorizontalPadding?: number; firstColumnHorizontalPadding?: number; scrollTrailingColumnOverflow?: boolean; disabledRowKeys?: string[]; secondaryCellKeys?: string[]; spanningRowKeys?: string[]; onSelectionChange?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; onRowDoublePress?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  return <NativeAppKitTable columnLabels={columnLabels} columnWidths={columnWidths} rowKeys={rowKeys} cells={cells} selectedKey={selectedKey} alternatingRows={alternatingRows} compact={compact} followBottom={followBottom} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} spanningRowKeys={spanningRowKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} style={[styles.table, style]} />;
+export function AppKitTable({ columnLabels, columnWidths, rowKeys, cells, selectedKey, alternatingRows, compact, followBottom, borderless, cellHorizontalPadding, firstColumnHorizontalPadding, preserveColumnWidths, scrollTrailingColumnOverflow, disabledRowKeys, secondaryCellKeys, spanningRowKeys, onSelectionChange, onRowDoublePress, style }: { columnLabels: string[]; columnWidths: number[]; rowKeys: string[]; cells: string[]; selectedKey: string; alternatingRows?: boolean; compact?: boolean; followBottom?: boolean; borderless?: boolean; cellHorizontalPadding?: number; firstColumnHorizontalPadding?: number; preserveColumnWidths?: boolean; scrollTrailingColumnOverflow?: boolean; disabledRowKeys?: string[]; secondaryCellKeys?: string[]; spanningRowKeys?: string[]; onSelectionChange?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; onRowDoublePress?: (event: NativeSyntheticEvent<{ key: string; index: number }>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <NativeAppKitTable columnLabels={columnLabels} columnWidths={columnWidths} rowKeys={rowKeys} cells={cells} selectedKey={selectedKey} alternatingRows={alternatingRows} compact={compact} followBottom={followBottom} borderless={borderless} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} spanningRowKeys={spanningRowKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} style={[styles.table, style]} />;
 }
 
 export function AppKitTextEditor({ value, documentKey, readOnly, wrap, onChangeText, style }: { value: string; documentKey?: string; readOnly?: boolean; wrap?: boolean; onChangeText?: (text: string) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   return <NativeAppKitTextEditor value={value} documentKey={documentKey} readOnly={readOnly} wrap={wrap} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} style={[styles.editor, style]} />;
 }
 
-export type SecureTextEditorState = {
-  revision: number;
-  status: string;
-  error: string;
-};
-
-export function AppKitSecureTextEditor({ editorToken, language, onEditorState, style }: { editorToken: string; language: string; onEditorState?: (event: NativeSyntheticEvent<SecureTextEditorState>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  return <NativeAppKitSecureTextEditor editorToken={editorToken} language={language} onEditorState={onEditorState} style={[styles.editor, style]} />;
+export function AppKitPersistentScrollIndicator({ style }: { style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <NativeAppKitPersistentScrollIndicator enabled pointerEvents="none" style={style} />;
 }
 
 export type SecureTextInputState = {

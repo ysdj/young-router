@@ -33,7 +33,6 @@ HOOK_MODULE_NAMES = (
     "image_inputs",
     "responses_request",
     "responses_execution",
-    "responses_bridge",
     "patches",
     "tools",
     "computer_facade",

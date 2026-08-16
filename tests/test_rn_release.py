@@ -301,7 +301,8 @@ class ReactNativeReleaseTests(unittest.TestCase):
         script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
 
         self.assertIn('"codegen:windows:check"', package)
-        self.assertIn("pnpm run codegen:windows:check", script)
+        self.assertEqual(1, package.count("pnpm run codegen:windows:check"))
+        self.assertNotIn("pnpm run codegen:windows:check", script)
         self.assertIn("scripts\\update_litellm.py", script)
         self.assertIn("RunCodegenWindows=false", script)
         self.assertIn('"sitecustomize.py"', script)

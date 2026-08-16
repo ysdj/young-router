@@ -43,7 +43,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu.codex": "Codex / Claude Settings",
         "menu.claude": "Claude Settings",
         "menu.runtime": "Runtime Settings",
-        "menu.webdav": "WebDAV Sync Settings",
+        "menu.dataManagement": "Import / Export / Sync",
         "menu.logs": "Logs",
         "menu.logsSummary": "Logs (route recovery {recovering}, cooldown {cooldown})",
         "menu.language": "Language Settings",
@@ -76,7 +76,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "error.generic": "Something went wrong",
         "common.secureEditorLoading": "Loading document...",
         "common.secureEditorReadFailed": "The document could not be loaded.",
-        "common.secureEditorStageFailed": "The latest edits could not be staged. Your text remains in this editor.",
         "service.starting": "Starting",
         "service.running": "Running",
         "service.runningOnPort": "Running (port {port})",
@@ -96,7 +95,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "card.codexSettings": "Codex Settings",
         "card.claudeSettings": "Claude Settings",
         "card.runtimeSettings": "Runtime Settings",
-        "card.webdavSettings": "WebDAV Sync Settings",
+        "card.dataManagement": "Import / Export / Sync",
         "card.logs": "Logs",
         "card.languageSettings": "Language Settings",
     },
@@ -106,7 +105,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu.codex": "Codex / Claude 设置",
         "menu.claude": "Claude 设置",
         "menu.runtime": "运行时设置",
-        "menu.webdav": "WebDAV 同步设置",
+        "menu.dataManagement": "导入 / 导出 / 同步",
         "menu.logs": "日志",
         "menu.logsSummary": "日志 (路由恢复 {recovering}, 冷却 {cooldown})",
         "menu.language": "语言设置",
@@ -139,7 +138,6 @@ MESSAGES: dict[str, dict[str, str]] = {
         "error.generic": "发生错误",
         "common.secureEditorLoading": "正在加载文档...",
         "common.secureEditorReadFailed": "无法加载文档。",
-        "common.secureEditorStageFailed": "无法暂存最新修改。当前文本仍保留在此编辑器中。",
         "service.starting": "启动中",
         "service.running": "运行中",
         "service.runningOnPort": "运行中 (端口 {port})",
@@ -159,7 +157,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "card.codexSettings": "Codex 设置",
         "card.claudeSettings": "Claude 设置",
         "card.runtimeSettings": "运行时设置",
-        "card.webdavSettings": "WebDAV 同步设置",
+        "card.dataManagement": "导入 / 导出 / 同步",
         "card.logs": "日志",
         "card.languageSettings": "语言设置",
     },
@@ -307,6 +305,22 @@ class LanguageSettingsDomain:
         self._baseline_bytes = text.encode("utf-8")
         self.revision += 1
         return {"applied": True, **self.snapshot()}
+
+    def export(self, *, include_sensitive: bool = False) -> dict[str, Any]:
+        del include_sensitive
+        return {"domain": self.name, "choice": self.choice}
+
+    def import_package(self, payload: object) -> None:
+        if not isinstance(payload, Mapping):
+            raise LanguageSettingsError("Language package is invalid")
+        data = dict(payload)
+        if data.get("domain", self.name) != self.name or set(data).difference({"domain", "choice"}):
+            raise LanguageSettingsError("Language package is invalid")
+        value = data.get("choice")
+        if value not in LANGUAGE_OPTIONS:
+            raise LanguageSettingsError("Unsupported language")
+        self.choice = str(value)
+        self.revision += 1
 
     def translate(self, key: str, values: Mapping[str, object] | None = None) -> str:
         return create_translator(self.choice, self.system_locale)(key, values)

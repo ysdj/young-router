@@ -12,7 +12,7 @@ from typing import Any
 from ..persistence import PersistenceError, atomic_write_text
 from ..security import REDACTED, safe_exception_message
 from ._shared import (
-    LegacyDomainError,
+    DomainError,
     _action_name,
     _default_runtime_settings_path,
     _file_bytes,
@@ -58,7 +58,7 @@ class RuntimeSettingsDomain:
             }
             baseline = _file_bytes(self.settings_path)
             values = read_settings_file(self.settings_path, specs)
-        except LegacyDomainError:
+        except DomainError:
             raise
         except Exception as exc:
             raise _safe_problem(exc, "Runtime settings could not be loaded") from None
@@ -139,20 +139,20 @@ class RuntimeSettingsDomain:
         draft = copy.deepcopy(self._draft_values)
         for key, item in updates.items():
             if key not in self.specs:
-                raise LegacyDomainError("Runtime settings contain an unsupported field")
+                raise DomainError("Runtime settings contain an unsupported field")
             if item == "__LITELLM_MENU_RETAIN_EXISTING__":
                 if key not in self._SECRET_KEYS:
-                    raise LegacyDomainError("Runtime settings are invalid")
+                    raise DomainError("Runtime settings are invalid")
                 continue
             if not isinstance(item, str):
-                raise LegacyDomainError("Runtime setting values must be text")
+                raise DomainError("Runtime setting values must be text")
             draft[key] = item
         self._draft_values = self._validate_values(draft)
 
     def _set_setting(self, data: Mapping[str, Any]) -> None:
         key = data.get("key")
         if not isinstance(key, str) or key not in self.specs:
-            raise LegacyDomainError("Runtime settings contain an unsupported field")
+            raise DomainError("Runtime settings contain an unsupported field")
         value = data.get("value")
         if isinstance(value, bool):
             if self.specs[key].kind == "bool_auto":
@@ -162,19 +162,19 @@ class RuntimeSettingsDomain:
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             value = str(value)
         if not isinstance(value, str):
-            raise LegacyDomainError("Runtime setting values must be text")
+            raise DomainError("Runtime setting values must be text")
         self._set_values({"values": {key: value}})
 
     def _clear_setting(self, data: Mapping[str, Any]) -> None:
         key = data.get("key")
         if not isinstance(key, str) or key not in self.specs:
-            raise LegacyDomainError("Runtime settings contain an unsupported field")
+            raise DomainError("Runtime settings contain an unsupported field")
         self._draft_values[key] = self._defaults({key: self.specs[key]})[key]
 
     def _set_raw(self, data: Mapping[str, Any]) -> None:
         source = data.get("raw_text", data.get("text", data.get("settings_text")))
         if not isinstance(source, str):
-            raise LegacyDomainError("Runtime settings text must be text")
+            raise DomainError("Runtime settings text must be text")
         try:
             with tempfile.TemporaryDirectory(prefix="litellm-core-runtime-validate-") as directory:
                 path = Path(directory) / "runtime-settings.env"
@@ -202,22 +202,22 @@ class RuntimeSettingsDomain:
         elif name in {"reset", "cancel", "reload"}:
             self._draft_values = copy.deepcopy(self._raw_values)
         else:
-            raise LegacyDomainError("The requested runtime action is unavailable")
+            raise DomainError("The requested runtime action is unavailable")
         self.revision += 1
         return self.snapshot()
 
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if field != "setting" or not isinstance(target, str) or target not in self.specs:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         if not self._is_secret_setting(target):
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         return bool(self._draft_values.get(target, ""))
 
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
         if field != "setting" or not isinstance(target, str) or target not in self.specs:
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         if not self._is_secret_setting(target):
-            raise LegacyDomainError("The requested secret field is unavailable")
+            raise DomainError("The requested secret field is unavailable")
         self._set_values({"values": {target: value}})
         self.revision += 1
 
@@ -230,7 +230,7 @@ class RuntimeSettingsDomain:
                 updates = _mapping(data.get("values", data), "runtime values")
                 values.update(updates)
             self._validate_values(values)
-        except LegacyDomainError:
+        except DomainError:
             return {"valid": False, "errors": ["Runtime settings are invalid"]}
         return {"valid": True, "errors": []}
 
@@ -241,7 +241,7 @@ class RuntimeSettingsDomain:
         try:
             bytes_value = round(float(value) * 1024 * 1024)
         except (TypeError, ValueError, OverflowError):
-            raise LegacyDomainError("Runtime settings are invalid") from None
+            raise DomainError("Runtime settings are invalid") from None
         return str(bytes_value)
 
     def _encoded_draft(self) -> str:
@@ -261,13 +261,13 @@ class RuntimeSettingsDomain:
                 self._set_values(data)
         validation = self.validate()
         if not validation["valid"]:
-            raise LegacyDomainError("Runtime settings are invalid")
+            raise DomainError("Runtime settings are invalid")
         if not _same_file(self.settings_path, self._baseline_bytes):
-            raise LegacyDomainError("Runtime settings changed on disk; reload before applying")
+            raise DomainError("Runtime settings changed on disk; reload before applying")
         try:
             atomic_write_text(self.settings_path, self._encoded_draft())
         except PersistenceError as exc:
-            raise LegacyDomainError(safe_exception_message(exc)) from None
+            raise DomainError(safe_exception_message(exc)) from None
         self.reload()
         return {"applied": True, **self.snapshot()}
 

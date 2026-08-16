@@ -10,18 +10,20 @@
 
 - `rn/packages/shared/` owns shared React/TypeScript routes, composition, interaction state, i18n, and the typed Core IPC client.
 - `litellm_menu/core/` owns domain state, validation, staged configuration, service operations, persistence, and the authenticated versioned loopback IPC contract.
-- `rn/apps/macos/` is the AppKit host and `rn/apps/windows/` is the WinUI 3 host. Native code owns platform leaves: status/tray menus, windows, native controls, secure editors, file panels, alerts, shortcuts, and platform lifecycle.
-- One feature has one shared UI and one Core domain implementation. Do not introduce a second platform-specific domain store, configuration writer, WebView, Electron/Tauri layer, or legacy shell launcher.
-- React holds view state only. It must not write configuration files, manage the proxy process, read arbitrary paths, or handle raw credentials.
+- `rn/apps/macos/` is the AppKit host and `rn/apps/windows/` is the WinUI 3 host. Native code owns platform leaves: status/tray menus, windows, native controls, system WebView hosts for CodeMirror code panes, secure inputs, file panels, alerts, shortcuts, and platform lifecycle.
+- One feature has one shared UI and one Core domain implementation. Do not introduce a second platform-specific domain store, configuration writer, WebView application shell, Electron/Tauri layer, or legacy shell launcher. Embedded system WebViews are permitted only for the shared CodeMirror code panes.
+- React holds view state only. It must not write configuration files, manage the proxy process, read arbitrary paths, or handle raw credentials. Versioned code-editor document text is the explicit exception.
 - The language choice belongs in each host's native application menu. Shared UI consumes that preference; do not add an in-window language selector.
 - All user-visible shared strings go through i18n. Keep platform titles and menu labels aligned with the selected language.
 
 ## UI And Native Boundaries
 
 - Preserve native platform behavior and visual conventions. Shared UI describes the workflow; native leaves render controls that require AppKit or WinUI behavior.
-- Use typed IPC snapshots and actions. Never expose a path, secret, raw editor value, or unrestricted native capability through ordinary React props.
+- Default every desktop surface to compact native density. Avoid redundant in-content titles, oversized empty cards, web-like vertical whitespace, and detached action rows; prefer tightly grouped 24–28 px controls, concise helper text, content-sized route windows, and one fixed bottom action bar. Tabs must be genuinely switchable and render only their active pane. Compact layouts must still reflow before controls overlap or hide required content on either macOS or Windows.
+- A route window's bottom-right action bar contains only `Close` and a conditional `Apply` when staged configuration is dirty. File selection, import/export, WebDAV testing, and synchronization actions belong in the active pane, never in that footer.
+- Use typed IPC snapshots and actions. Never expose a path, secret, or unrestricted native capability through ordinary React props. Versioned code-editor document text may flow through the shared CodeMirror view.
 - Route windows must render their first data-backed frame from the shared snapshot; do not paint empty shells and refill them or issue duplicate per-window snapshot/subscription requests.
-- Secure editors and file panels use opaque one-time native capabilities. Do not serialize secret values into IPC snapshots, logs, drafts, or test fixtures.
+- Secure inputs and file panels use opaque one-time native capabilities. Do not serialize secret values into IPC snapshots, logs, drafts, or test fixtures. Raw configuration documents use the authenticated versioned editor IPC instead of the retired native-only editor path.
 - Keep configuration changes staged and explicit. Validation may update draft state, but writing configuration and restarting a service require an explicit Apply action.
 
 ## Runtime And Compatibility
@@ -41,6 +43,8 @@
 - Do not render unbounded log/trace collections with `ScrollView` plus `map`, duplicate every table cell into a data signature, or measure every cell on ordinary table updates. Virtualize long lists, memoize derived rows/columns and native props, compare old/new props directly, and reserve full content-width scans for controls whose contract requires them.
 - For log-tab memory fixes, verify the installed app by repeatedly switching populated tabs and checking that RSS settles or falls after warm-up. A successful render or a single before/after sample does not disprove a retention leak.
 - Treat encrypted Responses history as an immutable replay prefix. Preserve genuine `encrypted_content`, compaction items, IDs, ordering, and any image bytes inside that signed history exactly; do not recompress, re-encode, normalize, or otherwise rewrite them. Compress newly added oversized images before they enter encrypted history, and when replaying mixed history limit image compression to the suffix after the latest encrypted item.
+- Do not inject `truncation=auto` or another request-control field merely because inline images in the encrypted replay prefix exceed a local image budget. Responses-compatible gateways may reject that parameter, after which route failover and stream recovery can masquerade as a long hang. Image-byte thresholds are diagnostic only; add truncation solely through the existing explicit context-size-error fallback, never preemptively from signed-prefix size, upstream 5xx, or stream timeouts.
+- Large signed image history may remain in the same task while new turns are appended. To make the replay prefix smaller, accept a genuine upstream `compaction` item or start a new task; never synthesize, forge, drop, reorder, recompress, or path-rewrite signed items. Path-backed previews and image compression apply only before signing or in the mutable suffix after the latest encrypted item.
 - An `encrypted_content` field containing obvious natural-language plaintext is malformed client history, not valid ciphertext. Repair only that narrow field shape back to ordinary text; do not decode, regenerate, or broadly rewrite opaque encrypted values.
 - Treat signature/decryption failures such as `thinking_signature_invalid` as deterministic request errors. Return the explicit client error immediately; never send them into route cooldown or the long recovery polling loop.
 - Do not infer that gateways are interchangeable merely because they may ultimately target the same upstream API. Diagnose the exact request, route, account, response event, and terminal status while keeping provider-specific workarounds out of the implementation.

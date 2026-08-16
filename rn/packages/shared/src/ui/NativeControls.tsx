@@ -14,9 +14,9 @@ import {
 import {
   AppKitButton,
   AppKitCheckbox,
+  AppKitPersistentScrollIndicator,
   AppKitPicker,
   AppKitSegmentedControl,
-  AppKitSecureTextEditor,
   AppKitSecureTextInput,
   AppKitSelectableRow,
   AppKitSplitView,
@@ -29,7 +29,6 @@ import WinUIButton from "./windows/NativeButtonNativeComponent";
 import WinUICheckbox from "./windows/NativeCheckboxNativeComponent";
 import WinUIPicker from "./windows/NativePickerNativeComponent";
 import WinUISegmented from "./windows/NativeSegmentedNativeComponent";
-import WinUISecureTextEditor from "./windows/NativeSecureTextEditorNativeComponent";
 import WinUISecureTextInput from "./windows/NativeSecureTextInputNativeComponent";
 import WinUITextInput from "./windows/NativeTextInputNativeComponent";
 import WinUIToggle from "./windows/NativeToggleNativeComponent";
@@ -140,8 +139,10 @@ type TableProps = {
   alternatingRows?: boolean;
   compact?: boolean;
   followBottom?: boolean;
+  framed?: boolean;
   cellHorizontalPadding?: number;
   firstColumnHorizontalPadding?: number;
+  preserveColumnWidths?: boolean;
   scrollTrailingColumnOverflow?: boolean;
   disabledRowKeys?: string[];
   secondaryCellKeys?: string[];
@@ -156,19 +157,6 @@ type TextEditorProps = {
   readOnly?: boolean;
   wrap?: boolean;
   onChangeText?: (text: string) => void;
-  style?: StyleProp<ViewStyle>;
-};
-
-export type SecureTextEditorState = Readonly<{
-  revision: number;
-  status: string;
-  error: string;
-}>;
-
-export type SecureTextEditorProps = {
-  editorToken: string;
-  language: string;
-  onEditorState?: (state: SecureTextEditorState) => void;
   style?: StyleProp<ViewStyle>;
 };
 
@@ -292,7 +280,7 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
 }
 
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, framed = true, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style }: TableProps): React.JSX.Element {
   const stripedRows = striped && (alternatingRows || rows.length > 0);
   const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);
   const nativeProps = {
@@ -304,6 +292,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, a
     alternatingRows: stripedRows,
     compact,
     followBottom,
+    borderless: !framed,
     disabledRowKeys,
     secondaryCellKeys,
     spanningRowKeys,
@@ -312,9 +301,9 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, a
     return <WinUITable {...nativeProps} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
+    return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
-  return <View style={[styles.tableFallback, style]}>{rows.map((row, index) => {
+  return <View style={[styles.tableFallback, !framed && styles.tableFallbackUnframed, style]}>{rows.map((row, index) => {
     const selected = row.key === selectedKey;
     const stripe = stripedRows && !selected && index % 2 === 1 ? styles.tableFallbackStripe : undefined;
     if (row.spanning) {
@@ -334,14 +323,9 @@ export function NativeTextEditor({ value, documentKey, readOnly, wrap = true, on
   return <TextInput value={value} editable={!readOnly} multiline onChangeText={onChangeText} style={[styles.editorFallback, style]} />;
 }
 
-export function NativeSecureTextEditor({ editorToken, language, onEditorState, style, unavailableLabel }: SecureTextEditorProps & { unavailableLabel: string }): React.JSX.Element {
-  if (Platform.OS === "windows") {
-    return <WinUISecureTextEditor editorToken={editorToken} language={language} onEditorState={(event) => onEditorState?.(event.nativeEvent)} style={[styles.editor, style]} />;
-  }
-  if (Platform.OS === "macos") {
-    return <AppKitSecureTextEditor editorToken={editorToken} language={language} onEditorState={(event) => onEditorState?.(event.nativeEvent)} style={[styles.editor, style]} />;
-  }
-  return <View accessibilityLabel={unavailableLabel} style={[styles.secureEditorUnavailable, style]}><Text style={styles.secureEditorUnavailableText}>{unavailableLabel}</Text></View>;
+export function NativePersistentScrollIndicator({ style }: { style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  if (Platform.OS === "macos") return <AppKitPersistentScrollIndicator style={style} />;
+  return <View pointerEvents="none" style={style} />;
 }
 
 /** Native password leaves never pass secret text through React. */
@@ -391,13 +375,12 @@ const styles = StyleSheet.create({
   // it; `overflow: scroll` would force an empty scrollbar gutter on every
   // table, even when all rows fit.
   tableFallback: { minHeight: 120, borderWidth: 1, borderColor: "#d4d4d8", overflow: "hidden" },
+  tableFallbackUnframed: { borderWidth: 0 },
   tableFallbackStripe: { backgroundColor: "#f1f1f3" },
   tableFallbackGroupRow: { minHeight: 26, justifyContent: "center", paddingHorizontal: 8 },
   tableFallbackGroupText: { fontWeight: "400" },
   editor: { minHeight: 160 },
   editorFallback: { minHeight: 160, textAlignVertical: "top", fontSize: UI_FONT_SIZE },
-  secureEditorUnavailable: { minHeight: 160, justifyContent: "center", alignItems: "center" },
-  secureEditorUnavailableText: { fontSize: UI_FONT_SIZE, opacity: 0.65 },
   splitView: { minHeight: 120, flexDirection: "row" },
   splitFallback: { minHeight: 120, flexDirection: "row" },
   splitLeading: { minWidth: 0, flexShrink: 0 },

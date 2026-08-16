@@ -23,7 +23,6 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(ShowReadOnlyText, L"showReadOnlyText");
   REACT_METHOD(ShowActionMenu, L"showActionMenu");
   REACT_METHOD(ChooseModelsToAdd, L"chooseModelsToAdd");
-  REACT_METHOD(EditSecureDocument, L"editSecureDocument");
   REACT_METHOD(SetLocalization, L"setLocalization");
   REACT_METHOD(EditSecret, L"editSecret");
   REACT_METHOD(ClearSecret, L"clearSecret");
@@ -44,6 +43,7 @@ struct WinUI3NativeLeafModule {
   void CloseWindow(std::optional<std::wstring> const& route) noexcept;
   void FocusWindow(std::wstring const& route) noexcept;
   void SetWindowContentSize(
+      std::wstring const& route,
       double width,
       double height,
       winrt::Microsoft::ReactNative::ReactPromise<bool> const& promise) noexcept;
@@ -62,6 +62,8 @@ struct WinUI3NativeLeafModule {
       std::wstring const& title,
       std::wstring const& text,
       std::wstring const& close_label,
+      std::wstring const& language,
+      std::wstring const& html,
       winrt::Microsoft::ReactNative::ReactPromise<void> const& promise) noexcept;
   void ShowActionMenu(
       std::wstring const& title,
@@ -73,11 +75,6 @@ struct WinUI3NativeLeafModule {
       std::wstring const& provider_name,
       std::wstring const& key_name,
       winrt::Microsoft::ReactNative::ReactPromise<std::optional<std::vector<std::string>>> const& promise) noexcept;
-  void EditSecureDocument(
-      std::string const& editor_token,
-      std::string const& language,
-      std::wstring const& title,
-      winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept;
   void SetLocalization(winrt::Microsoft::ReactNative::JSValueObject const& strings) noexcept;
   void EditSecret(
       std::string const& domain,

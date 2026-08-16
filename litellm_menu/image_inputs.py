@@ -12,8 +12,11 @@ from .base import (
     _INLINE_IMAGE_MANY_MAX_EDGE,
     _INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES,
     _INLINE_IMAGE_MANY_TARGET_BYTES,
+    _INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES,
+    _CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES,
     _INLINE_IMAGE_SINGLE_MAX_EDGE,
     _INLINE_IMAGE_SINGLE_TARGET_BYTES,
+    _CODEX_VIEW_IMAGE_REFERENCE_MARKER,
     _OMIT_RESPONSE_VALUE,
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
 )
@@ -394,24 +397,95 @@ def _bound_image_data_urls(value: Any, *, target_bytes: int, max_edge: int) -> t
     return value, False
 
 
+def _output_has_codex_view_image_references(output: Any) -> bool:
+    if not isinstance(output, list):
+        return False
+    return any(
+        isinstance(part, dict)
+        and part.get("type") == "input_text"
+        and isinstance(part.get("text"), str)
+        and _CODEX_VIEW_IMAGE_REFERENCE_MARKER in part["text"]
+        for part in output
+    )
+
+
+def _bound_codex_view_image_previews(value: Any) -> tuple[Any, bool]:
+    """Keep one small inline preview while retaining a full-resolution path reference."""
+
+    if isinstance(value, list):
+        changed = False
+        updated_items: List[Any] = []
+        for item in value:
+            updated_item, item_changed = _bound_codex_view_image_previews(item)
+            updated_items.append(updated_item)
+            changed = changed or item_changed
+        return (updated_items if changed else value), changed
+    if not isinstance(value, dict):
+        return value, False
+    if (
+        value.get("type") == "custom_tool_call_output"
+        and _output_has_codex_view_image_references(value.get("output"))
+    ):
+        updated_output, changed = _bound_image_data_urls(
+            value["output"],
+            target_bytes=_CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES,
+            max_edge=_INLINE_IMAGE_MANY_MAX_EDGE,
+        )
+        if not changed:
+            return value, False
+        updated_value = value.copy()
+        updated_value["output"] = updated_output
+        return updated_value, True
+    changed = False
+    updated_value: Dict[Any, Any] = {}
+    for key, item in value.items():
+        updated_item, item_changed = _bound_codex_view_image_previews(item)
+        updated_value[key] = updated_item
+        changed = changed or item_changed
+    return (updated_value if changed else value), changed
+
+
 def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
     sizes: List[int] = []
+    encrypted_prefix_image_count = 0
+    encrypted_prefix_inline_image_bytes = 0
+    bounded_suffixes: Dict[str, Any] = {}
+    preview_changed_by_key: Dict[str, bool] = {}
     for key in ("input", "messages"):
-        _collect_image_data_url_sizes(
-            _image_bounding_suffix(request_kwargs.get(key)),
-            sizes,
-        )
+        value = request_kwargs.get(key)
+        suffix = _image_bounding_suffix(value)
+        bounded_suffix, preview_changed = _bound_codex_view_image_previews(suffix)
+        bounded_suffixes[key] = bounded_suffix
+        preview_changed_by_key[key] = preview_changed
+        _collect_image_data_url_sizes(bounded_suffix, sizes)
+        if isinstance(value, list):
+            prefix = value[: len(value) - len(suffix)]
+            prefix_stats = _image_input_stats(prefix)
+            encrypted_prefix_image_count += prefix_stats["image_count"]
+            encrypted_prefix_inline_image_bytes += prefix_stats["inline_image_bytes"]
     if not sizes:
         return None
 
-    many_images = len(sizes) > 1
+    total_image_count = encrypted_prefix_image_count + len(sizes)
+    many_images = total_image_count > 1
     target_bytes = _INLINE_IMAGE_SINGLE_TARGET_BYTES
     if many_images:
+        remaining_history_bytes = max(
+            0,
+            _INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES
+            - encrypted_prefix_inline_image_bytes,
+        )
+        remaining_per_image_bytes = remaining_history_bytes // len(sizes)
         target_bytes = min(
             _INLINE_IMAGE_MANY_TARGET_BYTES,
-            _INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES // len(sizes),
+            max(
+                _INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES,
+                remaining_per_image_bytes,
+            ),
         )
-    if all(size <= target_bytes for size in sizes):
+    if all(size <= target_bytes for size in sizes) and not any(
+        preview_changed_by_key.values()
+    ):
         return None
 
     max_edge = _INLINE_IMAGE_MANY_MAX_EDGE if many_images else _INLINE_IMAGE_SINGLE_MAX_EDGE
@@ -421,12 +495,13 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
     for key in ("input", "messages"):
         value = request_kwargs.get(key)
         suffix = _image_bounding_suffix(value)
+        bounded_suffix = bounded_suffixes[key]
         updated_suffix, value_changed = _bound_image_data_urls(
-            suffix,
+            bounded_suffix,
             target_bytes=target_bytes,
             max_edge=max_edge,
         )
-        if value_changed:
+        if value_changed or preview_changed_by_key[key]:
             if isinstance(value, list):
                 modified_kwargs[key] = value[: len(value) - len(suffix)] + updated_suffix
             else:

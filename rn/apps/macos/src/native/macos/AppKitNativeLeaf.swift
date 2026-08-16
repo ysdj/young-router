@@ -7,7 +7,6 @@ import WebKit
 private let nativeUIFontSize: CGFloat = 13
 // Monospaced glyphs have a larger optical body than the surrounding system
 // labels at the same point size. Keep read-only code text visually aligned.
-private let readOnlyCodeFontSize: CGFloat = 12
 
 private func withoutAnimations(_ changes: () -> Void) {
     NSAnimationContext.runAnimationGroup { context in
@@ -65,28 +64,8 @@ private enum NativeRelayOriginPolicy {
         contentsOf: Bundle.main.url(forResource: "AppIcon", withExtension: "icns")!
     )!
     private static let statusBarIcon: NSImage = {
-        let image = NSImage(size: NSSize(width: 22, height: 18))
-        image.lockFocus()
-
-        let scale: CGFloat = 1
-        let transform = NSAffineTransform()
-        transform.translateX(by: 22 * (1 - scale) / 2, yBy: 18 * (1 - scale) / 2)
-        transform.scale(by: scale)
-        transform.concat()
-
-        let attributes: [NSAttributedString.Key: Any] = [
-            .foregroundColor: NSColor.black,
-        ]
-        ("L" as NSString).draw(
-            at: NSPoint(x: 3, y: 0),
-            withAttributes: attributes.merging([.font: NSFont.systemFont(ofSize: 15, weight: .light)]) { _, new in new }
-        )
-        ("L" as NSString).draw(
-            at: NSPoint(x: 11.5, y: 1),
-            withAttributes: attributes.merging([.font: NSFont.systemFont(ofSize: 13, weight: .light)]) { _, new in new }
-        )
-
-        image.unlockFocus()
+        let image = NSImage(named: NSImage.Name("MenuIcon"))!
+        image.size = NSSize(width: 20, height: 20)
         image.isTemplate = true
         return image
     }()
@@ -97,7 +76,7 @@ private enum NativeRelayOriginPolicy {
         "status", "separator",
         "toggle-autostart", "toggle-codex-model-catalog", "separator",
         "open-providers-models", "open-runtime-settings", "open-codex-settings", "open-relay-accounts", "separator",
-        "webdav-status", "open-webdav-settings", "separator",
+        "webdav-status", "open-data-management", "separator",
         "open-logs", "separator",
         "show-version", "quit",
     ]
@@ -112,9 +91,9 @@ private enum NativeRelayOriginPolicy {
         "language-menu", "set-language-system", "set-language-en", "set-language-zh-Hans",
     ]
     public static let shared = AppKitNativeLeaf()
-    /// Injected by the host that owns ``CoreIPCServer``.  The callback turns
-    /// a native URL into a Core file capability before the token reaches RN.
-    var fileCapabilityRegistrar: ((URL, String) -> String?)?
+    /// The Core capability exchange is asynchronous so AppKit never waits on
+    /// the Core endpoint while a file panel is being handled.
+    var fileCapabilityRegistrar: ((URL, String, @escaping (String?) -> Void) -> Void)?
     /// The RN bridge installs this to route native menu and deep-link actions
     /// without ever serializing a local path or Core credential into JS.
     var menuActionHandler: ((String) -> Void)? {
@@ -132,6 +111,7 @@ private enum NativeRelayOriginPolicy {
     private var approvedCloseRoutes: Set<String> = []
     private var codexRestartConfirmationPanel: NSPanel?
     private var codexRestartConfirmationCompletion: ((String) -> Void)?
+    private var activeReadOnlyCodeController: NativeReadOnlyCodeController?
     // Retain the browser flow across the asynchronous React Native promise.
     private var activeRelayLoginController: NativeRelayLoginController?
     // The native shell is visible before React and Core publish their first
@@ -158,7 +138,7 @@ private enum NativeRelayOriginPolicy {
         "routeRelayAccounts": "Relay Accounts", "routeRelayAdd": "Add Relay Account",
         "routeCodexSettings": "Codex / Claude Settings", "routeClaudeSettings": "Claude Settings",
         "routeRuntimeSettings": "Runtime Settings",
-        "routeWebdavSettings": "WebDAV Sync Settings", "routeLogs": "Logs",
+        "routeDataManagement": "Data Management", "routeLogs": "Logs",
         "modelChooserTitle": "Choose Models to Add", "modelChooserHeading": "Choose models to add",
         "modelChooserProvider": "Provider", "modelChooserKey": "Key", "modelChooserSearch": "Search models",
         "modelChooserAll": "All", "modelChooserSelectAllVisible": "Select all visible models",
@@ -323,8 +303,8 @@ private enum NativeRelayOriginPolicy {
         updateActivationPolicy()
     }
 
-    func setWindowContentSize(width: Double, height: Double) -> Bool {
-        let minimumContentExtent = 128.0
+    func setWindowContentSize(route: String, width: Double, height: Double) -> Bool {
+        let minimumContentExtent = canonicalRoute(route) == "data-management" ? 96.0 : 128.0
         let maximumContentExtent = 8_192.0
         guard width.isFinite,
               height.isFinite,
@@ -332,7 +312,7 @@ private enum NativeRelayOriginPolicy {
               height >= minimumContentExtent,
               width <= maximumContentExtent,
               height <= maximumContentExtent,
-              let window = activeWindow()
+              let window = routeWindows[canonicalRoute(route)]
         else {
             return false
         }
@@ -377,26 +357,57 @@ private enum NativeRelayOriginPolicy {
         }
     }
 
-    func chooseImportFile(purpose: String = "import") -> String? {
+    func chooseImportFile(
+        purpose: String = "import",
+        completion: @escaping (String?) -> Void
+    ) {
         let panel = NSOpenPanel()
         configureImmediatePresentation(panel)
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
-        return panel.runModal() == .OK ? registerSelection(panel.url, purpose: purpose) : nil
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self, weak panel] response in
+            guard response == .OK, let url = panel?.url else {
+                completion(nil)
+                return
+            }
+            self?.registerSelection(url, purpose: purpose, completion: completion)
+        }
+        if let owner = activeWindow() {
+            panel.beginSheetModal(for: owner, completionHandler: finish)
+        } else {
+            panel.begin(completionHandler: finish)
+        }
     }
 
-    func chooseExportFile(suggestedName: String) -> String? {
+    func chooseExportFile(
+        suggestedName: String,
+        completion: @escaping (String?) -> Void
+    ) {
         let trimmed = suggestedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.utf8.count <= 255,
               !trimmed.contains("/"),
-              !trimmed.contains(":") else { return nil }
+              !trimmed.contains(":") else {
+            completion(nil)
+            return
+        }
         let panel = NSSavePanel()
         configureImmediatePresentation(panel)
         panel.nameFieldStringValue = trimmed
         panel.canCreateDirectories = true
-        return panel.runModal() == .OK ? registerSelection(panel.url, purpose: "export") : nil
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self, weak panel] response in
+            guard response == .OK, let url = panel?.url else {
+                completion(nil)
+                return
+            }
+            self?.registerSelection(url, purpose: "export", completion: completion)
+        }
+        if let owner = activeWindow() {
+            panel.beginSheetModal(for: owner, completionHandler: finish)
+        } else {
+            panel.begin(completionHandler: finish)
+        }
     }
 
     func confirm(title: String, message: String, confirmTitle: String) -> Bool {
@@ -512,40 +523,38 @@ private enum NativeRelayOriginPolicy {
         completion?(choice)
     }
 
-    func showReadOnlyText(title: String, text: String, closeTitle: String) {
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 680, height: 420))
-        scrollView.borderType = .bezelBorder
-        scrollView.hasHorizontalScroller = true
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-
-        let textView = NSTextView(frame: scrollView.contentView.bounds)
-        textView.string = text
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.isRichText = false
-        textView.importsGraphics = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: readOnlyCodeFontSize, weight: .regular)
-        textView.textContainerInset = NSSize(width: 8, height: 8)
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = true
-        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.textContainer?.containerSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
-            height: CGFloat.greatestFiniteMagnitude
+    func showReadOnlyText(
+        title: String,
+        text: String,
+        closeTitle: String,
+        language: String,
+        html: String,
+        completion: @escaping () -> Void
+    ) {
+        activeReadOnlyCodeController?.close()
+        let owner = activeWindow()
+        let controller = NativeReadOnlyCodeController(
+            title: title,
+            text: text,
+            closeTitle: closeTitle,
+            language: language,
+            html: html,
+            onClose: { [weak self, weak owner] closedController in
+                if let owner, closedController.panel.parent === owner {
+                    owner.removeChildWindow(closedController.panel)
+                }
+                if self?.activeReadOnlyCodeController === closedController {
+                    self?.activeReadOnlyCodeController = nil
+                }
+                completion()
+            }
         )
-        textView.textContainer?.widthTracksTextView = false
-        textView.setAccessibilityLabel(title)
-        scrollView.documentView = textView
-
-        let alert = NSAlert()
-        configureImmediatePresentation(alert.window)
-        alert.messageText = title
-        alert.accessoryView = scrollView
-        alert.addButton(withTitle: closeTitle)
-        alert.buttons.first?.keyEquivalent = "\u{1b}"
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        activeReadOnlyCodeController = controller
+        let panel = controller.panel
+        if let owner {
+            owner.addChildWindow(panel, ordered: .above)
+        }
+        controller.present()
     }
 
     func showActionMenu(title: String, items: [String], anchor: [String: NSNumber]) -> Int? {
@@ -974,34 +983,6 @@ private enum NativeRelayOriginPolicy {
         localized(key, fallback: fallback)
     }
 
-    func editText(content: String, language: String, title: String) -> String? {
-        let editor = NativeTextEditor(frame: NSRect(x: 0, y: 0, width: 620, height: 500))
-        editor.textView.string = content
-        editor.textView.setAccessibilityLabel(title)
-
-        let split = NativeSplitView(frame: NSRect(x: 0, y: 0, width: 760, height: 500))
-        let sidebar = NSView(frame: NSRect(x: 0, y: 0, width: 128, height: 500))
-        let selector = NativeSegmentedControl(frame: NSRect(x: 8, y: 460, width: 112, height: 28))
-        selector.segmentCount = 1
-        selector.setLabel(language.uppercased(), forSegment: 0)
-        selector.selectedSegment = 0
-        selector.setAccessibilityLabel(language.uppercased())
-        sidebar.addSubview(selector)
-        split.addArrangedSubview(sidebar)
-        split.addArrangedSubview(editor)
-        split.setPosition(128, ofDividerAt: 0)
-
-        let alert = NSAlert()
-        configureImmediatePresentation(alert.window)
-        alert.messageText = title
-        alert.accessoryView = split
-        alert.addButton(withTitle: localized("stage", fallback: "Stage"))
-        alert.addButton(withTitle: localized("cancel", fallback: "Cancel"))
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        return editor.textView.string
-    }
-
     public func setShortcuts(_ shortcuts: [String: String]) {
         ensureSystemEditMenu()
         guard let mainMenu = NSApp.mainMenu else { return }
@@ -1031,6 +1012,14 @@ private enum NativeRelayOriginPolicy {
         )
         relayItem.target = self
         relayItem.representedObject = "native-open-relay-accounts"
+        let dataManagementItem = applicationMenu.addItem(
+            withTitle: localized("routeDataManagement", fallback: "Data Management"),
+            action: #selector(openDataManagement),
+            keyEquivalent: "d"
+        )
+        dataManagementItem.keyEquivalentModifierMask = [.command, .shift]
+        dataManagementItem.target = self
+        dataManagementItem.representedObject = "native-open-data-management"
         if shortcuts["reload"]?.lowercased().contains("cmd+r") == true {
             let item = applicationMenu.addItem(withTitle: localized("reload", fallback: "Reload"), action: #selector(reloadFromShortcut), keyEquivalent: "r")
             item.keyEquivalentModifierMask = [.command]
@@ -1111,9 +1100,16 @@ private enum NativeRelayOriginPolicy {
         alert.runModal()
     }
 
-    private func registerSelection(_ url: URL?, purpose: String) -> String? {
-        guard let url else { return nil }
-        return fileCapabilityRegistrar?(url, purpose)
+    private func registerSelection(
+        _ url: URL?,
+        purpose: String,
+        completion: @escaping (String?) -> Void
+    ) {
+        guard let url else {
+            completion(nil)
+            return
+        }
+        fileCapabilityRegistrar?(url, purpose, completion) ?? completion(nil)
     }
 
     private func makeMenu(actions: [MenuAction] = []) -> NSMenu {
@@ -1199,7 +1195,7 @@ private enum NativeRelayOriginPolicy {
         case "open-relay-accounts": return localized("routeRelayAccounts", fallback: fallback)
         case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: fallback)
         case "open-codex-settings": return localized("routeCodexSettings", fallback: fallback)
-        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: fallback)
+        case "open-data-management": return localized("routeDataManagement", fallback: fallback)
         case "open-logs", "open-logs?tab=recovery": return fallback
         case "quit": return localized("menuQuit", fallback: fallback)
         default: return fallback
@@ -1214,7 +1210,7 @@ private enum NativeRelayOriginPolicy {
         case "open-relay-accounts": return localized("routeRelayAccounts", fallback: "Relay Accounts")
         case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
         case "open-codex-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
-        case "open-webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings")
+        case "open-data-management": return localized("routeDataManagement", fallback: "Data Management")
         case "open-logs", "open-logs?tab=recovery": return localized("routeLogs", fallback: "Logs")
         case "show-version": return localized("version", fallback: "Version")
         case "quit": return localized("menuQuit", fallback: "Quit LiteLLM Menu")
@@ -1418,14 +1414,14 @@ private enum NativeRelayOriginPolicy {
         switch route {
         case "providers-models":
             return RouteWindowLayout(
-                contentSize: NSSize(width: 820, height: 460),
-                minSize: NSSize(width: 820, height: 460),
+                contentSize: NSSize(width: 780, height: 460),
+                minSize: NSSize(width: 780, height: 460),
                 maxSize: nil
             )
         case "relay-accounts":
             return RouteWindowLayout(
-                contentSize: NSSize(width: 920, height: 620),
-                minSize: NSSize(width: 760, height: 500),
+                contentSize: NSSize(width: 960, height: 620),
+                minSize: NSSize(width: 860, height: 540),
                 maxSize: nil
             )
         case "relay-add":
@@ -1446,11 +1442,16 @@ private enum NativeRelayOriginPolicy {
                 minSize: NSSize(width: 800, height: 520),
                 maxSize: NSSize(width: 1160, height: CGFloat.greatestFiniteMagnitude)
             )
-        case "webdav-settings":
+        case "data-management":
             return RouteWindowLayout(
-                contentSize: NSSize(width: 720, height: 440),
-                minSize: NSSize(width: 700, height: 420),
-                maxSize: nil
+                contentSize: NSSize(width: 500, height: 160),
+                // NSWindow's minimum is a frame size, so include the title bar
+                // while still allowing the compact import pane to fit content.
+                minSize: NSSize(width: 500, height: 140),
+                // React resizes this utility window for the active pane. Do
+                // not retain a previously user-stretched frame with a large,
+                // empty lower area.
+                maxSize: NSSize(width: 620, height: 500)
             )
         case "logs":
             return RouteWindowLayout(
@@ -1489,7 +1490,7 @@ private enum NativeRelayOriginPolicy {
         case "relay-add": return localized("routeRelayAdd", fallback: "Add Relay Account")
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
-        case "webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings")
+        case "data-management": return localized("routeDataManagement", fallback: "Data Management")
         case "logs": return localized("routeLogs", fallback: "Logs")
         default: return nil
         }
@@ -1505,7 +1506,7 @@ private enum NativeRelayOriginPolicy {
         case "relay-add": return "LiteLLM " + localized("routeRelayAdd", fallback: "Add Relay Account")
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
-        case "webdav-settings": return localized("routeWebdavSettings", fallback: "WebDAV Sync Settings")
+        case "data-management": return localized("routeDataManagement", fallback: "Data Management")
         case "logs": return "LiteLLM " + localized("routeLogs", fallback: "Logs")
         default: return nil
         }
@@ -1524,7 +1525,7 @@ private enum NativeRelayOriginPolicy {
     @objc private func openCodex() { openNamedRoute("codex-settings") }
     @objc private func openClaude() { openNamedRoute("claude-settings") }
     @objc private func openRuntime() { openNamedRoute("runtime-settings") }
-    @objc private func openWebDAV() { openNamedRoute("webdav-settings") }
+    @objc private func openDataManagement() { openNamedRoute("data-management") }
     private func openLogs(tab: String?) {
         guard let title = routeWindowTitle("logs") else { return }
         open(route: "logs", title: title, initialLogTab: tab)
@@ -1544,7 +1545,7 @@ private enum NativeRelayOriginPolicy {
         case "open-codex-settings": openCodex()
         case "open-claude-settings": openClaude()
         case "open-runtime-settings": openRuntime()
-        case "open-webdav-settings": openWebDAV()
+        case "open-data-management": openDataManagement()
         case "open-logs", "open-logs?tab=recovery": openLogs(tab: id == "open-logs?tab=recovery" ? "recovery" : nil)
         case "toggle-autostart":
             emitAction(id)
@@ -1558,6 +1559,8 @@ private enum NativeRelayOriginPolicy {
     }
 
     public func prepareForTermination() {
+        activeReadOnlyCodeController?.close()
+        activeReadOnlyCodeController = nil
         statusItem.menu = nil
         NSStatusBar.system.removeStatusItem(statusItem)
         for window in routeWindows.values { window.orderOut(nil) }
@@ -1780,6 +1783,143 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
         modalWindow?.orderOut(nil)
     }
     var selectedModels: [String] { listView.selectedModels }
+}
+
+private func readOnlyCodeEditorHTML(html: String, text: String, language: String) -> String {
+    let payload: [String: Any] = [
+        "type": "replace",
+        "documentKey": "readonly",
+        "value": text,
+        "baseline": text,
+        "language": language,
+        "readOnly": true,
+        "showDiff": false,
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: payload)
+    let json = String(data: data, encoding: .utf8)!
+        .replacingOccurrences(of: "</script", with: "<\\/script", options: .caseInsensitive)
+    let bodyEnd = html.range(of: "</body>", options: [.caseInsensitive, .backwards])!
+    let command = "<script>window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(\(json));</script>"
+    return html.replacingCharacters(in: bodyEnd, with: "\(command)</body>")
+}
+
+private final class NativeReadOnlyCodeController: NSObject, NSWindowDelegate {
+    let panel: NSPanel
+
+    private let webView: WKWebView
+    private var documentHTML: String
+    private var onClose: ((NativeReadOnlyCodeController) -> Void)?
+    private var stopped = false
+
+    init(
+        title: String,
+        text: String,
+        closeTitle: String,
+        language: String,
+        html: String,
+        onClose: @escaping (NativeReadOnlyCodeController) -> Void
+    ) {
+        let configuration = WKWebViewConfiguration()
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        documentHTML = readOnlyCodeEditorHTML(html: html, text: text, language: language)
+        self.onClose = onClose
+
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        super.init()
+
+        configureImmediatePresentation(panel)
+        panel.title = title
+        panel.minSize = NSSize(width: 560, height: 380)
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        panel.center()
+
+        let content = NSView()
+        panel.contentView = content
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.systemFont(ofSize: 16, weight: .semibold)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let editorFrame = NSView()
+        editorFrame.wantsLayer = true
+        editorFrame.layer?.borderColor = NSColor.separatorColor.cgColor
+        editorFrame.layer?.borderWidth = 1
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        editorFrame.addSubview(webView)
+        NSLayoutConstraint.activate([
+            webView.leadingAnchor.constraint(equalTo: editorFrame.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: editorFrame.trailingAnchor),
+            webView.topAnchor.constraint(equalTo: editorFrame.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: editorFrame.bottomAnchor),
+        ])
+
+        let closeButton = NSButton(title: closeTitle, target: self, action: #selector(closeAction(_:)))
+        closeButton.bezelStyle = .rounded
+        closeButton.keyEquivalent = "\u{1b}"
+
+        for view in [titleLabel, editorFrame, closeButton] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            editorFrame.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            editorFrame.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            editorFrame.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            editorFrame.bottomAnchor.constraint(equalTo: closeButton.topAnchor, constant: -14),
+            closeButton.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            closeButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
+        ])
+        panel.initialFirstResponder = webView
+        webView.setAccessibilityLabel(title)
+    }
+
+    func present() {
+        guard !stopped else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        withoutAnimations {
+            panel.makeKeyAndOrderFront(nil)
+            panel.contentView?.layoutSubtreeIfNeeded()
+        }
+        webView.loadHTMLString(documentHTML, baseURL: nil)
+        documentHTML = ""
+    }
+
+    @objc private func closeAction(_ sender: Any?) {
+        close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        finish()
+    }
+
+    func close() {
+        finish()
+        withoutAnimations { panel.close() }
+    }
+
+    private func finish() {
+        guard !stopped else { return }
+        stopped = true
+        panel.delegate = nil
+        webView.stopLoading()
+        webView.loadHTMLString("", baseURL: nil)
+        withoutAnimations { panel.orderOut(nil) }
+        let completion = onClose
+        onClose = nil
+        completion?(self)
+    }
 }
 
 private final class NativeActionMenuTarget: NSObject {

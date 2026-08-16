@@ -15,7 +15,7 @@ from .language import (
     create_translator,
     resolve_language,
 )
-from ._shared import LegacyDomainError
+from ._shared import DomainError
 from .codex import CodexSettingsDomain
 from .providers_models import ProvidersModelsDomain
 from .runtime import RuntimeSettingsDomain
@@ -35,7 +35,7 @@ __all__ = [
     "create_translator",
     "resolve_language",
     "CodexSettingsDomain",
-    "LegacyDomainError",
+    "DomainError",
     "ProvidersModelsDomain",
     "RuntimeSettingsDomain",
     "WebDAVSettingsDomain",

@@ -606,6 +606,79 @@ class HookImageRoutingTests(HookTestCase):
             hooks._INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES,
         )
 
+    def test_with_bounded_image_inputs_accounts_for_accumulated_encrypted_images(self) -> None:
+        hooks, _ = load_hook_module()
+
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        image = Image.frombytes("RGB", (900, 900), os.urandom(900 * 900 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        original_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        self.assertGreater(
+            hooks._image_data_url_size(original_url),
+            hooks._INLINE_IMAGE_MANY_TARGET_BYTES,
+        )
+
+        history = []
+        for batch in range(5):
+            request_kwargs = {
+                "input": history
+                + [
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": f"call-{batch}",
+                        "output": [
+                            {
+                                "type": "input_image",
+                                "image_url": original_url,
+                            }
+                            for _ in range(3)
+                        ],
+                    }
+                ]
+            }
+
+            modified = hooks._with_bounded_image_inputs(request_kwargs)
+
+            self.assertIsNotNone(modified)
+            assert modified is not None
+            if history:
+                self.assertEqual(modified["input"][:-1], history)
+            history = modified["input"] + [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": f"opaque-encrypted-{batch}",
+                }
+            ]
+
+        budget = hooks._image_input_budget({"input": history})
+
+        self.assertIsNotNone(budget)
+        assert budget is not None
+        self.assertEqual(budget["image_count"], 15)
+        self.assertEqual(budget["new_suffix_image_count"], 0)
+        self.assertLessEqual(
+            budget["inline_image_bytes"],
+            hooks._INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES
+            + 6 * hooks._INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES,
+        )
+        final_batch = history[-2]["output"]
+        self.assertTrue(
+            all(
+                hooks._image_data_url_size(item["image_url"])
+                <= hooks._INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES
+                for item in final_batch
+            )
+        )
+
     def test_with_bounded_image_inputs_reencodes_truncated_oversized_jpeg(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -677,12 +750,21 @@ class HookImageRoutingTests(HookTestCase):
 
         self.assertEqual(response, original)
 
-    async def test_structured_image_tool_with_normal_text_response_does_not_retry(self) -> None:
+    async def test_structured_image_tool_with_normal_text_response_forces_probe(self) -> None:
         hooks, proxy_server = load_hook_module()
+        calls = []
 
         class FakeRouter:
             async def aresponses(self, **payload):
-                raise AssertionError("normal text response must not invoke forced image fallback")
+                calls.append(payload)
+                return {
+                    "output": [
+                        {
+                            "type": "image_generation_call",
+                            "result": "base64-image",
+                        }
+                    ]
+                }
 
         proxy_server.llm_router = FakeRouter()
         hook = hooks.LiteLLMMenuHook()
@@ -697,7 +779,40 @@ class HookImageRoutingTests(HookTestCase):
 
         response = await hook.async_post_call_success_deployment_hook(request_data, original, call_type=None)
 
-        self.assertEqual(response, original)
+        self.assertEqual(response["output"][0]["type"], "image_generation_call")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool_choice"], {"type": "image_generation"})
+
+    async def test_image_policy_refusal_does_not_probe_or_mark_deployment_unsupported(self) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("policy refusals must not invoke image fallback")
+
+        proxy_server.llm_router = FakeRouter()
+        hook = hooks.LiteLLMMenuHook()
+        request_data = {
+            "model": "default-chat",
+            "input": "make a disallowed image",
+            "tools": [{"type": "image_generation"}],
+            "tool_choice": "auto",
+            "stream": False,
+        }
+        refusal = {"output_text": "This request violates our content policy."}
+
+        response = await hook.async_post_call_success_deployment_hook(
+            request_data,
+            refusal,
+            call_type=None,
+        )
+
+        self.assertIs(response, refusal)
+        policy_error = RuntimeError("This request violates our content policy.")
+        policy_error.status_code = 400
+        self.assertFalse(
+            hooks._is_image_generation_tool_capability_error(policy_error)
+        )
 
 
 if __name__ == "__main__":

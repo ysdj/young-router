@@ -1,6 +1,6 @@
 
 /*
- * This file is auto-generated from LiteLLMWinUISecureTextEditorNativeComponent spec file in flow / TypeScript.
+ * This file is auto-generated from LiteLLMWinUICodeWebViewNativeComponent spec file in flow / TypeScript.
  */
 // clang-format off
 #pragma once
@@ -18,16 +18,22 @@
 
 namespace winrt::LiteLLMMenu::Codegen {
 
-REACT_STRUCT(LiteLLMWinUISecureTextEditorProps)
-struct LiteLLMWinUISecureTextEditorProps : winrt::implements<LiteLLMWinUISecureTextEditorProps, winrt::Microsoft::ReactNative::IComponentProps> {
-  LiteLLMWinUISecureTextEditorProps(winrt::Microsoft::ReactNative::ViewProps props, const winrt::Microsoft::ReactNative::IComponentProps& cloneFrom)
+REACT_STRUCT(LiteLLMWinUICodeWebViewProps)
+struct LiteLLMWinUICodeWebViewProps : winrt::implements<LiteLLMWinUICodeWebViewProps, winrt::Microsoft::ReactNative::IComponentProps> {
+  LiteLLMWinUICodeWebViewProps(winrt::Microsoft::ReactNative::ViewProps props, const winrt::Microsoft::ReactNative::IComponentProps& cloneFrom)
     : ViewProps(props)
   {
      if (cloneFrom) {
-       auto cloneFromProps = cloneFrom.as<LiteLLMWinUISecureTextEditorProps>();
-       editorToken = cloneFromProps->editorToken;
+       auto cloneFromProps = cloneFrom.as<LiteLLMWinUICodeWebViewProps>();
+       html = cloneFromProps->html;
+       documentKey = cloneFromProps->documentKey;
+       value = cloneFromProps->value;
+       baseline = cloneFromProps->baseline;
        language = cloneFromProps->language;
-       onEditorState = cloneFromProps->onEditorState;  
+       readOnly = cloneFromProps->readOnly;
+       showDiff = cloneFromProps->showDiff;
+       onEditorChange = cloneFromProps->onEditorChange;
+       onEditorError = cloneFromProps->onEditorError;  
      }
   }
 
@@ -35,39 +41,73 @@ struct LiteLLMWinUISecureTextEditorProps : winrt::implements<LiteLLMWinUISecureT
     winrt::Microsoft::ReactNative::ReadProp(hash, propName, value, *this);
   }
 
-  REACT_FIELD(editorToken)
-  std::string editorToken;
+  REACT_FIELD(html)
+  std::string html;
+
+  REACT_FIELD(documentKey)
+  std::string documentKey;
+
+  REACT_FIELD(value)
+  std::string value;
+
+  REACT_FIELD(baseline)
+  std::string baseline;
 
   REACT_FIELD(language)
   std::string language;
 
+  REACT_FIELD(readOnly)
+  std::optional<bool> readOnly{};
+
+  REACT_FIELD(showDiff)
+  std::optional<bool> showDiff{};
+
    // These fields can be used to determine if JS has registered for this event
-  REACT_FIELD(onEditorState)
-  bool onEditorState{false};
+  REACT_FIELD(onEditorChange)
+  bool onEditorChange{false};
+
+  REACT_FIELD(onEditorError)
+  bool onEditorError{false};
 
   const winrt::Microsoft::ReactNative::ViewProps ViewProps;
 };
 
-REACT_STRUCT(LiteLLMWinUISecureTextEditorSpec_onEditorState)
-struct LiteLLMWinUISecureTextEditorSpec_onEditorState {
-  REACT_FIELD(revision)
-  int32_t revision{};
-
-  REACT_FIELD(status)
-  std::string status;
-
-  REACT_FIELD(error)
-  std::string error;
+REACT_STRUCT(LiteLLMWinUICodeWebViewSpec_onEditorError)
+struct LiteLLMWinUICodeWebViewSpec_onEditorError {
+  REACT_FIELD(message)
+  std::string message;
 };
 
-struct LiteLLMWinUISecureTextEditorEventEmitter {
-  LiteLLMWinUISecureTextEditorEventEmitter(const winrt::Microsoft::ReactNative::EventEmitter &eventEmitter)
+REACT_STRUCT(LiteLLMWinUICodeWebViewSpec_onEditorChange)
+struct LiteLLMWinUICodeWebViewSpec_onEditorChange {
+  REACT_FIELD(text)
+  std::string text;
+
+  REACT_FIELD(added)
+  int32_t added{};
+
+  REACT_FIELD(changed)
+  int32_t changed{};
+
+  REACT_FIELD(deleted)
+  int32_t deleted{};
+};
+
+struct LiteLLMWinUICodeWebViewEventEmitter {
+  LiteLLMWinUICodeWebViewEventEmitter(const winrt::Microsoft::ReactNative::EventEmitter &eventEmitter)
       : m_eventEmitter(eventEmitter) {}
 
-  using OnEditorState = LiteLLMWinUISecureTextEditorSpec_onEditorState;
+  using OnEditorChange = LiteLLMWinUICodeWebViewSpec_onEditorChange;
+  using OnEditorError = LiteLLMWinUICodeWebViewSpec_onEditorError;
 
-  void onEditorState(OnEditorState &&value) const {
-    m_eventEmitter.DispatchEvent(L"editorState", [value = std::move(value)](const winrt::Microsoft::ReactNative::IJSValueWriter writer) {
+  void onEditorChange(OnEditorChange &&value) const {
+    m_eventEmitter.DispatchEvent(L"editorChange", [value = std::move(value)](const winrt::Microsoft::ReactNative::IJSValueWriter writer) {
+      winrt::Microsoft::ReactNative::WriteValue(writer, value);
+    });
+  }
+
+  void onEditorError(OnEditorError &&value) const {
+    m_eventEmitter.DispatchEvent(L"editorError", [value = std::move(value)](const winrt::Microsoft::ReactNative::IJSValueWriter writer) {
       winrt::Microsoft::ReactNative::WriteValue(writer, value);
     });
   }
@@ -77,12 +117,12 @@ struct LiteLLMWinUISecureTextEditorEventEmitter {
 };
 
 template<typename TUserData>
-struct BaseLiteLLMWinUISecureTextEditor {
+struct BaseLiteLLMWinUICodeWebView {
 
   virtual void UpdateProps(
     const winrt::Microsoft::ReactNative::ComponentView &/*view*/,
-    const winrt::com_ptr<LiteLLMWinUISecureTextEditorProps> &newProps,
-    const winrt::com_ptr<LiteLLMWinUISecureTextEditorProps> &/*oldProps*/) noexcept {
+    const winrt::com_ptr<LiteLLMWinUICodeWebViewProps> &newProps,
+    const winrt::com_ptr<LiteLLMWinUICodeWebViewProps> &/*oldProps*/) noexcept {
     m_props = newProps;
   }
 
@@ -99,7 +139,7 @@ struct BaseLiteLLMWinUISecureTextEditor {
     const winrt::Microsoft::ReactNative::IComponentState &/*newState*/) noexcept {
   }
 
-  virtual void UpdateEventEmitter(const std::shared_ptr<LiteLLMWinUISecureTextEditorEventEmitter> &eventEmitter) noexcept {
+  virtual void UpdateEventEmitter(const std::shared_ptr<LiteLLMWinUICodeWebViewEventEmitter> &eventEmitter) noexcept {
     m_eventEmitter = eventEmitter;
   }
 
@@ -135,32 +175,32 @@ struct BaseLiteLLMWinUISecureTextEditor {
 
   
 
-  const std::shared_ptr<LiteLLMWinUISecureTextEditorEventEmitter>& EventEmitter() const { return m_eventEmitter; }
-  const winrt::com_ptr<LiteLLMWinUISecureTextEditorProps>& Props() const { return m_props; }
+  const std::shared_ptr<LiteLLMWinUICodeWebViewEventEmitter>& EventEmitter() const { return m_eventEmitter; }
+  const winrt::com_ptr<LiteLLMWinUICodeWebViewProps>& Props() const { return m_props; }
 
 private:
-  winrt::com_ptr<LiteLLMWinUISecureTextEditorProps> m_props;
-  std::shared_ptr<LiteLLMWinUISecureTextEditorEventEmitter> m_eventEmitter;
+  winrt::com_ptr<LiteLLMWinUICodeWebViewProps> m_props;
+  std::shared_ptr<LiteLLMWinUICodeWebViewEventEmitter> m_eventEmitter;
 };
 
 template <typename TUserData>
-void RegisterLiteLLMWinUISecureTextEditorNativeComponent(
+void RegisterLiteLLMWinUICodeWebViewNativeComponent(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const &packageBuilder,
     std::function<void(const winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder&)> builderCallback) noexcept {
   packageBuilder.as<winrt::Microsoft::ReactNative::IReactPackageBuilderFabric>().AddViewComponent(
-      L"LiteLLMWinUISecureTextEditor", [builderCallback](winrt::Microsoft::ReactNative::IReactViewComponentBuilder const &builder) noexcept {
+      L"LiteLLMWinUICodeWebView", [builderCallback](winrt::Microsoft::ReactNative::IReactViewComponentBuilder const &builder) noexcept {
         auto compBuilder = builder.as<winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder>();
 
         builder.SetCreateProps([](winrt::Microsoft::ReactNative::ViewProps props,
                               const winrt::Microsoft::ReactNative::IComponentProps& cloneFrom) noexcept {
-            return winrt::make<LiteLLMWinUISecureTextEditorProps>(props, cloneFrom); 
+            return winrt::make<LiteLLMWinUICodeWebViewProps>(props, cloneFrom); 
         });
 
         builder.SetUpdatePropsHandler([](const winrt::Microsoft::ReactNative::ComponentView &view,
                                      const winrt::Microsoft::ReactNative::IComponentProps &newProps,
                                      const winrt::Microsoft::ReactNative::IComponentProps &oldProps) noexcept {
             auto userData = view.UserData().as<TUserData>();
-            userData->UpdateProps(view, newProps ? newProps.as<LiteLLMWinUISecureTextEditorProps>() : nullptr, oldProps ? oldProps.as<LiteLLMWinUISecureTextEditorProps>() : nullptr);
+            userData->UpdateProps(view, newProps ? newProps.as<LiteLLMWinUICodeWebViewProps>() : nullptr, oldProps ? oldProps.as<LiteLLMWinUICodeWebViewProps>() : nullptr);
         });
 
         compBuilder.SetUpdateLayoutMetricsHandler([](const winrt::Microsoft::ReactNative::ComponentView &view,
@@ -173,10 +213,10 @@ void RegisterLiteLLMWinUISecureTextEditorNativeComponent(
         builder.SetUpdateEventEmitterHandler([](const winrt::Microsoft::ReactNative::ComponentView &view,
                                      const winrt::Microsoft::ReactNative::EventEmitter &eventEmitter) noexcept {
           auto userData = view.UserData().as<TUserData>();
-          userData->UpdateEventEmitter(std::make_shared<LiteLLMWinUISecureTextEditorEventEmitter>(eventEmitter));
+          userData->UpdateEventEmitter(std::make_shared<LiteLLMWinUICodeWebViewEventEmitter>(eventEmitter));
         });
 
-        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::FinalizeUpdate != &BaseLiteLLMWinUISecureTextEditor<TUserData>::FinalizeUpdate) {
+        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::FinalizeUpdate != &BaseLiteLLMWinUICodeWebView<TUserData>::FinalizeUpdate) {
             builder.SetFinalizeUpdateHandler([](const winrt::Microsoft::ReactNative::ComponentView &view,
                                      winrt::Microsoft::ReactNative::ComponentViewUpdateMask mask) noexcept {
             auto userData = view.UserData().as<TUserData>();
@@ -184,7 +224,7 @@ void RegisterLiteLLMWinUISecureTextEditorNativeComponent(
           });
         } 
 
-        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::UpdateState != &BaseLiteLLMWinUISecureTextEditor<TUserData>::UpdateState) {
+        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::UpdateState != &BaseLiteLLMWinUICodeWebView<TUserData>::UpdateState) {
           builder.SetUpdateStateHandler([](const winrt::Microsoft::ReactNative::ComponentView &view,
                                      const winrt::Microsoft::ReactNative::IComponentState &newState) noexcept {
             auto userData = view.UserData().as<TUserData>();
@@ -192,7 +232,7 @@ void RegisterLiteLLMWinUISecureTextEditorNativeComponent(
           });
         }
 
-        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::MountChildComponentView != &BaseLiteLLMWinUISecureTextEditor<TUserData>::MountChildComponentView) {
+        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::MountChildComponentView != &BaseLiteLLMWinUICodeWebView<TUserData>::MountChildComponentView) {
           builder.SetMountChildComponentViewHandler([](const winrt::Microsoft::ReactNative::ComponentView &view,
                                       const winrt::Microsoft::ReactNative::MountChildComponentViewArgs &args) noexcept {
             auto userData = view.UserData().as<TUserData>();
@@ -200,7 +240,7 @@ void RegisterLiteLLMWinUISecureTextEditorNativeComponent(
           });
         }
 
-        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::UnmountChildComponentView != &BaseLiteLLMWinUISecureTextEditor<TUserData>::UnmountChildComponentView) {
+        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::UnmountChildComponentView != &BaseLiteLLMWinUICodeWebView<TUserData>::UnmountChildComponentView) {
           builder.SetUnmountChildComponentViewHandler([](const winrt::Microsoft::ReactNative::ComponentView &view,
                                       const winrt::Microsoft::ReactNative::UnmountChildComponentViewArgs &args) noexcept {
             auto userData = view.UserData().as<TUserData>();
@@ -208,7 +248,7 @@ void RegisterLiteLLMWinUISecureTextEditorNativeComponent(
           });
         }
 
-        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::CreateAutomationPeer != &BaseLiteLLMWinUISecureTextEditor<TUserData>::CreateAutomationPeer) {
+        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::CreateAutomationPeer != &BaseLiteLLMWinUICodeWebView<TUserData>::CreateAutomationPeer) {
             builder.SetCreateAutomationPeerHandler([](const winrt::Microsoft::ReactNative::ComponentView &view,
                                      const winrt::Microsoft::ReactNative::CreateAutomationPeerArgs& args) noexcept {
             auto userData = view.UserData().as<TUserData>();
@@ -218,13 +258,13 @@ void RegisterLiteLLMWinUISecureTextEditorNativeComponent(
 
         compBuilder.SetViewComponentViewInitializer([](const winrt::Microsoft::ReactNative::ComponentView &view) noexcept {
           auto userData = winrt::make_self<TUserData>();
-          if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::Initialize != &BaseLiteLLMWinUISecureTextEditor<TUserData>::Initialize) {
+          if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::Initialize != &BaseLiteLLMWinUICodeWebView<TUserData>::Initialize) {
             userData->Initialize(view);
           }
           view.UserData(*userData);
         });
 
-        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::CreateVisual != &BaseLiteLLMWinUISecureTextEditor<TUserData>::CreateVisual) {
+        if CONSTEXPR_SUPPORTED_ON_VIRTUAL_FN_ADDRESS (&TUserData::CreateVisual != &BaseLiteLLMWinUICodeWebView<TUserData>::CreateVisual) {
           compBuilder.SetCreateVisualHandler([](const winrt::Microsoft::ReactNative::ComponentView &view) noexcept {
             auto userData = view.UserData().as<TUserData>();
             return userData->CreateVisual(view);

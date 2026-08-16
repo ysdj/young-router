@@ -476,7 +476,18 @@ def validate_config_bytes(name: str, data: bytes, required_key: str) -> dict[str
             loaded = json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
         except Exception as exc:
             raise SyncError(f"{name} is not valid JSON: {exc}") from exc
-        if not isinstance(loaded, dict) or loaded.get("version") != 1 or not isinstance(loaded.get("accounts"), list):
+        if (
+            not isinstance(loaded, dict)
+            or loaded.get("version") not in {1, 3}
+            or not isinstance(loaded.get("accounts"), list)
+            or (
+                loaded.get("version") == 3
+                and (
+                    not isinstance(loaded.get("stations"), list)
+                    or not isinstance(loaded.get("pending_credential_cleanups"), list)
+                )
+            )
+        ):
             raise SyncError(f"{name} is not a relay account file")
         return loaded
     try:
