@@ -249,6 +249,7 @@ struct ButtonComponentView final
       else if (symbol == "pause") icon.Glyph(L"\xE769");
       else if (symbol == "play") icon.Glyph(L"\xE768");
       else if (symbol == "plus") icon.Glyph(L"\xE710");
+      else if (symbol == "refresh") icon.Glyph(L"\xE72C");
       else icon.Glyph(L"\xE74D");
       button_.Content(icon);
     }
@@ -1762,9 +1763,6 @@ struct SecureTextInputComponentView final
     if (!Current(generation) || !IsPlainTextAutoCommitField()) return;
     loading_ = false;
     auto display_value = value.value_or("");
-    if (active_domain_ == "relay_accounts" && active_field_ == "api_key" && display_value.size() > 12) {
-      display_value = display_value.substr(0, 12) + "\xE2\x80\xA6";
-    }
     SetPassword(ToHString(display_value));
     dirty_ = false;
     password_box_.IsEnabled(!disabled);

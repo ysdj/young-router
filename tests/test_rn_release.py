@@ -51,7 +51,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('stable_checks >= REQUIRED_HEALTH_CHECKS', installer)
         self.assertIn('restore_previous_app', installer)
         self.assertIn("copy_tree()", installer)
-        self.assertIn('cp -ac "$source/." "$destination/"', installer)
+        self.assertIn('ditto --rsrc --extattr --acl "$source" "$destination"', installer)
         self.assertIn('copy_tree "$STAGED_APP" "$INSTALL_STAGE"', installer)
         self.assertIn('codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"', installer)
         self.assertIn('open -g "$DESTINATION" >/dev/null 2>&1 || true', installer)
@@ -95,6 +95,28 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("The old LiteLLM Menu app did not stop; restoring the previous bundle.", installer)
         self.assertLess(start_replacement, delete_previous)
         self.assertLess(delete_previous, mark_complete)
+
+    def test_macos_builds_and_installs_invalidate_finder_icon_cache(self) -> None:
+        build = (ROOT / "rn" / "scripts" / "build-macos.sh").read_text(
+            encoding="utf-8"
+        )
+        installer = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(
+            encoding="utf-8"
+        )
+
+        select_final_artifact = build.index('APP="$OUTPUT"')
+        touch_final_artifact = build.index('touch "$APP"')
+        print_final_artifact = build.index("printf '%s\\n' \"$APP\"")
+        self.assertLess(select_final_artifact, touch_final_artifact)
+        self.assertLess(touch_final_artifact, print_final_artifact)
+
+        install_replacement = installer.index('if ! mv "$INSTALL_STAGE" "$DESTINATION"; then')
+        refresh_installed_icon = installer.index("if ! refresh_installed_app_icon; then")
+        stop_previous_app = installer.index('if ! stop_installed_app "$OLD_PIDS"; then')
+        self.assertIn('touch "$DESTINATION"', installer)
+        self.assertIn('"$LSREGISTER" -f "$DESTINATION"', installer)
+        self.assertLess(install_replacement, refresh_installed_icon)
+        self.assertLess(refresh_installed_icon, stop_previous_app)
 
     def test_release_entry_uses_react_native_build_and_portable_core(self) -> None:
         script = (ROOT / "scripts" / "package-release.sh").read_text(encoding="utf-8")

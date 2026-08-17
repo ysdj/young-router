@@ -304,7 +304,7 @@ private enum NativeRelayOriginPolicy {
     }
 
     func setWindowContentSize(route: String, width: Double, height: Double) -> Bool {
-        let minimumContentExtent = canonicalRoute(route) == "data-management" ? 96.0 : 128.0
+        let minimumContentExtent = canonicalRoute(route) == "data-management" ? 84.0 : 128.0
         let maximumContentExtent = 8_192.0
         guard width.isFinite,
               height.isFinite,
@@ -1420,8 +1420,8 @@ private enum NativeRelayOriginPolicy {
             )
         case "relay-accounts":
             return RouteWindowLayout(
-                contentSize: NSSize(width: 960, height: 620),
-                minSize: NSSize(width: 860, height: 540),
+                contentSize: NSSize(width: 820, height: 480),
+                minSize: NSSize(width: 780, height: 440),
                 maxSize: nil
             )
         case "relay-add":

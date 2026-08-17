@@ -379,7 +379,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )[0]
         for marker in (
             'const [importPreview, setImportPreview] = useState<IpcResults["import_preview"]>();',
-            '!importPreview ? <DataManagementGroup style={styles.dataManagementImportIntro}><View style={styles.dataManagementInlineActions}><ActionButton title={translate("dataManagement.chooseImportFile")}',
+            '!importPreview ? <View style={styles.dataManagementImportIntro}><View style={styles.dataManagementImportFileRow}><Text style={styles.dataManagementImportFileLabel}>{translate("dataManagement.importFile")}</Text>',
+            '<Text numberOfLines={1} style={styles.dataManagementImportFilePlaceholder}>{translate("dataManagement.noImportFile")}</Text>',
             '{importReviewReady ? <>',
             '{sectionList(detectedImportSections, importSections, busy,',
             'title={translate("dataManagement.chooseImportFile")}',
@@ -431,7 +432,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{ width: windows ? 620 : 590, height: windows ? 480 : 410 }',
             '{ width: windows ? 560 : 540, height: windows ? 240 : 225 }',
             'const importHeight = importItemCount === 0',
-            '? windows ? 112 : 96',
+            '? windows ? 116 : 104',
             ': importItemCount <= 2',
             '? windows ? (replacingDraftSections.length > 0 ? 210 : 180) : (replacingDraftSections.length > 0 ? 195 : 160)',
             ': windows ? (replacingDraftSections.length > 0 ? 250 : 220) : (replacingDraftSections.length > 0 ? 235 : 195)',
@@ -442,7 +443,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, workspace)
         self.assert_ui_has('dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }')
-        self.assert_ui_has('dataManagementImportIntro: { minHeight: 0, paddingTop: 2 }')
+        self.assert_ui_has('dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }')
         self.assert_ui_has('dataManagementGroup: { gap: 6 }')
         self.assert_ui_has('dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap"')
         self.assertNotIn('dataManagementWarningPanel:', self.ui)
@@ -512,7 +513,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('dataManagementGroupHeader:', self.ui)
         self.assertNotIn('dataManagementGroupTitle:', self.ui)
         self.assertNotIn('DataManagementGroup title=', workspace)
-        self.assertIn('dataManagementInlineActions: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "flex-start", paddingLeft: 8 }', self.ui)
+        self.assertIn('dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }', self.ui)
+        self.assertIn('dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }', self.ui)
         self.assertIn('<NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSyncLabel}', workspace)
         self.assertIn('dataManagementDirectionPicker: { width: 210, height: 24', self.ui)
         self.assertNotIn('<WindowTabs values={syncOptions}', workspace)
@@ -1879,14 +1881,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'key: `station:${station.id}`',
             'cells: [stationLabel, ""]',
             'key: `account:${account.id}`',
-            'cells: [`\\t${accountDisplayName(account, translate)}`',
+            'cells: [`  ${accountDisplayName(account, translate)}`',
             "const stationFormDirty = Boolean(selectedStation)",
             'const relayTableSelection = selectedStationID ? `station:${selectedStationID}` : selected?.id ? `account:${selected.id}` : "";',
             "sidebarAddButton:",
             'symbol="minus"',
-            "NativeSplitView",
             "NativeTable",
-            'columns={[{ label: translate("relay.accounts"), width: 122 }, { label: translate("relay.balance"), width: 78 }]}',
+            'columns={[{ label: translate("relay.accounts"), width: 118 }, { label: translate("relay.balance"), width: 78 }]}',
             "onSelectionChange={selectRelayTableRow}",
             "nativeRelayTable:",
             "nativeRelayTable:",
@@ -1899,12 +1900,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title={translate("common.save")}',
             'function resourceModelsSummary(resource: RelayResource, translate: Translate): string {',
             'translate("relay.apiKeysTitle")',
-            'translate("relay.selectAllResources")',
-            'translate("relay.clearResourceSelection")',
             'translate("relay.apiKeyNamePlaceholder")',
+            "resourceTableRows",
+            "ResourceImportDialog",
+            "importDialogOpen",
             'translate("relay.apiKeyDelete")',
             'translate("relay.apiKeyCreate")',
-            "resourceToolbarActions",
             "NativeSecureTextInput",
             'symbol="copy"',
             "resourceToolbarCrud",
@@ -1925,51 +1926,41 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(marker, relay)
 
         self.assertEqual(2, relay.count('scrollTrailingColumnOverflow={false}'))
-        self.assertEqual(2, relay.count('framed={false}'))
         self.assertNotIn("resourceListActions", relay)
+        self.assertNotIn('translate("relay.selectAllResources")', relay)
+        self.assertNotIn("selectAllResources", relay)
 
-        # API-key inspection is independent from the batch import selection.
-        # The native list owns the current item; selectedResources remains the
-        # checkbox-style batch state used by the resource toolbar.
+        # The main workspace remains a single-selection native zebra table.
         for marker in (
-            "const [selectedResources, setSelectedResources] = useState<string[]>([]);",
-            "resourceTableRows",
+            "const resourceTableRows = useMemo",
             "resourceSecondaryCellKeys",
-            "selectedResource",
-            "resourceGroups",
-            "selectedResourceGroupLabel",
-            "resourcePaneWidth",
-            "selectedKey={selectedResourceID ?? \"\"}",
+            'rows={resourceTableRows}',
+            'selectedKey={selectedResourceID ?? ""}',
             "secondaryCellKeys={resourceSecondaryCellKeys}",
             "onSelectionChange={setSelectedResourceID}",
+            "resourceNativeTable:",
+            'columns={[{ label: translate("common.name"), width: 106 }, { label: translate("relay.apiKeyGroup"), width: 178 }]}',
+            "resourceInspectorPane: { width: 290",
+            "resourceInspectorLabel: { width: 78",
         ):
             self.assertIn(marker, relay)
         self.assertRegex(
             relay,
             r"const \[selectedResourceID, setSelectedResourceID\] = useState(?:<[^>]+>)?\(",
         )
-        self.assertRegex(
-            relay,
-            r"const selectedResource = selected\?\.resources\.find\(\(resource\) => resource\.id === selectedResourceID\)",
-        )
-        secondary_cells = relay.split("const resourceSecondaryCellKeys", 1)[1]
-        self.assertIn("!resource.enabled", secondary_cells)
-        self.assertNotRegex(relay, r"disabledRowKeys=\{[^}]*[Rr]esource[^}]*\}")
 
-        # The old all-fields-in-every-row grid is replaced inside the existing
-        # resources section by a compact Name/Group native table and a detail
-        # inspector made from the same native controls used by Models/Settings.
-        resource_table_row = relay.index("rows={resourceTableRows}")
-        resource_table_start = relay.rfind("<NativeTable", 0, resource_table_row)
-        resource_table_end = relay.find("/>", resource_table_row)
-        resource_table = relay[resource_table_start:resource_table_end]
+        # Batch selection exists only in the import dialog opened from the
+        # window footer, never in the account's main API-key toolbar/list.
+        import_dialog = relay.split("function ResourceImportDialog(", 1)[1].split("function RelayTablePane", 1)[0]
         for marker in (
-            'label: translate("common.name")',
-            'label: translate("relay.apiKeyGroup")',
-            "rows={resourceTableRows}",
-            "compact",
+            "NativeCheckbox",
+            "selectedResources.includes(resource.id)",
+            'title={translate("relay.importSelected")}',
+            'translate("relay.selectedCount"',
         ):
-            self.assertIn(marker, resource_table)
+            self.assertIn(marker, import_dialog)
+        self.assertIn('leading={<ActionButton title={translate("relay.apiKeyImport")}', self.ui)
+        self.assertIn("setRelayImportRequest((current) => current + 1)", self.ui)
         resources_section = relay.split(
             '<View style={[styles.resourcesSection, compactStyles.resourcesSection]}>',
             1,
@@ -1977,8 +1968,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '</View> : <View style={styles.blank}>',
             1,
         )[0]
-        self.assertIn("<NativeSplitView", resources_section)
         self.assertIn("<ResourceInspector", resources_section)
+        self.assertIn("<NativeTable", resources_section)
+        self.assertIn("          striped\n", resources_section)
+        self.assertNotIn("ResourceImportDialog", resources_section)
+        self.assertNotIn('translate("relay.importSelected")', resources_section)
+        self.assertNotIn("NativeCheckbox", resources_section)
         for marker in (
             "resourceToolbarCrud",
             'symbol="plus"',
@@ -1987,8 +1982,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'runApiKeyAction("remove", selectedResource.id)',
         ):
             self.assertIn(marker, resources_section)
-        self.assertIn("<NativeSplitView", relay)
-        self.assertIn("paneWidth={resourcePaneWidth}", relay)
         self.assertIn("function ResourceInspector(", relay)
         resource_inspector = relay.split("function ResourceInspector(", 1)[1].split(
             "export function RelayAccountManager(",
@@ -2001,8 +1994,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "NativeCheckbox",
             'symbol="copy"',
             'domain="relay_accounts"',
+            "<Text selectable style={styles.resourceInspectorModels}",
         ):
             self.assertIn(marker, resource_inspector)
+        self.assertNotIn("numberOfLines={3}", resource_inspector)
         for legacy_grid in (
             "function ResourceColumnHeader(",
             "function ResourceRow(",
@@ -2011,9 +2006,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(legacy_grid, relay)
 
-        # The redesign is nested inside the account detail and must not replace
-        # the established station/account list or its outer native split view.
-        self.assertIn("<NativeSplitView", relay)
+        # The redesign stays nested inside the account detail while preserving
+        # the established station/account list.
         self.assertIn("rows={relayTableRows}", relay)
         self.assertIn("onSelectionChange={selectRelayTableRow}", relay)
         self.assertIn("style={styles.nativeRelayTable}", relay)
@@ -2035,10 +2029,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("native.showActionMenu", relay)
         self.assertIn('selected.resourceError === "no_api_keys" && !resourceBusy && !restoreBusy', relay)
         self.assertIn('resourceBusy || restoreBusy ? translate("relay.resourcesChecking") : resourceHint(selected, translate)', relay)
-        self.assertIn('"relay.resourceCount": "共 {count} 项"', self.zh)
-        self.assertIn('"relay.resourceCount": "{count} total"', self.en)
-        self.assertIn('style={styles.resourceSelectionCount}', relay)
-        self.assertIn('title={translate("relay.importSelected")}', resources_section)
+        self.assertNotIn('translate("relay.resourceCount"', relay)
+        self.assertIn('"relay.apiKeyGroup": "分组 / 倍率"', self.zh)
+        self.assertIn('"relay.apiKeyGroup": "Group / Rate"', self.en)
+        self.assertIn('style={styles.resourceSelectionCount}', import_dialog)
+        self.assertIn('title={translate("relay.importSelected")}', import_dialog)
         self.assertNotIn('selectedResources.length > 0 ? <View style={[styles.bottomBar, compactStyles.bottomBar]}>', relay)
         self.assertIn("apiKeyActions", relay)
         self.assertIn('commitRelayMetadata("api_key.create"', self.ui)
@@ -2048,6 +2043,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('commitRelayMetadata("api_key.delete"', self.ui)
         self.assertNotIn('resource_ids: [resourceId]', self.ui)
         self.assertIn('relayTypeLabel(selected.type', relay)
+        self.assertIn('symbol="refresh"', relay)
+        self.assertIn("metaCheckbox: { minWidth: 78 }", relay)
+        self.assertIn("resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1", relay)
 
     def test_relay_empty_state_keeps_an_inline_add_affordance(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -2084,20 +2082,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         for marker in (
-            'splitView: { flex: 1, minHeight: 0, minWidth: 0',
+            'relayLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 4 }',
             'sidebarIconButton: { width: 22, minWidth: 22, height: 22 }',
             'formRow: { width: "100%", minHeight: 34, flexDirection: "column", alignItems: "stretch", gap: 6 }',
             'bottomBar: { minHeight: 38, paddingHorizontal: 12, paddingVertical: 6, flexDirection: "row", flexWrap: "wrap"',
-            'resourcesSection: { flex: 1, minWidth: 0, minHeight: 0 }',
+            'resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1, borderTopColor: colors.separator }',
             'accountDetailContent: { flex: 1, minWidth: 0, minHeight: 0 }',
             'accountHeader: { minWidth: 0, backgroundColor: colors.window }',
-            'accountMetadata: { minHeight: 38, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 24, rowGap: 4, backgroundColor: colors.window }',
+            'accountMetadata: { minHeight: 30, paddingHorizontal: 10, paddingVertical: 2, flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, backgroundColor: colors.window }',
             'resourcePane: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.window }',
-            'resourceToolbar: { minHeight: 36, paddingHorizontal: 12, flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: colors.panel }',
-            'sidebarTableFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.panel }',
-            'resourceListPane: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.panel }',
+            'resourceToolbar: { minHeight: 26, paddingHorizontal: 8, flexDirection: "row", alignItems: "center", gap: 6 }',
+            'sidebarTableFrame: { flex: 1, minWidth: 0, minHeight: 0 }',
+            'resourceListPane: { flex: 1, minWidth: 322, minHeight: 0 }',
             'resourceToolbarCrud: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4, marginLeft: 2 }',
-            'resourceInspectorHeader: { height: 24, minHeight: 24, paddingHorizontal: 12',
+            'resourceInspectorHeader: { height: 24, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }',
             '<Text numberOfLines={1} style={styles.resourceInspectorSubtitle}>{selectedResourceGroupLabel}</Text>',
             'pendingCleanupList: { maxHeight: 116',
             '<ScrollView style={styles.pendingCleanupList} contentContainerStyle={styles.pendingCleanupListContent}>',
@@ -2113,7 +2111,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(redundant_separator, relay)
         self.assertNotIn('accountHeader: { minWidth: 0, borderBottomWidth:', relay)
-        self.assertIn('relayAccountsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }', self.ui)
+        self.assertIn('relayAccountsContent: { paddingBottom: 6, gap: 6 }', self.ui)
 
     def test_provider_table_columns_fit_the_fixed_provider_pane(self) -> None:
         self.assertIn('"providers.modelCount": "Count"', self.en)
@@ -2137,6 +2135,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         for marker in (
             "const compact = props.compact ?? true;",
+            "disabled: props.disabled === true,",
+            "primary: props.primary === true,",
+            "destructive: props.destructive === true,",
+            "link: props.link === true,",
             "compact = true, onChange",
             "compact = true, followBottom",
             "button: { minWidth: 72, height: 24 }",
@@ -2154,18 +2156,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("formRow: { minHeight: 24, gap: 2 }")
         self.assert_ui_has("formRowControl: { gap: 1 }")
         self.assertIn("const compactStyles = StyleSheet.create({", relay)
-        self.assertIn('resourceInspectorRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }', relay)
+        self.assertIn('resourceInspectorRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 6 }', relay)
 
     def test_relay_tables_use_compact_native_zebra_rows_and_shared_alignment(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
 
+        # Both account and API-key panes use the native compact zebra table;
+        # explicit checkboxes are confined to the import dialog.
         self.assertEqual(2, relay.count("          striped\n"))
         self.assertNotIn("striped={false}", relay)
-        self.assertIn('tableTitleRow: { height: 24, minHeight: 24, paddingHorizontal: 16', relay)
-        self.assertIn('accountToolbar: { minHeight: 42, paddingHorizontal: 16, paddingVertical: 4', relay)
-        self.assertIn('accountMetadata: { minHeight: 34, paddingHorizontal: 16, paddingVertical: 4', relay)
-        self.assertIn('resourceToolbar: { minHeight: 24, paddingHorizontal: 16', relay)
-        self.assertIn('resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 0, paddingHorizontal: 16', relay)
+        for marker in (
+            'tableTitleRow: { height: 26, minHeight: 26, paddingHorizontal: 8',
+            'accountToolbar: { minHeight: 38, paddingHorizontal: 10, paddingVertical: 3',
+            'accountMetadata: { minHeight: 30, paddingHorizontal: 10, paddingVertical: 2',
+            'resourceToolbar: { minHeight: 26, paddingHorizontal: 8',
+            'resourceNativeTable: { flex: 1, minWidth: 0, minHeight: 0 }',
+            'resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 0, paddingHorizontal: 10',
+        ):
+            self.assertIn(marker, relay)
 
     def test_webdav_form_is_integrated_into_the_unified_sync_tab(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
@@ -2181,7 +2189,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: \"flex-start\" }",
             "webdavStateStatus:",
             "webdavFormBody:",
-            "webdavFormRows:",
+            'webdavFormRows: { width: "60%", gap: 5 }',
             "dataManagementWebDavPane:",
             "dataManagementWebDavContent:",
             'label={translate("webdav.url")}',

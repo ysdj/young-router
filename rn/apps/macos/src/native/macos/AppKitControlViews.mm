@@ -132,6 +132,8 @@ NSImage *ButtonSymbolImage(const std::string &symbol)
     symbolName = @"play.fill";
   } else if (symbol == "plus") {
     symbolName = @"plus";
+  } else if (symbol == "refresh") {
+    symbolName = @"arrow.clockwise";
   } else if (symbol == "trash") {
     symbolName = @"trash";
   }
@@ -712,6 +714,7 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 
 @interface LiteLLMNavigationLinkButton : LiteLLMTabButton
 @property(nonatomic) BOOL linkMode;
+@property(nonatomic) BOOL defaultAction;
 @end
 
 @implementation LiteLLMNavigationLinkButton {
@@ -742,6 +745,30 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 {
   [super setTitle:title];
   [self updateLinkAppearance];
+}
+
+- (void)applyDefaultAction
+{
+  self.keyEquivalent = self.defaultAction ? @"\r" : @"";
+  if (!self.defaultAction && self.window.defaultButtonCell == self.cell) {
+    [self.window setDefaultButtonCell:nil];
+  }
+}
+
+- (void)setDefaultAction:(BOOL)defaultAction
+{
+  _defaultAction = defaultAction;
+  [self applyDefaultAction];
+}
+
+- (void)viewDidMoveToWindow
+{
+  [super viewDidMoveToWindow];
+  [self applyDefaultAction];
+  __weak LiteLLMNavigationLinkButton *weakSelf = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [weakSelf applyDefaultAction];
+  });
 }
 
 - (void)updateTrackingAreas
@@ -845,8 +872,10 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
   const BOOL symbolChanged = oldViewProps.symbol != newViewProps.symbol;
   const BOOL linkChanged = oldViewProps.link != newViewProps.link;
   const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
+  const BOOL disabledChanged = oldViewProps.disabled != newViewProps.disabled;
   BOOL link = newViewProps.link;
   BOOL useCompactControl = newViewProps.compact && !link;
+  BOOL defaultAction = !link && newViewProps.primary && !newViewProps.disabled;
 
   if (titleChanged || symbolChanged) {
     NSString *title = StringFromStdString(newViewProps.title);
@@ -867,18 +896,17 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
   if (oldViewProps.accessibilityLabel != newViewProps.accessibilityLabel) {
     _button.accessibilityLabel = newViewProps.accessibilityLabel.empty() ? StringFromStdString(newViewProps.title) : StringFromStdString(newViewProps.accessibilityLabel);
   }
-  if (oldViewProps.disabled != newViewProps.disabled) {
+  if (disabledChanged) {
     _button.enabled = !newViewProps.disabled;
   }
   if (linkChanged ||
       oldViewProps.primary != newViewProps.primary ||
       oldViewProps.destructive != newViewProps.destructive ||
-      compactChanged) {
+      compactChanged ||
+      disabledChanged) {
     _button.bezelStyle = link ? NSBezelStyleInline : NSBezelStyleRounded;
-    _button.keyEquivalent = !link && newViewProps.primary ? @"\r" : @"";
-    if ((!newViewProps.primary || link) && _button.window.defaultButtonCell == _button.cell) {
-      [_button.window setDefaultButtonCell:nil];
-    }
+    _button.bezelColor = nil;
+    ((LiteLLMNavigationLinkButton *)_button).defaultAction = defaultAction;
     _button.hasDestructiveAction = !link && newViewProps.destructive;
     _button.controlSize = useCompactControl ? NSControlSizeSmall : NSControlSizeRegular;
     _button.font = link
@@ -887,10 +915,8 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
     ((LiteLLMNavigationLinkButton *)_button).linkMode = link;
   }
   if (!link && !newViewProps.primary) {
-    _button.keyEquivalent = @"";
-    if (_button.window.defaultButtonCell == _button.cell) {
-      [_button.window setDefaultButtonCell:nil];
-    }
+    _button.bezelColor = nil;
+    ((LiteLLMNavigationLinkButton *)_button).defaultAction = NO;
     _button.contentTintColor = nil;
   }
   if (!link && linkChanged) {
@@ -922,8 +948,9 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
   _button.accessibilityLabel = nil;
   _button.enabled = YES;
   _button.bezelStyle = NSBezelStyleRounded;
+  _button.bezelColor = nil;
   _button.buttonType = NSButtonTypeMomentaryPushIn;
-  _button.keyEquivalent = @"";
+  ((LiteLLMNavigationLinkButton *)_button).defaultAction = NO;
   _button.hasDestructiveAction = NO;
   _button.controlSize = NSControlSizeRegular;
   _button.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
@@ -3167,11 +3194,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
       return;
     }
     strongSelf->_synchronizingField = YES;
-    if ([domain isEqualToString:@"relay_accounts"] && [field isEqualToString:@"api_key"] && value.length > 12) {
-      strongSelf->_plainField.stringValue = [[value substringToIndex:12] stringByAppendingString:@"…"];
-    } else {
-      strongSelf->_plainField.stringValue = value;
-    }
+    strongSelf->_plainField.stringValue = value;
     strongSelf->_synchronizingField = NO;
     strongSelf->_secretDirty = NO;
   }];

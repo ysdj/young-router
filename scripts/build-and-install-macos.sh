@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DESTINATION="${LITELLM_MENU_INSTALL_APP:-/Applications/LiteLLM Menu.app}"
 DEVELOPER_DIR="${DEVELOPER_DIR:-}"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/litellm-menu-install.XXXXXX")"
 STAGED_APP="$STAGE_ROOT/LiteLLM Menu.app"
 INSTALL_STAGE=""
@@ -41,6 +42,14 @@ copy_tree() {
   # moving the verified build into the install staging path. `cp -a` can drop
   # those signatures even when the source bundle itself verifies.
   ditto --rsrc --extattr --acl "$source" "$destination"
+}
+
+refresh_installed_app_icon() {
+  # The installed path, bundle identifier, and build number intentionally stay
+  # stable across local builds. Notify Finder of the replacement and force
+  # LaunchServices to reload AppIcon.icns instead of retaining its placeholder.
+  touch "$DESTINATION"
+  "$LSREGISTER" -f "$DESTINATION"
 }
 
 bundle_roots() {
@@ -294,6 +303,11 @@ case "$(uname -s)" in
     ;;
 esac
 
+[[ -x "$LSREGISTER" ]] || {
+  echo "LaunchServices registration tool is missing: $LSREGISTER" >&2
+  exit 1
+}
+
 [[ "$DESTINATION" = /* && "$DESTINATION" == *.app ]] || {
   echo "LITELLM_MENU_INSTALL_APP must be an absolute .app path." >&2
   exit 1
@@ -371,6 +385,14 @@ if ! mv "$INSTALL_STAGE" "$DESTINATION"; then
   exit 1
 fi
 INSTALL_STAGE=""
+if ! refresh_installed_app_icon; then
+  echo "The new LiteLLM Menu app icon could not be refreshed; restoring the previous bundle." >&2
+  restore_previous_app || {
+    echo "The previous LiteLLM Menu bundle could not be restored." >&2
+    exit 1
+  }
+  exit 1
+fi
 if ! stop_installed_app "$OLD_PIDS"; then
   echo "The old LiteLLM Menu app did not stop; restoring the previous bundle." >&2
   restore_previous_app || {

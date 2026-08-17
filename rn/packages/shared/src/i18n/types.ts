@@ -553,6 +553,8 @@ export type TranslationKey =
   | "dataManagement.importHint"
   | "dataManagement.importRecognizedHint"
   | "dataManagement.importDetectedCount"
+  | "dataManagement.importFile"
+  | "dataManagement.noImportFile"
   | "dataManagement.chooseImportFile"
   | "dataManagement.changeImportFile"
   | "dataManagement.importReplaceDraftWarning"

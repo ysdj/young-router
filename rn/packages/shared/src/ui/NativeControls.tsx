@@ -40,7 +40,7 @@ import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type ButtonProps = {
   title: string;
-  symbol?: "check" | "close" | "copy" | "edit" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "trash";
+  symbol?: "check" | "close" | "copy" | "edit" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash";
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;
@@ -196,7 +196,14 @@ type SplitViewProps = {
 
 const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeButtonWithRef(props, ref): React.JSX.Element {
   const compact = props.compact ?? true;
-  const buttonProps = { ...props, compact };
+  const buttonProps = {
+    ...props,
+    compact,
+    disabled: props.disabled === true,
+    primary: props.primary === true,
+    destructive: props.destructive === true,
+    link: props.link === true,
+  };
   const contentWidth = !props.link && !props.symbol ? { minWidth: nativeButtonMinimumWidth(props.title, compact) } : undefined;
   const style = [props.link ? styles.linkButton : styles.button, contentWidth, props.style];
   if (Platform.OS === "windows") {

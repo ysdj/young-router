@@ -386,4 +386,10 @@ if [[ -n "${LITELLM_MENU_MACOS_OUTPUT:-}" ]]; then
   APP="$OUTPUT"
 fi
 
+# Xcode can reuse an incrementally built bundle while preserving the app
+# directory's old modification time. Finder keys its displayed icon cache to
+# that bundle metadata, so mark every finished artifact as newly built even
+# when the version and output path stay unchanged.
+touch "$APP"
+
 printf '%s\n' "$APP"

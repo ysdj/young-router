@@ -92,7 +92,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             ("providers-models", 780, 560),
             ("runtime-settings", 800, 520),
             ("data-management", 500, 160),
-            ("relay-accounts", 760, 500),
+            ("relay-accounts", 780, 440),
             ("relay-add", 720, 560),
             ("logs", 640, 420),
         ):
@@ -108,7 +108,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
         self.assertIn("ContentSize RouteInitialContentSize", leaf)
-        for size in ("{780, 560}", "{1160, 700}", "{1080, 620}", "{520, 175}", "{900, 680}", "{920, 620}", "{900, 580}"):
+        for size in ("{780, 560}", "{1160, 700}", "{1080, 620}", "{520, 175}", "{820, 480}", "{900, 680}", "{900, 580}"):
             self.assertIn(size, leaf)
         self.assertIn("RouteInitialContentSize(route)", leaf)
 
@@ -154,15 +154,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             (780, 460, 780, 460),
             (1160, 700, 1100, 640),
             (1080, 620, 800, 520),
-            (500, 160, 500, 190),
+            (500, 160, 500, 140),
             (900, 680, 720, 560),
             (900, 580, 640, 420),
         ):
             self.assertIn(f"contentSize: NSSize(width: {width}, height: {height})", leaf)
             self.assertIn(f"minSize: NSSize(width: {min_width}, height: {min_height})", leaf)
         relay_layout = leaf.split('case "relay-accounts":', 1)[1].split('case "relay-add":', 1)[0]
-        self.assertIn("contentSize: NSSize(width: 960, height: 620)", relay_layout)
-        self.assertIn("minSize: NSSize(width: 860, height: 540)", relay_layout)
+        self.assertIn("contentSize: NSSize(width: 820, height: 480)", relay_layout)
+        self.assertIn("minSize: NSSize(width: 780, height: 440)", relay_layout)
         self.assertNotIn('case "configuration-package":', leaf)
         self.assertNotIn("maxSize: NSSize(width: 680, height: 386)", leaf)
 
@@ -1358,6 +1358,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("IsPlainTextAutoCommitField", windows)
         self.assertIn("CreateSecretCapability(", windows)
         self.assertIn("StageSecret(capability->token, secret, false)", windows)
+        self.assertNotIn("substringToIndex:12", mac)
+        self.assertNotIn("display_value.substr(0, 12)", windows)
         self.assertNotIn("onChangeText", windows_codegen)
         self.assertIn("OnSecretState", windows_codegen)
         self.assertIn("NativeSecretInputControl", ui)
@@ -1692,6 +1694,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('symbolName = @"play.fill";', controls)
         self.assertIn('symbolName = @"minus";', controls)
         self.assertIn('symbolName = @"trash";', controls)
+        self.assertIn('symbolName = @"arrow.clockwise";', controls)
         self.assertIn("_button.imagePosition = symbolImage == nil ? NSNoImage : NSImageOnly;", button)
 
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
@@ -1701,6 +1704,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('else if (symbol == "power-on" || symbol == "power-off")', windows)
         self.assertIn('else if (symbol == "copy")', windows)
         self.assertIn('else if (symbol == "edit")', windows)
+        self.assertIn('else if (symbol == "refresh") icon.Glyph(L"\\xE72C");', windows)
 
     def test_macos_buttons_clear_default_action_state_before_fabric_reuse(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
@@ -1711,8 +1715,17 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("_props = defaultProps;", recycle)
         self.assertIn('((LiteLLMNavigationLinkButton *)_button).linkMode = NO;', recycle)
-        self.assertIn('_button.keyEquivalent = @"";', recycle)
-        self.assertIn('[_button.window setDefaultButtonCell:nil];', button)
+        self.assertIn('((LiteLLMNavigationLinkButton *)_button).defaultAction = NO;', recycle)
+        self.assertIn('self.keyEquivalent = self.defaultAction ? @"\\r" : @"";', controls)
+        self.assertIn('[self.window setDefaultButtonCell:nil];', controls)
+        self.assertIn('- (void)viewDidMoveToWindow', controls)
+        self.assertIn('dispatch_async(dispatch_get_main_queue()', controls)
+        self.assertIn('BOOL defaultAction = !link && newViewProps.primary && !newViewProps.disabled;', button)
+        self.assertIn('((LiteLLMNavigationLinkButton *)_button).defaultAction = defaultAction;', button)
+        self.assertNotIn("NSColor.systemGrayColor", button)
+        self.assertNotIn("NSColor.controlColor", button)
+        self.assertGreaterEqual(button.count("_button.bezelColor = nil;"), 3)
+        self.assertIn('compactChanged ||\n      disabledChanged)', button)
         self.assertIn('if (!link && !newViewProps.primary) {', button)
         self.assertIn("_button.hasDestructiveAction = NO;", recycle)
         self.assertIn("_button.contentTintColor = nil;", recycle)
