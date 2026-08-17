@@ -34,9 +34,25 @@ LOGIN_STATUSES = ("signed_out", "signed_in", "expired", "unknown")
 RESOURCE_STATUSES = ("idle", "ready", "unavailable")
 RESOURCE_ERRORS = ("none", "login_expired", "no_api_keys", "no_models", "unavailable")
 PENDING_CLEANUP_KINDS = ("credentials",)
+PENDING_OPERATION_KINDS = (
+    "api_key_create",
+    "api_key_update",
+    "api_key_set_group",
+    "api_key_set_enabled",
+    "api_key_delete",
+)
+PENDING_OPERATION_STATES = (
+    "staged",
+    "remote_applied",
+    "local_pending",
+    "completed",
+    "failed",
+)
+DEPENDENCY_POLICIES = ("delete_models", "detach", "detach_disabled", "rebind")
 MAX_ACCOUNTS = 64
 MAX_STATIONS = MAX_ACCOUNTS
 MAX_PENDING_CLEANUPS = MAX_ACCOUNTS
+MAX_PENDING_OPERATIONS = 512
 MAX_MODELS = 512
 MAX_RESOURCES = 256
 MAX_RESOURCE_ID = 128
@@ -195,6 +211,20 @@ def _station_id(value: object) -> str:
     result = _text(value, "Relay station", limit=96)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", result):
         raise RelayAccountsError("Relay station is invalid")
+    return result
+
+
+def _operation_id(value: object) -> str:
+    result = _text(value, "Relay operation", limit=96)
+    if not re.fullmatch(r"op-[A-Za-z0-9][A-Za-z0-9._-]{0,92}", result):
+        raise RelayAccountsError("Relay operation is invalid")
+    return result
+
+
+def _dependency_policy(value: object, *, default: str = "detach") -> str:
+    result = str(value or default).strip().lower().replace("-", "_")
+    if result not in DEPENDENCY_POLICIES:
+        raise RelayAccountsError("Relay dependency policy is invalid")
     return result
 
 
@@ -522,6 +552,74 @@ def _public_pending_cleanup(cleanup: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _pending_operation(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one durable, secret-free relay Apply operation."""
+
+    if _contains_secret(raw):
+        raise RelayAccountsError("Relay operation storage is invalid")
+    kind = str(raw.get("kind", ""))
+    state = str(raw.get("state", "staged"))
+    if kind not in PENDING_OPERATION_KINDS or state not in PENDING_OPERATION_STATES:
+        raise RelayAccountsError("Relay operation storage is invalid")
+    raw_changes = raw.get("changes", {})
+    if not isinstance(raw_changes, Mapping) or set(raw_changes).difference({"name", "group_id", "enabled"}):
+        raise RelayAccountsError("Relay operation storage is invalid")
+    changes: dict[str, Any] = {}
+    if "name" in raw_changes:
+        changes["name"] = _resource_name(raw_changes.get("name"), "API")
+    if "group_id" in raw_changes:
+        changes["group_id"] = _group_id(raw_changes.get("group_id"))
+    if "enabled" in raw_changes:
+        if not isinstance(raw_changes.get("enabled"), bool):
+            raise RelayAccountsError("Relay operation storage is invalid")
+        changes["enabled"] = raw_changes["enabled"]
+    raw_known_ids = raw.get("known_resource_ids", [])
+    if not isinstance(raw_known_ids, list) or len(raw_known_ids) > MAX_RESOURCES:
+        raise RelayAccountsError("Relay operation storage is invalid")
+    known_resource_ids = [_resource_id(item) for item in raw_known_ids]
+    if len(set(known_resource_ids)) != len(known_resource_ids):
+        raise RelayAccountsError("Relay operation storage is invalid")
+    result: dict[str, Any] = {
+        "id": _operation_id(raw.get("id")),
+        "kind": kind,
+        "state": state,
+        "station_id": _station_id(raw.get("station_id")),
+        "account_id": _account_id(raw.get("account_id")),
+        "resource_id": _resource_id(raw.get("resource_id")),
+        "changes": changes,
+        "dependency_policy": _dependency_policy(raw.get("dependency_policy")),
+        "known_resource_ids": known_resource_ids,
+        "created_at": _updated_at(raw.get("created_at")) or _utc_now_iso(),
+        "updated_at": _updated_at(raw.get("updated_at")) or _utc_now_iso(),
+    }
+    remote_resource_id = raw.get("remote_resource_id")
+    if remote_resource_id:
+        result["remote_resource_id"] = _resource_id(remote_resource_id)
+    error = raw.get("error")
+    if isinstance(error, str) and error.strip():
+        result["error"] = _text(error, "Relay operation error", limit=240)
+    return result
+
+
+def _public_pending_operation(operation: Mapping[str, Any]) -> dict[str, Any]:
+    """Project only identifiers and status; never request bodies or secrets."""
+
+    result: dict[str, Any] = {
+        "id": str(operation.get("id", "")),
+        "kind": str(operation.get("kind", "")),
+        "state": str(operation.get("state", "staged")),
+        "status": str(operation.get("state", "staged")),
+        "station_id": str(operation.get("station_id", "")),
+        "account_id": str(operation.get("account_id", "")),
+        "resource_id": str(operation.get("resource_id", "")),
+        "dependency_policy": str(operation.get("dependency_policy", "detach")),
+    }
+    error = operation.get("error")
+    if isinstance(error, str) and error:
+        result["error"] = error
+    return result
+
+
 def _json_data(payload: object) -> object:
     if not isinstance(payload, Mapping):
         return payload
@@ -816,6 +914,8 @@ class RelayAccountsDomain:
         root = _runtime_root(runtime_root)
         self.storage_path = Path(storage_path).expanduser() if storage_path else root / ".litellm-runtime" / "relay-accounts.json"
         self._store = AtomicJSONStore(self.storage_path)
+        self.journal_path = self.storage_path.with_name("relay-apply-operations.json")
+        self._journal_store = AtomicJSONStore(self.journal_path)
         self._http = http_client or RelayHTTPClient()
         self._stations: list[dict[str, str]] = []
         self._accounts: list[dict[str, Any]] = []
@@ -828,11 +928,16 @@ class RelayAccountsDomain:
         # A native browser-session erase can fail after account deletion. Keep
         # only an opaque tombstone so the UI can retry after a restart.
         self._pending_credential_cleanups: list[dict[str, str]] = []
-        # Ordinary relay-account changes retain their historical immediate
-        # persistence contract.  A configuration-package import is the one
-        # exception: it replaces this in-memory view first and is committed
-        # only by Core's explicit Apply transaction.
+        # Account, station, and relay-key CRUD are one explicit draft.  Login
+        # and metadata refresh may update the same in-memory state, but never
+        # smuggle a draft change across the persistence boundary.
+        self._pending_operations: list[dict[str, Any]] = []
+        self._draft_staged = False
         self._import_staged = False
+        # Binding counts are derived by the provider/model domain. They are
+        # deliberately process-local and contain only stable IDs and counts.
+        self._binding_summary: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._last_action: dict[str, Any] = {}
         self._baseline_bytes: bytes | None = None
         self.revision = 0
         self.reload()
@@ -856,6 +961,43 @@ class RelayAccountsDomain:
             ],
         }
 
+    def _journal_payload(self) -> dict[str, Any]:
+        """Return the durable no-secret remote-operation journal."""
+
+        return {
+            "version": 1,
+            "operations": [copy.deepcopy(operation) for operation in self._pending_operations],
+        }
+
+    def _read_journal(self) -> list[dict[str, Any]]:
+        try:
+            payload = self._journal_store.read(default={"version": 1, "operations": []})
+        except PersistenceError as exc:
+            raise RelayAccountsError(safe_exception_message(exc)) from None
+        if not isinstance(payload, Mapping) or payload.get("version", 1) != 1:
+            raise RelayAccountsError("Relay operation storage is invalid")
+        raw_operations = payload.get("operations", [])
+        if not isinstance(raw_operations, list) or len(raw_operations) > MAX_PENDING_OPERATIONS:
+            raise RelayAccountsError("Relay operation storage is invalid")
+        operations = [_pending_operation(item) for item in raw_operations if isinstance(item, Mapping)]
+        if len(operations) != len(raw_operations) or len({item["id"] for item in operations}) != len(operations):
+            raise RelayAccountsError("Relay operation storage is invalid")
+        return operations
+
+    def _persist_journal(self) -> None:
+        try:
+            if self._pending_operations:
+                self._journal_store.write(self._journal_payload())
+            elif self.journal_path.exists():
+                # AtomicJSONStore has no delete primitive. An empty journal is
+                # enough to make replay state unambiguous after a restart.
+                self._journal_store.write({"version": 1, "operations": []})
+        except PersistenceError as exc:
+            raise RelayAccountsError(safe_exception_message(exc)) from None
+
+    def _has_staged_changes(self) -> bool:
+        return self._draft_staged or self._import_staged or bool(self._pending_operations)
+
     def _read_storage_bytes(self) -> bytes | None:
         try:
             return read_bytes(self.storage_path)
@@ -863,11 +1005,9 @@ class RelayAccountsDomain:
             raise RelayAccountsError(safe_exception_message(exc)) from None
 
     def _persist(self, *, force: bool = False) -> None:
-        # A package import must remain reversible until the shared Core Apply
-        # transaction crosses the persistence boundary.  Existing account
-        # operations still call this method normally and therefore continue
-        # to persist immediately outside that staged-import state.
-        if self._import_staged and not force:
+        # No ordinary relay CRUD may write the durable account file until the
+        # shared Apply coordinator explicitly commits it.
+        if self._has_staged_changes() and not force:
             return
         try:
             self._store.write(self._stored_payload())
@@ -884,7 +1024,11 @@ class RelayAccountsDomain:
             "session_secrets": copy.deepcopy(self._session_secrets),
             "resource_secret_cache": copy.deepcopy(self._resource_secret_cache),
             "pending_credential_cleanups": copy.deepcopy(self._pending_credential_cleanups),
+            "pending_operations": copy.deepcopy(self._pending_operations),
+            "draft_staged": self._draft_staged,
             "import_staged": self._import_staged,
+            "binding_summary": copy.deepcopy(self._binding_summary),
+            "last_action": copy.deepcopy(self._last_action),
             "baseline_bytes": self._baseline_bytes,
             "revision": self.revision,
         }
@@ -895,7 +1039,11 @@ class RelayAccountsDomain:
         secrets = checkpoint.get("session_secrets")
         resource_secrets = checkpoint.get("resource_secret_cache")
         pending_cleanups = checkpoint.get("pending_credential_cleanups")
+        pending_operations = checkpoint.get("pending_operations")
+        draft_staged = checkpoint.get("draft_staged")
         import_staged = checkpoint.get("import_staged")
+        binding_summary = checkpoint.get("binding_summary")
+        last_action = checkpoint.get("last_action")
         baseline_bytes = checkpoint.get("baseline_bytes")
         revision = checkpoint.get("revision")
         if (
@@ -905,7 +1053,11 @@ class RelayAccountsDomain:
             or not isinstance(secrets, Mapping)
             or not isinstance(resource_secrets, Mapping)
             or not isinstance(pending_cleanups, list)
+            or not isinstance(pending_operations, list)
+            or type(draft_staged) is not bool
             or type(import_staged) is not bool
+            or not isinstance(binding_summary, Mapping)
+            or not isinstance(last_action, Mapping)
             or (baseline_bytes is not None and not isinstance(baseline_bytes, bytes))
             or type(revision) is not int
         ):
@@ -915,7 +1067,11 @@ class RelayAccountsDomain:
         self._session_secrets = copy.deepcopy(dict(secrets))
         self._resource_secret_cache = copy.deepcopy(dict(resource_secrets))
         self._pending_credential_cleanups = copy.deepcopy(pending_cleanups)
+        self._pending_operations = copy.deepcopy(pending_operations)
+        self._draft_staged = draft_staged
         self._import_staged = import_staged
+        self._binding_summary = copy.deepcopy(dict(binding_summary))
+        self._last_action = copy.deepcopy(dict(last_action))
         self._baseline_bytes = baseline_bytes
         self.revision = revision
 
@@ -992,15 +1148,110 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay credential cleanup limit reached")
         self._pending_credential_cleanups = [*retained, cleanup]
 
+    def set_binding_summary(self, summary: object) -> None:
+        """Accept provider-derived link counts without exposing provider state.
+
+        The Core coordinator may call this before taking a snapshot. The
+        summary is never persisted because providers/models remain the source
+        of truth for bindings.
+        """
+
+        raw_items = summary.get("resources", []) if isinstance(summary, Mapping) else summary
+        if raw_items is None:
+            raw_items = []
+        if not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes, bytearray)):
+            raise RelayAccountsError("Relay binding summary is invalid")
+        parsed: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for raw in raw_items:
+            if not isinstance(raw, Mapping):
+                raise RelayAccountsError("Relay binding summary is invalid")
+            key = (
+                _station_id(raw.get("station_id")),
+                _account_id(raw.get("account_id")),
+                _resource_id(raw.get("resource_id")),
+            )
+            count = raw.get("linked_model_count", raw.get("model_count", 0))
+            if type(count) is not int or count < 0:
+                raise RelayAccountsError("Relay binding summary is invalid")
+            status = str(raw.get("binding_status", "linked" if count else "independent"))
+            parsed[key] = {
+                "linked_model_count": count,
+                "binding_status": status[:64] if status else "independent",
+            }
+        self._binding_summary = parsed
+
+    def _pending_operation_summary(self) -> dict[str, int]:
+        summary = {
+            "total": len(self._pending_operations),
+            "staged": 0,
+            "remote_applied": 0,
+            "local_pending": 0,
+            "completed": 0,
+            "failed": 0,
+            "destructive": 0,
+        }
+        for operation in self._pending_operations:
+            state = str(operation.get("state", "staged"))
+            if state in summary:
+                summary[state] += 1
+            if operation.get("kind") == "api_key_delete":
+                summary["destructive"] += 1
+        return summary
+
+    def _resource_binding_summary(self, station_id: str, account_id: str, resource_id: str) -> dict[str, Any]:
+        return self._binding_summary.get(
+            (station_id, account_id, resource_id),
+            {"linked_model_count": 0, "binding_status": "independent"},
+        )
+
     def snapshot(self) -> dict[str, Any]:
-        accounts = [_public_account(account) for account in self._accounts]
-        stations = [
-            _public_station(station, self._station_account_count(station["id"]))
-            for station in self._stations
-        ]
+        accounts: list[dict[str, Any]] = []
+        for account in self._accounts:
+            public = _public_account(account)
+            station_id = str(account.get("station_id", ""))
+            account_id = str(account.get("id", ""))
+            account_operations = [
+                operation for operation in self._pending_operations if operation.get("account_id") == account_id
+            ]
+            linked_model_count = 0
+            for resource in public["resources"]:
+                resource_id = str(resource.get("id", ""))
+                binding = self._resource_binding_summary(station_id, account_id, resource_id)
+                resource_operations = [
+                    operation
+                    for operation in account_operations
+                    if resource_id in {operation.get("resource_id"), operation.get("remote_resource_id")}
+                ]
+                resource["linked_model_count"] = int(binding.get("linked_model_count", 0))
+                resource["binding_status"] = str(binding.get("binding_status", "independent"))
+                resource["last_synced_at"] = str(account.get("last_updated_at", ""))
+                resource["pending_operation_count"] = len(resource_operations)
+                resource["pending_operation_kinds"] = [
+                    str(operation.get("kind", "")) for operation in resource_operations
+                ]
+                resource["pending_delete"] = any(
+                    operation.get("kind") == "api_key_delete" for operation in resource_operations
+                )
+                linked_model_count += resource["linked_model_count"]
+            public["linked_model_count"] = linked_model_count
+            public["pending_operation_count"] = len(account_operations)
+            accounts.append(public)
+        stations: list[dict[str, Any]] = []
+        for station in self._stations:
+            public = _public_station(station, self._station_account_count(station["id"]))
+            station_accounts = [account for account in accounts if account.get("station_id") == station["id"]]
+            public["linked_model_count"] = sum(int(account.get("linked_model_count", 0)) for account in station_accounts)
+            public["pending_operation_count"] = sum(
+                int(account.get("pending_operation_count", 0)) for account in station_accounts
+            )
+            stations.append(public)
         pending_cleanups = [
             _public_pending_cleanup(cleanup)
             for cleanup in self._pending_credential_cleanups
+        ]
+        pending_operations = [
+            _public_pending_operation(operation)
+            for operation in self._pending_operations
         ]
         return {
             "domain": self.name,
@@ -1010,14 +1261,22 @@ class RelayAccountsDomain:
             "accounts": accounts,
             "account_count": len(accounts),
             "pending_credential_cleanups": pending_cleanups,
+            "pending_operations": pending_operations,
+            "pending_operation_count": len(pending_operations),
+            "pending_operation_summary": self._pending_operation_summary(),
+            "last_action": copy.deepcopy(self._last_action),
         }
 
     def draft_state(self) -> object:
-        # Relay-account operations persist immediately, except an imported
-        # package.  Returning the private durable payload only while that
-        # import is staged lets Core track it as a normal dirty draft without
-        # ever putting it in the public snapshot.
-        return self._stored_payload() if self._import_staged else {}
+        if not self._has_staged_changes():
+            return {}
+        # Core owns this value in-process. It is intentionally richer than the
+        # snapshot so remembered credentials can still be committed without
+        # ever crossing IPC.
+        return {
+            "storage": self._stored_payload(),
+            "operations": self._journal_payload()["operations"],
+        }
 
     def _migration_station(
         self,
@@ -1172,6 +1431,11 @@ class RelayAccountsDomain:
     def persistence_paths(self) -> tuple[Path, ...]:
         return (self.storage_path,)
 
+    def operation_journal_paths(self) -> tuple[Path, ...]:
+        """Return the non-rollback journal used after remote side effects."""
+
+        return (self.journal_path,)
+
     def external_disk_state(self) -> dict[str, bool]:
         current = self._read_storage_bytes()
         return {"changed": current != self._baseline_bytes, "exists": current is not None}
@@ -1195,7 +1459,11 @@ class RelayAccountsDomain:
         if not isinstance(loaded, Mapping):
             raise RelayAccountsError("Relay account storage is invalid")
         migrated = self._replace_storage_state(loaded)
+        self._pending_operations = self._read_journal()
+        self._draft_staged = bool(self._pending_operations)
         self._import_staged = False
+        self._last_action = {}
+        self._binding_summary = {}
         self._baseline_bytes = self._read_storage_bytes()
         if migrated:
             self._persist(force=True)
@@ -1371,6 +1639,212 @@ class RelayAccountsDomain:
         if old_station_id and old_station_id != station["id"] and self._station_account_count(old_station_id) == 0:
             self._stations = [item for item in self._stations if item["id"] != old_station_id]
 
+    def _new_pending_operation(
+        self,
+        *,
+        kind: str,
+        account: Mapping[str, Any],
+        resource_id: object,
+        changes: Mapping[str, Any] | None = None,
+        dependency_policy: object = "detach",
+        known_resource_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        if len(self._pending_operations) >= MAX_PENDING_OPERATIONS:
+            raise RelayAccountsError("Relay operation limit reached")
+        operation = _pending_operation(
+            {
+                "id": f"op-{uuid.uuid4().hex}",
+                "kind": kind,
+                "state": "staged",
+                "station_id": account.get("station_id"),
+                "account_id": account.get("id"),
+                "resource_id": resource_id,
+                "changes": dict(changes or {}),
+                "dependency_policy": dependency_policy,
+                "known_resource_ids": list(known_resource_ids),
+                "created_at": _utc_now_iso(),
+                "updated_at": _utc_now_iso(),
+            }
+        )
+        self._pending_operations.append(operation)
+        self._draft_staged = True
+        return operation
+
+    def _pending_for_resource(self, account_id: str, resource_id: str) -> list[dict[str, Any]]:
+        return [
+            operation
+            for operation in self._pending_operations
+            if operation.get("account_id") == account_id
+            and resource_id in {operation.get("resource_id"), operation.get("remote_resource_id")}
+            and operation.get("state") != "completed"
+        ]
+
+    def _update_pending_operation(self, operation: dict[str, Any], **updates: object) -> None:
+        candidate = copy.deepcopy(operation)
+        candidate.update(updates)
+        candidate["updated_at"] = _utc_now_iso()
+        operation.clear()
+        operation.update(_pending_operation(candidate))
+
+    def _replace_resource_preview(self, index: int, resource_id: str, changes: Mapping[str, Any]) -> None:
+        account = copy.deepcopy(self._accounts[index])
+        resources = account.get("resources", [])
+        replaced = False
+        for item_index, item in enumerate(resources):
+            if item.get("id") != resource_id:
+                continue
+            candidate = dict(item)
+            if "name" in changes:
+                candidate["name"] = changes["name"]
+                candidate["api_name"] = changes["name"]
+            if "group_id" in changes:
+                candidate["group_id"] = changes["group_id"]
+                selected_group = next(
+                    (
+                        group
+                        for group in account.get("groups", [])
+                        if isinstance(group, Mapping) and group.get("id") == changes["group_id"]
+                    ),
+                    None,
+                )
+                candidate["group_name"] = (
+                    str(selected_group.get("name", changes["group_id"]))
+                    if isinstance(selected_group, Mapping)
+                    else str(changes["group_id"])
+                )
+            if "enabled" in changes:
+                candidate["enabled"] = changes["enabled"]
+            resources[item_index] = _safe_resource(candidate)
+            replaced = True
+            break
+        if not replaced:
+            raise RelayAccountsError("The selected relay API resource is unavailable")
+        account["resources"] = resources
+        self._accounts[index] = _private_account(account)
+
+    def _remove_account_local(self, account_id: object, *, dependency_policy: object) -> dict[str, Any]:
+        index = self._index(account_id)
+        account = self._accounts[index]
+        policy = _dependency_policy(dependency_policy)
+        resources = [
+            {
+                "station_id": str(account.get("station_id", "")),
+                "account_id": str(account.get("id", "")),
+                "resource_id": str(resource.get("id", "")),
+            }
+            for resource in account.get("resources", [])
+            if isinstance(resource, Mapping)
+        ]
+        self._pending_operations = [
+            operation for operation in self._pending_operations if operation.get("account_id") != account["id"]
+        ]
+        self._pending_credential_cleanups = [
+            cleanup
+            for cleanup in self._pending_credential_cleanups
+            if cleanup["account_id"] != account["id"]
+        ]
+        self._retain_pending_cleanup(account_id=account["id"], label=account["label"], kind="credentials")
+        station_id = str(account.get("station_id", ""))
+        self._accounts.pop(index)
+        self._session_secrets.pop(account["id"], None)
+        self._clear_resource_cache(account["id"])
+        if station_id and self._station_account_count(station_id) == 0:
+            self._stations = [item for item in self._stations if item["id"] != station_id]
+        self._draft_staged = True
+        return {
+            "kind": "account_remove",
+            "account_id": account["id"],
+            "station_id": station_id,
+            "dependency_policy": policy,
+            "resources": resources,
+        }
+
+    def _remove_station_local(self, station_id: object, *, dependency_policy: object) -> dict[str, Any]:
+        station = self._stations[self._station_index(station_id)]
+        policy = _dependency_policy(dependency_policy)
+        account_ids = [
+            str(account["id"])
+            for account in self._accounts
+            if account.get("station_id") == station["id"]
+        ]
+        resources: list[dict[str, str]] = []
+        for account_id in account_ids:
+            details = self._remove_account_local(account_id, dependency_policy=policy)
+            resources.extend(details["resources"])
+        self._stations = [item for item in self._stations if item["id"] != station["id"]]
+        self._draft_staged = True
+        return {
+            "kind": "station_remove",
+            "station_id": station["id"],
+            "account_ids": account_ids,
+            "dependency_policy": policy,
+            "resources": resources,
+        }
+
+    def _removal_preview(self, kind: str, data: Mapping[str, Any]) -> dict[str, Any]:
+        if kind == "station":
+            station = self._stations[self._station_index(data.get("id", data.get("station_id")))]
+            accounts = [account for account in self._accounts if account.get("station_id") == station["id"]]
+            policies = ["delete_models", "detach", "rebind"]
+        elif kind == "account":
+            account = self._accounts[self._index(data.get("id", data.get("account_id")))]
+            station = None
+            accounts = [account]
+            policies = ["delete_models", "detach", "rebind"]
+        elif kind == "api_key":
+            account = self._accounts[self._index(data.get("account_id", data.get("id")))]
+            resource = self._selected_resource(account, data.get("resource_id", data.get("key_id")))
+            binding = self._resource_binding_summary(
+                str(account.get("station_id", "")),
+                str(account.get("id", "")),
+                str(resource.get("id", "")),
+            )
+            return {
+                "kind": "api_key_delete_preview",
+                "account_id": account["id"],
+                "station_id": account["station_id"],
+                "resource_id": resource["id"],
+                "linked_model_count": int(binding.get("linked_model_count", 0)),
+                "dependency_policies": ["delete_models", "rebind", "detach_disabled", "detach"],
+            }
+        else:
+            raise RelayAccountsError("Relay removal preview is invalid")
+        resources: list[dict[str, Any]] = []
+        linked_model_count = 0
+        for account in accounts:
+            for resource in account.get("resources", []):
+                if not isinstance(resource, Mapping):
+                    continue
+                binding = self._resource_binding_summary(
+                    str(account.get("station_id", "")),
+                    str(account.get("id", "")),
+                    str(resource.get("id", "")),
+                )
+                count = int(binding.get("linked_model_count", 0))
+                linked_model_count += count
+                resources.append(
+                    {
+                        "station_id": str(account.get("station_id", "")),
+                        "account_id": str(account.get("id", "")),
+                        "resource_id": str(resource.get("id", "")),
+                        "linked_model_count": count,
+                    }
+                )
+        result = {
+            "kind": f"{kind}_remove_preview",
+            "account_count": len(accounts),
+            "resource_count": len(resources),
+            "linked_model_count": linked_model_count,
+            "dependency_policies": policies,
+            "resources": resources,
+        }
+        if station is not None:
+            result["station_id"] = station["id"]
+        else:
+            result["account_id"] = accounts[0]["id"]
+            result["station_id"] = accounts[0]["station_id"]
+        return result
+
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
         if not isinstance(payload, Mapping):
             data: dict[str, Any] = {}
@@ -1383,7 +1857,23 @@ class RelayAccountsDomain:
             if set(data) != {"origin"}:
                 raise RelayAccountsError("Relay detection input is invalid")
             return self.detect_type(data.get("origin"))
-        if name in {"add", "account_add", "relay_add"}:
+        details: dict[str, Any] = {}
+        if name in {"station_remove_preview", "relay_station_remove_preview"}:
+            details = self._removal_preview("station", data)
+        elif name in {"account_remove_preview", "relay_account_remove_preview"}:
+            details = self._removal_preview("account", data)
+        elif name in {"api_key_delete_preview", "relay_api_key_delete_preview"}:
+            details = self._removal_preview("api_key", data)
+        elif name in {"station_add", "relay_station_add", "add_station"}:
+            station = self._new_station(
+                name=data.get("name", data.get("station_name", data.get("label", ""))),
+                origin=data.get("origin", data.get("base_url")),
+                station_type=data.get("type", data.get("station_type", "newapi")),
+            )
+            self._stations.append(station)
+            self._draft_staged = True
+            details = {"kind": "station_add", "station_id": station["id"]}
+        elif name in {"add", "account_add", "relay_add"}:
             if len(self._accounts) >= MAX_ACCOUNTS:
                 raise RelayAccountsError("Relay account limit reached")
             account_type = str(data.get("type", ""))
@@ -1418,56 +1908,100 @@ class RelayAccountsDomain:
                     self._stations = [item for item in self._stations if item["id"] != station["id"]]
                 raise
             self._accounts.append(account)
+            self._draft_staged = True
+            details = {"kind": "account_add", "account_id": account["id"], "station_id": station["id"]}
         elif name in {"station_update", "relay_station_update", "update_station"}:
+            station_id = _station_id(data.get("id", data.get("station_id")))
             self._update_station(data)
+            self._draft_staged = True
+            details = {"kind": "station_update", "station_id": station_id}
+        elif name in {"station_remove", "relay_station_remove", "remove_station", "station_delete"}:
+            details = self._remove_station_local(
+                data.get("id", data.get("station_id")),
+                dependency_policy=data.get("dependency_policy", data.get("policy", "detach")),
+            )
         elif name in {"api_key_create", "relay_api_key_create", "account_api_key_create"}:
             self.create_api_key(
                 str(data.get("account_id", data.get("id", ""))),
                 data.get("name"),
+                group_id=data.get("group_id"),
+                enabled=data.get("enabled", True),
             )
+            details = {"kind": "api_key_create", "account_id": str(data.get("account_id", data.get("id", "")))}
         elif name in {"api_key_update", "relay_api_key_update", "account_api_key_update"}:
             self.update_api_key(
                 str(data.get("account_id", data.get("id", ""))),
                 data.get("resource_id", data.get("key_id")),
                 data.get("name"),
             )
+            details = {"kind": "api_key_update", "account_id": str(data.get("account_id", data.get("id", ""))), "resource_id": str(data.get("resource_id", data.get("key_id", "")))}
         elif name in {"api_key_set_enabled", "relay_api_key_set_enabled", "account_api_key_set_enabled"}:
             self.set_api_key_enabled(
                 str(data.get("account_id", data.get("id", ""))),
                 data.get("resource_id", data.get("key_id")),
                 data.get("enabled"),
             )
+            details = {"kind": "api_key_set_enabled", "account_id": str(data.get("account_id", data.get("id", ""))), "resource_id": str(data.get("resource_id", data.get("key_id", "")))}
         elif name in {"api_key_set_group", "relay_api_key_set_group", "account_api_key_set_group"}:
             self.set_api_key_group(
                 str(data.get("account_id", data.get("id", ""))),
                 data.get("resource_id", data.get("key_id")),
                 data.get("group_id"),
             )
+            details = {"kind": "api_key_set_group", "account_id": str(data.get("account_id", data.get("id", ""))), "resource_id": str(data.get("resource_id", data.get("key_id", "")))}
         elif name in {"api_key_delete", "relay_api_key_delete", "account_api_key_delete"}:
+            account_id = str(data.get("account_id", data.get("id", "")))
+            resource_id = _resource_id(data.get("resource_id", data.get("key_id")))
             self.delete_api_key(
-                str(data.get("account_id", data.get("id", ""))),
-                data.get("resource_id", data.get("key_id")),
+                account_id,
+                resource_id,
+                dependency_policy=data.get("dependency_policy", data.get("policy", "delete_models")),
             )
-        elif name in {"delete", "account_delete", "relay_delete"}:
-            account = self._accounts[self._index(data.get("id"))]
-            # A whole-account erase supersedes an outstanding password-only
-            # cleanup for that account. Keeping both would make the persisted
-            # state internally inconsistent once the account is removed.
-            self._pending_credential_cleanups = [
-                cleanup
-                for cleanup in self._pending_credential_cleanups
-                if cleanup["account_id"] != account["id"]
-            ]
-            self._retain_pending_cleanup(
-                account_id=account["id"],
-                label=account["label"],
-                kind="credentials",
+            account = self._accounts[self._index(account_id)]
+            details = {
+                "kind": "api_key_delete",
+                "account_id": account_id,
+                "station_id": account["station_id"],
+                "resource_id": resource_id,
+                "dependency_policy": _dependency_policy(
+                    data.get("dependency_policy", data.get("policy", "delete_models")),
+                    default="delete_models",
+                ),
+                "resources": [
+                    {
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": resource_id,
+                    }
+                ],
+            }
+        elif name in {"api_key_detach", "relay_api_key_detach", "account_api_key_detach"}:
+            account_id = str(data.get("account_id", data.get("id", "")))
+            resource_id = _resource_id(data.get("resource_id", data.get("key_id")))
+            self.detach_api_key(
+                account_id,
+                resource_id,
             )
-            station_id = str(account.get("station_id", ""))
-            self._accounts.pop(self._index(account["id"]))
-            self._session_secrets.pop(account["id"], None)
-            if station_id and self._station_account_count(station_id) == 0:
-                self._stations = [item for item in self._stations if item["id"] != station_id]
+            account = self._accounts[self._index(account_id)]
+            details = {
+                "kind": "api_key_detach",
+                "account_id": account_id,
+                "station_id": account["station_id"],
+                "resource_id": resource_id,
+                "dependency_policy": "detach",
+                "resources": [
+                    {
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": resource_id,
+                    }
+                ],
+            }
+        elif name in {"delete", "account_delete", "account_remove", "relay_delete", "relay_account_remove", "remove_account"}:
+            details = self._remove_account_local(
+                data.get("id", data.get("account_id")),
+                dependency_policy=data.get("dependency_policy", data.get("policy", "detach")),
+            )
         elif name in {
             "credential_cleanup_confirm",
             "credential_cleanup_confirmed",
@@ -1482,6 +2016,7 @@ class RelayAccountsDomain:
                 for cleanup in self._pending_credential_cleanups
                 if not (cleanup["account_id"] == account_id and cleanup["kind"] == kind)
             ]
+            details = {"kind": "credential_cleanup_confirm", "account_id": account_id}
         elif name in {"update", "account_update", "relay_update"}:
             index = self._index(data.get("id"))
             current = copy.deepcopy(self._accounts[index])
@@ -1519,26 +2054,603 @@ class RelayAccountsDomain:
                     current["session"] = {}
                     self._session_secrets.pop(current["id"], None)
             self._accounts[index] = _private_account(current)
+            self._draft_staged = True
+            details = {"kind": "account_update", "account_id": current["id"]}
         else:
             raise RelayAccountsError("The requested relay action is unavailable")
+        self._last_action = details
         self._persist()
         self.revision += 1
         return self.snapshot()
 
-    def validate(self, payload: object | None = None) -> dict[str, Any]:
-        del payload
-        return {"valid": True, "issues": []}
+    @staticmethod
+    def _apply_issue(
+        code: str,
+        *,
+        account_id: str = "",
+        resource_id: str = "",
+    ) -> dict[str, str]:
+        """Create a stable no-secret issue suitable for IPC projection."""
 
-    def apply(self, payload: object | None = None) -> dict[str, Any]:
+        result = {"code": code, "message": "Relay Apply requires attention"}
+        if account_id:
+            result["account_id"] = account_id
+        if resource_id:
+            result["resource_id"] = resource_id
+        return result
+
+    def _operation_account(self, operation: Mapping[str, Any]) -> tuple[int, dict[str, Any]] | None:
+        account_id = str(operation.get("account_id", ""))
+        try:
+            index = self._index(account_id)
+        except RelayAccountsError:
+            return None
+        account = self._accounts[index]
+        if account.get("station_id") != operation.get("station_id"):
+            return None
+        return index, account
+
+    def prepare_apply(self, payload: object | None = None) -> dict[str, Any]:
+        """Validate the draft without writing disk or issuing HTTP requests."""
+
         del payload
-        if not self._import_staged:
-            return self.snapshot()
+        issues: list[dict[str, str]] = []
+        if self._read_storage_bytes() != self._baseline_bytes:
+            issues.append(self._apply_issue("external_disk_changed"))
+        for operation in self._pending_operations:
+            if operation.get("state") in {"completed"}:
+                continue
+            account_result = self._operation_account(operation)
+            account_id = str(operation.get("account_id", ""))
+            resource_id = str(operation.get("resource_id", ""))
+            if account_result is None:
+                issues.append(self._apply_issue("account_unavailable", account_id=account_id, resource_id=resource_id))
+                continue
+            _, account = account_result
+            if account.get("login_status") != "signed_in":
+                issues.append(self._apply_issue("login_required", account_id=account_id, resource_id=resource_id))
+                continue
+            if operation.get("kind") != "api_key_create":
+                try:
+                    self._selected_resource(account, resource_id)
+                except RelayAccountsError:
+                    issues.append(self._apply_issue("resource_unavailable", account_id=account_id, resource_id=resource_id))
+            if operation.get("kind") == "api_key_set_group":
+                group_id = str(operation.get("changes", {}).get("group_id", ""))
+                if group_id not in {
+                    str(group.get("id", ""))
+                    for group in account.get("groups", [])
+                    if isinstance(group, Mapping)
+                }:
+                    issues.append(self._apply_issue("group_unavailable", account_id=account_id, resource_id=resource_id))
+        operations = [_public_pending_operation(operation) for operation in self._pending_operations]
+        non_destructive = [operation for operation in operations if operation["kind"] != "api_key_delete"]
+        destructive = [operation for operation in operations if operation["kind"] == "api_key_delete"]
+        return {
+            "ready": not issues,
+            "status": "applied" if not issues else "failed",
+            "operations": operations,
+            "non_destructive": non_destructive,
+            "destructive": destructive,
+            "completed_operations": 0,
+            "pending_operations": len(operations),
+            "issues": issues,
+        }
+
+    def validate(self, payload: object | None = None) -> dict[str, Any]:
+        prepared = self.prepare_apply(payload)
+        return {"valid": prepared["ready"], "issues": prepared["issues"]}
+
+    def _mark_operation_uncertain(self, operation: dict[str, Any]) -> None:
+        """Retain an ambiguous remote result for read-only reconciliation.
+
+        A transport failure can occur after the relay accepted a mutation.  A
+        later Apply must refresh the stable resource before it ever retries a
+        create or delete, rather than treating the exception as proof that no
+        remote work happened.
+        """
+
+        self._update_pending_operation(
+            operation,
+            state="local_pending",
+            error="Relay API key operation requires reconciliation",
+        )
+        self._persist_journal()
+
+    @staticmethod
+    def _response_resource_id(account: Mapping[str, Any], payload: object) -> str | None:
+        value = _json_data(payload)
+        if not isinstance(value, Mapping):
+            return None
+        raw_id = value.get("id", value.get("key_id"))
+        if account.get("type") == "newapi":
+            if type(raw_id) is int:
+                return f"newapi-{raw_id}"
+            return None
+        if isinstance(raw_id, (str, int)) and not isinstance(raw_id, bool):
+            candidate = str(raw_id).strip()
+            if candidate:
+                return f"sub2api-{candidate}"
+        return None
+
+    def _execute_create_operation(self, account: Mapping[str, Any], operation: dict[str, Any]) -> None:
+        changes = operation.get("changes", {})
+        key_name = self._api_key_name(changes.get("name"))
+        if account["type"] == "newapi":
+            payload = self._api_key_request(
+                account,
+                method="post",
+                path="/api/token/",
+                body={"name": key_name, "unlimited_quota": True},
+            )
+        else:
+            payload = self._api_key_request(
+                account,
+                method="post",
+                path="/api/v1/keys",
+                body={"name": key_name},
+            )
+        updates: dict[str, Any] = {"state": "remote_applied"}
+        remote_resource_id = self._response_resource_id(account, payload)
+        if remote_resource_id:
+            updates["remote_resource_id"] = remote_resource_id
+        self._update_pending_operation(operation, **updates)
+        self._persist_journal()
+
+    def _execute_existing_operation(self, account: Mapping[str, Any], operation: dict[str, Any]) -> None:
+        resource_id = str(operation.get("resource_id", ""))
+        remote_id = self._api_key_remote_id(account, resource_id)
+        changes = operation.get("changes", {})
+        kind = operation.get("kind")
+        if kind == "api_key_update":
+            key_name = self._api_key_name(changes.get("name"))
+            if account["type"] == "newapi":
+                self._set_newapi_key_metadata(account, remote_id, {"name": key_name})
+            else:
+                self._api_key_request(
+                    account,
+                    method="put",
+                    path=f"/api/v1/keys/{quote(remote_id, safe='')}",
+                    body={"name": key_name},
+                )
+        elif kind == "api_key_set_group":
+            group_id = _group_id(changes.get("group_id"), required=account["type"] == "sub2api")
+            if account["type"] == "newapi":
+                self._set_newapi_key_metadata(account, remote_id, {"group": group_id})
+            else:
+                try:
+                    upstream_group_id = int(group_id)
+                except ValueError:
+                    raise RelayAccountsError("Relay API group is invalid") from None
+                self._api_key_request(
+                    account,
+                    method="put",
+                    path=f"/api/v1/keys/{quote(remote_id, safe='')}",
+                    body={"group_id": upstream_group_id},
+                )
+        elif kind == "api_key_set_enabled":
+            enabled = changes.get("enabled")
+            if not isinstance(enabled, bool):
+                raise RelayAccountsError("Relay API key status is invalid")
+            if account["type"] == "newapi":
+                self._api_key_request(
+                    account,
+                    method="put",
+                    path="/api/token/?status_only=true",
+                    body={"id": int(remote_id), "status": 1 if enabled else 2},
+                )
+            else:
+                self._api_key_request(
+                    account,
+                    method="put",
+                    path=f"/api/v1/keys/{quote(remote_id, safe='')}",
+                    body={"status": "active" if enabled else "inactive"},
+                )
+        elif kind == "api_key_delete":
+            if account["type"] == "newapi":
+                path = f"/api/token/{int(remote_id)}"
+            else:
+                path = f"/api/v1/keys/{quote(remote_id, safe='')}"
+            self._api_key_request(account, method="delete", path=path)
+            self._resource_secret_cache.pop(self._resource_cache_key(account["id"], resource_id), None)
+        else:
+            raise RelayAccountsError("The requested relay operation is unavailable")
+        self._update_pending_operation(operation, state="remote_applied")
+        self._persist_journal()
+
+    def _apply_create_metadata(self, account: Mapping[str, Any], operation: dict[str, Any]) -> None:
+        changes = operation.get("changes", {})
+        resource_id = str(operation.get("resource_id", ""))
+        remote_id = self._api_key_remote_id(account, resource_id)
+        resource = self._selected_resource(account, resource_id)
+        name = changes.get("name")
+        if isinstance(name, str) and resource.get("name") != name:
+            if account["type"] == "newapi":
+                self._set_newapi_key_metadata(account, remote_id, {"name": name})
+            else:
+                self._api_key_request(
+                    account,
+                    method="put",
+                    path=f"/api/v1/keys/{quote(remote_id, safe='')}",
+                    body={"name": name},
+                )
+        group_id = changes.get("group_id")
+        if group_id:
+            if account["type"] == "newapi":
+                self._set_newapi_key_metadata(account, remote_id, {"group": _group_id(group_id)})
+            else:
+                try:
+                    upstream_group_id = int(_group_id(group_id, required=True))
+                except ValueError:
+                    raise RelayAccountsError("Relay API group is invalid") from None
+                self._api_key_request(
+                    account,
+                    method="put",
+                    path=f"/api/v1/keys/{quote(remote_id, safe='')}",
+                    body={"group_id": upstream_group_id},
+                )
+        if changes.get("enabled") is False:
+            if account["type"] == "newapi":
+                self._api_key_request(
+                    account,
+                    method="put",
+                    path="/api/token/?status_only=true",
+                    body={"id": int(remote_id), "status": 2},
+                )
+            else:
+                self._api_key_request(
+                    account,
+                    method="put",
+                    path=f"/api/v1/keys/{quote(remote_id, safe='')}",
+                    body={"status": "inactive"},
+                )
+
+    @staticmethod
+    def _resource_matches_changes(resource: Mapping[str, Any], changes: Mapping[str, Any]) -> bool:
+        """Return whether a refreshed resource proves an operation applied."""
+
+        if "name" in changes and resource.get("name") != changes.get("name"):
+            return False
+        if "group_id" in changes and str(resource.get("group_id", "")) != str(changes.get("group_id", "")):
+            return False
+        if "enabled" in changes and resource.get("enabled") is not changes.get("enabled"):
+            return False
+        return True
+
+    def execute_pending_operations(
+        self,
+        prepared: Mapping[str, Any] | None = None,
+        *,
+        phase: str = "non_destructive",
+    ) -> dict[str, Any]:
+        """Execute journaled remote writes. ``prepare_apply`` itself has none."""
+
+        if phase not in {"non_destructive", "destructive"}:
+            raise RelayAccountsError("Relay Apply phase is invalid")
+        plan = dict(prepared) if isinstance(prepared, Mapping) else self.prepare_apply()
+        if plan.get("ready") is not True:
+            return {
+                "status": "failed",
+                "completed_operations": 0,
+                "pending_operations": len(self._pending_operations),
+                "issues": list(plan.get("issues", [])),
+            }
+        selected_kinds = {"api_key_delete"} if phase == "destructive" else set(PENDING_OPERATION_KINDS).difference({"api_key_delete"})
+        candidates = [
+            operation
+            for operation in self._pending_operations
+            if operation.get("kind") in selected_kinds and operation.get("state") == "staged"
+        ]
+        if not candidates:
+            return {
+                "status": "applied",
+                "completed_operations": 0,
+                "pending_operations": len(self._pending_operations),
+                "issues": [],
+            }
+        # Persist stable identifiers and staged state before the first remote
+        # side effect. The journal intentionally excludes all credentials.
+        self._persist_journal()
+        issues: list[dict[str, str]] = []
+        completed = 0
+        creates = [operation for operation in candidates if operation.get("kind") == "api_key_create"]
+        others = [operation for operation in candidates if operation.get("kind") != "api_key_create"]
+        for operation in [*creates, *others]:
+            account_result = self._operation_account(operation)
+            account_id = str(operation.get("account_id", ""))
+            resource_id = str(operation.get("resource_id", ""))
+            if account_result is None:
+                issues.append(self._apply_issue("account_unavailable", account_id=account_id, resource_id=resource_id))
+                self._mark_operation_uncertain(operation)
+                continue
+            _, account = account_result
+            try:
+                if operation.get("kind") == "api_key_create":
+                    # A previously reconciled create has a stable resource
+                    # ID.  Retry only its remaining metadata, never POST a
+                    # second remote key with the same display name.
+                    if operation.get("remote_resource_id") or not str(operation.get("resource_id", "")).startswith("pending-"):
+                        self._apply_create_metadata(account, operation)
+                        self._update_pending_operation(operation, state="remote_applied", error="")
+                        self._persist_journal()
+                    else:
+                        self._execute_create_operation(account, operation)
+                else:
+                    self._execute_existing_operation(account, operation)
+            except Exception:
+                issues.append(self._apply_issue("remote_operation_failed", account_id=account_id, resource_id=resource_id))
+                self._mark_operation_uncertain(operation)
+                continue
+            completed += 1
+        if phase == "non_destructive":
+            for operation in creates:
+                if operation.get("state") != "remote_applied":
+                    continue
+                account_result = self._operation_account(operation)
+                account_id = str(operation.get("account_id", ""))
+                if account_result is None:
+                    issues.append(self._apply_issue("account_unavailable", account_id=account_id))
+                    self._mark_operation_uncertain(operation)
+                    continue
+                _, account = account_result
+                try:
+                    self.refresh_resources(account_id, _for_apply=True)
+                    account_result = self._operation_account(operation)
+                    if account_result is None or not self._reconcile_created_resource(account_result[1], operation):
+                        self._update_pending_operation(
+                            operation,
+                            state="local_pending",
+                            error="Created relay API key requires reconciliation",
+                        )
+                        issues.append(self._apply_issue("created_resource_unresolved", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
+                        continue
+                    account = account_result[1]
+                    self._apply_create_metadata(account, operation)
+                    self._update_pending_operation(operation, state="remote_applied", error="")
+                    self._persist_journal()
+                except Exception:
+                    issues.append(self._apply_issue("remote_operation_failed", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
+                    self._mark_operation_uncertain(operation)
+        return {
+            "status": "partial" if issues else "applied",
+            "completed_operations": completed,
+            "pending_operations": len(self._pending_operations),
+            "issues": issues,
+        }
+
+    def _reconcile_created_resource(self, account: Mapping[str, Any], operation: dict[str, Any]) -> bool:
+        resources = account.get("resources", [])
+        if not isinstance(resources, list):
+            return False
+        remote_id = operation.get("remote_resource_id")
+        candidate: Mapping[str, Any] | None = None
+        if isinstance(remote_id, str):
+            candidate = next(
+                (resource for resource in resources if isinstance(resource, Mapping) and resource.get("id") == remote_id),
+                None,
+            )
+        if candidate is None:
+            known_ids = set(operation.get("known_resource_ids", []))
+            desired_name = str(operation.get("changes", {}).get("name", ""))
+            candidates = [
+                resource
+                for resource in resources
+                if isinstance(resource, Mapping)
+                and resource.get("id") not in known_ids
+                and resource.get("name") == desired_name
+            ]
+            if len(candidates) == 1:
+                candidate = candidates[0]
+        if candidate is None:
+            return False
+        resolved_id = _resource_id(candidate.get("id"))
+        self._update_pending_operation(
+            operation,
+            resource_id=resolved_id,
+            remote_resource_id=resolved_id,
+            state="remote_applied",
+        )
+        return True
+
+    def reconcile_apply(
+        self,
+        prepared: Mapping[str, Any] | None = None,
+        *,
+        phase: str = "non_destructive",
+    ) -> dict[str, Any]:
+        """Refresh remote facts and reconcile journal IDs without remote writes."""
+
+        del prepared
+        if phase not in {"non_destructive", "destructive"}:
+            raise RelayAccountsError("Relay Apply phase is invalid")
+        wanted_kinds = {"api_key_delete"} if phase == "destructive" else set(PENDING_OPERATION_KINDS).difference({"api_key_delete"})
+        affected_account_ids = list(dict.fromkeys(
+            str(operation.get("account_id", ""))
+            for operation in self._pending_operations
+            if operation.get("kind") in wanted_kinds and operation.get("state") in {"remote_applied", "local_pending"}
+        ))
+        issues: list[dict[str, str]] = []
+        for account_id in affected_account_ids:
+            try:
+                public = self.refresh_resources(account_id, _for_apply=True)
+            except Exception:
+                issues.append(self._apply_issue("refresh_failed", account_id=account_id))
+                continue
+            account_result = self._operation_account({
+                "account_id": account_id,
+                "station_id": next(
+                    (operation.get("station_id") for operation in self._pending_operations if operation.get("account_id") == account_id),
+                    "",
+                ),
+            })
+            if account_result is None:
+                issues.append(self._apply_issue("account_unavailable", account_id=account_id))
+                continue
+            account_index, account = account_result
+            del public
+            for operation in self._pending_operations:
+                if operation.get("account_id") != account_id or operation.get("kind") not in wanted_kinds:
+                    continue
+                if operation.get("state") not in {"remote_applied", "local_pending", "failed"}:
+                    continue
+                if operation.get("kind") == "api_key_create":
+                    if not self._reconcile_created_resource(account, operation):
+                        issues.append(self._apply_issue("created_resource_unresolved", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
+                        self._update_pending_operation(
+                            operation,
+                            # A lost create response may have allocated an
+                            # unknown key.  Without a stable remote ID (or a
+                            # unique refreshed match) replaying POST would
+                            # risk creating a duplicate, so keep it pending
+                            # for another read instead of guessing.
+                            state="local_pending",
+                            error="Created relay API key requires reconciliation",
+                        )
+                        continue
+                    resource_id = str(operation.get("resource_id", ""))
+                    resource = self._selected_resource(account, resource_id)
+                    if not self._resource_matches_changes(resource, operation.get("changes", {})):
+                        issues.append(self._apply_issue("resource_change_not_applied", account_id=account_id, resource_id=resource_id))
+                        self._update_pending_operation(
+                            operation,
+                            state="staged",
+                            error="Relay API key change requires retry",
+                        )
+                        continue
+                    self._replace_resource_preview(account_index, resource_id, operation.get("changes", {}))
+                    account = self._accounts[account_index]
+                if operation.get("kind") == "api_key_delete":
+                    resource_still_present = any(
+                        isinstance(resource, Mapping) and resource.get("id") == operation.get("resource_id")
+                        for resource in account.get("resources", [])
+                    )
+                    if resource_still_present:
+                        issues.append(self._apply_issue("deleted_resource_still_present", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
+                        self._update_pending_operation(
+                            operation,
+                            state="staged",
+                            error="Relay API key deletion requires retry",
+                        )
+                        continue
+                elif operation.get("kind") != "api_key_create":
+                    try:
+                        resource = self._selected_resource(account, str(operation.get("resource_id", "")))
+                    except RelayAccountsError:
+                        issues.append(self._apply_issue("resource_unavailable", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
+                        self._update_pending_operation(
+                            operation,
+                            state="staged",
+                            error="Relay API key change requires retry",
+                        )
+                        continue
+                    if not self._resource_matches_changes(resource, operation.get("changes", {})):
+                        issues.append(self._apply_issue("resource_change_not_applied", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
+                        # Keep the user's staged value visible while the
+                        # journal truthfully reports that the remote fact is
+                        # still awaiting retry.
+                        self._replace_resource_preview(
+                            account_index,
+                            str(operation.get("resource_id", "")),
+                            operation.get("changes", {}),
+                        )
+                        account = self._accounts[account_index]
+                        self._update_pending_operation(
+                            operation,
+                            state="staged",
+                            error="Relay API key change requires retry",
+                        )
+                        continue
+                    self._replace_resource_preview(
+                        account_index,
+                        str(operation.get("resource_id", "")),
+                        operation.get("changes", {}),
+                    )
+                self._update_pending_operation(operation, state="local_pending", error="")
+        self._persist_journal()
+        return {
+            "status": "partial" if issues else "applied",
+            "completed_operations": 0,
+            "pending_operations": len(self._pending_operations),
+            "issues": issues,
+        }
+
+    def commit_apply(self, payload: object | None = None) -> dict[str, Any]:
+        """Commit only local relay state after the coordinator materializes keys."""
+
+        del payload
         if self._read_storage_bytes() != self._baseline_bytes:
             raise RelayAccountsError("Relay accounts changed on disk; reload before applying")
         self._persist(force=True)
         self._import_staged = False
+        self._draft_staged = any(
+            operation.get("state") in {"staged", "failed"}
+            for operation in self._pending_operations
+        )
         self.revision += 1
-        return self.snapshot()
+        return {
+            "status": "partial" if self._pending_operations else "applied",
+            "completed_operations": 0,
+            "pending_operations": len(self._pending_operations),
+            "issues": [],
+        }
+
+    def finalize_apply(self, payload: object | None = None) -> dict[str, Any]:
+        """Finalize only operations whose remote and local work both completed."""
+
+        del payload
+        retained: list[dict[str, Any]] = []
+        completed = 0
+        has_completed = False
+        for operation in self._pending_operations:
+            if operation.get("state") == "local_pending" and not operation.get("error"):
+                completed += 1
+                has_completed = True
+                continue
+            retained.append(operation)
+        if has_completed:
+            if self._read_storage_bytes() != self._baseline_bytes:
+                raise RelayAccountsError("Relay accounts changed on disk; reload before applying")
+            self._persist(force=True)
+        self._pending_operations = retained
+        self._persist_journal()
+        self._draft_staged = bool(retained) or self._import_staged
+        self.revision += 1
+        return {
+            "status": "partial" if retained else "applied",
+            "completed_operations": completed,
+            "pending_operations": len(retained),
+            "issues": [],
+        }
+
+    def apply(self, payload: object | None = None) -> dict[str, Any]:
+        """Compatibility Apply path when no cross-domain coordinator is present."""
+
+        prepared = self.prepare_apply(payload)
+        if not prepared["ready"]:
+            raise RelayAccountsError("Relay Apply is not ready")
+        first = self.execute_pending_operations(prepared, phase="non_destructive")
+        reconciled = self.reconcile_apply(prepared, phase="non_destructive")
+        committed = self.commit_apply()
+        deleted = self.execute_pending_operations(prepared, phase="destructive")
+        delete_reconciled = self.reconcile_apply(prepared, phase="destructive")
+        finalized = self.finalize_apply()
+        issues = [
+            *([] if not reconciled["issues"] else first["issues"]),
+            *reconciled["issues"],
+            *committed["issues"],
+            *([] if not delete_reconciled["issues"] else deleted["issues"]),
+            *delete_reconciled["issues"],
+            *finalized["issues"],
+        ]
+        return {
+            "status": "partial" if issues or finalized["pending_operations"] else "applied",
+            "completed_operations": sum(
+                int(result["completed_operations"])
+                for result in (first, reconciled, committed, deleted, delete_reconciled, finalized)
+            ),
+            "pending_operations": int(finalized["pending_operations"]),
+            "issues": issues,
+        }
 
     def export(self, *, include_sensitive: bool = False) -> dict[str, Any]:
         """Export a package-ready durable relay document.
@@ -1980,7 +3092,7 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay account balance is unavailable")
         return quota / quota_per_unit
 
-    def refresh_resources(self, account_id: str) -> dict[str, Any]:
+    def refresh_resources(self, account_id: str, *, _for_apply: bool = False) -> dict[str, Any]:
         """Load selectable metadata after native login without staging providers."""
 
         index = self._index(account_id)
@@ -2043,8 +3155,9 @@ class RelayAccountsDomain:
                 account["resources"] = previous_resources
             account["groups"] = previous_groups
             self._accounts[index] = _private_account(account)
-            self._persist()
-            self.revision += 1
+            if not _for_apply:
+                self._persist()
+                self.revision += 1
             return _public_account(self._accounts[index])
         account["resources"] = resources
         account["groups"] = groups
@@ -2052,8 +3165,9 @@ class RelayAccountsDomain:
         account["last_updated_at"] = _utc_now_iso()
         account["resource_error"] = "none"
         self._accounts[index] = _private_account(account)
-        self._persist()
-        self.revision += 1
+        if not _for_apply:
+            self._persist()
+            self.revision += 1
         return _public_account(self._accounts[index])
 
     @staticmethod
@@ -2181,123 +3295,201 @@ class RelayAccountsDomain:
             body=self._newapi_update_payload(token, changes),
         )
 
-    def create_api_key(self, account_id: str, name: object = None) -> dict[str, Any]:
+    def _stage_resource_change(
+        self,
+        account_id: str,
+        resource_id: object,
+        *,
+        kind: str,
+        changes: Mapping[str, Any],
+    ) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
-        if account["login_status"] != "signed_in":
-            raise RelayAccountsError("Relay login is unavailable")
+        selected_id = _resource_id(resource_id)
+        self._selected_resource(account, selected_id)
+        pending = self._pending_for_resource(account["id"], selected_id)
+        if any(operation.get("kind") == "api_key_delete" for operation in pending):
+            raise RelayAccountsError("The selected relay API resource is pending deletion")
+        create = next((operation for operation in pending if operation.get("kind") == "api_key_create"), None)
+        if create is not None and create.get("state") == "staged":
+            merged = dict(create.get("changes", {}))
+            merged.update(changes)
+            self._update_pending_operation(create, changes=merged)
+        else:
+            operation = next((operation for operation in pending if operation.get("kind") == kind and operation.get("state") == "staged"), None)
+            if operation is None:
+                operation = self._new_pending_operation(
+                    kind=kind,
+                    account=account,
+                    resource_id=selected_id,
+                    changes=changes,
+                )
+            else:
+                merged = dict(operation.get("changes", {}))
+                merged.update(changes)
+                self._update_pending_operation(operation, changes=merged)
+        self._replace_resource_preview(index, selected_id, changes)
+        self._draft_staged = True
+        return _public_account(self._accounts[index])
+
+    def create_api_key(
+        self,
+        account_id: str,
+        name: object = None,
+        *,
+        group_id: object = None,
+        enabled: object = True,
+    ) -> dict[str, Any]:
+        index = self._index(account_id)
+        account = self._accounts[index]
+        if not isinstance(enabled, bool):
+            raise RelayAccountsError("Relay API key status is invalid")
         existing = account.get("resources", [])
         count = len(existing) if isinstance(existing, list) else 0
         key_name = self._api_key_name(name, fallback=f"API {count + 1}")
-        if account["type"] == "newapi":
-            self._api_key_request(
-                account,
-                method="post",
-                path="/api/token/",
-                body={"name": key_name, "unlimited_quota": True},
+        selected_group = _group_id(group_id, required=False) if group_id is not None else ""
+        if selected_group:
+            groups = account.get("groups", [])
+            if not isinstance(groups, list) or selected_group not in {
+                group.get("id") for group in groups if isinstance(group, Mapping)
+            }:
+                raise RelayAccountsError("Relay API group is unavailable")
+        temporary_id = f"pending-{uuid.uuid4().hex}"
+        changes: dict[str, Any] = {"name": key_name, "enabled": enabled}
+        if selected_group:
+            changes["group_id"] = selected_group
+        self._new_pending_operation(
+            kind="api_key_create",
+            account=account,
+            resource_id=temporary_id,
+            changes=changes,
+            known_resource_ids=[
+                str(resource.get("id", ""))
+                for resource in existing
+                if isinstance(resource, Mapping)
+            ],
+        )
+        group_name = selected_group
+        if selected_group:
+            group = next(
+                (item for item in account.get("groups", []) if isinstance(item, Mapping) and item.get("id") == selected_group),
+                None,
             )
-        else:
-            self._api_key_request(
-                account,
-                method="post",
-                path="/api/v1/keys",
-                body={"name": key_name},
-            )
-        self._mark_resources_stale(index)
+            if isinstance(group, Mapping):
+                group_name = str(group.get("name", selected_group))
+        updated = copy.deepcopy(account)
+        updated["resources"] = [
+            *[dict(item) for item in existing if isinstance(item, Mapping)],
+            _safe_resource(
+                {
+                    "id": temporary_id,
+                    "name": key_name,
+                    "api_base": f"{account['origin'].rstrip('/')}/v1",
+                    "enabled": enabled,
+                    "models": [],
+                    "group_id": selected_group,
+                    "group_name": group_name,
+                }
+            ),
+        ]
+        self._accounts[index] = _private_account(updated)
+        self._draft_staged = True
         return _public_account(self._accounts[index])
 
     def update_api_key(self, account_id: str, resource_id: object, name: object) -> dict[str, Any]:
-        index = self._index(account_id)
-        account = self._accounts[index]
-        if account["login_status"] != "signed_in":
-            raise RelayAccountsError("Relay login is unavailable")
-        key_name = self._api_key_name(name)
-        remote_id = self._api_key_remote_id(account, resource_id)
-        if account["type"] == "newapi":
-            self._set_newapi_key_metadata(account, remote_id, {"name": key_name})
-        else:
-            self._api_key_request(
-                account,
-                method="put",
-                path=f"/api/v1/keys/{quote(remote_id, safe='')}",
-                body={"name": key_name},
-            )
-        self._mark_resources_stale(index)
-        return _public_account(self._accounts[index])
+        return self._stage_resource_change(
+            account_id,
+            resource_id,
+            kind="api_key_update",
+            changes={"name": self._api_key_name(name)},
+        )
 
     def set_api_key_group(self, account_id: str, resource_id: object, group_id: object) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
-        if account["login_status"] != "signed_in":
-            raise RelayAccountsError("Relay login is unavailable")
         selected_group = _group_id(group_id, required=account["type"] == "sub2api")
         groups = account.get("groups", [])
         if not isinstance(groups, list) or selected_group not in {
             group.get("id") for group in groups if isinstance(group, Mapping)
         }:
             raise RelayAccountsError("Relay API group is unavailable")
-        remote_id = self._api_key_remote_id(account, resource_id)
-        if account["type"] == "newapi":
-            self._set_newapi_key_metadata(account, remote_id, {"group": selected_group})
-        else:
-            try:
-                upstream_group_id = int(selected_group)
-            except ValueError:
-                raise RelayAccountsError("Relay API group is invalid") from None
-            self._api_key_request(
-                account,
-                method="put",
-                path=f"/api/v1/keys/{quote(remote_id, safe='')}",
-                body={"group_id": upstream_group_id},
-            )
-        self._mark_resources_stale(index)
-        return _public_account(self._accounts[index])
+        return self._stage_resource_change(
+            account_id,
+            resource_id,
+            kind="api_key_set_group",
+            changes={"group_id": selected_group},
+        )
 
     def set_api_key_enabled(self, account_id: str, resource_id: object, enabled: object) -> dict[str, Any]:
-        index = self._index(account_id)
-        account = self._accounts[index]
-        if account["login_status"] != "signed_in":
-            raise RelayAccountsError("Relay login is unavailable")
         if not isinstance(enabled, bool):
             raise RelayAccountsError("Relay API key status is invalid")
-        remote_id = self._api_key_remote_id(account, resource_id)
-        if account["type"] == "newapi":
-            self._api_key_request(
-                account,
-                method="put",
-                path="/api/token/?status_only=true",
-                body={"id": int(remote_id), "status": 1 if enabled else 2},
-            )
-        else:
-            self._api_key_request(
-                account,
-                method="put",
-                path=f"/api/v1/keys/{quote(remote_id, safe='')}",
-                body={"status": "active" if enabled else "inactive"},
-            )
-        selected_id = _resource_id(resource_id)
-        updated_account = copy.deepcopy(self._accounts[index])
-        for resource in updated_account.get("resources", []):
-            if resource.get("id") == selected_id:
-                resource["enabled"] = enabled
-                break
-        self._accounts[index] = _private_account(updated_account)
-        self._mark_resources_stale(index)
-        return _public_account(self._accounts[index])
+        return self._stage_resource_change(
+            account_id,
+            resource_id,
+            kind="api_key_set_enabled",
+            changes={"enabled": enabled},
+        )
 
-    def delete_api_key(self, account_id: str, resource_id: object) -> dict[str, Any]:
+    def delete_api_key(
+        self,
+        account_id: str,
+        resource_id: object,
+        *,
+        dependency_policy: object = "delete_models",
+    ) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
-        if account["login_status"] != "signed_in":
-            raise RelayAccountsError("Relay login is unavailable")
-        remote_id = self._api_key_remote_id(account, resource_id)
-        if account["type"] == "newapi":
-            path = f"/api/token/{int(remote_id)}"
+        selected_id = _resource_id(resource_id)
+        self._selected_resource(account, selected_id)
+        policy = _dependency_policy(dependency_policy, default="delete_models")
+        pending = self._pending_for_resource(account["id"], selected_id)
+        create = next((operation for operation in pending if operation.get("kind") == "api_key_create"), None)
+        if create is not None and create.get("state") == "staged":
+            self._pending_operations = [operation for operation in self._pending_operations if operation is not create]
+            updated = copy.deepcopy(account)
+            updated["resources"] = [
+                item for item in updated.get("resources", []) if item.get("id") != selected_id
+            ]
+            self._accounts[index] = _private_account(updated)
+            self._draft_staged = True
+            return _public_account(self._accounts[index])
+        deleting = next((operation for operation in pending if operation.get("kind") == "api_key_delete"), None)
+        if deleting is not None:
+            if deleting.get("state") != "staged":
+                raise RelayAccountsError("The selected relay API resource is already being deleted")
+            self._update_pending_operation(deleting, dependency_policy=policy)
         else:
-            path = f"/api/v1/keys/{quote(remote_id, safe='')}"
-        self._api_key_request(account, method="delete", path=path)
-        self._resource_secret_cache.pop(self._resource_cache_key(account_id, resource_id), None)
-        self._mark_resources_stale(index)
+            self._pending_operations = [
+                operation
+                for operation in self._pending_operations
+                if not (
+                    operation.get("account_id") == account["id"]
+                    and operation.get("resource_id") == selected_id
+                    and operation.get("state") == "staged"
+                )
+            ]
+            self._new_pending_operation(
+                kind="api_key_delete",
+                account=account,
+                resource_id=selected_id,
+                dependency_policy=policy,
+            )
+        self._draft_staged = True
+        return _public_account(self._accounts[index])
+
+    def detach_api_key(self, account_id: str, resource_id: object) -> dict[str, Any]:
+        index = self._index(account_id)
+        account = self._accounts[index]
+        selected_id = _resource_id(resource_id)
+        self._selected_resource(account, selected_id)
+        pending = self._pending_for_resource(account["id"], selected_id)
+        deleting = next((operation for operation in pending if operation.get("kind") == "api_key_delete"), None)
+        if deleting is None:
+            return _public_account(self._accounts[index])
+        if deleting.get("state") != "staged":
+            raise RelayAccountsError("The remote relay API key deletion has already started")
+        self._pending_operations = [operation for operation in self._pending_operations if operation is not deleting]
+        self._draft_staged = True
         return _public_account(self._accounts[index])
 
     def _selected_resource(self, account: Mapping[str, Any], resource_id: object) -> dict[str, Any]:
@@ -2352,11 +3544,213 @@ class RelayAccountsDomain:
         self._resource_secret_cache[cache_key] = value
         return value
 
-    def import_resources(self, account_id: str, resource_ids: object, providers_domain: object) -> dict[str, Any]:
-        """Stage explicitly selected relay resources without applying config."""
+    @staticmethod
+    def _resource_multiplier(account: Mapping[str, Any], resource: Mapping[str, Any]) -> float | None:
+        group_id = str(resource.get("group_id", ""))
+        if not group_id:
+            return None
+        group = next(
+            (
+                item
+                for item in account.get("groups", [])
+                if isinstance(item, Mapping) and item.get("id") == group_id
+            ),
+            None,
+        )
+        return _group_multiplier(group.get("multiplier")) if isinstance(group, Mapping) else None
+
+    def _relay_source(
+        self,
+        account: Mapping[str, Any],
+        resource: Mapping[str, Any],
+        *,
+        include_key: bool = False,
+    ) -> dict[str, Any]:
+        """Build one stable source descriptor; keys stay private by default."""
+
+        source: dict[str, Any] = {
+            "station_id": _station_id(account.get("station_id")),
+            "account_id": _account_id(account.get("id")),
+            "resource_id": _resource_id(resource.get("id")),
+            "provider_name": f"relay-{_station_id(account.get('station_id'))}",
+            "api_base": _api_base(resource.get("api_base")),
+            "enabled": resource.get("enabled") is not False,
+            "name": _resource_name(resource.get("name"), "API"),
+            "api_key_name": _resource_name(resource.get("name"), "API"),
+            "models": _model_names(resource.get("models", [])),
+            "source_models": _model_names(resource.get("models", [])),
+        }
+        multiplier = self._resource_multiplier(account, resource)
+        if multiplier is not None:
+            source["multiplier"] = multiplier
+        if include_key:
+            source["api_key"] = self._read_key(account, resource)
+        return source
+
+    def binding_source(self, source: object) -> dict[str, Any]:
+        """Resolve one existing relay resource to a secret-free stable source.
+
+        Provider-key imports happen before Apply, so this deliberately reads
+        only the persisted relay metadata.  Credentials and an up-to-date API
+        base are resolved later by :meth:`binding_materials` during Apply.
+        """
+
+        if isinstance(source, Mapping) and isinstance(source.get("source"), Mapping):
+            source = source["source"]
+        if not isinstance(source, Mapping):
+            raise RelayAccountsError("Relay binding source is invalid")
+        station_id = _station_id(source.get("station_id"))
+        account_id = _account_id(source.get("account_id"))
+        resource_id = _resource_id(source.get("resource_id"))
+        if resource_id.startswith("pending-"):
+            raise RelayAccountsError("Apply the relay API key before importing it")
+        account_result = self._operation_account(
+            {"station_id": station_id, "account_id": account_id}
+        )
+        if account_result is None:
+            raise RelayAccountsError("Relay account is unavailable")
+        _, account = account_result
+        resource = self._selected_resource(account, resource_id)
+        if resource.get("enabled") is not True:
+            raise RelayAccountsError("Enable the relay API key before importing it")
+        return self._relay_source(account, resource)
+
+    def provider_station_source(self, source: object) -> dict[str, str]:
+        """Resolve the one non-secret station identity used by a provider."""
+
+        if not isinstance(source, Mapping):
+            raise RelayAccountsError("Relay station is unavailable")
+        station_id = _station_id(source.get("station_id", source.get("id")))
+        station = self._stations[self._station_index(station_id)]
+        return {
+            "station_id": station["id"],
+            "name": station["name"],
+            "api_base": station["origin"],
+        }
+
+    @staticmethod
+    def _binding_source_rows(sources: object | None) -> object:
+        if isinstance(sources, Mapping):
+            return sources.get("resources", sources.get("sources", []))
+        return sources
+
+    def refresh_binding_sources(self, sources: object | None = None) -> dict[str, Any]:
+        """Refresh linked relay accounts before materializing dynamic bindings.
+
+        This is an Apply-time read-only step. It deliberately reuses stable
+        account/resource IDs and never guesses a replacement by display name.
+        """
+
+        raw_sources = self._binding_source_rows(sources)
+        if raw_sources is None:
+            raw_sources = [
+                {"station_id": account.get("station_id"), "account_id": account.get("id")}
+                for account in self._accounts
+            ]
+        if not isinstance(raw_sources, Sequence) or isinstance(raw_sources, (str, bytes, bytearray)):
+            raise RelayAccountsError("Relay binding sources are invalid")
+        account_ids: list[str] = []
+        issues: list[dict[str, str]] = []
+        for raw in raw_sources:
+            if not isinstance(raw, Mapping):
+                raise RelayAccountsError("Relay binding sources are invalid")
+            station_id = _station_id(raw.get("station_id"))
+            account_id = _account_id(raw.get("account_id"))
+            account_result = self._operation_account(
+                {"station_id": station_id, "account_id": account_id}
+            )
+            if account_result is None:
+                issues.append(self._apply_issue("account_unavailable", account_id=account_id))
+                continue
+            if account_id not in account_ids:
+                account_ids.append(account_id)
+        refreshed = 0
+        for account_id in account_ids:
+            try:
+                result = self.refresh_resources(account_id, _for_apply=True)
+            except Exception:
+                issues.append(self._apply_issue("refresh_failed", account_id=account_id))
+                continue
+            refreshed += 1
+            if result.get("resource_status") != "ready":
+                issues.append(self._apply_issue("refresh_failed", account_id=account_id))
+        return {"refreshed_accounts": refreshed, "issues": issues}
+
+    def binding_materials(self, sources: object | None = None, *, refresh: bool = False) -> dict[str, Any]:
+        """Resolve private relay binding material for the Core Apply coordinator.
+
+        This method is intentionally *not* used by ``snapshot`` or generic
+        actions. Its return value can contain ``api_key`` and must remain
+        inside Core while it is passed straight to provider materialization.
+        """
+
+        refresh_result = self.refresh_binding_sources(sources) if refresh else {"issues": []}
+        raw_sources = self._binding_source_rows(sources)
+        if raw_sources is None:
+            raw_sources = [
+                {
+                    "station_id": account.get("station_id"),
+                    "account_id": account.get("id"),
+                    "resource_id": resource.get("id"),
+                }
+                for account in self._accounts
+                for resource in account.get("resources", [])
+                if isinstance(resource, Mapping)
+            ]
+        if not isinstance(raw_sources, Sequence) or isinstance(raw_sources, (str, bytes, bytearray)):
+            raise RelayAccountsError("Relay binding sources are invalid")
+        materials: list[dict[str, Any]] = []
+        issues: list[dict[str, str]] = list(refresh_result["issues"])
+        for raw in raw_sources:
+            if not isinstance(raw, Mapping):
+                raise RelayAccountsError("Relay binding sources are invalid")
+            station_id = _station_id(raw.get("station_id"))
+            account_id = _account_id(raw.get("account_id"))
+            resource_id = _resource_id(raw.get("resource_id"))
+            try:
+                _, account = self._operation_account(
+                    {"station_id": station_id, "account_id": account_id}
+                ) or (None, None)
+                if account is None:
+                    raise RelayAccountsError("Relay account is unavailable")
+                resource = self._selected_resource(account, resource_id)
+            except Exception:
+                issues.append(self._apply_issue("resource_unavailable", account_id=account_id, resource_id=resource_id))
+                continue
+            if resource_id.startswith("pending-"):
+                issues.append(self._apply_issue("created_resource_unresolved", account_id=account_id, resource_id=resource_id))
+                continue
+            try:
+                material = self._relay_source(account, resource, include_key=True)
+            except Exception:
+                issues.append(self._apply_issue("resource_key_unavailable", account_id=account_id, resource_id=resource_id))
+                continue
+            materials.append(material)
+            if material["enabled"] is not True:
+                issues.append(self._apply_issue("resource_disabled", account_id=account_id, resource_id=resource_id))
+        return {"resources": materials, "issues": issues}
+
+    def resolve_bindings(self, sources: object | None = None) -> dict[str, Any]:
+        """Alias retained for a coordinator that models this as resolution."""
+
+        return self.binding_materials(sources)
+
+    def import_resources(
+        self,
+        account_id: str,
+        resource_ids: object,
+        providers_domain: object,
+        *,
+        mode: object = "linked",
+        import_mode: object | None = None,
+    ) -> dict[str, Any]:
+        """Stage selected resources as linked (default) or independent models."""
 
         index = self._index(account_id)
         account = self._accounts[index]
+        selected_mode = str(import_mode if import_mode is not None else mode).strip().lower()
+        if selected_mode not in {"linked", "independent"}:
+            raise RelayAccountsError("Relay import mode is invalid")
         if not isinstance(resource_ids, Sequence) or isinstance(resource_ids, (str, bytes, bytearray)):
             raise RelayAccountsError("Select at least one relay API resource")
         requested = [_resource_id(value) for value in resource_ids]
@@ -2367,8 +3761,34 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Enable the selected relay API resource before importing")
         dispatch = getattr(providers_domain, "dispatch", None)
         snapshotter = getattr(providers_domain, "snapshot", None)
+        if not callable(dispatch) or not callable(snapshotter):
+            raise RelayAccountsError("Provider/model settings are unavailable")
+        sources = [self._relay_source(account, resource) for resource in selected]
+        if selected_mode == "linked":
+            stage_linked = getattr(providers_domain, "stage_relay_import", None)
+            try:
+                if callable(stage_linked):
+                    snapshot = stage_linked(sources, import_mode="linked")
+                else:
+                    snapshot = dispatch("relay.import", {"sources": sources, "import_mode": "linked"})
+            except Exception as exc:
+                raise RelayAccountsError("Provider/model import could not be staged") from exc
+            imported_models = sum(len(source["models"]) for source in sources)
+            self.revision += 1
+            return {
+                "imported": True,
+                "import_mode": "linked",
+                "account_id": account["id"],
+                "station_id": account["station_id"],
+                "resource_count": len(selected),
+                "provider_id": sources[0]["provider_name"] if sources else "",
+                "model_count": imported_models,
+                "sources": sources,
+                "providers": snapshot,
+            }
+
         exporter = getattr(providers_domain, "export", None)
-        if not callable(dispatch) or not callable(snapshotter) or not callable(exporter):
+        if not callable(exporter):
             raise RelayAccountsError("Provider/model settings are unavailable")
         private = exporter(include_sensitive=True)
         providers = private.get("providers", []) if isinstance(private, Mapping) else []
@@ -2381,9 +3801,15 @@ class RelayAccountsDomain:
         api_keys = [dict(item) for item in provider.get("api_keys", []) if isinstance(item, Mapping)]
         models = [dict(item) for item in provider.get("models", []) if isinstance(item, Mapping)]
         imported_models = 0
+        selected_names = [str(resource.get("name", "")) for resource in selected]
         for resource in selected:
             key = self._read_key(account, resource)
             key_name = _resource_name(resource["name"], "default")
+            if selected_names.count(key_name) > 1:
+                key_name = _resource_name(
+                    f"{key_name} ({str(resource['id']).rsplit('-', 1)[-1]})",
+                    key_name,
+                )
             api_keys = [item for item in api_keys if str(item.get("name", "")) != key_name]
             api_keys.append({"name": key_name, "value": key})
             models = [item for item in models if str(item.get("api_key_name", "")) != key_name]
@@ -2417,10 +3843,13 @@ class RelayAccountsDomain:
         self.revision += 1
         return {
             "imported": True,
+            "import_mode": "independent",
             "account_id": account["id"],
+            "station_id": account["station_id"],
             "resource_count": len(selected),
             "provider_id": provider_id,
             "model_count": imported_models,
+            "sources": sources,
             "providers": snapshot,
         }
 

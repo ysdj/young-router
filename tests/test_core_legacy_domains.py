@@ -16,9 +16,10 @@ from unittest import mock
 from litellm_menu.core.domains import DomainError
 from litellm_menu.core.domains.codex import CodexSettingsDomain
 from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
 from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
 from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
-from litellm_menu.core.service import CoreStore
+from litellm_menu.core.service import CoreError, CoreStore
 from runtime_settings_io import RuntimeSettingSpec
 
 
@@ -52,6 +53,118 @@ future_top_level:
 
 
 class ProvidersModelsDomainTests(unittest.TestCase):
+    def test_relay_provider_source_sets_name_and_url_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.yaml"
+            config_path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            relay = RelayAccountsDomain(root / "relay")
+            station = relay.dispatch(
+                "station.add",
+                {
+                    "name": "Relay Station",
+                    "origin": "https://relay.example.test",
+                    "type": "newapi",
+                },
+            )["stations"][0]
+            providers = ProvidersModelsDomain(config_path)
+            core = CoreStore(domains=[relay, providers])
+            provider_id = core.snapshot()["domains"]["providers_models"]["providers"][0]["editor_id"]
+
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.select_relay_station",
+                    "payload": {"provider_id": provider_id, "station_id": station["id"]},
+                }
+            )
+
+            selected = core.snapshot()["domains"]["providers_models"]["providers"][0]
+            self.assertEqual("Relay Station", selected["name"])
+            self.assertEqual("https://relay.example.test", selected["api_base"])
+            self.assertEqual("relay", selected["provider_type"])
+            self.assertEqual(station["id"], selected["relay_station_id"])
+            self.assertEqual("Relay Station", selected["models"][0]["provider"])
+            self.assertEqual("https://relay.example.test", selected["models"][0]["api_base"])
+
+            with self.assertRaisesRegex(CoreError, "set by its station"):
+                core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.patch",
+                        "payload": {"provider_id": provider_id, "changes": {"name": "mixed"}},
+                    }
+                )
+            with self.assertRaisesRegex(CoreError, "Select a relay station"):
+                core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.patch",
+                        "payload": {
+                            "provider_id": provider_id,
+                            "changes": {"provider_type": "relay", "relay_station_id": station["id"]},
+                        },
+                    }
+                )
+
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.patch",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "changes": {"provider_type": "custom", "relay_station_id": ""},
+                    },
+                }
+            )
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.patch",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "changes": {
+                            "provider_type": "custom",
+                            "relay_station_id": "",
+                            "extra": {
+                                "x-litellm-menu-provider-source": {
+                                    "kind": "relay",
+                                    "station_id": station["id"],
+                                }
+                            },
+                        },
+                    },
+                }
+            )
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.patch",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "changes": {"name": "Custom Provider", "endpoint": "https://custom.example.test/v1"},
+                    },
+                }
+            )
+            custom = core.snapshot()["domains"]["providers_models"]["providers"][0]
+            self.assertEqual("custom", custom["provider_type"])
+            self.assertEqual("", custom["relay_station_id"])
+            self.assertEqual(
+                {"kind": "custom"},
+                custom["extra"]["x-litellm-menu-provider-source"],
+            )
+            self.assertEqual("Custom Provider", custom["name"])
+            self.assertEqual("https://custom.example.test/v1", custom["api_base"])
+            self.assertEqual("Custom Provider", custom["models"][0]["provider"])
+            self.assertEqual("https://custom.example.test/v1", custom["models"][0]["api_base"])
+
+            providers.apply()
+            saved = config_path.read_text(encoding="utf-8")
+            self.assertIn("x-litellm-menu-provider-source: {kind: custom}", saved)
+            reloaded = ProvidersModelsDomain(config_path).snapshot()["providers"][0]
+            self.assertEqual("custom", reloaded["provider_type"])
+            self.assertEqual("", reloaded["relay_station_id"])
+
     def test_canonical_actions_stage_and_apply_without_exposing_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
@@ -87,10 +200,13 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
             self.assertEqual(["default"], provider["api_key_names"])
             self.assertEqual("default", provider["models"][0]["api_key_name"])
-            self.assertEqual(
-                [{"name": "default", "configured": True, "model_count": 1}],
-                provider["key_states"],
-            )
+            self.assertEqual(1, len(provider["key_states"]))
+            key_state = provider["key_states"][0]
+            self.assertEqual("default", key_state["name"])
+            self.assertTrue(key_state["configured"])
+            self.assertEqual(1, key_state["model_count"])
+            self.assertRegex(key_state["id"], r"^provider-slot-[0-9a-f]{32}$")
+            self.assertEqual({"kind": "independent"}, key_state["source"])
             self.assertNotIn("replace-me-secret", json.dumps(snapshot))
 
     def test_provider_model_contract_has_no_upstream_billing_state_or_action(self) -> None:
@@ -485,11 +601,6 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             provider = deleted["providers"][0]
             self.assertEqual(["default"], provider["api_key_names"])
             self.assertEqual([], provider["models"])
-            with self.assertRaisesRegex(DomainError, "retain at least one"):
-                domain.dispatch(
-                    "provider.key_delete",
-                    {"provider_id": "primary", "name": "default"},
-                )
             self.assertNotIn("replace-me-secondary-secret", json.dumps(deleted))
 
             domain.apply()
@@ -497,6 +608,13 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertNotIn("name: fallback", saved)
             self.assertNotIn("model_name: default-chat", saved)
             self.assertIn("replace-me-secret", saved)
+
+            emptied = ProvidersModelsDomain(path).dispatch(
+                "provider.key_delete",
+                {"provider_id": "primary", "name": "default"},
+            )
+            self.assertEqual([], emptied["providers"][0]["api_key_names"])
+            self.assertEqual([], emptied["providers"][0]["models"])
 
     def test_provider_import_link_is_staged_only_through_native_secret_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -80,6 +80,8 @@ constexpr wchar_t kImmediateWebPresentationScript[] = LR"JS((() => {
     style.id = styleID;
     style.textContent = `
       html { scroll-behavior: auto !important; }
+      html, body, * { scrollbar-width: none !important; }
+      *::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
       *, *::before, *::after {
         animation: none !important;
         transition: none !important;
@@ -634,7 +636,7 @@ bool RunOwnedWindow(xaml::Window const& dialog, HWND owner, std::atomic_bool& fi
     EnableWindow(owner, FALSE);
   }
   auto window_id = winrt::Microsoft::UI::GetWindowIdFromWindow(handle);
-  const auto frame = FrameTrackSizeForContentDips(handle, 860, 720);
+  const auto frame = FrameTrackSizeForContentDips(handle, 980, 820);
   winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(window_id).Resize({frame.x, frame.y});
   dialog.Activate();
   MSG message{};
@@ -1148,6 +1150,12 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
         if (submit instanceof HTMLElement) submit.click();
         else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
       }
+      const agreementPattern = /agree|terms|privacy|consent|协议|同意|隐私|用户协议/i;
+      const agreement = Array.from(document.querySelectorAll('input[type="checkbox"],[role="checkbox"]')).find((node) => {
+        const scope = node.closest('label,li,form,section,div') || node.parentElement || node;
+        return agreementPattern.test((scope.innerText || scope.textContent || '').trim());
+      });
+      if (agreement) (agreement.closest('label,li,form,section') || agreement).scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
       return hasCredentials;
     })())JS";
     auto after = [current, script = std::move(script), auto_submit_saved_password]() -> winrt::fire_and_forget {

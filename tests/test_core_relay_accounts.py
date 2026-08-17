@@ -584,6 +584,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 access_token="replace-access-token",
                 password="replace-password",
             )
+            domain.apply()
 
             self.assertEqual("signed_in", logged_in["login_status"])
             self.assertTrue(logged_in["remember_password"])
@@ -625,6 +626,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 cookie="session=remembered-cookie",
                 access_token="remembered-token",
             )
+            domain.apply()
 
             fake = FakeRelayHTTPClient({"/api/v1/auth/me": {"data": {"email": "person@example.test"}}})
             restored_domain = RelayAccountsDomain(root, http_client=fake)
@@ -665,7 +667,9 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 cookie="session=replace-cookie",
                 access_token="replace-access-token",
             )
+            domain.apply()
 
+            before_delete = (root / ".litellm-runtime" / "relay-accounts.json").read_bytes()
             deleted = domain.dispatch("account.delete", {"id": account["id"]})
             self.assertEqual([], deleted["accounts"])
             self.assertEqual(
@@ -678,6 +682,8 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 ],
                 deleted["pending_credential_cleanups"],
             )
+            self.assertEqual(before_delete, (root / ".litellm-runtime" / "relay-accounts.json").read_bytes())
+            domain.apply()
             persisted = (root / ".litellm-runtime" / "relay-accounts.json").read_text()
             self.assertNotIn("replace-cookie", persisted)
             self.assertNotIn("replace-access-token", persisted)
@@ -691,7 +697,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual([], confirmed["pending_credential_cleanups"])
             self.assertEqual([], RelayAccountsDomain(root).snapshot()["pending_credential_cleanups"])
 
-    def test_disabling_password_remember_clears_the_private_file_immediately(self) -> None:
+    def test_disabling_password_remember_clears_the_private_file_on_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             domain = RelayAccountsDomain(root)
@@ -710,6 +716,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 access_token="replace-access-token",
                 password="replace-password",
             )
+            domain.apply()
 
             disabled = domain.dispatch(
                 "account.update",
@@ -718,6 +725,10 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertFalse(disabled["accounts"][0]["remember_password"])
             self.assertFalse(disabled["accounts"][0]["password_saved"])
             self.assertEqual([], disabled["pending_credential_cleanups"])
+            persisted = (root / ".litellm-runtime" / "relay-accounts.json").read_text()
+            self.assertIn("replace-password", persisted)
+            self.assertIn("replace-access-token", persisted)
+            domain.apply()
             persisted = (root / ".litellm-runtime" / "relay-accounts.json").read_text()
             self.assertNotIn("replace-password", persisted)
             self.assertNotIn("replace-access-token", persisted)
@@ -742,6 +753,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 access_token="replace-access-token",
                 password="replace-password",
             )
+            domain.apply()
             self.assertTrue(accepted["password_saved"])
             self.assertNotIn("password", accepted)
 
@@ -841,6 +853,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 access_token="previous-access-token",
             )
             relay.refresh_resources(account["id"])
+            relay.apply()
             reloaded = RelayAccountsDomain(root, http_client=fake)
             self.assertEqual("unknown", reloaded.snapshot()["accounts"][0]["login_status"])
             self.assertEqual(["newapi-7"], [item["id"] for item in reloaded.snapshot()["accounts"][0]["resources"]])
@@ -896,6 +909,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 cookie="session=remembered-cookie",
                 password="replace-password",
             )
+            relay.apply()
             fake = FakeRelayHTTPClient({"/api/v1/auth/me": {"data": {"email": "person@example.test"}}})
             reloaded = RelayAccountsDomain(root, http_client=fake)
             core = CoreStore(
@@ -1005,7 +1019,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             refreshed_account = domain.snapshot()["accounts"][0]
             self.assertEqual("ready", refreshed_account["resource_status"])
             self.assertEqual("none", refreshed_account["resource_error"])
-            result = domain.import_resources(account_id, [resource["id"] for resource in resources], providers)
+            result = domain.import_resources(account_id, [resource["id"] for resource in resources], providers, mode="independent")
 
             self.assertTrue(result["imported"])
             self.assertEqual(2, result["model_count"])
@@ -1160,6 +1174,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 account_id,
                 [resource["id"] for resource in resources],
                 providers,
+                mode="independent",
             )
 
             self.assertEqual(2, result["model_count"])
@@ -1203,7 +1218,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             providers = ProvidersModelsDomain(root / "config.yaml")
 
             resources = domain.refresh_resources(account_id)["resources"]
-            result = domain.import_resources(account_id, [resource["id"] for resource in resources], providers)
+            result = domain.import_resources(account_id, [resource["id"] for resource in resources], providers, mode="independent")
 
             self.assertEqual(2, result["model_count"])
             self.assertEqual(
@@ -1257,6 +1272,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 account_id,
                 [resource["id"] for resource in resources],
                 providers,
+                mode="independent",
             )
 
             self.assertEqual(1, result["model_count"])
@@ -1295,7 +1311,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             resources = domain.refresh_resources(account_id)["resources"]
             providers = ProvidersModelsDomain(root / "config.yaml")
 
-            domain.import_resources(account_id, ["sub2api-5"], providers)
+            domain.import_resources(account_id, ["sub2api-5"], providers, mode="independent")
 
             private = providers.export(include_sensitive=True)["providers"][0]
             self.assertEqual("sk-replace-selected-key", private["api_key"])
@@ -1349,7 +1365,10 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertTrue(imported["imported"])
             provider = providers.export(include_sensitive=True)["providers"][0]
             self.assertEqual(["Secondary"], [item["name"] for item in provider["api_keys"]])
-            self.assertEqual("sk-replace-secondary-key", provider["api_key"])
+            self.assertEqual("", provider["api_key"])
+            self.assertEqual("relay", provider["api_keys"][0]["source"]["kind"])
+            self.assertEqual(account["station_id"], provider["api_keys"][0]["source"]["station_id"])
+            self.assertEqual(resources[1]["id"], provider["api_keys"][0]["source"]["resource_id"])
             self.assertEqual(["model-a", "model-b"], [item["model_name"] for item in provider["models"]])
             self.assertTrue(core.snapshot()["drafts"]["providers_models"]["dirty"])
 

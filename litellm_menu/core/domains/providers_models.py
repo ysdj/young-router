@@ -17,7 +17,18 @@ import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from config_editor_core.schema import infer_upstream_fallback_surface
+from config_editor_core.schema import (
+    MENU_PROVIDER_SOURCE_KEY,
+    MENU_RELAY_KEYS_KEY,
+    MENU_RELAY_KEYS_VERSION,
+    MODEL_ORDER_MODES,
+    _menu_order,
+    _provider_key_id,
+    _provider_source,
+    _relay_source,
+    _stable_provider_key_id,
+    infer_upstream_fallback_surface,
+)
 
 from ...api_base import isolated_http_opener, service_root
 from ..persistence import atomic_write_text
@@ -64,7 +75,10 @@ class ProvidersModelsDomain:
         # The config parser accepts a document with no providers. Do not create
         # this document on disk; it merely keeps a missing installation
         # renderable until the user explicitly restores/imports a config.
-        return {"config": "model_list: []\n", "disabled": None}
+        # Provider anchors must precede model aliases in the emitted YAML.
+        # Keep this first-run document in that order before any staged linked
+        # deployment causes the dumper to introduce aliases.
+        return {"config": "providers: {}\n\nmodel_list: []\n", "disabled": None}
 
     def _load(self) -> dict[str, Any]:
         from config_editor_core import load as config_load
@@ -163,7 +177,7 @@ class ProvidersModelsDomain:
         source_models = provider.get("models")
         copied_models = copied.get("models")
         if isinstance(source_models, list) and isinstance(copied_models, list):
-            for source_model, copied_model in zip(source_models, copied_models, strict=False):
+            for source_model, copied_model in zip(source_models, copied_models):
                 if isinstance(source_model, Mapping) and isinstance(copied_model, Mapping):
                     self._model_editor_ids[id(copied_model)] = self._editor_id(source_model, model=True)
         return copied
@@ -208,20 +222,63 @@ class ProvidersModelsDomain:
         prefix = cls._upstream_model_prefix(model)
         return f"{prefix}/{name}"
 
+    @staticmethod
+    def _binding_health(
+        model: Mapping[str, Any],
+        keys_by_id: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, str]:
+        provider_key_id = str(model.get("provider_key_id", "")).strip()
+        override = model.get("binding_health")
+
+        def preserved_problem() -> dict[str, str] | None:
+            if not isinstance(override, Mapping):
+                return None
+            status = str(override.get("status", "")).strip()
+            # Link state belongs to the selected ProviderKey, not to the
+            # model.  Keep only concrete Apply-time failures as an override.
+            if not status or status in {"linked", "independent"}:
+                return None
+            detail = str(override.get("detail", "")).strip()
+            return {"status": status, **({"detail": detail} if detail else {})}
+
+        if not provider_key_id:
+            problem = preserved_problem()
+            if problem is not None:
+                return problem
+            return {"status": "independent"}
+        key = keys_by_id.get(provider_key_id)
+        if key is None:
+            return {
+                "status": "missing_provider_key",
+                "detail": "The linked provider key is unavailable",
+            }
+        source = key.get("source", {})
+        if not isinstance(source, Mapping) or source.get("kind") != "relay":
+            return {"status": "independent"}
+        problem = preserved_problem()
+        if problem is not None:
+            return problem
+        return {"status": "linked"}
+
     def _safe_provider(self, provider: object, index: int) -> dict[str, Any]:
         if not isinstance(provider, Mapping):
             return {
                 "id": f"provider-{index + 1}",
                 "name": "",
                 "enabled": False,
+                "provider_type": "custom",
+                "relay_station_id": "",
                 "api_key_names": [],
                 "models": [],
             }
         name = str(provider.get("name", "")).strip()
-        keys = provider.get("api_keys", [])
+        provider_source = self._provider_source_state(provider)
+        keys = self._provider_api_keys(provider)
         configured_key = bool(provider.get("api_key"))
         api_key_names: list[str] = []
         key_configured: dict[str, bool] = {}
+        key_configured_by_id: dict[str, bool] = {}
+        keys_by_id: dict[str, Mapping[str, Any]] = {}
         key_states: list[dict[str, Any]] = []
         if isinstance(keys, Sequence) and not isinstance(keys, (str, bytes, bytearray)):
             for item in keys:
@@ -232,8 +289,12 @@ class ProvidersModelsDomain:
                     api_key_names.append(key_name)
                 key_value = item.get("value", "")
                 configured = isinstance(key_value, str) and bool(key_value.strip())
+                provider_key_id = str(item.get("id", "")).strip()
                 if key_name:
                     key_configured[key_name] = configured
+                if provider_key_id:
+                    key_configured_by_id[provider_key_id] = configured
+                    keys_by_id[provider_key_id] = item
                 configured_key = configured_key or configured
         models: list[dict[str, Any]] = []
         raw_models = provider.get("models", [])
@@ -242,9 +303,12 @@ class ProvidersModelsDomain:
                 if not isinstance(model, Mapping):
                     continue
                 model_key_name = str(model.get("api_key_name", "")).strip()
+                provider_key_id = str(model.get("provider_key_id", "")).strip()
                 model_api_key = model.get("api_key")
                 model_key = (
-                    key_configured.get(model_key_name, False)
+                    key_configured_by_id.get(provider_key_id, False)
+                    if provider_key_id
+                    else key_configured.get(model_key_name, False)
                     if model_key_name
                     else isinstance(model_api_key, str) and bool(model_api_key.strip())
                 )
@@ -257,6 +321,16 @@ class ProvidersModelsDomain:
                 }
                 live_probe = self._probe_overlay.get(name, {}).get(self._probe_model_key(model), {})
                 model_enabled = model.get("model_enabled", model.get("enabled", True)) is not False
+                effective_order = model.get("effective_order", model.get("order", 0))
+                manual_order = model.get("manual_order", model.get("order", 0))
+                selected_key = keys_by_id.get(provider_key_id)
+                relay_selected = (
+                    isinstance(selected_key, Mapping)
+                    and isinstance(selected_key.get("source"), Mapping)
+                    and selected_key["source"].get("kind") == "relay"
+                )
+                raw_order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
+                order_mode = raw_order_mode if relay_selected or raw_order_mode != "relay_multiplier" else "manual"
                 models.append(
                     {
                         "id": str(model.get("deployment_id") or model.get("model_name") or self._editor_id(model, model=True)),
@@ -269,9 +343,19 @@ class ProvidersModelsDomain:
                         "provider": str(model.get("provider", name)),
                         "api_base": REDACT_TEXT(str(model.get("api_base", ""))),
                         "api_key_name": model_key_name,
+                        "provider_key_id": provider_key_id,
+                        # Relation state is derived from the chosen ProviderKey
+                        # so a stale legacy model field cannot claim a relay
+                        # association after the key was changed.
+                        "catalog_mode": "relay_linked" if relay_selected else "independent",
+                        "source_model_id": str(model.get("source_model_id", "")) if relay_selected else "",
+                        "order_mode": order_mode,
+                        "manual_order": manual_order,
+                        "effective_order": effective_order,
+                        "binding_health": self._binding_health(model, keys_by_id),
                         "enabled": model_enabled,
                         "model_enabled": model_enabled,
-                        "order": model.get("order", 0),
+                        "order": effective_order,
                         "ssl_verify": str(model.get("ssl_verify", "")),
                         "ssl_verify_present": bool(model.get("ssl_verify_present")),
                         "deployment_id": str(model.get("deployment_id", "")),
@@ -286,9 +370,11 @@ class ProvidersModelsDomain:
                 )
         model_counts: dict[str, int] = {}
         for model in models:
+            key_id = str(model.get("provider_key_id", "")).strip()
             key_name = str(model.get("api_key_name", "")).strip()
-            if key_name:
-                model_counts[key_name] = model_counts.get(key_name, 0) + 1
+            count_key = key_id or key_name
+            if count_key:
+                model_counts[count_key] = model_counts.get(count_key, 0) + 1
         if isinstance(keys, Sequence) and not isinstance(keys, (str, bytes, bytearray)):
             for item in keys:
                 if not isinstance(item, Mapping):
@@ -297,11 +383,14 @@ class ProvidersModelsDomain:
                 if not key_name or any(state["name"] == key_name for state in key_states):
                     continue
                 key_value = item.get("value", "")
+                provider_key_id = str(item.get("id", "")).strip()
                 key_states.append(
                     {
+                        "id": provider_key_id,
                         "name": key_name,
                         "configured": isinstance(key_value, str) and bool(key_value.strip()),
-                        "model_count": model_counts.get(key_name, 0),
+                        "model_count": model_counts.get(provider_key_id or key_name, 0),
+                        "source": copy.deepcopy(item.get("source", {"kind": "independent"})),
                     }
                 )
         return {
@@ -309,6 +398,8 @@ class ProvidersModelsDomain:
             "editor_id": self._editor_id(provider),
             "name": name,
             "enabled": provider.get("enabled") is not False,
+            "provider_type": provider_source["kind"],
+            "relay_station_id": provider_source.get("station_id", ""),
             "api_base": REDACT_TEXT(str(provider.get("api_base", ""))),
             "api_key_configured": configured_key,
             "api_key_names": api_key_names,
@@ -530,10 +621,17 @@ class ProvidersModelsDomain:
         provider: Mapping[str, Any],
         provider_id: str,
         api_key_name: str | None = None,
+        *,
+        credential_override: str | None = None,
     ) -> dict[str, Any]:
         """Fetch one standard `/v1/models` list without exposing remote details."""
 
-        selected_key_name, credential = self._provider_credential(provider, api_key_name)
+        if credential_override is None:
+            selected_key_name, credential = self._provider_credential(provider, api_key_name)
+        else:
+            selected_key_name = self._api_key_name(api_key_name)
+            self._api_key_index(self._provider_api_keys(provider), selected_key_name)
+            credential = credential_override
         endpoint = self._model_endpoint(self._provider_api_base(provider))
         summary: dict[str, Any] = {
             "operation": "fetch_models",
@@ -619,6 +717,52 @@ class ProvidersModelsDomain:
             self._safe_provider(provider, index)["id"],
             api_key_name,
         )
+        self._last_operation = summary
+        return summary
+
+    def _fetch_relay_resource_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """Fetch models through a dynamically discovered relay API key.
+
+        The Core coordinator supplies the relay credential only for this
+        request.  The staged ProviderKey keeps its stable relay source and is
+        materialized again at Apply time; no relay secret becomes draft or
+        snapshot data.
+        """
+
+        raw_source = data.get("source")
+        if not isinstance(raw_source, Mapping):
+            raise DomainError("Relay API key is unavailable")
+        credential = raw_source.get("api_key")
+        if not isinstance(credential, str) or not credential.strip():
+            raise DomainError("Relay API key is unavailable")
+        provider_index = self._provider_index(data)
+        provider = self._draft["providers"][provider_index]
+        if not isinstance(provider, Mapping):
+            raise DomainError("The selected provider is unavailable")
+        provider_root = service_root(self._provider_api_base(provider))
+        relay_root = service_root(raw_source.get("api_base"))
+        if not provider_root or provider_root != relay_root:
+            raise DomainError("Relay API key does not match the provider Base URL")
+
+        imported = self._stage_provider_relay_key_import(
+            {
+                "provider_id": data.get("provider_id"),
+                "source": raw_source,
+                "api_key_name": raw_source.get("api_key_name", raw_source.get("name")),
+            }
+        )
+        staged_provider = self._draft["providers"][provider_index]
+        if not isinstance(staged_provider, Mapping):
+            raise DomainError("The selected provider is unavailable")
+        summary = self._fetch_provider_models(
+            staged_provider,
+            imported["provider_id"],
+            imported["api_key_name"],
+            credential_override=credential.strip(),
+        )
+        summary["slot_id"] = imported["slot_id"]
+        summary["imported"] = imported["imported"]
+        summary["reused"] = imported["reused"]
         self._last_operation = summary
         return summary
 
@@ -921,23 +1065,118 @@ class ProvidersModelsDomain:
         return name
 
     @staticmethod
-    def _provider_api_keys(provider: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _provider_key_source(value: object) -> dict[str, str]:
+        try:
+            return _relay_source(value)
+        except ValueError:
+            raise DomainError("Provider API key source is invalid") from None
+
+    @staticmethod
+    def _provider_source_state(provider: Mapping[str, Any]) -> dict[str, str]:
+        """Read the explicit URL/name source; legacy providers are custom."""
+
+        extra = provider.get("extra")
+        raw = extra.get(MENU_PROVIDER_SOURCE_KEY) if isinstance(extra, Mapping) else None
+        provider_type = provider.get("provider_type")
+        station_id = provider.get("relay_station_id")
+        if provider_type is not None or station_id is not None:
+            raw = {
+                "kind": str(provider_type or "custom"),
+                **({"station_id": str(station_id)} if station_id else {}),
+            }
+        try:
+            return _provider_source(raw)
+        except ValueError:
+            raise DomainError("Provider source is invalid") from None
+
+    @staticmethod
+    def _set_provider_source(provider: dict[str, Any], value: object) -> dict[str, str]:
+        try:
+            source = _provider_source(value, required=True)
+        except ValueError:
+            raise DomainError("Provider source is invalid") from None
+        provider["provider_type"] = source["kind"]
+        provider["relay_station_id"] = source.get("station_id", "")
+        extra = dict(provider.get("extra", {})) if isinstance(provider.get("extra"), Mapping) else {}
+        extra[MENU_PROVIDER_SOURCE_KEY] = copy.deepcopy(source)
+        provider["extra"] = extra
+        return source
+
+    @staticmethod
+    def _sync_provider_identity_to_models(provider: dict[str, Any]) -> None:
+        """Keep every staged model on its provider's URL and name."""
+
+        name = str(provider.get("name", "")).strip()
+        api_base = str(provider.get("api_base", "")).strip()
+        models = provider.get("models")
+        if not isinstance(models, list):
+            return
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            model["provider"] = name
+            model["api_base"] = api_base
+
+    @staticmethod
+    def _order_value(value: object, *, label: str = "Route order") -> int | float:
+        try:
+            return _menu_order(value, label)
+        except ValueError:
+            raise DomainError(f"{label} is invalid") from None
+
+    @staticmethod
+    def _new_provider_key_id() -> str:
+        return f"provider-slot-{uuid.uuid4().hex}"
+
+    @classmethod
+    def _provider_api_keys(cls, provider: Mapping[str, Any]) -> list[dict[str, Any]]:
         raw_keys = provider.get("api_keys", [])
         if raw_keys is None:
             return []
         if not isinstance(raw_keys, list):
             raise DomainError("Provider API keys are invalid")
         keys: list[dict[str, Any]] = []
+        provider_name = str(provider.get("name", "")).strip()
+        seen_ids: set[str] = set()
         for item in raw_keys:
             if not isinstance(item, Mapping):
                 raise DomainError("Provider API keys are invalid")
-            keys.append(copy.deepcopy(dict(item)))
+            copied = copy.deepcopy(dict(item))
+            key_name = cls._api_key_name(copied.get("name"))
+            try:
+                provider_key_id = _provider_key_id(copied.get("id"))
+            except ValueError:
+                raise DomainError("Provider API key ID is invalid") from None
+            provider_key_id = provider_key_id or _stable_provider_key_id(
+                provider_name, key_name
+            )
+            if provider_key_id in seen_ids:
+                raise DomainError("Provider API key IDs must be unique")
+            seen_ids.add(provider_key_id)
+            copied["id"] = provider_key_id
+            copied["name"] = key_name
+            copied["source"] = cls._provider_key_source(copied.get("source"))
+            keys.append(copied)
         return keys
 
-    @staticmethod
-    def _sync_primary_api_key(provider: dict[str, Any], keys: list[dict[str, Any]]) -> None:
-        provider["api_keys"] = keys
-        first_value = keys[0].get("value", "") if keys else ""
+    @classmethod
+    def _sync_primary_api_key(cls, provider: dict[str, Any], keys: list[dict[str, Any]]) -> None:
+        normalized = cls._provider_api_keys({**provider, "api_keys": keys})
+        extra = dict(provider.get("extra", {})) if isinstance(provider.get("extra"), Mapping) else {}
+        extra[MENU_RELAY_KEYS_KEY] = {
+            "version": MENU_RELAY_KEYS_VERSION,
+            "slots": [
+                {
+                    "id": item["id"],
+                    "api_key_name": item["name"],
+                    "source": copy.deepcopy(item["source"]),
+                }
+                for item in normalized
+            ],
+        }
+        provider["extra"] = extra
+        provider["api_keys"] = normalized
+        first_value = normalized[0].get("value", "") if normalized else ""
         provider["api_key"] = first_value if isinstance(first_value, str) else ""
 
     @classmethod
@@ -946,6 +1185,139 @@ class ProvidersModelsDomain:
             if str(item.get("name", "")).strip() == name:
                 return index
         raise DomainError("The selected API key is unavailable")
+
+    @staticmethod
+    def _provider_key_index(keys: Sequence[Mapping[str, Any]], provider_key_id: str) -> int:
+        for index, item in enumerate(keys):
+            if str(item.get("id", "")).strip() == provider_key_id:
+                return index
+        raise DomainError("The selected provider key is unavailable")
+
+    def _provider_key_location(self, provider_key_id: object) -> tuple[int, int]:
+        try:
+            target = _provider_key_id(provider_key_id, required=True)
+        except ValueError:
+            raise DomainError("The selected provider key is unavailable") from None
+        for provider_index, provider in enumerate(self._draft.get("providers", [])):
+            if not isinstance(provider, Mapping):
+                continue
+            keys = self._provider_api_keys(provider)
+            for key_index, item in enumerate(keys):
+                if item["id"] == target:
+                    return provider_index, key_index
+        raise DomainError("The selected provider key is unavailable")
+
+    def _model_provider_key(
+        self,
+        provider: Mapping[str, Any],
+        model: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        keys = self._provider_api_keys(provider)
+        provider_key_id = str(model.get("provider_key_id", "")).strip()
+        if provider_key_id:
+            for item in keys:
+                if item["id"] == provider_key_id:
+                    return item
+            return None
+        key_name = str(model.get("api_key_name", "")).strip()
+        if key_name:
+            for item in keys:
+                if item["name"] == key_name:
+                    return item
+            return None
+        return keys[0] if keys else None
+
+    def _normalize_model_binding(
+        self,
+        provider: Mapping[str, Any],
+        model: dict[str, Any],
+    ) -> None:
+        order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
+        if order_mode not in MODEL_ORDER_MODES:
+            raise DomainError("Order mode must be manual or relay_multiplier")
+        key = self._model_provider_key(provider, model)
+        if key is not None:
+            model["provider_key_id"] = key["id"]
+            model["api_key_name"] = key["name"]
+        relay_selected = (
+            key is not None
+            and isinstance(key.get("source"), Mapping)
+            and key["source"].get("kind") == "relay"
+        )
+        if order_mode == "relay_multiplier" and not relay_selected:
+            raise DomainError("Relay multiplier order requires a relay provider key")
+        # ProviderKey.source is the single relation source of truth.  These
+        # editor fields remain derived for old documents/UI readers, but they
+        # are never accepted as an independent model-level binding contract.
+        model["catalog_mode"] = "relay_linked" if relay_selected else "independent"
+        # Legacy documents persist this compatibility field.  Derive it from
+        # the model's ordinary upstream selection instead of accepting a
+        # second, independently editable relay-model identity.
+        model["source_model_id"] = self._wire_model_name(model) if relay_selected else ""
+        model["order_mode"] = order_mode
+        raw_manual_order = model.get("manual_order", model.get("order", 0))
+        manual_order = self._order_value(raw_manual_order, label="Manual route order")
+        model["manual_order"] = manual_order
+        if order_mode == "manual":
+            model["effective_order"] = manual_order
+            model["order"] = manual_order
+        else:
+            effective = model.get("effective_order")
+            if effective is None or str(effective).strip() == "":
+                model["effective_order"] = None
+            else:
+                model["effective_order"] = self._order_value(effective)
+                model["order"] = model["effective_order"]
+        model["binding_health"] = {
+            "status": "linked" if relay_selected else "independent"
+        }
+
+    def _normalize_provider_model_bindings(
+        self,
+        providers: object,
+    ) -> None:
+        """Derive model relation state from ProviderKeys after loading.
+
+        Legacy documents can carry model-level relay fields.  Reading them
+        remains supported, but the selected ProviderKey wins immediately so
+        stale metadata cannot survive in the staged editor state.
+        """
+
+        if not isinstance(providers, list):
+            return
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            models = provider.get("models", [])
+            if not isinstance(models, list):
+                continue
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                key = self._model_provider_key(provider, model)
+                relay_selected = (
+                    key is not None
+                    and isinstance(key.get("source"), Mapping)
+                    and key["source"].get("kind") == "relay"
+                )
+                if (
+                    not relay_selected
+                    and str(model.get("order_mode", "manual")).strip()
+                    == "relay_multiplier"
+                ):
+                    manual_order = self._order_value(
+                        model.get("manual_order", model.get("order", 0)),
+                        label="Manual route order",
+                    )
+                    model.update(
+                        {
+                            "order_mode": "manual",
+                            "manual_order": manual_order,
+                            "effective_order": manual_order,
+                            "order": manual_order,
+                        }
+                    )
+                self._normalize_model_binding(provider, model)
 
     def _dispatch_provider_key(self, action: str, data: Mapping[str, Any]) -> None:
         providers = self._draft["providers"]
@@ -959,33 +1331,49 @@ class ProvidersModelsDomain:
                 raise DomainError("The API key name is already in use")
             # The value is filled only through the native secret capability.
             # Validation remains false until that secure staging step finishes.
-            keys.append({"name": name, "value": ""})
+            keys.append(
+                {
+                    "id": self._new_provider_key_id(),
+                    "name": name,
+                    "value": "",
+                    "source": {"kind": "independent"},
+                }
+            )
         elif action == "provider_key_patch":
             old_name = self._api_key_name(data.get("old_name"))
             name = self._api_key_name(data.get("name"))
             key_index = self._api_key_index(keys, old_name)
+            if self._provider_key_source(keys[key_index].get("source"))["kind"] == "relay":
+                raise DomainError("Relay provider key is managed by its source")
             if name != old_name and any(
                 str(item.get("name", "")).strip() == name for item in keys
             ):
                 raise DomainError("The API key name is already in use")
+            provider_key_id = str(keys[key_index].get("id", "")).strip()
             keys[key_index]["name"] = name
             models = provider.get("models", [])
             if isinstance(models, list):
                 for model in models:
-                    if isinstance(model, dict) and str(model.get("api_key_name", "")).strip() == old_name:
+                    if isinstance(model, dict) and (
+                        str(model.get("provider_key_id", "")).strip() == provider_key_id
+                        or str(model.get("api_key_name", "")).strip() == old_name
+                    ):
+                        model["provider_key_id"] = provider_key_id
                         model["api_key_name"] = name
         elif action == "provider_key_delete":
             name = self._api_key_name(data.get("name"))
             key_index = self._api_key_index(keys, name)
-            if len(keys) <= 1:
-                raise DomainError("A provider must retain at least one API key")
+            provider_key_id = str(keys[key_index].get("id", "")).strip()
             keys.pop(key_index)
             models = provider.get("models", [])
             if isinstance(models, list):
                 provider_name = str(provider.get("name", "")).strip()
                 remaining_models: list[Any] = []
                 for model in models:
-                    if isinstance(model, Mapping) and str(model.get("api_key_name", "")).strip() == name:
+                    if isinstance(model, Mapping) and (
+                        str(model.get("provider_key_id", "")).strip() == provider_key_id
+                        or str(model.get("api_key_name", "")).strip() == name
+                    ):
                         self._probe_overlay.get(provider_name, {}).pop(self._probe_model_key(model), None)
                     else:
                         remaining_models.append(model)
@@ -1023,14 +1411,46 @@ class ProvidersModelsDomain:
                 return
         else:
             key_index = self._api_key_index(keys, key_name)
+        if self._provider_key_source(keys[key_index].get("source"))["kind"] == "relay":
+            raise DomainError("Relay provider key is managed by its source")
         keys[key_index]["value"] = value
         self._sync_primary_api_key(provider, keys)
+        providers[provider_index] = provider
+
+    def _select_provider_relay_station(self, data: Mapping[str, Any]) -> None:
+        """Atomically bind a provider's URL and name to one relay station."""
+
+        raw_source = data.get("source")
+        if not isinstance(raw_source, Mapping):
+            raise DomainError("Relay station is unavailable")
+        station_id = str(raw_source.get("station_id", "")).strip()
+        station_name = str(raw_source.get("name", "")).strip()
+        station_origin = str(raw_source.get("api_base", raw_source.get("origin", ""))).strip()
+        if not station_id or not station_name or not station_origin:
+            raise DomainError("Relay station is unavailable")
+        providers = self._draft["providers"]
+        provider_index = self._provider_index(data)
+        provider = self._copy_provider_for_edit(providers[provider_index])
+        if any(
+            index != provider_index
+            and isinstance(candidate, Mapping)
+            and str(candidate.get("name", "")).strip() == station_name
+            for index, candidate in enumerate(providers)
+        ):
+            raise DomainError("A provider with this name already exists")
+        provider["name"] = station_name
+        provider["api_base"] = station_origin
+        self._set_provider_source(provider, {"kind": "relay", "station_id": station_id})
+        self._sync_provider_identity_to_models(provider)
         providers[provider_index] = provider
 
     def _dispatch_provider(self, action: str, data: Mapping[str, Any]) -> None:
         providers = self._draft["providers"]
         if action in {"provider_key_add", "provider_key_patch", "provider_key_delete"}:
             self._dispatch_provider_key(action, data)
+            return
+        if action == "provider_select_relay_station":
+            self._select_provider_relay_station(data)
             return
         if action in {"provider_add", "add_provider"}:
             value = data.get("provider", data.get("value", data))
@@ -1043,6 +1463,10 @@ class ProvidersModelsDomain:
                 provider["api_keys"] = [{"name": "default", "value": ""}]
             if "api_keys" in provider:
                 self._sync_primary_api_key(provider, self._provider_api_keys(provider))
+            source = self._provider_source_state(provider)
+            if source["kind"] != "custom":
+                raise DomainError("Select a relay station to create a relay provider")
+            self._set_provider_source(provider, {"kind": "custom"})
             providers.append(provider)
             self._register_new_provider(provider)
             return
@@ -1050,9 +1474,28 @@ class ProvidersModelsDomain:
             index = self._provider_index(data)
             provider = self._copy_provider_for_edit(providers[index])
             previous_name = str(provider.get("name", "")).strip()
+            current_source = self._provider_source_state(provider)
             changes = self._changes(data, "provider")
             if "endpoint" in changes:
                 changes["api_base"] = changes.pop("endpoint")
+            source_requested = "provider_type" in changes or "relay_station_id" in changes
+            next_source = current_source
+            if source_requested:
+                next_type = str(changes.pop("provider_type", current_source["kind"])).strip() or "custom"
+                if next_type == "relay":
+                    raise DomainError("Select a relay station to set a relay provider")
+                next_station_id = str(changes.pop("relay_station_id", "")).strip()
+                next_source = self._set_provider_source(
+                    provider,
+                    {
+                        "kind": next_type,
+                        **({"station_id": next_station_id} if next_station_id else {}),
+                    },
+                )
+            elif current_source["kind"] == "relay" and any(key in changes for key in ("name", "api_base")):
+                raise DomainError("Relay provider URL and name are set by its station")
+            if next_source["kind"] == "relay" and any(key in changes for key in ("name", "api_base")):
+                raise DomainError("Relay provider URL and name are set by its station")
             if "api_key" in changes:
                 api_key = changes.pop("api_key")
                 keys = list(provider.get("api_keys", [])) if isinstance(provider.get("api_keys"), list) else []
@@ -1068,19 +1511,34 @@ class ProvidersModelsDomain:
                 provider["api_keys"] = keys
                 provider["api_key"] = api_key
             provider.update(changes)
+            if {"name", "api_base"}.intersection(changes):
+                self._sync_provider_identity_to_models(provider)
+            # ``extra`` is user-editable metadata.  Always write the
+            # authoritative source state last so a single patch cannot leave
+            # its top-level source fields and persisted metadata disagreeing.
+            self._set_provider_source(provider, next_source)
             current_name = str(provider.get("name", "")).strip()
             if current_name != previous_name:
                 if previous_name in self._probe_overlay:
                     self._probe_overlay[current_name] = self._probe_overlay.pop(previous_name)
             if "api_keys" in changes:
-                self._sync_primary_api_key(provider, self._provider_api_keys(provider))
+                normalized_keys = self._provider_api_keys(provider)
+                self._sync_primary_api_key(provider, normalized_keys)
+                keys_by_name = {item["name"]: item for item in normalized_keys}
+                models = provider.get("models", [])
+                if isinstance(models, list):
+                    for model in models:
+                        if not isinstance(model, dict):
+                            continue
+                        key = keys_by_name.get(str(model.get("api_key_name", "")).strip())
+                        if key is not None:
+                            model["provider_key_id"] = key["id"]
             providers[index] = provider
             return
         if action in {"provider_clear_key", "clear_provider_key"}:
             index = self._provider_index(data)
             provider = self._copy_provider_for_edit(providers[index])
-            provider["api_keys"] = []
-            provider["api_key"] = ""
+            self._sync_primary_api_key(provider, [])
             providers[index] = provider
             return
         if action in {"provider_delete", "delete_provider"}:
@@ -1114,12 +1572,17 @@ class ProvidersModelsDomain:
             model["model_enabled"] = model["enabled"]
         if "order" not in model:
             model["order"] = 0
+        if "catalog_mode" not in model:
+            model["catalog_mode"] = "independent"
+        if "order_mode" not in model:
+            model["order_mode"] = "manual"
         if not str(model.get("upstream_url_surface", "")).strip():
             model["upstream_url_surface"] = self._default_upstream_surface(provider, model)
         if not str(model.get("upstream_protocol_mode", "")).strip():
             model["upstream_protocol_mode"] = "fallback"
         if "litellm_model" in model:
             model["litellm_model"] = self._canonical_upstream_model(model["litellm_model"], model)
+        self._normalize_model_binding(provider, model)
         deployment_id = str(model.get("deployment_id", "")).strip().lower()
         if not deployment_id:
             deployment_id = uuid.uuid4().hex[:8]
@@ -1130,7 +1593,1110 @@ class ProvidersModelsDomain:
         self._editor_id(model, model=True)
         return model
 
+    @staticmethod
+    def _unique_provider_key_name(keys: Sequence[Mapping[str, Any]], preferred: str) -> str:
+        base = preferred.strip() or "independent"
+        used = {str(item.get("name", "")).strip() for item in keys}
+        if base not in used:
+            return base
+        suffix = 2
+        while f"{base}-{suffix}" in used:
+            suffix += 1
+        return f"{base}-{suffix}"
+
+    def _stage_provider_relay_key_import(
+        self,
+        data: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Create or reuse one relay-sourced ProviderKey in a target provider.
+
+        The staged slot intentionally has no credential or API base.  Core
+        resolves both from the stable relay source during coordinated Apply.
+        """
+
+        providers = self._draft["providers"]
+        provider_index = self._provider_index(data)
+        provider = self._copy_provider_for_edit(providers[provider_index])
+        relay_source = self._relay_source_filter(data)
+        keys = self._provider_api_keys(provider)
+        existing = next(
+            (
+                key
+                for key in keys
+                if key["source"].get("kind") == "relay"
+                and self._same_relay_source(key["source"], relay_source)
+            ),
+            None,
+        )
+        imported = existing is None
+        if existing is None:
+            preferred_name = self._api_key_name(data.get("api_key_name"))
+            existing = {
+                "id": self._new_provider_key_id(),
+                "name": self._unique_provider_key_name(keys, preferred_name),
+                "value": "",
+                "source": relay_source,
+            }
+            keys.append(existing)
+            self._sync_primary_api_key(provider, keys)
+            providers[provider_index] = provider
+        provider_id = str(provider.get("name", "")).strip() or self._editor_id(provider)
+        return {
+            "operation": "provider_relay_key_import",
+            "provider_id": provider_id,
+            "slot_id": existing["id"],
+            "api_key_name": existing["name"],
+            "imported": imported,
+            "reused": not imported,
+            "source": copy.deepcopy(relay_source),
+        }
+
+    def _select_model_relay_resource(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """Select a relay key discovered automatically from the provider Base URL."""
+
+        raw_source = data.get("source")
+        if not isinstance(raw_source, Mapping):
+            raise DomainError("Relay API key is unavailable")
+        provider_index = self._provider_index(data)
+        provider = self._draft["providers"][provider_index]
+        if not isinstance(provider, Mapping):
+            raise DomainError("The selected provider is unavailable")
+        provider_root = service_root(provider.get("api_base"))
+        relay_root = service_root(raw_source.get("api_base"))
+        if not provider_root or provider_root != relay_root:
+            raise DomainError("Relay API key does not match the provider Base URL")
+
+        imported = self._stage_provider_relay_key_import(
+            {
+                "provider_id": data.get("provider_id"),
+                "source": raw_source,
+                "api_key_name": raw_source.get("api_key_name", raw_source.get("name")),
+            }
+        )
+        self._dispatch_model(
+            "model_patch",
+            {
+                "provider_id": data.get("provider_id"),
+                "model_id": data.get("model_id"),
+                "changes": {
+                    "provider_key_id": imported["slot_id"],
+                    "api_key_name": imported["api_key_name"],
+                },
+            },
+        )
+        return {
+            **imported,
+            "operation": "model_relay_key_selected",
+            "model_id": str(data.get("model_id", "")),
+        }
+
+    def _link_or_rebind_model(self, data: Mapping[str, Any]) -> None:
+        """Legacy relay action alias for selecting a local relay ProviderKey.
+
+        A model no longer owns a relay source.  It stays in its provider and
+        selects one of that provider's stable key slots; the slot owns the
+        relay triple and is materialized during Apply.
+        """
+
+        providers = self._draft["providers"]
+        provider_index = self._provider_index(data)
+        provider = self._copy_provider_for_edit(providers[provider_index])
+        models = provider.get("models", [])
+        if not isinstance(models, list):
+            raise DomainError("The selected model is unavailable")
+        model_index = self._model_index(provider, data)
+        model = self._copy_model_for_edit(models[model_index])
+        keys = self._provider_api_keys(provider)
+        try:
+            target_key_id = _provider_key_id(
+                data.get("provider_key_id"), required=True
+            )
+        except ValueError:
+            raise DomainError("The selected provider key is unavailable") from None
+        target_key = keys[self._provider_key_index(keys, target_key_id)]
+        if target_key["source"].get("kind") != "relay":
+            raise DomainError("The selected provider key is not linked to a relay")
+        model.update(
+            {
+                "api_key_name": target_key["name"],
+                "provider_key_id": target_key["id"],
+            }
+        )
+        self._normalize_model_binding(provider, model)
+        models[model_index] = model
+        providers[provider_index] = provider
+
+    def _detach_model_from_relay(self, data: Mapping[str, Any]) -> None:
+        providers = self._draft["providers"]
+        provider_index = self._provider_index(data)
+        provider = self._copy_provider_for_edit(providers[provider_index])
+        models = provider.get("models", [])
+        if not isinstance(models, list):
+            raise DomainError("The selected model is unavailable")
+        model_index = self._model_index(provider, data)
+        model = self._copy_model_for_edit(models[model_index])
+        key = self._model_provider_key(provider, model)
+        if key is None:
+            raise DomainError("The linked provider key is unavailable")
+        keys = self._provider_api_keys(provider)
+        if key["source"].get("kind") == "relay":
+            key_value = key.get("value")
+            if not isinstance(key_value, str) or not key_value.strip():
+                raise DomainError(
+                    "The linked provider key has no materialized credential"
+                )
+            preferred_name = (
+                str(data.get("api_key_name", "")).strip()
+                or f"{key['name']}-independent"
+            )
+            detached_key = {
+                "id": self._new_provider_key_id(),
+                "name": self._unique_provider_key_name(keys, preferred_name),
+                "value": key_value,
+                "source": {"kind": "independent"},
+            }
+            keys.append(detached_key)
+            self._sync_primary_api_key(provider, keys)
+        else:
+            detached_key = key
+        manual_order = self._order_value(
+            model.get("effective_order", model.get("order", 0)),
+            label="Manual route order",
+        )
+        model.update(
+            {
+                "api_key_name": detached_key["name"],
+                "provider_key_id": detached_key["id"],
+                "catalog_mode": "independent",
+                "source_model_id": "",
+                "order_mode": "manual",
+                "manual_order": manual_order,
+                "effective_order": manual_order,
+                "order": manual_order,
+                "binding_health": {"status": "independent"},
+            }
+        )
+        models[model_index] = model
+        providers[provider_index] = provider
+
+    def link_model_to_relay_key(
+        self,
+        provider_id: str,
+        model_id: str,
+        provider_key_id: str,
+        **options: Any,
+    ) -> dict[str, Any]:
+        return self.dispatch(
+            "model.link_relay_key",
+            {
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "provider_key_id": provider_key_id,
+                **options,
+            },
+        )
+
+    def rebind_model_to_relay_key(
+        self,
+        provider_id: str,
+        model_id: str,
+        provider_key_id: str,
+        **options: Any,
+    ) -> dict[str, Any]:
+        return self.dispatch(
+            "model.rebind_relay_key",
+            {
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "provider_key_id": provider_key_id,
+                **options,
+            },
+        )
+
+    def detach_model_from_relay_key(
+        self,
+        provider_id: str,
+        model_id: str,
+        *,
+        api_key_name: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "provider_id": provider_id,
+            "model_id": model_id,
+        }
+        if api_key_name is not None:
+            payload["api_key_name"] = api_key_name
+        return self.dispatch("model.detach_relay_key", payload)
+
+    @staticmethod
+    def _relay_import_models(source: Mapping[str, Any]) -> list[str]:
+        raw_models = source.get("source_models", source.get("models", []))
+        if not isinstance(raw_models, Sequence) or isinstance(
+            raw_models, (str, bytes, bytearray)
+        ):
+            raise DomainError("Relay model catalog is invalid")
+        models: list[str] = []
+        seen: set[str] = set()
+        for raw_model in raw_models:
+            value = (
+                raw_model.get("id", raw_model.get("name", raw_model.get("model")))
+                if isinstance(raw_model, Mapping)
+                else raw_model
+            )
+            model = str(value).strip() if isinstance(value, str) else ""
+            if (
+                not model
+                or len(model.encode("utf-8")) > 256
+                or any(char in model for char in "\x00\r\n")
+            ):
+                raise DomainError("Relay model catalog is invalid")
+            if model not in seen:
+                seen.add(model)
+                models.append(model)
+        return models
+
+    def _stage_relay_import(
+        self,
+        sources: object,
+        *,
+        import_mode: object = "linked",
+    ) -> dict[str, Any]:
+        mode = str(import_mode).strip().lower()
+        if mode not in {"linked", "independent"}:
+            raise DomainError("Relay import mode is invalid")
+        if not isinstance(sources, Sequence) or isinstance(
+            sources, (str, bytes, bytearray)
+        ) or not sources:
+            raise DomainError("Select at least one relay API resource")
+        providers = self._draft.get("providers")
+        if not isinstance(providers, list):
+            raise DomainError("Provider/model configuration is invalid")
+        imported_models = 0
+        imported_keys = 0
+        updated_models = 0
+        for raw_source in sources:
+            if not isinstance(raw_source, Mapping):
+                raise DomainError("Relay import source is invalid")
+            relay_source = self._relay_source_filter(raw_source)
+            provider_name = str(raw_source.get("provider_name", "")).strip()
+            if not provider_name:
+                provider_name = f"relay-{relay_source['station_id']}"
+            if (
+                not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", provider_name)
+                or any(char in provider_name for char in "\x00\r\n")
+            ):
+                raise DomainError("Relay provider name is invalid")
+            provider_index = next(
+                (
+                    index
+                    for index, provider in enumerate(providers)
+                    if isinstance(provider, Mapping)
+                    and str(provider.get("name", "")).strip() == provider_name
+                ),
+                None,
+            )
+            if provider_index is None:
+                provider: dict[str, Any] = {
+                    "name": provider_name,
+                    "enabled": True,
+                    "api_base": str(raw_source.get("api_base", "")).strip(),
+                    "api_key": "",
+                    "api_keys": [],
+                    "models": [],
+                    "extra": {},
+                }
+                providers.append(provider)
+                provider_index = len(providers) - 1
+                self._register_new_provider(provider)
+            else:
+                provider = self._copy_provider_for_edit(providers[provider_index])
+            api_base = str(raw_source.get("api_base", "")).strip()
+            if api_base:
+                provider["api_base"] = api_base
+            keys = self._provider_api_keys(provider)
+            key = next(
+                (
+                    item
+                    for item in keys
+                    if item["source"].get("kind") == "relay"
+                    and self._same_relay_source(item["source"], relay_source)
+                ),
+                None,
+            ) if mode == "linked" else None
+            preferred_name = str(
+                raw_source.get("api_key_name", raw_source.get("name", "relay-key"))
+            ).strip() or "relay-key"
+            if key is None:
+                key_name = self._unique_provider_key_name(keys, preferred_name)
+                key = {
+                    "id": self._new_provider_key_id(),
+                    "name": key_name,
+                    "value": str(raw_source.get("api_key", "")),
+                    "source": relay_source
+                    if mode == "linked"
+                    else {"kind": "independent"},
+                }
+                keys.append(key)
+                imported_keys += 1
+            elif isinstance(raw_source.get("api_key"), str) and str(
+                raw_source.get("api_key", "")
+            ):
+                key["value"] = str(raw_source["api_key"])
+            self._sync_primary_api_key(provider, keys)
+
+            models = provider.get("models")
+            if not isinstance(models, list):
+                models = []
+                provider["models"] = models
+            order_mode = str(raw_source.get("order_mode", "manual")).strip() or "manual"
+            if order_mode not in MODEL_ORDER_MODES:
+                raise DomainError("Order mode must be manual or relay_multiplier")
+            manual_order = self._order_value(
+                raw_source.get("manual_order", 0), label="Manual route order"
+            )
+            if order_mode == "relay_multiplier":
+                multiplier = raw_source.get("multiplier")
+                effective_order = (
+                    self._order_value(multiplier)
+                    if multiplier is not None and str(multiplier).strip()
+                    else None
+                )
+            else:
+                effective_order = manual_order
+            for source_model in self._relay_import_models(raw_source):
+                existing = next(
+                    (
+                        model
+                        for model in models
+                        if isinstance(model, Mapping)
+                        and str(model.get("provider_key_id", "")).strip() == key["id"]
+                        and self._wire_model_name(model) == source_model
+                        and str(model.get("model_name", "")).strip() == source_model
+                    ),
+                    None,
+                )
+                if existing is None:
+                    model = self._new_model(
+                        provider,
+                        {
+                            "model_name": source_model,
+                            "litellm_model": f"openai/{source_model}",
+                            "provider": provider_name,
+                            "api_base": "",
+                            "api_key": "",
+                            "api_key_name": key["name"],
+                            "provider_key_id": key["id"],
+                            "order_mode": order_mode if mode == "linked" else "manual",
+                            "manual_order": manual_order,
+                            "effective_order": effective_order,
+                            "order": effective_order
+                            if effective_order is not None
+                            else manual_order,
+                            "enabled": True,
+                            "model_enabled": True,
+                            "upstream_url_surface": "openai/responses",
+                        },
+                        {
+                            str(candidate.get("deployment_id", "")).strip()
+                            for candidate_provider in providers
+                            if isinstance(candidate_provider, Mapping)
+                            for candidate in candidate_provider.get("models", [])
+                            if isinstance(candidate, Mapping)
+                            and str(candidate.get("deployment_id", "")).strip()
+                        },
+                    )
+                    models.append(model)
+                    imported_models += 1
+                else:
+                    existing.update(
+                        {
+                            "api_key_name": key["name"],
+                            "provider_key_id": key["id"],
+                            "order_mode": order_mode,
+                            "manual_order": manual_order,
+                            "effective_order": effective_order,
+                            "order": effective_order
+                            if effective_order is not None
+                            else existing.get("order", manual_order),
+                        }
+                    )
+                    self._normalize_model_binding(provider, existing)
+                    updated_models += 1
+            providers[provider_index] = provider
+        return {
+            "operation": "relay_import",
+            "import_mode": mode,
+            "resource_count": len(sources),
+            "provider_key_count": imported_keys,
+            "model_count": imported_models,
+            "updated_model_count": updated_models,
+        }
+
+    def stage_relay_import(
+        self,
+        sources: object,
+        *,
+        import_mode: object = "linked",
+    ) -> dict[str, Any]:
+        summary = self._stage_relay_import(sources, import_mode=import_mode)
+        self._last_operation = summary
+        self.revision += 1
+        result = self.snapshot()
+        result["operation_summary"] = copy.deepcopy(summary)
+        return result
+
+    @staticmethod
+    def _safe_relay_material_issue(value: object) -> dict[str, str] | None:
+        if not isinstance(value, Mapping):
+            return None
+        result: dict[str, str] = {}
+        for key in ("code", "station_id", "account_id", "resource_id"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                result[key] = candidate.strip()
+        return result if result.get("code") else None
+
+    def _relay_materials(self, relay: object) -> dict[str, Any]:
+        if isinstance(relay, Mapping):
+            return dict(relay)
+        resolver = getattr(relay, "binding_materials", None)
+        if not callable(resolver):
+            resolver = getattr(relay, "resolve_bindings", None)
+        if not callable(resolver):
+            raise DomainError("Relay binding material is unavailable")
+        try:
+            resolved = resolver()
+        except Exception:
+            raise DomainError("Relay binding material is unavailable") from None
+        if not isinstance(resolved, Mapping):
+            raise DomainError("Relay binding material is unavailable")
+        return dict(resolved)
+
+    def materialize_relay_bindings(self, relay: object) -> dict[str, Any]:
+        """Resolve private relay materials into the staged LiteLLM document.
+
+        The input is intentionally Core-only and may contain API key values.
+        This method never returns those values; it only updates the private
+        provider draft and reports stable source/model identifiers.
+        """
+
+        payload = self._relay_materials(relay)
+        raw_resources = payload.get("resources", [])
+        if not isinstance(raw_resources, Sequence) or isinstance(
+            raw_resources, (str, bytes, bytearray)
+        ):
+            raise DomainError("Relay binding material is invalid")
+        materials: dict[tuple[str, str, str], dict[str, Any]] = {}
+        issues: list[dict[str, Any]] = []
+        for raw_resource in raw_resources:
+            if not isinstance(raw_resource, Mapping):
+                raise DomainError("Relay binding material is invalid")
+            source = self._relay_source_filter(raw_resource)
+            resource_key = (
+                source["station_id"],
+                source["account_id"],
+                source["resource_id"],
+            )
+            if resource_key in materials:
+                issues.append(
+                    {"code": "duplicate_resource", "source": source}
+                )
+                continue
+            materials[resource_key] = dict(raw_resource)
+        for raw_issue in payload.get("issues", []):
+            safe_issue = self._safe_relay_material_issue(raw_issue)
+            if safe_issue is not None:
+                issues.append(safe_issue)
+
+        affected_models: list[dict[str, str]] = []
+        materialized_keys = 0
+        materialized_models = 0
+        providers = self._draft.get("providers", [])
+        if not isinstance(providers, list):
+            raise DomainError("Provider/model configuration is invalid")
+        for provider_index, raw_provider in enumerate(providers):
+            if not isinstance(raw_provider, Mapping):
+                continue
+            provider = self._copy_provider_for_edit(raw_provider)
+            keys = self._provider_api_keys(provider)
+            models = provider.get("models")
+            if not isinstance(models, list):
+                models = []
+                provider["models"] = models
+            provider_base: str | None = None
+            for key in keys:
+                source = key["source"]
+                if source.get("kind") != "relay":
+                    continue
+                resource_key = (
+                    source["station_id"],
+                    source["account_id"],
+                    source["resource_id"],
+                )
+                resource = materials.get(resource_key)
+                linked_models = [
+                    model
+                    for model in models
+                    if isinstance(model, dict)
+                    and str(model.get("provider_key_id", "")).strip() == key["id"]
+                ]
+                if resource is None:
+                    issue = {
+                        "code": "resource_missing",
+                        "provider_key_id": key["id"],
+                        "source": copy.deepcopy(source),
+                    }
+                    issues.append(issue)
+                    for model in linked_models:
+                        model["binding_health"] = {
+                            "status": "resource_missing",
+                            "detail": "The linked relay API key is unavailable",
+                        }
+                    continue
+                if resource.get("enabled") is not True:
+                    issues.append(
+                        {
+                            "code": "resource_disabled",
+                            "provider_key_id": key["id"],
+                            "source": copy.deepcopy(source),
+                        }
+                    )
+                    for model in linked_models:
+                        model["binding_health"] = {
+                            "status": "resource_disabled",
+                            "detail": "The linked relay API key is disabled",
+                        }
+                    continue
+                credential = resource.get("api_key")
+                if not isinstance(credential, str) or not credential.strip():
+                    issues.append(
+                        {
+                            "code": "credential_missing",
+                            "provider_key_id": key["id"],
+                            "source": copy.deepcopy(source),
+                        }
+                    )
+                    continue
+                api_base = resource.get("api_base")
+                if not isinstance(api_base, str) or not api_base.strip():
+                    issues.append(
+                        {
+                            "code": "api_base_missing",
+                            "provider_key_id": key["id"],
+                            "source": copy.deepcopy(source),
+                        }
+                    )
+                    continue
+                api_base = api_base.strip()
+                if provider_base is not None and provider_base != api_base:
+                    issues.append(
+                        {
+                            "code": "provider_api_base_conflict",
+                            "provider_key_id": key["id"],
+                            "source": copy.deepcopy(source),
+                        }
+                    )
+                    continue
+                provider_base = api_base
+                key["value"] = credential
+                materialized_keys += 1
+                catalog = set(self._relay_import_models(resource))
+                multiplier_raw = resource.get("multiplier")
+                multiplier: int | float | None
+                try:
+                    multiplier = (
+                        self._order_value(multiplier_raw, label="Relay multiplier")
+                        if multiplier_raw is not None and str(multiplier_raw).strip()
+                        else None
+                    )
+                except DomainError:
+                    multiplier = None
+                for model in linked_models:
+                    model["api_key_name"] = key["name"]
+                    model["api_key"] = ""
+                    model["provider_key_id"] = key["id"]
+                    model["catalog_mode"] = "relay_linked"
+                    model_id = str(model.get("deployment_id", "")).strip() or self._editor_id(
+                        model, model=True
+                    )
+                    source_model_id = self._wire_model_name(model)
+                    model["source_model_id"] = source_model_id
+                    if source_model_id not in catalog:
+                        issues.append(
+                            {
+                                "code": "catalog_model_missing",
+                                "provider_key_id": key["id"],
+                                "model_id": model_id,
+                                "source": copy.deepcopy(source),
+                            }
+                        )
+                        model["binding_health"] = {
+                            "status": "catalog_model_missing",
+                            "detail": "The selected source model is absent from the relay catalog",
+                        }
+                        continue
+                    order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
+                    if order_mode == "relay_multiplier":
+                        if multiplier is None:
+                            issues.append(
+                                {
+                                    "code": "multiplier_missing",
+                                    "provider_key_id": key["id"],
+                                    "model_id": model_id,
+                                    "source": copy.deepcopy(source),
+                                }
+                            )
+                            model["binding_health"] = {
+                                "status": "multiplier_missing",
+                                "detail": "The linked relay group has no usable multiplier",
+                            }
+                            continue
+                        model["effective_order"] = multiplier
+                        model["order"] = multiplier
+                    else:
+                        manual_order = self._order_value(
+                            model.get("manual_order", model.get("order", 0)),
+                            label="Manual route order",
+                        )
+                        model["manual_order"] = manual_order
+                        model["effective_order"] = manual_order
+                        model["order"] = manual_order
+                    model["binding_health"] = {"status": "linked"}
+                    materialized_models += 1
+                    affected_models.append(
+                        {
+                            "provider_key_id": key["id"],
+                            "model_id": model_id,
+                            "upstream_model": source_model_id,
+                        }
+                    )
+            if provider_base is not None:
+                provider["api_base"] = provider_base
+            self._sync_primary_api_key(provider, keys)
+            providers[provider_index] = provider
+        return {
+            "materialized": materialized_models,
+            "materialized_provider_keys": materialized_keys,
+            "affected_models": affected_models,
+            "issues": issues,
+        }
+
+    @staticmethod
+    def _relay_source_filter(value: object) -> dict[str, str]:
+        if isinstance(value, Mapping) and isinstance(value.get("source"), Mapping):
+            value = value["source"]
+        if not isinstance(value, Mapping):
+            raise DomainError("Relay dependency source is invalid")
+        candidate = {
+            "kind": value.get("kind", "relay"),
+            "station_id": value.get("station_id"),
+            "account_id": value.get("account_id"),
+            "resource_id": value.get("resource_id"),
+        }
+        try:
+            source = _relay_source(candidate, required=True)
+        except ValueError:
+            raise DomainError("Relay dependency source is invalid") from None
+        if source["kind"] != "relay":
+            raise DomainError("Relay dependency source is invalid")
+        return source
+
+    @staticmethod
+    def _same_relay_source(left: Mapping[str, Any], right: Mapping[str, str]) -> bool:
+        return all(
+            str(left.get(key, "")).strip() == right[key]
+            for key in ("station_id", "account_id", "resource_id")
+        )
+
+    def dependency_summary(self, source: object | None = None) -> dict[str, Any]:
+        """Describe relay-bound dependencies without returning credentials."""
+
+        source_filter: dict[str, str] | None = None
+        provider_key_filter = ""
+        if source is not None:
+            if isinstance(source, str):
+                provider_key_filter = source.strip()
+            elif isinstance(source, Mapping) and source.get("provider_key_id"):
+                provider_key_filter = str(source.get("provider_key_id", "")).strip()
+            else:
+                source_filter = self._relay_source_filter(source)
+
+        providers = self._draft.get("providers", [])
+        matched_keys: list[dict[str, Any]] = []
+        matched_ids: set[str] = set()
+        for provider_index, provider in enumerate(providers):
+            if not isinstance(provider, Mapping):
+                continue
+            provider_id = str(provider.get("name", "")).strip() or self._editor_id(provider)
+            for key in self._provider_api_keys(provider):
+                key_source = key["source"]
+                if key_source.get("kind") != "relay":
+                    continue
+                if provider_key_filter and key["id"] != provider_key_filter:
+                    continue
+                if source_filter is not None and not self._same_relay_source(
+                    key_source, source_filter
+                ):
+                    continue
+                matched_ids.add(key["id"])
+                matched_keys.append(
+                    {
+                        "provider_id": provider_id,
+                        "provider_key_id": key["id"],
+                        "api_key_name": key["name"],
+                        "source": copy.deepcopy(key_source),
+                        "model_count": 0,
+                    }
+                )
+
+        models: list[dict[str, Any]] = []
+        key_summary = {item["provider_key_id"]: item for item in matched_keys}
+        for provider in providers:
+            if not isinstance(provider, Mapping):
+                continue
+            provider_id = str(provider.get("name", "")).strip() or self._editor_id(provider)
+            raw_models = provider.get("models", [])
+            if not isinstance(raw_models, list):
+                continue
+            for model in raw_models:
+                if not isinstance(model, Mapping):
+                    continue
+                provider_key_id = str(model.get("provider_key_id", "")).strip()
+                if provider_key_id not in matched_ids:
+                    continue
+                key_summary[provider_key_id]["model_count"] += 1
+                models.append(
+                    {
+                        "provider_id": provider_id,
+                        "model_id": str(model.get("deployment_id", "")).strip()
+                        or self._editor_id(model, model=True),
+                        "model_name": str(model.get("model_name", "")),
+                        "provider_key_id": provider_key_id,
+                        "catalog_mode": "relay_linked",
+                        "order_mode": str(model.get("order_mode", "manual")),
+                    }
+                )
+        return {
+            "provider_key_count": len(matched_keys),
+            "model_count": len(models),
+            "provider_keys": matched_keys,
+            "models": models,
+        }
+
+    def _policy_target_key_ids(self, resources: object) -> set[str]:
+        if isinstance(resources, Mapping):
+            values = resources.get("resources", [resources])
+        else:
+            values = resources
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes, bytearray)):
+            raise DomainError("Relay dependency resources are invalid")
+        source_filters = [self._relay_source_filter(value) for value in values]
+        matched: set[str] = set()
+        for provider in self._draft.get("providers", []):
+            if not isinstance(provider, Mapping):
+                continue
+            for key in self._provider_api_keys(provider):
+                if key["source"].get("kind") != "relay":
+                    continue
+                if any(
+                    self._same_relay_source(key["source"], source)
+                    for source in source_filters
+                ):
+                    matched.add(key["id"])
+        return matched
+
+    @staticmethod
+    def _rebind_target_id(
+        rebind: object,
+        old_key: Mapping[str, Any],
+    ) -> str:
+        if isinstance(rebind, str):
+            return rebind.strip()
+        if not isinstance(rebind, Mapping):
+            return ""
+        direct = rebind.get(old_key["id"])
+        if direct is None:
+            direct = rebind.get(str(old_key["source"].get("resource_id", "")))
+        if direct is None:
+            direct = rebind.get("provider_key_id")
+        return str(direct).strip() if isinstance(direct, str) else ""
+
+    def _apply_relay_dependency_policy(
+        self,
+        resources: object,
+        policy: object,
+        rebind: object = None,
+    ) -> dict[str, Any]:
+        policy_name = str(policy).strip().lower()
+        if policy_name not in {"delete", "detach", "detach_disabled", "rebind"}:
+            raise DomainError("Relay dependency policy is invalid")
+        target_ids = self._policy_target_key_ids(resources)
+        before = self.dependency_summary()
+        target_key_summaries = [
+            item for item in before["provider_keys"] if item["provider_key_id"] in target_ids
+        ]
+        affected_models = [
+            item for item in before["models"] if item["provider_key_id"] in target_ids
+        ]
+        result: dict[str, Any] = {
+            "policy": policy_name,
+            "provider_key_count": len(target_key_summaries),
+            "affected_models": affected_models,
+            "deleted_models": 0,
+            "detached_models": 0,
+            "disabled_detached_models": 0,
+            "rebound_models": 0,
+            "issues": [],
+        }
+        if not target_ids:
+            return result
+
+        original = self._draft.get("providers", [])
+        if not isinstance(original, list):
+            raise DomainError("Provider/model configuration is invalid")
+        working = copy.deepcopy(original)
+        key_locations: dict[str, tuple[int, dict[str, Any]]] = {}
+        for provider_index, provider in enumerate(working):
+            if not isinstance(provider, Mapping):
+                continue
+            for key in self._provider_api_keys(provider):
+                if key["id"] in target_ids:
+                    key_locations[key["id"]] = (provider_index, key)
+
+        if policy_name == "detach":
+            for key_id, (_provider_index, key) in key_locations.items():
+                value = key.get("value")
+                if not isinstance(value, str) or not value.strip():
+                    result["issues"].append(
+                        {
+                            "code": "missing_materialized_key",
+                            "provider_key_id": key_id,
+                            "source": copy.deepcopy(key["source"]),
+                        }
+                    )
+        target_rebinds: dict[str, tuple[int, dict[str, Any]]] = {}
+        if policy_name == "rebind":
+            for key_id, (_provider_index, key) in key_locations.items():
+                target_id = self._rebind_target_id(rebind, key)
+                if not target_id or target_id in target_ids:
+                    result["issues"].append(
+                        {
+                            "code": "missing_rebind_target",
+                            "provider_key_id": key_id,
+                            "source": copy.deepcopy(key["source"]),
+                        }
+                    )
+                    continue
+                try:
+                    target_provider_index, target_key_index = self._provider_key_location(
+                        target_id
+                    )
+                    target_provider = working[target_provider_index]
+                    target_key = self._provider_api_keys(target_provider)[target_key_index]
+                except DomainError:
+                    result["issues"].append(
+                        {
+                            "code": "missing_rebind_target",
+                            "provider_key_id": key_id,
+                            "source": copy.deepcopy(key["source"]),
+                        }
+                    )
+                    continue
+                if target_key["source"].get("kind") != "relay" or not str(
+                    target_key.get("value", "")
+                ).strip():
+                    result["issues"].append(
+                        {
+                            "code": "invalid_rebind_target",
+                            "provider_key_id": key_id,
+                            "source": copy.deepcopy(key["source"]),
+                        }
+                    )
+                    continue
+                target_rebinds[key_id] = (target_provider_index, target_key)
+        if result["issues"]:
+            return result
+
+        if policy_name == "delete":
+            for provider in working:
+                if not isinstance(provider, dict) or not isinstance(provider.get("models"), list):
+                    continue
+                before_count = len(provider["models"])
+                provider["models"] = [
+                    model
+                    for model in provider["models"]
+                    if not isinstance(model, Mapping)
+                    or str(model.get("provider_key_id", "")).strip() not in target_ids
+                ]
+                result["deleted_models"] += before_count - len(provider["models"])
+        elif policy_name == "detach":
+            for key_id, (provider_index, key) in key_locations.items():
+                provider = working[provider_index]
+                if not isinstance(provider, dict):
+                    continue
+                keys = self._provider_api_keys(provider)
+                detached_key = {
+                    "id": self._new_provider_key_id(),
+                    "name": self._unique_provider_key_name(
+                        keys, f"{key['name']}-independent"
+                    ),
+                    "value": key["value"],
+                    "source": {"kind": "independent"},
+                }
+                keys.append(detached_key)
+                self._sync_primary_api_key(provider, keys)
+                models = provider.get("models", [])
+                if not isinstance(models, list):
+                    continue
+                for model in models:
+                    if not isinstance(model, dict) or str(
+                        model.get("provider_key_id", "")
+                    ).strip() != key_id:
+                        continue
+                    order = self._order_value(
+                        model.get("effective_order", model.get("order", 0)),
+                        label="Manual route order",
+                    )
+                    model.update(
+                        {
+                            "api_key_name": detached_key["name"],
+                            "provider_key_id": detached_key["id"],
+                            "catalog_mode": "independent",
+                            "source_model_id": "",
+                            "order_mode": "manual",
+                            "manual_order": order,
+                            "effective_order": order,
+                            "order": order,
+                            "binding_health": {"status": "independent"},
+                        }
+                    )
+                    result["detached_models"] += 1
+        elif policy_name == "detach_disabled":
+            for provider in working:
+                if not isinstance(provider, dict):
+                    continue
+                models = provider.get("models", [])
+                if not isinstance(models, list):
+                    continue
+                for model in models:
+                    if not isinstance(model, dict) or str(
+                        model.get("provider_key_id", "")
+                    ).strip() not in target_ids:
+                        continue
+                    order = self._order_value(
+                        model.get("effective_order", model.get("order", 0)),
+                        label="Manual route order",
+                    )
+                    model.update(
+                        {
+                            "api_key": "",
+                            "api_key_name": "",
+                            "provider_key_id": "",
+                            "catalog_mode": "independent",
+                            "source_model_id": "",
+                            "order_mode": "manual",
+                            "manual_order": order,
+                            "effective_order": order,
+                            "order": order,
+                            "enabled": False,
+                            "model_enabled": False,
+                            "binding_health": {
+                                "status": "credential_required",
+                                "detail": "A replacement API key is required before this model can be enabled",
+                            },
+                        }
+                    )
+                    result["disabled_detached_models"] += 1
+        else:
+            moves: list[tuple[int, dict[str, Any], int, dict[str, Any]]] = []
+            for provider_index, provider in enumerate(working):
+                if not isinstance(provider, Mapping):
+                    continue
+                models = provider.get("models", [])
+                if not isinstance(models, list):
+                    continue
+                for model in models:
+                    if not isinstance(model, Mapping):
+                        continue
+                    old_key_id = str(model.get("provider_key_id", "")).strip()
+                    target = target_rebinds.get(old_key_id)
+                    if target is not None:
+                        moves.append((provider_index, dict(model), target[0], target[1]))
+            for provider in working:
+                if isinstance(provider, dict) and isinstance(provider.get("models"), list):
+                    provider["models"] = [
+                        model
+                        for model in provider["models"]
+                        if not isinstance(model, Mapping)
+                        or str(model.get("provider_key_id", "")).strip() not in target_ids
+                    ]
+            for _source_index, model, target_provider_index, target_key in moves:
+                target_provider = working[target_provider_index]
+                if not isinstance(target_provider, dict):
+                    continue
+                models = target_provider.get("models")
+                if not isinstance(models, list):
+                    models = []
+                    target_provider["models"] = models
+                order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
+                if order_mode == "relay_multiplier":
+                    # A rebind keeps the mode but requires the coordinator to
+                    # materialize the target multiplier before Apply.
+                    model["effective_order"] = None
+                model.update(
+                    {
+                        "provider": str(target_provider.get("name", "")).strip(),
+                        "api_base": "",
+                        "api_key": "",
+                        "api_key_name": target_key["name"],
+                        "provider_key_id": target_key["id"],
+                        "catalog_mode": "relay_linked",
+                        "binding_health": {"status": "linked"},
+                    }
+                )
+                models.append(model)
+                result["rebound_models"] += 1
+
+        for provider in working:
+            if not isinstance(provider, dict):
+                continue
+            keys = [
+                key
+                for key in self._provider_api_keys(provider)
+                if key["id"] not in target_ids
+            ]
+            self._sync_primary_api_key(provider, keys)
+        working = [
+            provider
+            for provider in working
+            if not isinstance(provider, Mapping)
+            or self._provider_api_keys(provider)
+            or bool(provider.get("models"))
+        ]
+        provider_bindings, model_bindings = self._editor_id_bindings()
+        self._draft["providers"] = working
+        self._restore_editor_id_bindings(provider_bindings, model_bindings)
+        self._probe_overlay.clear()
+        return result
+
+    def apply_relay_dependency_policy(
+        self,
+        resources: object,
+        policy: object,
+        rebind: object = None,
+    ) -> dict[str, Any]:
+        result = self._apply_relay_dependency_policy(resources, policy, rebind)
+        if not result["issues"]:
+            self.revision += 1
+        return result
+
     def _dispatch_model(self, action: str, data: Mapping[str, Any]) -> None:
+        if action in {"model_link_relay_key", "model_rebind_relay_key"}:
+            self._link_or_rebind_model(data)
+            return
+        if action == "model_detach_relay_key":
+            self._detach_model_from_relay(data)
+            return
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
         provider = self._copy_provider_for_edit(providers[provider_index])
@@ -1152,8 +2718,9 @@ class ProvidersModelsDomain:
             if not isinstance(destination_models, list):
                 destination_models = []
                 destination_provider["models"] = destination_models
-            destination_keys = destination_provider.get("api_keys", [])
+            destination_keys = self._provider_api_keys(destination_provider)
             destination_key_name = ""
+            destination_provider_key_id = ""
             if isinstance(destination_keys, Sequence) and not isinstance(
                 destination_keys, (str, bytes, bytearray)
             ):
@@ -1162,6 +2729,7 @@ class ProvidersModelsDomain:
                         continue
                     destination_key_name = str(item.get("name", "")).strip()
                     if destination_key_name:
+                        destination_provider_key_id = str(item.get("id", "")).strip()
                         break
             model.update(
                 {
@@ -1169,8 +2737,14 @@ class ProvidersModelsDomain:
                     "api_base": "",
                     "api_key": "",
                     "api_key_name": destination_key_name,
+                    "provider_key_id": destination_provider_key_id,
+                    "catalog_mode": "independent",
+                    "source_model_id": "",
+                    "order_mode": "manual",
+                    "manual_order": model.get("effective_order", model.get("order", 0)),
                 }
             )
+            self._normalize_model_binding(destination_provider, model)
             destination_models.append(model)
             destination_provider_name = str(destination_provider.get("name", "")).strip()
             source_probe = self._probe_overlay.get(source_provider_name, {}).pop(probe_key, None)
@@ -1227,10 +2801,24 @@ class ProvidersModelsDomain:
                 model.get("upstream_url_surface", "")
             ).strip()
             changes = self._changes(data, "model")
+            if {"catalog_mode", "source_model_id"}.intersection(changes):
+                raise DomainError("Relay association is selected through a provider key")
+            provider_key_changed = "provider_key_id" in changes
+            api_key_name_changed = "api_key_name" in changes
             if "name" in changes:
                 changes["model_name"] = changes.pop("name")
             if "upstream_model" in changes:
                 changes["litellm_model"] = changes.pop("upstream_model")
+            current_order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
+            next_order_mode = str(changes.get("order_mode", current_order_mode)).strip() or "manual"
+            if "order" in changes and "manual_order" not in changes and next_order_mode == "manual":
+                changes["manual_order"] = changes["order"]
+            if (
+                next_order_mode == "relay_multiplier"
+                and current_order_mode != "relay_multiplier"
+                and "effective_order" not in changes
+            ):
+                changes["effective_order"] = None
             if "model_enabled" in changes:
                 changes["enabled"] = changes["model_enabled"]
             elif "enabled" in changes:
@@ -1265,10 +2853,62 @@ class ProvidersModelsDomain:
                 merged_extra.update(changes["litellm_extra"])
                 changes["litellm_extra"] = merged_extra
             model.update(changes)
+            if api_key_name_changed and not provider_key_changed:
+                selected_name = str(changes.get("api_key_name", "")).strip()
+                matching_key = next(
+                    (
+                        item
+                        for item in self._provider_api_keys(provider)
+                        if item["name"] == selected_name
+                    ),
+                    None,
+                )
+                # A typed key label can be staged before its credential slot
+                # is created/configured.  It is intentionally independent:
+                # only a verified stable provider_key_id can select a relay
+                # source.
+                model["provider_key_id"] = matching_key["id"] if matching_key else ""
+            if provider_key_changed:
+                selected_id = str(changes.get("provider_key_id", "")).strip()
+                matching_key = next(
+                    (
+                        item
+                        for item in self._provider_api_keys(provider)
+                        if item["id"] == selected_id
+                    ),
+                    None,
+                )
+                if selected_id and matching_key is None:
+                    raise DomainError("The selected provider key is unavailable")
+                model["api_key_name"] = matching_key["name"] if matching_key is not None else ""
+            selected_key = self._model_provider_key(provider, model)
+            selected_relay_key = (
+                selected_key is not None
+                and isinstance(selected_key.get("source"), Mapping)
+                and selected_key["source"].get("kind") == "relay"
+            )
+            if (provider_key_changed or api_key_name_changed) and not selected_relay_key:
+                # Moving off a relay ProviderKey must leave no model-local
+                # relay state behind.  Preserve the user's manual order.
+                if str(model.get("order_mode", "manual")).strip() == "relay_multiplier":
+                    manual_order = self._order_value(
+                        model.get("manual_order", model.get("order", 0)),
+                        label="Manual route order",
+                    )
+                    model.update(
+                        {
+                            "order_mode": "manual",
+                            "manual_order": manual_order,
+                            "effective_order": manual_order,
+                            "order": manual_order,
+                        }
+                    )
+                model["source_model_id"] = ""
             if "litellm_model" in changes:
                 model["litellm_model"] = self._canonical_upstream_model(model["litellm_model"], model)
             if "upstream_url_surface" in changes:
                 model["litellm_model"] = self._canonical_upstream_model(model.get("litellm_model"), model)
+            self._normalize_model_binding(provider, model)
             models[index] = model
         elif action in {"model_delete", "delete_model"}:
             removed = models.pop(self._model_index(provider, data))
@@ -1308,6 +2948,10 @@ class ProvidersModelsDomain:
                 route_id = str(model.get("deployment_id", "")).strip() or self._editor_id(model, model=True)
                 if model_name != public_model or not route_id:
                     continue
+                if str(model.get("order_mode", "manual")).strip() == "relay_multiplier":
+                    raise DomainError(
+                        "Routes that follow a relay multiplier cannot be manually reordered"
+                    )
                 matched[route_id] = (provider_index, model_index)
         if set(matched) != set(requested):
             raise DomainError("The route order changed; refresh and try again")
@@ -1323,6 +2967,8 @@ class ProvidersModelsDomain:
                 raise DomainError("The selected model is unavailable")
             model = self._copy_model_for_edit(models[model_index])
             model["order"] = order
+            model["manual_order"] = order
+            model["effective_order"] = order
             models[model_index] = model
         for provider_index, provider in changed_providers.items():
             self._draft["providers"][provider_index] = provider
@@ -1340,6 +2986,17 @@ class ProvidersModelsDomain:
             self._import_claude_current()
         elif name in {"providers_fetch_models", "provider_fetch_models", "fetch_models"}:
             self._fetch_models(data)
+        elif name == "provider_fetch_relay_resource_models":
+            self._fetch_relay_resource_models(data)
+        elif name in {"relay_import", "providers_relay_import"}:
+            self._last_operation = self._stage_relay_import(
+                data.get("sources"),
+                import_mode=data.get("import_mode", "linked"),
+            )
+        elif name == "provider_import_relay_key":
+            self._last_operation = self._stage_provider_relay_key_import(data)
+        elif name == "model_select_relay_resource":
+            self._last_operation = self._select_model_relay_resource(data)
         elif name in {"set", "replace"}:
             if "document" in data or any(key in data for key in ("config", "config_text", "raw_yaml", "text")):
                 self._set_raw(data)
@@ -1352,6 +3009,14 @@ class ProvidersModelsDomain:
             self._probe_overlay.clear()
         elif name in {"routes_reorder_group", "route_reorder_group"}:
             self._reorder_route_group(data)
+        elif name in {"relay_dependency_policy", "relay_apply_dependency_policy"}:
+            self._last_operation = self._apply_relay_dependency_policy(
+                data.get("resources", data.get("source", data)),
+                data.get("policy"),
+                data.get("rebind"),
+            )
+            if self._last_operation["issues"]:
+                raise DomainError("Relay dependency policy could not be applied")
         elif name.startswith("provider_") or name in {"add_provider", "patch_provider", "delete_provider", "move_provider", "clear_provider_key"}:
             self._dispatch_provider(name, data)
         elif name.startswith("model_") or name in {"add_model", "patch_model", "delete_model", "move_model"}:
@@ -1419,7 +3084,11 @@ class ProvidersModelsDomain:
         self._stage_provider_secret(index, key_name, value)
         self.revision += 1
 
-    def _validate(self) -> dict[str, Any]:
+    def _validate(
+        self,
+        *,
+        allow_unmaterialized_relay_keys: bool = False,
+    ) -> dict[str, Any]:
         from config_editor_core import api as config_api
 
         document = self._draft.get("document")
@@ -1428,17 +3097,68 @@ class ProvidersModelsDomain:
             for provider in providers:
                 if not isinstance(provider, Mapping):
                     continue
-                keys = provider.get("api_keys", [])
-                if not isinstance(keys, list):
-                    continue
+                try:
+                    keys = self._provider_api_keys(provider)
+                except DomainError:
+                    return {"valid": False, "errors": ["Provider API keys are invalid"]}
                 if any(
-                    isinstance(key, Mapping)
-                    and isinstance(key.get("name"), str)
+                    isinstance(key.get("name"), str)
                     and bool(key["name"].strip())
-                    and not (isinstance(key.get("value"), str) and bool(key["value"].strip()))
+                    and not (
+                        isinstance(key.get("value"), str)
+                        and bool(key["value"].strip())
+                    )
+                    and not (
+                        allow_unmaterialized_relay_keys
+                        and isinstance(key.get("source"), Mapping)
+                        and key["source"].get("kind") == "relay"
+                    )
                     for key in keys
                 ):
                     return {"valid": False, "errors": ["Every API key needs a value"]}
+        candidate_providers = copy.deepcopy(providers)
+        if allow_unmaterialized_relay_keys and isinstance(candidate_providers, list):
+            for provider in candidate_providers:
+                if not isinstance(provider, dict):
+                    continue
+                keys = self._provider_api_keys(provider)
+                changed = False
+                for key in keys:
+                    if (
+                        key["source"].get("kind") == "relay"
+                        and not str(key.get("value", "")).strip()
+                    ):
+                        key["value"] = "os.environ/LITELLM_MENU_RELAY_PREFLIGHT_PLACEHOLDER"
+                        changed = True
+                if changed:
+                    self._sync_primary_api_key(provider, keys)
+                relay_key_ids = {
+                    key["id"]
+                    for key in self._provider_api_keys(provider)
+                    if key["source"].get("kind") == "relay"
+                }
+                models = provider.get("models", [])
+                if isinstance(models, list):
+                    for model in models:
+                        if not isinstance(model, dict):
+                            continue
+                        if (
+                            str(model.get("provider_key_id", "")).strip()
+                            not in relay_key_ids
+                            or str(model.get("order_mode", "manual")).strip()
+                            != "relay_multiplier"
+                            or model.get("effective_order") not in (None, "")
+                        ):
+                            continue
+                        # Before Apply the multiplier has not been fetched
+                        # yet. Validate the rest of this staged draft using a
+                        # local candidate only; materialization remains the
+                        # strict gate that writes the real effective order.
+                        model["effective_order"] = self._order_value(
+                            model.get("manual_order", 1),
+                            label="Manual route order",
+                        )
+                        model["order"] = model["effective_order"]
         try:
             with tempfile.TemporaryDirectory(prefix="litellm-core-provider-validate-") as directory:
                 target = Path(directory) / "config.yaml"
@@ -1450,12 +3170,33 @@ class ProvidersModelsDomain:
                 disabled = source.get("disabled")
                 if isinstance(disabled, str):
                     atomic_write_text(target.with_name("config.disabled-models.yaml"), disabled)
-                config_api.save_config(copy.deepcopy(providers), target, document=source)
+                config_api.save_config(candidate_providers, target, document=source)
         except DomainError:
             raise
         except Exception:
             return {"valid": False, "errors": ["Provider/model configuration is invalid"]}
         return {"valid": True, "errors": []}
+
+    def validate_relay_preflight(self, payload: object | None = None) -> dict[str, Any]:
+        """Validate a linked draft before Core fetches its private key material."""
+
+        if payload is not None:
+            before = copy.deepcopy(self._draft)
+            provider_editor_ids = dict(self._provider_editor_ids)
+            model_editor_ids = dict(self._model_editor_ids)
+            try:
+                data = _mapping(payload)
+                if "providers" in data or "document" in data:
+                    self._replace_draft(
+                        data.get("providers", self._draft.get("providers", [])),
+                        data.get("document"),
+                    )
+                return self._validate(allow_unmaterialized_relay_keys=True)
+            finally:
+                self._draft = before
+                self._provider_editor_ids = provider_editor_ids
+                self._model_editor_ids = model_editor_ids
+        return self._validate(allow_unmaterialized_relay_keys=True)
 
     def validate(self, payload: object | None = None) -> dict[str, Any]:
         # Explicit candidate payloads are accepted by staging through the same
@@ -1542,6 +3283,7 @@ class ProvidersModelsDomain:
     def reload(self) -> dict[str, Any]:
         provider_bindings, model_bindings = self._editor_id_bindings()
         loaded = self._load()
+        self._normalize_provider_model_bindings(loaded["providers"])
         self._raw = {"providers": copy.deepcopy(loaded["providers"]), "document": copy.deepcopy(loaded["document"])}
         self._draft = copy.deepcopy(self._raw)
         self._disk_revision = copy.deepcopy(loaded["disk_revision"])

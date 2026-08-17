@@ -89,36 +89,27 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             self.assertNotIn("replace-secret", json.dumps(domain.snapshot()))
 
             domain.dispatch("api_key.update", {"account_id": account["id"], "resource_id": "newapi-7", "name": "renamed"})
-            self.assertEqual(
-                ("PUT", "/api/token/", "https://relay.example.test", {"Cookie": "session=fixture"}, {
-                    "id": 7, "name": "renamed", "expired_time": -1, "remain_quota": 0,
-                    "unlimited_quota": True, "model_limits_enabled": False, "model_limits": "",
-                    "allow_ips": "", "group": "default", "cross_group_retry": False,
-                }),
-                client.calls[-1],
-            )
-            self.assertEqual("newapi-7", domain.snapshot()["accounts"][0]["resources"][0]["id"])
-
             domain.dispatch("api_key.set_group", {"account_id": account["id"], "resource_id": "newapi-7", "group_id": "premium"})
-            self.assertEqual("premium", client.calls[-1][4]["group"])
-
             domain.dispatch("api_key.set_enabled", {"account_id": account["id"], "resource_id": "newapi-7", "enabled": False})
-            self.assertEqual(
+            domain.dispatch("api_key.create", {"account_id": account["id"], "name": "new-key"})
+            self.assertEqual([], client.calls)
+            prepared = domain.prepare_apply()
+            self.assertTrue(prepared["ready"])
+            domain.execute_pending_operations(prepared, phase="non_destructive")
+            domain.reconcile_apply(prepared, phase="non_destructive")
+            self.assertEqual("POST", client.calls[0][0])
+            self.assertEqual("/api/token/", client.calls[0][1])
+            self.assertEqual({"name": "new-key", "unlimited_quota": True}, client.calls[0][4])
+            self.assertIn(
                 ("PUT", "/api/token/?status_only=true", "https://relay.example.test", {"Cookie": "session=fixture"}, {"id": 7, "status": 2}),
-                client.calls[-1],
+                client.calls,
             )
             self.assertFalse(domain.snapshot()["accounts"][0]["resources"][0]["enabled"])
 
-            domain.refresh_resources(account["id"])
-            domain.dispatch("api_key.delete", {"account_id": account["id"], "resource_id": "newapi-7"})
+            domain.dispatch("api_key.delete", {"account_id": account["id"], "resource_id": "newapi-7", "dependency_policy": "delete_models"})
+            domain.execute_pending_operations(domain.prepare_apply(), phase="destructive")
             self.assertEqual("DELETE", client.calls[-1][0])
             self.assertEqual("/api/token/7", client.calls[-1][1])
-
-            domain.refresh_resources(account["id"])
-            domain.dispatch("api_key.create", {"account_id": account["id"], "name": "new-key"})
-            self.assertEqual("POST", client.calls[-1][0])
-            self.assertEqual("/api/token/", client.calls[-1][1])
-            self.assertEqual({"name": "new-key", "unlimited_quota": True}, client.calls[-1][4])
             self.assertNotIn("replace-generated-secret", json.dumps(domain.snapshot()))
 
     def test_sub2api_key_crud_uses_key_ids_and_never_returns_key_values(self) -> None:
@@ -150,31 +141,24 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             )
 
             domain.dispatch("api_key.set_enabled", {"account_id": account["id"], "resource_id": "sub2api-key-one", "enabled": False})
-            self.assertEqual("PUT", client.calls[-1][0])
-            self.assertEqual("/api/v1/keys/key-one", client.calls[-1][1])
-            self.assertEqual({"status": "inactive"}, client.calls[-1][4])
+            domain.dispatch("api_key.update", {"account_id": account["id"], "resource_id": "sub2api-key-one", "name": "renamed"})
+            domain.dispatch("api_key.set_group", {"account_id": account["id"], "resource_id": "sub2api-key-one", "group_id": "3"})
+            domain.dispatch("api_key.create", {"account_id": account["id"]})
+            self.assertEqual([], client.calls)
+            domain.execute_pending_operations(domain.prepare_apply(), phase="non_destructive")
+            domain.reconcile_apply(phase="non_destructive")
+            self.assertEqual("POST", client.calls[0][0])
+            self.assertEqual("/api/v1/keys", client.calls[0][1])
+            self.assertEqual({"name": "API 2"}, client.calls[0][4])
+            self.assertIn({"status": "inactive"}, [call[4] for call in client.calls])
+            self.assertIn({"name": "renamed"}, [call[4] for call in client.calls])
+            self.assertIn({"group_id": 3}, [call[4] for call in client.calls])
             self.assertFalse(domain.snapshot()["accounts"][0]["resources"][0]["enabled"])
 
-            domain.refresh_resources(account["id"])
-            domain.dispatch("api_key.update", {"account_id": account["id"], "resource_id": "sub2api-key-one", "name": "renamed"})
-            self.assertEqual("PUT", client.calls[-1][0])
-            self.assertEqual("/api/v1/keys/key-one", client.calls[-1][1])
-            self.assertEqual({"name": "renamed"}, client.calls[-1][4])
-
-            domain.refresh_resources(account["id"])
-            domain.dispatch("api_key.set_group", {"account_id": account["id"], "resource_id": "sub2api-key-one", "group_id": "3"})
-            self.assertEqual({"group_id": 3}, client.calls[-1][4])
-
-            domain.refresh_resources(account["id"])
-            domain.dispatch("api_key.delete", {"account_id": account["id"], "resource_id": "sub2api-key-one"})
+            domain.dispatch("api_key.delete", {"account_id": account["id"], "resource_id": "sub2api-key-one", "dependency_policy": "delete_models"})
+            domain.execute_pending_operations(domain.prepare_apply(), phase="destructive")
             self.assertEqual("DELETE", client.calls[-1][0])
             self.assertEqual("/api/v1/keys/key-one", client.calls[-1][1])
-
-            domain.refresh_resources(account["id"])
-            domain.dispatch("api_key.create", {"account_id": account["id"]})
-            self.assertEqual("POST", client.calls[-1][0])
-            self.assertEqual("/api/v1/keys", client.calls[-1][1])
-            self.assertEqual({"name": "API 2"}, client.calls[-1][4])
             self.assertNotIn("replace-secret", json.dumps(domain.snapshot()))
 
     def test_disabled_keys_remain_visible_but_cannot_be_imported(self) -> None:

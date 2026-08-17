@@ -80,6 +80,7 @@ std::string StdStringFromString(NSString *value)
 
 void ConfigureSingleLineTextField(NSTextField *field)
 {
+  field.focusRingType = NSFocusRingTypeNone;
   field.maximumNumberOfLines = 1;
   field.usesSingleLineMode = YES;
   field.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -120,6 +121,8 @@ NSImage *ButtonSymbolImage(const std::string &symbol)
     symbolName = @"doc.on.doc";
   } else if (symbol == "edit") {
     symbolName = @"pencil";
+  } else if (symbol == "import") {
+    symbolName = @"tray.and.arrow.down";
   } else if (symbol == "power-off") {
     symbolName = @"power";
   } else if (symbol == "power-on") {

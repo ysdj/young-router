@@ -140,6 +140,12 @@ class CoreProtocolTests(unittest.TestCase):
         self.assertEqual(len(schema["methods"]), len(schema["request"]["allOf"]))
         self.assertFalse(schema["$defs"]["applyParams"]["additionalProperties"])
         self.assertIn("domains", schema["$defs"]["applyParams"]["properties"])
+        self.assertEqual(
+            {"revision", "applied", "status", "completed_operations", "pending_operations", "issues"},
+            set(schema["$defs"]["applyResult"]["required"]),
+        )
+        self.assertFalse(schema["$defs"]["applyIssue"]["additionalProperties"])
+        self.assertNotIn("api_key", schema["$defs"]["applyIssue"]["properties"])
 
     def test_request_and_response_are_versioned_and_strict(self) -> None:
         request = RequestEnvelope.from_mapping(
@@ -232,7 +238,15 @@ class CoreProtocolTests(unittest.TestCase):
             "dispatch": {"revision": 0},
             "subscribe": {"subscription_id": "subscription"},
             "validate": {"validate": {}},
-            "apply": {"revision": 0, "applied": True, "domains": ["language"]},
+            "apply": {
+                "revision": 0,
+                "applied": True,
+                "domains": ["language"],
+                "status": "applied",
+                "completed_operations": 0,
+                "pending_operations": 0,
+                "issues": [],
+            },
             "reload": {"revision": 0},
             "probe": {"ok": False, "protocols": []},
             "export": {"revision": 0, "section_count": 0, "sections": ["language"]},
@@ -246,7 +260,14 @@ class CoreProtocolTests(unittest.TestCase):
             "dispatch": {"revision": -1},
             "subscribe": {"subscription_id": 1},
             "validate": {"validate": []},
-            "apply": {"revision": 0, "applied": False},
+            "apply": {
+                "revision": 0,
+                "applied": False,
+                "status": "partial",
+                "completed_operations": -1,
+                "pending_operations": 1,
+                "issues": [],
+            },
             "reload": {"revision": "0"},
             "probe": {"ok": True, "protocols": [1]},
             "export": {"revision": 0, "section_count": -1},
@@ -263,6 +284,18 @@ class CoreProtocolTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProtocolError, rf"^{method} result does not match") as raised:
                     validate_method_result(method, result)
                 self.assertEqual("invalid_response", raised.exception.code)
+        with self.assertRaisesRegex(ProtocolError, r"^apply result does not match"):
+            validate_method_result(
+                "apply",
+                {
+                    "revision": 0,
+                    "applied": False,
+                    "status": "partial",
+                    "completed_operations": 0,
+                    "pending_operations": 1,
+                    "issues": [{"code": "relay_apply", "message": "Retry required", "api_key": "must-not-leak"}],
+                },
+            )
 
     def test_snapshot_params_cannot_contain_extra_fields(self) -> None:
         with self.assertRaises(ProtocolError) as raised:

@@ -93,7 +93,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             ("runtime-settings", 800, 520),
             ("data-management", 500, 160),
             ("relay-accounts", 780, 440),
-            ("relay-add", 720, 560),
+            ("relay-add", 540, 330),
             ("logs", 640, 420),
         ):
             self.assertIn(f'route == L"{route}") return {{{width}, {height}}};', leaf)
@@ -108,7 +108,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
         self.assertIn("ContentSize RouteInitialContentSize", leaf)
-        for size in ("{780, 560}", "{1160, 700}", "{1080, 620}", "{520, 175}", "{820, 480}", "{900, 680}", "{900, 580}"):
+        for size in ("{780, 560}", "{1160, 700}", "{1080, 620}", "{520, 175}", "{820, 480}", "{620, 350}", "{900, 580}"):
             self.assertIn(size, leaf)
         self.assertIn("RouteInitialContentSize(route)", leaf)
 
@@ -155,7 +155,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             (1160, 700, 1100, 640),
             (1080, 620, 800, 520),
             (500, 160, 500, 140),
-            (900, 680, 720, 560),
+            (620, 350, 540, 330),
             (900, 580, 640, 420),
         ):
             self.assertIn(f"contentSize: NSSize(width: {width}, height: {height})", leaf)
@@ -829,7 +829,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("await leaf.showReadOnlyText(title, text, closeLabel, language, html);", platform)
 
         self.assertIn('import { CODE_EDITOR_HTML, CodeEditorWebView', ui)
-        self.assertEqual(2, ui.count("void native.showReadOnlyText({"))
+        self.assertEqual(3, ui.count("void native.showReadOnlyText({"))
         self.assertIn('text: selected.rows.map((row) => row.original).join("\\n\\n")', ui)
         self.assertIn("text: row.original", ui)
         self.assertIn('language: "json"', ui)
@@ -966,7 +966,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('onClose?.();\n        native.window.focus("relay-accounts");', relay_ui)
         self.assertIn("if (embedded) return true;", relay_ui)
         self.assertIn("NativeCheckbox", relay_ui)
-        self.assertIn('title={translate("relay.importSelected")}', relay_ui)
+        self.assertNotIn('title={translate("relay.importSelected")}', relay_ui)
         self.assertIn('type SavedSessionRestore = "signed_in" | "expired" | "unavailable";', relay_ui)
         self.assertIn("const openedAccountIDs = useRef(new Set<string>());", relay_ui)
         self.assertIn("const refreshLoginState = async (account: RelayAccount, automatic = false): Promise<void> => {", relay_ui)
@@ -1498,6 +1498,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_macos_single_line_controls_and_table_cells_are_vertically_centered(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        single_line = controls.split("void ConfigureSingleLineTextField", 1)[1].split("NSInteger SegmentIndex", 1)[0]
+        self.assertIn("field.focusRingType = NSFocusRingTypeNone;", single_line)
 
         self.assertIn("@interface LiteLLMAppKitControlHostView : NSView", controls)
         self.assertIn("NSMidY(bounds) - height / 2.0", controls)
@@ -1694,6 +1696,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('symbolName = @"play.fill";', controls)
         self.assertIn('symbolName = @"minus";', controls)
         self.assertIn('symbolName = @"trash";', controls)
+        self.assertIn('symbolName = @"tray.and.arrow.down";', controls)
         self.assertIn('symbolName = @"arrow.clockwise";', controls)
         self.assertIn("_button.imagePosition = symbolImage == nil ? NSNoImage : NSImageOnly;", button)
 
@@ -1704,6 +1707,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('else if (symbol == "power-on" || symbol == "power-off")', windows)
         self.assertIn('else if (symbol == "copy")', windows)
         self.assertIn('else if (symbol == "edit")', windows)
+        self.assertIn('else if (symbol == "import") icon.Glyph(L"\\xE8B5");', windows)
         self.assertIn('else if (symbol == "refresh") icon.Glyph(L"\\xE72C");', windows)
 
     def test_macos_buttons_clear_default_action_state_before_fabric_reuse(self) -> None:

@@ -17,14 +17,27 @@ from litellm_menu.api_base import normalize_configured_api_base
 from .schema import (
     DEFAULT_API_KEY_NAME,
     MENU_API_KEY_NAME_KEY,
+    MENU_MANUAL_ORDER_KEY,
     MENU_MODEL_ENABLED_KEY,
+    MENU_ORDER_MODE_KEY,
+    MENU_PROVIDER_KEY_ID_KEY,
+    MENU_PROVIDER_SOURCE_KEY,
+    MENU_RELAY_CATALOG_MODE_KEY,
+    MENU_RELAY_KEYS_KEY,
+    MENU_RELAY_KEYS_VERSION,
+    MENU_RELAY_SOURCE_MODEL_KEY,
     MENU_ROUTE_KEY,
+    MODEL_ORDER_MODES,
     RANDOM_DEPLOYMENT_ID_RE,
     UPSTREAM_PROTOCOL_MODE_KEY,
     UPSTREAM_URL_SURFACE_KEY,
     _as_dict,
     _as_list,
     _bool_value,
+    _provider_key_id,
+    _provider_source,
+    _relay_source,
+    _stable_provider_key_id,
     _string_value,
     _upstream_protocol_mode,
     _upstream_url_surface,
@@ -176,8 +189,11 @@ def _normalized_api_keys(provider: dict[str, Any]) -> list[dict[str, Any]]:
         if key_name in seen_names:
             raise ValueError(f"Duplicate API key label in provider {provider.get('name', '')}: {key_name}")
         keys.append({
+            "id": _provider_key_id(item_dict.get("id"))
+            or _stable_provider_key_id(provider.get("name"), key_name),
             "name": key_name,
             "value": key_value,
+            "source": _relay_source(item_dict.get("source")),
         })
         seen_names.add(key_name)
 
@@ -208,6 +224,29 @@ def _api_key_by_name(provider: dict[str, Any], key_name: str) -> dict[str, Any] 
     return _primary_api_key(keys)
 
 
+def _api_key_by_id(provider: dict[str, Any], provider_key_id: str) -> dict[str, Any] | None:
+    if not provider_key_id:
+        return None
+    for item in _normalized_api_keys(provider):
+        if item["id"] == provider_key_id:
+            return item
+    return None
+
+
+def _provider_key_metadata(keys: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "version": MENU_RELAY_KEYS_VERSION,
+        "slots": [
+            {
+                "id": item["id"],
+                "api_key_name": item["name"],
+                "source": item["source"],
+            }
+            for item in keys
+        ],
+    }
+
+
 def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
     lines = ["providers:"]
     seen: set[str] = set()
@@ -230,7 +269,19 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
             for item in keys:
                 lines.append(f"      - name: {_plain_scalar(item['name'])}")
                 lines.append(f"        value: {_anchor_scalar(item['value'], _provider_key_anchor(name, item['name']))}")
-        for key, value in _as_dict(provider.get("extra")).items():
+        extra = dict(_as_dict(provider.get("extra")))
+        extra[MENU_RELAY_KEYS_KEY] = _provider_key_metadata(keys)
+        raw_source = extra.get(MENU_PROVIDER_SOURCE_KEY)
+        provider_type = _string_value(provider.get("provider_type")).strip()
+        station_id = _string_value(provider.get("relay_station_id")).strip()
+        if provider_type or station_id:
+            raw_source = {
+                "kind": provider_type or "custom",
+                **({"station_id": station_id} if station_id else {}),
+            }
+        source = _provider_source(raw_source)
+        extra[MENU_PROVIDER_SOURCE_KEY] = source
+        for key, value in extra.items():
             lines.append(f"    {key}: {_plain_scalar(value)}")
     if len(lines) == 1:
         return "providers: {}\n"
@@ -276,22 +327,44 @@ def _entry_from_editor(
     _set_if_text(entry, "model_name", model_name)
     _set_if_text(params, "model", litellm_model)
     api_base = normalize_configured_api_base(provider.get("api_base", ""))
+    provider_key_id = _provider_key_id(model.get("provider_key_id"))
     key_name = str(model.get("api_key_name", "")).strip()
-    if not key_name:
+    if not key_name and not provider_key_id:
         model_api_key = str(model.get("api_key", "")).strip()
         for item in _normalized_api_keys(provider):
             if item["value"] == model_api_key:
                 key_name = item["name"]
                 break
-    api_key_item = _api_key_by_name(provider, key_name)
+    api_key_item = (
+        _api_key_by_id(provider, provider_key_id)
+        if provider_key_id
+        else _api_key_by_name(provider, key_name)
+    )
+    if provider_key_id and api_key_item is None:
+        raise ValueError(
+            f"Provider key for model {model_name or f'#{index + 1}'} is unavailable"
+        )
     api_key = api_key_item["value"] if api_key_item else ""
     api_key_name = api_key_item["name"] if api_key_item else ""
+    provider_key_id = api_key_item["id"] if api_key_item else provider_key_id
     if api_base:
         params["api_base"] = {"__alias__": _make_anchor_name(provider_name, "api_base")} if use_provider_aliases else api_base
     if api_key:
         params["api_key"] = {"__alias__": _provider_key_anchor(provider_name, api_key_name)} if use_provider_aliases else api_key
 
-    order = _numeric_order(model.get("order", ""))
+    order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
+    if order_mode not in MODEL_ORDER_MODES:
+        raise ValueError(f"Invalid route order mode: {order_mode}")
+    manual_order = _numeric_order(model.get("manual_order", model.get("order", "")))
+    if order_mode == "relay_multiplier":
+        effective_order_value = model.get("effective_order")
+        if effective_order_value is None or str(effective_order_value).strip() == "":
+            raise ValueError(
+                f"Relay multiplier is unavailable for model {model_name or f'#{index + 1}'}"
+            )
+        order = _numeric_order(effective_order_value)
+    else:
+        order = manual_order
     params["order"] = order
 
     deployment_id = str(model.get("deployment_id", "")).strip().lower()
@@ -316,6 +389,15 @@ def _entry_from_editor(
     )
     if api_key_name:
         model_info[MENU_API_KEY_NAME_KEY] = api_key_name
+    if provider_key_id:
+        model_info[MENU_PROVIDER_KEY_ID_KEY] = provider_key_id
+    # Relay ownership is persisted once on the ProviderKey slot.  Older
+    # model-level relay fields are accepted by the loader but deliberately
+    # removed on the next save so they cannot drift from the selected key.
+    model_info.pop(MENU_RELAY_CATALOG_MODE_KEY, None)
+    model_info.pop(MENU_RELAY_SOURCE_MODEL_KEY, None)
+    model_info[MENU_ORDER_MODE_KEY] = order_mode
+    model_info[MENU_MANUAL_ORDER_KEY] = manual_order
     # Keep the model's own switch explicit even when the provider disables the
     # effective route. Re-enabling a provider must restore each prior model
     # state instead of treating every companion-file entry as model-disabled.

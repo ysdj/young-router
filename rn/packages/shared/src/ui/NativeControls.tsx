@@ -40,7 +40,7 @@ import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type ButtonProps = {
   title: string;
-  symbol?: "check" | "close" | "copy" | "edit" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash";
+  symbol?: "check" | "close" | "copy" | "edit" | "import" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash";
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;

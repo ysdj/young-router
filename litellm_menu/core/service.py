@@ -887,6 +887,38 @@ class CoreStore:
         except Exception as exc:
             raise CoreError("domain_unavailable", safe_exception_message(exc)) from None
 
+    def _record_relay_transient_update(
+        self,
+        *,
+        was_dirty: bool,
+        prior_baseline: object,
+        prior_base_revision: object,
+    ) -> None:
+        """Keep an existing relay draft dirty across login/refresh reads.
+
+        Login restoration and resource discovery update private session/cache
+        state, but are not an implicit Apply of staged station, account, or
+        remote-key CRUD. A clean relay state can adopt that update as its new
+        baseline; a dirty one must retain the baseline from before the read.
+        """
+
+        if was_dirty:
+            self._baselines["relay_accounts"] = copy.deepcopy(prior_baseline)
+            base_revision = prior_base_revision if type(prior_base_revision) is int else self._revision
+            self._mark_domain(
+                "relay_accounts",
+                dirty=True,
+                base_revision=base_revision,
+            )
+            return
+        self._baselines["relay_accounts"] = self._adapter_draft_state("relay_accounts")
+        self._mark_domain(
+            "relay_accounts",
+            dirty=False,
+            validation={"valid": True, "issues": []},
+            base_revision=self._revision,
+        )
+
     def _persist_metadata(self) -> None:
         if self._metadata_store is None:
             return
@@ -941,6 +973,43 @@ class CoreStore:
                     raise CoreError("service_error", "LiteLLM service returned invalid status")
                 self._set_service_from_result(result, increment=False)
             self._refresh_external_disk_state()
+            # Relay snapshots display reverse dependency counts, while the
+            # provider/model domain remains the sole source of binding truth.
+            # Project only stable IDs and counts across this in-process seam;
+            # no API base or credential is copied into the relay snapshot.
+            relay = self._domains.get("relay_accounts")
+            providers_domain = self._domains.get("providers_models")
+            dependency_summary = getattr(providers_domain, "dependency_summary", None)
+            set_binding_summary = getattr(relay, "set_binding_summary", None)
+            if callable(dependency_summary) and callable(set_binding_summary):
+                try:
+                    summary = dependency_summary()
+                    provider_keys = summary.get("provider_keys", []) if isinstance(summary, Mapping) else []
+                    resources: list[dict[str, Any]] = []
+                    if isinstance(provider_keys, Sequence) and not isinstance(provider_keys, (str, bytes, bytearray)):
+                        for item in provider_keys:
+                            if not isinstance(item, Mapping):
+                                continue
+                            source = item.get("source")
+                            if not isinstance(source, Mapping) or source.get("kind") != "relay":
+                                continue
+                            count = item.get("model_count", 0)
+                            if type(count) is not int or count < 0:
+                                continue
+                            resources.append(
+                                {
+                                    "station_id": source.get("station_id"),
+                                    "account_id": source.get("account_id"),
+                                    "resource_id": source.get("resource_id"),
+                                    "linked_model_count": count,
+                                    "binding_status": "linked" if count else "independent",
+                                }
+                            )
+                    set_binding_summary({"resources": resources})
+                except Exception:
+                    # A reverse-count projection is informational. Domain
+                    # validation during Apply still enforces binding health.
+                    pass
             domain_states = {name: self._adapter_snapshot(name) for name in self._domains}
             providers = self._providers_summary(domain_states)
             webdav = self._webdav_summary(domain_states)
@@ -1296,6 +1365,7 @@ class CoreStore:
         resource_ids: object,
         *,
         revision: int,
+        mode: object = "linked",
     ) -> dict[str, Any]:
         """Stage only the API resources explicitly selected by the user."""
 
@@ -1306,9 +1376,12 @@ class CoreStore:
             importer = getattr(relay, "import_resources", None) if relay is not None else None
             if not isinstance(account_id, str) or not account_id or not callable(importer) or providers is None:
                 raise CoreError("relay_import_failed", "Relay account is unavailable")
+            import_mode = str(mode).strip().lower()
+            if import_mode not in {"linked", "independent"}:
+                raise CoreError("relay_import_failed", "Relay import mode is invalid")
             provider_checkpoint = _checkpoint_adapter(providers, error_code="relay_import_failed")
             try:
-                result = importer(account_id, resource_ids, providers)
+                result = importer(account_id, resource_ids, providers, mode=import_mode)
             except Exception as exc:
                 try:
                     _restore_adapter(providers, provider_checkpoint)
@@ -1329,6 +1402,7 @@ class CoreStore:
             self._last_actions["relay_accounts"] = {
                 "resources_ready": True,
                 "account_id": account_id,
+                "import_mode": import_mode,
                 "resource_count": int(result.get("resource_count", 0)) if isinstance(result, Mapping) else 0,
                 "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
             }
@@ -1337,6 +1411,7 @@ class CoreStore:
             return {
                 "revision": self._revision,
                 "imported": True,
+                "import_mode": import_mode,
                 "resource_count": int(result.get("resource_count", 0)) if isinstance(result, Mapping) else 0,
                 "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
             }
@@ -1370,6 +1445,9 @@ class CoreStore:
                 or not callable(relay_restore)
             ):
                 raise CoreError("relay_login_failed", "Relay account is unavailable")
+            relay_was_dirty = bool(self._drafts.get("relay_accounts", {}).get("dirty"))
+            relay_prior_baseline = copy.deepcopy(self._baselines.get("relay_accounts"))
+            relay_prior_base_revision = self._drafts.get("relay_accounts", {}).get("base_revision")
             relay_state = relay_checkpoint()
             core_checkpoint = {
                 "revision": self._revision,
@@ -1414,12 +1492,10 @@ class CoreStore:
                 # discovery is a separate explicit action so a station API
                 # outage cannot change the result of a successful sign-in.
                 self._revision += 1
-                self._baselines["relay_accounts"] = self._adapter_draft_state("relay_accounts")
-                self._mark_domain(
-                    "relay_accounts",
-                    dirty=False,
-                    validation={"valid": True, "issues": []},
-                    base_revision=self._revision,
+                self._record_relay_transient_update(
+                    was_dirty=relay_was_dirty,
+                    prior_baseline=relay_prior_baseline,
+                    prior_base_revision=relay_prior_base_revision,
                 )
                 self._last_actions["relay_accounts"] = {
                     "logged_in": True,
@@ -1476,6 +1552,9 @@ class CoreStore:
             refresher = getattr(relay, "refresh_resources", None) if relay is not None else None
             if not isinstance(account_id, str) or not account_id or not callable(refresher):
                 raise CoreError("relay_resources_failed", "Relay account is unavailable")
+            relay_was_dirty = bool(self._drafts.get("relay_accounts", {}).get("dirty"))
+            relay_prior_baseline = copy.deepcopy(self._baselines.get("relay_accounts"))
+            relay_prior_base_revision = self._drafts.get("relay_accounts", {}).get("base_revision")
             try:
                 result = refresher(account_id)
             except Exception as exc:
@@ -1484,12 +1563,10 @@ class CoreStore:
             resource_status = result.get("resource_status", "unavailable") if isinstance(result, Mapping) else "unavailable"
             resource_count = len(resources) if isinstance(resources, list) else 0
             self._revision += 1
-            self._baselines["relay_accounts"] = self._adapter_draft_state("relay_accounts")
-            self._mark_domain(
-                "relay_accounts",
-                dirty=False,
-                validation={"valid": True, "issues": []},
-                base_revision=self._revision,
+            self._record_relay_transient_update(
+                was_dirty=relay_was_dirty,
+                prior_baseline=relay_prior_baseline,
+                prior_base_revision=relay_prior_base_revision,
             )
             self._last_actions["relay_accounts"] = {
                 "resources_ready": resource_status == "ready",
@@ -1543,6 +1620,9 @@ class CoreStore:
                 or not callable(password_restorer)
             ):
                 raise CoreError("relay_restore_failed", "Relay account is unavailable")
+            relay_was_dirty = bool(self._drafts.get("relay_accounts", {}).get("dirty"))
+            relay_prior_baseline = copy.deepcopy(self._baselines.get("relay_accounts"))
+            relay_prior_base_revision = self._drafts.get("relay_accounts", {}).get("base_revision")
             current = self._adapter_snapshot("relay_accounts")
             accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
             matching = next(
@@ -1584,12 +1664,10 @@ class CoreStore:
                 else:
                     raise CoreError("relay_restore_failed", "Relay login status is invalid")
                 self._revision += 1
-                self._baselines["relay_accounts"] = self._adapter_draft_state("relay_accounts")
-                self._mark_domain(
-                    "relay_accounts",
-                    dirty=False,
-                    validation={"valid": True, "issues": []},
-                    base_revision=self._revision,
+                self._record_relay_transient_update(
+                    was_dirty=relay_was_dirty,
+                    prior_baseline=relay_prior_baseline,
+                    prior_base_revision=relay_prior_base_revision,
                 )
                 self._last_actions["relay_accounts"] = {
                     "session_restored": public.get("login_status") == "signed_in",
@@ -2073,6 +2151,7 @@ class CoreStore:
                         resource_data.get("id", resource_data.get("account_id")),
                         resource_data.get("resource_ids"),
                         revision=self._revision,
+                        mode=resource_data.get("import_mode", resource_data.get("mode", "linked")),
                     )
                 if name == "relay_accounts" and normalized_action in {
                     "resources_refresh",
@@ -2084,13 +2163,145 @@ class CoreStore:
                         resource_data.get("id", resource_data.get("account_id")),
                         revision=self._revision,
                     )
+                if name == "providers_models" and normalized_action == "provider_select_relay_station":
+                    station_data = _as_mapping(payload)
+                    relay = self._domains.get("relay_accounts")
+                    resolver = getattr(relay, "provider_station_source", None)
+                    if not callable(resolver):
+                        raise CoreError("domain_error", "Relay stations are unavailable")
+                    try:
+                        source = resolver(station_data)
+                    except Exception as exc:
+                        raise CoreError("domain_error", safe_exception_message(exc)) from None
+                    if not isinstance(source, Mapping):
+                        raise CoreError("domain_error", "Relay station is unavailable")
+                    payload = {
+                        "provider_id": station_data.get("provider_id"),
+                        "source": dict(source),
+                    }
+                relay_dependency_action = name == "relay_accounts" and normalized_action in {
+                    "station_remove",
+                    "relay_station_remove",
+                    "remove_station",
+                    "account_remove",
+                    "relay_account_remove",
+                    "remove_account",
+                    "api_key_delete",
+                    "relay_api_key_delete",
+                    "account_api_key_delete",
+                    "api_key_detach",
+                    "relay_api_key_detach",
+                    "account_api_key_detach",
+                }
+                providers = self._domains.get("providers_models") if relay_dependency_action else None
+                provider_before = self._adapter_draft_state("providers_models") if providers is not None else None
+                relay_checkpoint = _checkpoint_adapter(adapter, error_code="domain_error") if relay_dependency_action else None
+                provider_checkpoint = _checkpoint_adapter(providers, error_code="domain_error") if providers is not None else None
                 try:
+                    if name == "providers_models" and normalized_action in {
+                        "provider_import_relay_key",
+                        "model_select_relay_resource",
+                        "provider_fetch_relay_resource_models",
+                    }:
+                        resource_data = _as_mapping(payload)
+                        relay = self._domains.get("relay_accounts")
+                        resolver = getattr(relay, "binding_source", None)
+                        if not callable(resolver):
+                            raise CoreError(
+                                "domain_error",
+                                "Relay API resources are unavailable",
+                            )
+                        resolved = resolver(resource_data)
+                        if not isinstance(resolved, Mapping):
+                            raise CoreError(
+                                "domain_error",
+                                "Relay API resource is unavailable",
+                            )
+                        source = dict(resolved)
+                        if normalized_action == "provider_fetch_relay_resource_models":
+                            materializer = getattr(relay, "binding_materials", None)
+                            if not callable(materializer):
+                                raise CoreError(
+                                    "domain_error",
+                                    "Relay API key material is unavailable",
+                                )
+                            materials = materializer({"resources": [source]})
+                            rows = materials.get("resources") if isinstance(materials, Mapping) else None
+                            material = next(
+                                (
+                                    item
+                                    for item in rows
+                                    if isinstance(item, Mapping)
+                                    and all(item.get(key) == source.get(key) for key in ("station_id", "account_id", "resource_id"))
+                                ),
+                                None,
+                            ) if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes, bytearray)) else None
+                            if not isinstance(material, Mapping) or not isinstance(material.get("api_key"), str):
+                                raise CoreError(
+                                    "domain_error",
+                                    "Relay API key material is unavailable",
+                                )
+                            source = dict(material)
+                        payload = {
+                            "provider_id": resource_data.get("provider_id"),
+                            **(
+                                {"model_id": resource_data.get("model_id")}
+                                if normalized_action == "model_select_relay_resource"
+                                else {}
+                            ),
+                            "source": source,
+                            "api_key_name": resolved.get("api_key_name"),
+                        }
                     result = adapter.dispatch(action_type, payload)
+                    if relay_dependency_action and providers is not None:
+                        relay_snapshot = adapter.snapshot()
+                        details = relay_snapshot.get("last_action") if isinstance(relay_snapshot, Mapping) else None
+                        resources = details.get("resources") if isinstance(details, Mapping) else None
+                        policy = details.get("dependency_policy") if isinstance(details, Mapping) else None
+                        if isinstance(resources, Sequence) and not isinstance(resources, (str, bytes, bytearray)):
+                            normalized_policy = {
+                                "delete_models": "delete",
+                                "delete": "delete",
+                                "detach": "detach",
+                                "release": "detach",
+                                "detach_disabled": "detach_disabled",
+                                "rebind": "rebind",
+                            }.get(str(policy or "detach"), "")
+                            handler = getattr(providers, "apply_relay_dependency_policy", None)
+                            if not normalized_policy or not callable(handler):
+                                raise CoreError("domain_error", "Linked model dependency handling is unavailable")
+                            rebind = _as_mapping(payload).get("rebind") if isinstance(payload, Mapping) else None
+                            dependency_result = handler(resources, normalized_policy, rebind=rebind)
+                            if isinstance(dependency_result, Mapping):
+                                dependency_issues = dependency_result.get("issues")
+                                if (
+                                    isinstance(dependency_issues, Sequence)
+                                    and not isinstance(dependency_issues, (str, bytes, bytearray))
+                                    and dependency_issues
+                                ):
+                                    raise CoreError(
+                                        "domain_error",
+                                        "Linked model dependency handling could not be completed",
+                                    )
+                                self._last_actions["providers_models"] = dict(_safe_public(dependency_result))
                 except ConfirmationNeeded:
+                    if relay_checkpoint is not None:
+                        _restore_adapter(adapter, relay_checkpoint)
+                    if providers is not None and provider_checkpoint is not None:
+                        _restore_adapter(providers, provider_checkpoint)
                     raise
                 except Exception as exc:
+                    if relay_checkpoint is not None:
+                        try:
+                            _restore_adapter(adapter, relay_checkpoint)
+                            if providers is not None and provider_checkpoint is not None:
+                                _restore_adapter(providers, provider_checkpoint)
+                        except Exception:
+                            raise CoreError("domain_error", "Linked model dependency handling could not be rolled back") from None
                     # Domain exceptions are authored to be safe; normalize
                     # them into the stable Core protocol error shape.
+                    if isinstance(exc, CoreError):
+                        raise
                     raise CoreError("domain_error", safe_exception_message(exc)) from None
                 after = self._adapter_draft_state(name)
                 if isinstance(result, Mapping):
@@ -2108,6 +2319,18 @@ class CoreStore:
                         else self._revision
                     ),
                 )
+                if providers is not None and provider_before is not None:
+                    provider_after = self._adapter_draft_state("providers_models")
+                    provider_dirty = provider_after != self._baselines.get("providers_models")
+                    self._mark_domain(
+                        "providers_models",
+                        dirty=provider_dirty,
+                        base_revision=(
+                            self._drafts.get("providers_models", {}).get("base_revision", self._revision)
+                            if provider_dirty
+                            else self._revision
+                        ),
+                    )
                 self._persist_metadata()
             if self._revision != previous_revision:
                 self._emit()
@@ -2245,6 +2468,372 @@ class CoreStore:
                     issues.append(issue)
             return {"valid": not any(issue["severity"] == "error" for issue in issues), "issues": issues}
 
+    @staticmethod
+    def _relay_operation_count(relay: DomainAdapter) -> int:
+        """Return the public count of remote relay work that remains.
+
+        The relay adapter deliberately owns the journal and its retry state.
+        Core only needs the count for the Apply result, and must never copy a
+        credential-bearing resource payload into an IPC response.
+        """
+
+        try:
+            state = relay.snapshot()
+        except Exception:
+            return 0
+        if not isinstance(state, Mapping):
+            return 0
+        count = state.get("pending_operation_count")
+        if type(count) is int and count >= 0:
+            return count
+        entries = state.get("pending_operations")
+        if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes, bytearray)):
+            return 0
+        return sum(
+            1
+            for entry in entries
+            if isinstance(entry, Mapping)
+            and str(entry.get("status", entry.get("state", "staged"))) != "completed"
+        )
+
+    @staticmethod
+    def _relay_apply_issues(count: int, *, phase: str = "relay_apply") -> list[dict[str, str]]:
+        """Return a stable secret-free issue summary for an Apply result."""
+
+        if count <= 0:
+            return []
+        return [
+            {
+                "code": phase,
+                "message": "Relay synchronization has work that still needs attention.",
+            }
+        ]
+
+    @staticmethod
+    def _relay_public_issue_count(value: object) -> int:
+        """Count relay issues without echoing remote/server text to IPC."""
+
+        if not isinstance(value, Mapping):
+            return 0
+        issues = value.get("issues")
+        if not isinstance(issues, Sequence) or isinstance(issues, (str, bytes, bytearray)):
+            return 0
+        return sum(1 for item in issues if isinstance(item, (str, Mapping)))
+
+    def _mark_relay_coordinated_applied(self, name: str) -> None:
+        """Advance Core's local baseline after one coordinated local commit."""
+
+        self._baselines[name] = self._adapter_draft_state(name)
+        self._disk[name] = {
+            "changed": False,
+            "generation": int(self._disk.get(name, {}).get("generation", 0)),
+            "keep_draft": False,
+        }
+        self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
+
+    def _apply_relay_coordinated(
+        self,
+        names: Sequence[str],
+        adapters: Mapping[str, DomainAdapter],
+        confirm_codes: Sequence[str],
+        overwrite_codes: set[str],
+    ) -> dict[str, Any]:
+        """Apply relay and linked model changes around irreversible remote work.
+
+        The normal multi-domain Apply path can restore local files and adapter
+        objects. It cannot undo a remote key create, rotation, or deletion.
+        This coordinator therefore commits in the one safe ordering:
+
+        * validate and journal first;
+        * perform non-destructive remote mutations;
+        * reconcile stable resource IDs and materialize linked deployments;
+        * save local files and reload LiteLLM;
+        * only then delete remote keys.
+
+        Once an operation may have reached the remote service, a later local
+        failure becomes a truthful ``partial`` result. The relay journal is
+        intentionally retained for a retry instead of attempting a fictional
+        rollback.
+        """
+
+        relay = adapters.get("relay_accounts")
+        if relay is None:
+            raise CoreError("relay_apply_unavailable", "Relay synchronization is unavailable")
+        prepare = getattr(relay, "prepare_apply", None)
+        execute = getattr(relay, "execute_pending_operations", None)
+        reconcile = getattr(relay, "reconcile_apply", None)
+        commit = getattr(relay, "commit_apply", None)
+        finalize = getattr(relay, "finalize_apply", None)
+        binding_materials = getattr(relay, "binding_materials", None)
+        if not all(callable(method) for method in (prepare, execute, reconcile, commit, finalize, binding_materials)):
+            raise CoreError("relay_apply_unavailable", "Relay synchronization is unavailable")
+
+        transaction_adapters = dict(adapters)
+        adapter_checkpoints = {
+            name: _checkpoint_adapter(adapter, error_code="apply_failed")
+            for name, adapter in transaction_adapters.items()
+        }
+        core_checkpoint = {
+            "revision": self._revision,
+            "drafts": copy.deepcopy(self._drafts),
+            "last_actions": copy.deepcopy(self._last_actions),
+            "baselines": copy.deepcopy(self._baselines),
+            "disk": copy.deepcopy(self._disk),
+            "disk_identities": copy.deepcopy(self._disk_identities),
+            "service": copy.deepcopy(self._service),
+        }
+        persistence_paths = [
+            path
+            for adapter in transaction_adapters.values()
+            for path in _adapter_persistence_paths(adapter)
+        ]
+        if self._metadata_store is not None:
+            persistence_paths.append(self._metadata_store.path)
+        file_checkpoints = _checkpoint_files(persistence_paths)
+        remote_boundary_crossed = False
+        provider_locally_applied = False
+        relay_locally_applied = False
+        applied: list[str] = []
+        operation_total = 0
+
+        def restore_local_state() -> None:
+            _restore_files(file_checkpoints)
+            for adapter_name, adapter in transaction_adapters.items():
+                _restore_adapter(adapter, adapter_checkpoints[adapter_name])
+            self._revision = int(core_checkpoint["revision"])
+            self._drafts = copy.deepcopy(core_checkpoint["drafts"])
+            self._last_actions = copy.deepcopy(core_checkpoint["last_actions"])
+            self._baselines = copy.deepcopy(core_checkpoint["baselines"])
+            self._disk = copy.deepcopy(core_checkpoint["disk"])
+            self._disk_identities = copy.deepcopy(core_checkpoint["disk_identities"])
+            self._service = copy.deepcopy(core_checkpoint["service"])
+
+        try:
+            for name in names:
+                if f"overwrite_external_{name}" not in overwrite_codes:
+                    continue
+                rebase = getattr(adapters[name], "rebase_external_disk", None)
+                if not callable(rebase):
+                    raise CoreError("apply_failed", "Settings changed on disk; choose the disk version")
+                rebase()
+                self._disk[name]["changed"] = False
+                self._disk[name]["keep_draft"] = True
+
+            # Validate every participating local domain before a remote API
+            # call. Relay's preflight separately validates login/session,
+            # operation targets, and deletion policies.
+            for name in names:
+                if name == "providers_models":
+                    # Linked provider keys intentionally have no materialized
+                    # value until the relay resolution step below. Validate
+                    # the rest of the candidate with a domain-owned placeholder
+                    # contract, then run the strict validator after private
+                    # material is injected and before any local write.
+                    preflight = getattr(adapters[name], "validate_relay_preflight", None)
+                    if not callable(preflight) or preflight().get("valid") is not True:
+                        raise CoreError("validation_failed", "Fix provider/model issues before applying")
+                    continue
+                if not self.validate(name)["valid"]:
+                    raise CoreError("validation_failed", "Fix validation errors before applying")
+            prepared = prepare()
+            if not isinstance(prepared, Mapping) or prepared.get("ready") is not True:
+                raise CoreError("validation_failed", "Fix relay connection or binding issues before applying")
+            operations = prepared.get("operations", ())
+            if isinstance(operations, Sequence) and not isinstance(operations, (str, bytes, bytearray)):
+                operation_total = len(operations)
+            else:
+                operations = ()
+            # The journal itself is the phase source of truth. It is kept
+            # deliberately small and secret-free, so Core can classify work
+            # without inspecting an API request body.
+            non_destructive = [
+                operation
+                for operation in operations
+                if isinstance(operation, Mapping)
+                and operation.get("kind") != "api_key_delete"
+                and operation.get("state", operation.get("status", "staged")) == "staged"
+            ]
+            non_destructive_result: object = {"issues": []}
+            if non_destructive:
+                # We cross the remote boundary immediately before invoking the
+                # helper because a timeout is ambiguous: it may have applied
+                # the remote mutation even when no response was received.
+                remote_boundary_crossed = True
+                non_destructive_result = execute(prepared, phase="non_destructive")
+
+            reconciled = reconcile(prepared, phase="non_destructive")
+            # Transport failures are provisional until the immediate factual
+            # refresh. A lost response may still have applied remotely; only
+            # unresolved reconciliation issues stop the coordinated Apply.
+            if self._relay_public_issue_count(reconciled):
+                raise RuntimeError("relay_reconciliation_failed")
+
+            providers = adapters.get("providers_models")
+            if providers is not None:
+                materialize = getattr(providers, "materialize_relay_bindings", None)
+                dependency_summary = getattr(providers, "dependency_summary", None)
+                if not callable(materialize) or not callable(dependency_summary):
+                    raise CoreError("relay_apply_unavailable", "Linked model synchronization is unavailable")
+                dependencies = dependency_summary()
+                provider_keys = dependencies.get("provider_keys", []) if isinstance(dependencies, Mapping) else []
+                sources = [
+                    item.get("source")
+                    for item in provider_keys
+                    if isinstance(item, Mapping)
+                    and isinstance(item.get("source"), Mapping)
+                ]
+                if sources:
+                    # A relay ProviderKey is itself a dynamic binding, even
+                    # before a model selects it.  Resolve every selected key
+                    # here so a provider-side key import is fully usable
+                    # after Apply; private material remains inside Core.
+                    materials = binding_materials({"resources": sources}, refresh=True)
+                    materialized = materialize(materials)
+                    if self._relay_public_issue_count(materialized):
+                        raise RuntimeError("relay_binding_materialization_failed")
+                if not self.validate("providers_models")["valid"]:
+                    raise CoreError("validation_failed", "Fix linked model issues before applying")
+                providers.apply()
+                provider_locally_applied = True
+                self._mark_relay_coordinated_applied("providers_models")
+                applied.append("providers_models")
+
+            # Other local domains can participate in one explicit Apply. They
+            # commit after non-destructive relay work but before any remote
+            # deletion. A failure is therefore either fully rollbackable
+            # (there were no remote mutations) or truthfully partial.
+            for name in names:
+                if name in {"providers_models", "relay_accounts"}:
+                    continue
+                adapter = adapters[name]
+                domain_confirmations = list(confirm_codes)
+                if name == "claude" and any(
+                    item in {"accepted", "claude-risk-confirmed"} for item in domain_confirmations
+                ):
+                    try:
+                        from .domains.claude import RISK_CONFIRMATION_CODES
+                    except Exception:
+                        RISK_CONFIRMATION_CODES = ()
+                    domain_confirmations = [str(item) for item in RISK_CONFIRMATION_CODES]
+                payload: object | None = None
+                if domain_confirmations:
+                    payload = {"confirm_risks": domain_confirmations, "confirmation": domain_confirmations}
+                if payload is None:
+                    adapter.apply()
+                else:
+                    adapter.apply(payload)
+                self._mark_relay_coordinated_applied(name)
+                applied.append(name)
+
+            # The relay's durable draft includes operation-journal state. It
+            # is committed only after model materialization has reached disk,
+            # so a remote create cannot be lost if the app exits now.
+            commit()
+            relay_locally_applied = True
+            self._mark_relay_coordinated_applied("relay_accounts")
+            applied.append("relay_accounts")
+
+            if provider_locally_applied:
+                reloader = self._service_handlers.get("reload")
+                if reloader is not None:
+                    service_result = reloader("reload")
+                    if not isinstance(service_result, Mapping):
+                        raise RuntimeError("service_reload_failed")
+                    self._set_service_from_result(service_result, increment=False)
+                    if service_result.get("state") not in {"running", "starting"}:
+                        raise RuntimeError("service_reload_failed")
+
+            destructive = [
+                operation
+                for operation in operations
+                if isinstance(operation, Mapping)
+                and operation.get("kind") == "api_key_delete"
+                and operation.get("state", operation.get("status", "staged")) == "staged"
+            ]
+            destructive_result: object = {"issues": []}
+            if destructive:
+                # Local configuration is now independent of every key marked
+                # for removal; a failed deletion remains journaled for retry.
+                remote_boundary_crossed = True
+                destructive_result = execute(prepared, phase="destructive")
+            reconciled_after_delete = reconcile(prepared, phase="destructive")
+            finalize_result = finalize()
+            issue_count = (
+                self._relay_public_issue_count(reconciled_after_delete)
+                + self._relay_public_issue_count(finalize_result)
+            )
+            pending = self._relay_operation_count(relay)
+            if issue_count or pending:
+                # The local relay document is authoritative for completed
+                # work, while outstanding journal entries keep this domain
+                # dirty and retryable.
+                self._drafts["relay_accounts"]["dirty"] = True
+                self._drafts["relay_accounts"]["validation"] = {"valid": True, "issues": []}
+                self._revision += 1
+                self._persist_metadata()
+                self._emit()
+                return {
+                    "revision": self._revision,
+                    "applied": False,
+                    "status": "partial",
+                    "domains": applied,
+                    "completed_operations": max(operation_total - pending, 0),
+                    "pending_operations": pending,
+                    "issues": self._relay_apply_issues(issue_count),
+                }
+
+            self._mark_relay_coordinated_applied("relay_accounts")
+            self._revision += 1
+            self._persist_metadata()
+        except Exception as exc:
+            if not remote_boundary_crossed:
+                rollback_failed = False
+                try:
+                    restore_local_state()
+                except Exception:
+                    rollback_failed = True
+                if rollback_failed:
+                    raise CoreError("apply_failed", "Settings could not be rolled back") from None
+                if isinstance(exc, CoreError):
+                    raise
+                raise CoreError("apply_failed", safe_exception_message(exc)) from None
+
+            # Remote work may have succeeded even if the network connection
+            # timed out. Do not restore its operation journal or local files
+            # that have already committed; leave a visible, retryable partial
+            # state instead.
+            if provider_locally_applied:
+                self._mark_relay_coordinated_applied("providers_models")
+            if relay_locally_applied:
+                self._mark_relay_coordinated_applied("relay_accounts")
+            else:
+                self._drafts["relay_accounts"]["dirty"] = True
+                self._drafts["relay_accounts"]["validation"] = {"valid": True, "issues": []}
+            pending = self._relay_operation_count(relay)
+            self._revision += 1
+            self._persist_metadata()
+            self._emit()
+            return {
+                "revision": self._revision,
+                "applied": False,
+                "status": "partial",
+                "domains": applied,
+                "completed_operations": max(operation_total - pending, 0),
+                "pending_operations": pending,
+                "issues": self._relay_apply_issues(1),
+            }
+
+        self._emit()
+        return {
+            "revision": self._revision,
+            "applied": True,
+            "status": "applied",
+            "domains": applied,
+            "completed_operations": operation_total,
+            "pending_operations": 0,
+            "issues": [],
+        }
+
     def apply(
         self,
         domain: str | None = None,
@@ -2268,7 +2857,40 @@ class CoreStore:
             else:
                 names = [_canonical_domain(domain)] if domain is not None else [name for name, meta in self._drafts.items() if meta.get("dirty")]
             if not names:
-                return {"revision": self._revision, "applied": True, "domains": []}
+                return {
+                    "revision": self._revision,
+                    "applied": True,
+                    "status": "applied",
+                    "domains": [],
+                    "completed_operations": 0,
+                    "pending_operations": 0,
+                    "issues": [],
+                }
+
+            # A provider draft containing relay-sourced ProviderKeys must
+            # resolve them against the relay domain in the same Apply.
+            # Conversely, a relay draft that can affect those keys must bring
+            # the provider domain into the coordinated transaction.
+            # Independent providers keep the ordinary local-only path.
+            relay_candidate = self._domains.get("relay_accounts")
+            provider_candidate = self._domains.get("providers_models")
+            relay_coordinator_available = callable(getattr(relay_candidate, "prepare_apply", None))
+            dependency_summary = getattr(provider_candidate, "dependency_summary", None)
+            linked_provider_key_count = 0
+            if callable(dependency_summary):
+                try:
+                    dependency_state = dependency_summary()
+                except Exception:
+                    dependency_state = None
+                if isinstance(dependency_state, Mapping):
+                    count = dependency_state.get("provider_key_count")
+                    if type(count) is int and count > 0:
+                        linked_provider_key_count = count
+            if relay_coordinator_available and linked_provider_key_count:
+                if "providers_models" in names and "relay_accounts" not in names:
+                    names.append("relay_accounts")
+                elif "relay_accounts" in names and "providers_models" not in names:
+                    names.append("providers_models")
             adapters: dict[str, DomainAdapter] = {}
             for name in names:
                 adapter = self._domains.get(name)
@@ -2292,6 +2914,9 @@ class CoreStore:
                 # this Apply attempt has written to disk. In particular, never
                 # restore an older checkpoint over the newly detected file.
                 raise ConfirmationNeeded(missing_overwrite)
+
+            if "relay_accounts" in adapters and relay_coordinator_available:
+                return self._apply_relay_coordinated(names, adapters, confirm_codes, overwrite_codes)
 
             transaction_adapters = dict(adapters)
             adapter_checkpoints = {
@@ -2385,7 +3010,15 @@ class CoreStore:
                     raise
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
             self._emit()
-            return {"revision": self._revision, "applied": True, "domains": applied}
+            return {
+                "revision": self._revision,
+                "applied": True,
+                "status": "applied",
+                "domains": applied,
+                "completed_operations": 0,
+                "pending_operations": 0,
+                "issues": [],
+            }
 
     def reload(self, domain: str | None = None, *, revision: int | None = None) -> dict[str, Any]:
         with self._lock:

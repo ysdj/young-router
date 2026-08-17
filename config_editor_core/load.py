@@ -9,8 +9,16 @@ from .schema import (
     DEFAULT_API_KEY_NAME,
     DISABLED_MODELS_KEY,
     MENU_API_KEY_NAME_KEY,
+    MENU_MANUAL_ORDER_KEY,
     MENU_MODEL_ENABLED_KEY,
+    MENU_ORDER_MODE_KEY,
+    MENU_PROVIDER_KEY_ID_KEY,
+    MENU_RELAY_CATALOG_MODE_KEY,
+    MENU_RELAY_KEYS_KEY,
+    MENU_RELAY_KEYS_VERSION,
+    MENU_RELAY_SOURCE_MODEL_KEY,
     MENU_ROUTE_KEY,
+    MENU_PROVIDER_SOURCE_KEY,
     UPSTREAM_PROTOCOL_MODE_KEY,
     UPSTREAM_URL_SURFACE_KEY,
     _as_dict,
@@ -20,6 +28,11 @@ from .schema import (
     _disabled_models_path,
     _editor_deployment_id,
     _jsonable,
+    _menu_order,
+    _provider_key_id,
+    _provider_source,
+    _relay_source,
+    _stable_provider_key_id,
     _string_value,
     _upstream_protocol_mode,
     _upstream_url_surface,
@@ -34,8 +47,18 @@ CONFIG_DOCUMENT_KEYS = {CONFIG_DOCUMENT_CONFIG_KEY, CONFIG_DOCUMENT_DISABLED_KEY
 
 def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
     provider = _as_dict(value)
-    api_keys = _provider_api_keys_from_raw(provider)
+    api_keys = _provider_api_keys_from_raw(name, provider)
     api_key = api_keys[0]["value"] if api_keys else ""
+    source = _provider_source(provider.get(MENU_PROVIDER_SOURCE_KEY))
+    extra = {
+        key: _jsonable(raw_value)
+        for key, raw_value in provider.items()
+        if key not in {"enabled", "api_base", "api_keys"}
+    }
+    # Legacy documents get deterministic independent IDs on first load. The
+    # dumper persists them in this existing provider-extra extension without
+    # ever copying credential values into metadata.
+    extra[MENU_RELAY_KEYS_KEY] = _relay_key_metadata(api_keys)
     return {
         "name": name,
         "enabled": _bool_value(provider.get("enabled"), True),
@@ -43,15 +66,37 @@ def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
         "api_key": api_key,
         "api_keys": api_keys,
         "models": [],
-        "extra": {
-            key: _jsonable(raw_value)
-            for key, raw_value in provider.items()
-            if key not in {"enabled", "api_base", "api_keys"}
-        },
+        "extra": extra,
+        "provider_type": source["kind"],
+        "relay_station_id": source.get("station_id", ""),
     }
 
 
-def _provider_api_keys_from_raw(provider: dict[str, Any]) -> list[dict[str, Any]]:
+def _relay_key_metadata(api_keys: list[dict[str, Any]]) -> dict[str, Any]:
+    """Persist stable ProviderKey slots separately from credential values."""
+
+    return {
+        "version": MENU_RELAY_KEYS_VERSION,
+        "slots": [
+            {
+                "id": _provider_key_id(item.get("id"), required=True),
+                "api_key_name": _string_value(item.get("name")).strip(),
+                "source": _relay_source(item.get("source")),
+            }
+            for item in api_keys
+        ],
+    }
+
+
+def _provider_api_keys_from_raw(provider_name: str, provider: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_slots = _as_dict(provider.get(MENU_RELAY_KEYS_KEY)).get("slots")
+    slots_by_name: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_slots, list):
+        for raw_slot in raw_slots:
+            slot = _as_dict(raw_slot)
+            key_name = _string_value(slot.get("api_key_name")).strip()
+            if key_name:
+                slots_by_name[key_name] = slot
     keys: list[dict[str, Any]] = []
     seen_names: set[str] = set()
     seen_values: set[str] = set()
@@ -61,10 +106,16 @@ def _provider_api_keys_from_raw(provider: dict[str, Any]) -> list[dict[str, Any]
         key_value = _string_value(item_dict.get("value"))
         if not key_value or key_name in seen_names or key_value in seen_values:
             continue
-        keys.append({
-            "name": key_name,
-            "value": key_value,
-        })
+        slot = slots_by_name.get(key_name, {})
+        keys.append(
+            {
+                "id": _provider_key_id(slot.get("id"))
+                or _stable_provider_key_id(provider_name, key_name),
+                "name": key_name,
+                "value": key_value,
+                "source": _relay_source(slot.get("source")),
+            }
+        )
         seen_names.add(key_name)
         seen_values.add(key_value)
     return keys
@@ -111,15 +162,28 @@ def _ensure_provider_key(provider: dict[str, Any], api_key: str, preferred_name:
 
     keys = [
         {
+            "id": _provider_key_id(_as_dict(item).get("id"))
+            or _stable_provider_key_id(provider.get("name"), _string_value(_as_dict(item).get("name")).strip()),
             "name": _string_value(_as_dict(item).get("name")).strip(),
             "value": _string_value(_as_dict(item).get("value")),
+            "source": _relay_source(_as_dict(item).get("source")),
         }
         for item in _as_list(provider.get("api_keys"))
         if _string_value(_as_dict(item).get("value"))
     ]
     key_name = _unique_key_name(keys, preferred_name)
-    keys.append({"name": key_name, "value": api_key})
+    keys.append(
+        {
+            "id": _stable_provider_key_id(provider.get("name"), key_name),
+            "name": key_name,
+            "value": api_key,
+            "source": {"kind": "independent"},
+        }
+    )
     provider["api_keys"] = keys
+    extra = dict(_as_dict(provider.get("extra")))
+    extra[MENU_RELAY_KEYS_KEY] = _relay_key_metadata(keys)
+    provider["extra"] = extra
     return key_name
 
 
@@ -131,6 +195,7 @@ def _model_to_editor(
     provider_by_key: dict[str, tuple[str, str]],
     provider_by_base: dict[str, str],
     provider_keys: dict[str, list[dict[str, Any]]],
+    provider_by_key_id: dict[str, tuple[str, str]],
 ) -> dict[str, Any]:
     entry = _as_dict(model)
     params = _as_dict(entry.get("litellm_params"))
@@ -138,7 +203,12 @@ def _model_to_editor(
     provider = _string_value(model_info.get("provider")).strip()
     api_base = _string_value(params.get("api_base"))
     api_key = _string_value(params.get("api_key"))
-    api_key_name = ""
+    api_key_name = _string_value(model_info.get(MENU_API_KEY_NAME_KEY)).strip()
+    provider_key_id = _provider_key_id(model_info.get(MENU_PROVIDER_KEY_ID_KEY))
+    if provider_key_id:
+        match = provider_by_key_id.get(provider_key_id)
+        if match:
+            provider, api_key_name = match
     if not provider:
         match = provider_by_pair.get((api_base, api_key))
         if match:
@@ -156,6 +226,14 @@ def _model_to_editor(
             if item.get("value") == api_key:
                 api_key_name = item.get("name", "")
                 break
+    if provider and not provider_key_id:
+        for item in provider_keys.get(provider, []):
+            if api_key_name and item.get("name") == api_key_name:
+                provider_key_id = _string_value(item.get("id")).strip()
+                break
+            if api_key and item.get("value") == api_key:
+                provider_key_id = _string_value(item.get("id")).strip()
+                break
 
     litellm_extra = {
         key: _jsonable(value)
@@ -170,6 +248,11 @@ def _model_to_editor(
             "provider",
             MENU_ROUTE_KEY,
             MENU_API_KEY_NAME_KEY,
+            MENU_PROVIDER_KEY_ID_KEY,
+            MENU_RELAY_CATALOG_MODE_KEY,
+            MENU_RELAY_SOURCE_MODEL_KEY,
+            MENU_ORDER_MODE_KEY,
+            MENU_MANUAL_ORDER_KEY,
             "supports_responses_image_generation_tool",
             UPSTREAM_PROTOCOL_MODE_KEY,
             UPSTREAM_URL_SURFACE_KEY,
@@ -193,6 +276,10 @@ def _model_to_editor(
         if key not in {"model_name", "litellm_params", "model_info"}
     }
     order = _string_value(params.get("order") if params.get("order") is not None else 1).strip() or "1"
+    manual_order = _string_value(model_info.get(MENU_MANUAL_ORDER_KEY)).strip() or order
+    order_mode = _string_value(model_info.get(MENU_ORDER_MODE_KEY)).strip() or "manual"
+    catalog_mode = _string_value(model_info.get(MENU_RELAY_CATALOG_MODE_KEY)).strip() or "independent"
+    effective_order = _menu_order(order, "Route order")
 
     supports_responses_image_tool = bool(
         model_info.get("supports_responses_image_generation_tool")
@@ -210,6 +297,12 @@ def _model_to_editor(
         "api_base": api_base,
         "api_key": api_key,
         "api_key_name": api_key_name,
+        "provider_key_id": provider_key_id,
+        "catalog_mode": catalog_mode,
+        "source_model_id": _string_value(model_info.get(MENU_RELAY_SOURCE_MODEL_KEY)).strip(),
+        "order_mode": order_mode,
+        "manual_order": manual_order,
+        "effective_order": effective_order,
         "order": order,
         "ssl_verify": _string_value(params.get("ssl_verify")) if "ssl_verify" in params else "",
         "ssl_verify_present": "ssl_verify" in params,
@@ -238,10 +331,23 @@ def _append_model_to_provider(
             "enabled": True,
             "api_base": str(model.get("api_base", "")).strip(),
             "api_key": api_key,
-            "api_keys": [{"name": key_name, "value": api_key}] if api_key else [],
+            "api_keys": [
+                {
+                    "id": _string_value(model.get("provider_key_id")).strip()
+                    or _stable_provider_key_id(provider, key_name),
+                    "name": key_name,
+                    "value": api_key,
+                    "source": {"kind": "independent"},
+                }
+            ]
+            if api_key
+            else [],
             "models": [],
             "extra": {},
         }
+        provider_index[provider]["extra"][MENU_RELAY_KEYS_KEY] = _relay_key_metadata(
+            provider_index[provider]["api_keys"]
+        )
         providers.append(provider_index[provider])
     provider_entry = provider_index[provider]
     if not str(provider_entry.get("api_base", "")).strip():
@@ -253,6 +359,11 @@ def _append_model_to_provider(
     )
     if key_name:
         model["api_key_name"] = key_name
+        for item in _as_list(provider_entry.get("api_keys")):
+            item_dict = _as_dict(item)
+            if _string_value(item_dict.get("name")).strip() == key_name:
+                model["provider_key_id"] = _string_value(item_dict.get("id")).strip()
+                break
     provider_index[provider]["models"].append(model)
 
 
@@ -313,13 +424,16 @@ def load_config_document(document: Any) -> dict[str, Any]:
     provider_by_key: dict[str, tuple[str, str]] = {}
     provider_by_base: dict[str, str] = {}
     provider_keys: dict[str, list[dict[str, Any]]] = {}
+    provider_by_key_id: dict[str, tuple[str, str]] = {}
 
     for name, provider in provider_index.items():
         api_base = _string_value(provider.get("api_base"))
         keys = [
             {
+                "id": _string_value(_as_dict(item).get("id")).strip(),
                 "name": _string_value(_as_dict(item).get("name")).strip(),
                 "value": _string_value(_as_dict(item).get("value")),
+                "source": _relay_source(_as_dict(item).get("source")),
             }
             for item in _as_list(provider.get("api_keys"))
             if _string_value(_as_dict(item).get("value"))
@@ -328,6 +442,9 @@ def load_config_document(document: Any) -> dict[str, Any]:
         for item in keys:
             api_key = item["value"]
             key_name = item["name"]
+            provider_key_id = item["id"]
+            if provider_key_id:
+                provider_by_key_id[provider_key_id] = (name, key_name)
             if api_base and api_key and (api_base, api_key) not in provider_by_pair:
                 provider_by_pair[(api_base, api_key)] = (name, key_name)
             if api_key and api_key not in provider_by_key:
@@ -336,7 +453,16 @@ def load_config_document(document: Any) -> dict[str, Any]:
             provider_by_base[api_base] = name
 
     for item in _as_list(data.get("model_list")):
-        model = _model_to_editor(item, True, known_provider_names, provider_by_pair, provider_by_key, provider_by_base, provider_keys)
+        model = _model_to_editor(
+            item,
+            True,
+            known_provider_names,
+            provider_by_pair,
+            provider_by_key,
+            provider_by_base,
+            provider_keys,
+            provider_by_key_id,
+        )
         _append_model_to_provider(providers, provider_index, model)
 
     disabled_text = normalized_document[CONFIG_DOCUMENT_DISABLED_KEY]
@@ -345,7 +471,16 @@ def load_config_document(document: Any) -> dict[str, Any]:
             disabled_text, pathlib.Path("config.disabled-models.yaml")
         )
         for item in _as_list(disabled_data.get(DISABLED_MODELS_KEY)):
-            model = _model_to_editor(item, False, known_provider_names, provider_by_pair, provider_by_key, provider_by_base, provider_keys)
+            model = _model_to_editor(
+                item,
+                False,
+                known_provider_names,
+                provider_by_pair,
+                provider_by_key,
+                provider_by_base,
+                provider_keys,
+                provider_by_key_id,
+            )
             _append_model_to_provider(providers, provider_index, model)
 
     _refresh_model_enabled_states(providers)

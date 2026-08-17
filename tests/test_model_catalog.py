@@ -113,7 +113,7 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(272_000, model["context_window"])
         self.assertEqual(272_000, model["max_context_window"])
 
-    def test_upstream_refresh_updates_cache_and_codex_policy_has_priority(self) -> None:
+    def test_upstream_refresh_uses_pi_agent_policy_before_hard_limit_catalogs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = root / "runtime-settings.env"
@@ -123,18 +123,35 @@ class ModelCatalogTests(unittest.TestCase):
             def fetch(source: str) -> object:
                 if source == MODEL_CONTEXT_SOURCES[0]:
                     return {
-                        "vendor/new-agent": {"limit": {"context": 400_000, "input": 500_000}},
-                        "openai/gpt-5.6-sol": {"limit": {"context": 1_050_000, "input": 922_000}},
-                        "moonshotai/kimi-k3": {"limit": {"context": 1_048_576, "input": 1_048_576}},
+                        "openai": {
+                            "gpt-5.6-sol": {
+                                "id": "gpt-5.6-sol",
+                                "contextWindow": 272_000,
+                                "maxTokens": 128_000,
+                            }
+                        },
+                        "openrouter": {
+                            "openai/gpt-5.6-sol": {
+                                "id": "openai/gpt-5.6-sol",
+                                "contextWindow": 1_050_000,
+                                "maxTokens": 128_000,
+                            }
+                        },
+                    }
+                if source == MODEL_CONTEXT_SOURCES[1]:
+                    return {
+                        "models": [
+                            {
+                                "slug": "gpt-5.6-sol",
+                                "context_window": 300_000,
+                                "max_context_window": 300_000,
+                            }
+                        ]
                     }
                 return {
-                    "models": [
-                        {
-                            "slug": "gpt-5.6-sol",
-                            "context_window": 300_000,
-                            "max_context_window": 300_000,
-                        }
-                    ]
+                    "vendor/new-agent": {"limit": {"context": 400_000, "input": 500_000}},
+                    "openai/gpt-5.6-sol": {"limit": {"context": 1_050_000, "input": 922_000}},
+                    "moonshotai/kimi-k3": {"limit": {"context": 1_048_576, "input": 1_048_576}},
                 }
 
             registry = ModelContextRegistry(
@@ -147,12 +164,61 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertTrue(registry.refresh_if_due(force=True))
             self.assertEqual(400_000, registry.record_for("vendor/new-agent").context_window)
             self.assertEqual(300_000, registry.record_for("gpt-5.6-sol").context_window)
-            self.assertEqual(300_000, registry.record_for("openai/gpt-5.6-sol").context_window)
+            self.assertEqual(272_000, registry.record_for("openai/gpt-5.6-sol").context_window)
+            self.assertEqual(1_050_000, registry.record_for("openrouter/openai/gpt-5.6-sol").context_window)
             self.assertEqual(262_144, registry.record_for("openai/kimi-k3").context_window)
             self.assertTrue(cache.exists())
 
             cached = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
             self.assertEqual(400_000, cached.record_for("vendor/new-agent").context_window)
+
+    def test_legacy_context_cache_refreshes_for_pi_profiles_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "runtime-settings.env"
+            settings.write_text("LITELLM_MENU_MODEL_CONTEXT_REFRESH_HOURS=24\n", encoding="utf-8")
+            cache = root / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": 1_000_000,
+                        "records": {
+                            "openai/gpt-5.6-sol": {
+                                "context_window": 1_050_000,
+                                "max_context_window": 1_050_000,
+                                "source": "https://models.dev/models.json",
+                                "priority": 20,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fetched: list[str] = []
+
+            def fetch(source: str) -> object:
+                fetched.append(source)
+                if source == MODEL_CONTEXT_SOURCES[0]:
+                    return {
+                        "openai": {
+                            "gpt-5.6-sol": {
+                                "id": "gpt-5.6-sol",
+                                "contextWindow": 272_000,
+                            }
+                        }
+                    }
+                return {}
+
+            registry = ModelContextRegistry(
+                runtime_settings_path=settings,
+                cache_path=cache,
+                refresh_enabled=True,
+                fetcher=fetch,
+                clock=lambda: 1_000_000,
+            )
+            self.assertTrue(registry.refresh_if_due())
+            self.assertIn(MODEL_CONTEXT_SOURCES[0], fetched)
+            self.assertEqual(272_000, registry.record_for("openai/gpt-5.6-sol").context_window)
 
     def test_catalog_current_check_detects_changed_model_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

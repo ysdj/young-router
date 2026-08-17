@@ -244,6 +244,7 @@ struct ButtonComponentView final
       else if (symbol == "close") icon.Glyph(L"\xE711");
       else if (symbol == "copy") icon.Glyph(L"\xE8C8");
       else if (symbol == "edit") icon.Glyph(L"\xE70F");
+      else if (symbol == "import") icon.Glyph(L"\xE8B5");
       else if (symbol == "power-on" || symbol == "power-off") icon.Glyph(L"\xE7E8");
       else if (symbol == "minus") icon.Glyph(L"\xE738");
       else if (symbol == "pause") icon.Glyph(L"\xE769");

@@ -116,7 +116,24 @@
     "revisionResult": {"type": "object", "additionalProperties": false, "required": ["revision"], "properties": {"revision": {"$ref": "#/$defs/revision"}}},
     "subscribeResult": {"type": "object", "additionalProperties": false, "required": ["subscription_id"], "properties": {"subscription_id": {"type": "string"}}},
     "validateResult": {"type": "object", "additionalProperties": false, "required": ["validate"], "properties": {"validate": {"$ref": "#/$defs/validationSummary"}}},
-    "applyResult": {"type": "object", "additionalProperties": false, "required": ["revision", "applied"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "applied": {"const": true}, "domains": {"type": "array", "items": {"$ref": "#/$defs/domain"}}}},
+    "applyIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": "string"},
+        "message": {"type": "string"},
+        "operation_id": {"type": "string"},
+        "domain": {"$ref": "#/$defs/domain"},
+        "station_id": {"type": "string"},
+        "account_id": {"type": "string"},
+        "resource_id": {"type": "string"},
+        "provider_id": {"type": "string"},
+        "model_id": {"type": "string"},
+        "retryable": {"type": "boolean"}
+      }
+    },
+    "applyIssues": {"type": "array", "items": {"$ref": "#/$defs/applyIssue"}, "x-typescript-type": "ApplyIssue[]"},
+    "applyResult": {"type": "object", "additionalProperties": false, "required": ["revision", "applied", "status", "completed_operations", "pending_operations", "issues"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "applied": {"type": "boolean"}, "domains": {"type": "array", "items": {"$ref": "#/$defs/domain"}}, "status": {"enum": ["applied", "partial", "failed"]}, "completed_operations": {"type": "integer", "minimum": 0}, "pending_operations": {"type": "integer", "minimum": 0}, "issues": {"$ref": "#/$defs/applyIssues"}}},
     "probeResult": {"type": "object", "required": ["ok", "protocols"], "properties": {"ok": {"type": "boolean"}, "protocols": {"type": "array", "items": {"type": "string"}}, "detail": {"type": "string"}, "available": {"type": "boolean"}, "provider_id": {"type": "string"}, "model_id": {"type": "string"}, "recommended_surface": {"enum": ["openai/responses", "openai/chat", "anthropic", null]}, "summary": {"type": "object", "required": ["available_surfaces", "unavailable_surfaces", "statuses"], "properties": {"available_surfaces": {"type": "array", "items": {"type": "string"}}, "unavailable_surfaces": {"type": "array", "items": {"type": "string"}}, "statuses": {"type": "object", "x-typescript-type": "Record<string, string>"}}}, "surfaces": {"type": "array", "items": {"type": "object", "required": ["surface", "available"], "properties": {"surface": {"type": "string"}, "available": {"type": "boolean"}, "status": {"type": "string"}, "original_request": {"type": "object", "required": ["method", "url", "headers", "body"], "properties": {"method": {"type": "string"}, "url": {"type": "string"}, "headers": {"type": "object", "x-typescript-type": "Record<string, string>"}, "body": {"type": "object", "x-typescript-type": "Record<string, unknown>"}}}}}}}},
     "exportResult": {"type": "object", "additionalProperties": false, "required": ["revision", "section_count"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "section_count": {"type": "integer", "minimum": 0}, "sections": {"type": "array", "items": {"$ref": "#/$defs/domain"}}}},
     "importPreviewResult": {"type": "object", "additionalProperties": false, "required": ["revision", "import_plan_token", "detected_sections", "preview"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "import_plan_token": {"type": "string", "minLength": 1, "maxLength": 256}, "detected_sections": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/domain"}}, "preview": {"$ref": "#/$defs/importPreview"}}},

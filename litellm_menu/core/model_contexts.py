@@ -25,10 +25,17 @@ DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
 DEFAULT_MODEL_CONTEXT_REFRESH_HOURS = 24
 MODEL_CONTEXT_CACHE_FILE_NAME = "litellm-menu-model-contexts.json"
 MODEL_CONTEXT_SOURCES = (
-    "https://models.dev/models.json",
+    "https://pi.dev/api/models",
     "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json",
+    "https://models.dev/models.json",
 )
+_PI_SOURCE = MODEL_CONTEXT_SOURCES[0]
 _CODEX_SOURCE = MODEL_CONTEXT_SOURCES[1]
+_SOURCE_PRIORITIES = {
+    _PI_SOURCE: 40,
+    _CODEX_SOURCE: 30,
+    MODEL_CONTEXT_SOURCES[2]: 20,
+}
 _UPSTREAM_MAX_BYTES = 8 * 1024 * 1024
 
 
@@ -103,7 +110,11 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
         return None
     limits = value.get("limit")
     limits = limits if isinstance(limits, Mapping) else {}
-    context = _positive_int(value.get("context_window")) or _positive_int(limits.get("context"))
+    context = (
+        _positive_int(value.get("context_window"))
+        or _positive_int(value.get("contextWindow"))
+        or _positive_int(limits.get("context"))
+    )
     maximum = _positive_int(value.get("max_context_window"))
     if maximum is None:
         maximum = _positive_int(value.get("max_input_tokens")) or _positive_int(limits.get("input"))
@@ -128,9 +139,35 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
     return result
 
 
+def _pi_source_records(payload: object, *, source: str, priority: int) -> dict[str, dict[str, Any]]:
+    """Extract Pi's provider-qualified agent profiles without conflating routes."""
+
+    result: dict[str, dict[str, Any]] = {}
+    if not isinstance(payload, Mapping):
+        return result
+    for raw_provider, models in payload.items():
+        if not isinstance(raw_provider, str) or not raw_provider.strip():
+            continue
+        if not isinstance(models, Mapping):
+            continue
+        provider = raw_provider.strip().casefold()
+        for item in models.values():
+            if not isinstance(item, Mapping):
+                continue
+            model_id = item.get("id")
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+            record = _record_from_payload(item, source=source, priority=priority)
+            if record is not None:
+                result[f"{provider}/{model_id.strip().casefold()}"] = record
+    return result
+
+
 def _source_records(payload: object, *, source: str, priority: int) -> dict[str, dict[str, Any]]:
     """Extract provider-neutral or Codex model records from an upstream JSON document."""
 
+    if source == _PI_SOURCE:
+        return _pi_source_records(payload, source=source, priority=priority)
     result: dict[str, dict[str, Any]] = {}
     if isinstance(payload, Mapping):
         if isinstance(payload.get("models"), Sequence) and not isinstance(payload.get("models"), (str, bytes, bytearray)):
@@ -292,6 +329,10 @@ class ModelContextRegistry:
         cached = payload.get("records")
         if not isinstance(cached, Mapping):
             return
+        cache_has_pi_profiles = any(
+            isinstance(record, Mapping) and record.get("source") == _PI_SOURCE
+            for record in cached.values()
+        )
         parsed = _source_records(cached, source="cache", priority=1)
         # Preserve the source and priority carried by a valid cache entry.
         for model_id, raw in cached.items():
@@ -301,6 +342,11 @@ class ModelContextRegistry:
             if record is not None:
                 parsed[model_id.casefold()] = record
         _merge_records(self._records, parsed)
+        # The pre-Pi cache contains only hard-limit sources.  Do not make an
+        # installed upgrade wait for its previous 24-hour refresh interval
+        # before adopting provider-specific agent profiles.
+        if self._cache_fetched_at is not None and not cache_has_pi_profiles:
+            self._cache_fetched_at = None
 
     def _runtime_values(self) -> tuple[int, int]:
         unknown = UNKNOWN_MODEL_CONTEXT_WINDOW
@@ -358,7 +404,7 @@ class ModelContextRegistry:
         self._last_refresh_attempt = now
         refreshed = False
         for source in MODEL_CONTEXT_SOURCES:
-            priority = 30 if source == _CODEX_SOURCE else 20
+            priority = _SOURCE_PRIORITIES[source]
             try:
                 payload = self._fetcher(source)
                 incoming = _source_records(payload, source=source, priority=priority)

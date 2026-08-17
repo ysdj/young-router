@@ -1426,8 +1426,8 @@ private enum NativeRelayOriginPolicy {
             )
         case "relay-add":
             return RouteWindowLayout(
-                contentSize: NSSize(width: 900, height: 680),
-                minSize: NSSize(width: 720, height: 560),
+                contentSize: NSSize(width: 620, height: 350),
+                minSize: NSSize(width: 540, height: 330),
                 maxSize: nil
             )
         case "codex-settings", "claude-settings":
@@ -2034,6 +2034,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         style.id = styleID;
         style.textContent = `
           html { scroll-behavior: auto !important; }
+          html, body, * { scrollbar-width: none !important; }
+          *::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
           *, *::before, *::after {
             animation: none !important;
             transition: none !important;
@@ -2101,6 +2103,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private var loginFormRevealProbe: DispatchWorkItem?
     private var loginFormRevealAttempts = 0
     private var didRevealLoginField = false
+    private var agreementRevealProbe: DispatchWorkItem?
+    private var agreementRevealAttempts = 0
     private var automaticCheckProbe: DispatchWorkItem?
     private var panelClosedDuringCommit = false
     private var activeCheck: NativeRelayLoginAttempt?
@@ -2192,6 +2196,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             configureImmediatePresentation(panel)
             withoutAnimations { panel.makeKeyAndOrderFront(nil) }
         } else if let embeddedWindow {
+            // The compact URL form does not reserve browser space. Expand the
+            // sheet only when the native WebView is actually presented so the
+            // page can show its lower agreement control without scrolling the
+            // surrounding settings surface.
+            embeddedWindow.setContentSize(NSSize(width: 900, height: 760))
             configureImmediatePresentation(embeddedWindow)
             embeddedCloseObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.willCloseNotification,
@@ -2945,6 +2954,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         pageReadinessProbe = nil
         loginFormRevealProbe?.cancel()
         loginFormRevealProbe = nil
+        agreementRevealProbe?.cancel()
+        agreementRevealProbe = nil
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "litellmRelayPassword")
         if let observer = embeddedCloseObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -2972,6 +2983,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard isBrowserFlowLive else { return }
         schedulePageReadinessProbe()
+        scheduleAgreementReveal()
         if mode == .logs {
             if !didRestoreSession {
                 restoreLocalStorageWhenReady()
@@ -3016,6 +3028,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 guard let self, self.isBrowserFlowLive else { return }
                 if value as? Bool == true {
                     withoutAnimations { self.loadingOverlay.isHidden = true }
+                    self.scheduleAgreementReveal()
                     if self.mode == .logs {
                         if !self.didRestoreSession {
                             self.restoreLocalStorageWhenReady()
@@ -3095,12 +3108,52 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
+    private func scheduleAgreementReveal() {
+        guard mode == .login, isBrowserFlowLive, agreementRevealAttempts < 16 else { return }
+        agreementRevealProbe?.cancel()
+        agreementRevealAttempts += 1
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isBrowserFlowLive else { return }
+            let script = """
+            (() => {
+              const terms = /agree|terms|privacy|consent|协议|同意|隐私|用户协议/iu;
+              const visible = (node) => {
+                if (!(node instanceof Element)) return false;
+                const rect = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const checkbox = Array.from(document.querySelectorAll('input[type="checkbox"],[role="checkbox"]')).find((node) => {
+                const scope = node.closest('label,li,form,section,div') || node.parentElement || node;
+                return terms.test((scope.innerText || scope.textContent || '').trim());
+              });
+              if (!checkbox || !visible(checkbox)) return false;
+              (checkbox.closest('label,li,form,section') || checkbox).scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+              return true;
+            })();
+            """
+            self.webView.evaluateJavaScript(script) { [weak self] value, _ in
+                guard let self, self.isBrowserFlowLive else { return }
+                if value as? Bool == true {
+                    self.agreementRevealProbe = nil
+                } else {
+                    self.scheduleAgreementReveal()
+                }
+            }
+        }
+        agreementRevealProbe = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+    }
+
     private func showBrowserLoading() {
         pageReadinessProbe?.cancel()
         loginFormRevealProbe?.cancel()
         loginFormRevealProbe = nil
         loginFormRevealAttempts = 0
         didRevealLoginField = false
+        agreementRevealProbe?.cancel()
+        agreementRevealProbe = nil
+        agreementRevealAttempts = 0
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
         loadingLabel.stringValue = mode == .logs

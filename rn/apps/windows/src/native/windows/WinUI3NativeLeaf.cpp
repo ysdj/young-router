@@ -52,7 +52,7 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   // page, while Win32 owns frame constraints and DPI conversion.
   if (route == L"providers-models") return {780, 560};
   if (route == L"relay-accounts") return {780, 440};
-  if (route == L"relay-add") return {720, 560};
+  if (route == L"relay-add") return {540, 330};
   if (route == L"codex-settings" || route == L"claude-settings") return {1100, 640};
   if (route == L"runtime-settings") return {800, 520};
   if (route == L"data-management") return {500, 160};
@@ -65,7 +65,7 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
 ContentSize RouteInitialContentSize(std::wstring_view route) {
   if (route == L"providers-models") return {780, 560};
   if (route == L"relay-accounts") return {820, 480};
-  if (route == L"relay-add") return {900, 680};
+  if (route == L"relay-add") return {620, 350};
   if (route == L"codex-settings" || route == L"claude-settings") return {1160, 700};
   if (route == L"runtime-settings") return {1080, 620};
   if (route == L"data-management") return {520, 175};

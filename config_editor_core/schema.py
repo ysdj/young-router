@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -36,6 +37,18 @@ DEFAULT_API_KEY_NAME = "default"
 MENU_MODEL_ENABLED_KEY = "x-litellm-menu-model-enabled"
 MENU_ROUTE_KEY = "route_key"
 MENU_API_KEY_NAME_KEY = "api_key_name"
+MENU_RELAY_KEYS_KEY = "x-litellm-menu-relay-keys"
+MENU_RELAY_KEYS_VERSION = 1
+MENU_PROVIDER_KEY_ID_KEY = "x-litellm-menu-provider-key-id"
+MENU_RELAY_CATALOG_MODE_KEY = "x-litellm-menu-relay-catalog-mode"
+MENU_RELAY_SOURCE_MODEL_KEY = "x-litellm-menu-relay-source-model"
+MENU_ORDER_MODE_KEY = "x-litellm-menu-order-mode"
+MENU_MANUAL_ORDER_KEY = "x-litellm-menu-manual-order"
+MENU_PROVIDER_SOURCE_KEY = "x-litellm-menu-provider-source"
+PROVIDER_KEY_SOURCE_KINDS = {"independent", "relay"}
+PROVIDER_SOURCE_KINDS = {"custom", "relay"}
+MODEL_CATALOG_MODES = {"independent", "relay_linked"}
+MODEL_ORDER_MODES = {"manual", "relay_multiplier"}
 RANDOM_DEPLOYMENT_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 UPSTREAM_URL_SURFACE_KEY = "upstream_url_surface"
 UPSTREAM_URL_SURFACES = {"openai/chat", "openai/responses", "anthropic"}
@@ -182,6 +195,104 @@ def _string_value(value: Any) -> str:
     return str(value)
 
 
+def _menu_metadata_text(value: Any, field: str, *, required: bool = False) -> str:
+    """Validate opaque, secret-free IDs used by editor-owned metadata."""
+
+    text = value.strip() if isinstance(value, str) else ""
+    if (
+        (required and not text)
+        or len(text.encode("utf-8")) > 256
+        or any(char in text for char in "\x00\r\n")
+    ):
+        raise ValueError(f"{field} is invalid")
+    return text
+
+
+def _provider_key_id(value: Any, *, required: bool = False) -> str:
+    return _menu_metadata_text(value, "Provider key ID", required=required)
+
+
+def _relay_source(value: Any, *, required: bool = False) -> dict[str, str]:
+    """Return the only supported, non-secret ProviderKey source fields."""
+
+    if value is None:
+        if required:
+            raise ValueError("Provider key source is invalid")
+        return {"kind": "independent"}
+    if not isinstance(value, dict):
+        raise ValueError("Provider key source is invalid")
+    if set(value).difference({"kind", "station_id", "account_id", "resource_id"}):
+        raise ValueError("Provider key source is invalid")
+    kind = value.get("kind", "independent")
+    if not isinstance(kind, str) or kind not in PROVIDER_KEY_SOURCE_KINDS:
+        raise ValueError("Provider key source is invalid")
+    if kind == "independent":
+        if any(value.get(key) not in (None, "") for key in ("station_id", "account_id", "resource_id")):
+            raise ValueError("Independent provider key source cannot reference a relay")
+        return {"kind": "independent"}
+    source = {"kind": "relay"}
+    for key in ("station_id", "account_id", "resource_id"):
+        source[key] = _menu_metadata_text(value.get(key), f"Relay {key}", required=True)
+    return source
+
+
+def _provider_source(value: Any, *, required: bool = False) -> dict[str, str]:
+    """Return the provider URL/name source without duplicating either value."""
+
+    if value is None:
+        if required:
+            raise ValueError("Provider source is invalid")
+        return {"kind": "custom"}
+    if not isinstance(value, dict):
+        raise ValueError("Provider source is invalid")
+    if set(value).difference({"kind", "station_id"}):
+        raise ValueError("Provider source is invalid")
+    kind = value.get("kind", "custom")
+    if not isinstance(kind, str) or kind not in PROVIDER_SOURCE_KINDS:
+        raise ValueError("Provider source is invalid")
+    station_id = value.get("station_id")
+    if kind == "custom":
+        if station_id not in (None, ""):
+            raise ValueError("Custom provider source cannot reference a relay station")
+        return {"kind": "custom"}
+    return {
+        "kind": "relay",
+        "station_id": _menu_metadata_text(
+            station_id, "Relay station ID", required=True
+        ),
+    }
+
+
+def _stable_provider_key_id(provider_name: Any, api_key_name: Any) -> str:
+    """Derive a migration-safe ID without ever using the credential value."""
+
+    provider = _string_value(provider_name).strip()
+    key_name = _string_value(api_key_name).strip()
+    digest = hashlib.sha256(
+        f"litellm-menu-provider-key-v1\x1f{provider}\x1f{key_name}".encode("utf-8")
+    ).hexdigest()[:32]
+    # Avoid a token-like ``key-<long value>`` shape: generic snapshot
+    # redaction correctly treats that pattern as a possible credential.
+    return f"provider-slot-{digest}"
+
+
+def _menu_order(value: Any, field: str) -> int | float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} is invalid")
+    if isinstance(value, (int, float)):
+        result = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            result = float(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field} is invalid") from exc
+    else:
+        raise ValueError(f"{field} is invalid")
+    if not math.isfinite(result):
+        raise ValueError(f"{field} is invalid")
+    return int(result) if isinstance(result, float) and result.is_integer() else result
+
+
 def _bool_value(value: Any, default: bool = True) -> bool:
     if value is None:
         return default
@@ -305,6 +416,7 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
             )
 
     providers = _as_dict(data.get("providers"))
+    seen_provider_key_ids: set[str] = set()
     for provider_name, raw_provider in providers.items():
         provider = _as_dict(raw_provider)
         if "api_key" in provider:
@@ -317,13 +429,12 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 f"{path.name} provider {provider_name} uses unsupported disabled_api_keys; "
                 "remove unused API keys instead"
             )
-        raw_keys = provider.get("api_keys")
-        if raw_keys is None:
-            continue
+        raw_keys = provider.get("api_keys", [])
         if not isinstance(raw_keys, list):
             raise ValueError(
                 f"{path.name} provider {provider_name} api_keys must be a list of objects"
             )
+        api_key_names: set[str] = set()
         for index, raw_key in enumerate(raw_keys, start=1):
             key = _as_dict(raw_key)
             if not key:
@@ -344,6 +455,60 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 raise ValueError(
                     f"{path.name} provider {provider_name} api_keys[{index}] needs value"
                 )
+            key_name = _menu_metadata_text(
+                key.get("name"), "Provider API key name", required=True
+            )
+            if key_name in api_key_names:
+                raise ValueError(
+                    f"{path.name} provider {provider_name} has duplicate API key name {key_name}"
+                )
+            api_key_names.add(key_name)
+
+        relay_keys = provider.get(MENU_RELAY_KEYS_KEY)
+        if relay_keys is not None:
+            if not isinstance(relay_keys, dict) or set(relay_keys).difference({"version", "slots"}):
+                raise ValueError(
+                    f"{path.name} provider {provider_name} {MENU_RELAY_KEYS_KEY} is invalid"
+                )
+            if relay_keys.get("version") != MENU_RELAY_KEYS_VERSION:
+                raise ValueError(
+                    f"{path.name} provider {provider_name} {MENU_RELAY_KEYS_KEY} version is unsupported"
+                )
+            slots = relay_keys.get("slots")
+            if not isinstance(slots, list):
+                raise ValueError(
+                    f"{path.name} provider {provider_name} {MENU_RELAY_KEYS_KEY}.slots must be a list"
+                )
+            seen_slot_names: set[str] = set()
+            for slot_index, raw_slot in enumerate(slots, start=1):
+                if not isinstance(raw_slot, dict) or set(raw_slot) != {"id", "api_key_name", "source"}:
+                    raise ValueError(
+                        f"{path.name} provider {provider_name} relay key slot #{slot_index} is invalid"
+                    )
+                slot_id = _provider_key_id(raw_slot.get("id"), required=True)
+                key_name = _menu_metadata_text(
+                    raw_slot.get("api_key_name"), "Provider API key name", required=True
+                )
+                _relay_source(raw_slot.get("source"), required=True)
+                if slot_id in seen_provider_key_ids:
+                    raise ValueError(
+                        f"{path.name} contains duplicate provider key ID {slot_id}"
+                    )
+                if key_name in seen_slot_names or key_name not in api_key_names:
+                    raise ValueError(
+                        f"{path.name} provider {provider_name} relay key slot #{slot_index} does not match one API key"
+                    )
+                seen_provider_key_ids.add(slot_id)
+                seen_slot_names.add(key_name)
+
+        provider_source = provider.get(MENU_PROVIDER_SOURCE_KEY)
+        if provider_source is not None:
+            try:
+                _provider_source(provider_source, required=True)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{path.name} provider {provider_name} {MENU_PROVIDER_SOURCE_KEY} is invalid"
+                ) from exc
 
     section_names = (DISABLED_MODELS_KEY,) if is_disabled_file else ("model_list",)
     for section_name in section_names:
@@ -403,6 +568,47 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 raise ValueError(
                     f"{path.name} {section_name}[{index}] {exc}"
                 ) from exc
+            if MENU_PROVIDER_KEY_ID_KEY in model_info:
+                try:
+                    _provider_key_id(model_info.get(MENU_PROVIDER_KEY_ID_KEY), required=True)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {exc}"
+                    ) from exc
+            catalog_mode = model_info.get(MENU_RELAY_CATALOG_MODE_KEY, "independent")
+            if not isinstance(catalog_mode, str) or catalog_mode not in MODEL_CATALOG_MODES:
+                raise ValueError(
+                    f"{path.name} {section_name}[{index}] {MENU_RELAY_CATALOG_MODE_KEY} is invalid"
+                )
+            if catalog_mode == "relay_linked" and not _string_value(
+                model_info.get(MENU_PROVIDER_KEY_ID_KEY)
+            ).strip():
+                raise ValueError(
+                    f"{path.name} {section_name}[{index}] relay-linked model needs {MENU_PROVIDER_KEY_ID_KEY}"
+                )
+            if MENU_RELAY_SOURCE_MODEL_KEY in model_info:
+                try:
+                    _menu_metadata_text(
+                        model_info.get(MENU_RELAY_SOURCE_MODEL_KEY),
+                        "Relay source model",
+                        required=False,
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {exc}"
+                    ) from exc
+            order_mode = model_info.get(MENU_ORDER_MODE_KEY, "manual")
+            if not isinstance(order_mode, str) or order_mode not in MODEL_ORDER_MODES:
+                raise ValueError(
+                    f"{path.name} {section_name}[{index}] {MENU_ORDER_MODE_KEY} is invalid"
+                )
+            if MENU_MANUAL_ORDER_KEY in model_info:
+                try:
+                    _menu_order(model_info.get(MENU_MANUAL_ORDER_KEY), "Manual route order")
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {exc}"
+                    ) from exc
 
 
 def safe_load_yaml_text(text: str, source_name: str) -> Any:

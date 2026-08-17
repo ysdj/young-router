@@ -98,6 +98,63 @@ export interface ValidationIssue {
   severity: "error" | "warning";
 }
 
+export type RelayBindingStatus =
+  | "independent"
+  | "linked"
+  | "missing_key"
+  | "invalid_source"
+  | "disabled"
+  | "missing_multiplier"
+  | "catalog_missing"
+  | "login_expired"
+  | "unavailable";
+
+export interface RelayKeySource {
+  kind: "independent" | "relay";
+  station_id?: string;
+  account_id?: string;
+  resource_id?: string;
+}
+
+export interface ProviderKeySummary {
+  id: string;
+  name: string;
+  configured: boolean;
+  model_count: number;
+  source: RelayKeySource;
+  binding_status?: RelayBindingStatus;
+}
+
+export interface ModelBindingHealth {
+  status: RelayBindingStatus;
+  detail?: string;
+}
+
+export interface ApplyIssue {
+  code?: string;
+  message?: string;
+  operation_id?: string;
+  domain?: ConfigDomain;
+  station_id?: string;
+  account_id?: string;
+  resource_id?: string;
+  provider_id?: string;
+  model_id?: string;
+  retryable?: boolean;
+}
+
+export type RelayPendingOperationStatus = "staged" | "remote_applied" | "local_pending" | "completed";
+
+export interface RelayPendingOperationSummary {
+  id: string;
+  action: string;
+  status: RelayPendingOperationStatus;
+  station_id?: string;
+  account_id?: string;
+  resource_id?: string;
+  linked_model_count?: number;
+}
+
 export interface ProviderSummary {
   id: string;
   display_name: string;
@@ -105,6 +162,9 @@ export interface ProviderSummary {
   model_count: number;
   api_key: SecretState;
   endpoint: string;
+  provider_type?: "custom" | "relay";
+  relay_station_id?: string;
+  key_states?: ProviderKeySummary[];
   models?: ProviderModelSummary[];
 }
 
@@ -137,6 +197,14 @@ export interface ProviderModelSummary {
   upstream_model: string;
   enabled: boolean;
   order: number | string;
+  api_key_name?: string;
+  provider_key_id?: string;
+  catalog_mode?: "independent" | "relay_linked";
+  source_model_id?: string;
+  order_mode?: "manual" | "relay_multiplier";
+  manual_order?: number;
+  effective_order?: number;
+  binding_health?: ModelBindingHealth;
   upstream_protocol_mode?: "fallback" | "fixed";
   upstream_url_surface?: ProbeSurfaceName;
   probe?: {
@@ -217,7 +285,15 @@ export interface IpcResults {
   dispatch: { revision: number };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
-  apply: { revision: number; applied: true; domains?: ConfigDomain[] };
+  apply: {
+    revision: number;
+    applied: boolean;
+    domains?: ConfigDomain[];
+    status: "applied" | "partial" | "failed";
+    completed_operations: number;
+    pending_operations: number;
+    issues: ApplyIssue[];
+  };
   reload: { revision: number };
   probe: {
     ok: boolean;

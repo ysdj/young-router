@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState, useContext } from "react";
-import { AppState, Dimensions, FlatList, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
+import { AppState, FlatList, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, codexFeatureLabel, localizeCodexValidationMessage, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
@@ -7,7 +7,6 @@ import { canonicalWindowRoute, LOG_TABS, routeMenuActions, ROUTES } from "../rou
 import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeSplitView, NativeTable, NativeTextField } from "./NativeControls";
 import { CODE_EDITOR_HTML, CodeEditorWebView } from "./code-editor/CodeEditorWebView";
 import { normalizeRelayOrigin, RelayAccountManager, stationOriginKey } from "./RelayAccountManager";
-import { screenBoundedTooltipText } from "./tooltip";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import type {
   AppRoute,
@@ -67,8 +66,8 @@ const PendingFieldContext = createContext<PendingFieldRegistry | undefined>(unde
 const TranslationContext = createContext<Translate | undefined>(undefined);
 // React Native macOS supports `tooltip` on Text, but its published TypeScript
 // declaration has not caught up with that native prop. Keep the cast narrow so
-// the full probe result is a real native hover tooltip, not an accessibility-
-// only hint.
+// the probe status has a short native hover hint; the full result opens in the
+// shared read-only CodeMirror viewer.
 const TooltipText = Text as unknown as React.ComponentType<React.ComponentProps<typeof Text> & { tooltip?: string }>;
 
 // Shared dense overrides keep forms and section chrome consistent across all
@@ -99,6 +98,7 @@ const ROUTE_TRACE_SCROLLBAR_MIN_THUMB_WIDTH = 32;
 const SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH = 420;
 const WEBDAV_FORM_LABEL_WIDTH = 108;
 const SETTINGS_STRUCTURED_SCROLLBAR_GUTTER = 18;
+const RELAY_KEY_ICON = "⇄";
 
 function sameDiskState(left: DiskState | undefined, right: DiskState | undefined): boolean {
   return left?.changed === right?.changed
@@ -163,6 +163,215 @@ function numberValue(value: unknown, fallback = 0): number {
     if (Number.isFinite(parsed)) return parsed;
   }
   return fallback;
+}
+
+type RelaySourceOption = {
+  stationID: string;
+  accountID: string;
+  resourceID: string;
+  baseURL: string;
+  stationLabel: string;
+  accountLabel: string;
+  resourceLabel: string;
+  models: string[];
+  enabled: boolean;
+  multiplier?: number;
+};
+
+type RelayStationOption = {
+  id: string;
+  name: string;
+  baseURL: string;
+};
+
+type ProviderKeyState = {
+  id: string;
+  name: string;
+  configured: boolean;
+  modelCount: number;
+  source: { kind: "independent" | "relay"; stationID: string; accountID: string; resourceID: string };
+};
+
+type ProviderKeyChoice = {
+  id: string;
+  name: string;
+  kind: "independent" | "relay";
+  state?: ProviderKeyState;
+  source?: RelaySourceOption;
+};
+
+function relaySourcesFromSnapshot(snapshot: CoreSnapshot | undefined): RelaySourceOption[] {
+  const relay = domainState(snapshot, "relay_accounts");
+  const accounts = asRecords(relay.accounts);
+  const stationByID = new Map(asRecords(relay.stations).map((station) => [stringValue(station.id), {
+    label: stringValue(station.name, stringValue(station.label)),
+    origin: stringValue(station.origin, stringValue(station.base_url, stringValue(station.url))),
+  }]));
+  return accounts.flatMap((account) => {
+    const accountID = stringValue(account.id);
+    if (!accountID) return [];
+    const stationID = stringValue(account.station_id);
+    const station = stationByID.get(stationID);
+    const stationLabel = station?.label || stringValue(account.station_name, stringValue(account.origin, stationID));
+    const stationOrigin = station?.origin || stringValue(account.origin);
+    const username = stringValue(account.username).trim();
+    const accountLabel = username ? username.split("@", 1)[0].trim() || username : stringValue(account.label, accountID).trim();
+    const groups = new Map(asRecords(account.groups).map((group) => [stringValue(group.id), numberValue(group.multiplier, Number.NaN)]));
+    const resources = asRecords(Array.isArray(account.resources) ? account.resources : account.api_keys);
+    return resources.flatMap((resource) => {
+      const resourceID = stringValue(resource.id);
+      if (!resourceID) return [];
+      const multiplier = groups.get(stringValue(resource.group_id));
+      return [{
+        stationID,
+        accountID,
+        resourceID,
+        baseURL: stringValue(resource.api_base, stationOrigin),
+        stationLabel: stationLabel || stationID,
+        accountLabel: accountLabel || accountID,
+        resourceLabel: stringValue(resource.api_name, stringValue(resource.name, resourceID)),
+        models: stringList(resource.models),
+        enabled: resource.enabled !== false,
+        ...(Number.isFinite(multiplier) ? { multiplier } : {}),
+      }];
+    });
+  });
+}
+
+function relayStationsFromSnapshot(snapshot: CoreSnapshot | undefined): RelayStationOption[] {
+  const relay = domainState(snapshot, "relay_accounts");
+  const stations = asRecords(relay.stations);
+  return stations.flatMap((station) => {
+    const id = stringValue(station.id).trim();
+    const name = stringValue(station.name, stringValue(station.label)).trim();
+    const baseURL = stringValue(station.origin, stringValue(station.base_url, stringValue(station.url))).trim();
+    return id && name && baseURL ? [{ id, name, baseURL }] : [];
+  });
+}
+
+function relaySourcesForBaseUrl(value: string, relaySources: RelaySourceOption[]): RelaySourceOption[] {
+  const target = stationOriginKey(value);
+  if (!target) return [];
+  return relaySources.filter((source) => source.enabled && stationOriginKey(source.baseURL) === target);
+}
+
+function providerKeyStates(provider: UnknownRecord): ProviderKeyState[] {
+  return asRecords(provider.key_states).flatMap((value) => {
+    const source = asRecord(value.source);
+    const kind = source.kind === "relay" ? "relay" : source.kind === "independent" ? "independent" : undefined;
+    const id = stringValue(value.id);
+    const name = stringValue(value.name, stringValue(value.api_key_name));
+    if (!id || !name || !kind) return [];
+    return [{
+      id,
+      name,
+      configured: booleanValue(value.configured),
+      modelCount: numberValue(value.model_count),
+      source: {
+        kind,
+        stationID: stringValue(source.station_id),
+        accountID: stringValue(source.account_id),
+        resourceID: stringValue(source.resource_id),
+      },
+    }];
+  });
+}
+
+function relaySourceForKey(key: ProviderKeyState | undefined, relaySources: RelaySourceOption[]): RelaySourceOption | undefined {
+  if (!key || key.source.kind !== "relay") return undefined;
+  return relaySources.find((source) => source.stationID === key.source.stationID && source.accountID === key.source.accountID && source.resourceID === key.source.resourceID);
+}
+
+function relaySourceSelectionID(source: Pick<RelaySourceOption, "stationID" | "accountID" | "resourceID">): string {
+  return `${source.stationID}\x1f${source.accountID}\x1f${source.resourceID}`;
+}
+
+function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {
+  const keyStates = providerKeyStates(provider);
+  const providerBaseURL = stringValue(provider.endpoint, stringValue(provider.api_base));
+  const matchingRelaySources = relaySourcesForBaseUrl(providerBaseURL, relaySources);
+  const persistedRelaySourceIDs = new Set(
+    keyStates
+      .filter((key) => key.source.kind === "relay")
+      .map((key) => relaySourceSelectionID(key.source)),
+  );
+  return [
+    ...keyStates.map((key) => ({
+      id: key.id,
+      name: key.name,
+      kind: key.source.kind,
+      state: key,
+      source: relaySourceForKey(key, relaySources),
+    })),
+    ...matchingRelaySources
+      .filter((source) => !persistedRelaySourceIDs.has(relaySourceSelectionID(source)))
+      .map((source) => ({
+        id: `relay:${relaySourceSelectionID(source)}`,
+        name: source.resourceLabel,
+        kind: "relay" as const,
+        source,
+      })),
+  ];
+}
+
+function providerKeyChoiceLabel(choice: Pick<ProviderKeyChoice, "name" | "kind" | "source">, translate: Translate): string {
+  const name = apiKeyDisplayName(choice.name, translate);
+  if (choice.kind !== "relay") return name;
+  const sourceName = choice.source
+    ? [choice.source.stationLabel, choice.source.accountLabel, choice.source.resourceLabel].filter(Boolean).join("/")
+    : name;
+  const multiplier = choice.source && Number.isFinite(choice.source.multiplier) ? ` (${choice.source.multiplier}x)` : "";
+  return `${RELAY_KEY_ICON} ${sourceName || name}${multiplier}`;
+}
+
+function modelOrderMode(model: UnknownRecord): "manual" | "relay_multiplier" {
+  return model.order_mode === "relay_multiplier" ? "relay_multiplier" : "manual";
+}
+
+function modelEffectiveOrder(model: UnknownRecord): number {
+  return numberValue(model.effective_order, numberValue(model.order, 0));
+}
+
+function modelRelayMultiplier(model: UnknownRecord, provider: UnknownRecord, relaySources: RelaySourceOption[]): number | undefined {
+  if (modelOrderMode(model) !== "relay_multiplier") return undefined;
+  const key = providerKeyStates(provider).find((entry) => entry.id === stringValue(model.provider_key_id));
+  const multiplier = relaySourceForKey(key, relaySources)?.multiplier;
+  return Number.isFinite(multiplier) ? multiplier as number : undefined;
+}
+
+function modelProviderKeyLabel(model: UnknownRecord, provider: UnknownRecord, translate: Translate): string {
+  const key = providerKeyStates(provider).find((entry) => entry.id === stringValue(model.provider_key_id));
+  return key?.name || stringValue(model.api_key_name, translate("common.default"));
+}
+
+function modelOrderSourceLabel(model: UnknownRecord, provider: UnknownRecord, relaySources: RelaySourceOption[], translate: Translate): string {
+  const multiplier = modelRelayMultiplier(model, provider, relaySources);
+  return multiplier === undefined
+    ? modelOrderMode(model) === "relay_multiplier" ? translate("providers.orderRelayMultiplier") : translate("providers.orderManual")
+    : translate("providers.followsMultiplier", { value: multiplier });
+}
+
+function isApplyResult(value: unknown): value is IpcResults["apply"] {
+  const result = asRecord(value);
+  return (result.status === "applied" || result.status === "partial" || result.status === "failed")
+    && typeof result.completed_operations === "number"
+    && typeof result.pending_operations === "number"
+    && Array.isArray(result.issues);
+}
+
+function applyResultMessage(result: IpcResults["apply"], translate: Translate): string {
+  if (result.status === "partial") return translate("relay.applyPartial", { completed: result.completed_operations, pending: result.pending_operations });
+  if (result.status === "failed") return translate("relay.applyFailed", { pending: result.pending_operations });
+  return translate("common.applied");
+}
+
+function applyIssuesForDisplay(result: IpcResults["apply"]): ValidationSummary["issues"] {
+  return result.issues.map((issue) => ({
+    path: [issue.domain, issue.station_id, issue.account_id, issue.resource_id, issue.provider_id, issue.model_id].filter(Boolean).join(" / "),
+    code: issue.code ?? "relay_apply",
+    message: issue.message ?? "",
+    severity: result.status === "partial" ? "warning" : "error",
+  }));
 }
 
 function errorMessage(reason: unknown, translate: Translate): string {
@@ -589,8 +798,8 @@ function WindowTitle({ title, validation }: { title: string; validation?: string
   return <View style={styles.windowTitleBlock}><Text style={styles.windowTitle}>{title}</Text>{validation ? <Text style={styles.validationText}>{validation}</Text> : null}</View>;
 }
 
-function DialogFooter({ status, leading, children, compact = false }: { status?: string; leading?: React.ReactNode; children: React.ReactNode; compact?: boolean }): React.JSX.Element {
-  return <View style={[styles.footer, compact && styles.footerCompact]}>{leading ?? (status ? <Text numberOfLines={1} style={styles.footerStatus}>{status}</Text> : <View />)}<View style={styles.footerSpacer} /><View style={styles.footerButtons}>{children}</View></View>;
+function DialogFooter({ status, leading, children, compact = false, borderless = false }: { status?: string; leading?: React.ReactNode; children: React.ReactNode; compact?: boolean; borderless?: boolean }): React.JSX.Element {
+  return <View style={[styles.footer, compact && styles.footerCompact, borderless && styles.footerBorderless]}>{leading ?? (status ? <Text numberOfLines={1} style={styles.footerStatus}>{status}</Text> : <View />)}<View style={styles.footerSpacer} /><View style={styles.footerButtons}>{children}</View></View>;
 }
 
 function IconButton({ label, symbol, title, disabled, onPress }: { label: string; symbol?: "pause" | "play" | "trash"; title: string; disabled?: boolean; onPress: () => void }): React.JSX.Element {
@@ -612,7 +821,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const [busy, setBusy] = useState(false);
   const [webDavOperationBusy, setWebDavOperationBusy] = useState(false);
   const [result, setResult] = useState<string>();
-  const [relayImportRequest, setRelayImportRequest] = useState(0);
   const [issues, setIssues] = useState<ValidationSummary["issues"]>([]);
   const [settingsRawReloadToken, setSettingsRawReloadToken] = useState(0);
   const [settingsRawBaselineToken, setSettingsRawBaselineToken] = useState(0);
@@ -635,11 +843,8 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(currentSnapshot),
     claudeDeploymentFromSnapshot(currentSnapshot),
   );
-  // Relay account metadata is persisted by its own domain actions. Resource
-  // import is different: it stages provider/model entries and must be
-  // committed from this route's window-level Apply action. Keep that mapping
-  // explicit so the footer and the close/discard path operate on the same
-  // domain instead of silently treating the relay route as clean.
+  // Relay CRUD and linked imports are one coordinated draft. The relay route
+  // therefore applies both domains together whenever either side is dirty.
   const stagedDomainsForRoute = (currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {
     if (settingsRoute) {
       return (["codex", "claude"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);
@@ -648,7 +853,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       return DATA_MANAGEMENT_DIRTY_DOMAINS.filter((name) => currentSnapshot?.drafts[name]?.dirty);
     }
     if (route === "relay-accounts") {
-      return currentSnapshot?.drafts.providers_models?.dirty ? ["providers_models"] : [];
+      return (["relay_accounts", "providers_models"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);
     }
     return domain && currentSnapshot?.drafts[domain]?.dirty ? [domain] : [];
   };
@@ -716,6 +921,9 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       } else if (isValidation(value)) {
         setIssues(value.issues);
         setResult(value.valid ? translate("common.applied") : `${value.issues.length} ${translate("common.validationIssues")}`);
+      } else if (isApplyResult(value)) {
+        setIssues(applyIssuesForDisplay(value));
+        setResult(applyResultMessage(value, translate));
       } else {
         setIssues([]);
         setResult(message === null ? undefined : translate(message));
@@ -932,6 +1140,10 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     if ((route !== "relay-accounts" && !domain) || domain === "logs") return Promise.resolve();
     return run(async () => {
       await flushPendingFields();
+      // Inline relay edits stage through the shared dispatch queue when their
+      // fields lose focus. Wait for that queue before taking the apply
+      // snapshot so the footer Apply button is the only remote commit point.
+      await dispatchQueue.current;
       const refreshed = await ipc.snapshot();
       revision.current = refreshed.revision;
       onSnapshot(refreshed);
@@ -957,7 +1169,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       if (domains.includes("codex") || domains.includes("claude")) {
         setSettingsRawBaselineToken((current) => current + 1);
       }
-      if ((domains.includes("providers_models") || domains.includes("runtime")) && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
+      if (!result.domains?.includes("relay_accounts") && result.status === "applied" && (domains.includes("providers_models") || domains.includes("runtime")) && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
         const reloaded = await ipc.dispatch({ type: "service.reload" }, result.revision);
         revision.current = reloaded.revision;
       }
@@ -991,7 +1203,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     const confirmations = [...risks, ...diskConflicts.map((name) => `overwrite_external_${name}`)];
     const applied = await ipc.applyDomains(domains, refreshed.revision, confirmations.length > 0 ? confirmations : undefined);
     revision.current = applied.revision;
-    if ((domains.includes("providers_models") || domains.includes("runtime")) && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
+    if (!applied.domains?.includes("relay_accounts") && applied.status === "applied" && (domains.includes("providers_models") || domains.includes("runtime")) && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
       const reloaded = await ipc.dispatch({ type: "service.reload" }, applied.revision);
       revision.current = reloaded.revision;
     }
@@ -1126,7 +1338,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       const confirmations = staged.disk.providers_models?.changed ? ["overwrite_external_providers_models"] : undefined;
       const result = await ipc.apply("providers_models", staged.revision, confirmations);
       revision.current = result.revision;
-      if (staged.service.state === "running" || staged.service.state === "unhealthy") {
+      if (result.status === "applied" && (staged.service.state === "running" || staged.service.state === "unhealthy")) {
         const reloaded = await ipc.dispatch({ type: "service.reload" }, result.revision);
         revision.current = reloaded.revision;
       }
@@ -1223,7 +1435,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       });
     }} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} />}</> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
-    {route === "relay-accounts" || route === "relay-add" ? <RelayAccountManager visible setupOnly={route === "relay-add"} snapshot={snapshot} native={native} busy={busy} translate={translate} onClose={closeRoute} importRequestKey={route === "relay-accounts" ? relayImportRequest : 0} commit={commitRelayMetadata} detectType={async (origin) => {
+    {route === "relay-accounts" || route === "relay-add" ? <RelayAccountManager visible setupOnly={route === "relay-add"} snapshot={snapshot} native={native} busy={busy} translate={translate} onClose={closeRoute} commit={commitRelayMetadata} detectType={async (origin) => {
       const staged = await enqueueDispatch("account.detect_type", { origin }, "relay_accounts");
       revision.current = staged.revision;
       const next = await refresh();
@@ -1233,11 +1445,14 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       const staged = await enqueueDispatch("resources.refresh", { account_id: accountId }, "relay_accounts");
       revision.current = staged.revision;
       return asRecord(staged).resource_status === "ready" ? "ready" : "unavailable";
-    }} importResources={async (accountId, resourceIds) => {
-      await commitRelayMetadata("resources.import", { account_id: accountId, resource_ids: resourceIds }, "relay_accounts");
     }} apiKeyActions={{
-      create: async (accountId) => {
-        await commitRelayMetadata("api_key.create", { account_id: accountId }, "relay_accounts");
+      create: async (accountId, options) => {
+        await commitRelayMetadata("api_key.create", {
+          account_id: accountId,
+          name: options.name,
+          ...(options.groupID ? { group_id: options.groupID } : {}),
+          enabled: options.enabled,
+        }, "relay_accounts");
       },
       update: async (accountId, resourceId, name) => {
         await commitRelayMetadata("api_key.update", { account_id: accountId, resource_id: resourceId, name }, "relay_accounts");
@@ -1248,8 +1463,15 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       setGroup: async (accountId, resourceId, groupId) => {
         await commitRelayMetadata("api_key.set_group", { account_id: accountId, resource_id: resourceId, group_id: groupId }, "relay_accounts");
       },
-      remove: async (accountId, resourceId) => {
-        await commitRelayMetadata("api_key.delete", { account_id: accountId, resource_id: resourceId }, "relay_accounts");
+      remove: async (accountId, resourceId, dependencyPolicy) => {
+        await commitRelayMetadata("api_key.delete", {
+          account_id: accountId,
+          resource_id: resourceId,
+          dependency_policy: dependencyPolicy,
+        }, "relay_accounts");
+      },
+      detach: async (accountId, resourceId) => {
+        await commitRelayMetadata("api_key.detach", { account_id: accountId, resource_id: resourceId }, "relay_accounts");
       },
     }} addAccount={async (type, origin, rememberPassword, stationOptions = {}) => {
       const before = await refresh();
@@ -1297,7 +1519,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} busy={busy} webDavOperationBusy={webDavOperationBusy} status={result} hasPendingChanges={hasPendingFieldEdits()} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onResize={resizeDataManagement} onFlushPendingFields={flushPendingFields} onTabSwitchError={(reason) => setResult(errorMessage(reason, translate))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onApplyImported={applyDataManagement} onProbeWebDav={probeWebDav} onApplyWebDav={applyWebDav} onSyncWebDav={syncWebDav} /> : null}
     {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
     </View> : null}
-    {route === "relay-accounts" ? <DialogFooter compact status={result} leading={<ActionButton title={translate("relay.apiKeyImport")} disabled={busy} onPress={() => setRelayImportRequest((current) => current + 1)} />}><ActionButton title={translate("menu.close")} disabled={busy} onPress={requestClose} /><ActionButton primary title={translate("menu.apply")} disabled={busy || stagedDomainsForRoute(snapshot).length === 0} onPress={apply} /></DialogFooter> : route !== "logs" && route !== "relay-add" && route !== "data-management" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || (settingsRoute ? !(snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()) : domain ? !(snapshot?.drafts[domain]?.dirty || hasPendingFieldEdits()) : false)} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
+    {route === "relay-accounts" ? <DialogFooter compact borderless status={result}><ActionButton title={translate("menu.close")} onPress={requestClose} /><ActionButton primary title={translate("menu.apply")} disabled={busy || stagedDomainsForRoute(snapshot).length === 0} onPress={apply} /></DialogFooter> : route !== "logs" && route !== "relay-add" && route !== "data-management" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || (settingsRoute ? !(snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()) : domain ? !(snapshot?.drafts[domain]?.dirty || hasPendingFieldEdits()) : false)} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -1314,6 +1536,8 @@ function riskCodes(snapshot: CoreSnapshot, domain: ConfigDomain): string[] {
 
 function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface }): React.JSX.Element {
   const state = domainState(snapshot, "providers_models");
+  const relaySources = useMemo(() => relaySourcesFromSnapshot(snapshot), [snapshot]);
+  const relayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
   const providers = useMemo(() => {
     const details = asRecords(state.providers);
     if (details.length > 0) return details;
@@ -1339,16 +1563,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const [viewMode, setViewMode] = useState<"providers" | "routes">("providers");
   const [selectedRoute, setSelectedRoute] = useState<string>();
-  const [fetchKeyName, setFetchKeyName] = useState<string>();
+  const [fetchKeyID, setFetchKeyID] = useState<string>();
   const probingModelKeys = useRef(new Set<string>());
   const [, setProbeActivityRevision] = useState(0);
   const [probeResults, setProbeResults] = useState<Record<string, IpcResults["probe"]>>({});
-  const apiKeyNames = useMemo(() => stringList(provider?.api_key_names), [provider?.api_key_names]);
-  const fetchKeyOptions = useMemo(
-    () => apiKeyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) })),
-    [apiKeyNames, translate],
+  const fetchKeyChoices = useMemo(
+    () => provider ? providerKeyChoices(provider, relaySources) : [],
+    [provider, relaySources],
   );
-  const selectedFetchKey = fetchKeyName ?? apiKeyNames[0] ?? "";
+  const fetchKeyOptions = useMemo(
+    () => fetchKeyChoices.map((choice) => ({ value: choice.id, label: providerKeyChoiceLabel(choice, translate) })),
+    [fetchKeyChoices, translate],
+  );
+  const selectedFetchKey = fetchKeyID ?? fetchKeyChoices[0]?.id ?? "";
   const selectedFetchLabel = fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default");
   async function probeModel(targetProviderId: string, targetModelId: string, options?: { confirmRecommendation?: boolean }): Promise<void> {
     const key = modelProbeKey(targetProviderId, targetModelId);
@@ -1412,8 +1639,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
   }, [models, providerId, selectedModel]);
   useEffect(() => {
-    if (!apiKeyNames.includes(fetchKeyName ?? "")) setFetchKeyName(apiKeyNames[0]);
-  }, [apiKeyNames, fetchKeyName, providerId]);
+    if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) setFetchKeyID(fetchKeyChoices[0]?.id);
+  }, [fetchKeyChoices, fetchKeyID, providerId]);
   const handleFetchedModels = (summary: UnknownRecord): void => {
     const summaryProviderId = stringValue(summary.provider_id);
     const providerIdentity = identifier(provider);
@@ -1430,13 +1657,18 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     onStatus(undefined);
     const candidateSet = new Set(candidates);
     const providerName = stringValue(provider?.display_name, stringValue(provider?.name, providerId));
-    const keyName = apiKeyDisplayName(fetchKeyName ?? "default", translate);
+    const apiKeyName = stringValue(summary.api_key_name);
+    if (!apiKeyName) {
+      onStatus(translate("providers.fetchFailed", { detail: translate("common.notAvailable") }));
+      return;
+    }
+    const keyName = fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? apiKeyDisplayName(apiKeyName, translate);
     void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then((selection) => {
       const selectedModels = (selection ?? []).filter((model, index, all) => candidateSet.has(model) && all.indexOf(model) === index);
       if (selectedModels.length === 0) return;
       void dispatch("model.add_many", {
         provider_id: providerId,
-        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: fetchKeyName, enabled: true, order: 0 })),
+        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 })),
       });
     }).catch(() => undefined);
   };
@@ -1451,8 +1683,20 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     void dispatch("model.add", { provider_id: providerId, model: { name: "", upstream_model: "", enabled: true, order: 0 } });
   };
   const fetchModels = (): void => {
-    if (!provider || !fetchKeyName) return;
-    void dispatchWithOutcome("providers.fetch_models", { provider_id: providerId, api_key_name: fetchKeyName }).then((next) => {
+    const choice = fetchKeyChoices.find((item) => item.id === selectedFetchKey);
+    if (!provider || !choice) return;
+    const relaySource = choice.kind === "relay" ? choice.source : undefined;
+    const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";
+    const payload = relaySource ? {
+      provider_id: providerId,
+      station_id: relaySource.stationID,
+      account_id: relaySource.accountID,
+      resource_id: relaySource.resourceID,
+    } : {
+      provider_id: providerId,
+      api_key_name: choice.name,
+    };
+    void dispatchWithOutcome(action, payload).then((next) => {
       if (!next) {
         onStatus(translate("providers.fetchFailed", { detail: translate("common.notAvailable") }));
         return;
@@ -1462,6 +1706,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         onStatus(translate("providers.fetchFailed", { detail: translate("common.notAvailable") }));
         return;
       }
+      const slotID = stringValue(summary.slot_id);
+      if (slotID) setFetchKeyID(slotID);
       handleFetchedModels(summary);
     });
   };
@@ -1493,8 +1739,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   })).sort((left, right) => {
     const modelOrder = left.publicModel.localeCompare(right.publicModel, undefined, { sensitivity: "base" });
     if (modelOrder !== 0) return modelOrder;
-    const leftOrder = numberValue(left.model.order, Number.MAX_SAFE_INTEGER);
-    const rightOrder = numberValue(right.model.order, Number.MAX_SAFE_INTEGER);
+    const leftOrder = modelEffectiveOrder(left.model);
+    const rightOrder = modelEffectiveOrder(right.model);
     if (leftOrder !== rightOrder) return leftOrder - rightOrder;
     const providerOrder = stringValue(left.provider.name).localeCompare(stringValue(right.provider.name), undefined, { sensitivity: "base" });
     if (providerOrder !== 0) return providerOrder;
@@ -1503,14 +1749,15 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const activeRoute = routes.find((entry) => entry.key === selectedRoute);
   const activeRouteGroup = activeRoute ? routes.filter((entry) => entry.publicModel === activeRoute.publicModel) : [];
   const activeRouteIndex = activeRoute ? activeRouteGroup.findIndex((entry) => entry.key === activeRoute.key) : -1;
-  const canMoveRouteUp = activeRouteIndex > 0;
-  const canMoveRouteDown = activeRouteIndex >= 0 && activeRouteIndex < activeRouteGroup.length - 1;
+  const activeRouteUsesMultiplier = Boolean(activeRoute && modelOrderMode(activeRoute.model) === "relay_multiplier");
+  const canMoveRouteUp = !activeRouteUsesMultiplier && activeRouteIndex > 0;
+  const canMoveRouteDown = !activeRouteUsesMultiplier && activeRouteIndex >= 0 && activeRouteIndex < activeRouteGroup.length - 1;
   useEffect(() => {
     if (viewMode !== "routes" || routes.length === 0 || routes.some((entry) => entry.key === selectedRoute)) return;
     setSelectedRoute(routes[0].key);
   }, [routes, selectedRoute, viewMode]);
   const moveRoute = (direction: "up" | "down"): void => {
-    if (!activeRoute || activeRouteIndex < 0) return;
+    if (!activeRoute || activeRouteIndex < 0 || modelOrderMode(activeRoute.model) === "relay_multiplier") return;
     const targetIndex = direction === "up" ? activeRouteIndex - 1 : activeRouteIndex + 1;
     if (targetIndex < 0 || targetIndex >= activeRouteGroup.length) return;
     const reordered = [...activeRouteGroup];
@@ -1536,8 +1783,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     [providers],
   );
   const modelRows = useMemo(
-    () => models.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newModel"))), upstreamModelLabel(item), `${apiKeyDisplayName(item.api_key_name, translate)} / ${numberValue(item.order, 0)}`] })),
-    [models, translate],
+    () => models.map((item) => ({ key: editorIdentifier(item), cells: [stringValue(item.display_name, stringValue(item.name, translate("providers.newModel"))), upstreamModelLabel(item), modelProviderKeyLabel(item, provider ?? {}, translate)] })),
+    [models, provider, translate],
   );
   const disabledModelKeys = useMemo(
     () => models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier),
@@ -1550,20 +1797,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       if (entry.publicModel !== previousPublicModel) {
         rows.push({
           key: `route-public-model:${entry.publicModel}`,
-          cells: [entry.publicModel, "", "", ""],
+          cells: [entry.publicModel, "", "", "", ""],
           spanning: true,
         });
         previousPublicModel = entry.publicModel;
       }
-      const numericOrder = numberValue(entry.model.order, Number.NaN);
-      const order = Number.isFinite(numericOrder) ? String(numericOrder) : stringValue(entry.model.order).trim();
+      const order = String(modelEffectiveOrder(entry.model));
       rows.push({
         key: entry.key,
-        cells: [`\t${stringValue(entry.provider.display_name, stringValue(entry.provider.name, translate("providers.newProvider")))}`, order || "-", apiKeyDisplayName(entry.model.api_key_name, translate), upstreamModelLabel(entry.model) || translate("common.notAvailable")],
+        cells: [`\t${stringValue(entry.provider.display_name, stringValue(entry.provider.name, translate("providers.newProvider")))}`, modelProviderKeyLabel(entry.model, entry.provider, translate), order, modelOrderSourceLabel(entry.model, entry.provider, relaySources, translate), upstreamModelLabel(entry.model) || translate("common.notAvailable")],
       });
     }
     return rows;
-  }, [routes, translate]);
+  }, [relaySources, routes, translate]);
   const disabledRouteKeys = useMemo(
     () => routes.filter((entry) => !entry.providerEnabled || !entry.modelEnabled || !entry.keyAvailable).map((entry) => entry.key),
     [routes],
@@ -1595,7 +1841,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
         <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="↑" title={translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
-          <NativeTable columns={[{ label: translate("providers.provider"), width: 136 }, { label: translate("common.order"), width: 48 }, { label: translate("providers.keyName"), width: 112 }, { label: translate("providers.upstream"), width: 136 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} compact onSelectionChange={selectRoute} style={styles.nativeRouteTable} />
+          <NativeTable columns={[{ label: translate("providers.provider"), width: 116 }, { label: translate("providers.providerKey"), width: 166 }, { label: translate("providers.effectiveOrder"), width: 72 }, { label: translate("providers.orderSource"), width: 126 }, { label: translate("providers.upstream"), width: 136 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} compact onSelectionChange={selectRoute} style={styles.nativeRouteTable} />
         </TablePane>
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
@@ -1603,13 +1849,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
             <NativeTable columns={[{ label: translate("providers.provider"), width: 88 }, { label: translate("providers.modelCount"), width: 64 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
           <TablePane style={styles.modelListPane} title={translate("providers.models")} actions={<><IconButton label="+" title={translate("providers.newModel")} disabled={busy || !provider} onPress={addModel} /><IconButton label="⧉" title={translate("common.copy")} disabled={busy || !model} onPress={duplicateModel} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !model} onPress={confirmDeleteModel} /></>}>
-            <NativeTable columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.apiKeyOrder"), width: 96 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
-            <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={selectedFetchLabel} disabled={busy || !provider || apiKeyNames.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyName(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} disabled={busy || !provider || !fetchKeyName} onPress={fetchModels} /></View>
+            <NativeTable columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.providerKey"), width: 128 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
+            <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={selectedFetchLabel} disabled={busy || !provider || fetchKeyChoices.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} disabled={busy || !provider || !selectedFetchKey} onPress={fetchModels} /></View>
           </TablePane>
         </View>
       </View>}
     </View>
-    <View style={styles.providerInspector}>{viewMode === "routes" ? (activeRoute ? (providerSourceModel ? <ProviderEditor provider={activeRoute.provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} /> : <ModelInspector providers={providers} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector providers={providers} provider={provider} providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(providerId, editorIdentifier(model))} {...modelProbeProps(providerId, editorIdentifier(model))} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor provider={provider} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} /> : <EmptyState translate={translate} />}</View>
+    <View style={styles.providerInspector}>{viewMode === "routes" ? (activeRoute ? (providerSourceModel ? <ProviderEditor provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} /> : <ModelInspector providers={providers} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model))} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector providers={providers} provider={provider} providerId={providerId} model={model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} probe={() => probeModel(providerId, editorIdentifier(model))} {...modelProbeProps(providerId, editorIdentifier(model))} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} /> : <EmptyState translate={translate} />}</View>
   </View>;
 }
 
@@ -1617,18 +1863,75 @@ function TablePane({ title, actions, wide, style, children }: { title: string; a
   return <View style={[styles.tablePane, compactStyles.tablePane, wide && styles.tablePaneWide, style]}><View style={[styles.tableTitleRow, compactStyles.tableTitleRow]}><Text style={styles.tableTitle}>{title}</Text><View style={[styles.tableActions, compactStyles.inlineGap]}>{actions}</View></View>{children}</View>;
 }
 
-function ModelInspector({ providers, provider, providerId, model, busy, translate, dispatch, probe, probing, probeResult, onProviderClick, onProviderChange }: { providers: UnknownRecord[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; onProviderClick: () => void; onProviderChange: (providerId: string) => void }): React.JSX.Element {
+function ModelInspector({ providers, provider, providerId, model, relaySources, native, busy, translate, dispatch, probe, probing, probeResult, onProviderClick, onProviderChange }: { providers: UnknownRecord[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; onProviderClick: () => void; onProviderChange: (providerId: string) => void }): React.JSX.Element {
   const id = editorIdentifier(model);
   const providerLabels = providers.map((item) => stringValue(item.name, translate("providers.newProvider")));
   const providerIndex = providers.findIndex((item) => editorIdentifier(item) === providerId);
   const providerLabel = providerLabels[Math.max(0, providerIndex)] ?? "";
-  const keyNames = stringList(provider.api_key_names);
-  const keyOptions = keyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) }));
-  const selectedKey = stringValue(model.api_key_name, keyNames[0] ?? "");
+  const keyStates = providerKeyStates(provider);
+  const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
+    ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
+  const usesRelayKey = selectedProviderKey?.source.kind === "relay";
+  const orderMode = usesRelayKey && modelOrderMode(model) === "relay_multiplier" ? "relay_multiplier" : "manual";
+  const relayMultiplier = modelRelayMultiplier(model, provider, relaySources);
+  const matchingRelaySources = relaySourcesForBaseUrl(stringValue(provider.endpoint, stringValue(provider.api_base)), relaySources);
+  const persistedRelaySourceIDs = new Set(keyStates.filter((key) => key.source.kind === "relay").map((key) => relaySourceSelectionID(key.source)));
+  const providerKeyOptions = [...keyStates.map((key) => ({
+    value: key.id,
+    label: providerKeyChoiceLabel({ name: key.name, kind: key.source.kind, source: relaySourceForKey(key, relaySources) }, translate),
+  })), ...matchingRelaySources.filter((source) => !persistedRelaySourceIDs.has(relaySourceSelectionID(source))).map((source) => ({
+    value: `relay:${relaySourceSelectionID(source)}`,
+    label: providerKeyChoiceLabel({ name: source.resourceLabel, kind: "relay", source }, translate),
+  }))];
   const probePresentation = modelProbePresentation(model, probeResult, translate);
-  const probeTooltip = screenBoundedTooltipText(probePresentation.full, Dimensions.get("screen"));
+  const probeDetailHint = translate("providers.probeDetailsHint");
   const probeReady = Boolean(stringValue(provider.endpoint, stringValue(provider.api_base)).trim() && upstreamModelLabel(model).trim() && booleanValue(model.api_key_configured));
-  return <View style={styles.inspectorContent}><View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{stringValue(model.name, translate("providers.newModel"))}</Text></View><View style={styles.inspectorDivider} /><View style={styles.inspectorBody}><View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} style={styles.inspectorEnableControl} /><ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} disabled={busy || probing || !probeReady} onPress={probe} />{probePresentation.compact ? <TooltipText numberOfLines={2} tooltip={probeTooltip} accessibilityHint={probePresentation.full} style={styles.probeSummary}>{probePresentation.compact}</TooltipText> : null}</View><TextField label={translate("providers.publicModel")} labelWidth={60} value={stringValue(model.name)} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} /><PickerField label={translate("providers.provider")} labelWidth={60} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers.find((item) => stringValue(item.name, translate("providers.newProvider")) === label); if (next) onProviderChange(editorIdentifier(next)); }} /><PickerField label={translate("providers.keyName")} labelWidth={60} allowShrink value={selectedKey} values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]} disabled={busy || keyNames.length === 0} onSelect={(api_key_name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { api_key_name } })} /><TextField label={translate("providers.upstream")} labelWidth={60} value={upstreamModelLabel(model)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} /><TextField label={translate("common.order")} labelWidth={60} controlWidth={64} value={String(numberValue(model.order, 0))} keyboardType="numeric" onCommit={(order) => { const nextOrder = Number(order); return dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { order: Number.isFinite(nextOrder) ? nextOrder : 0 } }); }} /><ProtocolPicker providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} /></View></View>;
+  const openProbeDetails = (): void => {
+    if (!probePresentation.full) return;
+    void native.showReadOnlyText({
+      title: translate("providers.probeDetails"),
+      text: probePresentation.full,
+      closeLabel: translate("menu.close"),
+      language: "text",
+      html: CODE_EDITOR_HTML,
+    }).catch(() => undefined);
+  };
+  const selectProviderKey = (providerKeyID: string): void => {
+    if (providerKeyID.startsWith("relay:")) {
+      const sourceID = providerKeyID.slice("relay:".length);
+      const source = matchingRelaySources.find((candidate) => relaySourceSelectionID(candidate) === sourceID);
+      if (!source) return;
+      void dispatch("model.select_relay_resource", {
+        provider_id: providerId,
+        model_id: id,
+        station_id: source.stationID,
+        account_id: source.accountID,
+        resource_id: source.resourceID,
+      });
+      return;
+    }
+    const providerKey = keyStates.find((key) => key.id === providerKeyID);
+    if (!providerKey) return;
+    void dispatch("model.patch", {
+      provider_id: providerId,
+      model_id: id,
+      changes: { provider_key_id: providerKey.id, api_key_name: providerKey.name },
+    });
+  };
+  return <View style={styles.inspectorContent}>
+    <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{stringValue(model.name, translate("providers.newModel"))}</Text></View>
+    <View style={styles.inspectorDivider} />
+    <View style={styles.inspectorBody}>
+      <View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} style={styles.inspectorEnableControl} /><ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} disabled={busy || probing || !probeReady} onPress={probe} />{probePresentation.compact ? <Pressable accessibilityRole="button" accessibilityLabel={probePresentation.compact} accessibilityHint={probeDetailHint} onPress={openProbeDetails} style={({ pressed }) => [styles.probeSummaryTrigger, pressed && styles.probeSummaryTriggerPressed]}><TooltipText numberOfLines={2} tooltip={probeDetailHint} style={styles.probeSummary}>{probePresentation.compact}</TooltipText></Pressable> : null}</View>
+      <TextField label={translate("providers.publicModel")} labelWidth={60} value={stringValue(model.name)} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} />
+      <PickerField label={translate("providers.provider")} labelWidth={60} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers.find((item) => stringValue(item.name, translate("providers.newProvider")) === label); if (next) onProviderChange(editorIdentifier(next)); }} />
+      {providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")} labelWidth={60} allowShrink value={selectedProviderKey?.id ?? providerKeyOptions[0]?.value ?? ""} values={providerKeyOptions} disabled={busy || providerKeyOptions.length <= 1} onSelect={selectProviderKey} /> : null}
+      <TextField label={translate("providers.upstream")} labelWidth={60} value={upstreamModelLabel(model)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} />
+      {usesRelayKey ? <PickerField label={translate("providers.orderMode")} labelWidth={60} allowShrink value={orderMode} values={[{ value: "manual", label: translate("providers.orderManual") }, { value: "relay_multiplier", label: translate("providers.orderRelayMultiplier") }]} disabled={busy} onSelect={(order_mode) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { order_mode, manual_order: numberValue(model.manual_order, modelEffectiveOrder(model)) } })} /> : null}
+      {orderMode === "manual" ? <TextField label={translate("providers.manualOrder")} labelWidth={60} controlWidth={64} value={String(numberValue(model.manual_order, modelEffectiveOrder(model)))} keyboardType="numeric" onCommit={(manualOrder) => { const manual_order = Number(manualOrder); return dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { manual_order: Number.isFinite(manual_order) ? manual_order : 0, order: Number.isFinite(manual_order) ? manual_order : 0 } }); }} /> : <TextField label={translate("providers.effectiveOrder")} labelWidth={60} controlWidth={64} value={relayMultiplier === undefined ? translate("common.notAvailable") : `${relayMultiplier}x`} disabled onCommit={() => undefined} />}
+      <ProtocolPicker providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} />
+    </View>
+  </View>;
 }
 
 function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
@@ -1653,12 +1956,33 @@ function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { prov
 }
 
 function providerRecord(provider: ProviderSummary): UnknownRecord {
-  return { id: provider.id, name: provider.display_name, display_name: provider.display_name, enabled: provider.enabled, endpoint: provider.endpoint, model_count: provider.model_count, models: provider.models ?? [] };
+  return {
+    id: provider.id,
+    name: provider.display_name,
+    display_name: provider.display_name,
+    enabled: provider.enabled,
+    endpoint: provider.endpoint,
+    model_count: provider.model_count,
+    key_states: provider.key_states ?? [],
+    api_key_names: provider.key_states?.map((key) => key.name) ?? [],
+    models: provider.models ?? [],
+  };
 }
 
 function modelRecord(model: UnknownRecord): UnknownRecord {
   const modelEnabled = booleanValue(model.model_enabled, booleanValue(model.enabled, true));
-  return { ...model, id: editorIdentifier(model), name: stringValue(model.name, stringValue(model.display_name, stringValue(model.model))), display_name: stringValue(model.display_name, stringValue(model.name)), enabled: modelEnabled, model_enabled: modelEnabled, order: numberValue(model.order, 0) };
+  const effectiveOrder = numberValue(model.effective_order, numberValue(model.order, 0));
+  return {
+    ...model,
+    id: editorIdentifier(model),
+    name: stringValue(model.name, stringValue(model.display_name, stringValue(model.model))),
+    display_name: stringValue(model.display_name, stringValue(model.name)),
+    enabled: modelEnabled,
+    model_enabled: modelEnabled,
+    effective_order: effectiveOrder,
+    order: effectiveOrder,
+    manual_order: numberValue(model.manual_order, effectiveOrder),
+  };
 }
 
 function isProbeSurface(value: string): value is "openai/responses" | "openai/chat" | "anthropic" {
@@ -1694,33 +2018,74 @@ function editorIdentifier(record: UnknownRecord): string {
   return stringValue(record.editor_id, identifier(record));
 }
 
-function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretState, sourceModel, onReturnToModel }: { provider: UnknownRecord; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void }): React.JSX.Element {
-  const id = editorIdentifier(provider);
-  const keys = useMemo(() => stringList(provider.api_key_names), [provider.api_key_names]);
-  const keyStates = asRecords(provider.key_states);
-  const [selectedKey, setSelectedKey] = useState<string>(keys[0] ?? "");
-  const pendingKeySelection = useRef<string | undefined>(undefined);
-  React.useLayoutEffect(() => {
-    const pending = pendingKeySelection.current;
-    if (pending && keys.includes(pending)) {
-      pendingKeySelection.current = undefined;
-      if (selectedKey !== pending) setSelectedKey(pending);
+const CUSTOM_BASE_URL_SOURCE = "__custom__";
+
+function ProviderSourceFields({ provider, providerID, relayStations, busy, translate, dispatch }: { provider: UnknownRecord; providerID: string; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
+  const providerType = stringValue(provider.provider_type, "custom") === "relay" ? "relay" : "custom";
+  const stationID = stringValue(provider.relay_station_id).trim();
+  const selectedStation = relayStations.find((station) => station.id === stationID);
+  const stationOptions = relayStations.map((station) => ({ value: `relay:${station.id}`, label: `${station.name} · ${station.baseURL}` }));
+  const selectedValue = providerType === "relay" ? `relay:${stationID}` : CUSTOM_BASE_URL_SOURCE;
+  const sourceOptions: AssistantSettingOption[] = [
+    { value: CUSTOM_BASE_URL_SOURCE, label: translate("providers.providerTypeCustom") },
+    ...stationOptions,
+    ...(providerType === "relay" && stationID && !stationOptions.some((option) => option.value === selectedValue)
+      ? [{ value: selectedValue, label: stationID }]
+      : []),
+  ];
+  const providerName = stringValue(provider.name, stringValue(provider.display_name));
+  const providerBaseURL = stringValue(provider.endpoint, stringValue(provider.api_base));
+  const effectiveName = providerType === "relay" ? stringValue(selectedStation?.name, providerName) : providerName;
+  const effectiveBaseURL = providerType === "relay" ? stringValue(selectedStation?.baseURL, providerBaseURL) : providerBaseURL;
+  const selectSource = (value: string): void => {
+    if (value === CUSTOM_BASE_URL_SOURCE) {
+      void dispatch("provider.patch", { provider_id: providerID, changes: { provider_type: "custom", relay_station_id: "" } });
       return;
     }
-    if (!keys.includes(selectedKey)) setSelectedKey(keys[0] ?? "");
-  }, [keys, selectedKey]);
+    const nextStationID = value.startsWith("relay:") ? value.slice("relay:".length) : "";
+    if (!nextStationID) return;
+    void dispatch("provider.select_relay_station", { provider_id: providerID, station_id: nextStationID });
+  };
+  return <View style={styles.providerSourceFields}>
+    <PickerField label={translate("providers.providerType")} labelWidth={68} value={selectedValue} values={sourceOptions} disabled={busy} onSelect={selectSource} />
+    <TextField label={translate("providers.baseUrl")} labelWidth={68} value={effectiveBaseURL} disabled={busy || providerType === "relay"} onCommit={(endpoint) => providerType === "custom" ? dispatch("provider.patch", { provider_id: providerID, changes: { endpoint } }) : undefined} />
+    <TextField label={translate("providers.providerName")} labelWidth={68} value={effectiveName} disabled={busy || providerType === "relay"} onCommit={(name) => providerType === "custom" ? dispatch("provider.patch", { provider_id: providerID, changes: { name } }) : undefined} />
+  </View>;
+}
+
+function ProviderEditor({ provider, relaySources, relayStations, native, busy, translate, dispatch, onSecretState, sourceModel, onReturnToModel }: { provider: UnknownRecord; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; sourceModel?: UnknownRecord; onReturnToModel: () => void }): React.JSX.Element {
+  const id = editorIdentifier(provider);
+  const keys = useMemo(() => stringList(provider.api_key_names), [provider.api_key_names]);
+  const keyStates = useMemo(() => providerKeyStates(provider), [provider.key_states]);
+  const keyChoices = useMemo(() => providerKeyChoices(provider, relaySources), [provider, relaySources]);
+  const [selectedKeyID, setSelectedKeyID] = useState<string>(keyChoices[0]?.id ?? "");
+  const pendingKeySelection = useRef<string | undefined>(undefined);
+  const selectedChoice = keyChoices.find((choice) => choice.id === selectedKeyID) ?? keyChoices[0];
+  const selectedKeyState = selectedChoice?.state;
+  const selectedRelaySource = selectedChoice?.kind === "relay" ? selectedChoice.source : undefined;
+  React.useLayoutEffect(() => {
+    const pending = pendingKeySelection.current;
+    const pendingState = pending ? keyStates.find((key) => key.name === pending) : undefined;
+    if (pendingState) {
+      pendingKeySelection.current = undefined;
+      if (selectedKeyID !== pendingState.id) setSelectedKeyID(pendingState.id);
+      return;
+    }
+    if (!keyChoices.some((choice) => choice.id === selectedKeyID)) setSelectedKeyID(keyChoices[0]?.id ?? "");
+  }, [keyChoices, keyStates, selectedKeyID]);
   const addKey = (): void => {
     const name = uniqueKeyName(keys);
     pendingKeySelection.current = name;
     void dispatch("provider.key_add", { provider_id: id, name });
   };
   const renameKey = (name: string): void => {
-    if (!selectedKey || !name || name === selectedKey) return;
+    if (!selectedKeyState || selectedKeyState.source.kind !== "independent" || !name || name === selectedKeyState.name) return;
     pendingKeySelection.current = name;
-    void dispatch("provider.key_patch", { provider_id: id, old_name: selectedKey, name });
+    void dispatch("provider.key_patch", { provider_id: id, old_name: selectedKeyState.name, name });
   };
   const deleteKey = (): void => {
-    if (!selectedKey || keys.length <= 1) return;
+    if (!selectedKeyState) return;
+    const selectedKey = selectedKeyState.name;
     const affectedModelLines = asRecords(provider.models)
       .filter((model) => stringValue(model.api_key_name).trim() === selectedKey)
       .map((model, index) => {
@@ -1743,26 +2108,35 @@ function ProviderEditor({ provider, native, busy, translate, dispatch, onSecretS
   };
   const providerLabel = stringValue(provider.display_name, stringValue(provider.name, translate("providers.newProvider")));
   const sourceModelLabel = sourceModel ? stringValue(sourceModel.name, translate("providers.newModel")) : "";
-  const selectedKeyConfigured = booleanValue(keyStates.find((state) => stringValue(state.name) === selectedKey)?.configured);
-  const keyRows = keys.map((key) => ({ key, cells: [apiKeyDisplayName(key, translate)] }));
+  const selectedKeyConfigured = booleanValue(selectedKeyState?.configured);
+  const relayAccountID = selectedChoice?.kind === "relay"
+    ? selectedRelaySource?.accountID ?? selectedChoice.state?.source.accountID ?? ""
+    : "";
+  const relayResourceID = selectedChoice?.kind === "relay"
+    ? selectedRelaySource?.resourceID ?? selectedChoice.state?.source.resourceID ?? ""
+    : "";
+  const relaySecretTarget = relayAccountID && relayResourceID ? `${relayAccountID}:${relayResourceID}` : "";
+  const keyRows = keyChoices.map((choice) => ({ key: choice.id, cells: [providerKeyChoiceLabel(choice, translate)] }));
   return <View style={styles.providerEditorContent}>
     <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerLabel}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
     <View style={styles.providerEditorSection}><View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch("provider.patch", { provider_id: id, changes: { enabled } })} /></View>
-    <TextField label={translate("providers.baseUrl")} labelWidth={68} value={stringValue(provider.endpoint, stringValue(provider.api_base))} onCommit={(endpoint) => dispatch("provider.patch", { provider_id: id, changes: { endpoint } })} />
-    <TextField label={translate("providers.providerName")} labelWidth={68} value={stringValue(provider.name, stringValue(provider.display_name))} onCommit={(name) => dispatch("provider.patch", { provider_id: id, changes: { name } })} />
+    <ProviderSourceFields provider={provider} providerID={id} relayStations={relayStations} busy={busy} translate={translate} dispatch={dispatch} />
     <View style={styles.providerKeysEditor}>
       <View style={styles.providerKeysHeader}>
         <Text style={styles.providerKeysHeading}>{translate("providers.apiKeys")}</Text>
         <View style={styles.providerKeyActions}>
           <IconButton label="+" title={translate("common.add")} disabled={busy} onPress={addKey} />
-          <IconButton label="−" title={translate("common.delete")} disabled={busy || keys.length <= 1 || !selectedKey} onPress={deleteKey} />
+          <IconButton label="−" title={translate("common.delete")} disabled={busy || !selectedKeyState} onPress={deleteKey} />
         </View>
       </View>
-      <NativeTable columns={[{ label: translate("providers.key"), width: 220 }]} rows={keyRows} selectedKey={selectedKey} compact cellHorizontalPadding={0} firstColumnHorizontalPadding={0} onSelectionChange={setSelectedKey} style={styles.providerKeyTable} />
+      <NativeTable columns={[{ label: translate("providers.key"), width: 260 }]} rows={keyRows} selectedKey={selectedChoice?.id ?? ""} compact cellHorizontalPadding={0} firstColumnHorizontalPadding={0} onSelectionChange={setSelectedKeyID} style={styles.providerKeyTable} />
       <View style={styles.providerKeyFields}>
-        {selectedKey ? <>
-          <TextField label={translate("providers.keyName")} labelWidth={68} value={selectedKey} onCommit={renameKey} />
-          <NativeSecretField plainText autoCommit label={translate("providers.keyValue")} hint={selectedKeyConfigured ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} labelWidth={68} busy={busy || !selectedKey} domain="providers_models" field="api_key" target={`${id}\x1f${selectedKey}`} onSecretState={onSecretState} />
+        {selectedChoice ? <>
+          <TextField label={translate("providers.keyName")} labelWidth={68} value={selectedChoice.name} disabled={!selectedKeyState || selectedChoice.kind === "relay"} onCommit={renameKey} />
+          {selectedChoice.kind === "relay" ? relaySecretTarget
+            ? <NativeSecretField plainText autoCommit label={translate("providers.keyValue")} hint={translate("providers.relayKeyValueHint")} labelWidth={68} busy={busy} disabled domain="relay_accounts" field="api_key" target={relaySecretTarget} onSecretState={onSecretState} />
+            : <TextField label={translate("providers.keyValue")} labelWidth={68} value={translate("providers.relayKeyValueHint")} disabled onCommit={() => undefined} />
+            : selectedKeyState ? <NativeSecretField plainText autoCommit label={translate("providers.keyValue")} hint={selectedKeyConfigured ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} labelWidth={68} busy={busy} domain="providers_models" field="api_key" target={`${id}\x1f${selectedKeyState.name}`} onSecretState={onSecretState} /> : null}
         </> : <Text style={styles.empty}>{translate("common.notAvailable")}</Text>}
       </View>
     </View>
@@ -3493,7 +3867,7 @@ function TextField({ label, value, onCommit, hint, secret, multiline, compactMul
   return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text><View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea]} value={field.draft} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={styles.fieldHint}>{hint}</Text> : null}</View>{suffix ? <Text style={styles.fieldHint}>{suffix}</Text> : null}</View>;
 }
 
-function NativeSecretInputControl({ label, hint, busy, domain, field, target, plainText = false, autoCommit = false, resetToken = 0, onSecretState, setTitle, setBelow, onSetReady, inputMinWidth }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; plainText?: boolean; autoCommit?: boolean; resetToken?: number; onSecretState: (state: SecretState) => void; setTitle?: string; setBelow?: boolean; onSetReady?: (requestSet: () => void, saving: boolean) => void; inputMinWidth?: number }): React.JSX.Element {
+function NativeSecretInputControl({ label, hint, busy, domain, field, target, plainText = false, autoCommit = false, resetToken = 0, onSecretState, setTitle, setBelow, onSetReady, inputMinWidth }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "relay_accounts" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; plainText?: boolean; autoCommit?: boolean; resetToken?: number; onSecretState: (state: SecretState) => void; setTitle?: string; setBelow?: boolean; onSetReady?: (requestSet: () => void, saving: boolean) => void; inputMinWidth?: number }): React.JSX.Element {
   const [commitRequest, setCommitRequest] = useState(0);
   const [resetRequest, setResetRequest] = useState(0);
   const [status, setStatus] = useState("ready");
@@ -3596,16 +3970,17 @@ function NativeSecretInputControl({ label, hint, busy, domain, field, target, pl
   }} style={[styles.nativeSecretInput, compactStyles.input, inputMinWidth === undefined ? null : { minWidth: inputMinWidth }]} />{!autoCommit && !setBelow && setTitle ? <NativeButton title={setTitle} compact disabled={busy || status === "saving"} onPress={requestCommit} style={styles.secretActionButton} /> : null}</View>;
 }
 
-function NativeSecretField({ label, hint, busy, domain, field, target, plainText = false, autoCommit = false, onSecretState, labelWidth, labelAlign, setTitle, clearTitle, clearDisabled, onClear, actionsBelow }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; plainText?: boolean; autoCommit?: boolean; onSecretState: (state: SecretState) => void; labelWidth?: number; labelAlign?: "left" | "right"; setTitle?: string; clearTitle?: string; clearDisabled?: boolean; onClear?: () => Promise<void>; actionsBelow?: boolean }): React.JSX.Element {
+function NativeSecretField({ label, hint, busy, disabled = false, domain, field, target, plainText = false, autoCommit = false, onSecretState, labelWidth, labelAlign, setTitle, clearTitle, clearDisabled, onClear, actionsBelow }: { label: string; hint?: string; busy: boolean; disabled?: boolean; domain: "providers_models" | "relay_accounts" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; plainText?: boolean; autoCommit?: boolean; onSecretState: (state: SecretState) => void; labelWidth?: number; labelAlign?: "left" | "right"; setTitle?: string; clearTitle?: string; clearDisabled?: boolean; onClear?: () => Promise<void>; actionsBelow?: boolean }): React.JSX.Element {
   const setAction = useRef<() => void>(() => undefined);
   const [saving, setSaving] = useState(false);
   const [resetToken, setResetToken] = useState(0);
+  const inputBusy = busy || disabled;
   const handleSetReady = React.useCallback((requestSet: () => void, nextSaving: boolean): void => { setAction.current = requestSet; setSaving(nextSaving); }, []);
   const handleClear = React.useCallback((): void => {
     if (!onClear) return;
     void onClear().then(() => setResetToken((current) => current + 1));
   }, [onClear]);
-  return <View style={[styles.formRow, compactStyles.formRow, actionsBelow && styles.formRowSecretStacked]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><View style={[styles.formRowControl, compactStyles.formRowControl]}>{actionsBelow ? <><NativeSecretInputControl label={label} hint={hint} busy={busy} domain={domain} field={field} target={target} plainText={plainText} autoCommit={autoCommit} resetToken={resetToken} onSecretState={onSecretState} setTitle={setTitle} setBelow onSetReady={handleSetReady} inputMinWidth={110} /><View style={[styles.secretFieldButtons, compactStyles.inlineGap]}>{!autoCommit && setTitle ? <NativeButton title={setTitle} compact disabled={busy || saving} onPress={() => setAction.current()} style={styles.secretFieldButton} /> : null}{onClear && clearTitle ? <NativeButton title={clearTitle} compact disabled={clearDisabled ?? busy} onPress={handleClear} style={styles.secretFieldButton} /> : null}</View></> : <View style={[styles.secretFieldActions, compactStyles.inlineGap]}><NativeSecretInputControl label={label} hint={hint} busy={busy} domain={domain} field={field} target={target} plainText={plainText} autoCommit={autoCommit} resetToken={resetToken} onSecretState={onSecretState} setTitle={setTitle} />{onClear && clearTitle ? <NativeButton title={clearTitle} compact disabled={clearDisabled ?? busy} onPress={handleClear} style={styles.secretActionButton} /> : null}</View>}</View></View>;
+  return <View style={[styles.formRow, compactStyles.formRow, actionsBelow && styles.formRowSecretStacked]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><View style={[styles.formRowControl, compactStyles.formRowControl]}>{actionsBelow ? <><NativeSecretInputControl label={label} hint={hint} busy={inputBusy} domain={domain} field={field} target={target} plainText={plainText} autoCommit={autoCommit} resetToken={resetToken} onSecretState={onSecretState} setTitle={setTitle} setBelow onSetReady={handleSetReady} inputMinWidth={110} /><View style={[styles.secretFieldButtons, compactStyles.inlineGap]}>{!autoCommit && setTitle ? <NativeButton title={setTitle} compact disabled={inputBusy || saving} onPress={() => setAction.current()} style={styles.secretFieldButton} /> : null}{onClear && clearTitle ? <NativeButton title={clearTitle} compact disabled={clearDisabled ?? inputBusy} onPress={handleClear} style={styles.secretFieldButton} /> : null}</View></> : <View style={[styles.secretFieldActions, compactStyles.inlineGap]}><NativeSecretInputControl label={label} hint={hint} busy={inputBusy} domain={domain} field={field} target={target} plainText={plainText} autoCommit={autoCommit} resetToken={resetToken} onSecretState={onSecretState} setTitle={setTitle} />{onClear && clearTitle ? <NativeButton title={clearTitle} compact disabled={clearDisabled ?? inputBusy} onPress={handleClear} style={styles.secretActionButton} /> : null}</View>}</View></View>;
 }
 
 function ToggleRow({ label, value, onChange, disabled }: { label: string; value: boolean; onChange: (value: boolean) => void; disabled?: boolean }): React.JSX.Element {
@@ -3888,10 +4263,7 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
     status: surface.status ?? "unavailable",
     original_request: surface.original_request ?? {},
   }));
-  const compactRequest = requests.length > 0
-    ? requests.map((item) => `${item.surface}: ${stringValue(asRecord(item.original_request).url) || translate("common.none")}`).join("\n")
-    : result?.detail ?? "";
-  const compact = [summary, compactRequest ? translate("providers.probeOriginalRequest", { request: compactRequest }) : ""].filter(Boolean).join("\n");
+  const compact = availabilitySummary;
   const full = [summary, result?.detail ?? "", translate("providers.probeOriginalRequest", { request: JSON.stringify(requests, null, 2) })].filter(Boolean).join("\n\n");
   return { compact, full };
 }
@@ -3911,7 +4283,7 @@ function IssueList({ issues, translate }: { issues: ValidationSummary["issues"];
     revision_conflict: "error.revisionConflict",
   };
   return <View style={styles.issueBox}><Text style={styles.sectionTitle}>{translate("common.validationIssues")}</Text>{issues.map((issue, index) => {
-    const message = translate(keyByCode[issue.code] ?? "error.validationFailed");
+    const message = keyByCode[issue.code] ? translate(keyByCode[issue.code]) : issue.message || translate("error.validationFailed");
     return <Text key={`${issue.path}-${index}`} style={styles.issue}>{issue.path ? `${issue.path}: ${message}` : message}</Text>;
   })}</View>;
 }
@@ -4021,10 +4393,10 @@ const styles = StyleSheet.create({
   root: { flex: 1, minWidth: 420, backgroundColor: systemColors.window },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
   windowSurface: { flex: 1, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
-  footer: { height: 52, minHeight: 52, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 6 }, footerCompact: { height: 48, minHeight: 48, paddingHorizontal: 14, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.control }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
+  footer: { height: 52, minHeight: 52, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 6 }, footerCompact: { height: 48, minHeight: 48, paddingHorizontal: 14, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.control }, footerBorderless: { borderTopWidth: 0 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
   providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, settingsTabBar: { minHeight: 36, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsTabs: { alignSelf: "flex-start", width: 250 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
-  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 6 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 154, minWidth: 154, maxWidth: 154, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 240 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 240, minWidth: 240, maxWidth: 240, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingHorizontal: 12, paddingRight: 8, paddingBottom: 12, gap: 6 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, inspectorContent: { paddingTop: 3, paddingHorizontal: 12, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, probeSummary: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
+  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 6 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 154, minWidth: 154, maxWidth: 154, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 280 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 280, minWidth: 280, maxWidth: 280, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingHorizontal: 12, paddingRight: 8, paddingBottom: 12, gap: 6 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingTop: 3, paddingHorizontal: 12, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, probeSummaryTrigger: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, probeSummaryTriggerPressed: { opacity: 0.65 }, probeSummary: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
   codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, codexSplit: { flex: 1, minWidth: 0, minHeight: 0 }, codexStructuredPane: { flex: 1, minWidth: 0, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }, codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch", gap: 14, paddingLeft: 16, paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER, paddingTop: 10, paddingBottom: 16 }, codexStructuredWithHorizontalScrollbar: { paddingBottom: 32 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanControl: { width: 24, minWidth: 24, height: 24, alignSelf: "flex-start" }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 134, paddingTop: 4 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   dataManagementWorkspace: { flex: 1, minHeight: 0 }, dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, dataManagementTabs: { width: 280, height: 24, alignSelf: "center", flexShrink: 0 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: 10, paddingHorizontal: 4, paddingBottom: 14 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementImportFileLabel: { width: 72, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSyncScopeLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementDirectionLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementDirectionPicker: { width: 210, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },

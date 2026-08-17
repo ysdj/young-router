@@ -170,10 +170,12 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         provider = config_load.load_config(path)["providers"][0]
 
-        self.assertEqual(
-            [{"name": "Experimental-Chat", "value": "sk-inline"}],
-            provider["api_keys"],
-        )
+        self.assertEqual(1, len(provider["api_keys"]))
+        key = provider["api_keys"][0]
+        self.assertEqual("Experimental-Chat", key["name"])
+        self.assertEqual("sk-inline", key["value"])
+        self.assertRegex(key["id"], r"^provider-slot-[0-9a-f]{32}$")
+        self.assertEqual({"kind": "independent"}, key["source"])
         self.assertEqual(
             "Experimental-Chat",
             provider["models"][0]["api_key_name"],
@@ -320,6 +322,37 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         self.assertEqual(["renamed"], [key["name"] for key in reloaded["api_keys"]])
         self.assertEqual("renamed", reloaded["models"][0]["api_key_name"])
+
+    def test_provider_source_metadata_defaults_to_custom_and_round_trips(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              custom_provider:
+                api_base: "https://custom.example.test/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-custom"
+            model_list: []
+            """
+        )
+
+        payload = config_load.load_config(path)
+        provider = payload["providers"][0]
+        self.assertEqual("custom", provider["provider_type"])
+        self.assertEqual("", provider["relay_station_id"])
+
+        provider["provider_type"] = "relay"
+        provider["relay_station_id"] = "station-example"
+        config_api.save_config(payload["providers"], path)
+
+        saved = config_schema._load_yaml(path)
+        self.assertEqual(
+            {"kind": "relay", "station_id": "station-example"},
+            saved["providers"]["custom_provider"]["x-litellm-menu-provider-source"],
+        )
+        reloaded = config_load.load_config(path)["providers"][0]
+        self.assertEqual("relay", reloaded["provider_type"])
+        self.assertEqual("station-example", reloaded["relay_station_id"])
 
     def test_save_round_trip_keeps_multiple_providers_nested(self) -> None:
         path = self.write_config(

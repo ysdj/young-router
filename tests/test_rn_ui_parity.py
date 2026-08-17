@@ -166,8 +166,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title={probing ? translate("providers.probing") : translate("providers.probe")}',
             'function modelProbePresentation(',
             'translate("providers.probeSummaryAvailable"',
-            'tooltip={probeTooltip}',
-            'screenBoundedTooltipText(probePresentation.full, Dimensions.get("screen"))',
+            'tooltip={probeDetailHint}',
+            'accessibilityHint={probeDetailHint}',
+            'void native.showReadOnlyText({',
+            'language: "text"',
             'translate("providers.probeOriginalRequest"',
             'const applyProbedSurface: ApplyProbedSurface = (providerId, modelId, nextSurface, options) => {',
             'const currentSurface = stringValue(currentModel.upstream_url_surface, "openai/responses");',
@@ -178,7 +180,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const nextSurface = stringValue(result.recommended_surface);',
             'isProbeSurface(nextSurface)',
             'dispatch("model.add_many", {',
-            'models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: fetchKeyName, enabled: true, order: 0 }))',
+            'models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 }))',
             '<ProtocolPicker providerId={providerId}',
             'function ProtocolPicker(',
             'const mode = stringValue(model.upstream_protocol_mode, "fallback");',
@@ -193,7 +195,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_unprobed_models_do_not_render_a_status_placeholder(self) -> None:
         self.assert_ui_has('return { compact: "", full: "" };')
-        self.assert_ui_has('{probePresentation.compact ? <TooltipText')
+        self.assert_ui_has('{probePresentation.compact ? <Pressable')
         self.assertNotIn(
             '<TooltipText numberOfLines={2} tooltip={probeTooltip} accessibilityHint={probePresentation.full} style={styles.probeSummary}>{probePresentation.compact}</TooltipText></View>',
             self.ui,
@@ -229,9 +231,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_new_models_use_zero_order_without_coercing_zero_to_one(self) -> None:
         self.assert_ui_has('model: { name: "", upstream_model: "", enabled: true, order: 0 }')
-        self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: fetchKeyName, enabled: true, order: 0 }))')
-        self.assert_ui_has('value={String(numberValue(model.order, 0))}')
-        self.assert_ui_has('order: Number.isFinite(nextOrder) ? nextOrder : 0')
+        self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 }))')
+        self.assert_ui_has('value={String(numberValue(model.manual_order, modelEffectiveOrder(model)))}')
+        self.assert_ui_has('manual_order: Number.isFinite(manual_order) ? manual_order : 0')
+        self.assert_ui_has('order: Number.isFinite(manual_order) ? manual_order : 0')
         self.assertNotIn('models.length + index + 1', self.ui)
         self.assertNotIn('Number(order) || 1', self.ui)
 
@@ -258,15 +261,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "tableScroll:",
         ):
             self.assert_ui_has(marker)
-        self.assert_ui_has('providerInspector: { width: 240, minWidth: 240, maxWidth: 240')
+        self.assert_ui_has('providerInspector: { width: 280, minWidth: 280, maxWidth: 280')
         self.assertNotIn("<ScrollView contentContainerStyle={styles.providerEditorScroll}><ProviderEditor", self.ui)
         self.assert_ui_has("providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingHorizontal: 12, paddingRight: 8, paddingBottom: 12")
         self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 }')
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }")
         self.assert_ui_has("providerListPane: { width: 154, minWidth: 154, maxWidth: 154")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 88 }, { label: translate("providers.modelCount"), width: 64 }]}')
-        self.assert_ui_has('columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.apiKeyOrder"), width: 96 }]}')
-        self.assert_ui_has('columns={[{ label: translate("providers.key"), width: 220 }]}')
+        self.assert_ui_has('columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.providerKey"), width: 128 }]}')
+        self.assert_ui_has('columns={[{ label: translate("providers.key"), width: 260 }]}')
         self.assert_ui_has('cellHorizontalPadding={0}')
         self.assert_ui_has('firstColumnHorizontalPadding={0}')
         self.assert_ui_has('label={translate("providers.keyName")} labelWidth={68}')
@@ -292,9 +295,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('routeWorkspaceWithInspector', self.ui)
         self.assert_ui_has('routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 }')
         self.assert_ui_has('onSelectionChange={selectRoute}')
-        self.assert_ui_has('label: translate("providers.provider"), width: 136 }, { label: translate("common.order"), width: 48')
-        self.assert_ui_has('width: 112 }, { label: translate("providers.upstream"), width: 136')
-        self.assert_ui_has('label: translate("providers.keyName"), width: 112')
+        self.assert_ui_has('label: translate("providers.provider"), width: 116 }, { label: translate("providers.providerKey"), width: 166')
+        self.assert_ui_has('label: translate("providers.effectiveOrder"), width: 72 }, { label: translate("providers.orderSource"), width: 126')
+        self.assert_ui_has('modelOrderMode(activeRoute.model) === "relay_multiplier"')
         self.assertNotIn('const displayRoutes = useMemo', self.ui)
         self.assert_ui_has('key: `route-public-model:${entry.publicModel}`')
         self.assert_ui_has('spanning: true')
@@ -303,7 +306,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange=')
         self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange=')
         self.assert_ui_has('columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths')
-        self.assert_ui_has('rows={keyRows} selectedKey={selectedKey} compact cellHorizontalPadding={0} firstColumnHorizontalPadding={0} onSelectionChange={setSelectedKey}')
+        self.assert_ui_has('rows={keyRows} selectedKey={selectedChoice?.id ?? ""} compact cellHorizontalPadding={0} firstColumnHorizontalPadding={0} onSelectionChange={setSelectedKeyID}')
         select_route = self.ui.split('const selectRoute = useCallback', 1)[1].split('const chooseViewMode', 1)[0]
         self.assertLess(select_route.index('if (!selected) return;'), select_route.index('setSelectedRoute(routeId);'))
         self.assert_ui_has('providerSourceModel ? <ProviderEditor provider={activeRoute.provider}')
@@ -616,7 +619,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", self.ui)},
         )
         self.assertEqual(
-            {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE"},
+            {"UI_FONT_SIZE"},
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", relay)},
         )
         self.assertEqual(
@@ -625,7 +628,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         self.assertIn("runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE", self.ui)
         self.assertIn("fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE", self.ui)
-        self.assertIn("formHint: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE", relay)
+        self.assertIn("formHint: { color: colors.secondary, fontSize: UI_FONT_SIZE", relay)
 
         self.assertIn("constexpr CGFloat LiteLLMUIFontSize = 13.0;", macos_controls)
         self.assertNotIn("systemFontSizeForControlSize", macos_controls)
@@ -715,7 +718,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"dataManagement.tab.export": "Export"',
             '"dataManagement.tab.webdav": "WebDAV Sync"',
             '"dataManagement.section.providersModels": "Providers & Models"',
-            '"dataManagement.section.relayAccounts": "Relay Accounts"',
+            '"dataManagement.section.relayAccounts": "Relay Management"',
             '"dataManagement.importHint": "Choose a file to detect its importable configuration automatically."',
             '"dataManagement.importRecognizedHint": "These configuration areas were detected in the selected file and are selected by default."',
             '"dataManagement.syncSettings": "Sync settings"',
@@ -727,7 +730,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"dataManagement.tab.export": "导出"',
             '"dataManagement.tab.webdav": "WebDAV 同步"',
             '"dataManagement.section.providersModels": "供应商与模型"',
-            '"dataManagement.section.relayAccounts": "中转站账号"',
+            '"dataManagement.section.relayAccounts": "中转站管理"',
             '"dataManagement.importHint": "选择文件后会自动识别可导入的配置项。"',
             '"dataManagement.importRecognizedHint": "以下为文件中识别到的配置项，默认全选。"',
             '"dataManagement.syncSettings": "同步设置"',
@@ -762,7 +765,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_relay_metadata_commits_before_native_credential_cleanup_and_persists_a_retry(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         route = self.ui.split("const commitRelayMetadata", 1)[1].split("const flushPendingFields", 1)[0]
-        delete = relay.split("const deleteAccount", 1)[1].split("const remove", 1)[0]
+        deletion = relay.split("const clearRemovedAccountCredentials", 1)[1].split("const openLocalRemoval", 1)[0]
         password = relay.split("const updateRememberPassword", 1)[1].split("return <Modal", 1)[0]
 
         self.assertIn("type PendingCredentialCleanup", relay)
@@ -775,11 +778,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("await enqueueDispatch(type, payload, targetDomain);", route)
         self.assertIn("commit={commitRelayMetadata}", self.ui)
         self.assertLess(
-            delete.index('await commit("account.delete"'),
-            delete.index("await native.clearRelayCredentials(account.id)"),
+            deletion.index('await commit("account.delete"'),
+            deletion.index("await clearRemovedAccountCredentials([account.id])"),
         )
-        self.assertIn('kind: "credentials"', delete)
-        self.assertIn("secret-free Core", delete)
+        self.assertIn("await native.clearRelayCredentials(accountID)", deletion)
+        self.assertIn('kind: "credentials"', deletion)
+        self.assertIn("secret-free cleanup tombstone", deletion)
         self.assertLess(
             password.index('await commit("account.update"'),
             password.index("await native.clearRelayPassword(accountID)"),
@@ -1547,10 +1551,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # index. Resolve that index through the raw value so "默认" never
         # becomes the persisted API-key identifier.
         for marker in (
-            '() => apiKeyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) })),',
-            'const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyName(option.value);',
-            'const keyOptions = keyNames.map((name) => ({ value: name, label: apiKeyDisplayName(name, translate) }));',
-            'values={keyOptions.length > 0 ? keyOptions : [{ value: "", label: translate("common.notAvailable") }]}',
+            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
+            '() => provider ? providerKeyChoices(provider, relaySources) : [],',
+            '() => fetchKeyChoices.map((choice) => ({ value: choice.id, label: providerKeyChoiceLabel(choice, translate) })),',
+            'const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value);',
+            'const providerKeyOptions = [...keyStates.map((key) => ({',
+            'value={selectedProviderKey?.id ?? providerKeyOptions[0]?.value ?? ""}',
             'rows={keyRows}',
             'const pendingKeySelection = useRef<string | undefined>(undefined);',
             'pendingKeySelection.current = undefined;',
@@ -1558,8 +1564,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'function apiKeyDisplayName(value: unknown, translate: Translate): string {',
             'if (!name) return translate("common.notAvailable");',
             'return name === "default" ? translate("providers.defaultKey") : name;',
+            'const sourceName = choice.source',
+            'join("/")',
+            'const RELAY_KEY_ICON = "⇄";',
+            'const accountLabel = username ? username.split("@", 1)[0].trim() || username : stringValue(account.label, accountID).trim();',
+            'return `${RELAY_KEY_ICON} ${sourceName || name}${multiplier}`;',
         ):
             self.assert_ui_has(marker)
+        self.assertNotIn('keys.length <= 1', self.ui)
 
     def test_provider_api_key_deletion_confirmation_explains_model_deletion(self) -> None:
         self.assert_ui_has('const affectedModelLines = asRecords(provider.models)')
@@ -1629,7 +1641,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """The provider editor uses compact, consistently aligned rows and a source-model return link."""
         for marker in (
             'const [providerSourceModel, setProviderSourceModel] = useState<string>();',
-            'label={translate("providers.baseUrl")} labelWidth={68}',
+            'function ProviderSourceFields(',
+            'label={translate("providers.providerType")} labelWidth={68}',
+            'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: nextStationID })',
+            'disabled={busy || providerType === "relay"}',
             'label={translate("providers.providerName")} labelWidth={68}',
             'label={translate("providers.keyName")} labelWidth={68}',
             'NativeSecretField plainText autoCommit label={translate("providers.keyValue")} hint={selectedKeyConfigured',
@@ -1816,7 +1831,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('translate("relay.refreshResources")', relay)
         self.assertIn('account.loginStatus === "signed_in" ? translate("relay.resourcesNotLoaded")', relay)
         self.assertIn('case "login_expired": return translate("relay.resourcesLoginExpired")', relay)
-        self.assertIn('title={translate("relay.importSelected")}', relay)
+        self.assertNotIn('title={translate("relay.importSelected")}', relay)
         self.assertIn("const accountType = detected ?? manualType;", relay)
         self.assertIn("account = await addAccount(accountType, candidate, passwordStorageAvailable && rememberPasswordRef.current, {", relay)
         self.assertIn("await deleteAccount(account);", relay)
@@ -1827,7 +1842,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("stationOriginKey(stringValue(item.origin)) === originKey && item.type === type", self.ui)
         self.assertIn("NativePicker", relay)
         self.assertIn('title={translate("relay.next")}', relay)
-        self.assertIn('title={translate("relay.importSelected")}', relay)
+        self.assertNotIn('title={translate("relay.importSelected")}', relay)
         self.assertNotIn("NativeSegmentedControl", relay)
         self.assertNotIn("const restorationAttempts", relay)
         self.assertIn("const openedAccountIDs = useRef(new Set<string>());", relay)
@@ -1852,13 +1867,51 @@ class ReactNativeUiParityTests(unittest.TestCase):
         remember_password_update = relay.split(
             "const updateRememberPassword = async (next: boolean): Promise<void> => {",
             1,
-        )[1].split("const updateStation = async", 1)[0]
+        )[1].split("const stageStationUpdate = async", 1)[0]
 
         self.assertIn("const [rememberPasswordDrafts, setRememberPasswordDrafts]", relay)
         self.assertIn("const selectedRememberPassword = selected ?", relay)
         self.assertIn('value={selectedRememberPassword}', relay)
         self.assertIn("setRememberPasswordDrafts", remember_password_update)
         self.assertNotIn("setCleanupBusy", remember_password_update)
+
+    def test_relay_inline_edits_stage_without_local_save_buttons(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+
+        self.assertNotIn('symbol="check"', relay)
+        self.assertNotIn('title={translate("common.save")}', relay)
+        self.assertIn('onBlur={() => { if (!disabled) void onNameCommit(); }}', relay)
+        self.assertIn('onNameCommit={() => runApiKeyAction("update", selectedResource.id)}', relay)
+        self.assertIn('onBlur={() => { if (!controlsBusy) void stageStationUpdate(); }}', relay)
+        self.assertIn('void stageStationUpdate({ type: nextType });', relay)
+        self.assertIn('translate("relay.stationUpdateStaged")', relay)
+        apply_body = self.ui.split('const apply = (): Promise<void> => {', 1)[1].split('const applyDataManagement', 1)[0]
+        self.assertIn('await dispatchQueue.current;', apply_body)
+        self.assertIn('title={translate("menu.apply")}', self.ui)
+
+    def test_relay_model_names_are_explicit_and_expandable(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+
+        self.assertIn('const INLINE_MODEL_LIMIT = 12;', relay)
+        self.assertIn('function visibleResourceModels(resource: RelayResource, showAll: boolean): string[] {', relay)
+        self.assertIn('models.join("\\n")', relay)
+        self.assertIn('"relay.showAllModels"', relay)
+        self.assertIn('"relay.showFewerModels"', relay)
+        self.assertNotIn('+${resource.models.length - 2}', relay)
+
+    def test_relay_account_header_is_a_single_compact_summary_row(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        header = relay.split('<View style={styles.accountHeader}>', 1)[1].split('<View style={[styles.resourcesSection]', 1)[0]
+
+        self.assertIn('<View style={styles.accountIdentity}>', relay)
+        self.assertIn('<View style={styles.accountFacts}>', relay)
+        self.assertIn('<View style={styles.accountHeaderActions}>', relay)
+        self.assertLess(header.index('relay.type'), header.index('relay.balance'))
+        self.assertGreaterEqual(header.count('<Text style={styles.accountHeaderSeparator}>·</Text>'), 3)
+        self.assertIn('accountHeader: { minWidth: 0, minHeight: 38', relay)
+        self.assertIn('flexDirection: "row", flexWrap: "wrap"', relay)
+        self.assertNotIn('accountMetadata:', relay)
+        self.assertNotIn('accountToolbar:', relay)
 
     def test_relay_manager_groups_accounts_by_station_and_uses_a_key_master_detail_workspace(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -1882,7 +1935,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'cells: [stationLabel, ""]',
             'key: `account:${account.id}`',
             'cells: [`  ${accountDisplayName(account, translate)}`',
-            "const stationFormDirty = Boolean(selectedStation)",
+            "const stageStationUpdate = async",
             'const relayTableSelection = selectedStationID ? `station:${selectedStationID}` : selected?.id ? `account:${selected.id}` : "";',
             "sidebarAddButton:",
             'symbol="minus"',
@@ -1897,25 +1950,33 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "stationSettingsForm:",
             "stationSettingsRow:",
             "stationSettingsFeedback:",
-            'title={translate("common.save")}',
-            'function resourceModelsSummary(resource: RelayResource, translate: Translate): string {',
+            'translate("relay.stationUpdateStaged")',
+            'const INLINE_MODEL_LIMIT = 12;',
+            'function visibleResourceModels(resource: RelayResource, showAll: boolean): string[] {',
+            'models.join("\\n")',
+            'relay.showAllModels',
+            'relay.showFewerModels',
             'translate("relay.apiKeysTitle")',
             'translate("relay.apiKeyNamePlaceholder")',
             "resourceTableRows",
-            "ResourceImportDialog",
-            "importDialogOpen",
             'translate("relay.apiKeyDelete")',
             'translate("relay.apiKeyCreate")',
             "NativeSecureTextInput",
             'symbol="copy"',
             "resourceToolbarCrud",
             'translate("relay.apiKeyGroup")',
-            "function groupLabel(group: RelayGroup): string {",
-            "return `${group.name} / ${Number.isInteger(group.multiplier) ? group.multiplier : group.multiplier.toString()}x`;",
+            'translate("relay.apiKeyMultiplier")',
+            "function groupMultiplierLabel(multiplier: number | null, translate: Translate): string {",
+            "function groupLabel(group: RelayGroup, translate: Translate): string {",
+            "function resourceGroupName(resource: RelayResource, groups: RelayGroup[], translate: Translate): string {",
+            "function resourceGroupMultiplier(resource: RelayResource, groups: RelayGroup[], translate: Translate): string {",
+            "function resourceGroupLabel(resource: RelayResource, groups: RelayGroup[], translate: Translate): string {",
+            "return `${group.name} / ${groupMultiplierLabel(group.multiplier, translate)}`;",
             "multiplier: groupMultiplier(entry.multiplier ?? entry.rate_multiplier ?? entry.ratio)",
             'domain="relay_accounts"',
             "apiKeyNameDrafts",
-            "accountMetadata",
+            "accountFacts",
+            "accountIdentity",
             "resourceEmptyText",
             'accountStationLabel(selected)',
             'translate("relay.balance")',
@@ -1939,8 +2000,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "secondaryCellKeys={resourceSecondaryCellKeys}",
             "onSelectionChange={setSelectedResourceID}",
             "resourceNativeTable:",
-            'columns={[{ label: translate("common.name"), width: 106 }, { label: translate("relay.apiKeyGroup"), width: 178 }]}',
-            "resourceInspectorPane: { width: 290",
+            'columns={[{ label: translate("common.name"), width: 116 }, { label: translate("relay.apiKeyGroup"), width: 124 }, { label: translate("relay.apiKeyMultiplier"), width: 64 }]}',
+            "resourceInspectorPane: { width: 266",
             "resourceInspectorLabel: { width: 78",
         ):
             self.assertIn(marker, relay)
@@ -1949,18 +2010,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
             r"const \[selectedResourceID, setSelectedResourceID\] = useState(?:<[^>]+>)?\(",
         )
 
-        # Batch selection exists only in the import dialog opened from the
-        # window footer, never in the account's main API-key toolbar/list.
-        import_dialog = relay.split("function ResourceImportDialog(", 1)[1].split("function RelayTablePane", 1)[0]
+        # Relay API keys are a live management list. There is no manual import
+        # selection or import mode in this route.
         for marker in (
-            "NativeCheckbox",
-            "selectedResources.includes(resource.id)",
-            'title={translate("relay.importSelected")}',
-            'translate("relay.selectedCount"',
+            "function ResourceImportDialog(",
+            "selectedResources",
+            "RelayImportMode",
+            'translate("relay.importSelected")',
+            'symbol="import"',
+            "openResourceImport",
         ):
-            self.assertIn(marker, import_dialog)
-        self.assertIn('leading={<ActionButton title={translate("relay.apiKeyImport")}', self.ui)
-        self.assertIn("setRelayImportRequest((current) => current + 1)", self.ui)
+            self.assertNotIn(marker, relay)
+        self.assertNotIn('leading={<ActionButton title={translate("relay.apiKeyImport")}', self.ui)
+        self.assertNotIn("setRelayImportRequest((current) => current + 1)", self.ui)
+        self.assertNotIn("importRequestKey", relay)
         resources_section = relay.split(
             '<View style={[styles.resourcesSection, compactStyles.resourcesSection]}>',
             1,
@@ -1978,8 +2041,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "resourceToolbarCrud",
             'symbol="plus"',
             'symbol="minus"',
-            'runApiKeyAction("create")',
-            'runApiKeyAction("remove", selectedResource.id)',
+            "setApiKeyCreateOpen(true)",
+            "openRemoteKeyDelete(selected, selectedResource)",
         ):
             self.assertIn(marker, resources_section)
         self.assertIn("function ResourceInspector(", relay)
@@ -2010,6 +2073,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the established station/account list.
         self.assertIn("rows={relayTableRows}", relay)
         self.assertIn("onSelectionChange={selectRelayTableRow}", relay)
+        self.assertIn('if (kind === "station") selectStation(id);', relay)
+        self.assertIn('const separator = key.indexOf(":");', relay)
+        self.assertNotIn('key: `station:${station.id}`,\n      cells: [stationLabel, ""],\n      spanning: true,', relay)
         self.assertIn("style={styles.nativeRelayTable}", relay)
         self.assertIn("export function normalizeRelayOrigin(value: string): string {", relay_origin)
         self.assertNotIn('`${stationName(account)} / ${account.username || translate("relay.unsignedAccount")}`', relay)
@@ -2030,22 +2096,151 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('selected.resourceError === "no_api_keys" && !resourceBusy && !restoreBusy', relay)
         self.assertIn('resourceBusy || restoreBusy ? translate("relay.resourcesChecking") : resourceHint(selected, translate)', relay)
         self.assertNotIn('translate("relay.resourceCount"', relay)
-        self.assertIn('"relay.apiKeyGroup": "分组 / 倍率"', self.zh)
-        self.assertIn('"relay.apiKeyGroup": "Group / Rate"', self.en)
-        self.assertIn('style={styles.resourceSelectionCount}', import_dialog)
-        self.assertIn('title={translate("relay.importSelected")}', import_dialog)
+        self.assertIn('"relay.apiKeyGroup": "分组"', self.zh)
+        self.assertIn('"relay.apiKeyMultiplier": "倍率"', self.zh)
+        self.assertIn('"relay.apiKeyGroup": "Group"', self.en)
+        self.assertIn('"relay.apiKeyMultiplier": "Rate"', self.en)
+        self.assertIn('columns={[{ label: translate("common.name"), width: 116 }, { label: translate("relay.apiKeyGroup"), width: 124 }, { label: translate("relay.apiKeyMultiplier"), width: 64 }]}', relay)
+        self.assertIn('resourceGroupName(resource, selectedGroups, translate)', relay)
+        self.assertIn('resourceGroupMultiplier(resource, selectedGroups, translate)', relay)
         self.assertNotIn('selectedResources.length > 0 ? <View style={[styles.bottomBar, compactStyles.bottomBar]}>', relay)
+        self.assertNotIn("resourceSearch", relay)
+        self.assertNotIn("syncTimeLabel", relay)
+        self.assertNotIn("lastSyncedAt", relay)
+        self.assertNotIn("UI_TIP_FONT_SIZE", relay)
+        self.assertIn("resourceGroupLabel(selectedResource, selected?.groups ?? [], translate)", relay)
         self.assertIn("apiKeyActions", relay)
         self.assertIn('commitRelayMetadata("api_key.create"', self.ui)
         self.assertIn('commitRelayMetadata("api_key.update"', self.ui)
         self.assertIn('commitRelayMetadata("api_key.set_enabled"', self.ui)
         self.assertIn('commitRelayMetadata("api_key.set_group"', self.ui)
         self.assertIn('commitRelayMetadata("api_key.delete"', self.ui)
+        self.assertIn('commitRelayMetadata("api_key.detach"', self.ui)
+        self.assertIn('dependency_policy: dependencyPolicy', self.ui)
+        self.assertNotIn('import_mode: importMode', self.ui)
+        self.assertIn('const [localRemoval, setLocalRemoval] = useState<LocalRemovalIntent>();', relay)
+        self.assertIn('const [remoteKeyDelete, setRemoteKeyDelete] = useState<RemoteKeyDeleteIntent>();', relay)
+        self.assertNotIn('const [importMode, setImportMode]', relay)
+        self.assertIn('? "relay.apiKeyCreateStaged"', relay)
+        self.assertIn('? "relay.apiKeyDetachStaged" : "relay.apiKeyDeleteStaged"', relay)
+        self.assertIn('translate("relay.pendingOperationsCount"', relay)
+        self.assertNotIn("await refreshAccountResources(selected);", relay)
         self.assertNotIn('resource_ids: [resourceId]', self.ui)
         self.assertIn('relayTypeLabel(selected.type', relay)
         self.assertIn('symbol="refresh"', relay)
-        self.assertIn("metaCheckbox: { minWidth: 78 }", relay)
+        self.assertIn("accountRememberPassword: { minWidth: 78 }", relay)
         self.assertIn("resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1", relay)
+
+    def test_relay_dialogs_avoid_the_unregistered_macos_fabric_modal_host(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+
+        # react-native-macos 0.85 can crash in RCTComponentViewFactory when
+        # ModalHostView is first mounted on a secondary route surface.
+        self.assertNotIn("<Modal", relay)
+        self.assertNotIn("import { Modal,", relay)
+        self.assertIn("function RelayDialogLayer(", relay)
+        self.assertEqual(2, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
+        self.assertIn(
+            'relayDialogLayer: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 100 }',
+            relay,
+        )
+
+    def test_relay_keys_are_discovered_by_base_url_without_manual_import_or_linking(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
+
+        for marker in (
+            'return (["relay_accounts", "providers_models"] as const).filter',
+            'function relaySourcesForBaseUrl(',
+            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
+            'function ProviderSourceFields(',
+            'function relayStationsFromSnapshot(',
+            'const providerType = stringValue(provider.provider_type, "custom") === "relay" ? "relay" : "custom";',
+            'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: nextStationID })',
+            'const matchingRelaySources = relaySourcesForBaseUrl(',
+            '() => provider ? providerKeyChoices(provider, relaySources) : [],',
+            'const keyChoices = useMemo(() => providerKeyChoices(provider, relaySources), [provider, relaySources]);',
+            'const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";',
+            'dispatch("model.select_relay_resource"',
+            'changes: { provider_key_id: providerKey.id, api_key_name: providerKey.name },',
+            'providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")}',
+            'hint={translate("providers.relayKeyValueHint")}',
+            'disabled domain="relay_accounts" field="api_key" target={relaySecretTarget}',
+            '<TextField label={translate("providers.keyValue")} labelWidth={68} value={translate("providers.relayKeyValueHint")} disabled',
+            'modelOrderMode(activeRoute.model) === "relay_multiplier"',
+            'function modelRelayMultiplier(model: UnknownRecord, provider: UnknownRecord, relaySources: RelaySourceOption[]): number | undefined {',
+            'label: translate("providers.effectiveOrder")',
+            'value={relayMultiplier === undefined ? translate("common.notAvailable") : `${relayMultiplier}x`}',
+            'label: translate("providers.orderSource")',
+            'result.status === "partial"',
+            'result.status === "failed"',
+            'setIssues(applyIssuesForDisplay(value));',
+            'if (!result.domains?.includes("relay_accounts") && result.status === "applied"',
+            'if (!applied.domains?.includes("relay_accounts") && applied.status === "applied"',
+        ):
+            self.assertIn(marker, self.ui)
+
+        for marker in (
+            'dispatch("model.link_relay_key"',
+            'dispatch("model.rebind_relay_key"',
+            'dispatch("model.detach_relay_key"',
+            'translate("providers.connectionSource")',
+            'translate("providers.relayStation")',
+            'translate("providers.relayAccount")',
+            'translate("providers.relayApiKey")',
+            'translate("providers.keyMode")',
+            'translate("providers.sourceIndependent")',
+            'translate("providers.sourceRelay")',
+            'function relayRebindTargetsFromSnapshot(',
+            'rebind: { provider_key_id:',
+        ):
+            self.assertNotIn(marker, self.ui)
+
+        self.assertIn('"providers.providerKey": "供应商密钥"', self.zh)
+        self.assertIn('"providers.apiKeys": "密钥列表"', self.zh)
+        self.assertIn('"providers.relayKeyValueHint": "由中转站管理"', self.zh)
+        self.assertNotIn('providers.bindingHealth', self.ui + self.zh + self.en)
+        self.assertNotIn('providers.relayMultiplier', self.ui + self.zh + self.en)
+        self.assertNotIn('providers.relayKeyBadge', self.ui + self.zh + self.en)
+
+        for marker in (
+            'commitRelayMetadata("resources.import"',
+            'dispatch("provider.import_relay_key"',
+            'translate("providers.relayKeySource")',
+            "ResourceImportDialog",
+            "RelayImportMode",
+        ):
+            self.assertNotIn(marker, self.ui + relay)
+
+        for marker in (
+            'value: "detach_disabled"',
+            'value: "detach_only"',
+            'commit("station.remove"',
+            'linkedModelCount: count(entry.linked_model_count)',
+            'pendingOperationCount: count(entry.pending_operation_count)',
+        ):
+            self.assertIn(marker, relay)
+
+        for marker in (
+            'translate("relay.bindingStatus")',
+            'translate("relay.linkedModels")',
+            'translate("relay.policyRebind")',
+            'rebindTargetID',
+        ):
+            self.assertNotIn(marker, relay)
+
+        for marker in (
+            'catalog_mode?: "independent" | "relay_linked";',
+            'order_mode?: "manual" | "relay_multiplier";',
+            'effective_order?: number;',
+            'status: "applied" | "partial" | "failed";',
+            'completed_operations: number;',
+            'pending_operations: number;',
+        ):
+            self.assertIn(marker, types)
+        provider_key_contract = types.split("export interface ProviderKeySummary", 1)[1].split("}\n", 1)[0]
+        for forbidden in ("value:", "password", "token", "secret"):
+            self.assertNotIn(forbidden, provider_key_contract)
 
     def test_relay_empty_state_keeps_an_inline_add_affordance(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -2082,20 +2277,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         for marker in (
-            'relayLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 4 }',
+            'relayLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }',
             'sidebarIconButton: { width: 22, minWidth: 22, height: 22 }',
             'formRow: { width: "100%", minHeight: 34, flexDirection: "column", alignItems: "stretch", gap: 6 }',
             'bottomBar: { minHeight: 38, paddingHorizontal: 12, paddingVertical: 6, flexDirection: "row", flexWrap: "wrap"',
-            'resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1, borderTopColor: colors.separator }',
+            'resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1, borderTopColor: colors.separator, paddingTop: 4 }',
             'accountDetailContent: { flex: 1, minWidth: 0, minHeight: 0 }',
-            'accountHeader: { minWidth: 0, backgroundColor: colors.window }',
-            'accountMetadata: { minHeight: 30, paddingHorizontal: 10, paddingVertical: 2, flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, backgroundColor: colors.window }',
+            'accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 12, rowGap: 4, backgroundColor: colors.window }',
+            'accountIdentity: { flexGrow: 0, flexShrink: 1, flexBasis: "auto", minWidth: 150, flexDirection: "row", alignItems: "baseline", gap: 5 }',
+            'accountFacts: { flexShrink: 1, minWidth: 0, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }',
             'resourcePane: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.window }',
-            'resourceToolbar: { minHeight: 26, paddingHorizontal: 8, flexDirection: "row", alignItems: "center", gap: 6 }',
+            'resourceToolbar: { minHeight: 32, paddingHorizontal: 12, paddingVertical: 3, flexDirection: "row", alignItems: "center", gap: 8 }',
             'sidebarTableFrame: { flex: 1, minWidth: 0, minHeight: 0 }',
-            'resourceListPane: { flex: 1, minWidth: 322, minHeight: 0 }',
-            'resourceToolbarCrud: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4, marginLeft: 2 }',
-            'resourceInspectorHeader: { height: 24, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }',
+            'resourceListPane: { flex: 1, minWidth: 0, minHeight: 0 }',
+            'resourceToolbarCrud: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }',
+            'resourceInspectorHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }',
             '<Text numberOfLines={1} style={styles.resourceInspectorSubtitle}>{selectedResourceGroupLabel}</Text>',
             'pendingCleanupList: { maxHeight: 116',
             '<ScrollView style={styles.pendingCleanupList} contentContainerStyle={styles.pendingCleanupListContent}>',
@@ -2113,15 +2309,31 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('accountHeader: { minWidth: 0, borderBottomWidth:', relay)
         self.assertIn('relayAccountsContent: { paddingBottom: 6, gap: 6 }', self.ui)
 
+    def test_relay_add_setup_is_compact_and_starts_with_the_station_choice(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        setup = relay.split('<View style={[styles.formSection, setupOnly && styles.setupFormSection]}>', 1)[1].split('</View>', 1)[0]
+
+        self.assertLess(setup.index('label={translate("relay.stationChoice")}'), setup.index('label={translate("relay.origin")}'))
+        self.assertLess(setup.index('label={translate("relay.origin")}'), setup.index('label={translate("relay.stationName")}'))
+        self.assertIn('const steps = [translate("relay.setupStepStation"), translate("relay.stepSignIn")];', relay)
+        self.assertIn('setupContent: { justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }', relay)
+        self.assertIn('setupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }', relay)
+        self.assertIn('setupFormSection: { maxWidth: 520, paddingVertical: 0, gap: 10 }', relay)
+        self.assertIn('setupBottomBar: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, borderTopWidth: 0, backgroundColor: colors.window }', relay)
+        self.assertNotIn('setupProgressConnector', relay)
+        form_section = relay.split('formSection: {', 1)[1].split('},', 1)[0]
+        self.assertNotIn('borderTopWidth', form_section)
+
     def test_provider_table_columns_fit_the_fixed_provider_pane(self) -> None:
         self.assertIn('"providers.modelCount": "Count"', self.en)
         self.assertIn('"providers.modelCount": "模型数"', self.zh)
-        self.assertIn('"providers.apiKeyOrder": "密钥/顺序"', self.zh)
+        self.assertNotIn('"providers.routeSource"', self.zh)
+        self.assertIn('"providers.effectiveOrder": "有效顺序"', self.zh)
         self.assertIn('"providers.keyName": "密钥名"', self.zh)
         self.assertIn('"providers.keyValue": "密钥值"', self.zh)
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 88 }, { label: translate("providers.modelCount"), width: 64 }]}')
         self.assert_ui_has('providerListPane: { width: 154, minWidth: 154, maxWidth: 154')
-        self.assert_ui_has('columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.apiKeyOrder"), width: 96 }]}')
+        self.assert_ui_has('columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.providerKey"), width: 128 }]}')
         self.assert_ui_has('modelListPane: { flex: 1, minWidth: 0 }')
         self.assert_ui_has('providerKeysHeader: { minHeight: 24, flexDirection: "row"')
         self.assert_ui_has('<View style={styles.providerKeyActions}>')
@@ -2156,7 +2368,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("formRow: { minHeight: 24, gap: 2 }")
         self.assert_ui_has("formRowControl: { gap: 1 }")
         self.assertIn("const compactStyles = StyleSheet.create({", relay)
-        self.assertIn('resourceInspectorRow: { minHeight: 28, flexDirection: "row", alignItems: "center", gap: 6 }', relay)
+        self.assertIn('resourceInspectorRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 6 }', relay)
 
     def test_relay_tables_use_compact_native_zebra_rows_and_shared_alignment(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -2166,12 +2378,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(2, relay.count("          striped\n"))
         self.assertNotIn("striped={false}", relay)
         for marker in (
-            'tableTitleRow: { height: 26, minHeight: 26, paddingHorizontal: 8',
-            'accountToolbar: { minHeight: 38, paddingHorizontal: 10, paddingVertical: 3',
-            'accountMetadata: { minHeight: 30, paddingHorizontal: 10, paddingVertical: 2',
-            'resourceToolbar: { minHeight: 26, paddingHorizontal: 8',
+            'tableTitleRow: { height: 30, minHeight: 30, paddingHorizontal: 10',
+            'accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5',
+            'accountIdentity: { flexGrow: 0, flexShrink: 1, flexBasis: "auto"',
+            'resourceToolbar: { minHeight: 32, paddingHorizontal: 12',
             'resourceNativeTable: { flex: 1, minWidth: 0, minHeight: 0 }',
-            'resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 0, paddingHorizontal: 10',
+            'resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 6, paddingHorizontal: 12',
         ):
             self.assertIn(marker, relay)
 
@@ -2362,7 +2574,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for source in (english, chinese, translation_keys):
             self.assertNotIn('"common.staged"', source)
         self.assertNotIn('"dataManagement.staged":', chinese)
-        self.assertIn('"relay.resourcesImported": "所选 API 资源已导入“供应商与模型”。请前往该页面并点击“应用”以启用连接。"', chinese)
+        for source in (english, chinese, translation_keys):
+            self.assertNotIn("relay.resourcesImportedLinked", source)
+            self.assertNotIn("relay.importLinked", source)
 
     def test_macos_leaf_localizes_window_titles_and_keeps_status_menu_order(self) -> None:
         for title in (
