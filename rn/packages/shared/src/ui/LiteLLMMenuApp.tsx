@@ -2554,6 +2554,12 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     const optionLabels = optionValues.map((option) => runtimeOptionLabel(key, option, translate));
     const selectedIndex = optionValues.indexOf(value);
     control = <NativePicker labels={optionLabels} selectedValue={optionLabels[selectedIndex] ?? optionLabels[0] ?? ""} disabled={busy} onChange={({ nativeEvent }) => { const next = optionValues[nativeEvent.index]; if (next !== undefined) void dispatch("set_setting", { key, value: next }); }} style={styles.runtimeValueControl} />;
+  } else if (kind === "json") {
+    // JSON may contain provider credentials. Keep the document in the native
+    // editor and stage it through the one-time Core secret capability while
+    // still giving the user a real multiline textarea.
+    control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} multiline plainText autoCommit onSecretState={onSecretState} />;
+    action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => clearSecret({ domain: "runtime", field: "setting", target: key })} />;
   } else if (item.secret === true) {
     control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} onSecretState={onSecretState} setTitle={translate("common.set")} />;
     action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => clearSecret({ domain: "runtime", field: "setting", target: key })} />;
@@ -2561,7 +2567,8 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     control = <RuntimeValueField label={label} value={value} keyboardType={["number", "integer", "int", "float", "mb"].includes(storageKind) ? "numeric" : undefined} onCommit={(next) => dispatch("set_setting", { key, value: next })} />;
   }
   const isBoolean = kind === "boolean" || kind === "toggle" || kind === "bool" || kind === "bool_auto";
-  return <View style={styles.runtimeField}><View style={styles.runtimeInputRow}><Text numberOfLines={2} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</Text><View style={styles.runtimeValueSlot}>{control}</View>{!isBoolean && unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}{!isBoolean ? <View style={styles.runtimeActionSlot}>{action}</View> : null}</View><RuntimeFieldMeta item={item} translate={translate} /></View>;
+  const isMultiline = kind === "json";
+  return <View style={styles.runtimeField}><View style={[styles.runtimeInputRow, isMultiline && styles.runtimeMultilineInputRow]}><Text numberOfLines={2} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</Text><View style={[styles.runtimeValueSlot, isMultiline && styles.runtimeMultilineValueSlot]}>{control}</View>{!isBoolean && unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}{!isBoolean ? <View style={[styles.runtimeActionSlot, isMultiline && styles.runtimeMultilineActionSlot]}>{action}</View> : null}</View><RuntimeFieldMeta item={item} translate={translate} /></View>;
 }
 
 function RuntimeFieldMeta({ item, translate }: { item: UnknownRecord; translate: Translate }): React.JSX.Element {
@@ -3867,7 +3874,7 @@ function TextField({ label, value, onCommit, hint, secret, multiline, compactMul
   return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text><View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea]} value={field.draft} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={styles.fieldHint}>{hint}</Text> : null}</View>{suffix ? <Text style={styles.fieldHint}>{suffix}</Text> : null}</View>;
 }
 
-function NativeSecretInputControl({ label, hint, busy, domain, field, target, plainText = false, autoCommit = false, resetToken = 0, onSecretState, setTitle, setBelow, onSetReady, inputMinWidth }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "relay_accounts" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; plainText?: boolean; autoCommit?: boolean; resetToken?: number; onSecretState: (state: SecretState) => void; setTitle?: string; setBelow?: boolean; onSetReady?: (requestSet: () => void, saving: boolean) => void; inputMinWidth?: number }): React.JSX.Element {
+function NativeSecretInputControl({ label, hint, busy, domain, field, target, multiline = false, plainText = false, autoCommit = false, resetToken = 0, onSecretState, setTitle, setBelow, onSetReady, inputMinWidth }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "relay_accounts" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; multiline?: boolean; plainText?: boolean; autoCommit?: boolean; resetToken?: number; onSecretState: (state: SecretState) => void; setTitle?: string; setBelow?: boolean; onSetReady?: (requestSet: () => void, saving: boolean) => void; inputMinWidth?: number }): React.JSX.Element {
   const [commitRequest, setCommitRequest] = useState(0);
   const [resetRequest, setResetRequest] = useState(0);
   const [status, setStatus] = useState("ready");
@@ -3936,7 +3943,7 @@ function NativeSecretInputControl({ label, hint, busy, domain, field, target, pl
     };
   }, [commit, registry, reset]);
   useEffect(() => { onSetReady?.(requestCommit, status === "saving"); }, [onSetReady, status]);
-  return <View style={[styles.nativeSecretControl, compactStyles.nativeSecretControl]}><NativeSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={hint ?? ""} plainText={plainText} autoCommit={autoCommit} disabled={busy} commitRequest={commitRequest} resetRequest={resetRequest + resetToken} onSecretState={(state) => {
+  return <View style={[styles.nativeSecretControl, compactStyles.nativeSecretControl, multiline && styles.nativeSecretMultilineControl]}><NativeSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={hint ?? ""} multiline={multiline} plainText={plainText} autoCommit={autoCommit} disabled={busy} commitRequest={commitRequest} resetRequest={resetRequest + resetToken} onSecretState={(state) => {
     statusRef.current = state.status;
     setStatus(state.status);
     if (state.status === "dirty") {
@@ -3967,7 +3974,7 @@ function NativeSecretInputControl({ label, hint, busy, domain, field, target, pl
       if (!autoCommit) setResetRequest((current) => current + 1);
       onSecretState(state);
     }
-  }} style={[styles.nativeSecretInput, compactStyles.input, inputMinWidth === undefined ? null : { minWidth: inputMinWidth }]} />{!autoCommit && !setBelow && setTitle ? <NativeButton title={setTitle} compact disabled={busy || status === "saving"} onPress={requestCommit} style={styles.secretActionButton} /> : null}</View>;
+  }} style={[styles.nativeSecretInput, compactStyles.input, multiline && styles.nativeSecretTextArea, inputMinWidth === undefined ? null : { minWidth: inputMinWidth }]} />{!autoCommit && !setBelow && setTitle ? <NativeButton title={setTitle} compact disabled={busy || status === "saving"} onPress={requestCommit} style={styles.secretActionButton} /> : null}</View>;
 }
 
 function NativeSecretField({ label, hint, busy, disabled = false, domain, field, target, plainText = false, autoCommit = false, onSecretState, labelWidth, labelAlign, setTitle, clearTitle, clearDisabled, onClear, actionsBelow }: { label: string; hint?: string; busy: boolean; disabled?: boolean; domain: "providers_models" | "relay_accounts" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; plainText?: boolean; autoCommit?: boolean; onSecretState: (state: SecretState) => void; labelWidth?: number; labelAlign?: "left" | "right"; setTitle?: string; clearTitle?: string; clearDisabled?: boolean; onClear?: () => Promise<void>; actionsBelow?: boolean }): React.JSX.Element {

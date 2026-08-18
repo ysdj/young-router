@@ -61,7 +61,7 @@ class SearchEndpointTests(unittest.TestCase):
 
         async def fake_run_actions(actions, _cache, _tasks):
             return (
-                "Title: Synthetic source\nURL: https://example.test/source\nSnippet: synthetic",
+                "1. Synthetic source\n   https://example.test/source",
                 ["https://example.test/source"],
                 [["https://example.test/source"]],
                 actions,
@@ -90,6 +90,18 @@ class SearchEndpointTests(unittest.TestCase):
                     os.environ["LITELLM_MENU_SEARCH_STATE_FILE"] = previous
         self.assertIn("output", response)
         self.assertRegex(response["output"], r"Reference: turn\d+search0")
+        self.assertEqual(
+            search_endpoint._bridge._external_web_search_result_cards(
+                "1. Synthetic source\n   https://example.test/source"
+            ),
+            [
+                {
+                    "title": "Synthetic source",
+                    "url": "https://example.test/source",
+                    "snippet": "",
+                }
+            ],
+        )
 
     def test_url_reference_ids_are_stable_across_sessions(self) -> None:
         search_endpoint = self._module()

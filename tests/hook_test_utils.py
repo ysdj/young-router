@@ -39,7 +39,7 @@ HOOK_MODULE_NAMES = (
     "image_generation",
     "vision_bridge",
     "streaming",
-    "external_web_search",
+    "pi_web_access",
     "hook",
 )
 

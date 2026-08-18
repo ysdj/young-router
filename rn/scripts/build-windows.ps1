@@ -8,6 +8,9 @@ if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
 } else {
   $Core = Join-Path $env:RUNNER_TEMP ("litellm-menu-rn-core-" + [guid]::NewGuid().ToString("N"))
 }
+$PiWork = Join-Path ([System.IO.Path]::GetTempPath()) ("litellm-menu-pi-web-access-" + [guid]::NewGuid().ToString("N"))
+$PiPackage = Join-Path $PiWork "package"
+$PiNode = Join-Path $PiWork "node"
 
 function Copy-CoreSource {
   param([string]$Source, [string]$Destination)
@@ -25,6 +28,11 @@ try {
   }
   & uv run --no-project --python 3.12 (Join-Path $ProjectRoot "scripts\update_litellm.py")
   if ($LASTEXITCODE -ne 0) { throw "Could not update LiteLLM to the latest stable release." }
+  $PiWebAccessUpdater = Join-Path $ProjectRoot "scripts\update_pi_web_access.py"
+  & uv run --no-project --python 3.12 $PiWebAccessUpdater `
+    --output $PiPackage `
+    --node-output $PiNode
+  if ($LASTEXITCODE -ne 0) { throw "Could not update pi-web-access and the bundled Node.js runtime." }
   if (-not (Test-Path (Join-Path $AppRoot "windows"))) {
     throw "React Native Windows host project is missing at rn/apps/windows/windows."
   }
@@ -45,6 +53,7 @@ try {
   foreach ($Name in @("litellm_menu", "config_editor_core", "webdav")) {
     Copy-CoreSource (Join-Path $ProjectRoot $Name) (Join-Path $Core $Name)
   }
+  Copy-CoreSource $PiPackage (Join-Path $Core "litellm_menu\pi-web-access")
   Get-ChildItem -LiteralPath $Core -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
   Get-ChildItem -LiteralPath $Core -Recurse -File -Include "*.pyc", "*.pyo" | Remove-Item -Force
 
@@ -63,7 +72,8 @@ try {
 
   $LiteLLMVersion = (Get-Content -Raw (Join-Path $ProjectRoot "LITELLM_VERSION")).Trim()
   uv pip install --python (Join-Path $RuntimeBin "python.exe") `
-    "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow ddgs
+    "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML Pillow
+  Copy-Item -LiteralPath (Join-Path $PiNode "node.exe") -Destination $RuntimeBin -Force
   $GeneratedScripts = Join-Path $RuntimeBin "Scripts"
   if (Test-Path $GeneratedScripts) {
     Remove-Item -LiteralPath $GeneratedScripts -Recurse -Force
@@ -77,6 +87,20 @@ set "RUNTIME_ROOT=%~dp0"
 '@
   Set-Content -LiteralPath (Join-Path $RuntimeBin "litellm.cmd") -Value $LiteLLMCommand -Encoding ascii
   Copy-Item -LiteralPath (Join-Path $ProjectRoot "LITELLM_VERSION") -Destination (Join-Path $Core "runtime\LITELLM_VERSION") -Force
+  if (-not (Test-Path (Join-Path $Core "litellm_menu\pi-web-access\index.ts"))) {
+    throw "The bundled pi-web-access package is missing."
+  }
+  if (-not (Test-Path (Join-Path $RuntimeBin "node.exe"))) {
+    throw "The bundled Node.js runtime is missing."
+  }
+  $PiSmokeConfig = Join-Path $PiWork "smoke-config"
+  "" | & (Join-Path $RuntimeBin "node.exe") `
+    (Join-Path $Core "litellm_menu\pi_web_access_worker.mjs") `
+    --entry (Join-Path $Core "litellm_menu\pi-web-access\index.ts") `
+    --config-dir $PiSmokeConfig
+  if ($LASTEXITCODE -ne 0) {
+    throw "The bundled pi-web-access worker could not load its staged SDK."
+  }
 
   $Python = Join-Path $RuntimeBin "python.exe"
   $PreviousPythonPath = $env:PYTHONPATH
@@ -130,6 +154,12 @@ set "RUNTIME_ROOT=%~dp0"
   if (-not (Test-Path $BundledLiteLLM)) {
     throw "The Windows build output does not contain Core/runtime/bin/litellm.cmd."
   }
+  if (-not (Test-Path (Join-Path $BundledBin "node.exe"))) {
+    throw "The Windows build output does not contain Core/runtime/bin/node.exe."
+  }
+  if (-not (Test-Path (Join-Path $BundledCore "litellm_menu\pi-web-access\index.ts"))) {
+    throw "The Windows build output does not contain litellm_menu/pi-web-access/index.ts."
+  }
   if (-not (Test-Path $BundledVersion) -or (Get-Content -Raw $BundledVersion).Trim() -ne $LiteLLMVersion) {
     throw "The Windows build output does not contain the pinned LiteLLM release lock."
   }
@@ -147,5 +177,8 @@ set "RUNTIME_ROOT=%~dp0"
 } finally {
   if (Test-Path $Core) {
     Remove-Item -LiteralPath $Core -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  if (Test-Path $PiWork) {
+    Remove-Item -LiteralPath $PiWork -Recurse -Force -ErrorAction SilentlyContinue
   }
 }

@@ -366,6 +366,13 @@ function stationDisplayName(station: RelayStation, translate: Translate): string
   return name;
 }
 
+function stationPickerLabel(station: RelayStation, translate: Translate): string {
+  const name = stationDisplayName(station, translate);
+  const origin = station.origin.trim();
+  if (!origin || stationOriginKey(name) === stationOriginKey(origin)) return name || origin;
+  return `${name} — ${origin}`;
+}
+
 function usernameShortName(account: RelayAccount): string {
   const username = account.username.trim();
   if (!username) return "";
@@ -659,6 +666,7 @@ export function RelayAccountManager({
   const [selectedStationID, setSelectedStationID] = useState<string>();
   const [adding, setAdding] = useState(setupOnly);
   const [addStep, setAddStep] = useState<AddStep>("origin");
+  const [addStationID, setAddStationID] = useState("__custom__");
   const [origin, setOrigin] = useState("");
   const [addStationName, setAddStationName] = useState("");
   const [stationNameEdited, setStationNameEdited] = useState(false);
@@ -717,9 +725,8 @@ export function RelayAccountManager({
     ? groupLabel(selectedResourceGroup, translate)
     : selectedResource ? resourceGroupLabel(selectedResource, selected?.groups ?? [], translate) : translate("relay.apiKeyUngrouped");
   const selectedRememberPassword = selected ? rememberPasswordDrafts[selected.id] ?? selected.rememberPassword : false;
-  const selectedStation = stations.find((station) => station.id === selectedStationID)
-    ?? (selected ? stations.find((station) => station.accountIDs.includes(selected.id)) : undefined)
-    ?? stations[0];
+  const selectedStation = selectedStationID ? stations.find((station) => station.id === selectedStationID) : undefined;
+  const selectedAddStation = stations.find((station) => station.id === addStationID);
   const effectiveLoginStatus = (account: RelayAccount): "signed_in" | "signed_out" | "expired" | "unknown" => {
     if (loginFailureIDs.has(account.id)) return "expired";
     if (account.loginStatus === "signed_in" || account.loginStatus === "signed_out" || account.loginStatus === "expired") return account.loginStatus;
@@ -753,11 +760,6 @@ export function RelayAccountManager({
     setStationOriginDraft(selectedStation.origin);
     setStationTypeDraft(selectedStation.type);
   }, [selectedStationID, selectedStation?.id, selectedStation?.name, selectedStation?.origin, selectedStation?.type]);
-  useEffect(() => {
-    if (setupOnly || adding || selectedStationID || selectedID || stations.length === 0) return;
-    setSelectedID(undefined);
-    setSelectedStationID(stations[0].id);
-  }, [adding, selectedID, selectedStationID, setupOnly, stations]);
   useEffect(() => {
     const route = setupOnly ? "relay-add" : "relay-accounts";
     const showingLoginStep = setupOnly && adding && addStep === "sign-in";
@@ -797,6 +799,7 @@ export function RelayAccountManager({
     typeDetectionRequest.current += 1;
     setAdding(setupOnly);
     setAddStep("origin");
+    setAddStationID("__custom__");
     setOrigin("");
     setAddStationName("");
     setStationNameEdited(false);
@@ -867,8 +870,9 @@ export function RelayAccountManager({
     setFeedback(undefined);
     let account: AddedRelayAccount | undefined;
     try {
-      const detected = await detectRelayType();
-    const accountType = detected ?? manualType ?? detectedAddType;
+      const chosenStation = selectedAddStation;
+      const detected = chosenStation?.type ?? await detectRelayType();
+      const accountType = detected ?? manualType ?? detectedAddType;
       if (!accountType) {
         // A white-label site can block the public detection probes while
         // still presenting a normal sign-in page. Require an explicit family
@@ -876,7 +880,12 @@ export function RelayAccountManager({
         setFeedback(translate("relay.typeNotDetected"));
         return;
       }
-      account = await addAccount(accountType, candidate, false, {
+      account = await addAccount(accountType, candidate, false, chosenStation ? {
+        stationID: chosenStation.id,
+        stationOrigin: chosenStation.origin,
+        stationName: chosenStation.name,
+        stationType: chosenStation.type ?? accountType,
+      } : {
         stationOrigin: candidate,
         stationName: addStationName.trim() || undefined,
         stationType: accountType,
@@ -1230,6 +1239,7 @@ export function RelayAccountManager({
   };
   const updateAddOrigin = (value: string): void => {
     typeDetectionRequest.current += 1;
+    setAddStationID("__custom__");
     setOrigin(value);
     if (!stationNameEdited) {
       setAddStationName(suggestedRelayStationName(value));
@@ -1244,6 +1254,25 @@ export function RelayAccountManager({
   };
   const detectedAddType = typeDetection !== "checking" && typeDetection !== "unknown" ? typeDetection : undefined;
   const selectedAddType = manualType ?? detectedAddType;
+  const addStationPickerLabels = [translate("relay.stationCustom"), ...stations.map((station) => stationPickerLabel(station, translate))];
+  const addStationPickerValue = selectedAddStation ? stationPickerLabel(selectedAddStation, translate) : translate("relay.stationCustom");
+  const selectAddStation = (index: number): void => {
+    const station = stations[index - 1];
+    typeDetectionRequest.current += 1;
+    if (!station) {
+      setAddStationID("__custom__");
+      setTypeDetection(undefined);
+      setManualType(undefined);
+      setStationNameEdited(false);
+      return;
+    }
+    setAddStationID(station.id);
+    setOrigin(station.origin);
+    setAddStationName(stationDisplayName(station, translate));
+    setStationNameEdited(false);
+    setTypeDetection(station.type);
+    setManualType(station.type);
+  };
   const localPolicyOptions: Array<PolicyOption<LocalDependencyPolicy>> = [
     { value: "detach", label: translate("relay.policyRelease"), hint: translate("relay.policyReleaseHint") },
     { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
@@ -1269,7 +1298,7 @@ export function RelayAccountManager({
     || selectedStationAccounts.reduce((total, account) => total + account.linkedModelCount, 0);
   return <View style={styles.workspace} accessibilityLabel={translate("relay.title")}>
     <View style={styles.relayLayout}>
-      {!setupOnly ? <RelayTablePane title={translate("relay.accounts")} style={styles.sidebar} actions={<>
+      {!setupOnly ? <RelayTablePane title={translate("relay.accountsHeader")} style={styles.sidebar} actions={<>
         <NativeButton title={translate("relay.addAccount")} symbol="plus" toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} compact disabled={adding} onPress={beginAdding} style={styles.sidebarAddButton} />
         <NativeButton title={translate("relay.removeLocal")} symbol="minus" toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} destructive compact disabled={(!selected && !selectedStation) || adding} onPress={openLocalRemoval} style={styles.sidebarIconButton} />
       </>}>
@@ -1306,9 +1335,10 @@ export function RelayAccountManager({
                 <Text style={styles.detailTitle}>{translate("relay.addAccount")}</Text>
               </View>
               <View style={[styles.formSection, setupOnly && styles.setupFormSection]}>
-                <FormRow label={translate("relay.origin")}><NativeTextField value={origin} placeholder={translate("relay.originPlaceholder")} editable={!controlsBusy} accessibilityLabel={translate("relay.origin")} autoCapitalize="none" autoCorrect={false} onChangeText={updateAddOrigin} style={[styles.control, compactStyles.control]} /></FormRow>
-                <FormRow label={translate("relay.stationName")}><NativeTextField value={addStationName} placeholder={translate("relay.stationNamePlaceholder")} editable={!controlsBusy} accessibilityLabel={translate("relay.stationName")} onChangeText={updateAddStationName} style={[styles.control, compactStyles.control]} /></FormRow>
-                <FormRow label={translate("relay.type")}><NativePicker labels={[relayTypeLabel("newapi", translate), relayTypeLabel("sub2api", translate)]} selectedValue={selectedAddType ? relayTypeLabel(selectedAddType, translate) : ""} disabled={controlsBusy} onChange={({ nativeEvent }) => { setManualType(nativeEvent.index === 1 ? "sub2api" : "newapi"); }} style={styles.typeSelector} /></FormRow>
+                {stations.length > 0 ? <FormRow label={translate("relay.station")}><NativePicker labels={addStationPickerLabels} selectedValue={addStationPickerValue} disabled={controlsBusy} onChange={({ nativeEvent }) => selectAddStation(nativeEvent.index)} style={styles.typeSelector} /></FormRow> : null}
+                <FormRow label={translate("relay.origin")}><NativeTextField value={origin} placeholder={translate("relay.originPlaceholder")} editable={!controlsBusy && !selectedAddStation} accessibilityLabel={translate("relay.origin")} autoCapitalize="none" autoCorrect={false} onChangeText={updateAddOrigin} style={[styles.control, compactStyles.control]} /></FormRow>
+                <FormRow label={translate("relay.stationName")}><NativeTextField value={addStationName} placeholder={translate("relay.stationNamePlaceholder")} editable={!controlsBusy && !selectedAddStation} accessibilityLabel={translate("relay.stationName")} onChangeText={updateAddStationName} style={[styles.control, compactStyles.control]} /></FormRow>
+                <FormRow label={translate("relay.type")}><NativePicker labels={[relayTypeLabel("newapi", translate), relayTypeLabel("sub2api", translate)]} selectedValue={selectedAddType ? relayTypeLabel(selectedAddType, translate) : ""} disabled={controlsBusy || Boolean(selectedAddStation)} onChange={({ nativeEvent }) => { setManualType(nativeEvent.index === 1 ? "sub2api" : "newapi"); }} style={styles.typeSelector} /></FormRow>
               </View>
             </View>
           </View>

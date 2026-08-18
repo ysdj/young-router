@@ -174,6 +174,7 @@ export type SecureTextInputProps = {
   target?: string;
   label: string;
   placeholder?: string;
+  multiline?: boolean;
   plainText?: boolean;
   autoCommit?: boolean;
   disabled?: boolean;
@@ -336,12 +337,12 @@ export function NativePersistentScrollIndicator({ style }: { style?: StyleProp<V
 }
 
 /** Native password leaves never pass secret text through React. */
-export function NativeSecureTextInput({ domain, field, target = "", label, placeholder, plainText = false, autoCommit = false, disabled, commitRequest, resetRequest, onSecretState, style }: SecureTextInputProps): React.JSX.Element {
+export function NativeSecureTextInput({ domain, field, target = "", label, placeholder, multiline = false, plainText = false, autoCommit = false, disabled, commitRequest, resetRequest, onSecretState, style }: SecureTextInputProps): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUISecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
+    return <WinUISecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} multiline={multiline} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
+    return <AppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} multiline={multiline} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
   }
   return <View accessibilityLabel={label} style={style} />;
 }

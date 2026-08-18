@@ -53,6 +53,28 @@ if [[ "$NODE_MAJOR" -lt 22 ]]; then
   exit 1
 fi
 
+PI_WEB_ACCESS_UPDATE_COMMAND=()
+if [[ -n "${LITELLM_PI_WEB_ACCESS_PYTHON:-}" ]]; then
+  command -v "$LITELLM_PI_WEB_ACCESS_PYTHON" >/dev/null 2>&1 || {
+    echo "Configured LITELLM_PI_WEB_ACCESS_PYTHON was not found." >&2
+    exit 1
+  }
+  PI_WEB_ACCESS_UPDATE_COMMAND=("$LITELLM_PI_WEB_ACCESS_PYTHON")
+elif [[ -n "$UV_BIN" && -x "$UV_BIN" ]]; then
+  PI_WEB_ACCESS_UPDATE_COMMAND=("$UV_BIN" run --no-project --python 3.12)
+elif command -v python3 >/dev/null 2>&1 \
+  && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+  PI_WEB_ACCESS_UPDATE_COMMAND=(python3)
+else
+  echo "Python 3.11+ (or uv) is required to stage pi-web-access for the macOS Core runtime." >&2
+  exit 1
+fi
+PI_WEB_ACCESS_PACKAGE_WORK="$RUNTIME_WORK/pi-web-access"
+PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_pi_web_access.py" \
+  --output "$PI_WEB_ACCESS_PACKAGE_WORK" \
+  --node-output "$PI_WEB_ACCESS_NODE_WORK"
+
 export RCT_USE_RN_DEP=0
 export RCT_USE_PREBUILT_RNCORE=0
 export RCT_BUILD_HERMES_FROM_SOURCE=true
@@ -148,6 +170,7 @@ for directory in litellm_menu config_editor_core webdav; do
     --exclude '*.pyo' \
     "$PROJECT_ROOT/$directory/" "$CORE/$directory/"
 done
+copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/litellm_menu/pi-web-access"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \
@@ -184,14 +207,15 @@ else
     "litellm[proxy]==$LITELLM_VERSION" \
     "fastapi==0.140.3" \
     Pillow \
-    PyYAML \
-    ddgs >/dev/null
+    PyYAML >/dev/null
   cp "$PROJECT_ROOT/scripts/runtime/python-wrapper.sh" "$CORE/runtime/bin/python"
   cp "$PROJECT_ROOT/scripts/runtime/litellm-wrapper.sh" "$CORE/runtime/bin/litellm"
   cp "$PROJECT_ROOT/LITELLM_VERSION" "$CORE/runtime/LITELLM_VERSION"
   chmod 0755 "$CORE/runtime/bin/python" "$CORE/runtime/bin/litellm"
 fi
 cp "$PROJECT_ROOT/LITELLM_VERSION" "$CORE/runtime/LITELLM_VERSION"
+mkdir -p "$CORE/runtime/bin"
+copy_tree "$PI_WEB_ACCESS_NODE_WORK" "$CORE/runtime/bin"
 
 VISION_HELPER_SOURCE="$APP_ROOT/src/native/macos/VisionOCR.swift"
 VISION_HELPER="$CORE/bin/vision_ocr"
@@ -226,6 +250,10 @@ fi
   echo "Bundled Core launcher is missing." >&2
   exit 5
 }
+[[ -f "$CORE/litellm_menu/pi-web-access/index.ts" ]] || {
+  echo "The bundled pi-web-access package is missing." >&2
+  exit 5
+}
 [[ -f "$CORE/config_editor_core/api.py" ]] || {
   echo "Bundled Core dependencies are incomplete." >&2
   exit 5
@@ -238,6 +266,18 @@ fi
   echo "The bundled Core runtime does not contain the LiteLLM executable." >&2
   exit 5
 }
+[[ -x "$CORE/runtime/bin/node" ]] || {
+  echo "The bundled Node.js runtime is missing." >&2
+  exit 5
+}
+PI_WEB_ACCESS_SMOKE_CONFIG="$RUNTIME_WORK/pi-web-access-smoke-config"
+if ! printf '' | "$CORE/runtime/bin/node" \
+  "$CORE/litellm_menu/pi_web_access_worker.mjs" \
+  --entry "$CORE/litellm_menu/pi-web-access/index.ts" \
+  --config-dir "$PI_WEB_ACCESS_SMOKE_CONFIG"; then
+  echo "The bundled pi-web-access worker could not load its staged SDK." >&2
+  exit 5
+fi
 [[ "$(tr -d '[:space:]' < "$CORE/runtime/LITELLM_VERSION")" == "$(tr -d '[:space:]' < "$PROJECT_ROOT/LITELLM_VERSION")" ]] || {
   echo "The bundled Core runtime does not contain the pinned LiteLLM release lock." >&2
   exit 5

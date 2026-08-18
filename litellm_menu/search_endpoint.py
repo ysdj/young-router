@@ -213,16 +213,18 @@ def _annotate_search_result_refs(
     if not ref_by_url:
         return search_results
     lines = search_results.splitlines()
-    current_url: Optional[str] = None
     annotated: list[str] = []
     for line in lines:
+        current_url: Optional[str] = None
         if line.startswith("URL:"):
             current_url = _clean_url(line.partition(":")[2].strip())
-            annotated.append(line)
-            if current_url and current_url in ref_by_url:
-                annotated.append(f"Reference: {ref_by_url[current_url]}")
-            continue
+        else:
+            numbered_url = re.fullmatch(r"\s+(https?://\S+)\s*", line)
+            if numbered_url:
+                current_url = _clean_url(numbered_url.group(1))
         annotated.append(line)
+        if current_url and current_url in ref_by_url:
+            annotated.append(f"Reference: {ref_by_url[current_url]}")
     return "\n".join(annotated)
 
 

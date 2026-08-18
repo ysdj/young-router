@@ -30,7 +30,6 @@ elif command -v uv >/dev/null 2>&1; then
     --with "fastapi==0.140.3"
     --with PyYAML
     --with Pillow
-    --with ddgs
     python
   )
 else

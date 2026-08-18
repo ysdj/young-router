@@ -521,20 +521,6 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual("1", restored_default._runtime_env()[key])
             self.assertNotIn(key, (root / "runtime-settings.env").read_text(encoding="utf-8"))
 
-    def test_controller_ignores_removed_persisted_runtime_settings(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "runtime-settings.env").write_text(
-                "LITELLM_PORT=49173\n"
-                "LITELLM_MENU_WEB_SEARCH_READ_RESULTS=1\n",
-                encoding="utf-8",
-            )
-
-            environment = CoreServiceController(root)._runtime_env()
-
-            self.assertEqual("49173", environment["LITELLM_PORT"])
-            self.assertNotIn("LITELLM_MENU_WEB_SEARCH_READ_RESULTS", environment)
-
     def test_proxy_environment_loads_bundled_callback_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)

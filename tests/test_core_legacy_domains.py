@@ -1412,6 +1412,21 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             with self.assertRaisesRegex(DomainError, "changed on disk"):
                 domain.apply()
 
+    def test_pi_web_access_json_default_is_not_reported_as_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
+            key = "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
+            field = next(item for item in domain.snapshot()["settings"] if item["key"] == key)
+
+            self.assertFalse(field["configured"])
+            self.assertFalse(domain.secret_present("setting", key))
+
+            domain.stage_secret("setting", key, '{"provider":"duckduckgo"}')
+            configured = next(item for item in domain.snapshot()["settings"] if item["key"] == key)
+            self.assertTrue(configured["configured"])
+            self.assertTrue(domain.secret_present("setting", key))
+            self.assertEqual("configured", configured["value"])
+
 
 class WebDAVSettingsDomainTests(unittest.TestCase):
     def test_webdav_patch_apply_and_password_presence_are_safe(self) -> None:

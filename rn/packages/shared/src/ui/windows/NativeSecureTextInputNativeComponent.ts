@@ -26,6 +26,7 @@ export interface NativeSecureTextInputProps extends ViewProps {
   target: string;
   label: string;
   placeholder?: string;
+  multiline?: WithDefault<boolean, false>;
   plainText?: WithDefault<boolean, false>;
   autoCommit?: WithDefault<boolean, false>;
   disabled?: WithDefault<boolean, false>;

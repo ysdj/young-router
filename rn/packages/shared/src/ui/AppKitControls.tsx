@@ -99,8 +99,8 @@ export type SecureTextInputState = {
   commitRequest: number;
 };
 
-export function AppKitSecureTextInput({ domain, field, target = "", label, placeholder, plainText = false, autoCommit = false, disabled, commitRequest, resetRequest, onSecretState, style }: { domain: string; field: string; target?: string; label: string; placeholder?: string; plainText?: boolean; autoCommit?: boolean; disabled?: boolean; commitRequest?: number; resetRequest?: number; onSecretState?: (event: NativeSyntheticEvent<SecureTextInputState>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
-  return <NativeAppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={onSecretState} style={[styles.textField, style]} />;
+export function AppKitSecureTextInput({ domain, field, target = "", label, placeholder, multiline = false, plainText = false, autoCommit = false, disabled, commitRequest, resetRequest, onSecretState, style }: { domain: string; field: string; target?: string; label: string; placeholder?: string; multiline?: boolean; plainText?: boolean; autoCommit?: boolean; disabled?: boolean; commitRequest?: number; resetRequest?: number; onSecretState?: (event: NativeSyntheticEvent<SecureTextInputState>) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  return <NativeAppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} multiline={multiline} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={onSecretState} style={[styles.textField, style]} />;
 }
 
 export function AppKitSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpen, disabled, onPaneWidthChange, children, style }: { paneWidth: number; minPaneWidth: number; maxPaneWidth: number; paneOpen?: boolean; disabled?: boolean; onPaneWidthChange?: (width: number) => void; children?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {

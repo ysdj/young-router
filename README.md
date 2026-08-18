@@ -16,7 +16,7 @@ dependency rules, and the staged cleanup plan.
 
 ### Native Desktop Hosts
 
-LiteLLM Menu uses one shared React/TypeScript UI with an AppKit status item and native macOS controls, plus a WinUI 3 window, native controls, and Windows tray. The app automatically starts and monitors its local LiteLLM proxy while it is open, and shuts that proxy down before it exits. No Docker container, database, virtual environment, or system Python installation is required. Release builds include a self-contained Python runtime, Python Core, and pinned LiteLLM dependencies.
+LiteLLM Menu uses one shared React/TypeScript UI with an AppKit status item and native macOS controls, plus a WinUI 3 window, native controls, and Windows tray. The app automatically starts and monitors its local LiteLLM proxy while it is open, and shuts that proxy down before it exits. No Docker container, database, virtual environment, or system Python installation is required. Release builds include self-contained Python and Node.js runtimes, Python Core, and pinned LiteLLM dependencies.
 
 The native menu is grouped by task:
 
@@ -77,7 +77,7 @@ When a Responses API request includes `web_search` tool usage:
 1. **Native hosted search** is attempted first when route metadata indicates support or support is unknown on a Responses-capable route.
 2. **External bridge** activates when the route is chat-only, explicitly lacks hosted web search support, or returns an unsupported hosted-tool error.
 
-The external bridge uses DDGS (DuckDuckGo Search) for query execution and direct retrieval of model-selected source pages. Search parameters — result count, page read character limit, region, backend list, fetch timeout, max rounds, max queries, max open pages — are configurable through runtime settings.
+The external bridge executes the bundled [pi-web-access](https://github.com/nicobailon/pi-web-access) extension through its Pi SDK worker. Search and page-fetch parameters are configurable through runtime settings; the extension's provider, routing, credentials, and SSRF policy are supplied as a private `web-search.json` configuration. The Runtime Settings field `LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON` accepts that JSON object and never exports it as a plain process setting.
 
 The bridge exposes focused search queries and source URLs to the model. Query planning is model-driven; the bridge does not add request-specific query rewrites.
 
@@ -291,6 +291,8 @@ Build a macOS preview or release only when explicitly needed, with an isolated o
 
 LiteLLM is checked and advanced to the latest stable PyPI release at the beginning of every macOS and Windows build. `./scripts/update-litellm.sh --check` reports whether `LITELLM_VERSION` is current. A build may compile LiteLLM from its source distribution in the controlled build environment when PyPI has not published a matching wheel; the completed app still packages and runs the exact locked version, so app startup never compiles or upgrades LiteLLM.
 
+Each macOS and Windows build also resolves the npm `latest` release of [pi-web-access](https://github.com/nicobailon/pi-web-access), freshly installs its Pi SDK dependencies, and bundles the matching Node.js 22 runtime into Core. A failed package or runtime download stops the build; the app never falls back to an older checkout.
+
 ---
 
 ## License
@@ -370,7 +372,7 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 1. **原生托管搜索** — 路由元数据表明支持或支持状态未知时，优先在支持 Responses 的路由上尝试原生托管搜索。
 2. **外部桥接** — 路由仅支持聊天、明确不支持托管网页搜索，或返回不支持托管工具错误时激活。
 
-外部桥接使用 DDGS（DuckDuckGo Search）执行查询，并直接读取模型选定的来源页面。默认先用 Yahoo；只有结果不足时才继续用 Bing，因此正常查询保持快速，同时不会因单个后端临时空结果而只给模型一条空白线索。搜索参数 — 结果数量、读取字符限制、区域、后端列表、获取超时、最大轮次、最大查询数、最大打开页面数 — 均可通过运行时设置配置。
+外部桥接通过 Pi SDK worker 执行内置的 [pi-web-access](https://github.com/nicobailon/pi-web-access) 扩展，并读取模型选定的来源页面。搜索与页面抓取参数可通过运行时设置配置；扩展的 provider、路由、凭据和 SSRF 策略写入私有 `web-search.json` 配置。运行时设置 `LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON` 可直接录入该 JSON 对象，配置不会作为明文进程设置导出。
 
 桥接器向模型暴露聚焦的搜索查询和来源 URL。查询规划由模型驱动：模型决定是否直接回答、换词、查看下一页或打开某个来源；默认四个动作轮次让它在多次换词后仍有机会查看刚找到的来源。桥接器不添加特定于请求的查询重写。
 
@@ -581,6 +583,8 @@ pnpm exec tsc --noEmit
 `VERSION`、`BUILD_NUMBER`、RN macOS plist/Xcode 工程、两个 Windows manifest 和 `Casks/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
 
 每次 macOS 与 Windows 构建开始时，LiteLLM 都会检查并推进到 PyPI 最新稳定版。`./scripts/update-litellm.sh --check` 可检查 `LITELLM_VERSION` 是否最新。若 PyPI 尚未提供匹配 wheel，构建环境会受控地从源码分发构建 LiteLLM；完成后的应用仍打包并运行这个精确锁定版本，因此应用启动时不会编译或自动升级 LiteLLM。
+
+每次 macOS 与 Windows 构建也会解析 [pi-web-access](https://github.com/nicobailon/pi-web-access) 的 npm `latest` 版本，重新安装其 Pi SDK 依赖，并把匹配的 Node.js 22 运行时打包进 Core。库或运行时下载失败会直接终止构建，不会回退到旧 checkout。
 
 ---
 

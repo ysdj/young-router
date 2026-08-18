@@ -18,33 +18,10 @@ import os
 import re
 import threading
 import time
+from urllib.parse import urlparse
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
-from urllib.parse import quote, urlparse
-import urllib.error
-import urllib.request
-
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
-
-try:
-    from litellm.integrations.websearch_interception.handler import (
-        WebSearchInterceptionLogger as _BaseWebSearchInterceptionLogger,
-    )
-    from litellm.integrations.websearch_interception.transformation import (
-        WebSearchTransformation as _WebSearchTransformation,
-    )
-    from litellm.llms.base_llm.search.transformation import (
-        SearchResponse as _SearchResponse,
-        SearchResult as _SearchResult,
-    )
-
-    _WEB_SEARCH_INTERCEPTION_AVAILABLE = True
-except Exception:
-    _BaseWebSearchInterceptionLogger = CustomLogger
-    _WebSearchTransformation = None
-    _SearchResponse = None
-    _SearchResult = None
-    _WEB_SEARCH_INTERCEPTION_AVAILABLE = False
 
 
 _RouteOrder = Union[int, float]
@@ -324,8 +301,6 @@ _EXTERNAL_WEB_SEARCH_MAX_ROUNDS_ENV = "LITELLM_MENU_WEB_SEARCH_MAX_ROUNDS"
 _EXTERNAL_WEB_SEARCH_MAX_QUERIES_ENV = "LITELLM_MENU_WEB_SEARCH_MAX_QUERIES"
 _EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_ENV = "LITELLM_MENU_WEB_SEARCH_MAX_OPEN_PAGES"
 _EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_ENV = "LITELLM_MENU_WEB_SEARCH_MAX_FIND_IN_PAGE"
-_EXTERNAL_WEB_SEARCH_REGION_ENV = "LITELLM_MENU_WEB_SEARCH_REGION"
-_EXTERNAL_WEB_SEARCH_BACKEND_ENV = "LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND"
 _VISION_BRIDGE_BACKEND_ENV = "LITELLM_MENU_VISION_BRIDGE_BACKEND"
 _VISION_BRIDGE_API_BASE_ENV = "LITELLM_MENU_VISION_BRIDGE_API_BASE"
 _VISION_BRIDGE_API_KEY_ENV = "LITELLM_MENU_VISION_BRIDGE_API_KEY"
@@ -340,8 +315,6 @@ _EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT = 4
 _EXTERNAL_WEB_SEARCH_MAX_QUERIES_DEFAULT = 16
 _EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_DEFAULT = 8
 _EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_DEFAULT = 12
-_EXTERNAL_WEB_SEARCH_REGION_DEFAULT = "wt-wt"
-_EXTERNAL_WEB_SEARCH_BACKEND_DEFAULT = "yahoo,bing"
 _VISION_BRIDGE_BACKEND_DEFAULT = "auto"
 _VISION_BRIDGE_API_BASE_DEFAULT = "http://127.0.0.1:11434/v1"
 _VISION_BRIDGE_MODEL_DEFAULT = "qwen2.5vl:3b"

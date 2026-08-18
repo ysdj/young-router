@@ -6,33 +6,37 @@ from hook_test_utils import *
 
 
 class HookExternalWebSearchSynthesisTests(HookTestCase):
-    def test_direct_page_reader_extracts_html_and_uses_service_user_agent(self) -> None:
+    def test_pi_web_access_page_reader_uses_worker_response(self) -> None:
         hooks, _ = load_hook_module()
-        original_urlopen = hooks.urllib.request.urlopen
+        original_worker = hooks._pi_web_access_module._worker_request
         observed = {}
 
-        class Response:
-            headers = {"Content-Type": "text/html; charset=utf-8"}
+        def fake_worker(request, *, timeout_seconds, max_results=None):
+            observed["request"] = request
+            observed["timeout_seconds"] = timeout_seconds
+            observed["max_results"] = max_results
+            return {
+                "ok": True,
+                "text": (
+                    "Retrieved page content for URL: "
+                    "https://raw.githubusercontent.com/example/project/main/source.py\n\n"
+                    "Source title\nsource file text"
+                ),
+                "sourceUrls": [
+                    "https://raw.githubusercontent.com/example/project/main/source.py"
+                ],
+                "details": {},
+            }
 
-            def read(self, _size):
-                return b"<html><body><h1>Source title</h1><script>ignore()</script><p>source file text</p></body></html>"
+        hooks._pi_web_access_module._worker_request = fake_worker
+        self.addCleanup(
+            setattr,
+            hooks._pi_web_access_module,
+            "_worker_request",
+            original_worker,
+        )
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, _exc_type, _exc, _traceback):
-                return False
-
-        def fake_urlopen(request, *, timeout):
-            observed["url"] = request.full_url
-            observed["user_agent"] = request.get_header("User-agent")
-            observed["timeout"] = timeout
-            return Response()
-
-        hooks.urllib.request.urlopen = fake_urlopen
-        self.addCleanup(setattr, hooks.urllib.request, "urlopen", original_urlopen)
-
-        text = hooks._web_page_excerpt(
+        text = hooks._pi_web_access_page_excerpt(
             "https://raw.githubusercontent.com/example/project/main/source.py",
             timeout=12,
             max_chars=200,
@@ -40,232 +44,76 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         self.assertEqual(text, "Source title\nsource file text")
         self.assertEqual(
-            observed["url"],
-            "https://raw.githubusercontent.com/example/project/main/source.py",
+            observed["request"],
+            {
+                "action": "openPage",
+                "url": "https://raw.githubusercontent.com/example/project/main/source.py",
+            },
         )
-        self.assertEqual(observed["user_agent"], "LiteLLM-Menu/1.0")
-        self.assertEqual(observed["timeout"], 12)
+        self.assertEqual(observed["timeout_seconds"], 12)
+        self.assertIsNone(observed["max_results"])
 
-    def test_external_web_search_sync_has_search_types_in_module_scope(self) -> None:
+    def test_pi_web_access_search_returns_structured_sources(self) -> None:
         hooks, _ = load_hook_module()
+        original_worker = hooks._pi_web_access_module._worker_request
+        observed = {}
 
-        class FakeDDGS:
-            def __init__(self, timeout=None):
-                self.timeout = timeout
+        def fake_worker(request, *, timeout_seconds, max_results=None):
+            observed["request"] = request
+            observed["timeout_seconds"] = timeout_seconds
+            observed["max_results"] = max_results
+            return {
+                "ok": True,
+                "text": "1. Signal source https://example.test/erk",
+                "sourceUrls": ["https://example.test/erk"],
+                "details": {"provider": "test"},
+            }
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def text(self, query, max_results=None, region=None, backend=None, **kwargs):
-                return [
-                    {
-                        "title": "Signal source",
-                        "href": "https://example.test/erk",
-                        "body": "Sample subject and Signal pathway evidence.",
-                    }
-                ]
-
-        fake_ddgs_module = types.ModuleType("ddgs")
-        fake_ddgs_module.DDGS = FakeDDGS
-        previous_ddgs = sys.modules.get("ddgs")
-        sys.modules["ddgs"] = fake_ddgs_module
-
-        def restore_ddgs() -> None:
-            if previous_ddgs is None:
-                sys.modules.pop("ddgs", None)
-            else:
-                sys.modules["ddgs"] = previous_ddgs
-
-        self.addCleanup(restore_ddgs)
-        text, structured = hooks._ddgs_jina_web_search_sync("sample subject Signal")
-
-        self.assertIn("Title: Signal source", text)
-        self.assertIn("https://example.test/erk", text)
-        self.assertIsNone(structured)
-
-    def test_external_web_search_sync_aggregates_configured_ddgs_backends(self) -> None:
-        hooks, _ = load_hook_module()
-        calls = []
-
-        class FakeDDGS:
-            def __init__(self, timeout=None):
-                self.timeout = timeout
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def text(self, query, max_results=None, region=None, backend=None, **kwargs):
-                calls.append(
-                    {
-                        "query": query,
-                        "max_results": max_results,
-                        "region": region,
-                        "backend": backend,
-                        "safesearch": kwargs.get("safesearch"),
-                        "page": kwargs.get("page"),
-                    }
-                )
-                if backend == "first":
-                    return [
-                        {
-                            "title": "Shared source",
-                            "href": "https://example.test/shared",
-                            "body": "first shared result",
-                        },
-                        {
-                            "title": "First-only source",
-                            "href": "https://example.test/first",
-                            "body": "first unique result",
-                        },
-                    ]
-                if backend == "second":
-                    return [
-                        {
-                            "title": "Shared source duplicate",
-                            "href": "https://example.test/shared",
-                            "body": "duplicate should be skipped",
-                        },
-                        {
-                            "title": "Second-only source",
-                            "href": "https://example.test/second",
-                            "body": "second unique result",
-                        },
-                    ]
-                return []
-
-        fake_ddgs_module = types.ModuleType("ddgs")
-        fake_ddgs_module.DDGS = FakeDDGS
-        previous_ddgs = sys.modules.get("ddgs")
-        sys.modules["ddgs"] = fake_ddgs_module
-
-        def restore_ddgs() -> None:
-            if previous_ddgs is None:
-                sys.modules.pop("ddgs", None)
-            else:
-                sys.modules["ddgs"] = previous_ddgs
-
-        self.addCleanup(restore_ddgs)
-        self.set_env("LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND", "first,second")
-        self.set_env("LITELLM_MENU_WEB_SEARCH_MAX_RESULTS", "3")
-        text, structured = hooks._ddgs_jina_web_search_sync(
-            "query needing breadth",
-            page=2,
+        hooks._pi_web_access_module._worker_request = fake_worker
+        self.addCleanup(
+            setattr,
+            hooks._pi_web_access_module,
+            "_worker_request",
+            original_worker,
         )
 
-        self.assertEqual([call["backend"] for call in calls], ["first", "second"])
-        self.assertTrue(all(call["safesearch"] == "off" for call in calls))
-        self.assertTrue(all(call["region"] == "wt-wt" for call in calls))
-        self.assertTrue(all(call["page"] == 2 for call in calls))
-        self.assertIn("https://example.test/shared", text)
-        self.assertIn("https://example.test/first", text)
-        self.assertIn("https://example.test/second", text)
-        self.assertEqual(text.count("https://example.test/shared"), 1)
-        self.assertIsNone(structured)
+        text, structured = hooks._pi_web_access_search_sync("sample subject Signal")
 
-    def test_external_web_search_sync_keeps_explicit_results(self) -> None:
-        hooks, _ = load_hook_module()
-
-        class FakeDDGS:
-            def __init__(self, timeout=None):
-                self.timeout = timeout
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def text(self, query, max_results=None, region=None, backend=None, **kwargs):
-                return [
-                    {
-                        "title": "Explicit result",
-                        "href": "https://www.xvideos.example/video",
-                        "body": "adult video",
-                    },
-                    {
-                        "title": "Trusted weather source",
-                        "href": "https://weather.example/pingdingshan",
-                        "body": "Forecast for Pingdingshan.",
-                    },
-                    {
-                        "title": "Another explicit result",
-                        "href": "https://example.test/redirect",
-                        "body": "Watch Pornhub now.",
-                    },
-                ]
-
-        fake_ddgs_module = types.ModuleType("ddgs")
-        fake_ddgs_module.DDGS = FakeDDGS
-        previous_ddgs = sys.modules.get("ddgs")
-        sys.modules["ddgs"] = fake_ddgs_module
-
-        def restore_ddgs() -> None:
-            if previous_ddgs is None:
-                sys.modules.pop("ddgs", None)
-            else:
-                sys.modules["ddgs"] = previous_ddgs
-
-        self.addCleanup(restore_ddgs)
-        self.set_env("LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND", "first")
-
-        text, _ = hooks._ddgs_jina_web_search_sync("Pingdingshan weather")
-
-        self.assertIn("https://weather.example/pingdingshan", text)
-        self.assertIn("xvideos", text.lower())
-        self.assertIn("pornhub", text.lower())
-
-    def test_external_web_search_sync_uses_default_backends_for_legacy_auto_backend(self) -> None:
-        hooks, _ = load_hook_module()
-        calls = []
-
-        class FakeDDGS:
-            def __init__(self, timeout=None):
-                self.timeout = timeout
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def text(self, query, max_results=None, region=None, backend=None, **kwargs):
-                calls.append(
-                    {
-                        "backend": backend,
-                        "region": region,
-                        "safesearch": kwargs.get("safesearch"),
-                    }
-                )
-                return []
-
-        fake_ddgs_module = types.ModuleType("ddgs")
-        fake_ddgs_module.DDGS = FakeDDGS
-        previous_ddgs = sys.modules.get("ddgs")
-        sys.modules["ddgs"] = fake_ddgs_module
-
-        def restore_ddgs() -> None:
-            if previous_ddgs is None:
-                sys.modules.pop("ddgs", None)
-            else:
-                sys.modules["ddgs"] = previous_ddgs
-
-        self.addCleanup(restore_ddgs)
-        self.set_env("LITELLM_MENU_WEB_SEARCH_DDGS_BACKEND", "auto")
-
-        hooks._ddgs_jina_web_search_sync("safe query")
-
+        self.assertIn("Signal source", text)
+        self.assertEqual(structured["results"], [{"url": "https://example.test/erk"}])
+        self.assertEqual(structured["details"], {"provider": "test"})
         self.assertEqual(
-            calls,
-            [
-                {"backend": "yahoo", "region": "wt-wt", "safesearch": "off"},
-                {"backend": "bing", "region": "wt-wt", "safesearch": "off"},
-            ],
+            observed["request"],
+            {"action": "search", "query": "sample subject Signal", "page": 1},
+        )
+        self.assertEqual(observed["max_results"], 5)
+
+    def test_pi_web_access_search_forwards_result_pages(self) -> None:
+        hooks, _ = load_hook_module()
+        original_worker = hooks._pi_web_access_module._worker_request
+        observed = {}
+
+        def fake_worker(request, *, timeout_seconds, max_results=None):
+            observed["request"] = request
+            return {
+                "ok": True,
+                "text": "2. Search result https://example.test/page-2",
+                "sourceUrls": ["https://example.test/page-2"],
+                "details": {},
+            }
+
+        hooks._pi_web_access_module._worker_request = fake_worker
+        self.addCleanup(
+            setattr,
+            hooks._pi_web_access_module,
+            "_worker_request",
+            original_worker,
+        )
+
+        hooks._pi_web_access_search_sync("safe query", page=2)
+        self.assertEqual(
+            observed["request"],
+            {"action": "search", "query": "safe query", "page": 2},
         )
 
     def test_external_web_search_defaults_bound_fast_common_queries(self) -> None:
@@ -274,7 +122,8 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_MAX_RESULTS_DEFAULT, 5)
         self.assertEqual(hooks._EXTERNAL_WEB_FETCH_TIMEOUT_DEFAULT, 12.0)
         self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT, 4)
-        self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_BACKEND_DEFAULT, "yahoo,bing")
+        self.assertEqual(hooks._DEFAULT_MAX_RESULTS, 5)
+        self.assertEqual(hooks._DEFAULT_FETCH_TIMEOUT_SECONDS, 12.0)
 
     async def test_external_web_search_synthesis_failure_raises_for_route_recovery(self) -> None:
         hooks, _ = load_hook_module()
@@ -293,8 +142,8 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                     "Title: Source One\n"
                     "URL: https://example.test/one\n"
                     "Snippet: useful snippet.\n\n"
-                    "Jina Reader excerpt:\n"
-                    "Markdown Content:\n"
+                    "Retrieved page content for URL: https://example.test/one\n"
+                    "\n"
                     "raw page body that should not be copied wholesale"
                 ),
                 queries=["test"],
@@ -1282,8 +1131,8 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 "Title: Example source\n"
                 "URL: https://example.test/source-two\n"
                 "Snippet: useful snippet.\n\n"
-                "Jina Reader excerpt:\n"
-                f"Markdown Content:\n{long_page}"
+                "Retrieved page content for URL: https://example.test/source-two\n"
+                f"\n{long_page}"
             ),
             queries=["sample subject factor A"],
             source_urls=["https://example.test/source-two"],
@@ -3242,7 +3091,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
     async def test_external_web_search_run_actions_reads_page_and_finds_text(self) -> None:
         hooks, _ = load_hook_module()
-        original_reader = hooks._external_web_search_module._web_page_excerpt
+        original_reader = hooks._pi_web_access_module._pi_web_access_page_excerpt
 
         def fake_reader(url, *, timeout, max_chars):
             self.assertEqual(url, "https://example.test/article")
@@ -3250,11 +3099,11 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             self.assertGreater(max_chars, 0)
             return "Example Domain body with factor A marker."
 
-        hooks._external_web_search_module._web_page_excerpt = fake_reader
+        hooks._pi_web_access_module._pi_web_access_page_excerpt = fake_reader
         self.addCleanup(
             setattr,
-            hooks._external_web_search_module,
-            "_web_page_excerpt",
+            hooks._pi_web_access_module,
+            "_pi_web_access_page_excerpt",
             original_reader,
         )
 
@@ -3293,7 +3142,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
     async def test_external_web_search_find_scans_full_bounded_page(self) -> None:
         hooks, _ = load_hook_module()
-        original_reader = hooks._external_web_search_module._web_page_excerpt
+        original_reader = hooks._pi_web_access_module._pi_web_access_page_excerpt
         observed_limits = []
 
         def fake_reader(url, *, timeout, max_chars):
@@ -3302,11 +3151,11 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             observed_limits.append(max_chars)
             return "imports and helpers\n" + ("x" * 6000) + "\npage: int = 1"
 
-        hooks._external_web_search_module._web_page_excerpt = fake_reader
+        hooks._pi_web_access_module._pi_web_access_page_excerpt = fake_reader
         self.addCleanup(
             setattr,
-            hooks._external_web_search_module,
-            "_web_page_excerpt",
+            hooks._pi_web_access_module,
+            "_pi_web_access_page_excerpt",
             original_reader,
         )
 

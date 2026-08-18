@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from . import external_web_search as _external_web_search_module
+from . import pi_web_access as _pi_web_access_module
 from . import responses_output as _responses_output_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
@@ -10,7 +10,10 @@ from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import tools as _tools_module
 from . import trace as _trace_module
-from .external_web_search import _external_web_search_float_env
+from .pi_web_access import (
+    _external_web_search_float_env,
+    _external_web_search_int_env,
+)
 
 
 from .base import (
@@ -2189,7 +2192,7 @@ async def _external_web_search_run_query(
 ) -> tuple[str, list[str]]:
     try:
         text, structured = await asyncio.to_thread(
-            _external_web_search_module._ddgs_jina_web_search_sync,
+            _pi_web_access_module._pi_web_access_search_sync,
             query,
             page=page,
         )
@@ -2202,7 +2205,7 @@ async def _external_web_search_run_query(
 
 
 def _external_web_search_page_read_chars() -> int:
-    return _external_web_search_module._external_web_search_int_env(
+    return _external_web_search_int_env(
         _EXTERNAL_WEB_SEARCH_READ_CHARS_ENV,
         _EXTERNAL_WEB_SEARCH_READ_CHARS_DEFAULT * 3,
         500,
@@ -2233,7 +2236,7 @@ async def _external_web_search_fetch_page_text_with_limit(
 ) -> str:
     try:
         text = await asyncio.to_thread(
-            _external_web_search_module._web_page_excerpt,
+            _pi_web_access_module._pi_web_access_page_excerpt,
             url,
             timeout=_external_web_search_page_timeout_seconds(),
             max_chars=max_chars,
@@ -2398,7 +2401,7 @@ async def _external_web_search_run_actions(
 
 
 def _external_web_search_max_rounds() -> int:
-    return _external_web_search_module._external_web_search_int_env(
+    return _external_web_search_int_env(
         _EXTERNAL_WEB_SEARCH_MAX_ROUNDS_ENV,
         _EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT,
         1,
@@ -2407,7 +2410,7 @@ def _external_web_search_max_rounds() -> int:
 
 
 def _external_web_search_max_queries() -> int:
-    return _external_web_search_module._external_web_search_int_env(
+    return _external_web_search_int_env(
         _EXTERNAL_WEB_SEARCH_MAX_QUERIES_ENV,
         _EXTERNAL_WEB_SEARCH_MAX_QUERIES_DEFAULT,
         1,
@@ -2416,7 +2419,7 @@ def _external_web_search_max_queries() -> int:
 
 
 def _external_web_search_max_open_pages() -> int:
-    return _external_web_search_module._external_web_search_int_env(
+    return _external_web_search_int_env(
         _EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_ENV,
         _EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_DEFAULT,
         0,
@@ -2425,7 +2428,7 @@ def _external_web_search_max_open_pages() -> int:
 
 
 def _external_web_search_max_find_in_page() -> int:
-    return _external_web_search_module._external_web_search_int_env(
+    return _external_web_search_int_env(
         _EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_ENV,
         _EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_DEFAULT,
         0,
@@ -2572,31 +2575,51 @@ def _external_web_search_raise_if_invalid_initial_no_action_response(
 def _external_web_search_result_cards(search_results: str) -> list[dict[str, str]]:
     cards: list[dict[str, str]] = []
     seen_urls: set[str] = set()
+
+    def append_card(title: Any, url: Any, snippet: Any = "") -> None:
+        cleaned_url = _external_web_search_clean_url(url)
+        if not cleaned_url or cleaned_url in seen_urls:
+            return
+        seen_urls.add(cleaned_url)
+        normalized_snippet = " ".join(str(snippet or "").split())
+        if len(normalized_snippet) > 420:
+            normalized_snippet = normalized_snippet[:420].rstrip() + "..."
+        cards.append(
+            {
+                "title": " ".join(str(title or "").split()) or cleaned_url,
+                "url": cleaned_url,
+                "snippet": normalized_snippet,
+            }
+        )
+
     pattern = re.compile(
         r"(?ms)^Title:\s*(?P<title>.*?)\n"
         r"URL:\s*(?P<url>\S+)\n"
-        r"Snippet:\s*(?P<snippet>.*?)(?=\n\nTitle:|\n\nWeb search results for query:|\n\nJina Reader excerpt:|\n\nMarkdown Content:|\Z)"
+        r"Snippet:\s*(?P<snippet>.*?)(?=\n\nTitle:|\n\nWeb search results for query:|\n\nRetrieved page content for URL:|\n\nPage text matches for pattern:|\Z)"
     )
     for match in pattern.finditer(search_results or ""):
-        url = match.group("url").strip()
-        if not url or url in seen_urls:
-            continue
-        seen_urls.add(url)
         snippet_source = re.split(
-            r"\n\s*\n|Jina Reader excerpt:|Markdown Content:",
+            r"\n\s*\n|Retrieved page content for URL:|Page text matches for pattern:",
             match.group("snippet"),
             maxsplit=1,
         )[0]
-        snippet = " ".join(snippet_source.split())
-        if len(snippet) > 420:
-            snippet = snippet[:420].rstrip() + "..."
-        cards.append(
-            {
-                "title": " ".join(match.group("title").split()) or url,
-                "url": url,
-                "snippet": snippet,
-            }
-        )
+        append_card(match.group("title"), match.group("url"), snippet_source)
+
+    # pi-web-access renders workflow:none results as numbered title/URL pairs.
+    # Keep the bridge's card shape stable for the standalone search endpoint.
+    numbered_pattern = re.compile(
+        r"(?m)^\s*\d+\.\s+(?P<title>[^\n]+?)\s*\n"
+        r"\s+(?P<url>https?://\S+)\s*(?=\n|\Z)"
+    )
+    for match in numbered_pattern.finditer(search_results or ""):
+        append_card(match.group("title"), match.group("url"))
+
+    full_result_pattern = re.compile(
+        r"(?ms)^###\s+(?P<title>[^\n]+?)\s*\n"
+        r"(?P<url>https?://\S+)\s*(?=\n|\Z)"
+    )
+    for match in full_result_pattern.finditer(search_results or ""):
+        append_card(match.group("title"), match.group("url"))
     return cards
 
 
@@ -2806,7 +2829,7 @@ def _external_web_search_trim_evidence_section(
         return text
 
     head_limit = max_chars
-    for marker in ("\n\nJina Reader excerpt:", "\n\nMarkdown Content:"):
+    for marker in ("\n\nRetrieved page content for URL:", "\n\nPage text matches for pattern:"):
         marker_index = text.find(marker)
         if marker_index > 0:
             head_limit = min(head_limit, marker_index)
@@ -4748,8 +4771,8 @@ def _external_web_search_synthesis_kwargs(
         "the evidence is insufficient. Page-text matches and opened-page content "
         "are stronger evidence than search-result snippets; if sources conflict, "
         "do not make an absence claim from an omitted field or wrapper alone. The "
-        "local DDGS/Jina bridge may differ from hosted OpenAI web_search ranking "
-        "and snippets."
+        "local pi-web-access bridge may differ from hosted OpenAI web_search "
+        "ranking and snippets."
     )
     time_note = _responses_tools_module._current_time_context_instruction(request_kwargs)
     if time_note:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,12 +14,12 @@ from litellm_menu.core.runtime_settings_schema import runtime_settings_metadata
 
 
 MAX_PACKAGE_BYTES = 16 * 1024 * 1024
+MAX_JSON_SETTING_BYTES = 256 * 1024
 RETAIN_EXISTING_VALUE = "__LITELLM_MENU_RETAIN_EXISTING__"
 RETIRED_PERSISTED_SETTINGS = frozenset(
     {
         "LITELLM_CONFIG_WATCH_INTERVAL",
         "LITELLM_CONFIG_WATCH_SETTLE_INTERVAL",
-        "LITELLM_MENU_WEB_SEARCH_READ_RESULTS",
     }
 )
 
@@ -100,6 +103,33 @@ def _normalize_number(spec: RuntimeSettingSpec, raw: str) -> str:
     return normalized
 
 
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON constant {value} is not allowed")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _parse_json_object(text: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError) as exc:
+        raise PackageError("JSON must be valid, finite, and free of duplicate keys.") from exc
+    if not isinstance(parsed, dict):
+        raise PackageError("JSON must contain an object.")
+    return parsed
+
+
 def normalize_payload_value(spec: RuntimeSettingSpec, raw: object) -> str:
     """Normalize a value exactly as the Runtime Settings save payload expects."""
 
@@ -109,6 +139,20 @@ def normalize_payload_value(spec: RuntimeSettingSpec, raw: object) -> str:
         raise PackageError(f"{spec.key} cannot use the retain-existing marker in a package.")
     if spec.kind in {"int", "float", "mb"}:
         return _normalize_number(spec, raw)
+    if spec.kind == "json":
+        text = raw.strip() or spec.default
+        if len(text.encode("utf-8")) > MAX_JSON_SETTING_BYTES:
+            raise PackageError(f"{spec.key} is too large.")
+        try:
+            parsed = _parse_json_object(text)
+        except PackageError as exc:
+            raise PackageError(f"{spec.key} must contain valid JSON.") from exc
+        canonical = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        try:
+            canonical.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise PackageError(f"{spec.key} must contain valid UTF-8 JSON.") from exc
+        return canonical
     if spec.kind == "string" and any(character in raw for character in "\n\r#"):
         raise PackageError(f"{spec.key} cannot contain newlines or #.")
     text = raw.strip() or spec.default
@@ -132,10 +176,6 @@ def normalize_payload_value(spec: RuntimeSettingSpec, raw: object) -> str:
             raise PackageError(f"{spec.key} must be one of: {', '.join(spec.options)}")
         return lowered
     if spec.kind == "string":
-        if spec.key == "LITELLM_MENU_WEB_SEARCH_REGION" and any(
-            character.isspace() for character in text
-        ):
-            raise PackageError(f"{spec.key} cannot contain whitespace.")
         return text
     raise PackageError("Runtime Settings schema is unavailable.")
 
@@ -191,7 +231,7 @@ def _read_persisted_values(path: Path, specs: dict[str, RuntimeSettingSpec]) -> 
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if "#" in stripped or "=" not in stripped:
+        if "=" not in stripped:
             raise PackageError(f"Runtime settings file has invalid content at line {line_number}.")
         key, raw = stripped.split("=", 1)
         key = key.strip()
@@ -199,6 +239,11 @@ def _read_persisted_values(path: Path, specs: dict[str, RuntimeSettingSpec]) -> 
         if key in RETIRED_PERSISTED_SETTINGS:
             continue
         if key not in specs or key in raw_values:
+            raise PackageError(f"Runtime settings file has invalid content at line {line_number}.")
+        # JSON settings are canonicalized by their own parser, so a '#' in a
+        # quoted value (for example an API key) is data rather than an env-file
+        # comment marker. Other setting kinds retain the line-oriented format.
+        if specs[key].kind != "json" and "#" in stripped:
             raise PackageError(f"Runtime settings file has invalid content at line {line_number}.")
         raw_values[key] = raw
     return raw_values
@@ -221,6 +266,21 @@ def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict
             if stored_bytes < minimum_bytes or stored_bytes > maximum_bytes:
                 raise PackageError(f"{key} is outside its allowed range.")
             values[key] = _number_text(stored_bytes / (1024 * 1024))
+        elif spec.kind == "json":
+            encoded = raw.removeprefix("base64:")
+            if encoded != raw:
+                padding = "=" * ((4 - len(encoded) % 4) % 4)
+                try:
+                    if not re.fullmatch(r"[A-Za-z0-9_-]*", encoded):
+                        raise ValueError("invalid base64 characters")
+                    raw = base64.b64decode(
+                        encoded + padding,
+                        altchars=b"-_",
+                        validate=True,
+                    ).decode("utf-8")
+                except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+                    raise PackageError(f"{key} contains invalid encoded JSON.") from exc
+            values[key] = normalize_payload_value(spec, raw)
         else:
             values[key] = normalize_payload_value(spec, raw)
     return validate_values(values, specs)

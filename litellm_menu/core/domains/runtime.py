@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 from pathlib import Path
@@ -25,7 +26,10 @@ class RuntimeSettingsDomain:
     """Staged runtime settings backed by ``runtime_settings_io`` validation."""
 
     name = "runtime"
-    _SECRET_KEYS = frozenset({"LITELLM_MENU_VISION_BRIDGE_API_KEY"})
+    _SECRET_KEYS = frozenset({
+        "LITELLM_MENU_VISION_BRIDGE_API_KEY",
+        "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON",
+    })
 
     def __init__(self, settings_path: Path | str | None = None):
         self.settings_path = Path(settings_path).expanduser() if settings_path else _default_runtime_settings_path()
@@ -69,6 +73,7 @@ class RuntimeSettingsDomain:
         default = self._defaults({key: spec})[key]
         metadata = self._metadata.get(key, {})
         is_secret = key in self._SECRET_KEYS or metadata.get("secret") is True
+        configured = value != default
         baseline_value = self._raw_values.get(key, default)
         ui_kind = {
             "bool": "toggle",
@@ -95,8 +100,8 @@ class RuntimeSettingsDomain:
             "minimum": spec.minimum,
             "maximum": spec.maximum,
             "options": options,
-            "value": REDACTED if is_secret and value else value,
-            "configured": value != default,
+            "value": REDACTED if is_secret and configured else value,
+            "configured": configured,
             "retained": is_secret and baseline_value != default,
             "will_clear": is_secret and baseline_value != default and value == default,
             "secret": is_secret,
@@ -108,8 +113,9 @@ class RuntimeSettingsDomain:
 
     def snapshot(self) -> dict[str, Any]:
         fields = [self._field_projection(key, spec, self._draft_values.get(key, "")) for key, spec in self.specs.items()]
+        defaults = self._defaults(self.specs)
         values = {
-            key: (REDACTED if key in self._SECRET_KEYS and value else value)
+            key: (REDACTED if key in self._SECRET_KEYS and value != defaults.get(key, "") else value)
             for key, value in self._draft_values.items()
         }
         return {
@@ -211,7 +217,8 @@ class RuntimeSettingsDomain:
             raise DomainError("The requested secret field is unavailable")
         if not self._is_secret_setting(target):
             raise DomainError("The requested secret field is unavailable")
-        return bool(self._draft_values.get(target, ""))
+        default = self._defaults({target: self.specs[target]})[target]
+        return self._draft_values.get(target, default) != default
 
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
         if field != "setting" or not isinstance(target, str) or target not in self.specs:
@@ -237,6 +244,9 @@ class RuntimeSettingsDomain:
     @staticmethod
     def _stored_value(spec: Any, value: str) -> str:
         if spec.kind != "mb":
+            if spec.kind == "json":
+                encoded = base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+                return f"base64:{encoded}"
             return value
         try:
             bytes_value = round(float(value) * 1024 * 1024)

@@ -53,6 +53,7 @@ SERVICE_STATUS_CACHE_SECONDS = 10.0
 _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
     {"LITELLM_MENU_CODEX_DESCENDANT_CLEANUP"}
 )
+_PI_WEB_ACCESS_CONFIG_KEY = "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
 
 
 @dataclass(frozen=True)
@@ -414,7 +415,30 @@ class CoreServiceController:
         # This optional credential is file-owned: clearing it in Runtime
         # Settings must override an inherited host environment.
         env.pop("LITELLM_MENU_VISION_BRIDGE_API_KEY", None)
+        # pi-web-access configuration is also file-owned. Do not forward raw
+        # JSON settings from a host environment into every proxy worker.
+        env.pop(_PI_WEB_ACCESS_CONFIG_KEY, None)
+        env.pop("LITELLM_MENU_WEB_SEARCH_CONFIG_JSON", None)
         configured = self._configured_runtime_values(strict=strict)
+        pi_web_access_config = configured.pop(_PI_WEB_ACCESS_CONFIG_KEY, "{}")
+        try:
+            pi_web_access_payload = json.loads(pi_web_access_config)
+        except (TypeError, ValueError):
+            if strict:
+                raise RuntimeError("Runtime settings are invalid") from None
+            pi_web_access_payload = {}
+        if not isinstance(pi_web_access_payload, dict):
+            if strict:
+                raise RuntimeError("Runtime settings are invalid")
+            pi_web_access_payload = {}
+        if strict:
+            try:
+                web_search_config = self.paths.root / "web-search.json"
+                atomic_write_json(web_search_config, pi_web_access_payload)
+            except PersistenceError:
+                raise RuntimeError("Runtime settings are invalid") from None
+        env["PI_CODING_AGENT_DIR"] = str(self.paths.root)
+        env["LITELLM_MENU_WEB_SEARCH_CONFIG_DIR"] = str(self.paths.root)
         # The native preview port is a host-owned isolation boundary. A
         # persisted user setting must not redirect an isolated preview back
         # onto production's 4000 listener.
@@ -440,6 +464,12 @@ class CoreServiceController:
         # the proxy process together with the bundled package root.
         core_root = Path(__file__).resolve().parents[2]
         python_path = [str(core_root)]
+        bundled_node = core_root / "runtime" / "bin" / ("node.exe" if os.name == "nt" else "node")
+        bundled_pi_entry = core_root / "litellm_menu" / "pi-web-access" / "index.ts"
+        if bundled_node.is_file():
+            env["LITELLM_MENU_PI_WEB_ACCESS_NODE"] = str(bundled_node)
+        if bundled_pi_entry.is_file():
+            env["LITELLM_MENU_PI_WEB_ACCESS_ENTRY"] = str(bundled_pi_entry)
         inherited_python_path = env.get("PYTHONPATH", "")
         if inherited_python_path:
             python_path.extend(
