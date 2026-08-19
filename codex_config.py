@@ -19,12 +19,31 @@ import sys
 import tempfile
 import tomllib
 from typing import Any
+import urllib.error
+import urllib.request
 
 import yaml
 
 
 DEFAULT_PORT = "4000"
 DEFAULT_KEY = "sk-local-litellm"
+LOCAL_MODEL_LIST_TIMEOUT_SECONDS = 1.0
+LOCAL_MODEL_LIST_MAX_BYTES = 512 * 1024
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never carry the local LiteLLM bearer token across a redirect."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        fp: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
 
 # These are the simple, stable fields the native editor renders directly.  Raw
 # TOML remains available for every other Codex setting and is never discarded.
@@ -153,6 +172,69 @@ def local_api_key(config: dict[str, Any]) -> str:
     if not value or "\n" in value or "\r" in value:
         raise EditorError("LiteLLM master key is unavailable or malformed")
     return value
+
+
+def _local_exposed_models(api_key: str) -> tuple[list[str], bool]:
+    """Read the model IDs LiteLLM currently exposes on its local API.
+
+    The configured ``model_list`` is intentionally not a catalog source.  A
+    model becomes selectable in Codex only after the running LiteLLM Menu
+    answers the authenticated ``/v1/models`` request.  Any transport,
+    authentication, response-shape, or size failure therefore produces no
+    exposed models.
+    """
+
+    if not isinstance(api_key, str) or not api_key.strip():
+        return [], False
+    request = urllib.request.Request(
+        f"{local_base_url().rstrip('/')}/models",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "LiteLLM-Menu-Codex-Settings/1",
+        },
+        method="GET",
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _NoRedirect(),
+    )
+    try:
+        with opener.open(request, timeout=LOCAL_MODEL_LIST_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", None)
+            if status is None:
+                status = response.getcode()
+            body = response.read(LOCAL_MODEL_LIST_MAX_BYTES + 1)
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError):
+        return [], False
+    except Exception:
+        return [], False
+
+    if not isinstance(status, int) or status < 200 or status >= 300:
+        return [], False
+    if len(body) > LOCAL_MODEL_LIST_MAX_BYTES:
+        return [], False
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return [], False
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return [], False
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in payload["data"]:
+        value = item.get("id") if isinstance(item, dict) else item
+        if not isinstance(value, str):
+            continue
+        name = value.strip()
+        if not name or len(name) > 256 or any(ord(char) < 32 for char in name):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names, True
 
 
 def _safe_file_state(path: pathlib.Path, label: str) -> tuple[bool, int]:
@@ -608,9 +690,9 @@ def _structured_scalar(mapping: dict[str, Any], key: str) -> Any:
     return value
 
 
-def configured_models(config: dict[str, Any]) -> list[dict[str, str]]:
+def configured_models(config: dict[str, Any]) -> list[dict[str, Any]]:
     providers = _get_mapping(config.get("providers"))
-    result: list[dict[str, str]] = []
+    result: list[dict[str, Any]] = []
     model_list = config.get("model_list")
     if not isinstance(model_list, list):
         return result
@@ -624,6 +706,9 @@ def configured_models(config: dict[str, Any]) -> list[dict[str, str]]:
         model = str(entry.get("model_name") or "").strip()
         if not model:
             continue
+        model_enabled = info.get("x-litellm-menu-model-enabled")
+        if not isinstance(model_enabled, bool):
+            model_enabled = provider.get("enabled") is not False
         result.append(
             {
                 "model": model,
@@ -631,6 +716,9 @@ def configured_models(config: dict[str, Any]) -> list[dict[str, str]]:
                 "deployment_id": str(info.get("id") or "").strip(),
                 "upstream_model": str(params.get("model") or "").strip(),
                 "api_base": str(params.get("api_base") or provider.get("api_base") or "").strip(),
+                "upstream_url_surface": str(info.get("upstream_url_surface") or "").strip().lower(),
+                "mode": str(info.get("mode") or "").strip().lower(),
+                "model_enabled": model_enabled,
             }
         )
     return result
@@ -845,19 +933,24 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
     return structured
 
 
-def _runtime_context(config_path: pathlib.Path) -> tuple[list[dict[str, str]], str, list[str]]:
+def _runtime_context(
+    config_path: pathlib.Path,
+) -> tuple[list[dict[str, str]], list[str], bool, str, list[str]]:
     warnings: list[str] = []
     try:
         runtime_config = load_yaml(config_path)
         models = configured_models(runtime_config)
         key = local_api_key(runtime_config)
+        exposed_models, menu_enabled = _local_exposed_models(key)
     except EditorError as exc:
         # The Codex editor must remain usable to repair an existing Codex file
         # even if the LiteLLM source is temporarily invalid/unavailable.
         models = []
+        exposed_models = []
+        menu_enabled = False
         key = ""
         warnings.append(str(exc))
-    return models, key, warnings
+    return models, exposed_models, menu_enabled, key, warnings
 
 
 def editor_payload(
@@ -872,7 +965,7 @@ def editor_payload(
     validation_errors: list[str] | None = None,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
-    models, local_key, runtime_warnings = _runtime_context(
+    models, exposed_models, menu_enabled, local_key, runtime_warnings = _runtime_context(
         runtime_config_path or default_config_path()
     )
     all_warnings = list(warnings or []) + runtime_warnings
@@ -880,6 +973,11 @@ def editor_payload(
     result: dict[str, Any] = {
         "structured": structured_config(config, auth),
         "models": models,
+        # ``exposed_models`` is the only source used by the managed Codex
+        # catalog.  It is deliberately empty when LiteLLM Menu is stopped or
+        # its authenticated model endpoint is unavailable.
+        "exposed_models": exposed_models,
+        "litellm_menu_enabled": menu_enabled,
         "local_base_url": local_base_url(),
         "local_api_key": local_key,
         "validation_errors": errors,

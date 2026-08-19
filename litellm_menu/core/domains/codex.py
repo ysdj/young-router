@@ -7,14 +7,17 @@ from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
+import stat
 import threading
+import time
 from collections.abc import Mapping
 from typing import Any, Iterator
 
 from ..model_catalog import (
     catalog_is_current,
+    catalog_model_names,
+    catalog_names_from_editor,
     managed_catalog_path,
-    selected_model_names,
     write_catalog,
 )
 from ..model_contexts import ModelContextRegistry, default_context_cache_path
@@ -28,6 +31,7 @@ from ._shared import (
 )
 
 _CODEX_ENVIRONMENT_LOCK = threading.RLock()
+_CATALOG_SOURCE_REFRESH_SECONDS = 0.5
 
 
 @contextmanager
@@ -84,6 +88,7 @@ class CodexSettingsDomain:
         self._catalog_restart_required = False
         self._catalog_change_reason: str | None = None
         self._catalog_change_event = 0
+        self._catalog_source_checked_at = 0.0
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._baseline: tuple[str, str] = ("", "{}\n")
@@ -106,6 +111,38 @@ class CodexSettingsDomain:
             raise DomainError("Codex settings are invalid")
         return copy.deepcopy(dict(payload))
 
+    def _editor_documents_from_disk(self) -> tuple[str, str, bool, bool]:
+        """Read the two editor documents without probing the LiteLLM endpoint.
+
+        The settings-page watcher only needs an opaque file comparison.  Going
+        through ``codex_config.load_editor`` here also refreshes the exposed
+        model catalog, which performs an authenticated local ``/v1/models``
+        request.  That work belongs to a full snapshot, after a real file
+        change, rather than to a five-second idle probe.
+        """
+
+        configured_home = os.environ.get("CODEX_HOME", "").strip()
+        home = self.codex_home or (Path(configured_home).expanduser() if configured_home else Path.home() / ".codex")
+
+        def read_document(filename: str, label: str) -> tuple[str, bool]:
+            path = home / filename
+            try:
+                details = path.lstat()
+            except FileNotFoundError:
+                return "", False
+            except OSError:
+                raise DomainError(f"{label} could not be read") from None
+            if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+                raise DomainError(f"{label} is unavailable")
+            try:
+                return path.read_text(encoding="utf-8"), True
+            except (OSError, UnicodeError):
+                raise DomainError(f"{label} could not be read") from None
+
+        config_text, config_exists = read_document("config.toml", "Codex config file")
+        auth_text, auth_exists = read_document("auth.json", "Codex auth file")
+        return config_text, auth_text if auth_exists else "{}\n", config_exists, auth_exists
+
     def _is_catalog_enabled(self, payload: Mapping[str, Any]) -> bool:
         structured = payload.get("structured", {})
         value = structured.get("model_catalog_json") if isinstance(structured, Mapping) else None
@@ -113,37 +150,83 @@ class CodexSettingsDomain:
 
     @staticmethod
     def _catalog_model_names(payload: Mapping[str, Any]) -> list[str]:
-        structured = payload.get("structured", {})
-        return selected_model_names(structured)
+        return catalog_names_from_editor(payload)
 
-    def _require_catalog_model_names(self, payload: Mapping[str, Any]) -> list[str]:
-        names = self._catalog_model_names(payload)
-        if not names:
-            raise DomainError("Select a Codex model before enabling the model catalog")
-        return names
+    @staticmethod
+    def _catalog_source_is_available(payload: Mapping[str, Any]) -> bool:
+        """Whether the current LiteLLM endpoint probe completed successfully."""
+
+        return payload.get("litellm_menu_enabled") is True
+
+    def _refresh_live_catalog_source(self, *, force: bool = False) -> None:
+        """Refresh the endpoint-backed catalog source without replacing drafts."""
+
+        now = time.monotonic()
+        if not force and now - self._catalog_source_checked_at < _CATALOG_SOURCE_REFRESH_SECONDS:
+            return
+        self._catalog_source_checked_at = now
+        try:
+            payload = self._load_editor()
+        except DomainError:
+            exposed_models: list[str] = []
+            source_available = False
+        else:
+            raw_exposed = payload.get("exposed_models", [])
+            exposed_models = list(raw_exposed) if isinstance(raw_exposed, list) else []
+            source_available = self._catalog_source_is_available(payload)
+        for state in (self._raw, self._draft):
+            # A failed probe is not an observed empty model list.  Keep the
+            # last verified names so a transient startup/reload failure cannot
+            # erase the catalog and manufacture a Codex restart prompt.
+            if source_available:
+                state["exposed_models"] = copy.deepcopy(exposed_models)
+            state["litellm_menu_enabled"] = source_available
+
+    def _catalog_model_ids_changed(self, names: list[str]) -> bool:
+        """Return whether the Codex-visible model IDs changed, ignoring priority order."""
+
+        existing_names = catalog_model_names(self.model_catalog_path)
+        return existing_names is not None and set(existing_names) != set(names)
 
     def _queue_catalog_restart(self, reason: str) -> None:
         self._catalog_restart_required = True
         self._catalog_change_reason = reason
         self._catalog_change_event += 1
 
-    def _ensure_model_catalog_current(self, *, notify: bool) -> bool:
+    def _ensure_model_catalog_current(
+        self,
+        *,
+        notify: bool,
+        force_source_refresh: bool = False,
+    ) -> bool:
         if not self._is_catalog_enabled(self._raw):
+            return False
+        self._refresh_live_catalog_source(force=force_source_refresh)
+        if not self._catalog_source_is_available(self._raw):
             return False
         names = self._catalog_model_names(self._raw)
         self._context_registry.refresh_if_due()
         if catalog_is_current(self.model_catalog_path, names, registry=self._context_registry):
             return False
+        model_ids_changed = self._catalog_model_ids_changed(names)
         write_catalog(self.model_catalog_path, names, registry=self._context_registry)
-        if notify:
+        if notify and model_ids_changed:
             self._queue_catalog_restart("catalog_repaired")
         self.revision += 1
         return True
 
+    def refresh_model_catalog(self) -> bool:
+        """Refresh the enabled catalog after LiteLLM reloads its routes."""
+
+        return self._ensure_model_catalog_current(
+            notify=True,
+            force_source_refresh=True,
+        )
+
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
         errors = payload.get("validation_errors", [])
         warnings = payload.get("warnings", [])
-        public_models = self._catalog_model_names(payload)
+        public_models = self._catalog_model_names(payload) if self._is_catalog_enabled(payload) else []
         return {
             "domain": "codex",
             "revision": revision,
@@ -168,7 +251,13 @@ class CodexSettingsDomain:
         return self._safe_snapshot(self._draft, self.revision)
 
     def draft_state(self) -> object:
-        return copy.deepcopy(self._draft)
+        # Live model-catalog metadata is refreshed from LiteLLM while the
+        # window is open. It is a read-only projection, not a Codex document
+        # edit, so it must not participate in Core's dirty-state comparison.
+        return {
+            "config_text": str(self._draft.get("config_text", "")),
+            "auth_text": str(self._draft.get("auth_text", "{}\n")),
+        }
 
     def _sync(self, config_text: str, auth_text: str, patch: object | None = None) -> dict[str, Any]:
         import codex_config
@@ -289,13 +378,26 @@ class CodexSettingsDomain:
             raise DomainError("Codex settings changed on disk; reload before applying")
         was_enabled = self._is_catalog_enabled(self._raw)
         will_be_enabled = self._is_catalog_enabled(self._draft)
-        catalog_models = self._require_catalog_model_names(self._draft) if will_be_enabled else None
-        self._context_registry.refresh_if_due()
-        catalog_changed = catalog_models is not None and not catalog_is_current(
-            self.model_catalog_path,
-            catalog_models,
-            registry=self._context_registry,
-        )
+        catalog_models: list[str] | None = None
+        catalog_changed = False
+        catalog_model_ids_changed = False
+        if will_be_enabled:
+            self._refresh_live_catalog_source(force=True)
+            source_available = self._catalog_source_is_available(self._draft)
+            if not source_available:
+                if not was_enabled:
+                    raise DomainError("LiteLLM Menu is not running or exposes no models")
+            else:
+                catalog_models = self._catalog_model_names(self._draft)
+                if not was_enabled and not catalog_models:
+                    raise DomainError("LiteLLM Menu is not running or exposes no models")
+                self._context_registry.refresh_if_due()
+                catalog_changed = not catalog_is_current(
+                    self.model_catalog_path,
+                    catalog_models,
+                    registry=self._context_registry,
+                )
+                catalog_model_ids_changed = self._catalog_model_ids_changed(catalog_models)
         if catalog_changed and catalog_models is not None:
             write_catalog(self.model_catalog_path, catalog_models, registry=self._context_registry)
         try:
@@ -310,7 +412,7 @@ class CodexSettingsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Codex settings could not be saved") from None
         self.reload()
-        if will_be_enabled and (not was_enabled or catalog_changed):
+        if will_be_enabled and (not was_enabled or catalog_model_ids_changed):
             self._queue_catalog_restart("enabled" if not was_enabled else "catalog_repaired")
             self.revision += 1
         elif was_enabled and not will_be_enabled:
@@ -334,13 +436,26 @@ class CodexSettingsDomain:
         if (current.get("config_text"), current.get("auth_text")) != self._baseline:
             raise DomainError("Codex settings changed on disk; reload before applying")
         was_enabled = self._is_catalog_enabled(self._raw)
-        catalog_models = self._require_catalog_model_names(self._raw) if enabled else None
-        self._context_registry.refresh_if_due()
-        catalog_changed = catalog_models is not None and not catalog_is_current(
-            self.model_catalog_path,
-            catalog_models,
-            registry=self._context_registry,
-        )
+        catalog_models: list[str] | None = None
+        catalog_changed = False
+        catalog_model_ids_changed = False
+        if enabled:
+            self._refresh_live_catalog_source(force=True)
+            source_available = self._catalog_source_is_available(self._raw)
+            if not source_available:
+                if not was_enabled:
+                    raise DomainError("LiteLLM Menu is not running or exposes no models")
+            else:
+                catalog_models = self._catalog_model_names(self._raw)
+                if not was_enabled and not catalog_models:
+                    raise DomainError("LiteLLM Menu is not running or exposes no models")
+                self._context_registry.refresh_if_due()
+                catalog_changed = not catalog_is_current(
+                    self.model_catalog_path,
+                    catalog_models,
+                    registry=self._context_registry,
+                )
+                catalog_model_ids_changed = self._catalog_model_ids_changed(catalog_models)
         draft_before = copy.deepcopy(self._draft)
         draft_next = draft_before
         draft_config = draft_before.get("config_text", "")
@@ -379,7 +494,7 @@ class CodexSettingsDomain:
         self.reload()
         if draft_next != draft_before:
             self._draft = draft_next
-        if enabled and (not was_enabled or catalog_changed):
+        if enabled and (not was_enabled or catalog_model_ids_changed):
             self._queue_catalog_restart("enabled" if not was_enabled else "catalog_repaired")
             self.revision += 1
         elif was_enabled and not enabled:
@@ -390,20 +505,19 @@ class CodexSettingsDomain:
     def external_disk_state(self) -> dict[str, bool]:
         """Report only whether either private Codex document changed."""
 
-        self._ensure_model_catalog_current(notify=True)
-        current = self._load_editor()
-        identity = (str(current.get("config_text", "")), str(current.get("auth_text", "{}\n")))
+        config_text, auth_text, config_exists, auth_exists = self._editor_documents_from_disk()
+        identity = (config_text, auth_text)
         return {
             "changed": identity != self._baseline,
-            "exists": bool(current.get("config_exists") or current.get("auth_exists")),
+            "exists": config_exists or auth_exists,
         }
 
     def external_disk_identity(self) -> str:
         """Return an opaque identity without exposing either private document."""
 
-        current = self._load_editor()
-        config = str(current.get("config_text", "")).encode("utf-8")
-        auth = str(current.get("auth_text", "{}\n")).encode("utf-8")
+        config_text, auth_text, _, _ = self._editor_documents_from_disk()
+        config = config_text.encode("utf-8")
+        auth = auth_text.encode("utf-8")
         digest = hashlib.sha256()
         digest.update(len(config).to_bytes(8, "big"))
         digest.update(config)

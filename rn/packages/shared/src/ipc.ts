@@ -80,6 +80,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
       }
       return initialSnapshotRequest;
     },
+    diskState: (domains: ConfigDomain[]): Promise<IpcResults["disk_state"]> => call("disk_state", { domains }),
     logs: async (tab, revision) => call("logs", revision === undefined ? { tab } : { tab, revision }),
     editor: async (domain, document): Promise<IpcResults["editor"]> => call("editor", { domain, document }),
     stageEditor: async (editorToken, text): Promise<IpcResults["editor"]> => call("editor", { editor_token: editorToken, text }),

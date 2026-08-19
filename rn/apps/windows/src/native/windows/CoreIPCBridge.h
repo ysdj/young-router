@@ -57,7 +57,7 @@ class CoreIPCBridge {
       std::string const& domain,
       std::string const& field,
       std::optional<std::string> const& target);
-  std::optional<std::string> ReadSecret(std::string const& secret_read_token);
+  std::optional<std::string> ReadSecret(std::string const& secret_read_token, bool allow_multiline = false);
   std::optional<std::string> ReadPlainTextSecret(
       std::string const& domain,
       std::string const& field,

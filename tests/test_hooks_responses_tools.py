@@ -317,6 +317,47 @@ class HookResponsesToolBridgeTests(HookTestCase):
             bridge_kwargs["litellm_metadata"],
         )
 
+    def test_responses_function_tool_bridge_preserves_named_snapshot_choice(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": "check descendants",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {"type": "function", "name": "list_agents"},
+                        {"type": "function", "name": "interrupt_agent"},
+                    ],
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "list_agents"},
+            "model_info": {
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
+            },
+        }
+
+        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+            request_kwargs
+        )
+
+        self.assertIsNotNone(bridge_kwargs)
+        assert bridge_kwargs is not None
+        self.assertEqual(
+            bridge_kwargs["tool_choice"],
+            {"type": "function", "name": "list_agents"},
+        )
+        self.assertEqual(
+            [tool["name"] for tool in bridge_kwargs["tools"]],
+            ["list_agents", "interrupt_agent"],
+        )
+
     def test_unknown_client_tool_support_does_not_preemptively_bridge(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
@@ -349,6 +390,86 @@ class HookResponsesToolBridgeTests(HookTestCase):
             hooks._responses_function_tool_bridge_preemptive_kwargs(
                 request_kwargs
             )
+        )
+
+    def test_unknown_nested_custom_tool_support_preemptively_bridges(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": "use tools",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec",
+                            "description": "Run JavaScript.",
+                        }
+                    ],
+                }
+            ],
+            "model_info": {
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        }
+
+        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+            request_kwargs
+        )
+
+        self.assertIsNotNone(bridge_kwargs)
+        assert bridge_kwargs is not None
+        self.assertEqual([tool["name"] for tool in bridge_kwargs["tools"]], ["exec"])
+        self.assertTrue(
+            bridge_kwargs["tools"][0][hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY]
+        )
+
+    def test_responses_function_tool_bridge_converts_namespace_custom_tool(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": "use tools",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "exec",
+                            "description": "Run JavaScript.",
+                        }
+                    ],
+                }
+            ],
+            "model_info": {
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": False,
+                "supports_responses_function_tools": True,
+            },
+        }
+
+        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+            request_kwargs
+        )
+
+        self.assertIsNotNone(bridge_kwargs)
+        assert bridge_kwargs is not None
+        self.assertEqual([tool["name"] for tool in bridge_kwargs["tools"]], ["exec"])
+        self.assertTrue(
+            bridge_kwargs["tools"][0][hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY]
+        )
+        self.assertEqual(
+            bridge_kwargs["tools"][0]["parameters"]["required"],
+            ["input"],
         )
 
     def test_explicit_function_tool_unsupported_disables_bridge(self) -> None:

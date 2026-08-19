@@ -56,6 +56,32 @@ class HookPatchTests(HookTestCase):
         self.assertIsInstance(wrapped, AsyncIterator)
         self.assertEqual([chunk async for chunk in wrapped], ["first", "second"])
 
+    def test_selected_marker_does_not_wrap_local_terminal_streams(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": "hello",
+            "stream": True,
+        }
+        error = RuntimeError("invalid request")
+        error.status_code = 400
+        failed = hooks._failed_responses_stream_response(request, error)
+        recovery = hooks._route_recovery_stream_response(request, error)
+        marker = {"model_info": {"id": "route-a"}}
+
+        self.assertIs(
+            hooks._wrap_response_with_selected_deployment_marker(failed, marker),
+            failed,
+        )
+        self.assertIs(
+            hooks._wrap_response_with_selected_deployment_marker(
+                recovery,
+                marker,
+            ),
+            recovery,
+        )
+
     async def test_install_all_keeps_large_responses_json_on_native_http_path(self) -> None:
         hooks, _ = load_hook_module()
         received = {}
@@ -354,6 +380,175 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(error.failed_deployment_id, "picked-deployment")
         self.assertIsNone(getattr(error, "failed_deployment_order", None))
         self.assertEqual(error.num_retries, 0)
+
+    async def test_generic_helper_retries_invalid_parameter_combination_on_configured_protocol(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        router_module = types.ModuleType("litellm.router")
+        attempts = []
+        deployment = {
+            "litellm_params": {
+                "model": "openai/vendor-model",
+                "order": 0,
+            },
+            "model_info": {
+                "id": "dual-protocol-route",
+                "model_group": "default-chat",
+                "order": 0,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            def _update_kwargs_with_deployment(
+                self,
+                selected_deployment,
+                kwargs,
+                function_name=None,
+            ):
+                kwargs["model_info"] = selected_deployment["model_info"].copy()
+                kwargs["litellm_params"] = selected_deployment[
+                    "litellm_params"
+                ].copy()
+
+            async def make_call(self, original_function, *args, **kwargs):
+                self._update_kwargs_with_deployment(
+                    deployment,
+                    kwargs,
+                    function_name="aresponses",
+                )
+                response = original_function(*args, **kwargs)
+                if hasattr(response, "__await__"):
+                    return await response
+                return response
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await self.make_call(original_generic_function, **kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            surface = hooks._request_current_upstream_surface(kwargs)
+            attempts.append(surface)
+            if surface == "openai/responses":
+                error = RuntimeError(
+                    'OpenAIException - {"error":{"code":"server_error",'
+                    '"message":"请求参数组合无效"}}'
+                )
+                error.status_code = 400
+                raise error
+            return {"ok": True, "surface": surface}
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            call_type="aresponses",
+            input="hello",
+            stream=True,
+        )
+
+        self.assertEqual(
+            response,
+            {"ok": True, "surface": "openai/chat"},
+        )
+        self.assertEqual(attempts, ["openai/responses", "openai/chat"])
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_failed_protocol_fallback_is_counted_once_and_returns_terminal_failure(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        router_module = types.ModuleType("litellm.router")
+        attempts = []
+        deployment = {
+            "litellm_params": {
+                "model": "openai/vendor-model",
+                "order": 0,
+            },
+            "model_info": {
+                "id": "dual-protocol-route",
+                "model_group": "default-chat",
+                "order": 0,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            def _update_kwargs_with_deployment(
+                self,
+                selected_deployment,
+                kwargs,
+                function_name=None,
+            ):
+                kwargs["model_info"] = selected_deployment["model_info"].copy()
+                kwargs["litellm_params"] = selected_deployment[
+                    "litellm_params"
+                ].copy()
+
+            async def make_call(self, original_function, *args, **kwargs):
+                self._update_kwargs_with_deployment(
+                    deployment,
+                    kwargs,
+                    function_name="aresponses",
+                )
+                response = original_function(*args, **kwargs)
+                if hasattr(response, "__await__"):
+                    return await response
+                return response
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await self.make_call(original_generic_function, **kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            surface = hooks._request_current_upstream_surface(kwargs)
+            attempts.append(surface)
+            error = RuntimeError(
+                "请求参数组合无效"
+                if surface == "openai/responses"
+                else "fallback request rejected"
+            )
+            error.status_code = 400
+            raise error
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            call_type="aresponses",
+            input="hello",
+            stream=True,
+        )
+
+        self.assertTrue(hooks._is_failed_responses_stream_response(response))
+        self.assertEqual(attempts, ["openai/responses", "openai/chat"])
+        state = hooks._DEPLOYMENT_COOLDOWNS["id:dual-protocol-route"]
+        self.assertEqual(state["failures"], 1)
+        self.assertEqual(state.get("cooldown_until", 0), 0)
+        self.assertFalse(hooks._is_route_recovery_poll_error(response.exception))
 
     async def test_generic_helper_preserves_historical_tool_item_ids(self) -> None:
         hooks, _ = load_hook_module()

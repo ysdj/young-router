@@ -2,6 +2,7 @@ export const IPC_PROTOCOL_VERSION = 1 as const;
 
 export type IpcMethod =
   | "snapshot"
+  | "disk_state"
   | "logs"
   | "editor"
   | "dispatch"
@@ -263,6 +264,7 @@ export interface DispatchAction {
 
 export interface IpcParams {
   snapshot: Record<string, never>;
+  disk_state: { domains: ConfigDomain[] };
   logs: { tab: LogTab; revision?: number };
   editor:
     | { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer" }
@@ -280,6 +282,7 @@ export interface IpcParams {
 
 export interface IpcResults {
   snapshot: { snapshot: CoreSnapshot };
+  disk_state: { revision: number; disk: Partial<Record<ConfigDomain, DiskState>> };
   logs: { changed: boolean; revision: number; log: LogView | null };
   editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; editor_token: string; revision: number; text: string };
   dispatch: { revision: number };
@@ -354,6 +357,7 @@ export interface IpcClient {
   /** The newest snapshot already received by this shared desktop runtime. */
   latestSnapshot(): CoreSnapshot | undefined;
   snapshot(): Promise<CoreSnapshot>;
+  diskState(domains: ConfigDomain[]): Promise<IpcResults["disk_state"]>;
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
   editor(domain: "codex" | "claude", document: "config" | "auth" | "settings" | "desktop" | "developer"): Promise<IpcResults["editor"]>;
   stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;

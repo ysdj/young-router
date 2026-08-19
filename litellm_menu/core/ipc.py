@@ -993,6 +993,11 @@ class CoreIPCServer:
             params = request.params
             if request.method == "snapshot":
                 result: Any = {"snapshot": self.core.snapshot()}
+            elif request.method == "disk_state":
+                domains = params.get("domains")
+                if not isinstance(domains, list) or not domains or any(not isinstance(domain, str) for domain in domains):
+                    raise CoreError("invalid_domain", "The disk-state domains are invalid")
+                result = self.core.disk_state(domains)
             elif request.method == "logs":
                 tab = params.get("tab")
                 known_revision = params.get("revision")

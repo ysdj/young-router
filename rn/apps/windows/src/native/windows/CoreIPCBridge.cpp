@@ -345,7 +345,7 @@ std::optional<CoreIPCBridge::SecretReadCapability> CoreIPCBridge::CreateSecretRe
   }
 }
 
-std::optional<std::string> CoreIPCBridge::ReadSecret(std::string const& secret_read_token) {
+std::optional<std::string> CoreIPCBridge::ReadSecret(std::string const& secret_read_token, bool allow_multiline) {
   if (secret_read_token.empty() || secret_read_token.size() > 256) return std::nullopt;
   try {
     winrt::Windows::Data::Json::JsonObject payload;
@@ -360,7 +360,7 @@ std::optional<std::string> CoreIPCBridge::ReadSecret(std::string const& secret_r
     }
     std::string value = WideToUtf8(response.GetNamedString(L"value", L"").c_str());
     if (value.size() > 16 * 1024 || value.find('\0') != std::string::npos ||
-        value.find('\r') != std::string::npos || value.find('\n') != std::string::npos) {
+        (!allow_multiline && (value.find('\r') != std::string::npos || value.find('\n') != std::string::npos))) {
       return std::nullopt;
     }
     return value;
@@ -375,7 +375,9 @@ std::optional<std::string> CoreIPCBridge::ReadPlainTextSecret(
     std::optional<std::string> const& target) {
   auto capability = CreateSecretReadCapability(domain, field, target);
   if (!capability) return std::nullopt;
-  return ReadSecret(capability->token);
+  return ReadSecret(
+      capability->token,
+      domain == "runtime" && field == "setting" && target && *target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON");
 }
 
 std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(

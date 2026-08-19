@@ -283,10 +283,29 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["tool_choice"],
+            {"type": "function", "name": "list_agents"},
+        )
         self.assertEqual(
             modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
             "snapshot_missing",
+        )
+
+    def test_codex_root_missing_snapshot_narrows_existing_required_choice(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["tool_choice"] = "required"
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            modified["tool_choice"],
+            {"type": "function", "name": "list_agents"},
         )
 
     def test_codex_root_clean_snapshot_allows_tool_free_completion(self) -> None:
@@ -345,7 +364,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["tool_choice"],
+            {"type": "function", "name": "list_agents"},
+        )
         self.assertEqual(
             modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
             "snapshot_invalidated",
@@ -421,7 +443,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["tool_choice"],
+            {"type": "function", "name": "list_agents"},
+        )
 
     def test_codex_root_snapshot_called_before_parallel_followup_stays_invalid(self) -> None:
         hooks, _ = load_hook_module()
@@ -468,7 +493,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["tool_choice"],
+            {"type": "function", "name": "list_agents"},
+        )
         self.assertEqual(
             modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
             "snapshot_invalidated",
@@ -519,7 +547,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(modified["tool_choice"], "required")
+        self.assertEqual(
+            modified["tool_choice"],
+            {"type": "function", "name": "list_agents"},
+        )
         self.assertEqual(
             modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
             "snapshot_invalidated",

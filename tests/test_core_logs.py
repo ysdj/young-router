@@ -961,6 +961,76 @@ model_list:
             self.assertNotIn("stale-chat", json.dumps(tab))
             self.assertNotIn("expired-chat", json.dumps(tab))
 
+    def test_recovery_cooldown_countdown_uses_whole_seconds_and_refreshes_each_second(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir()
+            now = 1_800_000_000.25
+            (runtime / "deployment-cooldowns.json").write_text(
+                json.dumps(
+                    {
+                        "cooldowns": {
+                            "active": {
+                                "cooldown_until": now + 60.75,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            domain = LogsDomain(root)
+
+            with mock.patch("litellm_menu.core.domains.logs.time.time", return_value=now):
+                first = domain.view("recovery")
+            with mock.patch("litellm_menu.core.domains.logs.time.time", return_value=now + 1):
+                second = domain.view("recovery", known_revision=first["revision"])
+
+            self.assertEqual("cooldown=61s", first["log"]["records"][0]["detail"])
+            self.assertTrue(second["changed"])
+            self.assertEqual("cooldown=60s", second["log"]["records"][0]["detail"])
+
+    def test_clear_recovery_and_cooldowns_removes_both_routing_states(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir()
+            now = datetime.now(timezone.utc)
+            recovery_path = runtime / "route-recovery-state.json"
+            recovery_payload = {
+                "recoveries": {
+                    "live": {
+                        "heartbeat_at": now.isoformat(),
+                        "status": "waiting",
+                    }
+                }
+            }
+            recovery_path.write_text(json.dumps(recovery_payload), encoding="utf-8")
+            cooldown_path = runtime / "deployment-cooldowns.json"
+            cooldown_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "cooldowns": {"active": {"cooldown_until": now.timestamp() + 60}},
+                        "image_tool_unsupported": {"preserved": {"expires_at": now.timestamp() + 60}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            domain = LogsDomain(root)
+
+            domain.dispatch("logs.clear_recovery_and_cooldowns", {"tab": "recovery"})
+
+            self.assertEqual({}, json.loads(recovery_path.read_text(encoding="utf-8"))["recoveries"])
+            cooldown_payload = json.loads(cooldown_path.read_text(encoding="utf-8"))
+            self.assertEqual({}, cooldown_payload["cooldowns"])
+            self.assertEqual(
+                {"preserved": {"expires_at": now.timestamp() + 60}},
+                cooldown_payload["image_tool_unsupported"],
+            )
+            tab = domain.view("recovery")["log"]
+            self.assertEqual(0, tab["line_count"])
+
     def test_clearing_recovery_view_hides_both_state_sources_until_they_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

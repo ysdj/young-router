@@ -94,6 +94,7 @@ The facade intercepts computer action calls, routes them to the configured backe
 LiteLLM Menu includes targeted optimizations for [Codex](https://github.com/openai/codex) CLI and similar Responses API clients:
 
 - **Codex Settings** — a single staged editor combines typed settings for connection, behavior, features, permissions, providers, MCP/plugins, and advanced options with synchronized `config.toml` and `auth.json` text views. Selecting a LiteLLM deployment stages its local endpoint/key without overwriting unrelated Codex settings or credentials.
+- **Managed Codex model catalog** — the menu-bar switch publishes exactly the model IDs returned by the running LiteLLM Menu `/v1/models` endpoint, keeping the current and review models first only when that endpoint exposes them. Configured-only or stale selections are never added as fallbacks. A failed endpoint probe leaves the last verified catalog intact; a successful empty response clears it.
 - **Fast default tier** — when effective `CODEX_HOME/config.toml` has `service_tier = "fast"` (or `"priority"`) and `[features].fast_mode = true`, Menu injects the upstream value `"priority"` only into reliably identified Codex native `/v1/responses` requests whose original body has no `service_tier`. The config is refreshed on the next request after Apply; explicit tiers and non-Codex traffic are never overwritten. Known boundary: if Desktop strips a manual Standard selection into an absent HTTP field while config remains Fast, the gateway cannot distinguish it; the config file is this shim's explicit switch.
 - **Compaction controls** — request pre-processing adds compaction-related metadata and headers that Codex expects.
 - **Reasoning effort compatibility** — when an upstream returns an error indicating `xhigh` reasoning effort is unsupported, the proxy retries with a compatible effort level (`high` or `max`) and records the compat retry.
@@ -389,6 +390,7 @@ Facade 拦截 computer 动作调用，路由到已配置的后端，并返回观
 LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似 Responses API 客户端的定向优化：
 
 - **Codex Settings** — 单一草稿窗口把连接、行为、功能开关、权限、provider、MCP/plugin 与高级选项的结构化控制，同 `config.toml` / `auth.json` 的实时文本视图同步；选择 LiteLLM 部署只会暂存本地端点与密钥，直到点击 Apply 才会写入，且保留其余 Codex 设置和认证字段。
+- **托管 Codex 模型目录** — 菜单栏开关只会把运行中的 LiteLLM Menu `/v1/models` 实际返回的模型 ID 发布给 Codex；当前模型和 review 模型仅在端点确实暴露它们时保持在前。已配置但未暴露的模型和陈旧选择都不会作为回退加入。端点探测失败时保留上一次已验证的目录；只有端点成功返回空列表时才会清空目录。
 - **Fast 默认 tier** — 当有效 `CODEX_HOME/config.toml` 同时包含 `service_tier = "fast"`（也兼容 `"priority"`）和 `[features].fast_mode = true` 时，Menu 只会为可可靠识别的 Codex 原生 `/v1/responses` 请求、且原始请求未提供 `service_tier` 时注入上游标准值 `"priority"`。配置文件每次请求按变更刷新，因此 Codex Settings 的 Apply 后下一请求生效；显式 tier 与非 Codex 流量绝不覆盖。已知边界：若 Desktop 在用户手动选择 Standard 后先把该选择剥为“字段缺失”，而配置仍为 Fast，网关无法仅从 HTTP 请求区分这种情形；此 shim 的明确开关是配置文件。
 - **压缩控制** — 请求预处理添加 Codex 所需的压缩相关元数据和头信息。
 - **推理强度兼容** — 上游返回表明 `xhigh` 推理强度不支持的错误时，代理以兼容强度级别（`high` 或 `max`）重试，并记录兼容重试。

@@ -122,6 +122,7 @@ def run(argv: list[str] | None = None) -> int:
         claude_settings_path=args.claude_settings,
         language_path=args.language_file,
         runtime_root=args.runtime_root,
+        reset_transient_routing_state=True,
     )
     server = CoreIPCServer(core, address=args.address, port=args.port)
 

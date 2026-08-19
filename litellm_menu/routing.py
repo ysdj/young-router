@@ -49,6 +49,7 @@ from .base import (
     _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
     _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
     _PROTOCOL_FALLBACK_DEFAULT_TTL_SECONDS,
+    _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR,
     _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
     _PROTOCOL_FALLBACK_LOCK,
     _PROTOCOL_FALLBACKS,
@@ -165,6 +166,11 @@ def _wrap_response_with_selected_deployment_marker(
     marker: Any,
 ) -> Any:
     if not isinstance(marker, dict) or not callable(getattr(response, "__aiter__", None)):
+        return response
+    if isinstance(
+        response,
+        (_RouteRecoveryStreamResponse, _TerminalFailedResponsesStreamResponse),
+    ):
         return response
     if _selected_deployment_marker_from_response(response) is not None:
         return response
@@ -1473,11 +1479,19 @@ def _record_protocol_fallback_success(request_kwargs: Optional[dict]) -> None:
     fallback_surface = _request_current_upstream_surface(request_kwargs)
     deployment_id = _request_surface_deployment_id(request_kwargs) or _deployment_id_from_request(request_kwargs)
     cache_key = _protocol_fallback_cache_key(deployment_id, client_surface)
+    fallback_succeeded = bool(
+        from_surface
+        and client_surface
+        and fallback_surface
+        and fallback_surface != from_surface
+    )
+    # The first protocol's rejection is provisional.  A successful request
+    # on the configured alternate protocol proves the route is usable, so it
+    # must not leave a recovery/cooldown failure behind.
+    if fallback_succeeded:
+        _record_deployment_success_for_cooldown(request_kwargs)
     ttl = _protocol_fallback_ttl_seconds()
-    if not from_surface or not client_surface or not fallback_surface or not cache_key or ttl <= 0:
-        _clear_protocol_fallback_request_state(request_kwargs)
-        return
-    if fallback_surface == from_surface:
+    if not fallback_succeeded or not cache_key or ttl <= 0:
         _clear_protocol_fallback_request_state(request_kwargs)
         return
     now = time.time()
@@ -2360,6 +2374,10 @@ def _next_upstream_surface_for_failed_deployment(
         return None
     attempted = _request_attempted_upstream_surfaces(request_kwargs)
     current_surface = _request_current_upstream_surface(request_kwargs)
+    if not current_surface:
+        current_surface = _normalized_request_surface(
+            getattr(exception, "failed_deployment_surface", None)
+        )
     if current_surface and current_surface not in attempted:
         attempted.append(current_surface)
     if fallback_surface in attempted:
@@ -3536,8 +3554,12 @@ def _mark_exception_for_deployment_failover(
         request=_trace_module._trace_request_summary(request_kwargs),
         exception=_trace_exception(exception),
     )
-    if not protocol_surface_failover:
-        _record_deployment_failure_for_cooldown(exception, request_kwargs)
+    if _protocol_fallback_attempt_active(request_kwargs):
+        _mark_protocol_fallback_failure(exception, request_kwargs)
+        return
+    if protocol_surface_failover:
+        return
+    _record_deployment_failure_for_cooldown(exception, request_kwargs)
 
 
 def _mark_exception_for_upstream_surface_failover(
@@ -3549,6 +3571,51 @@ def _mark_exception_for_upstream_surface_failover(
     except Exception:
         pass
     _mark_exception_for_deployment_failover(exception, request_kwargs)
+
+
+def _protocol_fallback_attempt_active(
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    from_surface = _normalized_request_surface(
+        request_kwargs.get(_PROTOCOL_FALLBACK_FROM_SURFACE_KEY)
+    )
+    if not from_surface:
+        metadata = _request_context_module._request_metadata_dict(
+            request_kwargs,
+            "litellm_metadata",
+        ) or {}
+        from_surface = _normalized_request_surface(
+            metadata.get(_PROTOCOL_FALLBACK_FROM_SURFACE_KEY)
+        )
+    current_surface = _request_current_upstream_surface(request_kwargs)
+    return bool(
+        from_surface
+        and current_surface
+        and current_surface != from_surface
+    )
+
+
+def _mark_protocol_fallback_failure(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> None:
+    if getattr(exception, _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR, False):
+        return
+    try:
+        setattr(exception, _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR, True)
+    except Exception:
+        pass
+    # A deterministic 4xx normally stays out of cooldown accounting. Once
+    # both protocols have failed, the pair is one failed route attempt. Count
+    # it once without turning the deterministic error into a recovery poll.
+    _record_deployment_failure_for_cooldown(
+        exception,
+        request_kwargs,
+        force=True,
+    )
+    _clear_protocol_fallback_cache_for_request(request_kwargs)
 
 
 def _exception_excluded_deployment_ids(exception: Exception) -> set[str]:
@@ -3694,12 +3761,20 @@ def _should_count_deployment_failure_for_cooldown(
 def _record_deployment_failure_for_cooldown(
     exception: Exception,
     request_kwargs: Optional[dict],
+    *,
+    force: bool = False,
 ) -> None:
     if not _deployment_cooldown_enabled():
         return
     if not _deployment_cooldown_recording_enabled_for_request(request_kwargs):
         return
-    if not _should_count_deployment_failure_for_cooldown(exception, request_kwargs):
+    if (
+        not force
+        and not _should_count_deployment_failure_for_cooldown(
+            exception,
+            request_kwargs,
+        )
+    ):
         return
     if getattr(exception, _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR, False):
         return
@@ -4260,6 +4335,41 @@ def _is_current_upstream_surface_incompatible_error(
         return False
 
     text = _exception_text(exception)
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    if not model_info:
+        model_info = _request_context_module._request_model_info(
+            outer_request_kwargs
+        )
+    configured_surface = _normalized_request_surface(
+        model_info.get(_UPSTREAM_URL_SURFACE_KEY)
+    )
+    protocol_mode = str(
+        model_info.get(
+            _UPSTREAM_PROTOCOL_MODE_KEY,
+            _UPSTREAM_PROTOCOL_MODE_FALLBACK,
+        )
+    ).strip().lower()
+    client_surface = _request_client_surface(outer_request_kwargs)
+    if not client_surface:
+        client_surface = _request_client_surface(request_kwargs)
+    invalid_parameter_combination = any(
+        marker in text
+        for marker in (
+            "请求参数组合无效",
+            "invalid parameter combination",
+            "invalid parameters combination",
+            "invalid combination of parameters",
+            "invalid request parameter combination",
+        )
+    )
+    if (
+        invalid_parameter_combination
+        and protocol_mode == _UPSTREAM_PROTOCOL_MODE_FALLBACK
+        and client_surface == current_surface
+        and configured_surface
+        and configured_surface != current_surface
+    ):
+        return True
     endpoint_markers = (
         "endpoint not found",
         "unknown endpoint",

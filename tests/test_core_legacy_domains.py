@@ -19,6 +19,7 @@ from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
 from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
 from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
 from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
+from litellm_menu.core.model_catalog import catalog_is_current
 from litellm_menu.core.service import CoreError, CoreStore
 from runtime_settings_io import RuntimeSettingSpec
 
@@ -1065,6 +1066,35 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertTrue(raw["config_exists"])
             self.assertTrue(raw["auth_file_exists"])
 
+    @mock.patch("codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    def test_live_catalog_refresh_does_not_make_a_noop_editor_stage_dirty(self, _live_models) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            catalog_path = home / "litellm-menu-model-catalog.json"
+            (home / "config.toml").write_text(
+                f'model = "default-chat"\nmodel_catalog_json = "{catalog_path}"\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[codex])
+
+            text = core.editor_document("codex", "config")["text"]
+            core.snapshot()
+            core.stage_editor_text(
+                "codex",
+                "config",
+                text,
+                revision=core.revision,
+                expected_text_digest=CoreStore._editor_text_digest(text),
+            )
+
+            self.assertFalse(core.snapshot()["drafts"]["codex"]["dirty"])
+
     def test_missing_codex_file_remains_missing_until_apply_creates_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1081,7 +1111,8 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertTrue(applied["config_exists"])
             self.assertTrue(applied["auth_file_exists"])
 
-    def test_menu_catalog_toggle_preserves_staged_codex_edits_and_tracks_public_models(self) -> None:
+    @mock.patch("codex_config._local_exposed_models", return_value=(['default-chat'], True))
+    def test_menu_catalog_toggle_preserves_staged_codex_edits_and_tracks_public_models(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = root / "config.yaml"
@@ -1126,10 +1157,252 @@ class CodexSettingsDomainTests(unittest.TestCase):
             disabled_catalog = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertEqual(disabled["revision"], core.snapshot()["revision"])
             self.assertFalse(disabled_catalog["enabled"])
+            self.assertEqual([], disabled_catalog["public_models"])
             self.assertTrue(disabled_catalog["restart_required"])
             self.assertEqual("disabled", disabled_catalog["change_reason"])
 
-    def test_provider_apply_updates_enabled_catalog_and_requests_restart(self) -> None:
+    @mock.patch(
+        "codex_config._local_exposed_models",
+        return_value=(['default-chat', 'second-chat', 'third-chat'], True),
+    )
+    def test_model_catalog_uses_every_litellm_exposed_model(self, _live_models) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime_text = textwrap.dedent(PROVIDER_CONFIG).lstrip()
+            model_list_suffix = (
+                "  - model_name: second-chat\n"
+                "    litellm_params:\n"
+                "      model: openai/second-chat\n"
+                "      api_base: \"https://example.test/v1\"\n"
+                "      api_key: \"replace-me-secret\"\n"
+                "    model_info:\n"
+                "      id: \"00000072\"\n"
+                "      provider: primary\n"
+                "      upstream_url_surface: openai/responses\n"
+                "  - model_name: third-chat\n"
+                "    litellm_params:\n"
+                "      model: openai/third-chat\n"
+                "      api_base: \"https://example.test/v1\"\n"
+                "      api_key: \"replace-me-secret\"\n"
+                "    model_info:\n"
+                "      id: \"00000073\"\n"
+                "      provider: primary\n"
+                "      upstream_url_surface: openai/responses\n"
+            )
+            runtime_text = runtime_text.replace(
+                "litellm_settings:\n",
+                model_list_suffix + "litellm_settings:\n",
+                1,
+            )
+            runtime.write_text(runtime_text, encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "default-chat"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[codex])
+
+            before = core.snapshot()["domains"]["codex"]["model_catalog"]
+            self.assertEqual([], before["public_models"])
+
+            enabled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
+                expected_revision=core.revision,
+            )
+            self.assertEqual(
+                ["default-chat", "second-chat", "third-chat"],
+                enabled["result"]["model_catalog"]["public_models"],
+            )
+            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                ["default-chat", "second-chat", "third-chat"],
+                [model["slug"] for model in catalog["models"]],
+            )
+
+    def test_enabled_catalog_keeps_last_verified_models_when_litellm_menu_is_unavailable(self) -> None:
+        endpoint = {"result": (["default-chat"], True)}
+
+        def exposed_models(_api_key: str):
+            return endpoint["result"]
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ):
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "default-chat"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[codex])
+
+            enabled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
+                expected_revision=core.revision,
+            )
+            core.dispatch(
+                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
+                expected_revision=enabled["revision"],
+            )
+
+            endpoint["result"] = ([], False)
+            codex._catalog_source_checked_at = 0.0
+            snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
+
+            self.assertEqual(["default-chat"], snapshot["public_models"])
+            self.assertFalse(snapshot["restart_required"])
+            self.assertIsNone(snapshot["change_reason"])
+            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
+
+    def test_enabled_catalog_updates_when_litellm_reports_an_empty_model_list(self) -> None:
+        endpoint = {"result": (["default-chat"], True)}
+
+        def exposed_models(_api_key: str):
+            return endpoint["result"]
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ):
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "default-chat"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[codex])
+
+            enabled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
+                expected_revision=core.revision,
+            )
+            core.dispatch(
+                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
+                expected_revision=enabled["revision"],
+            )
+
+            endpoint["result"] = ([], True)
+            codex._catalog_source_checked_at = 0.0
+            snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
+
+            self.assertEqual([], snapshot["public_models"])
+            self.assertTrue(snapshot["restart_required"])
+            self.assertEqual("catalog_repaired", snapshot["change_reason"])
+            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual([], catalog["models"])
+
+    @mock.patch("codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    def test_catalog_metadata_repair_does_not_request_codex_restart(self, _live_models) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "default-chat"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[codex])
+
+            enabled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
+                expected_revision=core.revision,
+            )
+            core.dispatch(
+                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
+                expected_revision=enabled["revision"],
+            )
+            catalog_path = home / "litellm-menu-model-catalog.json"
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            catalog["models"][0]["description"] = "stale metadata"
+            catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+            snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
+
+            self.assertEqual(["default-chat"], snapshot["public_models"])
+            self.assertFalse(snapshot["restart_required"])
+            self.assertIsNone(snapshot["change_reason"])
+            self.assertTrue(catalog_is_current(catalog_path, ["default-chat"], registry=codex._context_registry))
+
+    @mock.patch("codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    def test_missing_catalog_repair_does_not_request_codex_restart(self, _live_models) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "default-chat"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[codex])
+
+            enabled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
+                expected_revision=core.revision,
+            )
+            core.dispatch(
+                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
+                expected_revision=enabled["revision"],
+            )
+            catalog_path = home / "litellm-menu-model-catalog.json"
+            catalog_path.unlink()
+
+            snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
+
+            self.assertFalse(snapshot["restart_required"])
+            self.assertIsNone(snapshot["change_reason"])
+            self.assertTrue(catalog_is_current(catalog_path, ["default-chat"], registry=codex._context_registry))
+
+    def test_catalog_priority_reorder_does_not_request_codex_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "codex_config._local_exposed_models",
+            return_value=(["model-a", "model-b"], True),
+        ), mock.patch(
+            "litellm_menu.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "model-a"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            codex = CodexSettingsDomain(runtime, codex_home=home)
+            core = CoreStore(domains=[codex])
+
+            enabled = core.dispatch(
+                {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
+                expected_revision=core.revision,
+            )
+            acknowledged = core.dispatch(
+                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
+                expected_revision=enabled["revision"],
+            )
+            staged = core.dispatch(
+                {"domain": "codex", "type": "patch", "payload": {"model": "model-b"}},
+                expected_revision=acknowledged["revision"],
+            )
+            core.apply("codex", revision=staged["revision"])
+
+            snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
+            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(["model-b", "model-a"], snapshot["public_models"])
+            self.assertEqual(["model-b", "model-a"], [model["slug"] for model in catalog["models"]])
+            self.assertFalse(snapshot["restart_required"])
+            self.assertIsNone(snapshot["change_reason"])
+
+    @mock.patch("codex_config._local_exposed_models", return_value=(['default-chat'], True))
+    def test_provider_apply_updates_enabled_catalog_and_requests_restart(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runtime = root / "config.yaml"
@@ -1195,10 +1468,12 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
             snapshot = core.snapshot()
             catalog_state = snapshot["domains"]["codex"]["model_catalog"]
-            self.assertTrue(catalog_state["restart_required"])
-            self.assertEqual("catalog_repaired", catalog_state["change_reason"])
+            # A Codex selection alone cannot add a model that LiteLLM's live
+            # /v1/models surface does not expose.
+            self.assertFalse(catalog_state["restart_required"])
+            self.assertIsNone(catalog_state["change_reason"])
             catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
-            self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
+            self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
     def test_sync_and_apply_preserve_unknown_toml_and_auth_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1426,6 +1701,21 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             self.assertTrue(configured["configured"])
             self.assertTrue(domain.secret_present("setting", key))
             self.assertEqual("configured", configured["value"])
+
+    def test_pi_web_access_json_multiline_value_uses_only_the_native_read_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
+            core = CoreStore(domains=[domain])
+            key = "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
+            value = '{\n  "provider": "duckduckgo"\n}'
+
+            result = core.stage_secret("runtime", "setting", key, value, revision=core.revision)
+            self.assertTrue(result["present"])
+            self.assertEqual('{"provider":"duckduckgo"}', core.trusted_secret_value("runtime", "setting", key, revision=core.revision))
+            self.assertNotIn(value, json.dumps(core.snapshot()))
+
+            with self.assertRaisesRegex(CoreError, "unavailable"):
+                core.trusted_secret_descriptor("runtime", "setting", "LITELLM_MENU_VISION_BRIDGE_API_KEY")
 
 
 class WebDAVSettingsDomainTests(unittest.TestCase):

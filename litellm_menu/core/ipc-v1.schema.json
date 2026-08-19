@@ -6,6 +6,7 @@
   "protocol_version": 1,
   "methods": [
     "snapshot",
+    "disk_state",
     "logs",
     "editor",
     "dispatch",
@@ -20,6 +21,7 @@
   ],
   "x-method-contracts": {
     "snapshot": {"params": {"$ref": "#/$defs/emptyParams"}, "result": {"$ref": "#/$defs/snapshotResult"}},
+    "disk_state": {"params": {"$ref": "#/$defs/diskStateParams"}, "result": {"$ref": "#/$defs/diskStateResult"}},
     "logs": {"params": {"$ref": "#/$defs/logsParams"}, "result": {"$ref": "#/$defs/logsResult"}},
     "editor": {"params": {"$ref": "#/$defs/editorParams"}, "result": {"$ref": "#/$defs/editorResult"}},
     "dispatch": {"params": {"$ref": "#/$defs/dispatchParams"}, "result": {"$ref": "#/$defs/revisionResult"}},
@@ -39,11 +41,12 @@
     "properties": {
       "protocol_version": {"const": 1},
       "request_id": {"type": "string", "minLength": 1, "maxLength": 256},
-      "method": {"enum": ["snapshot", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"]},
+      "method": {"enum": ["snapshot", "disk_state", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"]},
       "params": {"type": "object"}
     },
     "allOf": [
       {"if": {"properties": {"method": {"const": "snapshot"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/emptyParams"}}}},
+      {"if": {"properties": {"method": {"const": "disk_state"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/diskStateParams"}}}},
       {"if": {"properties": {"method": {"const": "logs"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/logsParams"}}}},
       {"if": {"properties": {"method": {"const": "editor"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/editorParams"}}}},
       {"if": {"properties": {"method": {"const": "dispatch"}}}, "then": {"properties": {"params": {"$ref": "#/$defs/dispatchParams"}}}},
@@ -95,6 +98,7 @@
     "revision": {"type": "integer", "minimum": 0},
     "emptyParams": {"type": "object", "additionalProperties": false, "maxProperties": 0, "x-typescript-type": "Record<string, never>"},
     "logsParams": {"type": "object", "additionalProperties": false, "required": ["tab"], "properties": {"tab": {"$ref": "#/$defs/logTab"}, "revision": {"$ref": "#/$defs/revision"}}},
+    "diskStateParams": {"type": "object", "additionalProperties": false, "required": ["domains"], "properties": {"domains": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["providers_models", "codex", "claude", "runtime", "webdav", "logs", "language", "relay_accounts"]}}}, "x-typescript-type": "{ domains: ConfigDomain[] }"},
     "editorParams": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["domain", "document"], "properties": {"domain": {"enum": ["codex", "claude"]}, "document": {"enum": ["config", "auth", "settings", "desktop", "developer"]}}}, {"type": "object", "additionalProperties": false, "required": ["editor_token", "text"], "properties": {"editor_token": {"type": "string", "minLength": 1, "maxLength": 256}, "text": {"type": "string", "maxLength": 2097152}}}]},
     "dispatchAction": {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "minLength": 1}, "domain": {"$ref": "#/$defs/domain"}, "payload": {"type": "object", "x-typescript-type": "Record<string, unknown>"}}, "additionalProperties": false, "x-typescript-type": "DispatchAction"},
     "dispatchParams": {"type": "object", "additionalProperties": false, "required": ["action"], "properties": {"action": {"$ref": "#/$defs/dispatchAction"}, "revision": {"$ref": "#/$defs/revision"}}},
@@ -107,9 +111,11 @@
     "importPreviewParams": {"type": "object", "additionalProperties": false, "required": ["source_token", "revision"], "properties": {"source_token": {"type": "string", "minLength": 1, "maxLength": 256}, "revision": {"$ref": "#/$defs/revision"}}},
     "importParams": {"type": "object", "additionalProperties": false, "required": ["import_plan_token", "sections", "revision"], "properties": {"import_plan_token": {"type": "string", "minLength": 1, "maxLength": 256}, "sections": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/domain"}}, "revision": {"$ref": "#/$defs/revision"}}},
     "coreSnapshot": {"type": "object", "x-typescript-type": "CoreSnapshot"},
+    "diskState": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": false, "required": ["changed", "generation"], "properties": {"changed": {"type": "boolean"}, "generation": {"$ref": "#/$defs/revision"}, "keep_draft": {"type": "boolean"}}}, "x-typescript-type": "Partial<Record<ConfigDomain, DiskState>>"},
     "validationSummary": {"type": "object", "x-typescript-type": "ValidationSummary"},
     "importPreview": {"type": "object", "x-typescript-type": "Partial<Record<ConfigDomain, { available: boolean; will_replace_draft: boolean }>>"},
     "snapshotResult": {"type": "object", "additionalProperties": false, "required": ["snapshot"], "properties": {"snapshot": {"$ref": "#/$defs/coreSnapshot"}}},
+    "diskStateResult": {"type": "object", "additionalProperties": false, "required": ["revision", "disk"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "disk": {"$ref": "#/$defs/diskState"}}},
     "logView": {"type": "object", "additionalProperties": false, "required": ["tab", "available", "paused", "line_count", "records", "filter", "limit"], "properties": {"tab": {"$ref": "#/$defs/logTab"}, "available": {"type": "boolean"}, "paused": {"type": "boolean"}, "line_count": {"type": "integer", "minimum": 0}, "records": {"type": "array", "maxItems": 100000, "items": {"type": ["object", "string"]}}, "filter": {"type": "string", "maxLength": 256}, "limit": {"type": "integer", "minimum": 1}}, "x-typescript-type": "LogView"},
     "logsResult": {"type": "object", "additionalProperties": false, "required": ["changed", "revision", "log"], "properties": {"changed": {"type": "boolean"}, "revision": {"$ref": "#/$defs/revision"}, "log": {"oneOf": [{"$ref": "#/$defs/logView"}, {"type": "null"}]}}},
     "editorResult": {"type": "object", "additionalProperties": false, "required": ["domain", "document", "editor_token", "revision", "text"], "properties": {"domain": {"enum": ["codex", "claude"]}, "document": {"enum": ["config", "auth", "settings", "desktop", "developer"]}, "editor_token": {"type": "string", "minLength": 1, "maxLength": 256}, "revision": {"$ref": "#/$defs/revision"}, "text": {"type": "string", "maxLength": 2097152}}},

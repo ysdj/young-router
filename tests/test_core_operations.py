@@ -351,6 +351,19 @@ class CoreOperationsTests(unittest.TestCase):
         controller.start.assert_not_called()
         self.assertEqual("stopped", core.snapshot()["service"]["state"])
 
+    def test_new_app_core_resets_transient_routing_state(self) -> None:
+        with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
+            controller = controller_type.return_value
+            controller.status.return_value = {"state": "stopped"}
+            controller.dispatch.return_value = {"state": "stopped"}
+
+            CoreStore.with_default_domains(
+                runtime_root="/tmp/litellm-menu-core-new-app",
+                reset_transient_routing_state=True,
+            )
+
+        controller.reset_transient_routing_state.assert_called_once_with()
+
     def test_default_core_exposes_a_non_running_service_for_diagnostics(self) -> None:
         with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
             controller = controller_type.return_value

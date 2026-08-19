@@ -1638,8 +1638,129 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
 
+    def test_invalid_parameter_combination_uses_protocol_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        deployment = {
+            "litellm_params": {"model": "openai/vendor-model", "order": 0},
+            "model_info": {
+                "id": "dual-protocol-route",
+                "order": 0,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": "hello",
+            "stream": True,
+            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_litellm_menu_attempted_upstream_url_surfaces": [
+                "openai/responses"
+            ],
+            "_litellm_menu_upstream_url_surface_deployment_id": (
+                "dual-protocol-route"
+            ),
+            "model_info": deployment["model_info"],
+            "litellm_params": deployment["litellm_params"],
+        }
+        error = RuntimeError(
+            'OpenAIException - {"error":{"code":"server_error",'
+            '"message":"请求参数组合无效"}}'
+        )
+        error.status_code = 400
+
+        self.assertTrue(
+            hooks._is_current_upstream_surface_incompatible_error(
+                error,
+                request,
+            )
+        )
+        hooks._mark_exception_for_upstream_surface_failover(error, request)
+        entry = hooks._ordered_deployment_fallback_entry(
+            Router(),
+            error,
+            request,
+        )
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(
+            entry["_litellm_menu_upstream_url_surface"],
+            "openai/chat",
+        )
+        self.assertEqual(
+            entry["_litellm_menu_surface_target_deployment_id"],
+            "dual-protocol-route",
+        )
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
+    def test_failed_protocol_fallback_counts_once_without_recovery(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        with tempfile.TemporaryDirectory() as directory:
+            self.set_env(
+                hooks._DEPLOYMENT_COOLDOWN_FILE_ENV,
+                str(Path(directory) / "deployment-cooldowns.json"),
+            )
+            request = {
+                "model": "default-chat",
+                "call_type": "aresponses",
+                "input": "hello",
+                "stream": True,
+                "_litellm_menu_upstream_url_surface": "openai/chat",
+                "_litellm_menu_attempted_upstream_url_surfaces": [
+                    "openai/responses",
+                    "openai/chat",
+                ],
+                "_litellm_menu_upstream_url_surface_deployment_id": (
+                    "dual-protocol-route"
+                ),
+                "_litellm_menu_protocol_fallback_from_surface": (
+                    "openai/responses"
+                ),
+                "_litellm_menu_protocol_fallback_client_surface": (
+                    "openai/responses"
+                ),
+                "model_info": {
+                    "id": "dual-protocol-route",
+                    "order": 0,
+                    "upstream_url_surface": "openai/chat",
+                    "upstream_protocol_mode": "fallback",
+                },
+                "litellm_params": {
+                    "model": "openai/vendor-model",
+                    "order": 0,
+                },
+            }
+            error = RuntimeError("fallback request rejected")
+            error.status_code = 400
+
+            hooks._mark_exception_for_deployment_failover(error, request)
+            hooks._mark_exception_for_deployment_failover(error, request)
+
+            state = hooks._DEPLOYMENT_COOLDOWNS["id:dual-protocol-route"]
+            self.assertEqual(state["failures"], 1)
+            self.assertEqual(state.get("cooldown_until", 0), 0)
+            self.assertEqual(
+                hooks._recovery_policy_for_exception(error),
+                hooks._RECOVERY_POLICY_ERROR,
+            )
+            self.assertFalse(hooks._is_route_recovery_poll_error(error))
+            self.assertFalse(
+                hooks._protocol_fallback_attempt_active(request)
+            )
+
     def test_successful_protocol_fallback_is_remembered_for_runtime_ttl(self) -> None:
         hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployment = {
             "litellm_params": {"model": "openai/kimi-k3", "order": 1},
             "model_info": {
@@ -1651,6 +1772,21 @@ class HookRoutingTests(HookTestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(Path(directory) / "routing.json"))
             self.set_env(hooks._PROTOCOL_FALLBACK_TTL_SECONDS_ENV, "600")
+            failed_request = {
+                "model": "default-chat",
+                "_litellm_menu_upstream_url_surface": "anthropic",
+                "_litellm_menu_upstream_url_surface_deployment_id": "kimi-route",
+                "model_info": deployment["model_info"],
+                "litellm_params": deployment["litellm_params"],
+            }
+            initial_error = RuntimeError("initial protocol rejected")
+            initial_error.status_code = 503
+            hooks._mark_exception_for_deployment_failover(
+                initial_error,
+                failed_request,
+            )
+            self.assertIn("id:kimi-route", hooks._DEPLOYMENT_COOLDOWNS)
+
             request = {
                 "model": "default-chat",
                 "call_type": "messages",
@@ -1662,6 +1798,7 @@ class HookRoutingTests(HookTestCase):
                 "model_info": deployment["model_info"],
             }
             hooks._record_protocol_fallback_success(request)
+            self.assertNotIn("id:kimi-route", hooks._DEPLOYMENT_COOLDOWNS)
 
             next_request = {
                 "call_type": "messages",

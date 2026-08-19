@@ -153,6 +153,9 @@ _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY = (
 _PROTOCOL_FALLBACK_CACHE_HIT_KEY = (
     "_litellm_menu_protocol_fallback_cache_hit"
 )
+_PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR = (
+    "_protocol_fallback_failure_recorded"
+)
 _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY = (
     "responses_chat_bridge_preemptive"
 )

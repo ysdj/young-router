@@ -8,6 +8,7 @@ snapshots never expose those values.
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 import hashlib
@@ -60,6 +61,10 @@ MAX_GROUPS = 256
 MAX_GROUP_ID = 160
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 12.0
+# Relay metadata endpoints are independent. Keep the fan-out bounded so a
+# slow account cannot create an unbounded number of sockets or overwhelm the
+# upstream dashboard while still finishing the common refresh in parallel.
+RESOURCE_REFRESH_MAX_WORKERS = 8
 DETECTION_RESPONSE_BYTES = 64 * 1024
 DETECTION_TIMEOUT_SECONDS = 3.0
 _SECRET_FIELDS = frozenset(
@@ -2939,8 +2944,21 @@ class RelayAccountsDomain:
 
     def _newapi_resources(self, account: Mapping[str, Any]) -> list[dict[str, Any]]:
         headers = self._headers(account)
-        models = _model_names(self._http.json(account["origin"], "/api/user/models", headers=headers))
-        tokens = _json_data(self._http.json(account["origin"], "/api/token/?p=1&size=100", headers=headers))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            models_future = executor.submit(
+                self._http.json,
+                account["origin"],
+                "/api/user/models",
+                headers=headers,
+            )
+            tokens_future = executor.submit(
+                self._http.json,
+                account["origin"],
+                "/api/token/?p=1&size=100",
+                headers=headers,
+            )
+            models = _model_names(models_future.result())
+            tokens = _json_data(tokens_future.result())
         if isinstance(tokens, Mapping):
             tokens = tokens.get("items", [])
         if not isinstance(tokens, Sequence) or isinstance(tokens, (str, bytes, bytearray)):
@@ -2971,23 +2989,35 @@ class RelayAccountsDomain:
 
     def _sub2api_resources(self, account: Mapping[str, Any]) -> list[dict[str, Any]]:
         headers = self._headers(account)
-        keys = _json_data(self._http.json(account["origin"], "/api/v1/keys?page=1&page_size=100", headers=headers))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            keys_future = executor.submit(
+                self._http.json,
+                account["origin"],
+                "/api/v1/keys?page=1&page_size=100",
+                headers=headers,
+            )
+            channels_future = executor.submit(
+                self._http.json,
+                account["origin"],
+                "/api/v1/channels/available",
+                headers=headers,
+            )
+            keys = _json_data(keys_future.result())
+            try:
+                channels = channels_future.result()
+                models = _sub2api_channel_models(channels)
+            except RelayAccountsError:
+                # The key list above is the dashboard-session authentication
+                # check. A deployment may protect, omit, or disable this
+                # dashboard-only channel catalog while its OpenAI-compatible
+                # gateway remains usable; discover models from each active key
+                # below instead of falsely expiring the account.
+                models = []
         if isinstance(keys, Mapping):
             keys = keys.get("items", [])
         if not isinstance(keys, Sequence) or isinstance(keys, (str, bytes, bytearray)):
             raise RelayAccountsError("Relay API key list is invalid")
-        models: list[str] = []
-        try:
-            channels = self._http.json(account["origin"], "/api/v1/channels/available", headers=headers)
-            models = _sub2api_channel_models(channels)
-        except RelayAccountsError:
-            # The key list above is the dashboard-session authentication
-            # check.  A deployment may protect, omit, or disable this
-            # dashboard-only channel catalog while its OpenAI-compatible
-            # gateway remains usable; discover models from each active key
-            # below instead of falsely expiring the account.
-            pass
-        resources: list[dict[str, Any]] = []
+        key_items: list[tuple[int, str, bool, str, str, str, str]] = []
         for index, item in enumerate(keys):
             if not isinstance(item, Mapping):
                 continue
@@ -2999,22 +3029,39 @@ class RelayAccountsDomain:
             group_id = _group_id(item.get("group_id"))
             group = item.get("group")
             group_name = _resource_name(group.get("name"), group_id) if isinstance(group, Mapping) and group_id else group_id
-            self._resource_secret_cache[self._resource_cache_key(account["id"], resource_id)] = key.strip()
-            resource_models = models
-            if enabled and not resource_models:
+            normalized_key = key.strip()
+            self._resource_secret_cache[self._resource_cache_key(account["id"], resource_id)] = normalized_key
+            key_items.append((index, normalized_key, enabled, resource_id, name, group_id, group_name))
+
+        gateway_models: dict[int, list[str]] = {}
+        gateway_items = [entry for entry in key_items if entry[2] and not models]
+        if gateway_items:
+            def fetch_gateway_models(entry: tuple[int, str, bool, str, str, str, str]) -> tuple[int, list[str]]:
+                index, key, _enabled, _resource_id, _name, _group_id_value, _group_name = entry
                 try:
-                    resource_models = _model_names(
-                        self._http.json(
-                            account["origin"],
-                            "/v1/models",
-                            headers={"Authorization": f"Bearer {key.strip()}"},
-                        )
+                    payload = self._http.json(
+                        account["origin"],
+                        "/v1/models",
+                        headers={"Authorization": f"Bearer {key}"},
                     )
                 except RelayAccountsError:
                     # The gateway request is authenticated by the selected
                     # API key, not by the dashboard session. A rejected key
                     # must not clear a valid dashboard login.
-                    resource_models = []
+                    return index, []
+                try:
+                    return index, _model_names(payload)
+                except RelayAccountsError:
+                    return index, []
+
+            worker_count = min(RESOURCE_REFRESH_MAX_WORKERS, len(gateway_items))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                for index, resource_models in executor.map(fetch_gateway_models, gateway_items):
+                    gateway_models[index] = resource_models
+
+        resources: list[dict[str, Any]] = []
+        for index, key, enabled, resource_id, name, group_id, group_name in key_items:
+            resource_models = models if models else gateway_models.get(index, [])
             resources.append(
                 {
                     "id": resource_id,
@@ -3046,18 +3093,28 @@ class RelayAccountsDomain:
         ])
 
     def _sub2api_groups(self, account: Mapping[str, Any]) -> list[dict[str, Any]]:
-        payload = _json_data(
-            self._http.json(account["origin"], "/api/v1/groups/available", headers=self._headers(account))
-        )
+        headers = self._headers(account)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            groups_future = executor.submit(
+                self._http.json,
+                account["origin"],
+                "/api/v1/groups/available",
+                headers=headers,
+            )
+            rates_future = executor.submit(
+                self._http.json,
+                account["origin"],
+                "/api/v1/groups/rates",
+                headers=headers,
+            )
+            payload = _json_data(groups_future.result())
+            try:
+                raw_rates = _json_data(rates_future.result())
+            except Exception:
+                raw_rates = {}
         if not isinstance(payload, Sequence) or isinstance(payload, (str, bytes, bytearray)):
             raise RelayAccountsError("Relay API groups are invalid")
         groups = _safe_groups(payload)
-        try:
-            raw_rates = _json_data(
-                self._http.json(account["origin"], "/api/v1/groups/rates", headers=self._headers(account))
-            )
-        except Exception:
-            raw_rates = {}
         if isinstance(raw_rates, Mapping):
             rates = {_group_id(group_id): _group_multiplier(rate) for group_id, rate in raw_rates.items()}
             for group in groups:
@@ -3102,29 +3159,32 @@ class RelayAccountsDomain:
         if account["login_status"] != "signed_in":
             raise RelayAccountsError("Relay login is unavailable")
         try:
-            account["balance"] = self._account_balance(account)
-        except Exception:
-            # Balance is an independent account summary. A station that omits
-            # its profile endpoint must not hide usable API keys.
-            account["balance"] = None
-        try:
             self._clear_resource_cache(account_id)
-            try:
-                groups = (
-                    self._newapi_groups(account)
-                    if account["type"] == "newapi"
-                    else self._sub2api_groups(account)
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                balance_future = executor.submit(self._account_balance, account)
+                groups_future = executor.submit(
+                    self._newapi_groups if account["type"] == "newapi" else self._sub2api_groups,
+                    account,
                 )
-            except RelayAccountsError:
-                # Group selection is an enhancement to a usable key list.
-                # Keep the last verified choices when an older relay omits
-                # this optional dashboard endpoint.
-                groups = previous_groups
-            private_resources = (
-                self._newapi_resources(account)
-                if account["type"] == "newapi"
-                else self._sub2api_resources(account)
-            )
+                resources_future = executor.submit(
+                    self._newapi_resources if account["type"] == "newapi" else self._sub2api_resources,
+                    account,
+                )
+                try:
+                    account["balance"] = balance_future.result()
+                except Exception:
+                    # Balance is an independent account summary. A station
+                    # that omits its profile endpoint must not hide usable
+                    # API keys.
+                    account["balance"] = None
+                try:
+                    groups = groups_future.result()
+                except RelayAccountsError:
+                    # Group selection is an enhancement to a usable key list.
+                    # Keep the last verified choices when an older relay omits
+                    # this optional dashboard endpoint.
+                    groups = previous_groups
+                private_resources = resources_future.result()
             resources = _safe_resources(private_resources)
             if not resources:
                 raise RelayAccountsError("Relay has no API keys")

@@ -9,8 +9,8 @@ import type {
 /**
  * This leaf intentionally has no text prop or text-change event. The native
  * editor stays inside the Windows host and is sent directly to Core with a
- * one-time secret capability. `plainText` alters native rendering only for
- * the provider API-key editor.
+ * one-time secret capability. `plainText` is used only by native fields
+ * explicitly approved for visible editing.
  */
 type SecretStateEvent = Readonly<{
   revision: Int32;

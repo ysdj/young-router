@@ -1454,6 +1454,12 @@ struct SecureTextInputComponentView final
       if (password_box_ && key_down_token_.value != 0) {
         password_box_.KeyDown(key_down_token_);
       }
+      if (multiline_box_ && text_changed_token_.value != 0) {
+        multiline_box_.TextChanged(text_changed_token_);
+      }
+      if (multiline_box_ && multiline_lost_focus_token_.value != 0) {
+        multiline_box_.LostFocus(multiline_lost_focus_token_);
+      }
     } catch (...) {
     }
   }
@@ -1471,6 +1477,14 @@ struct SecureTextInputComponentView final
       password_box_.VerticalContentAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
       password_box_.PasswordRevealMode(winrt::Microsoft::UI::Xaml::Controls::PasswordRevealMode::Hidden);
       password_box_.MaxLength(16 * 1024);
+      multiline_box_ = TextBox{};
+      multiline_box_.FontSize(kUIFontSize);
+      multiline_box_.MinHeight(72.0);
+      multiline_box_.Padding(winrt::Microsoft::UI::Xaml::Thickness{8, 4, 8, 4});
+      multiline_box_.VerticalContentAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Top);
+      multiline_box_.AcceptsReturn(true);
+      multiline_box_.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap);
+      multiline_box_.MaxLength(16 * 1024);
       dispatcher_ = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
       auto weak_self = get_weak();
       password_changed_token_ = password_box_.PasswordChanged([weak_self](auto const&, auto const&) {
@@ -1484,6 +1498,12 @@ struct SecureTextInputComponentView final
             if (args.Key() != winrt::Windows::System::VirtualKey::Enter) return;
             if (auto self = weak_self.get()) self->StageOnSubmit();
           });
+      text_changed_token_ = multiline_box_.TextChanged([weak_self](auto const&, auto const&) {
+        if (auto self = weak_self.get()) self->MarkDirty();
+      });
+      multiline_lost_focus_token_ = multiline_box_.LostFocus([weak_self](auto const&, auto const&) {
+        if (auto self = weak_self.get()) self->StageOnBlur();
+      });
       island_.Content(password_box_);
       island_view.Connect(island_.ContentIsland());
       ApplyProps(nullptr);
@@ -1527,30 +1547,61 @@ struct SecureTextInputComponentView final
     if (props.domain == "codex") {
       return props.field == "api_key" && props.target.empty();
     }
-    return props.domain == "claude" && props.target.empty() &&
-        (props.field == "deployment_token" || props.field == "desktop_gateway_api_key");
+    if (props.domain == "claude") {
+      return props.target.empty() &&
+          (props.field == "deployment_token" || props.field == "desktop_gateway_api_key");
+    }
+    return props.domain == "runtime" && props.field == "setting" &&
+        props.target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON";
   }
 
   bool IsPlainTextAutoCommitField() const noexcept {
     return Props() && IsPlainTextAutoCommitField(*Props());
   }
 
-  void SetPassword(winrt::hstring const& value) noexcept {
-    if (!password_box_) return;
+  bool IsMultiline() const noexcept {
+    return Props() && Props()->multiline.value_or(false);
+  }
+
+  void SetInput(winrt::hstring const& value) noexcept {
     syncing_ = true;
-    password_box_.Password(value);
+    if (IsMultiline()) {
+      multiline_box_.Text(value);
+    } else {
+      password_box_.Password(value);
+    }
     syncing_ = false;
+  }
+
+  void ClearInputs() noexcept {
+    syncing_ = true;
+    password_box_.Password(winrt::hstring{});
+    multiline_box_.Text(winrt::hstring{});
+    syncing_ = false;
+  }
+
+  std::wstring InputValue() const {
+    return IsMultiline() ? std::wstring{multiline_box_.Text().c_str()} : std::wstring{password_box_.Password().c_str()};
+  }
+
+  void SetInputEnabled(bool enabled) noexcept {
+    if (IsMultiline()) {
+      multiline_box_.IsEnabled(enabled);
+    } else {
+      password_box_.IsEnabled(enabled);
+    }
   }
 
   void ApplyProps(
       winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps> const& old_props) noexcept {
-    if (!password_box_ || !Props()) return;
+    if (!password_box_ || !multiline_box_ || !Props()) return;
     auto const& props = *Props();
     const bool identity_changed = !old_props || old_props->domain != props.domain ||
         old_props->field != props.field || old_props->target != props.target;
     const bool plain_key_mode_changed = !old_props ||
         old_props->plainText != props.plainText || old_props->autoCommit != props.autoCommit;
-    const bool reset_identity = identity_changed || plain_key_mode_changed;
+    const bool multiline_changed = !old_props || old_props->multiline != props.multiline;
+    const bool reset_identity = identity_changed || plain_key_mode_changed || multiline_changed;
     const bool should_load_plaintext = reset_identity && IsPlainTextAutoCommitField(props);
     const bool placeholder_changed = !old_props || old_props->placeholder != props.placeholder;
     const bool plain_text_changed = !old_props || old_props->plainText != props.plainText;
@@ -1563,7 +1614,7 @@ struct SecureTextInputComponentView final
       active_domain_ = props.domain;
       active_field_ = props.field;
       active_target_ = props.target;
-      SetPassword(winrt::hstring{});
+      ClearInputs();
       dirty_ = false;
       last_revision_ = 0;
       last_present_ = false;
@@ -1572,6 +1623,7 @@ struct SecureTextInputComponentView final
     }
     if (placeholder_changed) {
       password_box_.PlaceholderText(ToHString(props.placeholder.value_or("")));
+      multiline_box_.PlaceholderText(ToHString(props.placeholder.value_or("")));
     }
     if (plain_text_changed) {
       password_box_.PasswordRevealMode(props.plainText.value_or(false)
@@ -1580,15 +1632,18 @@ struct SecureTextInputComponentView final
     }
     if (label_changed) {
       winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(password_box_, ToHString(props.label));
+      winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(multiline_box_, ToHString(props.label));
+    }
+    if (multiline_changed) {
+      island_.Content(IsMultiline() ? multiline_box_ : password_box_);
     }
     if (disabled_changed || reset_identity) {
-      password_box_.IsEnabled(
-          Enabled(props.disabled) && !lifecycle_->staging.load(std::memory_order_acquire) && !loading_);
+      SetInputEnabled(Enabled(props.disabled) && !lifecycle_->staging.load(std::memory_order_acquire) && !loading_);
     }
     const int32_t reset_request = props.resetRequest.value_or(0);
     if ((!old_props || old_props->resetRequest != props.resetRequest) && reset_request != last_reset_request_) {
       last_reset_request_ = reset_request;
-      SetPassword(winrt::hstring{});
+      ClearInputs();
       dirty_ = false;
       if (!lifecycle_->staging.load(std::memory_order_acquire)) {
         EmitState(last_revision_, last_present_, "ready", "", last_commit_request_);
@@ -1606,7 +1661,7 @@ struct SecureTextInputComponentView final
   void MarkDirty() noexcept {
     if (syncing_ || !lifecycle_ || lifecycle_->staging.load(std::memory_order_acquire)) return;
     try {
-      if (password_box_.Password().empty() && !IsPlainTextAutoCommitField()) return;
+      if (InputValue().empty() && !IsPlainTextAutoCommitField()) return;
       dirty_ = true;
       EmitState(last_revision_, last_present_, "dirty", "", last_commit_request_);
     } catch (...) {
@@ -1633,10 +1688,10 @@ struct SecureTextInputComponentView final
   }
 
   void StageForRequest(int32_t requested_commit, bool allow_empty) noexcept {
-    if (!Props() || !password_box_ || lifecycle_->staging.load(std::memory_order_acquire)) return;
+    if (!Props() || !password_box_ || !multiline_box_ || lifecycle_->staging.load(std::memory_order_acquire)) return;
     std::wstring password;
     try {
-      password = password_box_.Password().c_str();
+      password = InputValue();
     } catch (...) {
       EmitState(last_revision_, last_present_, "error", "invalid_secret", last_commit_request_);
       return;
@@ -1647,7 +1702,7 @@ struct SecureTextInputComponentView final
       return;
     }
     if (active_domain_.empty() || active_field_.empty()) {
-      SetPassword(winrt::hstring{});
+      ClearInputs();
       if (IsPlainTextAutoCommitField()) dirty_ = true;
       last_commit_request_ = std::max(last_commit_request_, requested_commit);
       EmitState(last_revision_, last_present_, "error", "invalid_secret", last_commit_request_);
@@ -1661,7 +1716,7 @@ struct SecureTextInputComponentView final
     }
     const bool preserve_input = IsPlainTextAutoCommitField();
     if (!preserve_input) {
-      SetPassword(winrt::hstring{});
+      ClearInputs();
     }
     if (!secret || secret->size() > 16 * 1024) {
       last_commit_request_ = std::max(last_commit_request_, requested_commit);
@@ -1671,7 +1726,7 @@ struct SecureTextInputComponentView final
     }
     bool expected = false;
     if (!lifecycle_->staging.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
-    password_box_.IsEnabled(false);
+    SetInputEnabled(false);
     dirty_ = false;
     last_commit_request_ = std::max(last_commit_request_, requested_commit);
     const auto generation = lifecycle_->generation.load(std::memory_order_acquire);
@@ -1701,7 +1756,7 @@ struct SecureTextInputComponentView final
       }).detach();
     } catch (...) {
       lifecycle_->staging.store(false, std::memory_order_release);
-      password_box_.IsEnabled(!disabled);
+      SetInputEnabled(!disabled);
       if (IsPlainTextAutoCommitField()) dirty_ = true;
       EmitState(last_revision_, last_present_, "error", "stage_failed", last_commit_request_);
     }
@@ -1713,7 +1768,7 @@ struct SecureTextInputComponentView final
       std::optional<LiteLLMMenu::CoreIPCBridge::SecretStageResult> result) noexcept {
     if (!Current(generation)) return;
     lifecycle_->staging.store(false, std::memory_order_release);
-    password_box_.IsEnabled(!disabled);
+    SetInputEnabled(!disabled);
     if (!result || result->revision < 0 || result->revision > std::numeric_limits<int32_t>::max() ||
         std::floor(result->revision) != result->revision) {
       EmitState(last_revision_, last_present_, "error", "stage_failed", last_commit_request_);
@@ -1734,7 +1789,7 @@ struct SecureTextInputComponentView final
     auto dispatcher = dispatcher_;
     auto weak_self = get_weak();
     loading_ = true;
-    password_box_.IsEnabled(false);
+    SetInputEnabled(false);
     try {
       std::thread([lifecycle, dispatcher, weak_self, generation, disabled, domain, field, target] {
         auto value = LiteLLMMenu::CoreIPCBridge::Shared().ReadPlainTextSecret(domain, field, target);
@@ -1752,7 +1807,7 @@ struct SecureTextInputComponentView final
       }).detach();
     } catch (...) {
       loading_ = false;
-      password_box_.IsEnabled(!disabled);
+      SetInputEnabled(!disabled);
       EmitState(last_revision_, last_present_, "error", "read_failed", last_commit_request_);
     }
   }
@@ -1764,9 +1819,9 @@ struct SecureTextInputComponentView final
     if (!Current(generation) || !IsPlainTextAutoCommitField()) return;
     loading_ = false;
     auto display_value = value.value_or("");
-    SetPassword(ToHString(display_value));
+    SetInput(ToHString(display_value));
     dirty_ = false;
-    password_box_.IsEnabled(!disabled);
+    SetInputEnabled(!disabled);
     if (!value) {
       EmitState(last_revision_, false, "error", "read_failed", last_commit_request_);
       return;
@@ -1801,6 +1856,7 @@ struct SecureTextInputComponentView final
   winrt::Microsoft::UI::Dispatching::DispatcherQueue dispatcher_{nullptr};
   winrt::Microsoft::UI::Xaml::XamlIsland island_{nullptr};
   PasswordBox password_box_{nullptr};
+  TextBox multiline_box_{nullptr};
   std::string active_domain_;
   std::string active_field_;
   std::string active_target_;
@@ -1814,6 +1870,8 @@ struct SecureTextInputComponentView final
   winrt::event_token password_changed_token_{};
   winrt::event_token lost_focus_token_{};
   winrt::event_token key_down_token_{};
+  winrt::event_token text_changed_token_{};
+  winrt::event_token multiline_lost_focus_token_{};
 };
 
 struct SwitchComponentView final

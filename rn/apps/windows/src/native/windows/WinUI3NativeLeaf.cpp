@@ -55,7 +55,7 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   if (route == L"relay-add") return {540, 330};
   if (route == L"codex-settings" || route == L"claude-settings") return {1100, 640};
   if (route == L"runtime-settings") return {800, 520};
-  if (route == L"data-management") return {500, 160};
+  if (route == L"data-management") return {500, 180};
   if (route == L"logs") return {640, 420};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
@@ -68,7 +68,7 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
   if (route == L"relay-add") return {620, 350};
   if (route == L"codex-settings" || route == L"claude-settings") return {1160, 700};
   if (route == L"runtime-settings") return {1080, 620};
-  if (route == L"data-management") return {520, 175};
+  if (route == L"data-management") return {620, 220};
   if (route == L"logs") return {900, 580};
   return {320, 160};
 }

@@ -662,6 +662,36 @@ def _install_selected_deployment_marker_patch() -> None:
         try:
             response = await original_make_call(self, original_function, *args, **kwargs)
             marker = _CURRENT_SELECTED_DEPLOYMENT.get()
+            if _routing_module._is_failed_responses_stream_response(response):
+                failed_request = getattr(response, "request_data", None)
+                if not isinstance(failed_request, dict):
+                    failed_request = kwargs
+                if marker is not None:
+                    _routing_module._apply_selected_deployment_marker_to_request(
+                        failed_request,
+                        marker,
+                    )
+                if _routing_module._protocol_fallback_attempt_active(
+                    failed_request,
+                ):
+                    _routing_module._mark_exception_for_deployment_failover(
+                        response.exception,
+                        failed_request,
+                    )
+                    raise response.exception
+                if marker is not None and _routing_module._is_current_upstream_surface_incompatible_error(
+                    response.exception,
+                    failed_request,
+                ):
+                    _routing_module._clear_protocol_fallback_cache_for_request(
+                        failed_request
+                    )
+                    _routing_module._mark_exception_for_upstream_surface_failover(
+                        response.exception,
+                        failed_request,
+                    )
+                    raise response.exception
+                return response
             if marker is not None:
                 # LiteLLM invokes the streaming-iterator hook after make_call
                 # returns.  Persist the selected route on the request object
@@ -683,14 +713,24 @@ def _install_selected_deployment_marker_patch() -> None:
             return response
         except Exception as exc:
             marker = _CURRENT_SELECTED_DEPLOYMENT.get()
-            if marker is not None and _routing_module._is_current_upstream_surface_incompatible_error(
+            if marker is not None:
+                _routing_module._apply_selected_deployment_marker_to_request(
+                    kwargs,
+                    marker,
+                )
+            if (
+                marker is not None
+                and _routing_module._protocol_fallback_attempt_active(kwargs)
+            ):
+                _routing_module._mark_exception_for_deployment_failover(exc, kwargs)
+            elif marker is not None and _routing_module._is_current_upstream_surface_incompatible_error(
                 exc,
-                marker,
+                kwargs,
             ):
                 _routing_module._clear_protocol_fallback_cache_for_request(kwargs)
                 _routing_module._mark_exception_for_upstream_surface_failover(
                     exc,
-                    marker,
+                    kwargs,
                 )
             elif (
                 marker is not None

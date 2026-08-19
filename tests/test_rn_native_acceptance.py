@@ -91,7 +91,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         for route, width, height in (
             ("providers-models", 780, 560),
             ("runtime-settings", 800, 520),
-            ("data-management", 500, 160),
+            ("data-management", 500, 180),
             ("relay-accounts", 780, 440),
             ("relay-add", 540, 330),
             ("logs", 640, 420),
@@ -108,7 +108,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
         self.assertIn("ContentSize RouteInitialContentSize", leaf)
-        for size in ("{780, 560}", "{1160, 700}", "{1080, 620}", "{520, 175}", "{820, 480}", "{620, 350}", "{900, 580}"):
+        for size in ("{780, 560}", "{1160, 700}", "{1080, 620}", "{620, 220}", "{820, 480}", "{620, 350}", "{900, 580}"):
             self.assertIn(size, leaf)
         self.assertIn("RouteInitialContentSize(route)", leaf)
 
@@ -154,7 +154,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             (780, 460, 780, 460),
             (1160, 700, 1100, 640),
             (1080, 620, 800, 520),
-            (500, 160, 500, 140),
+            (600, 220, 500, 180),
             (620, 350, 540, 330),
             (900, 580, 640, 420),
         ):
@@ -798,7 +798,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("JSValueObject const& anchor", windows_module_header)
         self.assertIn("TryGetDouble", windows_module)
 
-    def test_log_original_record_uses_the_shared_read_only_codemirror_viewer(self) -> None:
+    def test_log_original_record_uses_the_shared_read_only_code_viewer(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
         bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
@@ -1327,11 +1327,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("LiteLLMWinUISecureTextInput", windows_spec)
         for spec in (mac_spec, windows_spec):
             self.assertNotIn("value?:", spec)
+            self.assertIn("multiline?: WithDefault<boolean, false>;", spec)
             self.assertIn("plainText?: WithDefault<boolean, false>;", spec)
             self.assertNotIn("onChangeText", spec)
             self.assertIn("onSecretState", spec)
         self.assertIn("NSSecureTextField *_field", mac)
         self.assertIn("NSTextField *_plainField", mac)
+        self.assertIn("LiteLLMTabTextView *_multilineField", mac)
+        self.assertIn("NSTextViewDelegate", mac)
         self.assertIn("loadPlainTextSecretForGeneration", mac)
         self.assertIn("void ConfigureSingleLineTextField(NSTextField *field)", mac)
         self.assertIn("field.usesSingleLineMode = YES", mac)
@@ -1344,6 +1347,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("stageSecretForDomain", mac)
         self.assertIn("stageSecretForDomain(", mac_core)
         self.assertIn("PasswordBox password_box_", windows)
+        self.assertIn("TextBox multiline_box_", windows)
+        self.assertIn("multiline_box_.AcceptsReturn(true);", windows)
         self.assertIn("password_box_.MinHeight(30.0);", windows)
         self.assertIn(
             "password_box_.Padding(winrt::Microsoft::UI::Xaml::Thickness{8, 0, 8, 0});",
@@ -1363,6 +1368,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("onChangeText", windows_codegen)
         self.assertIn("OnSecretState", windows_codegen)
         self.assertIn("NativeSecretInputControl", ui)
+        self.assertIn("multiline plainText autoCommit", ui)
         self.assertNotIn('onEdit={() => stageSecret({ domain: "runtime"', ui)
 
     def test_provider_api_key_plaintext_readback_is_narrow_and_native_only(self) -> None:

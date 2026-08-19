@@ -2973,8 +2973,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 }
 
 
-@interface LiteLLMAppKitSecureTextInputComponentView () <NSTextFieldDelegate, RCTLiteLLMAppKitSecureTextInputViewProtocol>
-- (NSTextField *)activeField;
+@interface LiteLLMAppKitSecureTextInputComponentView () <NSTextFieldDelegate, NSTextViewDelegate, RCTLiteLLMAppKitSecureTextInputViewProtocol>
+- (NSView *)activeControl;
+- (NSString *)activeText;
+- (void)setActiveText:(NSString *)value;
+- (void)setActiveEnabled:(BOOL)enabled editable:(BOOL)editable selectable:(BOOL)selectable;
+- (BOOL)isPlainTextAutoCommitField;
 - (void)stageCurrentSecretForRequest:(NSInteger)commitRequest;
 - (void)loadPlainTextSecretForGeneration:(NSUInteger)generation;
 @end
@@ -2982,6 +2986,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 @implementation LiteLLMAppKitSecureTextInputComponentView {
   NSSecureTextField *_field;
   NSTextField *_plainField;
+  NSScrollView *_scrollView;
+  LiteLLMTabTextView *_multilineField;
   LiteLLMAppKitControlHostView *_host;
   NSString *_domain;
   NSString *_secretField;
@@ -2996,6 +3002,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   NSUInteger _generation;
   BOOL _stageInFlight;
   BOOL _autoCommit;
+  BOOL _plainText;
   BOOL _secretDirty;
   BOOL _synchronizingField;
 }
@@ -3026,6 +3033,23 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _plainField.bezelStyle = NSTextFieldRoundedBezel;
     _plainField.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
     ConfigureSingleLineTextField(_plainField);
+    _multilineField = [[LiteLLMTabTextView alloc] initWithFrame:NSZeroRect];
+    _multilineField.identifier = LiteLLMTabStopIdentifier;
+    _multilineField.delegate = self;
+    _multilineField.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
+    _multilineField.usesFindPanel = YES;
+    _multilineField.richText = NO;
+    _multilineField.allowsUndo = YES;
+    _multilineField.verticallyResizable = YES;
+    _multilineField.horizontallyResizable = YES;
+    _multilineField.textContainer.containerSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+    _multilineField.textContainer.widthTracksTextView = YES;
+    _multilineField.textContainerInset = NSMakeSize(5, 4);
+    _scrollView = [[LiteLLMTextFieldScrollView alloc] initWithFrame:NSZeroRect];
+    _scrollView.borderType = NSBezelBorder;
+    _scrollView.hasVerticalScroller = YES;
+    _scrollView.autohidesScrollers = YES;
+    _scrollView.documentView = _multilineField;
     _host = [[LiteLLMAppKitControlHostView alloc] initWithFrame:NSZeroRect];
     // Match ordinary text fields: preserve the native bezel height and center
     // it inside the shared compact form row.
@@ -3050,11 +3074,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   NSString *field = StringFromStdString(newViewProps.field);
   NSString *target = StringFromStdString(newViewProps.target);
   NSString *label = StringFromStdString(newViewProps.label);
-  NSTextField *activeField = newViewProps.plainText ? _plainField : _field;
-  NSTextField *inactiveField = newViewProps.plainText ? _field : _plainField;
-  if (_host.control != activeField) {
-    _host.control = activeField;
-  }
+  const BOOL isMultiline = newViewProps.multiline;
+  NSView *activeControl = isMultiline ? _scrollView : (newViewProps.plainText ? _plainField : _field);
+  if (_host.control != activeControl) _host.control = activeControl;
+  _host.fillsHeight = isMultiline;
   BOOL identityChanged = ![_domain isEqualToString:domain] || ![_secretField isEqualToString:field] ||
       ![_target isEqualToString:target];
   if (identityChanged) {
@@ -3067,6 +3090,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _synchronizingField = YES;
     _field.stringValue = @"";
     _plainField.stringValue = @"";
+    _multilineField.string = @"";
     _synchronizingField = NO;
     _lastRevision = 0;
     _lastPresent = NO;
@@ -3074,14 +3098,17 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _lastError = @"";
   }
   _autoCommit = newViewProps.autoCommit;
+  _plainText = newViewProps.plainText;
   _label = label;
-  activeField.placeholderString = StringFromStdString(newViewProps.placeholder);
-  activeField.accessibilityLabel = label;
+  _field.placeholderString = StringFromStdString(newViewProps.placeholder);
+  _plainField.placeholderString = StringFromStdString(newViewProps.placeholder);
+  _field.accessibilityLabel = label;
+  _plainField.accessibilityLabel = label;
+  _multilineField.accessibilityLabel = label;
   const BOOL readOnlyPlainText = newViewProps.plainText && newViewProps.disabled;
-  activeField.enabled = (readOnlyPlainText || !newViewProps.disabled) && !_stageInFlight;
-  activeField.editable = !readOnlyPlainText;
-  activeField.selectable = readOnlyPlainText || !newViewProps.disabled;
-  inactiveField.enabled = NO;
+  [self setActiveEnabled:(readOnlyPlainText || !newViewProps.disabled) && !_stageInFlight
+                 editable:!readOnlyPlainText
+               selectable:readOnlyPlainText || !newViewProps.disabled];
 
   if (newViewProps.resetRequest != oldViewProps.resetRequest &&
       newViewProps.resetRequest != _lastResetRequest) {
@@ -3089,6 +3116,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _synchronizingField = YES;
     _field.stringValue = @"";
     _plainField.stringValue = @"";
+    _multilineField.string = @"";
     _synchronizingField = NO;
     _secretDirty = NO;
     if (!_stageInFlight) [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
@@ -3103,7 +3131,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
       ([domain isEqualToString:@"codex"] && [field isEqualToString:@"api_key"] && target.length == 0) ||
       ([domain isEqualToString:@"claude"] &&
        ([field isEqualToString:@"deployment_token"] || [field isEqualToString:@"desktop_gateway_api_key"]) &&
-       target.length == 0));
+       target.length == 0) ||
+      ([domain isEqualToString:@"runtime"] && [field isEqualToString:@"setting"] &&
+       [target isEqualToString:@"LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"]));
   if (identityChanged && readablePlainText) {
     [self loadPlainTextSecretForGeneration:_generation];
   }
@@ -3122,8 +3152,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 - (void)stageCurrentSecretForRequest:(NSInteger)commitRequest
 {
   if (_stageInFlight) return;
-  NSString *value = [[self activeField].stringValue copy];
-  const BOOL allowEmptyValue = _autoCommit && [_host.control isEqual:_plainField];
+  NSString *value = [[self activeText] copy];
+  const BOOL allowEmptyValue = [self isPlainTextAutoCommitField];
   if (value.length == 0 && !allowEmptyValue) {
     _lastCommitRequest = MAX(_lastCommitRequest, commitRequest);
     [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
@@ -3133,6 +3163,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _synchronizingField = YES;
     _field.stringValue = @"";
     _plainField.stringValue = @"";
+    _multilineField.string = @"";
     _synchronizingField = NO;
     _lastCommitRequest = MAX(_lastCommitRequest, commitRequest);
     [self emitRevision:_lastRevision present:_lastPresent status:@"error" error:@"invalid_secret" commitRequest:_lastCommitRequest];
@@ -3140,18 +3171,19 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   }
 
   _stageInFlight = YES;
-  [self activeField].enabled = NO;
+  [self setActiveEnabled:NO editable:NO selectable:NO];
   _lastCommitRequest = MAX(_lastCommitRequest, commitRequest);
   const NSUInteger generation = _generation;
   NSString *domain = [_domain copy];
   NSString *field = [_secretField copy];
   NSString *target = [_target copy];
   NSString *secret = value;
-  const BOOL preservePlainText = [_host.control isEqual:_plainField];
+  const BOOL preservePlainText = [self isPlainTextAutoCommitField];
   if (!preservePlainText) {
     _synchronizingField = YES;
     _field.stringValue = @"";
     _plainField.stringValue = @"";
+    _multilineField.string = @"";
     _synchronizingField = NO;
   }
   _secretDirty = NO;
@@ -3167,9 +3199,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     strongSelf->_stageInFlight = NO;
     const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitSecureTextInputProps>(strongSelf->_props);
     const BOOL readOnlyPlainText = viewProps.plainText && viewProps.disabled;
-    [strongSelf activeField].enabled = readOnlyPlainText || !viewProps.disabled;
-    [strongSelf activeField].editable = !readOnlyPlainText;
-    [strongSelf activeField].selectable = readOnlyPlainText || !viewProps.disabled;
+    [strongSelf setActiveEnabled:readOnlyPlainText || !viewProps.disabled
+                         editable:!readOnlyPlainText
+                       selectable:readOnlyPlainText || !viewProps.disabled];
     if (error.length > 0 || revision == nil || present == nil) {
       strongSelf->_secretDirty = preservePlainText;
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"stage_failed" commitRequest:strongSelf->_lastCommitRequest];
@@ -3191,13 +3223,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
                                           completion:^(NSString *_Nullable value, NSString *_Nullable error) {
     LiteLLMAppKitSecureTextInputComponentView *strongSelf = weakSelf;
     if (strongSelf == nil || generation != strongSelf->_generation ||
-        ![strongSelf->_host.control isEqual:strongSelf->_plainField] || strongSelf->_secretDirty) return;
+        ![strongSelf isPlainTextAutoCommitField] || strongSelf->_secretDirty) return;
     if (error.length > 0 || value == nil) {
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"read_failed" commitRequest:strongSelf->_lastCommitRequest];
       return;
     }
     strongSelf->_synchronizingField = YES;
-    strongSelf->_plainField.stringValue = value;
+    [strongSelf setActiveText:value];
     strongSelf->_synchronizingField = NO;
     strongSelf->_secretDirty = NO;
   }];
@@ -3211,14 +3243,28 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 
 - (void)controlTextDidChange:(NSNotification *)notification
 {
-  if (_synchronizingField || notification.object != [self activeField]) return;
+  if (_synchronizingField || notification.object != [self activeControl]) return;
   _secretDirty = YES;
   [self emitRevision:_lastRevision present:_lastPresent status:@"dirty" error:@"" commitRequest:_lastCommitRequest];
 }
 
 - (void)controlTextDidEndEditing:(NSNotification *)notification
 {
-  if (_synchronizingField || notification.object != [self activeField] || !_autoCommit || !_secretDirty) return;
+  if (_synchronizingField || notification.object != [self activeControl] || !_autoCommit || !_secretDirty) return;
+  [self stageCurrentSecretForRequest:_lastCommitRequest + 1];
+}
+
+- (void)textDidChange:(NSNotification *)notification
+{
+  if (_synchronizingField || notification.object != _multilineField || _host.control != _scrollView) return;
+  _secretDirty = YES;
+  [self emitRevision:_lastRevision present:_lastPresent status:@"dirty" error:@"" commitRequest:_lastCommitRequest];
+}
+
+- (void)textDidEndEditing:(NSNotification *)notification
+{
+  if (_synchronizingField || notification.object != _multilineField || _host.control != _scrollView ||
+      !_autoCommit || !_secretDirty) return;
   [self stageCurrentSecretForRequest:_lastCommitRequest + 1];
 }
 
@@ -3226,7 +3272,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
        textView:(__unused NSTextView *)textView
 doCommandBySelector:(SEL)commandSelector
 {
-  return HandleLiteLLMTabCommand([self activeField], commandSelector);
+  return HandleLiteLLMTabCommand([self activeControl], commandSelector);
+}
+
+- (BOOL)textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector
+{
+  return textView == _multilineField && HandleLiteLLMTabCommand(textView, commandSelector);
 }
 
 - (void)emitRevision:(NSInteger)revision present:(BOOL)present status:(NSString *)status error:(NSString *)error commitRequest:(NSInteger)commitRequest
@@ -3248,8 +3299,12 @@ doCommandBySelector:(SEL)commandSelector
   [super prepareForRecycle];
   _generation += 1;
   _stageInFlight = NO;
+  _autoCommit = NO;
+  _plainText = NO;
+  _secretDirty = NO;
   _field.stringValue = @"";
   _plainField.stringValue = @"";
+  _multilineField.string = @"";
   _domain = @"";
   _secretField = @"";
   _target = @"";
@@ -3262,17 +3317,65 @@ doCommandBySelector:(SEL)commandSelector
   _generation += 1;
   _field.stringValue = @"";
   _plainField.stringValue = @"";
+  _multilineField.string = @"";
+  _multilineField.delegate = nil;
   [super invalidate];
 }
 
-- (NSTextField *)activeField
+- (NSView *)activeControl
 {
-  return [_host.control isKindOfClass:NSTextField.class] ? (NSTextField *)_host.control : _field;
+  return _host.control ?: _field;
+}
+
+- (NSString *)activeText
+{
+  return _host.control == _scrollView ? _multilineField.string : ((NSTextField *)[self activeControl]).stringValue;
+}
+
+- (void)setActiveText:(NSString *)value
+{
+  if (_host.control == _scrollView) {
+    _multilineField.string = value;
+    return;
+  }
+  ((NSTextField *)[self activeControl]).stringValue = value;
+}
+
+- (void)setActiveEnabled:(BOOL)enabled editable:(BOOL)editable selectable:(BOOL)selectable
+{
+  const BOOL multilineActive = _host.control == _scrollView;
+  const BOOL secureActive = _host.control == _field;
+  const BOOL plainActive = _host.control == _plainField;
+  _field.enabled = secureActive && enabled;
+  _field.editable = secureActive && editable;
+  _field.selectable = secureActive && selectable;
+  _plainField.enabled = plainActive && enabled;
+  _plainField.editable = plainActive && editable;
+  _plainField.selectable = plainActive && selectable;
+  _multilineField.editable = multilineActive && editable;
+  _multilineField.selectable = multilineActive && selectable;
+}
+
+- (BOOL)isPlainTextAutoCommitField
+{
+  if (!_plainText || !_autoCommit) return NO;
+  if ([_domain isEqualToString:@"providers_models"] || [_domain isEqualToString:@"relay_accounts"]) {
+    return [_secretField isEqualToString:@"api_key"] && _target.length > 0;
+  }
+  if ([_domain isEqualToString:@"codex"]) {
+    return [_secretField isEqualToString:@"api_key"] && _target.length == 0;
+  }
+  if ([_domain isEqualToString:@"claude"]) {
+    return (_target.length == 0 &&
+        ([_secretField isEqualToString:@"deployment_token"] || [_secretField isEqualToString:@"desktop_gateway_api_key"]));
+  }
+  return [_domain isEqualToString:@"runtime"] && [_secretField isEqualToString:@"setting"] &&
+      [_target isEqualToString:@"LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"];
 }
 
 - (NSView *)accessibilityElement
 {
-  return [self activeField];
+  return _host.control == _scrollView ? _multilineField : [self activeControl];
 }
 
 @end

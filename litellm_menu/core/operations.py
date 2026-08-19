@@ -579,8 +579,8 @@ class CoreServiceController:
         except Exception:
             raise RuntimeError("Provider/model configuration is invalid") from None
 
-    def _clear_transient_routing_state(self) -> None:
-        """Remove recovery/cooldown data before creating a new proxy."""
+    def reset_transient_routing_state(self) -> None:
+        """Remove recovery/cooldown data at the start of a new app/proxy run."""
 
         for path in (self.paths.recovery, self.paths.cooldowns):
             try:
@@ -662,7 +662,7 @@ class CoreServiceController:
         if current["state"] == "unhealthy":
             raise RuntimeError("A managed LiteLLM service is already active")
         self._stage_runtime_config()
-        self._clear_transient_routing_state()
+        self.reset_transient_routing_state()
         self.paths.runtime_config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         environment = self._runtime_env()
         owner_token = secrets.token_urlsafe(OWNER_TOKEN_BYTES)

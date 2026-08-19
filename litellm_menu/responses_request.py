@@ -1677,8 +1677,13 @@ def _with_codex_descendant_cleanup_instruction(
     if runtime_state is not None and _codex_tool_choice_name(
         request_kwargs.get("tool_choice")
     ) is None:
-        if request_kwargs.get("tool_choice") != "required":
-            modified_kwargs["tool_choice"] = "required"
+        # Snapshot recovery has one valid action. Generic ``required`` lets
+        # the model pick an unrelated tool and repeat the same turn.
+        required_tool_choice: Any = "required"
+        if runtime_state in {"snapshot_missing", "snapshot_invalidated"}:
+            required_tool_choice = {"type": "function", "name": "list_agents"}
+        if request_kwargs.get("tool_choice") != required_tool_choice:
+            modified_kwargs["tool_choice"] = required_tool_choice
             changed = True
         metadata = (
             _request_context_module._request_metadata_dict(

@@ -48,7 +48,7 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
         --editor-border: #e5e7eb;
         --editor-active: #f4f8ff;
         --editor-active-gutter: #eef4ff;
-        --editor-selection: #c8ddff;
+        --editor-selection: #a9c7ff;
         --editor-caret: #2563eb;
         --editor-match: #dbeafe;
         --editor-match-border: #93c5fd;
@@ -76,7 +76,7 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
           --editor-border: #3f3f46;
           --editor-active: #253047;
           --editor-active-gutter: #303a4f;
-          --editor-selection: #264f78;
+          --editor-selection: #3b6ea8;
           --editor-caret: #93c5fd;
           --editor-match: #334155;
           --editor-match-border: #64748b;
@@ -119,13 +119,38 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
         min-width: 0;
         overflow: hidden;
       }
-      #editor .cm-scroller {
+      #editor #ace-editor {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+      }
+      #editor .ace_scroller {
         scrollbar-width: none;
       }
-      #editor .cm-scroller::-webkit-scrollbar {
+      #editor .ace_scroller::-webkit-scrollbar {
         width: 0;
         height: 0;
       }
+      #editor .ace_scrollbar,
+      #editor .ace_sb-v,
+      #editor .ace_sb-h { display: none !important; }
+      #editor .ace_editor {
+        position: absolute;
+        inset: 0;
+        font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        color: var(--editor-fg);
+        background: var(--editor-bg);
+      }
+      #editor .ace_gutter {
+        color: var(--editor-gutter-fg);
+        background: var(--editor-gutter);
+        border-right: 1px solid var(--editor-border);
+      }
+      #editor .ace_active-line { background: var(--editor-active); }
+      #editor .ace_gutter-active-line { background: var(--editor-active-gutter); color: var(--editor-fg); }
+      #editor .ace_marker-layer .ace_selection { background: var(--editor-selection); }
+      #editor .ace_cursor { color: var(--editor-caret); }
+      #editor .ace_fold-widget { color: var(--editor-gutter-fg); }
       #editor-scrollbar {
         position: absolute;
         z-index: 4;
@@ -258,6 +283,7 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
   <body>
     <div id="code-editor-layout">
       <div id="editor" tabindex="0" role="textbox" aria-multiline="true">
+        <div id="ace-editor"></div>
         <div id="editor-scrollbar" aria-hidden="true" hidden><div id="editor-scrollbar-thumb"></div></div>
       </div>
       <aside id="diff-sidebar" aria-hidden="true">

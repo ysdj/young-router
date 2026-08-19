@@ -220,6 +220,19 @@ class RuntimeSettingsDomain:
         default = self._defaults({target: self.specs[target]})[target]
         return self._draft_values.get(target, default) != default
 
+    def trusted_secret_value(self, field: str, target: str | None = None) -> str:
+        """Return the one runtime JSON document authorized for native editing."""
+
+        if field != "setting" or target != "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON":
+            raise DomainError("The requested secret field is unavailable")
+        if target not in self.specs or not self._is_secret_setting(target):
+            raise DomainError("The requested secret field is unavailable")
+        default = self._defaults({target: self.specs[target]})[target]
+        value = self._draft_values.get(target, default)
+        if not isinstance(value, str):
+            raise DomainError("The requested secret field is unavailable")
+        return value
+
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
         if field != "setting" or not isinstance(target, str) or target not in self.specs:
             raise DomainError("The requested secret field is unavailable")

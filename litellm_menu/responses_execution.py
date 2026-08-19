@@ -19,6 +19,9 @@ from .base import (
     Optional,
     _GENERIC_HELPER_PATCH_ATTR,
     _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY,
+    _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
+    _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
+    _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
     _RouteOrder,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
@@ -1253,6 +1256,20 @@ def _wrap_generic_function_for_deployment_failover(
             )
         except Exception as exc:
             original_exception = exc
+            # The router has selected a deployment by this point, but LiteLLM
+            # does not always preserve that selection on the generic callback
+            # kwargs.  Restore it before classifying an upstream 400 so the
+            # configured alternate protocol can be tried on the same route.
+            _routing_module._apply_current_selected_deployment_to_request(kwargs)
+            decision_kwargs = (
+                outer_request_kwargs
+                if isinstance(outer_request_kwargs, dict)
+                else kwargs
+            )
+            if decision_kwargs is not kwargs:
+                _routing_module._apply_current_selected_deployment_to_request(
+                    decision_kwargs
+                )
             if _routing_module._is_context_size_error(original_exception):
                 # Context-size errors are deterministic input errors until the
                 # dedicated native truncation fallback chooses to repair them.
@@ -1282,6 +1299,12 @@ def _wrap_generic_function_for_deployment_failover(
                 return response
             if _routing_module._is_context_size_error(original_exception):
                 raise original_exception
+            if _routing_module._protocol_fallback_attempt_active(decision_kwargs):
+                _routing_module._mark_exception_for_deployment_failover(
+                    exc,
+                    decision_kwargs,
+                )
+                raise
             responses_function_bridge_retry_kwargs = (
                 _responses_surfaces_module._responses_function_tool_bridge_retry_kwargs(
                     exc,
@@ -1299,12 +1322,14 @@ def _wrap_generic_function_for_deployment_failover(
             if _routing_module._is_current_upstream_surface_incompatible_error(
                 exc,
                 kwargs,
-                outer_request_kwargs,
+                decision_kwargs,
             ):
-                _routing_module._clear_protocol_fallback_cache_for_request(kwargs)
+                _routing_module._clear_protocol_fallback_cache_for_request(
+                    decision_kwargs
+                )
                 _routing_module._mark_exception_for_upstream_surface_failover(
                     exc,
-                    kwargs,
+                    decision_kwargs,
                 )
                 raise
             facade_response = await _computer_facade_module._responses_computer_facade_retry_response(
@@ -1736,9 +1761,18 @@ def _ordered_deployment_fallback_entry(
             "_litellm_menu_upstream_url_surface": next_surface,
             "_litellm_menu_attempted_upstream_url_surfaces": attempted_surfaces,
             "_litellm_menu_surface_target_deployment_id": target_deployment_id,
+            "_excluded_deployment_ids": sorted(excluded_ids),
         }
-        if excluded_ids:
-            entry["_excluded_deployment_ids"] = sorted(excluded_ids)
+        # This entry crosses a **kwargs copy boundary before the retry. Carry
+        # the request-scoped protocol state explicitly so a failure on the
+        # alternate surface is recognized as the second half of one attempt.
+        for key in (
+            _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
+            _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
+            _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
+        ):
+            if key in request_kwargs:
+                entry[key] = request_kwargs[key]
         _trace_module._route_trace(
             "same_deployment_protocol_fallback_available",
             request_id=_routing_module._trace_request_id(request_kwargs),

@@ -8,6 +8,7 @@ from unittest import mock
 
 from litellm_menu.core import ConfirmationNeeded, CoreStore
 from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+from litellm_menu.core.domains.codex import CodexSettingsDomain
 from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
 from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
 from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
@@ -15,6 +16,64 @@ from litellm_menu.core.service import RecoverableDomain
 
 
 class CoreDiskConflictTests(unittest.TestCase):
+    def test_disk_state_probes_only_requested_domains(self) -> None:
+        class ProbeDomain:
+            def __init__(self, name: str):
+                self.name = name
+                self.probes = 0
+                self.identities = 0
+
+            def draft_state(self) -> dict[str, object]:
+                return {}
+
+            def snapshot(self) -> dict[str, object]:
+                return {"domain": self.name}
+
+            def dispatch(self, _action: str, _payload: object | None = None) -> dict[str, object]:
+                return {}
+
+            def validate(self, _payload: object | None = None) -> dict[str, object]:
+                return {"valid": True, "errors": []}
+
+            def apply(self, _payload: object | None = None) -> dict[str, object]:
+                return {}
+
+            def reload(self) -> dict[str, object]:
+                return {}
+
+            def external_disk_state(self) -> dict[str, bool]:
+                self.probes += 1
+                return {"changed": False, "exists": True}
+
+            def external_disk_identity(self) -> str:
+                self.identities += 1
+                return self.name
+
+        runtime = ProbeDomain("runtime")
+        webdav = ProbeDomain("webdav")
+        core = CoreStore(domains=[runtime, webdav])
+
+        result = core.disk_state(["runtime"])
+
+        self.assertEqual({"runtime"}, set(result["disk"]))
+        self.assertEqual(1, runtime.probes)
+        self.assertEqual(2, runtime.identities)  # registration plus the requested probe
+        self.assertEqual(0, webdav.probes)
+        self.assertEqual(1, webdav.identities)  # registration establishes its baseline
+
+    def test_codex_disk_probe_does_not_load_or_probe_the_model_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.toml"
+            auth = root / "auth.json"
+            config.write_text('model = "example"\n', encoding="utf-8")
+            auth.write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(root / "runtime.yaml", codex_home=root)
+
+            with mock.patch.object(domain, "_load_editor", side_effect=AssertionError("full editor load")):
+                self.assertEqual({"changed": False, "exists": True}, domain.external_disk_state())
+                self.assertTrue(domain.external_disk_identity())
+
     def test_confirmation_required_does_not_checkpoint_or_restore_external_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"

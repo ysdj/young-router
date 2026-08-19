@@ -58,7 +58,14 @@ _PLAINTEXT_SECRET_FIELDS = {
     ("claude", "deployment_token"),
     ("claude", "desktop_gateway_api_key"),
     ("relay_accounts", "api_key"),
+    ("runtime", "setting"),
 }
+
+_MULTILINE_SECRET_TARGET = "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
+
+
+def _allows_multiline_secret(domain: str, field: str, target: str | None) -> bool:
+    return domain == "runtime" and field == "setting" and target == _MULTILINE_SECRET_TARGET
 
 # Keep the Core's direct and legacy IPC callers tolerant of route-shaped
 # domain names.  The unified UI emits canonical names, but older native
@@ -686,6 +693,7 @@ class CoreStore:
         claude_settings_path: Path | str | None = None,
         language_path: Path | str | None = None,
         runtime_root: Path | str | None = None,
+        reset_transient_routing_state: bool = False,
     ) -> "CoreStore":
         """Construct production domains without importing the LiteLLM proxy.
 
@@ -704,6 +712,11 @@ class CoreStore:
         from .domains.relay_accounts import RelayAccountsDomain
         from .domains.runtime import RuntimeSettingsDomain
         from .domains.webdav import WebDAVSettingsDomain
+        from .operations import CoreServiceController
+
+        controller = CoreServiceController(runtime_root)
+        if reset_transient_routing_state:
+            controller.reset_transient_routing_state()
 
         resolved_runtime_settings_path = (
             Path(runtime_settings_path).expanduser()
@@ -764,9 +777,6 @@ class CoreStore:
             adapters.append(RelayAccountsDomain(runtime_root, storage_path=relay_path))
         except Exception:
             adapters.append(UnavailableDomain("relay_accounts"))
-        from .operations import CoreServiceController
-
-        controller = CoreServiceController(runtime_root)
         operations = (
             "start",
             "stop",
@@ -1032,6 +1042,27 @@ class CoreStore:
                 "domains": copy.deepcopy(domain_states),
             }
 
+    def disk_state(self, domains: Sequence[str]) -> dict[str, Any]:
+        """Refresh only the external-file markers needed by the settings UI."""
+
+        if isinstance(domains, (str, bytes, bytearray)) or not isinstance(domains, Sequence):
+            raise CoreError("invalid_domain", "The disk-state domains are invalid")
+        try:
+            requested = tuple(dict.fromkeys(_canonical_domain(domain) for domain in domains))
+        except CoreError:
+            raise
+        if not requested:
+            raise CoreError("invalid_domain", "At least one disk-state domain is required")
+        with self._lock:
+            for name in requested:
+                if name not in self._domains:
+                    raise DomainNotFound(name)
+            self._refresh_external_disk_state(requested)
+            return {
+                "revision": self._revision,
+                "disk": {name: copy.deepcopy(self._disk[name]) for name in requested},
+            }
+
     def log_view(self, tab: str, known_revision: int | None = None) -> dict[str, Any]:
         """Load one requested log tab without inflating global snapshots."""
 
@@ -1051,10 +1082,13 @@ class CoreStore:
                 raise CoreError("logs_unavailable", "Logs are unavailable")
             return dict(safe_result)
 
-    def _refresh_external_disk_state(self) -> None:
+    def _refresh_external_disk_state(self, domains: Iterable[str] | None = None) -> None:
         """Auto-reload clean drafts and expose only sanitized conflict state."""
 
+        selected = None if domains is None else set(domains)
         for name, adapter in self._domains.items():
+            if selected is not None and name not in selected:
+                continue
             detector = getattr(adapter, "external_disk_state", None)
             if not callable(detector):
                 continue
@@ -1179,7 +1213,7 @@ class CoreStore:
         revision: int,
         expected_text_digest: str | None = None,
     ) -> dict[str, Any]:
-        """Stage one versioned CodeMirror editor document."""
+        """Stage one versioned code-editor document."""
 
         if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
             raise CoreError("invalid_editor", "The editor document is invalid")
@@ -1255,6 +1289,8 @@ class CoreStore:
             descriptor_key = (name, field_name)
             if descriptor_key not in _PLAINTEXT_SECRET_FIELDS:
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
+            if descriptor_key == ("runtime", "setting") and target != _MULTILINE_SECRET_TARGET:
+                raise CoreError("invalid_secret", "The requested secret field is unavailable")
             target_required = _SECRET_FIELDS[descriptor_key]
             if target_required and (
                 not isinstance(target, str)
@@ -1276,7 +1312,8 @@ class CoreStore:
             if (
                 not isinstance(value, str)
                 or len(value.encode("utf-8")) > 16_384
-                or any(character in value for character in "\x00\r\n")
+                or "\x00" in value
+                or (not _allows_multiline_secret(name, field_name, target_value) and any(character in value for character in "\r\n"))
             ):
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
             return {
@@ -1311,7 +1348,8 @@ class CoreStore:
             if (
                 not isinstance(value, str)
                 or len(value.encode("utf-8")) > 16_384
-                or any(character in value for character in "\x00\r\n")
+                or "\x00" in value
+                or (not _allows_multiline_secret(str(descriptor["domain"]), str(descriptor["field"]), descriptor["target"]) and any(character in value for character in "\r\n"))
             ):
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
             return value
@@ -1327,7 +1365,7 @@ class CoreStore:
     ) -> dict[str, Any]:
         """Stage a secret received only from an authenticated native control."""
 
-        if not isinstance(value, str) or len(value.encode("utf-8")) > 16_384 or any(char in value for char in "\x00\r\n"):
+        if not isinstance(value, str) or len(value.encode("utf-8")) > 16_384 or "\x00" in value or (not _allows_multiline_secret(_canonical_domain(domain), field, target) and any(char in value for char in "\r\n")):
             raise CoreError("invalid_secret", "The secret value is invalid")
         with self._lock:
             self._check_revision(revision)
@@ -2442,6 +2480,25 @@ class CoreStore:
         if increment:
             self._revision += 1
 
+    def _reload_service_after_provider_apply(self) -> None:
+        """Reload LiteLLM after the provider source configuration is committed."""
+
+        if self._service.get("state") not in {"running", "unhealthy"}:
+            return
+        reloader = self._service_handlers.get("reload")
+        if reloader is None:
+            return
+        service_result = reloader("reload")
+        if not isinstance(service_result, Mapping):
+            raise RuntimeError("service_reload_failed")
+        self._set_service_from_result(service_result, increment=False)
+        if service_result.get("state") not in {"running", "starting"}:
+            raise RuntimeError("service_reload_failed")
+        codex = self._domains.get("codex")
+        refresh_catalog = getattr(codex, "refresh_model_catalog", None)
+        if callable(refresh_catalog) and service_result.get("state") == "running":
+            refresh_catalog()
+
     def validate(self, domain: str | None = None, *, revision: int | None = None, payload: object | None = None) -> dict[str, Any]:
         with self._lock:
             self._check_revision(revision)
@@ -2734,14 +2791,7 @@ class CoreStore:
             applied.append("relay_accounts")
 
             if provider_locally_applied:
-                reloader = self._service_handlers.get("reload")
-                if reloader is not None:
-                    service_result = reloader("reload")
-                    if not isinstance(service_result, Mapping):
-                        raise RuntimeError("service_reload_failed")
-                    self._set_service_from_result(service_result, increment=False)
-                    if service_result.get("state") not in {"running", "starting"}:
-                        raise RuntimeError("service_reload_failed")
+                self._reload_service_after_provider_apply()
 
             destructive = [
                 operation
@@ -2985,6 +3035,8 @@ class CoreStore:
                     }
                     self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
                     applied.append(name)
+                if "providers_models" in applied:
+                    self._reload_service_after_provider_apply()
                 self._revision += 1
                 self._persist_metadata()
             except Exception as exc:

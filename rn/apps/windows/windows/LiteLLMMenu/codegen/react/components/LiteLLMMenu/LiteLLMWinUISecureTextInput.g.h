@@ -30,6 +30,7 @@ struct LiteLLMWinUISecureTextInputProps : winrt::implements<LiteLLMWinUISecureTe
        target = cloneFromProps->target;
        label = cloneFromProps->label;
        placeholder = cloneFromProps->placeholder;
+       multiline = cloneFromProps->multiline;
        plainText = cloneFromProps->plainText;
        autoCommit = cloneFromProps->autoCommit;
        disabled = cloneFromProps->disabled;
@@ -57,6 +58,9 @@ struct LiteLLMWinUISecureTextInputProps : winrt::implements<LiteLLMWinUISecureTe
 
   REACT_FIELD(placeholder)
   std::optional<std::string> placeholder;
+
+  REACT_FIELD(multiline)
+  std::optional<bool> multiline{};
 
   REACT_FIELD(plainText)
   std::optional<bool> plainText{};

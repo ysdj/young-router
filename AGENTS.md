@@ -10,8 +10,8 @@
 
 - `rn/packages/shared/` owns shared React/TypeScript routes, composition, interaction state, i18n, and the typed Core IPC client.
 - `litellm_menu/core/` owns domain state, validation, staged configuration, service operations, persistence, and the authenticated versioned loopback IPC contract.
-- `rn/apps/macos/` is the AppKit host and `rn/apps/windows/` is the WinUI 3 host. Native code owns platform leaves: status/tray menus, windows, native controls, system WebView hosts for CodeMirror code panes, secure inputs, file panels, alerts, shortcuts, and platform lifecycle.
-- One feature has one shared UI and one Core domain implementation. Do not introduce a second platform-specific domain store, configuration writer, WebView application shell, Electron/Tauri layer, or legacy shell launcher. Embedded system WebViews are permitted only for the shared CodeMirror code panes.
+- `rn/apps/macos/` is the AppKit host and `rn/apps/windows/` is the WinUI 3 host. Native code owns platform leaves: status/tray menus, windows, native controls, system WebView hosts for shared code panes, secure inputs, file panels, alerts, shortcuts, and platform lifecycle.
+- One feature has one shared UI and one Core domain implementation. Do not introduce a second platform-specific domain store, configuration writer, WebView application shell, Electron/Tauri layer, or legacy shell launcher. Embedded system WebViews are permitted only for the shared code panes.
 - React holds view state only. It must not write configuration files, manage the proxy process, read arbitrary paths, or handle raw credentials. Versioned code-editor document text is the explicit exception.
 - The language choice belongs in each host's native application menu. Shared UI consumes that preference; do not add an in-window language selector.
 - All user-visible shared strings go through i18n. Keep platform titles and menu labels aligned with the selected language.
@@ -21,7 +21,7 @@
 - Preserve native platform behavior and visual conventions. Shared UI describes the workflow; native leaves render controls that require AppKit or WinUI behavior.
 - Default every desktop surface to compact native density. Avoid redundant in-content titles, oversized empty cards, web-like vertical whitespace, and detached action rows; prefer tightly grouped 24–28 px controls, concise helper text, content-sized route windows, and one fixed bottom action bar. Tabs must be genuinely switchable and render only their active pane. Compact layouts must still reflow before controls overlap or hide required content on either macOS or Windows.
 - A route window's bottom-right action bar contains only `Close` and a conditional `Apply` when staged configuration is dirty. File selection, import/export, WebDAV testing, and synchronization actions belong in the active pane, never in that footer.
-- Use typed IPC snapshots and actions. Never expose a path, secret, or unrestricted native capability through ordinary React props. Versioned code-editor document text may flow through the shared CodeMirror view.
+- Use typed IPC snapshots and actions. Never expose a path, secret, or unrestricted native capability through ordinary React props. Versioned code-editor document text may flow through the shared code-editor view.
 - Route windows must render their first data-backed frame from the shared snapshot; do not paint empty shells and refill them or issue duplicate per-window snapshot/subscription requests.
 - Secure inputs and file panels use opaque one-time native capabilities. Do not serialize secret values into IPC snapshots, logs, drafts, or test fixtures. Raw configuration documents use the authenticated versioned editor IPC instead of the retired native-only editor path.
 - Keep configuration changes staged and explicit. Validation may update draft state, but writing configuration and restarting a service require an explicit Apply action.
@@ -38,6 +38,18 @@
 - The macOS Vision helper is built into `Contents/Resources/Core/bin/vision_ocr`. Keep its source in the RN macOS host and never restore a `Resources/App` lookup.
 
 ## Known Runtime Failure Modes
+
+### Observed macOS Energy-Use Incident (2026-08-19)
+
+- The macOS Battery panel displayed LiteLLM Menu under “使用大量能耗” while the menu application was idle.
+- While a settings route was mounted, `rn/packages/shared/src/ui/LiteLLMMenuApp.tsx` invoked `ipc.snapshot()` from a five-second disk-change timer.
+- `CoreStore.snapshot()` invoked `_refresh_external_disk_state()` across every registered domain, including domains unrelated to the visible settings route.
+- The pre-fix Codex disk detector invoked `_ensure_model_catalog_current()` and `_load_editor()`; `codex_config.load_editor()` queried the authenticated local `/v1/models` endpoint while constructing its editor payload.
+- The resulting timer call chain was: settings timer → full Core snapshot → all-domain disk probes → Codex editor/catalog load → local proxy `/v1/models` request, including cycles in which no settings file had changed.
+- The implemented fix adds the `disk_state` IPC method, has the settings timer request only its monitored domains, and requests a full snapshot only after a disk marker differs. The Codex disk detector now reads `config.toml` and `auth.json` directly for marker comparison and does not perform the endpoint/catalog query on that path.
+- Focused Core and IPC tests, the targeted React Native parity tests, TypeScript type checking, and the IPC contract check passed after the change.
+- The installed replacement process group consisted of a newly started App, Core, and proxy; the proxy health endpoint returned HTTP 200 and the proxy command retained `--workers 16`.
+- Idle samples after installation showed the AppKit event loop, Core IPC polling, and proxy worker processes in wait states; CPU spikes observed during the investigation coincided with active model requests rather than the idle disk-marker poll.
 
 - React Native Fabric may keep an unmounted native component in its recycle pool together with its last large props. Native tables, editors, or lists that hold bulk rows/text or derived caches must implement `prepareForRecycle` that resets `_props` to defaults and clears their AppKit backing data, columns, selection, and caches; removing the React element alone does not release that memory.
 - Do not render unbounded log/trace collections with `ScrollView` plus `map`, duplicate every table cell into a data signature, or measure every cell on ordinary table updates. Virtualize long lists, memoize derived rows/columns and native props, compare old/new props directly, and reserve full content-width scans for controls whose contract requires them.

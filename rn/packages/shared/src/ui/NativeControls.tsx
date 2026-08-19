@@ -99,7 +99,7 @@ function nativeControlTextWidth(label: string): number {
 // intrinsic content size. Give translated labels enough shared layout width so
 // buttons and checkboxes do not turn complete actions into truncated fragments.
 function nativeButtonMinimumWidth(title: string, compact = false): number {
-  return Math.ceil((compact ? 22 : 28) + Math.max(24, nativeControlTextWidth(title)));
+  return Math.max(72, Math.ceil((compact ? 32 : 38) + nativeControlTextWidth(title) * 1.15));
 }
 
 function nativeCheckboxMinimumWidth(label: string): number {
@@ -205,13 +205,15 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
     destructive: props.destructive === true,
     link: props.link === true,
   };
-  const contentWidth = !props.link && !props.symbol ? { minWidth: nativeButtonMinimumWidth(props.title, compact) } : undefined;
-  const style = [props.link ? styles.linkButton : styles.button, contentWidth, props.style];
+  // A caller may enlarge a button, but must never reduce a translated title to
+  // an ellipsis. Symbol-only buttons intentionally use their native icon size.
+  const titleWidth = !props.symbol ? { minWidth: nativeButtonMinimumWidth(props.title, compact), flexShrink: 0 } : undefined;
+  const style = [props.link ? styles.linkButton : styles.button, props.style, titleWidth];
   if (Platform.OS === "windows") {
     return <WinUIButton {...buttonProps} ref={ref as never} onPress={() => props.onPress?.()} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitButton {...buttonProps} ref={ref as never} style={[contentWidth, props.style]} />;
+    return <AppKitButton {...buttonProps} ref={ref as never} style={[props.style, titleWidth]} />;
   }
     return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={style} accessibilityRole={props.link ? "link" : "button"}><Text style={styles.controlText}>{props.title}</Text></Pressable>;
 });

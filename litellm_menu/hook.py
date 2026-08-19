@@ -9,6 +9,7 @@ from . import codex_fast_tier as _codex_fast_tier_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import reasoning as _reasoning_module
 from . import routing as _routing_module
 from . import state as _state_module
 from . import streaming as _streaming_module
@@ -84,6 +85,7 @@ class LiteLLMMenuHook(CustomLogger):
         changed = False
         for update_request in (
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
+            _reasoning_module._with_model_reasoning_mapping,
             _responses_request_module._with_plaintext_agent_message_content_restored,
             _responses_request_module._with_codex_view_image_output_paths,
             _responses_request_module._with_codex_function_call_output_text,

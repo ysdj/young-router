@@ -482,13 +482,19 @@ def _request_should_try_native_responses_client_tools(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> bool:
-    return (
-        _request_responses_client_tool_support(
-            request_kwargs,
-            outer_request_kwargs,
-        )
-        is not False
+    support = _request_responses_client_tool_support(
+        request_kwargs,
+        outer_request_kwargs,
     )
+    # Unknown Responses surfaces can accept the namespace envelope while
+    # degrading its nested free-form custom calls to empty JSON. Bridge that
+    # combination to a normal string-argument function tool.
+    if support is None and _request_has_responses_nested_custom_tools(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return False
+    return support is not False
 
 
 def _request_responses_client_tool_support(
@@ -535,6 +541,46 @@ def _request_supports_responses_function_tools(
         return configured_support
     if _request_uses_responses_endpoint(outer_request_kwargs):
         return True
+    return False
+
+
+def _responses_tool_tree_has_type(value: Any, tool_type: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") == tool_type:
+        return True
+    children = value.get("tools")
+    return isinstance(children, list) and any(
+        _responses_tool_tree_has_type(child, tool_type) for child in children
+    )
+
+
+def _request_has_responses_nested_custom_tools(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    for request in (request_kwargs, outer_request_kwargs):
+        if not isinstance(request, dict):
+            continue
+        raw_tools = request.get("tools")
+        candidates = list(raw_tools) if isinstance(raw_tools, list) else []
+        candidates.extend(
+            _responses_tools_module._responses_input_tool_search_output_tools(
+                request.get("input")
+            )
+        )
+        candidates.extend(
+            _responses_tools_module._responses_input_additional_tools(
+                request.get("input")
+            )
+        )
+        if any(
+            isinstance(tool, dict)
+            and tool.get("type") == "namespace"
+            and _responses_tool_tree_has_type(tool, "custom")
+            for tool in candidates
+        ):
+            return True
     return False
 
 

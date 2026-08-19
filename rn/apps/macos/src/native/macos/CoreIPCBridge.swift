@@ -414,7 +414,7 @@ import Foundation
         return SecretReadCapability(token: token)
     }
 
-    @nonobjc func readSecret(_ secretReadToken: String) throws -> String {
+    @nonobjc func readSecret(_ secretReadToken: String, allowMultiline: Bool = false) throws -> String {
         guard !secretReadToken.isEmpty,
               secretReadToken.utf8.count <= 256,
               let body = try? JSONSerialization.data(
@@ -434,8 +434,8 @@ import Foundation
               let value = object["value"] as? String,
               value.utf8.count <= 16_384,
               !value.contains("\u{0000}"),
-              !value.contains("\r"),
-              !value.contains("\n") else {
+              (allowMultiline || !value.contains("\r")),
+              (allowMultiline || !value.contains("\n")) else {
             if response.statusCode >= 500 { _ = resetCore(expectedGeneration: requestGeneration) }
             throw BridgeError.invalidResponse
         }
@@ -444,7 +444,8 @@ import Foundation
 
     @nonobjc func readPlainTextSecret(domain: String, field: String, target: String?) throws -> String {
         try readSecret(
-            createSecretReadCapability(domain: domain, field: field, target: target).token
+            createSecretReadCapability(domain: domain, field: field, target: target).token,
+            allowMultiline: domain == "runtime" && field == "setting" && target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
         )
     }
 

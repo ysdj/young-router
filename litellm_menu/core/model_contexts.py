@@ -22,7 +22,7 @@ from .persistence import PersistenceError, atomic_write_json, read_json
 
 UNKNOWN_MODEL_CONTEXT_WINDOW = 272_000
 DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
-DEFAULT_MODEL_CONTEXT_REFRESH_HOURS = 24
+DEFAULT_MODEL_CONTEXT_REFRESH_HOURS = 6
 MODEL_CONTEXT_CACHE_FILE_NAME = "litellm-menu-model-contexts.json"
 MODEL_CONTEXT_SOURCES = (
     "https://pi.dev/api/models",
@@ -37,6 +37,8 @@ _SOURCE_PRIORITIES = {
     MODEL_CONTEXT_SOURCES[2]: 20,
 }
 _UPSTREAM_MAX_BYTES = 8 * 1024 * 1024
+_PI_REASONING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+_CODEX_REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,89 @@ class ContextRecord:
     context_window: int
     max_context_window: int
     effective_context_window_percent: int = DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT
+
+
+@dataclass(frozen=True)
+class ReasoningCapability:
+    """Codex-facing reasoning levels plus Pi's provider-wire mapping."""
+
+    reasoning: bool | None
+    supported_levels: tuple[str, ...]
+    default_level: str | None
+    thinking_level_map: Mapping[str, str | None] | None = None
+
+
+def _pi_reasoning_level(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold()
+    if normalized == "none":
+        normalized = "off"
+    return normalized if normalized in _PI_REASONING_LEVELS else None
+
+
+def _codex_reasoning_level(value: object) -> str | None:
+    pi_level = _pi_reasoning_level(value)
+    if pi_level is None:
+        return None
+    return "none" if pi_level == "off" else pi_level
+
+
+def _thinking_level_map(value: object) -> dict[str, str | None] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, str | None] = {}
+    for raw_level, raw_mapped in value.items():
+        level = _pi_reasoning_level(raw_level)
+        if level is None or (raw_mapped is not None and not isinstance(raw_mapped, str)):
+            continue
+        mapped = raw_mapped.strip() if isinstance(raw_mapped, str) else None
+        if mapped or raw_mapped is None:
+            result[level] = mapped
+    return result
+
+
+def _supported_levels_from_payload(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    supported: set[str] = set()
+    for item in value:
+        raw_level = item.get("effort") if isinstance(item, Mapping) else item
+        level = _codex_reasoning_level(raw_level)
+        if level is not None:
+            supported.add(level)
+    return tuple(level for level in _CODEX_REASONING_LEVELS if level in supported)
+
+
+def _reasoning_fields_from_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    reasoning = value.get("reasoning")
+    if isinstance(reasoning, bool):
+        fields["reasoning"] = reasoning
+
+    raw_map = value.get("thinking_level_map")
+    if raw_map is None and "thinkingLevelMap" in value:
+        raw_map = value.get("thinkingLevelMap")
+    thinking_map = _thinking_level_map(raw_map)
+    if thinking_map is not None:
+        fields["thinking_level_map"] = thinking_map
+
+    supported = _supported_levels_from_payload(
+        value.get("supported_reasoning_levels")
+        if "supported_reasoning_levels" in value
+        else value.get("supportedReasoningLevels")
+    )
+    if supported:
+        fields["supported_reasoning_levels"] = list(supported)
+
+    default_level = _codex_reasoning_level(
+        value.get("default_reasoning_level")
+        if "default_reasoning_level" in value
+        else value.get("defaultReasoningLevel")
+    )
+    if default_level is not None:
+        fields["default_reasoning_level"] = default_level
+    return fields
 
 
 def _record(
@@ -136,6 +221,7 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
     }
     if auto_compact is not None:
         result["auto_compact_token_limit"] = auto_compact
+    result.update(_reasoning_fields_from_payload(value))
     return result
 
 
@@ -199,8 +285,28 @@ def _merge_records(target: dict[str, dict[str, Any]], incoming: Mapping[str, Map
         current = target.get(model_id)
         priority = _positive_int(record.get("priority")) or 0
         current_priority = _positive_int(current.get("priority")) if isinstance(current, Mapping) else None
-        if current is None or priority >= (current_priority or 0):
+        if current is None:
             target[model_id] = dict(record)
+            continue
+
+        merged = dict(current)
+        if priority >= (current_priority or 0):
+            merged.update(record)
+
+        # A hard-limit source can win the context fields while carrying no
+        # provider-specific reasoning policy. Keep the highest-priority value
+        # for each Pi/Codex reasoning field independently.
+        for key in (
+            "reasoning",
+            "thinking_level_map",
+            "supported_reasoning_levels",
+            "default_reasoning_level",
+        ):
+            if key in record and (
+                key not in current or priority >= (current_priority or 0)
+            ):
+                merged[key] = record[key]
+        target[model_id] = merged
 
 
 def _candidate_ids(value: str) -> list[str]:
@@ -255,6 +361,80 @@ def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str
         if len(top_records) == 1 or all(record == top_records[0] for record in top_records[1:]):
             return top_records[0]
     return None
+
+
+def _default_reasoning_level(
+    supported_levels: Sequence[str],
+    preferred: object = None,
+) -> str | None:
+    supported = tuple(supported_levels)
+    preferred_level = _codex_reasoning_level(preferred)
+    if preferred_level in supported:
+        return preferred_level
+    for candidate in ("medium", "low", "minimal", "high", "xhigh", "max", "none"):
+        if candidate in supported:
+            return candidate
+    return None
+
+
+def _reasoning_capability(record: Mapping[str, Any]) -> ReasoningCapability | None:
+    has_reasoning_metadata = any(
+        key in record
+        for key in (
+            "reasoning",
+            "thinking_level_map",
+            "supported_reasoning_levels",
+            "default_reasoning_level",
+        )
+    )
+    if not has_reasoning_metadata:
+        return None
+
+    reasoning = record.get("reasoning")
+    reasoning = reasoning if isinstance(reasoning, bool) else None
+    raw_map = record.get("thinking_level_map")
+    thinking_map = _thinking_level_map(raw_map) if isinstance(raw_map, Mapping) else None
+
+    if reasoning is False:
+        supported = ("none",)
+    elif thinking_map is not None:
+        supported_pi: list[str] = []
+        for level in _PI_REASONING_LEVELS:
+            mapped = thinking_map.get(level)
+            if mapped is None and level in thinking_map:
+                continue
+            if level in {"xhigh", "max"} and level not in thinking_map:
+                continue
+            supported_pi.append(level)
+        supported = tuple("none" if level == "off" else level for level in supported_pi)
+    else:
+        declared = _supported_levels_from_payload(record.get("supported_reasoning_levels"))
+        if declared:
+            supported = declared
+        elif reasoning is True:
+            # Pi's default contract exposes the standard levels through high;
+            # xhigh/max require explicit map entries.
+            supported = _CODEX_REASONING_LEVELS[:5]
+        else:
+            return None
+
+    codex_map = (
+        {
+            ("none" if level == "off" else level): mapped
+            for level, mapped in thinking_map.items()
+        }
+        if thinking_map is not None
+        else None
+    )
+    return ReasoningCapability(
+        reasoning=reasoning,
+        supported_levels=supported,
+        default_level=_default_reasoning_level(
+            supported,
+            record.get("default_reasoning_level"),
+        ),
+        thinking_level_map=codex_map,
+    )
 
 
 def _litellm_record(model_ids: Sequence[str]) -> dict[str, Any] | None:
@@ -343,7 +523,7 @@ class ModelContextRegistry:
                 parsed[model_id.casefold()] = record
         _merge_records(self._records, parsed)
         # The pre-Pi cache contains only hard-limit sources.  Do not make an
-        # installed upgrade wait for its previous 24-hour refresh interval
+        # installed upgrade wait for its previous refresh interval
         # before adopting provider-specific agent profiles.
         if self._cache_fetched_at is not None and not cache_has_pi_profiles:
             self._cache_fetched_at = None
@@ -386,7 +566,17 @@ class ModelContextRegistry:
                 continue
             model_id = params.get("model")
             if isinstance(model_id, str) and model_id.strip():
-                result.append(model_id.strip())
+                normalized_id = model_id.strip()
+                provider = params.get("custom_llm_provider")
+                if (
+                    isinstance(provider, str)
+                    and provider.strip()
+                    and not normalized_id.casefold().startswith(
+                        f"{provider.strip().casefold()}/"
+                    )
+                ):
+                    normalized_id = f"{provider.strip()}/{normalized_id}"
+                result.append(normalized_id)
         return result
 
     def refresh_if_due(self, *, force: bool = False) -> bool:
@@ -453,6 +643,55 @@ class ModelContextRegistry:
             effective_context_window_percent=DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         )
 
+    def reasoning_for_model_id(self, model_id: str) -> ReasoningCapability | None:
+        """Return Pi/Codex reasoning policy for one concrete deployment model."""
+
+        self._load_cache()
+        normalized_id = model_id.strip().casefold()
+        if "@" in normalized_id:
+            normalized_id = normalized_id.split("@", 1)[0]
+        record = self._records.get(normalized_id)
+        if record is None and "/" not in normalized_id:
+            record = _lookup(self._records, normalized_id)
+        if record is None:
+            alias = _BUNDLED_ALIASES.get(normalized_id)
+            if alias:
+                record = _lookup(self._records, alias)
+        return _reasoning_capability(record) if record is not None else None
+
+    def reasoning_for(self, public_name: str) -> ReasoningCapability | None:
+        """Return the common safe reasoning surface for a public route group."""
+
+        route_ids = self._load_route_model_ids(public_name)
+        model_ids = route_ids or [public_name]
+        capabilities = [self.reasoning_for_model_id(model_id) for model_id in model_ids]
+        if not capabilities or any(capability is None for capability in capabilities):
+            return None
+        resolved = [capability for capability in capabilities if capability is not None]
+        common = set(resolved[0].supported_levels)
+        for capability in resolved[1:]:
+            common.intersection_update(capability.supported_levels)
+        supported = tuple(level for level in _CODEX_REASONING_LEVELS if level in common)
+        if not supported:
+            return None
+
+        reasoning_values = {capability.reasoning for capability in resolved}
+        reasoning = reasoning_values.pop() if len(reasoning_values) == 1 else None
+        maps = [capability.thinking_level_map for capability in resolved]
+        common_map = maps[0] if all(mapping == maps[0] for mapping in maps[1:]) else None
+        preferred_defaults = [
+            capability.default_level
+            for capability in resolved
+            if capability.default_level in supported
+        ]
+        preferred = preferred_defaults[0] if preferred_defaults else None
+        return ReasoningCapability(
+            reasoning=reasoning,
+            supported_levels=supported,
+            default_level=_default_reasoning_level(supported, preferred),
+            thinking_level_map=dict(common_map) if common_map is not None else None,
+        )
+
 
 def default_context_cache_path(codex_home: Path | str) -> Path:
     return Path(codex_home).expanduser() / MODEL_CONTEXT_CACHE_FILE_NAME
@@ -465,6 +704,7 @@ __all__ = [
     "MODEL_CONTEXT_CACHE_FILE_NAME",
     "MODEL_CONTEXT_SOURCES",
     "ModelContextRegistry",
+    "ReasoningCapability",
     "UNKNOWN_MODEL_CONTEXT_WINDOW",
     "default_context_cache_path",
 ]

@@ -9,8 +9,11 @@ import tempfile
 import textwrap
 import tomllib
 import unittest
+import urllib.error
 from unittest import mock
 from pathlib import Path
+
+import codex_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +21,23 @@ CODEX_CONFIG = ROOT / "codex_config.py"
 
 
 class CodexConfigTests(unittest.TestCase):
+    class _Response:
+        def __init__(self, payload: object, status: int = 200):
+            self.status = status
+            self.body = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size: int = -1) -> bytes:
+            return self.body if size < 0 else self.body[:size]
+
+        def getcode(self) -> int:
+            return self.status
+
     def write_runtime_config(self, path: Path) -> None:
         path.write_text(
             textwrap.dedent(
@@ -66,6 +86,42 @@ class CodexConfigTests(unittest.TestCase):
             ).lstrip(),
             encoding="utf-8",
         )
+
+    def test_local_exposed_models_uses_authenticated_litellm_endpoint(self) -> None:
+        opener = mock.Mock()
+        opener.open.return_value = self._Response(
+            {
+                "data": [
+                    {"id": "model-b"},
+                    {"id": "model-a"},
+                    {"id": "model-b"},
+                    {"id": ""},
+                    {"id": "invalid\nmodel"},
+                ]
+            }
+        )
+
+        with mock.patch.object(codex_config, "local_base_url", return_value="http://127.0.0.1:4999/v1"), mock.patch.object(
+            codex_config.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            models, enabled = codex_config._local_exposed_models("sk-local-test")
+
+        self.assertTrue(enabled)
+        self.assertEqual(["model-b", "model-a"], models)
+        request = opener.open.call_args.args[0]
+        self.assertEqual("http://127.0.0.1:4999/v1/models", request.full_url)
+        self.assertEqual("Bearer sk-local-test", request.get_header("Authorization"))
+
+    def test_local_exposed_models_returns_none_when_menu_is_unavailable(self) -> None:
+        opener = mock.Mock()
+        opener.open.side_effect = urllib.error.URLError("offline")
+        with mock.patch.object(codex_config.urllib.request, "build_opener", return_value=opener):
+            models, enabled = codex_config._local_exposed_models("sk-local-test")
+
+        self.assertFalse(enabled)
+        self.assertEqual([], models)
 
     def run_command(
         self,
@@ -123,6 +179,28 @@ class CodexConfigTests(unittest.TestCase):
             self.assertEqual('{"OPENAI_API_KEY": "sk-editor-key"}\n', payload["auth_text"])
             self.assertIn("Permissions conflict", payload["validation_error"])
             self.assertEqual("mixed", payload["structured"]["permissions"]["mode"])
+
+    def test_editor_load_marks_routes_from_disabled_providers_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            runtime_config = temp / "config.yaml"
+            codex_home = temp / "codex"
+            codex_home.mkdir()
+            self.write_runtime_config(runtime_config)
+            (codex_home / "config.toml").write_text('model = "active-chat"\n', encoding="utf-8")
+            (codex_home / "auth.json").write_text("{}\n", encoding="utf-8")
+
+            result = self.run_command(runtime_config, codex_home, "load")
+
+            self.assertEqual(0, result.returncode, result.stderr)
+            payload = json.loads(result.stdout)
+            model_states = {
+                model["model"]: model["model_enabled"]
+                for model in payload["models"]
+            }
+            self.assertTrue(model_states["active-chat"])
+            self.assertFalse(model_states["disabled-chat"])
+            self.assertFalse(model_states["unavailable-chat"])
 
     def test_editor_sync_invalid_raw_text_returns_safe_zero_exit_payload_without_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

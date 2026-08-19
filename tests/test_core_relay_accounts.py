@@ -1240,6 +1240,45 @@ class RelayAccountsDomainTests(unittest.TestCase):
             ]
             self.assertTrue(all(headers == {"Authorization": "Bearer replace-dashboard-token"} for headers in dashboard_requests))
 
+    def test_sub2api_gateway_model_fallback_skips_disabled_keys(self) -> None:
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Active", "status": "active", "key": "sk-replace-active-key"},
+                            {"id": 5, "name": "Disabled", "status": "disabled", "key": "sk-replace-disabled-key"},
+                        ]
+                    },
+                },
+                "/v1/models": {
+                    "object": "list",
+                    "data": [{"id": "gateway-model"}],
+                },
+            },
+            errors={"/api/v1/channels/available": RelayAccountsError("Channel catalog unavailable")},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample@example.test",
+                access_token="replace-dashboard-token",
+            )
+
+            resources = domain.refresh_resources(account_id)["resources"]
+
+            self.assertEqual(2, len(resources))
+            self.assertEqual(
+                [{"Authorization": "Bearer sk-replace-active-key"}],
+                [headers for _, path, headers in fake.requests if path == "/v1/models"],
+            )
+
     def test_sub2api_cookie_only_session_can_import_models(self) -> None:
         fake = FakeRelayHTTPClient(
             {

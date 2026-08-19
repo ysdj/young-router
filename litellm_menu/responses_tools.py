@@ -230,6 +230,8 @@ def _responses_bridge_namespace_tools(tool: Any) -> list[dict]:
     for child_tool in child_tools:
         converted = _responses_bridge_function_tool(child_tool)
         if converted is None:
+            converted = _responses_bridge_custom_tool(child_tool)
+        if converted is None:
             continue
         name = converted.get("name")
         if not isinstance(name, str) or name in seen_names:

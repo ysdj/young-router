@@ -1444,14 +1444,15 @@ private enum NativeRelayOriginPolicy {
             )
         case "data-management":
             return RouteWindowLayout(
-                contentSize: NSSize(width: 500, height: 160),
+                contentSize: NSSize(width: 600, height: 220),
                 // NSWindow's minimum is a frame size, so include the title bar
-                // while still allowing the compact import pane to fit content.
-                minSize: NSSize(width: 500, height: 140),
-                // React resizes this utility window for the active pane. Do
-                // not retain a previously user-stretched frame with a large,
-                // empty lower area.
-                maxSize: NSSize(width: 620, height: 500)
+                // while keeping the file row and its helper copy comfortably
+                // inside the smallest useful import layout.
+                minSize: NSSize(width: 500, height: 180),
+                // React resizes this utility window for the active pane. Keep
+                // enough room for the review and WebDAV panes without making
+                // the utility window feel like a full settings screen.
+                maxSize: NSSize(width: 680, height: 620)
             )
         case "logs":
             return RouteWindowLayout(

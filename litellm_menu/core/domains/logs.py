@@ -14,8 +14,14 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..log_tabs import LOG_TABS
+from ..persistence import PersistenceError, atomic_write_json, read_json
 from ..security import REDACT_TEXT
 from ...log_rotation import append_bounded_log
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
+    fcntl = None
 
 
 DOMAIN_NAME = "logs"
@@ -415,15 +421,31 @@ def _trace_detail(raw: Mapping[str, Any]) -> str:
     )
 
 
-def _recovery_detail(raw: Mapping[str, Any]) -> str:
+def _whole_seconds(value: object) -> int | None:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return max(0, math.ceil(seconds))
+
+
+def _recovery_cooldown_seconds(raw: Mapping[str, Any], *, now: float | None = None) -> int | None:
+    cooldown_until = _timestamp_number(raw.get("cooldown_until"))
+    if cooldown_until is not None:
+        return _whole_seconds(cooldown_until - (time.time() if now is None else now))
+    return _whole_seconds(raw.get("cooldown_remaining_seconds"))
+
+
+def _recovery_detail(raw: Mapping[str, Any], *, now: float | None = None) -> str:
     details: list[str] = []
-    for source, key, suffix in (
-        (raw.get("attempt"), "attempt", ""),
-        (raw.get("attempt_timeout_seconds"), "timeout", "s"),
-        (raw.get("cooldown_remaining_seconds"), "cooldown", "s"),
-        (raw.get("poll_interval_seconds"), "retry", "s"),
+    for value, key, suffix in (
+        (_trace_value(raw.get("attempt")), "attempt", ""),
+        (_trace_value(_whole_seconds(raw.get("attempt_timeout_seconds"))), "timeout", "s"),
+        (_trace_value(_recovery_cooldown_seconds(raw, now=now)), "cooldown", "s"),
+        (_trace_value(_whole_seconds(raw.get("poll_interval_seconds"))), "retry", "s"),
     ):
-        value = _trace_value(source)
         if value:
             details.append(f"{key}={value}{suffix}")
     diagnostic = _mapping_value(raw.get("diagnostic"))
@@ -452,6 +474,8 @@ def _recovery_candidate(raw: Mapping[str, Any]) -> Mapping[str, Any]:
 def _safe_recovery_record(
     raw: Mapping[str, Any],
     configured_deployments: Mapping[str, Mapping[str, str]],
+    *,
+    now: float | None = None,
 ) -> dict[str, Any]:
     request = _mapping_value(raw.get("request"))
     exception = _mapping_value(raw.get("exception") or raw.get("error"))
@@ -528,7 +552,7 @@ def _safe_recovery_record(
         "provider": _safe_scalar(provider),
         "api_key_name": _safe_scalar(api_key_name),
         "status": _safe_scalar(raw.get("status")),
-        "detail": _safe_scalar(_recovery_detail(raw), limit=260),
+        "detail": _safe_scalar(_recovery_detail(raw, now=now), limit=260),
     }
     return {key: value for key, value in result.items() if value not in (None, "")}
 
@@ -539,6 +563,7 @@ def _safe_cooldown_record(
     configured_deployments: Mapping[str, Mapping[str, str]],
     *,
     remaining_seconds: float,
+    now: float,
 ) -> dict[str, Any]:
     """Project one live deployment cooldown into the recovery log schema."""
     timestamp = raw.get("last_failure_at") or raw.get("updated_at") or raw.get("cooldown_until")
@@ -547,9 +572,10 @@ def _safe_cooldown_record(
             **dict(raw),
             "status": "cooldown",
             "timestamp": timestamp,
-            "cooldown_remaining_seconds": round(max(0.0, remaining_seconds), 3),
+            "cooldown_remaining_seconds": _whole_seconds(remaining_seconds),
         },
         configured_deployments,
+        now=now,
     )
     failures = raw.get("failures")
     try:
@@ -563,7 +589,7 @@ def _safe_cooldown_record(
         return {
             "timestamp": _safe_scalar(timestamp),
             "status": "cooldown",
-            "detail": _safe_scalar(f"cooldown={round(max(0.0, remaining_seconds), 3)}s"),
+            "detail": _safe_scalar(f"cooldown={_whole_seconds(remaining_seconds) or 0}s"),
         }
     return projected
 
@@ -1359,6 +1385,38 @@ class LogsDomain:
         self._cleared.discard(tab)
         self._clear_cursors.pop(tab, None)
 
+    def _clear_recovery_and_cooldowns(self) -> None:
+        """Clear recovery and deployment cooldown state without other caches."""
+
+        def clear_collection(path: Path, key: str) -> None:
+            lock_descriptor: int | None = None
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if fcntl is not None:
+                    lock_path = Path(f"{path}.lock")
+                    lock_descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                    try:
+                        os.chmod(lock_path, 0o600)
+                    except OSError:
+                        pass
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                payload = read_json(path, default={})
+                payload["schema_version"] = 1
+                payload[key] = {}
+                atomic_write_json(path, payload)
+            finally:
+                if lock_descriptor is not None:
+                    try:
+                        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(lock_descriptor)
+
+        try:
+            clear_collection(self._recovery_path, "recoveries")
+            clear_collection(self._cooldowns_path, "cooldowns")
+        except (OSError, PersistenceError) as exc:
+            raise LogsDomainError("Recovery and cooldown state could not be cleared") from exc
+
     def _record_menu_action(self, value: object) -> None:
         action = value if isinstance(value, str) else ""
         if action.startswith("open-logs?tab="):
@@ -1413,7 +1471,7 @@ class LogsDomain:
             records: list[object] = []
             recoveries = recovery_payload.get("recoveries") if isinstance(recovery_payload, Mapping) else None
             for value in active_recovery_states(recoveries, now=now):
-                projected = _safe_recovery_record(value, configured_deployments)
+                projected = _safe_recovery_record(value, configured_deployments, now=now)
                 if projected:
                     records.append(projected)
             cooldowns = cooldown_payload.get("cooldowns") if isinstance(cooldown_payload, Mapping) else None
@@ -1424,6 +1482,7 @@ class LogsDomain:
                     cooldown_key,
                     configured_deployments,
                     remaining_seconds=remaining,
+                    now=now,
                 )
                 if projected:
                     records.append(projected)
@@ -1663,6 +1722,11 @@ class LogsDomain:
             # a separate, explicit destructive operation.
             self._cleared.add(str(tab))
             self._clear_cursors[str(tab)] = self._source_cursor(str(tab))
+        elif operation == "clear_recovery_and_cooldowns":
+            if tab != "recovery":
+                raise LogsDomainError("Log tab is invalid")
+            self._clear_recovery_and_cooldowns()
+            self._discard_clear("recovery")
         elif operation in {"set_filter", "filter"}:
             value = data.get("filter", data.get("query", ""))
             if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_FILTER_BYTES:

@@ -22,14 +22,7 @@
     "build:windows": "pwsh ./scripts/build-windows.ps1"
   },
   "dependencies": {
-    "@codemirror/commands": "6.10.4",
-    "@codemirror/lang-json": "6.0.2",
-    "@codemirror/language": "6.12.4",
-    "@codemirror/legacy-modes": "6.5.3",
-    "@codemirror/merge": "6.12.2",
-    "@codemirror/state": "6.7.1",
-    "@codemirror/view": "6.43.8",
-    "codemirror": "6.0.2",
+    "ace-builds": "1.44.0",
     "react": "19.2.3",
     "react-native": "0.85.3",
     "react-native-windows": "0.85.0-preview.1"

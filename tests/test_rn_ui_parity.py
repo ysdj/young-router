@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -123,6 +124,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const needsDiscardConfirmation = hasPendingFieldEdits()',
             'if (!needsDiscardConfirmation) {',
             "claudeDeploymentDraftRef.current = next;",
+            "claudeDeploymentDraftRef.current = undefined;",
             'if (reloadDomain === "claude") {',
             '}, [route]);',
         ):
@@ -232,9 +234,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_new_models_use_zero_order_without_coercing_zero_to_one(self) -> None:
         self.assert_ui_has('model: { name: "", upstream_model: "", enabled: true, order: 0 }')
         self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 }))')
-        self.assert_ui_has('value={String(numberValue(model.manual_order, modelEffectiveOrder(model)))}')
-        self.assert_ui_has('manual_order: Number.isFinite(manual_order) ? manual_order : 0')
-        self.assert_ui_has('order: Number.isFinite(manual_order) ? manual_order : 0')
+        self.assert_ui_has('value={String(displayedOrder)}')
+        self.assert_ui_has('label={translate("providers.order")}')
+        self.assert_ui_has('label={translate("providers.followMultiplier")}')
+        self.assert_ui_has('const canFollowMultiplier = usesRelayKey && relayMultiplier !== undefined;')
+        self.assert_ui_has('{canFollowMultiplier ? <NativeCheckbox')
+        self.assert_ui_has('const order = Number.isFinite(parsed) ? parsed : 0;')
+        self.assert_ui_has('changes: { manual_order: order, order }')
         self.assertNotIn('models.length + index + 1', self.ui)
         self.assertNotIn('Number(order) || 1', self.ui)
 
@@ -285,7 +291,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('providerKeyList:', self.ui)
         self.assert_ui_has('modelListPane: { flex: 1, minWidth: 0 }')
         self.assert_ui_has('providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }')
-        self.assert_ui_has('return <View style={styles.providersLayout}>')
+        self.assert_ui_has('return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={styles.providersLayout}>')
         self.assert_ui_has('<View style={styles.providerLeftColumn}>')
         self.assert_ui_has('{viewMode === "routes" ? <View style={styles.routeWorkspace}>')
         self.assert_ui_has('<TablePane wide style={styles.routeTablePane}')
@@ -296,12 +302,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 }')
         self.assert_ui_has('onSelectionChange={selectRoute}')
         self.assert_ui_has('label: translate("providers.provider"), width: 116 }, { label: translate("providers.providerKey"), width: 166')
-        self.assert_ui_has('label: translate("providers.effectiveOrder"), width: 72 }, { label: translate("providers.orderSource"), width: 126')
+        self.assert_ui_has('label: translate("common.order"), width: 72 }, { label: translate("providers.upstream"), width: 136')
+        self.assertNotIn('providers.orderSource', self.ui)
+        self.assertNotIn('providers.effectiveOrder', self.ui)
         self.assert_ui_has('modelOrderMode(activeRoute.model) === "relay_multiplier"')
         self.assertNotIn('const displayRoutes = useMemo', self.ui)
         self.assert_ui_has('key: `route-public-model:${entry.publicModel}`')
         self.assert_ui_has('spanning: true')
-        self.assert_ui_has(r'cells: [`\t${stringValue(entry.provider.display_name')
+        self.assert_ui_has(r'cells: [`\t${providerDisplayName(entry.provider)}`')
         self.assert_ui_has('rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} compact onSelectionChange={selectRoute}')
         self.assert_ui_has('rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange=')
         self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange=')
@@ -309,7 +317,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('rows={keyRows} selectedKey={selectedChoice?.id ?? ""} compact cellHorizontalPadding={0} firstColumnHorizontalPadding={0} onSelectionChange={setSelectedKeyID}')
         select_route = self.ui.split('const selectRoute = useCallback', 1)[1].split('const chooseViewMode', 1)[0]
         self.assertLess(select_route.index('if (!selected) return;'), select_route.index('setSelectedRoute(routeId);'))
-        self.assert_ui_has('providerSourceModel ? <ProviderEditor provider={activeRoute.provider}')
+        self.assert_ui_has('providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider}')
         self.assert_ui_has('model={activeRoute.model}')
         self.assert_ui_has('onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))}')
         self.assert_ui_has('setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`)')
@@ -346,16 +354,42 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'selected={tab}',
             'onSelect={(next) => switchDataManagementTab(next as DataManagementTab)}',
             'const switchDataManagementTab = (next: DataManagementTab): void => {',
+            'const previous = tab;',
             'const pending = onFlushPendingFields();',
             'setTab(next);',
             'void pending.catch((reason: unknown) => {',
-            'onTabSwitchError(reason);',
-            '{tab === "import" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={styles.dataManagementPaneScrollContent}>',
-            '{tab === "export" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={styles.dataManagementPaneScrollContent}>',
-            '{tab === "webdav" ? <ScrollView style={styles.dataManagementWebDavPane} contentContainerStyle={styles.dataManagementWebDavContent}>',
+            'onTabSwitchError(previous, reason);',
+            '{tab === "import" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent, !importPreview && dataManagementPolishStyles.importLandingContent]}>',
+            '{tab === "export" ? <View style={styles.dataManagementPane}>',
+            '{tab === "webdav" ? <View style={[styles.dataManagementWebDavPane, styles.dataManagementWebDavContent, dataManagementPolishStyles.webDavContent]}>',
         ):
             self.assert_ui_has(marker)
+        self.assertNotIn('<ScrollView style={styles.dataManagementWebDavPane}', workspace)
         self.assertEqual(3, workspace.count('{tab === "'))
+
+    def test_data_management_status_messages_stay_with_their_originating_tab(self) -> None:
+        workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
+            "function RuntimeField(",
+            1,
+        )[0]
+        for marker in (
+            'const runDataManagement = (tab: DataManagementTab, operation: () => Promise<unknown>, message: string | null, keepControlsEnabled = false): Promise<void> => run(operation, message, keepControlsEnabled, true, tab);',
+            'statuses={dataManagementStatuses}',
+            'onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))}',
+            'statuses.import ? <Text',
+            'statuses.export ? <Text',
+            'status={statuses.webdav}',
+            'const [dataManagementStatuses, setDataManagementStatuses] = useState<Partial<Record<DataManagementTab, string>>>({});',
+            'const publishResult = (next: string | undefined): void => {',
+            'setDataManagementStatuses((current) => ({ ...current, [dataManagementTab]: next }))',
+            'const dispatchDataManagement: Dispatch = (type, payload = {}, targetDomain = "webdav")',
+        ):
+            self.assert_ui_has(marker)
+        export_pane = workspace.split('{tab === "export"', 1)[1].split(
+            '{tab === "webdav"',
+            1,
+        )[0]
+        self.assertNotIn('{status ? <Text', export_pane)
 
     def test_import_starts_with_file_selection_while_export_defaults_to_every_section(self) -> None:
         section_block = self.ui.split("const DATA_PACKAGE_SECTIONS", 1)[1].split(
@@ -382,8 +416,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )[0]
         for marker in (
             'const [importPreview, setImportPreview] = useState<IpcResults["import_preview"]>();',
-            '!importPreview ? <View style={styles.dataManagementImportIntro}><View style={styles.dataManagementImportFileRow}><Text style={styles.dataManagementImportFileLabel}>{translate("dataManagement.importFile")}</Text>',
+            '!importPreview ? <View style={[styles.dataManagementImportIntro, dataManagementPolishStyles.importIntro]}><View style={styles.dataManagementImportFileRow}><Text style={styles.dataManagementImportFileLabel}>{translate("dataManagement.importFile")}</Text>',
             '<Text numberOfLines={1} style={styles.dataManagementImportFilePlaceholder}>{translate("dataManagement.noImportFile")}</Text>',
+            '<Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.importHint")}</Text>',
             '{importReviewReady ? <>',
             '{sectionList(detectedImportSections, importSections, busy,',
             'title={translate("dataManagement.chooseImportFile")}',
@@ -432,26 +467,31 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )[0]
         for marker in (
             'const windows = Platform.OS === "windows";',
-            '{ width: windows ? 620 : 590, height: windows ? 480 : 410 }',
-            '{ width: windows ? 560 : 540, height: windows ? 240 : 225 }',
+            '{ width: windows ? 660 : 640, height: windows ? 520 : 480 }',
+            '{ width: windows ? 640 : 620, height: windows ? 340 : 320 }',
             'const importHeight = importItemCount === 0',
-            '? windows ? 116 : 104',
+            '? windows ? 168 : 148',
             ': importItemCount <= 2',
-            '? windows ? (replacingDraftSections.length > 0 ? 210 : 180) : (replacingDraftSections.length > 0 ? 195 : 160)',
-            ': windows ? (replacingDraftSections.length > 0 ? 250 : 220) : (replacingDraftSections.length > 0 ? 235 : 195)',
-            '{ width: windows ? 520 : 500, height: importHeight }',
-            '{ width: windows ? 540 : 520, height: importHeight }',
-            '{ width: windows ? 560 : 540, height: importHeight }',
+            '? windows ? (replacingDraftSections.length > 0 ? 320 : 285) : (replacingDraftSections.length > 0 ? 305 : 270)',
+            ': windows ? (replacingDraftSections.length > 0 ? 385 : 350) : (replacingDraftSections.length > 0 ? 370 : 335)',
+            '{ width: windows ? 620 : 600, height: importHeight }',
+            '{ width: windows ? 640 : 620, height: importHeight }',
+            '{ width: windows ? 660 : 640, height: importHeight }',
             'void onResize(size.width, size.height);',
         ):
             self.assertIn(marker, workspace)
-        self.assert_ui_has('dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }')
-        self.assert_ui_has('dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }')
+        self.assert_ui_has('const dataManagementPolishStyles = StyleSheet.create({')
+        self.assert_ui_has('tabBar: { height: 42, minHeight: 42 }')
+        self.assert_ui_has('tabs: { width: 360, height: 28 }')
+        self.assert_ui_has('paneScrollContent: { flexGrow: 1, paddingTop: 14, paddingHorizontal: 12, paddingBottom: 14, gap: 14 }')
+        self.assert_ui_has('importLandingContent: { justifyContent: "center" }')
+        self.assert_ui_has('importIntro: { minHeight: 0, paddingHorizontal: 12, paddingVertical: 0, gap: 10 }')
+        self.assert_ui_has('paneHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }')
+        self.assert_ui_has('compactText: { fontSize: UI_FONT_SIZE, lineHeight: 16 }')
         self.assert_ui_has('dataManagementGroup: { gap: 6 }')
         self.assert_ui_has('dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap"')
         self.assertNotIn('dataManagementWarningPanel:', self.ui)
         self.assertNotIn('dataManagementImportEmpty:', self.ui)
-        self.assert_ui_has('dataManagementTabs: { width: 280, height: 24, alignSelf: "center"')
         self.assertNotIn('setContentSize?.("data-management", Platform.OS === "windows" ? 740 : 720', self.ui)
 
     def test_export_action_uses_the_compact_bottom_right_row(self) -> None:
@@ -463,11 +503,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{tab === "webdav"',
             1,
         )[0]
-        self.assertIn('<View style={styles.dataManagementBottomActions}>', export_pane)
+        self.assertIn('<View style={styles.dataManagementPane}>', export_pane)
+        self.assertIn('<ScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>', export_pane)
+        self.assertIn('<View style={[styles.dataManagementBottomActions, dataManagementPolishStyles.bottomActions]}>', export_pane)
+        self.assertGreater(
+            export_pane.index('<View style={[styles.dataManagementBottomActions, dataManagementPolishStyles.bottomActions]}>'),
+            export_pane.index('</ScrollView>'),
+        )
         self.assertIn('<View style={styles.dataManagementBottomMessage}>', export_pane)
         self.assertIn('title={translate("dataManagement.exportSelected")}', export_pane)
         self.assertLess(
-            export_pane.index('style={styles.dataManagementSensitiveNote}'),
+            export_pane.index('styles.dataManagementSensitiveNote, dataManagementPolishStyles.compactText'),
             export_pane.index('title={translate("dataManagement.exportSelected")}'),
         )
         self.assertIn('<ActionButton primary title={translate("dataManagement.exportSelected")}', export_pane)
@@ -477,9 +523,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'description={translate("dataManagement.exportHint")}',
         ):
             self.assertNotIn(header_tip, workspace)
-        self.assert_ui_has('dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }')
+        self.assert_ui_has('bottomActions: { minHeight: 58, flexShrink: 0, alignItems: "center", paddingHorizontal: 12, paddingTop: 10, paddingBottom: 14, borderTopWidth: 1, borderTopColor: systemColors.separator }')
         self.assert_ui_has('dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }')
-        self.assert_ui_has('dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }')
+        self.assert_ui_has('paneScrollContent: { flexGrow: 1, paddingTop: 14, paddingHorizontal: 12, paddingBottom: 14, gap: 14 }')
+        self.assert_ui_has('compactText: { fontSize: UI_FONT_SIZE, lineHeight: 16 }')
 
     def test_data_management_uses_native_preference_groups_not_web_cards(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
@@ -666,6 +713,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('setSelectedKeys((current) => ({ ...current, [tab]: undefined }));')
         self.assert_ui_has('void dispatch("logs.clear", { tab }, "logs").then(async () => {')
         self.assert_ui_has('const lineCount = clearing ? 0 : active?.line_count ?? rows.length;')
+        self.assert_ui_has('void dispatch("logs.clear_recovery_and_cooldowns", { tab }, "logs").then(async () => {')
+        self.assert_ui_has('NativeButton title={translate("logs.clearRecoveryCooldown")}')
         self.assert_ui_has('IconButton label="" symbol={paused ? "play" : "pause"}')
         self.assert_ui_has('IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs}')
         self.assertNotIn('dispatch("logs.refresh", { tab: selected }, "logs")', self.ui)
@@ -1011,10 +1060,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("style={sizedStyle}", self.native_controls)
         self.assertIn('<NativeCheckbox label={label} labelVisible={false}', self.ui)
         self.assertIn('<Text numberOfLines={2} style={styles.runtimeFieldLabel}', self.ui)
-        self.assertIn('<View style={styles.runtimeValueSlot}>{control}</View>', self.ui)
+        self.assertIn('style={[styles.runtimeValueSlot, isMultiline && styles.runtimeMultilineValueSlot]}', self.ui)
         self.assertIn('runtimeBooleanControl: { width: 24, minWidth: 24, height: 24', self.ui)
         self.assertNotIn("runtimeBooleanSlot", self.ui)
         self.assertNotIn("runtimeBooleanHelpSlot", self.ui)
+
+    def test_native_text_buttons_reserve_full_titles_after_local_styles(self) -> None:
+        """Translated command labels must not be reduced to an ellipsis."""
+        self.assertIn(
+            "return Math.max(72, Math.ceil((compact ? 32 : 38) + nativeControlTextWidth(title) * 1.15));",
+            self.native_controls,
+        )
+        self.assertIn(
+            "const titleWidth = !props.symbol ? { minWidth: nativeButtonMinimumWidth(props.title, compact), flexShrink: 0 } : undefined;",
+            self.native_controls,
+        )
+        self.assertIn(
+            "const style = [props.link ? styles.linkButton : styles.button, props.style, titleWidth];",
+            self.native_controls,
+        )
+        self.assertIn(
+            "return <AppKitButton {...buttonProps} ref={ref as never} style={[props.style, titleWidth]} />;",
+            self.native_controls,
+        )
 
     def test_settings_workspaces_keep_their_legacy_layout_roots(self) -> None:
         expected_components = {
@@ -1068,7 +1136,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function SettingsWorkspace", 1
         )[0]
         self.assertIn(
-            'identifier(item) === (selectedProvider ?? directProvider)', codex
+            'const selectedProviderID = selectedProvider ?? directProvider;', codex
         )
         self.assertIn(
             'setSelectedProvider(configuredProvider ? nextProvider : undefined)', codex
@@ -1081,7 +1149,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{ label: translate("providers.displayName"), width: 230 }', codex
         )
         self.assertIn(
-            'cells: [identifier(item), stringValue(item.name), stringValue(item.auth_mode, "none")]',
+            'cells: [providerDisplayID(item), providerDisplayName(item), stringValue(item.auth_mode, "none")]',
             codex,
         )
         self.assertNotIn(
@@ -1105,7 +1173,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             codex,
         )
         self.assertIn(
-            '<PickerField label={translate("codex.activeDeployment")} value={stringValue(structured.model)} values={deploymentModels.length > 0 ? deploymentModels',
+            '<PickerField label={translate("codex.activeDeployment")} value={displayedModel} values={deploymentModels.length > 0 ? deploymentModels',
+            codex,
+        )
+        self.assertIn(
+            'const displayedModel = modelDraft ?? stringValue(structured.model);',
             codex,
         )
         self.assertIn(
@@ -1273,8 +1345,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const latestSnapshot = useRef<CoreSnapshot | undefined>(snapshot);", self.ui)
         self.assertIn("const SETTINGS_DISK_POLL_MS = 5_000;", self.ui)
         self.assertIn("const LOG_VIEW_POLL_MS = 5_000;", self.ui)
+        self.assertIn("const RECOVERY_LOG_POLL_MS = 1_000;", self.ui)
         self.assertIn("const ONLINE_USAGE_POLL_MS = 15_000;", self.ui)
+        self.assertIn('selected === "recovery"\n      ? RECOVERY_LOG_POLL_MS', self.ui)
         self.assertIn('selected === "online-usage" ? ONLINE_USAGE_POLL_MS : LOG_VIEW_POLL_MS', self.ui)
+        self.assertIn("const next = await ipc.diskState(monitoredDiskDomains);", self.ui)
+        self.assertIn("const refreshed = await ipc.snapshot();", self.ui)
+        disk_watcher = self.ui.split("const monitoredDiskDomains = useMemo", 1)[1].split("const discardPendingFields", 1)[0]
+        self.assertNotIn("const next = await ipc.snapshot();", disk_watcher)
         self.assertIn("const diskStateChanged = monitoredDiskDomains.some", self.ui)
         self.assertIn("function sameDiskState(left: DiskState | undefined, right: DiskState | undefined)", self.ui)
         self.assertIn("if (!previous || diskStateChanged)", self.ui)
@@ -1282,7 +1360,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("revision.current = Math.max(revision.current ?? -1, next.revision);", self.ui)
         self.assertIn("This timer exists to observe external file changes", self.ui)
 
-    def test_raw_editors_surface_codemirror_loading_staging_and_failures_without_replacing_the_editor(self) -> None:
+    def test_raw_editors_surface_loading_staging_and_failures_without_replacing_the_editor(self) -> None:
         raw_editor = self.ui.split("function RawEditor(", 1)[1].split("function modelProbePresentation", 1)[0]
 
         self.assertIn("const [draft, setDraft] = useState(\"\");", raw_editor)
@@ -1314,43 +1392,39 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('setDocumentKey([domain, document].join(":"));', raw_editor)
         self.assertNotIn('setDocumentKey("")', raw_editor)
         self.assertIn("draftRef.current = text;", raw_editor)
+        self.assertIn("normalizeEditorText(text) === normalizeEditorText(draftRef.current)", raw_editor)
+        self.assertIn("!initializedRef.current", raw_editor)
         self.assertNotIn("setDraft(text)", raw_editor)
         self.assertIn("onChange={(text) => {", raw_editor)
-        self.assertIn("}, 450);", raw_editor)
+        self.assertIn("const RAW_EDITOR_SYNC_INTERVAL_MS = 120;", self.ui)
+        self.assertIn("void stageLatest(false).catch(() => undefined);", raw_editor)
+        self.assertIn("}, RAW_EDITOR_SYNC_INTERVAL_MS);", raw_editor)
         self.assertNotIn("`+${diff.added}  ~${diff.changed}  -${diff.deleted}`", raw_editor)
         self.assertIn('style={styles.rawEditorOverlay}', raw_editor)
         self.assertIn('disabled={reloadDisabled} onPress={reloadEditor}', raw_editor)
         self.assertNotIn("NativeSecureTextEditor", raw_editor)
 
-    def test_codemirror_enables_indentation_line_numbers_syntax_highlighting_and_live_diff_sidebar(self) -> None:
+    def test_code_editor_preserves_language_diff_and_host_contract(self) -> None:
         for marker in (
-            'import { Compartment, EditorState, Text } from "@codemirror/state";',
-            'import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";',
-            'import { toml } from "@codemirror/legacy-modes/mode/toml";',
-            'import { json } from "@codemirror/lang-json";',
-            'import { presentableDiff } from "@codemirror/merge";',
-            "const editorSetup = [",
-            "lineNumbers(),",
-            "syntaxHighlighting(defaultHighlightStyle, { fallback: true }),",
-            "EditorView.lineWrapping,",
-            '".cm-lineNumbers .cm-gutterElement": {',
-            "keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),",
-            "if (language === \"json\") return json();",
-            "if (language === \"toml\") return StreamLanguage.define(toml);",
-            'fontSize: "12px",',
-            'overflowY: "auto",',
-            'userSelect: "text",',
-            'WebkitUserSelect: "text",',
-            "const DIFF_CONFIG = { scanLimit: 2_000, timeout: 16 } as const;",
-            "const CHANGE_DEBOUNCE_MS = 40;",
-            "const DIFF_DEBOUNCE_MS = 120;",
-            "changeTimer = window.setTimeout(() => {",
-            "post({",
-            "}, CHANGE_DEBOUNCE_MS);",
-            "presentableDiff(original.toString(), current.toString(), DIFF_CONFIG)",
-            "if (diffTimer !== undefined) window.clearTimeout(diffTimer);",
-            "diffTimer = window.setTimeout(() => {",
-            "}, DIFF_DEBOUNCE_MS);",
+            'import "ace-builds/src-noconflict/ace";',
+            'import "ace-builds/src-noconflict/mode-json";',
+            'import "ace-builds/src-noconflict/mode-toml";',
+            'import "ace-builds/src-noconflict/ext-searchbox";',
+            'type EditorLanguage = "json" | "toml" | "text";',
+            "type ReplaceDocumentCommand = {",
+            'type SetBaselineCommand = { type: "setBaseline"; baseline: string };',
+            'type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | { type: "focus" };',
+            "type AceSession = {",
+            "type AceEditor = {",
+            "type AceApi = { edit: (element: HTMLElement, options?: Record<string, unknown>) => AceEditor };",
+            "const CHANGE_SYNC_INTERVAL_MS = 16;",
+            "if (changeTimer !== undefined) return;",
+            "}, CHANGE_SYNC_INTERVAL_MS);",
+            "const DIFF_LCS_CELL_LIMIT = 1_000_000;",
+            "function diffHunks(before: string[], after: string[]): DiffHunk[]",
+            "function computeDiff(): ComputedEditorDiff",
+            "function renderDiffSidebar(): void",
+            "function queueDiffSidebar(): void",
             'const diffSidebar = document.getElementById("diff-sidebar");',
             'const diffSidebarList = document.getElementById("diff-sidebar-list");',
             "const DIFF_SIDEBAR_ENTRY_LIMIT = 24;",
@@ -1359,24 +1433,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'item.className = `diff-sidebar-item diff-sidebar-item-${entry.kind}`;',
             'appendDiffPreview(item, "−", entry.before, "diff-sidebar-code-before");',
             'appendDiffPreview(item, "+", entry.after, "diff-sidebar-code-after");',
-            "languageConfiguration.reconfigure(languageExtension(command.language))",
-            "editabilityConfiguration.reconfigure([",
-            "if (!editor || applyingHostUpdate) return;",
+            "function modeForLanguage(language: EditorLanguage): string",
+            'if (language === "json") return "ace/mode/json";',
+            'if (language === "toml") return "ace/mode/toml";',
+            "function configureEditor(command: ReplaceDocumentCommand): void",
+            "aceEditor.session.setUseWorker(false);",
+            "function createEditor(command: ReplaceDocumentCommand): void",
+            "aceEditor = aceApi.edit(",
+            'aceEditor.session.on("change", reportChange);',
+            "function replaceDocument(command: ReplaceDocumentCommand): void",
+            "const summary = computeDiff();",
+            'post({ type: "change", text: aceEditor.getValue(), added: summary.added, changed: summary.changed, deleted: summary.deleted });',
+            'post({ type: "ready", documentKey: activeDocumentKey });',
             'const editorScrollbar = document.getElementById("editor-scrollbar");',
-            'editor.scrollDOM.addEventListener("scroll", queueEditorScrollbar, { passive: true });',
-            "scrollbarObserver = new ResizeObserver(queueEditorScrollbar);",
             'scrollTrack.addEventListener("pointerdown", (event) => {',
             "scrollEditorFromPointer(event.clientY, grabOffset);",
-            'post({ type: "ready", documentKey: activeDocumentKey });',
         ):
             self.assertIn(marker, self.code_editor_web)
         for marker in (
-            "unifiedMergeView({",
-            "highlightChanges: true,",
-            "allowInlineDiffs: true,",
-            '".cm-changedLine": {',
-            'import { basicSetup } from "codemirror";',
-            "editor?.destroy();",
             "diffSummaryElement",
         ):
             self.assertNotIn(marker, self.code_editor_web)
@@ -1401,21 +1475,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("#diff-summary", self.code_editor_wrapper)
         self.assertIn("window.webkit?.messageHandlers?.litellmCodeEditor", self.code_editor_web)
         self.assertIn("window.chrome?.webview?.postMessage", self.code_editor_web)
+        package = json.loads((ROOT / "rn/package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["dependencies"].get("ace-builds"), "1.44.0")
         self.assertIn("<NativeCodeWebView", self.code_editor_wrapper)
         self.assertIn("window.LiteLLMCodeEditorInitialCommand", self.code_editor_wrapper)
         self.assertIn("const [initialHtml] = React.useState(() => codeEditorHtml({", self.code_editor_wrapper)
         self.assertIn("Rebuilding the HTML for every document-key change reloads", self.code_editor_wrapper)
         self.assertNotIn("const initialHtml = React.useMemo", self.code_editor_wrapper)
         self.assertIn("html={initialHtml}", self.code_editor_wrapper)
-        package = (ROOT / "rn/package.json").read_text(encoding="utf-8")
-        for dependency in (
-            '"@codemirror/commands"',
-            '"@codemirror/lang-json"',
-            '"@codemirror/legacy-modes"',
-            '"@codemirror/merge"',
-            '"@codemirror/view"',
-        ):
-            self.assertIn(dependency, package)
         bundler = (ROOT / "rn/scripts/build-code-editor.mjs").read_text(encoding="utf-8")
         self.assertIn("entryPoints: [source]", bundler)
         self.assertIn('format: "iife"', bundler)
@@ -1507,6 +1574,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "runtimeFieldLabel:",
             'runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }',
             "runtimeValueSlot:",
+            "runtimeMultilineInputRow:",
+            "runtimeMultilineValueSlot:",
+            "runtimeMultilineActionSlot:",
+            'kind === "json"',
+            "multiline plainText autoCommit",
+            "nativeSecretTextArea:",
             "runtimeUnit:",
             "runtimeActionSlot:",
             "runtimeHelpSlot:",
@@ -1551,9 +1624,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # index. Resolve that index through the raw value so "默认" never
         # becomes the persisted API-key identifier.
         for marker in (
-            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
-            '() => provider ? providerKeyChoices(provider, relaySources) : [],',
-            '() => fetchKeyChoices.map((choice) => ({ value: choice.id, label: providerKeyChoiceLabel(choice, translate) })),',
+            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): ProviderKeyChoice[] {',
+            '() => provider ? providerKeyChoices(provider, relaySources, providerBaseURL(provider)) : [],',
+            'label: providerKeyChoiceLabel({ ...choice, name: providerKeyDisplayName(providerId, choice.id, choice.name) }, translate),',
             'const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value);',
             'const providerKeyOptions = [...keyStates.map((key) => ({',
             'value={selectedProviderKey?.id ?? providerKeyOptions[0]?.value ?? ""}',
@@ -1727,6 +1800,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
         self.assertIn('"logs.recovery": "恢复 / 冷却"', self.zh)
+        self.assertIn('"logs.clearRecoveryCooldown": "重置恢复和冷却"', self.zh)
         self.assertIn('"logs.recoveryStatus.cooldown": "冷却中"', self.zh)
 
     def test_menu_logs_do_not_repeat_actions_as_detail(self) -> None:
@@ -1824,16 +1898,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_relay_manager_restores_sessions_and_refreshes_resources_on_open(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
-        self.assertIn("const detected = await detectRelayType();", relay)
+        self.assertIn("const detected = chosenStation?.type || manualType ? undefined : await detectRelayType();", relay)
         self.assertIn('refreshResources: (accountId: string) => Promise<"ready" | "unavailable">;', relay)
-        self.assertIn("await refreshResources(account.id);", relay)
+        self.assertIn("resourceStatus = await refreshAccountResources(account, silent);", relay)
+        self.assertIn("const setupControlsBusy = controlsBusy || loginBusy;", relay)
+        self.assertIn("const [accountLoading, setAccountLoading]", relay)
+        self.assertIn('translate("relay.status.loading")', relay)
+        self.assertIn("selectedLoading.resources", relay)
+        self.assertNotIn("controlsBusy && styles.loadingSurface]", relay)
         self.assertIn('title={translate("common.refresh")}', relay)
         self.assertNotIn('translate("relay.refreshResources")', relay)
         self.assertIn('account.loginStatus === "signed_in" ? translate("relay.resourcesNotLoaded")', relay)
         self.assertIn('case "login_expired": return translate("relay.resourcesLoginExpired")', relay)
         self.assertNotIn('title={translate("relay.importSelected")}', relay)
-        self.assertIn("const accountType = detected ?? manualType;", relay)
-        self.assertIn("account = await addAccount(accountType, candidate, passwordStorageAvailable && rememberPasswordRef.current, {", relay)
+        self.assertIn("const accountType = chosenStation?.type ?? manualType ?? detected ?? detectedAddType;", relay)
+        self.assertIn("account = await addAccount(accountType, candidate, false, chosenStation ? {", relay)
         self.assertIn("await deleteAccount(account);", relay)
         self.assertIn("const beforeRelayState = asRecord(beforeRelay.state);", self.ui)
         self.assertIn("const existingIDs = new Set(beforeRelayAccounts.map((item) => stringValue(item.id)).filter(Boolean));", self.ui)
@@ -1842,6 +1921,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("stationOriginKey(stringValue(item.origin)) === originKey && item.type === type", self.ui)
         self.assertIn("NativePicker", relay)
         self.assertIn('title={translate("relay.next")}', relay)
+        self.assertIn('disabled={setupControlsBusy || !origin.trim() || !addStationName.trim()}', relay)
+        self.assertIn('disabled={setupControlsBusy || Boolean(selectedAddStation?.type)}', relay)
+        self.assertIn('setOrigin("");\n      setAddStationName("");', relay)
         self.assertNotIn('title={translate("relay.importSelected")}', relay)
         self.assertNotIn("NativeSegmentedControl", relay)
         self.assertNotIn("const restorationAttempts", relay)
@@ -1882,8 +1964,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('title={translate("common.save")}', relay)
         self.assertIn('onBlur={() => { if (!disabled) void onNameCommit(); }}', relay)
         self.assertIn('onNameCommit={() => runApiKeyAction("update", selectedResource.id)}', relay)
-        self.assertIn('onBlur={() => { if (!controlsBusy) void stageStationUpdate(); }}', relay)
-        self.assertIn('void stageStationUpdate({ type: nextType });', relay)
+        self.assertIn('onBlur={() => { if (!controlsBusy) void stageStationUpdate(selectedStation.id); }}', relay)
+        self.assertIn('void stageStationUpdate(selectedStation.id, { type: nextType });', relay)
         self.assertIn('translate("relay.stationUpdateStaged")', relay)
         apply_body = self.ui.split('const apply = (): Promise<void> => {', 1)[1].split('const applyDataManagement', 1)[0]
         self.assertIn('await dispatchQueue.current;', apply_body)
@@ -1892,7 +1974,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_relay_model_names_are_explicit_and_expandable(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
 
-        self.assertIn('const INLINE_MODEL_LIMIT = 12;', relay)
+        self.assertIn('const INLINE_MODEL_LIMIT = 5;', relay)
         self.assertIn('function visibleResourceModels(resource: RelayResource, showAll: boolean): string[] {', relay)
         self.assertIn('models.join("\\n")', relay)
         self.assertIn('"relay.showAllModels"', relay)
@@ -1932,7 +2014,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function accountStationLabel(account: RelayAccount): string {",
             "const relayTableRows = useMemo(() => stations.flatMap((station) => {",
             'key: `station:${station.id}`',
-            'cells: [stationLabel, ""]',
+            'const rows: Array<{ key: string; cells: string[] }> = [{',
+            'cells: [stationDisplay(station), translate("relay.station")]',
             'key: `account:${account.id}`',
             'cells: [`  ${accountDisplayName(account, translate)}`',
             "const stageStationUpdate = async",
@@ -1940,18 +2023,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "sidebarAddButton:",
             'symbol="minus"',
             "NativeTable",
-            'columns={[{ label: translate("relay.accounts"), width: 118 }, { label: translate("relay.balance"), width: 78 }]}',
+            'columns={[{ label: translate("common.name"), width: 118 }, { label: translate("relay.balance"), width: 78 }]}',
             "onSelectionChange={selectRelayTableRow}",
             "nativeRelayTable:",
             "nativeRelayTable:",
             "selectedStation",
             "selectedStationID",
-            "stationDetailContent:",
+            "stationHeader:",
+            "stationHeaderMetrics:",
+            'translate("relay.stationAccountCount", { count: selectedStationAccounts.length })',
+            'translate("relay.stationKeyCount", { count: selectedStationResourceCount })',
             "stationSettingsForm:",
             "stationSettingsRow:",
             "stationSettingsFeedback:",
             'translate("relay.stationUpdateStaged")',
-            'const INLINE_MODEL_LIMIT = 12;',
+            'const INLINE_MODEL_LIMIT = 5;',
             'function visibleResourceModels(resource: RelayResource, showAll: boolean): string[] {',
             'models.join("\\n")',
             'relay.showAllModels',
@@ -1978,10 +2064,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "accountFacts",
             "accountIdentity",
             "resourceEmptyText",
-            'accountStationLabel(selected)',
+            'accountStationDisplay(selected)',
             'translate("relay.balance")',
             'title={translate("relay.addAccount")}',
-            'typeDetection === "unknown" ? <FormRow label={translate("relay.type")}',
+            'disabled={setupControlsBusy || Boolean(selectedAddStation?.type)}',
             'scrollTrailingColumnOverflow={false}',
         ):
             self.assertIn(marker, relay)
@@ -2002,7 +2088,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "resourceNativeTable:",
             'columns={[{ label: translate("common.name"), width: 116 }, { label: translate("relay.apiKeyGroup"), width: 124 }, { label: translate("relay.apiKeyMultiplier"), width: 64 }]}',
             "resourceInspectorPane: { width: 266",
-            "resourceInspectorLabel: { width: 78",
+            "resourceInspectorLabel: { width: 54",
         ):
             self.assertIn(marker, relay)
         self.assertRegex(
@@ -2075,6 +2161,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("onSelectionChange={selectRelayTableRow}", relay)
         self.assertIn('if (kind === "station") selectStation(id);', relay)
         self.assertIn('const separator = key.indexOf(":");', relay)
+        self.assertNotIn("spanning: true", relay)
         self.assertNotIn('key: `station:${station.id}`,\n      cells: [stationLabel, ""],\n      spanning: true,', relay)
         self.assertIn("style={styles.nativeRelayTable}", relay)
         self.assertIn("export function normalizeRelayOrigin(value: string): string {", relay_origin)
@@ -2093,8 +2180,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("resourceColumnStatus", relay)
         self.assertNotIn("resourceKeyStatus", relay)
         self.assertNotIn("native.showActionMenu", relay)
-        self.assertIn('selected.resourceError === "no_api_keys" && !resourceBusy && !restoreBusy', relay)
-        self.assertIn('resourceBusy || restoreBusy ? translate("relay.resourcesChecking") : resourceHint(selected, translate)', relay)
+        self.assertIn('selected.resourceError === "no_api_keys" && !selectedLoading.resources && !selectedLoading.session', relay)
+        self.assertIn('selectedLoading.resources || selectedLoading.session ? translate("relay.resourcesChecking") : resourceHint(selected, translate)', relay)
         self.assertNotIn('translate("relay.resourceCount"', relay)
         self.assertIn('"relay.apiKeyGroup": "分组"', self.zh)
         self.assertIn('"relay.apiKeyMultiplier": "倍率"', self.zh)
@@ -2152,26 +2239,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'return (["relay_accounts", "providers_models"] as const).filter',
             'function relaySourcesForBaseUrl(',
-            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
+            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): ProviderKeyChoice[] {',
             'function ProviderSourceFields(',
             'function relayStationsFromSnapshot(',
             'const providerType = stringValue(provider.provider_type, "custom") === "relay" ? "relay" : "custom";',
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: nextStationID })',
             'const matchingRelaySources = relaySourcesForBaseUrl(',
-            '() => provider ? providerKeyChoices(provider, relaySources) : [],',
-            'const keyChoices = useMemo(() => providerKeyChoices(provider, relaySources), [provider, relaySources]);',
+            '() => provider ? providerKeyChoices(provider, relaySources, providerBaseURL(provider)) : [],',
+            'const keyChoices = useMemo(() => providerKeyChoices(provider, relaySources, providerBaseUrl), [provider, providerBaseUrl, relaySources]);',
             'const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";',
             'dispatch("model.select_relay_resource"',
-            'changes: { provider_key_id: providerKey.id, api_key_name: providerKey.name },',
+            'const providerKeyName = drafts?.providerKeyDisplayName(providerId, providerKey.id, providerKey.name) ?? providerKey.name;',
+            'changes: { provider_key_id: providerKey.id, api_key_name: providerKeyName },',
             'providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")}',
             'hint={translate("providers.relayKeyValueHint")}',
             'disabled domain="relay_accounts" field="api_key" target={relaySecretTarget}',
             '<TextField label={translate("providers.keyValue")} labelWidth={68} value={translate("providers.relayKeyValueHint")} disabled',
             'modelOrderMode(activeRoute.model) === "relay_multiplier"',
-            'function modelRelayMultiplier(model: UnknownRecord, provider: UnknownRecord, relaySources: RelaySourceOption[]): number | undefined {',
-            'label: translate("providers.effectiveOrder")',
-            'value={relayMultiplier === undefined ? translate("common.notAvailable") : `${relayMultiplier}x`}',
-            'label: translate("providers.orderSource")',
+            'const canFollowMultiplier = usesRelayKey && relayMultiplier !== undefined;',
+            'label={translate("providers.order")}',
+            'label={translate("providers.followMultiplier")}',
+            '{canFollowMultiplier ? <NativeCheckbox',
             'result.status === "partial"',
             'result.status === "failed"',
             'setIssues(applyIssuesForDisplay(value));',
@@ -2294,7 +2382,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'resourceInspectorHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }',
             '<Text numberOfLines={1} style={styles.resourceInspectorSubtitle}>{selectedResourceGroupLabel}</Text>',
             'pendingCleanupList: { maxHeight: 116',
-            '<ScrollView style={styles.pendingCleanupList} contentContainerStyle={styles.pendingCleanupListContent}>',
+            '<ScrollView style={styles.pendingCleanupList} contentContainerStyle={styles.pendingCleanupListContent}',
             'pendingCleanup: { minHeight: 30, flexDirection: "row", flexWrap: "wrap"',
         ):
             self.assertIn(marker, relay, marker)
@@ -2313,7 +2401,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         setup = relay.split('<View style={[styles.formSection, setupOnly && styles.setupFormSection]}>', 1)[1].split('</View>', 1)[0]
 
-        self.assertLess(setup.index('label={translate("relay.stationChoice")}'), setup.index('label={translate("relay.origin")}'))
+        self.assertLess(setup.index('label={translate("relay.station")}'), setup.index('label={translate("relay.origin")}'))
         self.assertLess(setup.index('label={translate("relay.origin")}'), setup.index('label={translate("relay.stationName")}'))
         self.assertIn('const steps = [translate("relay.setupStepStation"), translate("relay.stepSignIn")];', relay)
         self.assertIn('setupContent: { justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }', relay)
@@ -2328,7 +2416,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.modelCount": "Count"', self.en)
         self.assertIn('"providers.modelCount": "模型数"', self.zh)
         self.assertNotIn('"providers.routeSource"', self.zh)
-        self.assertIn('"providers.effectiveOrder": "有效顺序"', self.zh)
+        self.assertIn('"providers.order": "顺序"', self.zh)
+        self.assertIn('"providers.followMultiplier": "跟随倍率"', self.zh)
+        self.assertNotIn('"providers.effectiveOrder"', self.zh)
         self.assertIn('"providers.keyName": "密钥名"', self.zh)
         self.assertIn('"providers.keyValue": "密钥值"', self.zh)
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 88 }, { label: translate("providers.modelCount"), width: 64 }]}')
@@ -2394,14 +2484,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )[0]
         for marker in (
             "function WebDavWorkspace(",
-            '{tab === "webdav" ? <ScrollView style={styles.dataManagementWebDavPane} contentContainerStyle={styles.dataManagementWebDavContent}>',
-            '<WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} status={status} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={onProbeWebDav} hasChanges={hasWebDavChanges || hasPendingChanges} onApply={onApplyWebDav}>',
+            '{tab === "webdav" ? <View style={[styles.dataManagementWebDavPane, styles.dataManagementWebDavContent, dataManagementPolishStyles.webDavContent]}>',
+            '<WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={onProbeWebDav} hasChanges={hasWebDavChanges || hasPendingChanges} onApply={onApplyWebDav}>',
             '<NativeCheckbox label={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => dispatch("patch", { enabled })} style={styles.webdavEnabledControl} />',
             "webdavStateRow:",
             "webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: \"flex-start\" }",
             "webdavStateStatus:",
             "webdavFormBody:",
-            'webdavFormRows: { width: "60%", gap: 5 }',
+            'webDavFormRows: { width: "100%", maxWidth: 560, gap: 7 }',
             "dataManagementWebDavPane:",
             "dataManagementWebDavContent:",
             'label={translate("webdav.url")}',
@@ -2427,13 +2517,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(1, workspace.count("<WebDavWorkspace "))
         self.assertNotIn('title={translate("dataManagement.syncSettings")}', workspace)
         self.assertNotIn('dataManagementGroupDivider', workspace)
-        self.assertIn('<View style={styles.webdavSyncArea}>{children}</View>', self.ui)
-        self.assertIn('webdavActionRow: { minHeight: 32, flexDirection: "row"', self.ui)
+        self.assertIn('<View style={[styles.webdavSyncArea, dataManagementPolishStyles.webDavSyncArea]}>{children}</View>', self.ui)
+        self.assertIn('webDavSyncArea: { borderTopWidth: 0, paddingTop: 4, marginTop: 2 }', self.ui)
+        self.assertIn('webDavActionRow: { borderTopWidth: 0, paddingTop: 4, marginTop: 10 }', self.ui)
         self.assertIn('webdavActionSpacer: { flex: 1 }', self.ui)
         self.assertNotIn('webdavHeaderActions:', self.ui)
         webdav_component = self.ui.split("function WebDavWorkspace(", 1)[1].split("function WebDavPasswordField(", 1)[0]
         self.assertLess(webdav_component.index('title={translate("dataManagement.testConnection")}'), webdav_component.index('title={translate("common.saveAndApply")}'))
-        self.assertGreater(webdav_component.index('title={translate("dataManagement.testConnection")}'), webdav_component.index('<View style={styles.webdavSyncArea}>{children}</View>'))
+        self.assertGreater(webdav_component.index('title={translate("dataManagement.testConnection")}'), webdav_component.index('<View style={[styles.webdavSyncArea, dataManagementPolishStyles.webDavSyncArea]}>{children}</View>'))
         self.assertNotIn("dataManagementSectionGrid:", self.ui)
         self.assertIn("footerCompact:", self.ui)
         self.assertNotIn("dataManagementRelayRow:", self.ui)
@@ -2455,18 +2546,22 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
 
-    def test_text_fields_mark_apply_immediately_and_stage_after_a_short_idle(self) -> None:
+    def test_text_fields_keep_active_typing_local_and_project_dependent_views(self) -> None:
         for marker in (
             "function usePendingTextField(",
             "setDirty(next !== committedRef.current || commitInFlight.current !== undefined);",
-            "}, 240);",
+            "void commit().catch(() => undefined);",
             "void field.commit().catch(() => undefined);",
             "hasPendingFieldEdits())",
             "registry?.setDirty(fieldId.current, true);",
+            "const SECRET_INPUT_COMMIT_DEBOUNCE_MS = 150;",
             "const secretDebounceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);",
             "if (autoCommit) {",
-            "}, 240);",
+            "}, SECRET_INPUT_COMMIT_DEBOUNCE_MS);",
             "state.status === \"saved\" || state.status === \"ready\" || state.status === \"error\"",
+            "refreshAfter = true",
+            "if (refreshAfter) await refresh();",
+            "}, null, true);",
             "function WebDavPasswordField(",
             'isDirty: () => dirtyRef.current',
             "<NativeSecretField plainText autoCommit label={translate(\"common.apiKey\")}",
@@ -2476,8 +2571,49 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'structuredForm: { gap: 6 }',
         ):
             self.assert_ui_has(marker)
+        pending_hook = self.ui.split("function usePendingTextField(", 1)[1].split("function RuntimeValueField", 1)[0]
+        self.assertIn("if (!dirtyRef.current) {\n      committedRef.current = value;", pending_hook)
+        self.assertIn("onDraftChangeRef.current?.(next);", pending_hook)
+        self.assertIn("if (dirtyRef.current) void commit().catch(() => undefined);", pending_hook)
+        self.assertNotIn("debounceTimer", pending_hook)
+        self.assertNotIn("setTimeout(", pending_hook)
+        self.assertIn("onDraftChange={onNameDraftChange}", self.ui)
+        self.assertIn("drafts?.providerDisplayName(provider)", self.ui)
+        self.assertIn("setProviderNameDraft", self.ui)
+        self.assertIn("ProviderWorkspaceDraftContext", self.ui)
+        self.assertIn("const [providerNameDrafts, setProviderNameDrafts] = useState<Record<string, string>>({});", self.ui)
+        self.assertIn("function providerModelDraftKey(providerID: string, modelID: string)", self.ui)
+        self.assertIn("key={`model:${providerId}:${editorIdentifier(model)}`}", self.ui)
+        self.assertIn('cells: [providerDisplayName(item), String(asRecords(item.models).length', self.ui)
+        self.assertIn('cells: [modelDisplayName(providerId, item), modelUpstreamDisplay(providerId, item)', self.ui)
+        self.assertIn(r'cells: [`\t${providerDisplayName(entry.provider)}`', self.ui)
+        self.assertIn("modelUpstreamDisplay", self.ui)
+        self.assertIn("providerKeyDisplayName", self.ui)
+        self.assertIn('value={drafts?.providerKeyDisplayName(id, selectedChoice.id, selectedChoice.name)', self.ui)
+        self.assertIn("providerFieldDrafts", self.ui)
+        self.assertIn("const providerFieldDraftsRef = useRef(providerFieldDrafts);", self.ui)
+        self.assertIn("value={providerDisplayID(provider)}", self.ui)
+        self.assertIn("value={providerDisplayName(provider)}", self.ui)
+        self.assertIn("const draft = providerFieldDraftsRef.current[currentProviderId] ?? {};", self.ui)
+        self.assertIn("onDraftChange={setModelDraft}", self.ui)
+        self.assertIn('cells: [providerDisplayID(item), providerDisplayName(item), stringValue(item.auth_mode, "none")]', self.ui)
+        self.assertIn('value={displayedModel}', self.ui)
+        self.assertNotIn("const INPUT_SYNC_INTERVAL_MS", self.ui)
+        self.assertNotIn("const INPUT_COMMIT_DEBOUNCE_MS", self.ui)
+        self.assertNotIn("void commit(false).catch(() => undefined);", self.ui)
         appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
         native_controls = (ROOT / "rn/packages/shared/src/ui/NativeControls.tsx").read_text(encoding="utf-8")
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        self.assertIn("apiKeyNameDrafts[resource.id] !== undefined", relay)
+        self.assertIn("const apiKeyNameDraftsRef = useRef(apiKeyNameDrafts);", relay)
+        self.assertIn("apiKeyNameDraftsRef.current[resourceID as string]", relay)
+        self.assertIn("apiKeyNameDraftsRef.current = updated;", relay)
+        self.assertIn("resourceDisplayName(resource)", relay)
+        self.assertIn('const [stationDrafts, setStationDrafts] = useState<Record<string, StationDraft>>({});', relay)
+        self.assertIn("const projectedStation = (station: RelayStation): RelayStation => {", relay)
+        self.assertIn("cells: [stationDisplay(station), translate(\"relay.station\")]", relay)
+        self.assertIn("accountStationDisplay(selected)", relay)
+        self.assertIn("onChangeText={(value) => setStationDraft(selectedStation.id, { name: value })}", relay)
         self.assertIn("textField: { minHeight: 24 }", appkit_controls)
         self.assertIn("compact = true", native_controls)
         self.assertNotIn("providers.apiKeyHint", self.ui)
@@ -2500,7 +2636,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const [settingsRawReloadToken, setSettingsRawReloadToken] = useState(0);",
             "const [settingsRawBaselineToken, setSettingsRawBaselineToken] = useState(0);",
             'if (reloadDomain === "codex" || reloadDomain === "claude") setSettingsRawBaselineToken((current) => current + 1);',
-            'if ((next.disk[diskDomain]?.generation ?? 0) > priorGeneration && !next.disk[diskDomain]?.changed && (diskDomain === "codex" || diskDomain === "claude"))',
+            'if ((currentDisk[diskDomain]?.generation ?? 0) > priorGeneration && !currentDisk[diskDomain]?.changed && (diskDomain === "codex" || diskDomain === "claude"))',
             "await flushPendingFields();",
             "reloadToken={rawReloadToken}",
             "baselineToken={rawBaselineToken}",

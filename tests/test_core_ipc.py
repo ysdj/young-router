@@ -112,19 +112,20 @@ class CoreProtocolTests(unittest.TestCase):
 
         with (
             mock.patch.object(core_main.os, "getppid", side_effect=direct_parent),
-            mock.patch.object(core_main.CoreStore, "with_default_domains", return_value=FakeCore()),
+            mock.patch.object(core_main.CoreStore, "with_default_domains", return_value=FakeCore()) as create_core,
             mock.patch.object(core_main, "CoreIPCServer", FakeServer),
             mock.patch.object(core_main.signal, "signal"),
         ):
             self.assertEqual(0, core_main.run(["--parent-pid", "4321"]))
 
         self.assertEqual(["server.start", "core.shutdown", "server.stop"], events)
+        self.assertTrue(create_core.call_args.kwargs["reset_transient_routing_state"])
 
     def test_shared_schema_matches_python_and_typescript_method_contract(self) -> None:
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])
         self.assertEqual(
-            ["snapshot", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
+            ["snapshot", "disk_state", "logs", "editor", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
             schema["methods"],
         )
         typescript = (
@@ -168,6 +169,7 @@ class CoreProtocolTests(unittest.TestCase):
     def test_runtime_enforces_every_method_params_schema(self) -> None:
         valid = {
             "snapshot": {},
+            "disk_state": {"domains": ["codex", "claude"]},
             "logs": {"tab": "requests"},
             "editor": {"domain": "codex", "document": "config"},
             "dispatch": {"action": {"type": "set", "domain": "language", "payload": {}}},
@@ -182,6 +184,7 @@ class CoreProtocolTests(unittest.TestCase):
         }
         invalid = {
             "snapshot": {"stale": True},
+            "disk_state": {"domains": []},
             "logs": {"tab": "unknown"},
             "editor": {"domain": "runtime", "document": "config"},
             "dispatch": {"action": {"type": "", "unexpected": True}},
@@ -233,6 +236,7 @@ class CoreProtocolTests(unittest.TestCase):
     def test_runtime_enforces_every_method_result_schema(self) -> None:
         valid = {
             "snapshot": {"snapshot": {}},
+            "disk_state": {"revision": 0, "disk": {}},
             "logs": {"changed": True, "revision": 1, "log": {"tab": "requests", "available": False, "paused": False, "line_count": 0, "records": [], "filter": "", "limit": 10000}},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0, "text": "model = \"example\"\n"},
             "dispatch": {"revision": 0},
@@ -255,6 +259,7 @@ class CoreProtocolTests(unittest.TestCase):
         }
         invalid = {
             "snapshot": {"snapshot": []},
+            "disk_state": {"revision": -1, "disk": {}},
             "logs": {"changed": "yes", "revision": 1, "log": None},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0},
             "dispatch": {"revision": -1},
@@ -1600,6 +1605,8 @@ class CoreIPCTests(unittest.TestCase):
         # The bootstrap credential is intentionally one-shot.
         client = CoreIPCClient(endpoint, server.bootstrap_token)
         self.assertEqual("system", client.call("snapshot")["snapshot"]["language"])
+        disk_state = client.call("disk_state", {"domains": ["language"]})
+        self.assertEqual({"language"}, set(disk_state["disk"]))
         second = CoreIPCClient(endpoint, server.bootstrap_token)
         with self.assertRaises(Exception):
             second.call("snapshot")

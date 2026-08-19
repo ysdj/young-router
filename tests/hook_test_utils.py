@@ -21,6 +21,7 @@ HOOK_MODULE_NAMES = (
     "base",
     "api_base",
     "request_context",
+    "reasoning",
     "codex_fast_tier",
     "trace",
     "log_rotation",
