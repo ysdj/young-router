@@ -7,6 +7,7 @@ from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_surfaces as _responses_surfaces_module
+from . import responses_tools as _responses_tools_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
@@ -22,6 +23,7 @@ from .base import (
     _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
     _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
     _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
+    _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
     _RouteOrder,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_FALLBACK_REASON_KEY,
@@ -63,6 +65,82 @@ def _chat_completion_message_text(response: Any) -> str:
 
 def _chat_stream_usage(chunk: Any) -> Any:
     return _chat_stream_object_get(chunk, "usage")
+
+
+def _forced_tool_choice_auto_retry_kwargs(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> Optional[dict]:
+    """Build one same-surface retry after an explicit forced-choice rejection."""
+
+    if not _routing_module._is_forced_tool_choice_auto_retry_error(
+        exception,
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return None
+    if not isinstance(request_kwargs, dict):
+        return None
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "litellm_metadata",
+    ) or {}
+    if metadata.get("responses_forced_tool_choice_auto_retry") is True:
+        return None
+    _routing_module._mark_protocol_fallback_relax_tool_choice(request_kwargs)
+    _routing_module._mark_protocol_fallback_relax_tool_choice(
+        outer_request_kwargs
+    )
+    retry_kwargs = request_kwargs.copy()
+    retry_kwargs["tool_choice"] = "auto"
+    for container_key in ("extra_body", "litellm_params"):
+        container = request_kwargs.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        retry_container = container.copy()
+        # The request normalizers may mirror a forced choice into one of
+        # LiteLLM's nested parameter containers.  Leaving that stale mirror
+        # in place can make the upstream still see a named choice even after
+        # the top-level retry is explicitly ``auto``.
+        retry_container.pop("tool_choice", None)
+        retry_container.pop("function_call", None)
+        retry_kwargs[container_key] = retry_container
+    retry_metadata = metadata.copy()
+    retry_metadata["responses_forced_tool_choice_auto_retry"] = True
+    retry_metadata["responses_forced_tool_choice_auto_retry_reason"] = (
+        "upstream_rejected_forced_choice"
+    )
+    retry_kwargs["litellm_metadata"] = retry_metadata
+    return retry_kwargs
+
+
+def _function_tool_schema_compat_retry_kwargs(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> Optional[dict]:
+    """Build one same-surface retry for the observed strict=false shape."""
+
+    if _routing_module._exception_status_code(exception) not in {400, 422}:
+        return None
+    text = _routing_module._exception_text(exception)
+    if not any(
+        marker in text
+        for marker in (
+            "请求参数组合无效",
+            "参数组合无效",
+            "invalid parameter combination",
+            "invalid parameters combination",
+            "invalid combination of parameters",
+            "invalid schema",
+            "schema validation",
+            "schema is invalid",
+        )
+    ):
+        return None
+    return _responses_tools_module._responses_function_tool_schema_compat_retry_kwargs(
+        request_kwargs
+    )
 
 
 def _chat_bridge_stream_payload(
@@ -449,6 +527,17 @@ async def _execute_responses_chat_bridge_call(
     try:
         return await execute_once(bridge_kwargs)
     except Exception as bridge_exc:
+        forced_choice_retry_kwargs = _forced_tool_choice_auto_retry_kwargs(
+            bridge_exc,
+            bridge_kwargs,
+            outer_request_kwargs,
+        )
+        if forced_choice_retry_kwargs is not None:
+            bridge_kwargs = forced_choice_retry_kwargs
+            try:
+                return await execute_once(bridge_kwargs)
+            except Exception as retry_exc:
+                bridge_exc = retry_exc
         xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(
             bridge_exc,
             bridge_kwargs,
@@ -1052,6 +1141,63 @@ async def _execute_responses_function_tool_bridge_call(
         return await execute_once(bridge_kwargs)
     except Exception as exc:
         original_exc = exc
+        forced_choice_retry_kwargs = _forced_tool_choice_auto_retry_kwargs(
+            exc,
+            bridge_kwargs,
+            outer_request_kwargs,
+        )
+        if forced_choice_retry_kwargs is not None:
+            bridge_kwargs = forced_choice_retry_kwargs
+            try:
+                return await execute_once(bridge_kwargs)
+            except Exception as retry_exc:
+                exc = retry_exc
+        schema_retry_kwargs = _function_tool_schema_compat_retry_kwargs(
+            exc,
+            bridge_kwargs,
+        )
+        if schema_retry_kwargs is not None:
+            _trace_module._route_trace(
+                "responses_function_tool_schema_compat_retry_start",
+                request_id=_routing_module._trace_request_id(trace_request)
+                or _routing_module._trace_request_id(outer_request_kwargs),
+                session=_routing_module._trace_session_context(
+                    trace_request or outer_request_kwargs
+                ),
+                model_group=_request_model_group(trace_request)
+                or _request_model_group(outer_request_kwargs),
+                deployment_id=_routing_module._deployment_id_from_request(
+                    trace_request
+                ),
+                route_key=_routing_module._deployment_route_key_from_request(
+                    trace_request
+                ),
+                tool_types=_trace_module._trace_tool_types(
+                    schema_retry_kwargs.get("tools")
+                ),
+            )
+            bridge_kwargs = schema_retry_kwargs
+            try:
+                return await execute_once(bridge_kwargs)
+            except Exception as retry_exc:
+                _trace_module._route_trace(
+                    "responses_function_tool_schema_compat_retry_error",
+                    request_id=_routing_module._trace_request_id(trace_request)
+                    or _routing_module._trace_request_id(outer_request_kwargs),
+                    session=_routing_module._trace_session_context(
+                        trace_request or outer_request_kwargs
+                    ),
+                    model_group=_request_model_group(trace_request)
+                    or _request_model_group(outer_request_kwargs),
+                    deployment_id=_routing_module._deployment_id_from_request(
+                        trace_request
+                    ),
+                    route_key=_routing_module._deployment_route_key_from_request(
+                        trace_request
+                    ),
+                    exception=_routing_module._trace_exception(retry_exc),
+                )
+                exc = retry_exc
         xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(exc, bridge_kwargs)
         if xhigh_retry_kwargs is not None:
             try:
@@ -1126,6 +1272,15 @@ def _wrap_generic_function_for_deployment_failover(
             updated_kwargs = update_request(kwargs)
             if updated_kwargs is not None:
                 kwargs = updated_kwargs
+        async def surface_adapted_original_function(**call_kwargs: Any) -> Any:
+            dispatch_kwargs = _routing_module._surface_adapted_dispatch_kwargs(
+                call_kwargs
+            )
+            response = original_function(**dispatch_kwargs)
+            if inspect.isawaitable(response):
+                return await response
+            return response
+
         native_client_tool_kwargs = (
             _responses_surfaces_module._with_responses_native_client_tool_passthrough(
                 kwargs,
@@ -1143,12 +1298,68 @@ def _wrap_generic_function_for_deployment_failover(
         if responses_function_bridge_kwargs is not None:
             try:
                 return await _execute_responses_function_tool_bridge_call(
-                    original_function,
+                    surface_adapted_original_function,
                     responses_function_bridge_kwargs,
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
                 )
             except Exception as exc:
+                # Function-tool bridging is a pre-dispatch path for Codex
+                # namespace/custom tools.  Preserve the same protocol
+                # failover classification used by the ordinary upstream call
+                # path; otherwise a Responses 400 raised here would bypass
+                # the configured same-deployment Chat/Anthropic surface.
+                _routing_module._apply_current_selected_deployment_to_request(
+                    kwargs
+                )
+                decision_kwargs = (
+                    outer_request_kwargs
+                    if isinstance(outer_request_kwargs, dict)
+                    else kwargs
+                )
+                if decision_kwargs is not kwargs:
+                    _routing_module._apply_current_selected_deployment_to_request(
+                        decision_kwargs
+                    )
+                if _routing_module._protocol_fallback_attempt_active(
+                    decision_kwargs
+                ):
+                    _routing_module._mark_exception_for_deployment_failover(
+                        exc,
+                        decision_kwargs,
+                    )
+                    raise
+                if _routing_module._is_current_upstream_surface_incompatible_error(
+                    exc,
+                    responses_function_bridge_kwargs,
+                    decision_kwargs,
+                ):
+                    relax_tool_choice = (
+                        _routing_module._is_forced_tool_choice_unsupported_error(
+                            exc,
+                            responses_function_bridge_kwargs,
+                            decision_kwargs,
+                        )
+                    )
+                    _routing_module._clear_protocol_fallback_cache_for_request(
+                        decision_kwargs,
+                        preserve_relaxed_tool_choice=True,
+                    )
+                    if relax_tool_choice:
+                        _routing_module._mark_protocol_fallback_relax_tool_choice(
+                            kwargs
+                        )
+                        _routing_module._mark_protocol_fallback_relax_tool_choice(
+                            responses_function_bridge_kwargs
+                        )
+                        _routing_module._mark_protocol_fallback_relax_tool_choice(
+                            decision_kwargs
+                        )
+                    _routing_module._mark_exception_for_upstream_surface_failover(
+                        exc,
+                        decision_kwargs,
+                    )
+                    raise
                 if _routing_module._request_current_upstream_surface(kwargs):
                     raise
                 bridge_kwargs = _responses_surfaces_module._responses_chat_bridge_retry_kwargs(
@@ -1165,7 +1376,7 @@ def _wrap_generic_function_for_deployment_failover(
                 if bridge_kwargs is None:
                     raise
                 return await _execute_responses_chat_bridge_call(
-                    original_function,
+                    surface_adapted_original_function,
                     bridge_kwargs,
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
@@ -1180,7 +1391,7 @@ def _wrap_generic_function_for_deployment_failover(
         if external_web_search_bridge_kwargs is not None:
             try:
                 return await _execute_responses_external_web_search_bridge_call(
-                    original_function,
+                    surface_adapted_original_function,
                     external_web_search_bridge_kwargs,
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
@@ -1196,7 +1407,7 @@ def _wrap_generic_function_for_deployment_failover(
                 if bridge_kwargs is None:
                     raise
                 return await _execute_responses_chat_bridge_call(
-                    original_function,
+                    surface_adapted_original_function,
                     bridge_kwargs,
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
@@ -1213,7 +1424,7 @@ def _wrap_generic_function_for_deployment_failover(
         if preemptive_bridge_kwargs is not None:
             try:
                 return await _execute_responses_chat_bridge_call(
-                    original_function,
+                    surface_adapted_original_function,
                     preemptive_bridge_kwargs,
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
@@ -1228,7 +1439,7 @@ def _wrap_generic_function_for_deployment_failover(
                 ):
                     raise
                 return await _execute_responses_chat_bridge_call(
-                    original_function,
+                    surface_adapted_original_function,
                     preemptive_bridge_kwargs,
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
@@ -1237,7 +1448,7 @@ def _wrap_generic_function_for_deployment_failover(
                     error_event="responses_chat_bridge_preemptive_retry_error",
                 )
         try:
-            response = original_function(**kwargs)
+            response = surface_adapted_original_function(**kwargs)
             response = await _responses_request_module._await_streaming_fallback_candidate_response(
                 response,
                 kwargs,
@@ -1246,12 +1457,12 @@ def _wrap_generic_function_for_deployment_failover(
             response = await _postprocess_generic_bridge_response(
                 response,
                 kwargs,
-                original_function,
+                surface_adapted_original_function,
             )
             return _with_responses_context_truncation_fallback_stream(
                 response,
                 kwargs,
-                original_function,
+                surface_adapted_original_function,
                 outer_request_kwargs=outer_request_kwargs,
             )
         except Exception as exc:
@@ -1270,13 +1481,41 @@ def _wrap_generic_function_for_deployment_failover(
                 _routing_module._apply_current_selected_deployment_to_request(
                     decision_kwargs
                 )
+            forced_choice_retry_kwargs = _forced_tool_choice_auto_retry_kwargs(
+                original_exception,
+                kwargs,
+                outer_request_kwargs,
+            )
+            if forced_choice_retry_kwargs is not None:
+                try:
+                    response = surface_adapted_original_function(
+                        **forced_choice_retry_kwargs
+                    )
+                    response = await _responses_request_module._await_streaming_fallback_candidate_response(
+                        response,
+                        forced_choice_retry_kwargs,
+                        outer_request_kwargs,
+                    )
+                    return await _postprocess_generic_bridge_response(
+                        response,
+                        forced_choice_retry_kwargs,
+                        surface_adapted_original_function,
+                    )
+                except Exception as retry_exc:
+                    exc = retry_exc
+                    original_exception = retry_exc
+                    # Keep the auto-choice form active for every remaining
+                    # same-deployment compatibility attempt.  In particular,
+                    # a namespace/custom -> function bridge must not restore
+                    # the named choice that the upstream just rejected.
+                    kwargs = forced_choice_retry_kwargs
             if _routing_module._is_context_size_error(original_exception):
                 # Context-size errors are deterministic input errors until the
                 # dedicated native truncation fallback chooses to repair them.
                 # They must never enter an unrelated protocol bridge.
                 context_truncation_fallback = (
                     await _execute_responses_context_truncation_fallback(
-                        original_function,
+                        surface_adapted_original_function,
                         exc,
                         kwargs,
                         outer_request_kwargs=outer_request_kwargs,
@@ -1288,7 +1527,7 @@ def _wrap_generic_function_for_deployment_failover(
                 raise original_exception
             context_truncation_fallback = (
                 await _execute_responses_context_truncation_fallback(
-                    original_function,
+                    surface_adapted_original_function,
                     exc,
                     kwargs,
                     outer_request_kwargs=outer_request_kwargs,
@@ -1313,19 +1552,47 @@ def _wrap_generic_function_for_deployment_failover(
                 )
             )
             if responses_function_bridge_retry_kwargs is not None:
-                return await _execute_responses_function_tool_bridge_call(
-                    original_function,
-                    responses_function_bridge_retry_kwargs,
-                    original_request_kwargs=kwargs,
-                    outer_request_kwargs=outer_request_kwargs,
-                )
+                try:
+                    return await _execute_responses_function_tool_bridge_call(
+                        surface_adapted_original_function,
+                        responses_function_bridge_retry_kwargs,
+                        original_request_kwargs=kwargs,
+                        outer_request_kwargs=outer_request_kwargs,
+                    )
+                except Exception as bridge_exc:
+                    # Tool representation is a same-protocol fallback.  Only
+                    # after it also fails may this deployment advance to its
+                    # configured alternate protocol.
+                    if _routing_module._protocol_fallback_attempt_active(
+                        decision_kwargs
+                    ):
+                        _routing_module._mark_exception_for_deployment_failover(
+                            bridge_exc,
+                            decision_kwargs,
+                        )
+                        raise
+                    if _routing_module._is_current_upstream_surface_incompatible_error(
+                        bridge_exc,
+                        responses_function_bridge_retry_kwargs,
+                        decision_kwargs,
+                    ):
+                        _routing_module._clear_protocol_fallback_cache_for_request(
+                            decision_kwargs,
+                            preserve_relaxed_tool_choice=True,
+                        )
+                        _routing_module._mark_exception_for_upstream_surface_failover(
+                            bridge_exc,
+                            decision_kwargs,
+                        )
+                    raise
             if _routing_module._is_current_upstream_surface_incompatible_error(
                 exc,
                 kwargs,
                 decision_kwargs,
             ):
                 _routing_module._clear_protocol_fallback_cache_for_request(
-                    decision_kwargs
+                    decision_kwargs,
+                    preserve_relaxed_tool_choice=True,
                 )
                 _routing_module._mark_exception_for_upstream_surface_failover(
                     exc,
@@ -1345,7 +1612,7 @@ def _wrap_generic_function_for_deployment_failover(
             xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(exc, kwargs)
             if xhigh_retry_kwargs is not None:
                 try:
-                    response = original_function(**xhigh_retry_kwargs)
+                    response = surface_adapted_original_function(**xhigh_retry_kwargs)
                     response = await _responses_request_module._await_streaming_fallback_candidate_response(
                         response,
                         xhigh_retry_kwargs,
@@ -1354,7 +1621,7 @@ def _wrap_generic_function_for_deployment_failover(
                     return await _postprocess_generic_bridge_response(
                         response,
                         xhigh_retry_kwargs,
-                        original_function,
+                        surface_adapted_original_function,
                     )
                 except Exception as retry_exc:
                     _trace_module._route_trace(
@@ -1375,7 +1642,7 @@ def _wrap_generic_function_for_deployment_failover(
             )
             if external_web_search_bridge_kwargs is not None:
                 return await _execute_responses_external_web_search_bridge_call(
-                    original_function,
+                    surface_adapted_original_function,
                     external_web_search_bridge_kwargs,
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
@@ -1387,7 +1654,7 @@ def _wrap_generic_function_for_deployment_failover(
                 )
             if bridge_kwargs is not None:
                 return await _execute_responses_chat_bridge_call(
-                    original_function,
+                    surface_adapted_original_function,
                     bridge_kwargs,
                     original_request_kwargs=kwargs,
                     outer_request_kwargs=outer_request_kwargs,
@@ -1770,6 +2037,7 @@ def _ordered_deployment_fallback_entry(
             _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
             _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
             _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
+            _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
         ):
             if key in request_kwargs:
                 entry[key] = request_kwargs[key]

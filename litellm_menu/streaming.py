@@ -1738,10 +1738,10 @@ async def _stream_with_idle_timeout(
             _routing_module._FIRST_STREAM_OUTPUT_TIME_KEY not in request_data
             and _stream_chunk_has_meaningful_delta(chunk)
         ):
-            request_data[_routing_module._FIRST_STREAM_OUTPUT_TIME_KEY] = datetime.now(
-                timezone.utc
+            _routing_module._record_first_stream_output_time(
+                request_data,
+                datetime.now(timezone.utc),
             )
-            _routing_module._record_first_stream_output_time(request_data)
         if not visible_output_seen:
             visible_output_seen = _stream_chunk_has_visible_output(chunk) or (
                 _request_is_responses_stream(request_data)
@@ -1904,10 +1904,10 @@ async def _yield_codex_responses_initial_keepalive_stream(
             _routing_module._FIRST_STREAM_OUTPUT_TIME_KEY not in request_data
             and _stream_chunk_has_meaningful_delta(first_chunk)
         ):
-            request_data[_routing_module._FIRST_STREAM_OUTPUT_TIME_KEY] = datetime.now(
-                timezone.utc
+            _routing_module._record_first_stream_output_time(
+                request_data,
+                datetime.now(timezone.utc),
             )
-            _routing_module._record_first_stream_output_time(request_data)
         yield first_chunk
         async for chunk in _stream_with_idle_timeout(
             iterator,
@@ -3778,7 +3778,28 @@ async def _stream_route_recovery_poll(
         return
     started_at_monotonic = time.monotonic()
     poll_interval_seconds = _routing_module._recovery_interval_seconds()
-    deadline = started_at_monotonic + max_poll_seconds
+    # A network outage is an external connectivity condition, not a request
+    # failure.  Keep the existing stream alive until the client cancels it or
+    # an upstream route recovers; otherwise the timeout below becomes the
+    # exact point at which Codex receives a connection failure and starts its
+    # own reconnect loop.
+    network_recovery = (
+        _routing_module._is_network_recovery_exception(exception)
+        and _routing_module._recovery_policy_for_exception(exception)
+        != _routing_module._RECOVERY_POLICY_ERROR
+    )
+    if network_recovery:
+        # Establish every supported stream immediately while the first
+        # upstream probe is pending.  Without this event a quiet offline
+        # interval is indistinguishable from a failed request to the client.
+        yield _route_recovery_sse_keepalive(
+            0,
+            request_data=request_data,
+            phase="network",
+        )
+    deadline: Optional[float] = (
+        None if network_recovery else started_at_monotonic + max_poll_seconds
+    )
     last_exception = exception
     attempt = 0
     waited_for_all_cooldown = False
@@ -3845,7 +3866,9 @@ async def _stream_route_recovery_poll(
             if cooldown_wait is not None:
                 waited_for_all_cooldown = True
                 now = time.monotonic()
-                if max_poll_seconds <= 0 or now >= deadline:
+                if max_poll_seconds <= 0 or (
+                    deadline is not None and now >= deadline
+                ):
                     _trace_module._route_trace(
                         "route_recovery_poll_max_duration_reached",
                         request_id=_routing_module._trace_request_id(request_data),
@@ -3948,7 +3971,12 @@ async def _stream_route_recovery_poll(
                 waited_for_all_cooldown = False
                 ignore_local_constraints = False
             now = time.monotonic()
-            if attempt > 0 and max_poll_seconds > 0 and now >= deadline:
+            if (
+                attempt > 0
+                and max_poll_seconds > 0
+                and deadline is not None
+                and now >= deadline
+            ):
                 _trace_module._route_trace(
                     "route_recovery_poll_max_duration_reached",
                     request_id=_routing_module._trace_request_id(request_data),
@@ -4048,7 +4076,11 @@ async def _stream_route_recovery_poll(
                 poll_attempt=attempt,
                 target_order=target_order,
                 elapsed_seconds=round(attempt_started_at - started_at_monotonic, 3),
-                remaining_poll_seconds=max(0.0, round(deadline - attempt_started_at, 3)),
+                remaining_poll_seconds=(
+                    None
+                    if deadline is None
+                    else max(0.0, round(deadline - attempt_started_at, 3))
+                ),
                 exception=_routing_module._trace_exception(last_exception),
             )
 
@@ -4167,7 +4199,9 @@ async def _stream_route_recovery_poll(
                 last_exception = nonlocal_last_exception[0]
 
             now = time.monotonic()
-            if max_poll_seconds <= 0 or now >= deadline:
+            if max_poll_seconds <= 0 or (
+                deadline is not None and now >= deadline
+            ):
                 _trace_module._route_trace(
                     "route_recovery_poll_max_duration_reached",
                     request_id=_routing_module._trace_request_id(request_data),
@@ -4180,7 +4214,11 @@ async def _stream_route_recovery_poll(
                 )
                 break
 
-            delay_seconds = min(poll_interval_seconds, max(0.0, deadline - now))
+            delay_seconds = (
+                poll_interval_seconds
+                if deadline is None
+                else min(poll_interval_seconds, max(0.0, deadline - now))
+            )
             _trace_module._route_trace(
                 "route_recovery_poll_next_attempt_scheduled",
                 request_id=_routing_module._trace_request_id(request_data),
@@ -4303,10 +4341,14 @@ def _route_recovery_cooldown_wait_delay(
     cooldown_until: float,
     *,
     poll_interval_seconds: float,
-    deadline: float,
+    deadline: Optional[float],
 ) -> float:
     remaining_cooldown = max(0.0, cooldown_until - time.time())
-    remaining_poll = max(0.0, deadline - time.monotonic())
+    remaining_poll = (
+        float("inf")
+        if deadline is None
+        else max(0.0, deadline - time.monotonic())
+    )
     return max(
         0.001,
         min(poll_interval_seconds, remaining_cooldown or 0.001, remaining_poll or 0.001),
@@ -6257,6 +6299,11 @@ async def _yield_streaming_error_fallback_or_raise(
     exception: Exception,
 ) -> AsyncIterator[Any]:
     is_responses_stream = _request_is_responses_stream(request_data)
+    network_recovery = (
+        _routing_module._is_network_recovery_exception(exception)
+        and _routing_module._recovery_policy_for_exception(exception)
+        != _routing_module._RECOVERY_POLICY_ERROR
+    )
     supports_streaming_fallback = _request_supports_streaming_error_fallback(
         request_data
     )
@@ -6344,6 +6391,21 @@ async def _yield_streaming_error_fallback_or_raise(
             exception,
         ):
             yield chunk
+
+    if (
+        # Route recovery runs the same failover path under a keepalive-aware
+        # iterator.  Start it immediately for an offline upstream so Codex
+        # sees an established stream while the first replacement route is
+        # probed, rather than waiting for the ordinary one-shot fallback to
+        # finish or fail.
+        supports_streaming_fallback
+        and network_recovery
+        and not route_recovery_poll_payload
+        and _routing_module._recovery_max_seconds_for_request(request_data) > 0
+    ):
+        async for chunk in route_recovery_chunks(exception):
+            yield chunk
+        return
 
     if (
         supports_streaming_fallback
@@ -6452,15 +6514,24 @@ async def _yield_streaming_error_fallback_or_raise(
     if yielded_fallback:
         return
     final_exception = fallback_exception or exception
+    recovery_exception: Optional[Exception] = None
+    network_recovery = network_recovery or (
+        _routing_module._is_network_recovery_exception(final_exception)
+        and _routing_module._recovery_policy_for_exception(final_exception)
+        != _routing_module._RECOVERY_POLICY_ERROR
+    )
     if (
         supports_streaming_fallback
         and _routing_module._recovery_max_seconds_for_request(request_data) > 0
-        and _external_web_search_recovery_poll_error(final_exception)
+        and (
+            network_recovery
+            or _external_web_search_recovery_poll_error(final_exception)
+        )
     ):
         yielded_recovery = False
-        recovery_exception: Optional[Exception] = None
+        recovery_seed = exception if network_recovery else final_exception
         try:
-            async for chunk in route_recovery_chunks(final_exception):
+            async for chunk in route_recovery_chunks(recovery_seed):
                 yielded_recovery = True
                 yield chunk
         except Exception as exc:
@@ -6471,6 +6542,20 @@ async def _yield_streaming_error_fallback_or_raise(
             return
         if recovery_exception is not None:
             final_exception = recovery_exception
+    if (
+        network_recovery
+        and not route_recovery_poll_payload
+        and (
+            recovery_exception is None
+            or _routing_module._is_network_recovery_exception(recovery_exception)
+            or _external_web_search_recovery_poll_error(final_exception)
+        )
+    ):
+        # Never turn an offline upstream into the CancelledError escape hatch
+        # that asks Codex to reconnect.  The route-recovery iterator normally
+        # remains open until a route succeeds; if a bridge declined recovery,
+        # close quietly instead of exposing the transport exception.
+        return
     if is_responses_stream and (
         _routing_module._is_request_scoped_priority_deployment_failover_error(
             final_exception,

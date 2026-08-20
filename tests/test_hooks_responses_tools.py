@@ -4,6 +4,179 @@ from hook_test_utils import *
 
 
 class HookResponsesToolBridgeTests(HookTestCase):
+    def test_function_tool_bridge_normalizes_missing_parameter_object_members(self) -> None:
+        hooks, _ = load_hook_module()
+
+        bare = hooks._responses_bridge_function_tool(
+            {
+                "type": "function",
+                "name": "noop",
+                "parameters": {},
+            }
+        )
+        existing = hooks._responses_bridge_function_tool(
+            {
+                "type": "function",
+                "name": "inspect",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }
+        )
+
+        self.assertIsNotNone(bare)
+        self.assertIsNotNone(existing)
+        assert bare is not None
+        assert existing is not None
+        self.assertEqual(
+            bare["parameters"],
+            {"type": "object", "properties": {}, "required": []},
+        )
+        self.assertEqual(
+            existing["parameters"]["required"],
+            ["path"],
+        )
+
+    def test_forced_choice_auto_retry_clears_nested_choice_copies(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "tool_choice": {"type": "function", "name": "inspect"},
+            "tools": [{"type": "function", "name": "inspect"}],
+            "extra_body": {
+                "tool_choice": {"type": "function", "name": "inspect"},
+                "function_call": {"name": "inspect"},
+                "client_metadata": {"request": "kept"},
+            },
+            "litellm_params": {
+                "tool_choice": {"type": "function", "name": "inspect"},
+                "function_call": {"name": "inspect"},
+                "reasoning_effort": "max",
+            },
+        }
+        error = RuntimeError("请求参数组合无效")
+        error.status_code = 400
+
+        retry = hooks._forced_tool_choice_auto_retry_kwargs(error, request)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertEqual(retry["tool_choice"], "auto")
+        self.assertNotIn("tool_choice", retry["extra_body"])
+        self.assertNotIn("function_call", retry["extra_body"])
+        self.assertEqual(
+            retry["extra_body"]["client_metadata"],
+            {"request": "kept"},
+        )
+        self.assertNotIn("tool_choice", retry["litellm_params"])
+        self.assertNotIn("function_call", retry["litellm_params"])
+        self.assertEqual(retry["litellm_params"]["reasoning_effort"], "max")
+        self.assertEqual(
+            request["extra_body"]["tool_choice"],
+            {"type": "function", "name": "inspect"},
+        )
+        self.assertEqual(
+            request["litellm_params"]["function_call"],
+            {"name": "inspect"},
+        )
+
+    def test_function_schema_retry_drops_only_explicit_false_strict(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "loose",
+                    "strict": False,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {
+                    "type": "function",
+                    "name": "strict",
+                    "strict": True,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            ]
+        }
+
+        retry = hooks._responses_function_tool_schema_compat_retry_kwargs(request)
+
+        self.assertIsNotNone(retry)
+        assert retry is not None
+        self.assertNotIn("strict", retry["tools"][0])
+        self.assertTrue(retry["tools"][1]["strict"])
+        self.assertFalse(
+            hooks._responses_function_tool_schema_compat_retry_kwargs(retry)
+            is not None
+        )
+        self.assertFalse(request["tools"][0]["strict"])
+
+    async def test_function_bridge_schema_retry_precedes_protocol_change(self) -> None:
+        hooks, _ = load_hook_module()
+        attempts = []
+        request = {
+            "call_type": "aresponses",
+            "input": "Use the function.",
+            "tool_choice": "auto",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "inspect",
+                    "strict": False,
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+
+        async def original_function(**kwargs):
+            tools = kwargs.get("tools") or []
+            attempts.append(tools)
+            if tools and "strict" in tools[0]:
+                error = RuntimeError("请求参数组合无效")
+                error.status_code = 400
+                raise error
+            return {"ok": True}
+
+        result = await hooks._execute_responses_function_tool_bridge_call(
+            original_function,
+            request,
+        )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(attempts), 2)
+        self.assertIs(attempts[0][0].get("strict"), False)
+        self.assertFalse("strict" in attempts[1][0])
+
+    def test_bridge_carries_relaxed_choice_marker_into_metadata(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "input": "Use the tool.",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {"type": "function", "name": "list_agents"},
+                    ],
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "list_agents"},
+            hooks._PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY: True,
+        }
+
+        metadata = {}
+        hooks._with_responses_function_tool_bridge_compatible_tools(
+            request,
+            metadata,
+        )
+
+        self.assertTrue(
+            metadata[hooks._PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY]
+        )
+        self.assertEqual(request["tool_choice"], "auto")
+
     def test_external_web_search_bridge_tool_exposes_url_read_without_pseudo_actions(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -392,7 +565,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             )
         )
 
-    def test_unknown_nested_custom_tool_support_preemptively_bridges(self) -> None:
+    def test_unknown_nested_custom_tool_support_tries_native_first(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {
             "call_type": "aresponses",
@@ -418,15 +591,10 @@ class HookResponsesToolBridgeTests(HookTestCase):
             },
         }
 
-        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
-            request_kwargs
-        )
-
-        self.assertIsNotNone(bridge_kwargs)
-        assert bridge_kwargs is not None
-        self.assertEqual([tool["name"] for tool in bridge_kwargs["tools"]], ["exec"])
-        self.assertTrue(
-            bridge_kwargs["tools"][0][hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY]
+        self.assertIsNone(
+            hooks._responses_function_tool_bridge_preemptive_kwargs(
+                request_kwargs
+            )
         )
 
     def test_responses_function_tool_bridge_converts_namespace_custom_tool(self) -> None:

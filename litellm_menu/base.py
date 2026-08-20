@@ -153,11 +153,20 @@ _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY = (
 _PROTOCOL_FALLBACK_CACHE_HIT_KEY = (
     "_litellm_menu_protocol_fallback_cache_hit"
 )
+_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY = (
+    "_litellm_menu_protocol_fallback_relax_tool_choice"
+)
 _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR = (
     "_protocol_fallback_failure_recorded"
 )
+_PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY = (
+    "_litellm_menu_protocol_fallback_failure_recorded"
+)
 _RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY = (
     "responses_chat_bridge_preemptive"
+)
+_RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY = (
+    "responses_function_tool_schema_compat_retry"
 )
 _FALLBACK_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

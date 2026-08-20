@@ -26,6 +26,7 @@ from .base import (
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
     _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY,
+    _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
     _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY,
     _SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY,
     _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY,
@@ -60,6 +61,8 @@ def _with_responses_chat_bridge_compatible_tools(
     retry_kwargs: dict,
     retry_metadata: dict,
 ) -> None:
+    if _routing_module._protocol_fallback_relax_tool_choice(retry_kwargs):
+        retry_metadata[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
     discovered_tools = _responses_tools_module._responses_input_tool_search_output_tools(retry_kwargs.get("input"))
     additional_tools = _responses_tools_module._responses_input_additional_tools(
         retry_kwargs.get("input")
@@ -106,10 +109,16 @@ def _with_responses_chat_bridge_compatible_tools(
             if isinstance(tool.get("name"), str)
         }
         if "tool_choice" in retry_kwargs:
-            retry_kwargs["tool_choice"] = _responses_tools_module._responses_chat_bridge_sanitize_tool_choice(
-                retry_kwargs.get("tool_choice"),
-                kept_tool_names,
-            )
+            if _routing_module._protocol_fallback_relax_tool_choice(retry_kwargs):
+                retry_kwargs["tool_choice"] = "auto"
+                retry_metadata[
+                    "responses_chat_bridge_relaxed_forced_tool_choice"
+                ] = True
+            else:
+                retry_kwargs["tool_choice"] = _responses_tools_module._responses_chat_bridge_sanitize_tool_choice(
+                    retry_kwargs.get("tool_choice"),
+                    kept_tool_names,
+                )
         return
 
     retry_kwargs.pop("tools", None)
@@ -123,6 +132,8 @@ def _with_responses_function_tool_bridge_compatible_tools(
     bridge_metadata: dict,
     outer_request_kwargs: Optional[dict] = None,
 ) -> None:
+    if _routing_module._protocol_fallback_relax_tool_choice(bridge_kwargs):
+        bridge_metadata[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
     discovered_tools = _responses_tools_module._responses_input_tool_search_output_tools(bridge_kwargs.get("input"))
     additional_tools = _responses_tools_module._responses_input_additional_tools(
         bridge_kwargs.get("input")
@@ -188,7 +199,12 @@ def _with_responses_function_tool_bridge_compatible_tools(
         }
         if "tool_choice" in bridge_kwargs:
             tool_choice = bridge_kwargs.get("tool_choice")
-            if not (
+            if _routing_module._protocol_fallback_relax_tool_choice(bridge_kwargs):
+                bridge_kwargs["tool_choice"] = "auto"
+                bridge_metadata[
+                    "responses_function_tool_bridge_relaxed_forced_tool_choice"
+                ] = True
+            elif not (
                 not bridge_web_search
                 and isinstance(tool_choice, dict)
                 and tool_choice.get("type") in {"web_search", "web_search_preview"}
@@ -486,14 +502,6 @@ def _request_should_try_native_responses_client_tools(
         request_kwargs,
         outer_request_kwargs,
     )
-    # Unknown Responses surfaces can accept the namespace envelope while
-    # degrading its nested free-form custom calls to empty JSON. Bridge that
-    # combination to a normal string-argument function tool.
-    if support is None and _request_has_responses_nested_custom_tools(
-        request_kwargs,
-        outer_request_kwargs,
-    ):
-        return False
     return support is not False
 
 
@@ -541,46 +549,6 @@ def _request_supports_responses_function_tools(
         return configured_support
     if _request_uses_responses_endpoint(outer_request_kwargs):
         return True
-    return False
-
-
-def _responses_tool_tree_has_type(value: Any, tool_type: str) -> bool:
-    if not isinstance(value, dict):
-        return False
-    if value.get("type") == tool_type:
-        return True
-    children = value.get("tools")
-    return isinstance(children, list) and any(
-        _responses_tool_tree_has_type(child, tool_type) for child in children
-    )
-
-
-def _request_has_responses_nested_custom_tools(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-) -> bool:
-    for request in (request_kwargs, outer_request_kwargs):
-        if not isinstance(request, dict):
-            continue
-        raw_tools = request.get("tools")
-        candidates = list(raw_tools) if isinstance(raw_tools, list) else []
-        candidates.extend(
-            _responses_tools_module._responses_input_tool_search_output_tools(
-                request.get("input")
-            )
-        )
-        candidates.extend(
-            _responses_tools_module._responses_input_additional_tools(
-                request.get("input")
-            )
-        )
-        if any(
-            isinstance(tool, dict)
-            and tool.get("type") == "namespace"
-            and _responses_tool_tree_has_type(tool, "custom")
-            for tool in candidates
-        ):
-            return True
     return False
 
 
@@ -1116,6 +1084,22 @@ def _request_has_responses_client_tools_requiring_bridge(
     return False
 
 
+def _request_already_retried_forced_tool_choice_as_auto(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    """Whether this request already exhausted its narrow auto-choice retry."""
+
+    for request in (request_kwargs, outer_request_kwargs):
+        metadata = _request_context_module._request_metadata_dict(
+            request,
+            "litellm_metadata",
+        ) or {}
+        if metadata.get("responses_forced_tool_choice_auto_retry") is True:
+            return True
+    return False
+
+
 def _native_responses_client_tools_unsupported_error(
     exception: Exception,
     request_kwargs: Optional[dict],
@@ -1155,6 +1139,27 @@ def _native_responses_client_tools_unsupported_error(
         )
     ):
         return False
+
+    # Some OpenAI-compatible gateways report an unsupported namespace/custom
+    # tool only as a generic invalid-parameter-combination error.  Do not
+    # reinterpret that broad 400 on the first attempt: first relax an
+    # explicitly forced choice on the native protocol.  If that exact retry
+    # has already failed, a same-protocol function-tool bridge is the next
+    # compatible representation to try before changing protocol surfaces.
+    if _request_already_retried_forced_tool_choice_as_auto(
+        request_kwargs,
+        outer_request_kwargs,
+    ) and any(
+        marker in text
+        for marker in (
+            "请求参数组合无效",
+            "invalid parameter combination",
+            "invalid parameters combination",
+            "invalid combination of parameters",
+            "invalid request parameter combination",
+        )
+    ):
+        return True
 
     has_client_tool_marker = any(
         marker in text

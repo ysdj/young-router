@@ -1674,17 +1674,7 @@ def _with_codex_descendant_cleanup_instruction(
         changed = True
 
     runtime_state = _codex_descendant_cleanup_runtime_state(request_kwargs)
-    if runtime_state is not None and _codex_tool_choice_name(
-        request_kwargs.get("tool_choice")
-    ) is None:
-        # Snapshot recovery has one valid action. Generic ``required`` lets
-        # the model pick an unrelated tool and repeat the same turn.
-        required_tool_choice: Any = "required"
-        if runtime_state in {"snapshot_missing", "snapshot_invalidated"}:
-            required_tool_choice = {"type": "function", "name": "list_agents"}
-        if request_kwargs.get("tool_choice") != required_tool_choice:
-            modified_kwargs["tool_choice"] = required_tool_choice
-            changed = True
+    if runtime_state is not None:
         metadata = (
             _request_context_module._request_metadata_dict(
                 request_kwargs,
@@ -1698,6 +1688,26 @@ def _with_codex_descendant_cleanup_instruction(
             next_metadata[_CODEX_DESCENDANT_CLEANUP_METADATA_KEY] = state_metadata
             modified_kwargs["litellm_metadata"] = next_metadata
             changed = True
+
+        # A protocol fallback reaches this hook again after the surface
+        # adapter has deliberately relaxed a named choice that the upstream
+        # rejected.  Keep the cleanup instruction and its state metadata, but
+        # do not re-inject the rejected named choice on every lower-level
+        # pre-call hook.  The marker is request-scoped and is set only after
+        # the concrete compatibility error, so ordinary calls retain the
+        # strict cleanup barrier below.
+        if (
+            not _routing_module._protocol_fallback_relax_tool_choice(request_kwargs)
+            and _codex_tool_choice_name(request_kwargs.get("tool_choice")) is None
+        ):
+            # Snapshot recovery has one valid action. Generic ``required`` lets
+            # the model pick an unrelated tool and repeat the same turn.
+            required_tool_choice: Any = "required"
+            if runtime_state in {"snapshot_missing", "snapshot_invalidated"}:
+                required_tool_choice = {"type": "function", "name": "list_agents"}
+            if request_kwargs.get("tool_choice") != required_tool_choice:
+                modified_kwargs["tool_choice"] = required_tool_choice
+                changed = True
 
     return modified_kwargs if changed else None
 

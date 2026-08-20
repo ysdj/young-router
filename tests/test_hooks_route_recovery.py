@@ -856,6 +856,138 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         self.assertEqual(chunks[-1]["type"], "response.completed")
 
+    async def test_network_route_recovery_ignores_configured_poll_deadline(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["litellm_menu.streaming"]
+        original_attempt = streaming_module._stream_route_recovery_poll_attempt
+        original_keepalive_min_delay = (
+            hooks._ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS
+        )
+        original_keepalive_seconds = hooks._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS
+        attempts = []
+
+        class ReadError(Exception):
+            pass
+
+        async def failed_attempt(request_data, exception, *, attempt, deadline=None):
+            attempts.append(attempt)
+            raise ReadError("connection closed.")
+            yield None
+
+        streaming_module._stream_route_recovery_poll_attempt = failed_attempt
+        hooks._ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS = 0.0
+        hooks._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS = 0.001
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            original_attempt,
+        )
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS",
+            original_keepalive_min_delay,
+        )
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS",
+            original_keepalive_seconds,
+        )
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.01")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "offline-route", "order": 1},
+        }
+        stream = hooks._stream_route_recovery_poll(
+            request_data,
+            ReadError("connection closed."),
+        )
+        first_chunk = await anext(stream)
+        self.assertTrue(hooks._is_route_recovery_sse_keepalive(first_chunk))
+        keepalives = []
+        for _ in range(5):
+            keepalive = await asyncio.wait_for(anext(stream), timeout=0.05)
+            keepalives.append(keepalive)
+            if len(attempts) >= 2:
+                break
+        self.assertTrue(all(hooks._is_route_recovery_sse_keepalive(item) for item in keepalives))
+        self.assertGreaterEqual(len(attempts), 2)
+        await stream.aclose()
+
+    async def test_network_stream_fallback_never_raises_client_reconnect(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["litellm_menu.streaming"]
+        routing_module = sys.modules["litellm_menu.routing"]
+        original_fallback = streaming_module._stream_streaming_error_fallback
+        original_recovery = streaming_module._stream_route_recovery_poll
+        original_disconnect = routing_module._raise_retryable_stream_disconnect
+
+        class ReadError(Exception):
+            pass
+
+        fallback_called = False
+
+        async def failed_fallback(request_data, exception):
+            nonlocal fallback_called
+            fallback_called = True
+            raise AssertionError("offline recovery must not wait for one-shot fallback")
+            yield None
+
+        async def recovery_keepalive(request_data, exception):
+            yield hooks._route_recovery_sse_keepalive(
+                1,
+                request_data=request_data,
+                phase="network",
+            )
+
+        def unexpected_disconnect(*args, **kwargs):
+            raise AssertionError("network recovery must not ask Codex to reconnect")
+
+        streaming_module._stream_streaming_error_fallback = failed_fallback
+        streaming_module._stream_route_recovery_poll = recovery_keepalive
+        routing_module._raise_retryable_stream_disconnect = unexpected_disconnect
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_streaming_error_fallback",
+            original_fallback,
+        )
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_route_recovery_poll",
+            original_recovery,
+        )
+        self.addCleanup(
+            setattr,
+            routing_module,
+            "_raise_retryable_stream_disconnect",
+            original_disconnect,
+        )
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+        chunks = [
+            chunk
+            async for chunk in hooks._yield_streaming_error_fallback_or_raise(
+                request_data,
+                ReadError("connection closed."),
+            )
+        ]
+        self.assertEqual(len(chunks), 1)
+        self.assertTrue(hooks._is_route_recovery_sse_keepalive(chunks[0]))
+        self.assertFalse(fallback_called)
+
     async def test_route_recovery_poll_keepalive_does_not_cancel_pending_stream_read(self) -> None:
         hooks, _proxy_server = load_hook_module()
         attempts = []

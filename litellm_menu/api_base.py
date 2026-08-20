@@ -168,15 +168,17 @@ def apply_surface_api_base(request_kwargs: dict, surface: Any) -> bool:
     if not isinstance(configured, str) or not configured.strip():
         return False
     normalized = api_base_for_surface(configured, surface)
-    if not normalized or normalized == configured:
+    if not normalized:
         return False
     updated = litellm_params.copy()
     updated["api_base"] = normalized
     request_kwargs["litellm_params"] = updated
+    changed = normalized != configured or request_kwargs.get("api_base") != normalized
     request_kwargs["api_base"] = normalized
     metadata = request_kwargs.get("litellm_metadata")
     if isinstance(metadata, dict):
         updated_metadata = metadata.copy()
         updated_metadata["api_base"] = normalized
         request_kwargs["litellm_metadata"] = updated_metadata
-    return True
+        changed = changed or metadata.get("api_base") != normalized
+    return changed

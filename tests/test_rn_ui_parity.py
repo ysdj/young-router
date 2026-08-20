@@ -1985,13 +1985,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         header = relay.split('<View style={styles.accountHeader}>', 1)[1].split('<View style={[styles.resourcesSection]', 1)[0]
 
-        self.assertIn('<View style={styles.accountIdentity}>', relay)
-        self.assertIn('<View style={styles.accountFacts}>', relay)
-        self.assertIn('<View style={styles.accountHeaderActions}>', relay)
-        self.assertLess(header.index('relay.type'), header.index('relay.balance'))
-        self.assertGreaterEqual(header.count('<Text style={styles.accountHeaderSeparator}>·</Text>'), 3)
+        self.assertIn('<View style={styles.accountBreadcrumb}>', header)
+        self.assertIn('<NativeButton', header)
+        self.assertIn('style={styles.accountBreadcrumbStation}', header)
+        self.assertIn('<Text style={styles.accountBreadcrumbSeparator}>&gt;</Text>', header)
+        self.assertIn('style={styles.accountBreadcrumbAccount}', header)
+        self.assertIn('onPress={() => selectStation(selectedAccountStation.id)}', header)
+        self.assertNotIn('relay.type', header)
+        self.assertIn('<View style={styles.accountHeaderRight}>', header)
+        self.assertIn('<NativeButton title={translate("common.refresh")}', header)
+        self.assertIn('style={styles.accountHeaderMetric}', header)
+        self.assertIn('style={styles.accountHeaderMetricLabel}', header)
+        self.assertLess(header.index('relay.rememberPassword'), header.index('relay.balance'))
+        self.assertLess(header.index('relay.balance'), header.index('common.status'))
+        self.assertNotIn('accountHeaderFields', header)
+        self.assertNotIn('accountHeaderDivider', header)
+        self.assertIn('<View style={styles.accountStatusSlot}>', header)
         self.assertIn('accountHeader: { minWidth: 0, minHeight: 38', relay)
-        self.assertIn('flexDirection: "row", flexWrap: "wrap"', relay)
+        self.assertIn('accountBreadcrumb: { flex: 1, minWidth: 0, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }', relay)
+        self.assertIn('accountHeaderRight: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 }', relay)
         self.assertNotIn('accountMetadata:', relay)
         self.assertNotIn('accountToolbar:', relay)
 
@@ -2015,7 +2027,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const relayTableRows = useMemo(() => stations.flatMap((station) => {",
             'key: `station:${station.id}`',
             'const rows: Array<{ key: string; cells: string[] }> = [{',
-            'cells: [stationDisplay(station), translate("relay.station")]',
+            'cells: [stationDisplay(station), ""]',
             'key: `account:${account.id}`',
             'cells: [`  ${accountDisplayName(account, translate)}`',
             "const stageStationUpdate = async",
@@ -2061,8 +2073,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "multiplier: groupMultiplier(entry.multiplier ?? entry.rate_multiplier ?? entry.ratio)",
             'domain="relay_accounts"',
             "apiKeyNameDrafts",
-            "accountFacts",
-            "accountIdentity",
+            "accountBreadcrumb",
+            "accountBreadcrumbStation",
+            "accountBreadcrumbSeparator",
+            "accountBreadcrumbAccount",
+            "accountHeaderRight",
+            "accountHeaderMetric",
             "resourceEmptyText",
             'accountStationDisplay(selected)',
             'translate("relay.balance")',
@@ -2213,9 +2229,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('translate("relay.pendingOperationsCount"', relay)
         self.assertNotIn("await refreshAccountResources(selected);", relay)
         self.assertNotIn('resource_ids: [resourceId]', self.ui)
-        self.assertIn('relayTypeLabel(selected.type', relay)
+        self.assertIn('accountStationFor(selected)', relay)
         self.assertIn('symbol="refresh"', relay)
-        self.assertIn("accountRememberPassword: { minWidth: 78 }", relay)
+        self.assertIn("accountRememberPassword: { minWidth: 78, flexShrink: 0 }", relay)
         self.assertIn("resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1", relay)
 
     def test_relay_dialogs_avoid_the_unregistered_macos_fabric_modal_host(self) -> None:
@@ -2371,9 +2387,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'bottomBar: { minHeight: 38, paddingHorizontal: 12, paddingVertical: 6, flexDirection: "row", flexWrap: "wrap"',
             'resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1, borderTopColor: colors.separator, paddingTop: 4 }',
             'accountDetailContent: { flex: 1, minWidth: 0, minHeight: 0 }',
-            'accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 12, rowGap: 4, backgroundColor: colors.window }',
-            'accountIdentity: { flexGrow: 0, flexShrink: 1, flexBasis: "auto", minWidth: 150, flexDirection: "row", alignItems: "baseline", gap: 5 }',
-            'accountFacts: { flexShrink: 1, minWidth: 0, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 6 }',
+            'accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", alignItems: "center", columnGap: 8, backgroundColor: colors.window }',
+            'accountBreadcrumb: { flex: 1, minWidth: 0, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }',
+            'accountHeaderRight: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 }',
             'resourcePane: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.window }',
             'resourceToolbar: { minHeight: 32, paddingHorizontal: 12, paddingVertical: 3, flexDirection: "row", alignItems: "center", gap: 8 }',
             'sidebarTableFrame: { flex: 1, minWidth: 0, minHeight: 0 }',
@@ -2470,7 +2486,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'tableTitleRow: { height: 30, minHeight: 30, paddingHorizontal: 10',
             'accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5',
-            'accountIdentity: { flexGrow: 0, flexShrink: 1, flexBasis: "auto"',
+            'accountBreadcrumb: { flex: 1, minWidth: 0, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }',
+            'accountHeaderRight: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 }',
             'resourceToolbar: { minHeight: 32, paddingHorizontal: 12',
             'resourceNativeTable: { flex: 1, minWidth: 0, minHeight: 0 }',
             'resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 6, paddingHorizontal: 12',
@@ -2611,7 +2628,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("resourceDisplayName(resource)", relay)
         self.assertIn('const [stationDrafts, setStationDrafts] = useState<Record<string, StationDraft>>({});', relay)
         self.assertIn("const projectedStation = (station: RelayStation): RelayStation => {", relay)
-        self.assertIn("cells: [stationDisplay(station), translate(\"relay.station\")]", relay)
+        self.assertIn('cells: [stationDisplay(station), ""]', relay)
         self.assertIn("accountStationDisplay(selected)", relay)
         self.assertIn("onChangeText={(value) => setStationDraft(selectedStation.id, { name: value })}", relay)
         self.assertIn("textField: { minHeight: 24 }", appkit_controls)

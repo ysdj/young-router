@@ -684,7 +684,8 @@ def _install_selected_deployment_marker_patch() -> None:
                     failed_request,
                 ):
                     _routing_module._clear_protocol_fallback_cache_for_request(
-                        failed_request
+                        failed_request,
+                        preserve_relaxed_tool_choice=True,
                     )
                     _routing_module._mark_exception_for_upstream_surface_failover(
                         response.exception,
@@ -727,7 +728,10 @@ def _install_selected_deployment_marker_patch() -> None:
                 exc,
                 kwargs,
             ):
-                _routing_module._clear_protocol_fallback_cache_for_request(kwargs)
+                _routing_module._clear_protocol_fallback_cache_for_request(
+                    kwargs,
+                    preserve_relaxed_tool_choice=True,
+                )
                 _routing_module._mark_exception_for_upstream_surface_failover(
                     exc,
                     kwargs,
@@ -880,9 +884,53 @@ def _install_order_peer_failover_patch() -> None:
                 request=_trace_module._trace_request_summary(kwargs),
                 exception=_routing_module._trace_exception(e),
             )
+            decision_kwargs = _responses_execution_module._request_kwargs_with_model_group(
+                model_group,
+                kwargs,
+            )
+            if _routing_module._should_return_route_recovery_stream(
+                e,
+                decision_kwargs,
+                self,
+            ):
+                if _routing_module._should_block_external_web_search_original_recovery(
+                    decision_kwargs
+                ):
+                    _trace_module._route_trace(
+                        "external_web_search_original_recovery_blocked",
+                        request_id=_routing_module._trace_request_id(kwargs),
+                        session=_routing_module._trace_session_context(kwargs),
+                        model_group=_responses_execution_module._request_model_group(kwargs)
+                        or model_group,
+                        target_order=kwargs.get("_target_order"),
+                        excluded_deployment_ids=kwargs.get("_excluded_deployment_ids"),
+                        exception=_routing_module._trace_exception(e),
+                    )
+                    failed_stream_kwargs = decision_kwargs.copy()
+                    return _routing_module._failed_responses_stream_response(
+                        failed_stream_kwargs,
+                        e,
+                    )
+                _trace_module._route_trace(
+                    "route_recovery_stream_returned",
+                    request_id=_routing_module._trace_request_id(kwargs),
+                    session=_routing_module._trace_session_context(kwargs),
+                    model_group=_responses_execution_module._request_model_group(kwargs)
+                    or model_group,
+                    target_order=kwargs.get("_target_order"),
+                    excluded_deployment_ids=kwargs.get("_excluded_deployment_ids"),
+                    exception=_routing_module._trace_exception(e),
+                )
+                recovery_stream_kwargs = decision_kwargs.copy()
+                recovery_stream_kwargs["_route_recovery_ignore_local_constraints"] = True
+                return _routing_module._route_recovery_stream_response(
+                    recovery_stream_kwargs,
+                    e,
+                )
             if _routing_module._should_sanitize_final_upstream_route_error(e):
                 _routing_module._raise_sanitized_upstream_route_failure(
-                    _responses_execution_module._request_model_group(kwargs) or model_group,
+                    _responses_execution_module._request_model_group(kwargs)
+                    or model_group,
                     e,
                     kwargs,
                 )

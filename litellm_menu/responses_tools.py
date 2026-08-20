@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import request_context as _request_context_module
 from . import routing as _routing_module
 from . import tools as _tools_module
 from . import trace as _trace_module
@@ -17,6 +18,7 @@ from .base import (
     _HOSTED_WEB_SEARCH_TOOL_TYPES,
     _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY,
     _RESPONSES_BRIDGE_NAMESPACE_KEY,
+    _RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY,
     _TOOL_SEARCH_BRIDGE_FUNCTION_NAME,
     _WEB_SEARCH_BRIDGE_FUNCTION_NAME,
     copy,
@@ -37,6 +39,75 @@ def _responses_chat_bridge_tool_schema(value: Any) -> Any:
             continue
         sanitized[key] = _responses_chat_bridge_tool_schema(item)
     return sanitized
+
+
+def _responses_chat_bridge_function_parameters(value: Any) -> dict:
+    """Return a JSON-schema object accepted by the function-tool bridge.
+
+    The Responses function-tool shape requires an object parameter schema.
+    Keep the caller's properties and required members unchanged, while making
+    the omitted empty ``required`` member explicit for tools with no required
+    arguments.  This is a protocol-shape repair, not a provider-specific
+    schema rewrite.
+    """
+
+    normalized = _responses_chat_bridge_tool_schema(value)
+    if not isinstance(normalized, dict):
+        normalized = {}
+    else:
+        normalized = copy.deepcopy(normalized)
+    normalized.setdefault("type", "object")
+    if not isinstance(normalized.get("properties"), dict):
+        normalized["properties"] = {}
+    if "required" not in normalized:
+        normalized["required"] = []
+    return normalized
+
+
+def _responses_function_tool_schema_compat_retry_kwargs(
+    request_kwargs: Any,
+) -> Optional[dict]:
+    """Drop only explicit ``strict=false`` on one function-tool retry.
+
+    ``strict`` defaults to false for the Chat function-tool shape.  A few
+    gateways reject the explicit member while accepting the equivalent
+    omitted form, so this keeps the schema and semantics intact while giving
+    the same protocol one narrowly bounded compatibility attempt.  Explicit
+    ``strict=true`` is preserved.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "litellm_metadata",
+    ) or {}
+    if metadata.get(_RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY) is True:
+        return None
+    tools = request_kwargs.get("tools")
+    if not isinstance(tools, list):
+        return None
+
+    updated_tools = copy.deepcopy(tools)
+    changed = False
+    for tool in updated_tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "function" and tool.get("strict") is False:
+            tool.pop("strict", None)
+            changed = True
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("strict") is False:
+            function.pop("strict", None)
+            changed = True
+    if not changed:
+        return None
+    retry_kwargs = request_kwargs.copy()
+    retry_kwargs["tools"] = updated_tools
+    retry_metadata = metadata.copy()
+    retry_metadata[_RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY] = True
+    retry_kwargs["litellm_metadata"] = retry_metadata
+    return retry_kwargs
 
 
 def _responses_chat_bridge_tool_schema_has_empty_enum(value: Any) -> bool:
@@ -70,7 +141,7 @@ def _responses_bridge_function_tool(tool: Any) -> Optional[dict]:
     converted: dict[str, Any] = {
         "type": "function",
         "name": name,
-        "parameters": _responses_chat_bridge_tool_schema(parameters),
+        "parameters": _responses_chat_bridge_function_parameters(parameters),
     }
     description = _responses_bridge_tool_description(tool)
     if isinstance(description, str):
@@ -115,7 +186,7 @@ def _responses_bridge_custom_tool(tool: Any) -> Optional[dict]:
     converted: dict[str, Any] = {
         "type": "function",
         "name": name,
-        "parameters": _responses_chat_bridge_tool_schema(parameters),
+        "parameters": _responses_chat_bridge_function_parameters(parameters),
         _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY: True,
     }
     description = _responses_bridge_tool_description(tool)
@@ -209,7 +280,7 @@ def _responses_bridge_tool_search_tool(tool: Any) -> Optional[dict]:
         "type": "function",
         "name": _TOOL_SEARCH_BRIDGE_FUNCTION_NAME,
         "description": description,
-        "parameters": _responses_chat_bridge_tool_schema(parameters),
+        "parameters": _responses_chat_bridge_function_parameters(parameters),
     }
     if isinstance(tool.get("execution"), str):
         converted["x-litellm-menu-responses-tool-search-execution"] = tool["execution"]

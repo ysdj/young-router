@@ -92,6 +92,12 @@ class APIBaseTests(unittest.TestCase):
         self.assertEqual(request["api_base"], "https://api.example.test/v1/messages")
         self.assertEqual(request["litellm_metadata"]["api_base"], "https://api.example.test/v1/messages")
 
+    def test_surface_base_republishes_a_canonical_configured_v1_base(self) -> None:
+        request = {"litellm_params": {"api_base": "https://api.example.test/v1"}}
+
+        self.assertTrue(apply_surface_api_base(request, "openai/responses"))
+        self.assertEqual(request["api_base"], "https://api.example.test/v1")
+
     def test_gateway_path_names_are_not_mistaken_for_complete_endpoints(self) -> None:
         for path in ("model", "chat", "response", "tenant/model"):
             with self.subTest(path=path):

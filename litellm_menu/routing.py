@@ -50,8 +50,10 @@ from .base import (
     _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
     _PROTOCOL_FALLBACK_DEFAULT_TTL_SECONDS,
     _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR,
+    _PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY,
     _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
     _PROTOCOL_FALLBACK_LOCK,
+    _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
     _PROTOCOL_FALLBACKS,
     _PROTOCOL_FALLBACK_TTL_SECONDS_ENV,
     _EXTERNAL_WEB_SEARCH_STARTED_REQUESTS,
@@ -220,10 +222,14 @@ def _remember_request_time(
 def _record_request_started_time(request_kwargs: Optional[dict]) -> None:
     if not isinstance(request_kwargs, dict):
         return
-    if not isinstance(request_kwargs.get(_REQUEST_STARTED_TIME_KEY), datetime):
-        request_kwargs[_REQUEST_STARTED_TIME_KEY] = datetime.now(timezone.utc)
-    request_id = _trace_request_id(request_kwargs)
     started_at = request_kwargs.get(_REQUEST_STARTED_TIME_KEY)
+    if not isinstance(started_at, datetime):
+        # Keep the timestamp in the bounded correlation store instead of
+        # adding a datetime-valued private kwarg to LiteLLM's provider call.
+        # Anthropic-compatible handlers serialize unknown kwargs directly and
+        # reject that otherwise internal value before reaching the upstream.
+        started_at = datetime.now(timezone.utc)
+    request_id = _trace_request_id(request_kwargs)
     if request_id and isinstance(started_at, datetime):
         _remember_request_time(
             _REQUEST_STARTED_TIMES,
@@ -233,10 +239,14 @@ def _record_request_started_time(request_kwargs: Optional[dict]) -> None:
         )
 
 
-def _record_first_stream_output_time(request_kwargs: Optional[dict]) -> None:
+def _record_first_stream_output_time(
+    request_kwargs: Optional[dict],
+    observed_at: Optional[datetime] = None,
+) -> None:
     if not isinstance(request_kwargs, dict):
         return
-    observed_at = request_kwargs.get(_FIRST_STREAM_OUTPUT_TIME_KEY)
+    if observed_at is None:
+        observed_at = request_kwargs.get(_FIRST_STREAM_OUTPUT_TIME_KEY)
     if not isinstance(observed_at, datetime):
         return
     request_id = _trace_request_id(request_kwargs)
@@ -598,7 +608,7 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_COOLDOWN,
         )
 
-    if _exception_indicates_network_connectivity_error(exception):
+    if _is_network_recovery_exception(exception):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_NETWORK_ENV,
             _RECOVERY_POLICY_RECOVERY,
@@ -1379,7 +1389,89 @@ def _set_protocol_fallback_request_state(
     updated_metadata[_PROTOCOL_FALLBACK_FROM_SURFACE_KEY] = normalized_from
     updated_metadata[_PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY] = normalized_client
     updated_metadata[_PROTOCOL_FALLBACK_CACHE_HIT_KEY] = bool(cache_hit)
+    if _protocol_fallback_relax_tool_choice(request_kwargs):
+        request_kwargs[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
+        updated_metadata[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
     request_kwargs["litellm_metadata"] = updated_metadata
+
+
+def _mark_protocol_fallback_relax_tool_choice(
+    request_kwargs: Optional[dict],
+) -> None:
+    """Carry an explicit upstream request to use automatic tool selection.
+
+    Some endpoints reject a named/required tool choice even though the
+    protocol itself is usable.  The flag is set only after that concrete
+    error and is consumed when the configured alternate surface is applied.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return
+    request_kwargs[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    updated_metadata = metadata.copy()
+    updated_metadata[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
+    request_kwargs["litellm_metadata"] = updated_metadata
+
+
+def _protocol_fallback_relax_tool_choice(
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    if request_kwargs.get(_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY) is True:
+        return True
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    return metadata.get(_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY) is True
+
+
+def _protocol_fallback_failure_recorded(
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    marker = request_kwargs.get(_PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY)
+    if marker is True:
+        return True
+    current_deployment_id = _deployment_id_from_request(request_kwargs)
+    current_route_key = _deployment_route_key_from_request(request_kwargs)
+    if isinstance(marker, dict):
+        marker_deployment_id = marker.get("deployment_id")
+        marker_route_key = marker.get("route_key")
+        if (
+            isinstance(marker_deployment_id, str)
+            and marker_deployment_id
+            and marker_deployment_id == current_deployment_id
+        ):
+            return True
+        if (
+            isinstance(marker_route_key, str)
+            and marker_route_key
+            and marker_route_key == current_route_key
+        ):
+            return True
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "litellm_metadata",
+    ) or {}
+    metadata_marker = metadata.get(_PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY)
+    if metadata_marker is True:
+        return True
+    if isinstance(metadata_marker, dict):
+        return (
+            metadata_marker.get("deployment_id") == current_deployment_id
+            and isinstance(current_deployment_id, str)
+            and bool(current_deployment_id)
+        ) or (
+            metadata_marker.get("route_key") == current_route_key
+            and isinstance(current_route_key, str)
+            and bool(current_route_key)
+        )
+    return False
 
 
 def _clear_protocol_fallback_request_state(request_kwargs: Optional[dict]) -> None:
@@ -1389,6 +1481,7 @@ def _clear_protocol_fallback_request_state(request_kwargs: Optional[dict]) -> No
         _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
         _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
         _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
+        _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
     ):
         request_kwargs.pop(key, None)
     metadata = _request_context_module._request_metadata_dict(
@@ -1401,6 +1494,7 @@ def _clear_protocol_fallback_request_state(request_kwargs: Optional[dict]) -> No
             _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
             _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
             _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
+            _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
         ):
             if key in updated_metadata:
                 updated_metadata.pop(key, None)
@@ -1452,6 +1546,8 @@ def _protocol_fallback_cached_surface(
         client_surface=state.get("client_surface") or client_surface,
         cache_hit=True,
     )
+    if state.get("relax_tool_choice") is True:
+        _mark_protocol_fallback_relax_tool_choice(request_kwargs)
     _trace_module._route_trace(
         "protocol_fallback_cache_hit",
         request_id=_trace_request_id(request_kwargs),
@@ -1479,6 +1575,7 @@ def _record_protocol_fallback_success(request_kwargs: Optional[dict]) -> None:
     fallback_surface = _request_current_upstream_surface(request_kwargs)
     deployment_id = _request_surface_deployment_id(request_kwargs) or _deployment_id_from_request(request_kwargs)
     cache_key = _protocol_fallback_cache_key(deployment_id, client_surface)
+    relax_tool_choice = _protocol_fallback_relax_tool_choice(request_kwargs)
     fallback_succeeded = bool(
         from_surface
         and client_surface
@@ -1503,6 +1600,7 @@ def _record_protocol_fallback_success(request_kwargs: Optional[dict]) -> None:
             "client_surface": client_surface,
             "from_surface": from_surface,
             "fallback_surface": fallback_surface,
+            "relax_tool_choice": relax_tool_choice,
             "created_at": now,
             "expires_at": expires_at,
         }
@@ -1515,6 +1613,7 @@ def _record_protocol_fallback_success(request_kwargs: Optional[dict]) -> None:
                 "client_surface": client_surface,
                 "from_surface": from_surface,
                 "fallback_surface": fallback_surface,
+                "relax_tool_choice": relax_tool_choice,
                 "created_at": now,
                 "expires_at": expires_at,
             }
@@ -1535,9 +1634,15 @@ def _record_protocol_fallback_success(request_kwargs: Optional[dict]) -> None:
 
 def _clear_protocol_fallback_cache_for_request(
     request_kwargs: Optional[dict],
+    *,
+    preserve_relaxed_tool_choice: bool = False,
 ) -> None:
     if not isinstance(request_kwargs, dict):
         return
+    keep_relaxed_tool_choice = (
+        preserve_relaxed_tool_choice
+        and _protocol_fallback_relax_tool_choice(request_kwargs)
+    )
     client_surface = _normalized_request_surface(
         request_kwargs.get(_PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY)
     )
@@ -1545,6 +1650,8 @@ def _clear_protocol_fallback_cache_for_request(
     cache_key = _protocol_fallback_cache_key(deployment_id, client_surface)
     if not cache_key:
         _clear_protocol_fallback_request_state(request_kwargs)
+        if keep_relaxed_tool_choice:
+            _mark_protocol_fallback_relax_tool_choice(request_kwargs)
         return
 
     def clear(fallbacks: dict[str, Any], _now: float) -> Optional[dict[str, Any]]:
@@ -1568,6 +1675,8 @@ def _clear_protocol_fallback_cache_for_request(
             request=_trace_module._trace_request_summary(request_kwargs),
         )
     _clear_protocol_fallback_request_state(request_kwargs)
+    if keep_relaxed_tool_choice:
+        _mark_protocol_fallback_relax_tool_choice(request_kwargs)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -2320,6 +2429,16 @@ def _apply_surface_adapter_to_request(
         request_kwargs.pop("use_chat_completions_api", None)
     else:
         request_kwargs["use_chat_completions_api"] = True
+        if _protocol_fallback_relax_tool_choice(request_kwargs):
+            request_kwargs["tool_choice"] = "auto"
+            for container_key in ("extra_body", "litellm_params"):
+                container = request_kwargs.get(container_key)
+                if not isinstance(container, dict):
+                    continue
+                updated_container = container.copy()
+                updated_container.pop("tool_choice", None)
+                updated_container.pop("function_call", None)
+                request_kwargs[container_key] = updated_container
 
     litellm_params = request_kwargs.get("litellm_params")
     if isinstance(litellm_params, dict):
@@ -2533,6 +2652,38 @@ def _apply_current_selected_deployment_to_request(
         _selected_deployment_marker_from_box(selected_box),
         update_top_level=update_top_level,
     )
+
+
+def _surface_adapted_dispatch_kwargs(request_kwargs: Optional[dict]) -> dict:
+    """Copy callback kwargs and reapply the selected protocol's wire values.
+
+    LiteLLM's generic router rebuilds callback kwargs from the raw deployment
+    parameters.  That merge can overwrite the surface adapter's top-level
+    model/provider/api_base values even though the request-scoped surface
+    marker is still present.  Keep routing state untouched and adapt only the
+    copy handed to the provider callback.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return {}
+    adapted = request_kwargs.copy()
+    marker = _selected_deployment_marker_from_box()
+    surface = _request_current_upstream_surface(adapted)
+    if not surface and isinstance(marker, dict):
+        surface = _normalized_request_surface(
+            marker.get(_CURRENT_UPSTREAM_URL_SURFACE_KEY)
+        )
+    if not surface:
+        return adapted
+    upstream_model = None
+    if isinstance(marker, dict):
+        marker_params = marker.get("litellm_params")
+        if isinstance(marker_params, dict):
+            upstream_model = marker_params.get("model")
+    if upstream_model is None:
+        upstream_model = adapted.get("model")
+    _apply_surface_adapter_to_request(adapted, surface, upstream_model)
+    return adapted
 
 
 def _remember_selected_deployment_for_request(
@@ -2893,6 +3044,8 @@ def _exception_indicates_network_connectivity_error(exception: Exception) -> boo
             "api connection error",
             "apiconnectionerror",
             "connecterror",
+            "error sending request",
+            "error sending a request",
             "cannot connect to host",
             "failed to connect",
             "connection refused",
@@ -2909,6 +3062,39 @@ def _exception_indicates_network_connectivity_error(exception: Exception) -> boo
             "nodename nor servname provided",
         )
     )
+
+
+_NETWORK_CONNECTIVITY_MARKER_ATTR = "_litellm_menu_network_connectivity"
+
+
+def _is_network_recovery_exception(exception: Exception) -> bool:
+    """Return whether a route failure should keep the client stream in recovery.
+
+    A sanitized upstream exception intentionally replaces the original message,
+    so preserve an explicit marker when that wrapper is created.  The textual
+    check also covers wrappers produced by LiteLLM before they reach this
+    module.
+    """
+
+    pending = [exception]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        if bool(getattr(candidate, _NETWORK_CONNECTIVITY_MARKER_ATTR, False)):
+            return True
+        if _exception_indicates_network_connectivity_error(candidate):
+            return True
+        if "temporary network connectivity error" in _exception_text(candidate):
+            return True
+        for attr in ("__cause__", "__context__", "original_exception"):
+            nested = getattr(candidate, attr, None)
+            if isinstance(nested, Exception) and id(nested) not in seen:
+                pending.append(nested)
+    return False
 
 
 def _is_ssl_verification_error(exception: Exception) -> bool:
@@ -3559,13 +3745,16 @@ def _mark_exception_for_deployment_failover(
         return
     if protocol_surface_failover:
         return
-    _record_deployment_failure_for_cooldown(exception, request_kwargs)
+    if not _protocol_fallback_failure_recorded(request_kwargs):
+        _record_deployment_failure_for_cooldown(exception, request_kwargs)
 
 
 def _mark_exception_for_upstream_surface_failover(
     exception: Exception,
     request_kwargs: Optional[dict],
 ) -> None:
+    if _is_forced_tool_choice_unsupported_error(exception, request_kwargs):
+        _mark_protocol_fallback_relax_tool_choice(request_kwargs)
     try:
         exception.upstream_surface_unsupported = True  # type: ignore[attr-defined]
     except Exception:
@@ -3601,12 +3790,33 @@ def _mark_protocol_fallback_failure(
     exception: Exception,
     request_kwargs: Optional[dict],
 ) -> None:
+    if _protocol_fallback_failure_recorded(request_kwargs):
+        return
     if getattr(exception, _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR, False):
         return
     try:
         setattr(exception, _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR, True)
     except Exception:
         pass
+    if isinstance(request_kwargs, dict):
+        marker = {
+            "deployment_id": (
+                _responses_execution_module._failed_deployment_id(exception)
+                or _deployment_id_from_request(request_kwargs)
+            ),
+            "route_key": (
+                _responses_execution_module._failed_deployment_route_key(exception)
+                or _deployment_route_key_from_request(request_kwargs)
+            ),
+        }
+        request_kwargs[_PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY] = marker
+        metadata = _request_context_module._request_metadata_dict(
+            request_kwargs,
+            "litellm_metadata",
+        ) or {}
+        updated_metadata = metadata.copy()
+        updated_metadata[_PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY] = marker
+        request_kwargs["litellm_metadata"] = updated_metadata
     # A deterministic 4xx normally stays out of cooldown accounting. Once
     # both protocols have failed, the pair is one failed route attempt. Count
     # it once without turning the deterministic error into a recovery poll.
@@ -4247,6 +4457,11 @@ def _sanitized_upstream_route_exception(
         setattr(sanitized, _SANITIZED_UPSTREAM_ROUTE_FAILURE_ATTR, True)
     except Exception:
         pass
+    if _is_network_recovery_exception(exception):
+        try:
+            setattr(sanitized, _NETWORK_CONNECTIVITY_MARKER_ATTR, True)
+        except Exception:
+            pass
     try:
         setattr(
             sanitized,
@@ -4362,8 +4577,27 @@ def _is_current_upstream_surface_incompatible_error(
             "invalid request parameter combination",
         )
     )
+    forced_tool_choice_unsupported = _is_forced_tool_choice_unsupported_error(
+        exception,
+        request_kwargs,
+        outer_request_kwargs,
+    )
+    # A named choice may already have been retried as ``auto`` and then had
+    # its namespace/custom tools bridged to functions.  The bridge retains
+    # the confirmed incompatibility state, so a repeated explicit
+    # tool-choice rejection can advance to the configured protocol fallback
+    # even though the active retry no longer carries a named choice.
+    relaxed_tool_choice_still_rejected = (
+        (_protocol_fallback_relax_tool_choice(request_kwargs)
+         or _protocol_fallback_relax_tool_choice(outer_request_kwargs))
+        and _is_forced_tool_choice_unsupported_text(exception)
+    )
     if (
-        invalid_parameter_combination
+        (
+            invalid_parameter_combination
+            or forced_tool_choice_unsupported
+            or relaxed_tool_choice_still_rejected
+        )
         and protocol_mode == _UPSTREAM_PROTOCOL_MODE_FALLBACK
         and client_surface == current_surface
         and configured_surface
@@ -4400,6 +4634,180 @@ def _is_current_upstream_surface_incompatible_error(
             )
         )
     return False
+
+
+def _request_forced_tool_choice(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> Any:
+    """Return an explicitly forced tool choice from the active request."""
+
+    for request in (request_kwargs, outer_request_kwargs):
+        if not isinstance(request, dict) or "tool_choice" not in request:
+            continue
+        value = request.get("tool_choice")
+        if value is None:
+            continue
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"", "auto", "none"}:
+                continue
+            return value
+        if isinstance(value, dict):
+            choice_type = str(value.get("type") or "").strip().lower()
+            if choice_type in {"", "auto", "none"}:
+                continue
+            return value
+        return value
+    return None
+
+
+def _is_forced_tool_choice_unsupported_error(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    """Recognize an explicit upstream rejection of a forced tool choice.
+
+    This is intentionally narrower than a generic bad-request classifier. A
+    protocol retry is safe only when the request actually forced a tool and
+    the upstream response explicitly says that mode is unsupported or asks
+    for tool_choice=auto.
+    """
+
+    if _exception_status_code(exception) not in {400, 422}:
+        return False
+    if _is_terminal_prompt_or_policy_error(exception):
+        return False
+    if _request_forced_tool_choice(request_kwargs, outer_request_kwargs) is None:
+        return False
+    return _is_forced_tool_choice_unsupported_text(exception)
+
+
+def _is_forced_tool_choice_unsupported_text(exception: Exception) -> bool:
+    """Match an upstream error that explicitly rejects forced tool choice."""
+
+    if _exception_status_code(exception) not in {400, 422}:
+        return False
+    if _is_terminal_prompt_or_policy_error(exception):
+        return False
+    text = _exception_text(exception)
+    if not text or ("tool_choice" not in text and "tool choice" not in text):
+        return False
+
+    unsupported_markers = (
+        "unsupported",
+        "not support",
+        "does not support",
+        "not allowed",
+        "invalid",
+        "不支持",
+        "不允许",
+        "无效",
+    )
+    has_unsupported_marker = any(marker in text for marker in unsupported_markers)
+    requests_auto = any(
+        marker in text
+        for marker in (
+            "tool_choice=auto",
+            "tool_choice = auto",
+            "tool choice=auto",
+            "tool choice = auto",
+            "改用tool_choice=auto",
+            "改用 tool_choice=auto",
+            "请改用tool_choice=auto",
+            "请改用 tool_choice=auto",
+        )
+    )
+    forced_mode_marker = any(
+        marker in text
+        for marker in (
+            "forced tool choice",
+            "force tool choice",
+            "forced choice",
+            "强制选择",
+            "强制工具",
+        )
+    )
+    return bool(requests_auto or (has_unsupported_marker and forced_mode_marker))
+
+
+def _request_has_tool_compatibility_candidate(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    """Require an actual tool payload before retrying an ambiguous 400.
+
+    Some gateways use the same generic ``invalid parameter combination``
+    text for unrelated request errors.  The permissive retry is only useful
+    when the request carries a tool definition (including Responses input
+    tool items), so a forced choice alone must not trigger it.
+    """
+
+    for request in (request_kwargs, outer_request_kwargs):
+        if not isinstance(request, dict):
+            continue
+        tools = request.get("tools")
+        if isinstance(tools, list) and any(
+            isinstance(tool, dict) and tool.get("type") for tool in tools
+        ):
+            return True
+        input_items = request.get("input")
+        if isinstance(input_items, list) and any(
+            isinstance(item, dict)
+            and item.get("type")
+            in {
+                "function_call",
+                "function_call_output",
+                "namespace",
+                "custom",
+                "tool_search",
+            }
+            for item in input_items
+        ):
+            return True
+    return False
+
+
+def _is_forced_tool_choice_auto_retry_error(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    """Allow one same-protocol auto-choice retry for an ambiguous 400.
+
+    A few OpenAI-compatible gateways collapse the named-tool rejection into a
+    generic invalid-parameter-combination response. The request still
+    contains a forced choice, so trying auto once is the narrow tool
+    compatibility fallback before changing protocol surfaces.
+    """
+
+    if not _request_has_tool_compatibility_candidate(
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return False
+    if _is_forced_tool_choice_unsupported_error(
+        exception,
+        request_kwargs,
+        outer_request_kwargs,
+    ):
+        return True
+    if _exception_status_code(exception) not in {400, 422}:
+        return False
+    if _request_forced_tool_choice(request_kwargs, outer_request_kwargs) is None:
+        return False
+    text = _exception_text(exception)
+    return any(
+        marker in text
+        for marker in (
+            "请求参数组合无效",
+            "invalid parameter combination",
+            "invalid parameters combination",
+            "invalid combination of parameters",
+            "invalid request parameter combination",
+        )
+    )
 
 
 def _is_upstream_model_not_found_error(exception: Exception) -> bool:

@@ -564,6 +564,16 @@ class HookTraceLoggingTests(HookTestCase):
             64,
         )
 
+    def test_first_stream_output_time_is_not_forwarded_as_provider_kwarg(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {"litellm_call_id": "ttft-no-output-datetime"}
+        observed = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+        hooks._record_first_stream_output_time(request, observed)
+
+        self.assertNotIn(hooks._FIRST_STREAM_OUTPUT_TIME_KEY, request)
+        self.assertEqual(hooks._first_stream_output_time(request), observed)
+
     def test_ttft_uses_proxy_observed_request_start(self) -> None:
         hooks, _ = load_hook_module()
         started = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
@@ -614,6 +624,15 @@ class HookTraceLoggingTests(HookTestCase):
             ),
             first,
         )
+
+    def test_request_start_time_is_not_forwarded_as_provider_kwarg(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {"litellm_call_id": "ttft-no-private-datetime"}
+
+        hooks._record_request_started_time(request)
+
+        self.assertNotIn(hooks._REQUEST_STARTED_TIME_KEY, request)
+        self.assertIsNotNone(hooks._request_started_time(request))
 
     def test_recent_request_rotation_keeps_bounded_current_and_backup_tail(self) -> None:
         hooks, _ = load_hook_module()

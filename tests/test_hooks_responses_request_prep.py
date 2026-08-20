@@ -292,6 +292,33 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "snapshot_missing",
         )
 
+    def test_codex_cleanup_does_not_reinject_forced_choice_after_protocol_relaxation(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
+        )
+        request["litellm_metadata"] = {
+            hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY: {
+                "state": "snapshot_missing",
+                "tool_call_required": True,
+            },
+            hooks._PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY: True,
+        }
+
+        modified = hooks._with_codex_descendant_cleanup_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "auto")
+        self.assertNotEqual(
+            modified["tool_choice"],
+            {"type": "function", "name": "list_agents"},
+        )
+        self.assertEqual(
+            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY],
+            {"state": "snapshot_missing", "tool_call_required": True},
+        )
+
     def test_codex_root_missing_snapshot_narrows_existing_required_choice(self) -> None:
         hooks, _ = load_hook_module()
         request = self._as_root_collaboration_request(

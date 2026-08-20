@@ -274,6 +274,7 @@ class HookPatchTests(HookTestCase):
                     kwargs["litellm_params"]["api_base"],
                     expected_api_base,
                 )
+                self.assertEqual(kwargs["api_base"], expected_api_base)
                 self.assertEqual(kwargs["litellm_metadata"]["api_base"], expected_api_base)
 
     def test_selected_deployment_update_preserves_original_route_model_group(self) -> None:
@@ -464,6 +465,332 @@ class HookPatchTests(HookTestCase):
             {"ok": True, "surface": "openai/chat"},
         )
         self.assertEqual(attempts, ["openai/responses", "openai/chat"])
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_generic_callback_reapplies_surface_endpoint_after_router_merge(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        deployment = {
+            "model_name": "fixture-model",
+            "litellm_params": {
+                "model": "anthropic/fixture-model",
+                # The user-configured base already includes /v1.  The
+                # callback adapter must preserve that value for OpenAI wire
+                # calls and add only /messages for Anthropic Messages.
+                "api_base": "https://api.example.test/v1",
+                "order": 1,
+            },
+            "model_info": {
+                "id": "fixture-route",
+                "upstream_url_surface": "anthropic",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        seen = {}
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            def _update_kwargs_with_deployment(
+                self,
+                selected_deployment,
+                kwargs,
+                function_name=None,
+            ):
+                kwargs["model_info"] = selected_deployment["model_info"].copy()
+                kwargs["litellm_params"] = selected_deployment[
+                    "litellm_params"
+                ].copy()
+
+            async def make_call(self, original_function, *args, **kwargs):
+                self._update_kwargs_with_deployment(
+                    deployment,
+                    kwargs,
+                    function_name="_ageneric_api_call_with_fallbacks",
+                )
+                response = original_function(*args, **kwargs)
+                if hasattr(response, "__await__"):
+                    return await response
+                return response
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await self.make_call(original_generic_function, **kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            seen.update(
+                {
+                    "api_base": kwargs.get("api_base"),
+                    "model": kwargs.get("model"),
+                    "provider": kwargs.get("custom_llm_provider"),
+                }
+            )
+            return {"ok": True}
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "fixture-model",
+            original_generic_function,
+            call_type="aresponses",
+            input="hello",
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(
+            seen,
+            {
+                "api_base": "https://api.example.test/v1",
+                "model": "openai/fixture-model",
+                "provider": "openai",
+            },
+        )
+        self.assertEqual(
+            deployment["litellm_params"]["api_base"],
+            "https://api.example.test/v1",
+        )
+
+    async def test_generic_helper_uses_tool_type_fallback_before_protocol_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        router_module = types.ModuleType("litellm.router")
+        attempts = []
+        deployment = {
+            "litellm_params": {
+                "model": "openai/vendor-model",
+                "order": 0,
+            },
+            "model_info": {
+                "id": "dual-protocol-route",
+                "model_group": "default-chat",
+                "order": 0,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            def _update_kwargs_with_deployment(
+                self,
+                selected_deployment,
+                kwargs,
+                function_name=None,
+            ):
+                kwargs["model_info"] = selected_deployment["model_info"].copy()
+                kwargs["litellm_params"] = selected_deployment[
+                    "litellm_params"
+                ].copy()
+
+            async def make_call(self, original_function, *args, **kwargs):
+                self._update_kwargs_with_deployment(
+                    deployment,
+                    kwargs,
+                    function_name="aresponses",
+                )
+                response = original_function(*args, **kwargs)
+                if hasattr(response, "__await__"):
+                    return await response
+                return response
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await self.make_call(original_generic_function, **kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            surface = hooks._request_current_upstream_surface(kwargs)
+            tool_types = tuple(
+                tool.get("type")
+                for tool in kwargs.get("tools", [])
+                if isinstance(tool, dict)
+            )
+            attempts.append((surface, kwargs.get("tool_choice"), tool_types))
+            if surface == "openai/responses":
+                if kwargs.get("tool_choice") != "auto":
+                    error = RuntimeError(
+                        "Forced tool choice is unsupported; use tool_choice=auto"
+                    )
+                else:
+                    error = RuntimeError("请求参数组合无效")
+                error.status_code = 400
+                raise error
+            return {"ok": True, "surface": surface}
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            call_type="aresponses",
+            input="hello",
+            stream=True,
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "fixture",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "run",
+                            "description": "Run the synthetic fixture.",
+                        },
+                        {
+                            "type": "function",
+                            "name": "inspect",
+                            "description": "Inspect the synthetic fixture.",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    ],
+                }
+            ],
+            tool_choice={"type": "function", "name": "inspect"},
+        )
+
+        self.assertEqual(response, {"ok": True, "surface": "openai/chat"})
+        self.assertEqual(
+            attempts,
+            [
+                (
+                    "openai/responses",
+                    {"type": "function", "name": "inspect"},
+                    ("namespace",),
+                ),
+                ("openai/responses", "auto", ("namespace",)),
+                ("openai/responses", "auto", ("function", "function")),
+                (
+                    "openai/chat",
+                    "auto",
+                    ("function", "function"),
+                ),
+            ],
+        )
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_generic_helper_keeps_tool_type_fallback_on_native_protocol_when_it_succeeds(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        router_module = types.ModuleType("litellm.router")
+        attempts = []
+        deployment = {
+            "litellm_params": {
+                "model": "openai/vendor-model",
+                "order": 0,
+            },
+            "model_info": {
+                "id": "dual-protocol-route",
+                "model_group": "default-chat",
+                "order": 0,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            def _update_kwargs_with_deployment(
+                self,
+                selected_deployment,
+                kwargs,
+                function_name=None,
+            ):
+                kwargs["model_info"] = selected_deployment["model_info"].copy()
+                kwargs["litellm_params"] = selected_deployment[
+                    "litellm_params"
+                ].copy()
+
+            async def make_call(self, original_function, *args, **kwargs):
+                self._update_kwargs_with_deployment(
+                    deployment,
+                    kwargs,
+                    function_name="aresponses",
+                )
+                response = original_function(*args, **kwargs)
+                if hasattr(response, "__await__"):
+                    return await response
+                return response
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await self.make_call(original_generic_function, **kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_selected_deployment_marker_patch()
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            surface = hooks._request_current_upstream_surface(kwargs)
+            tool_types = tuple(
+                tool.get("type")
+                for tool in kwargs.get("tools", [])
+                if isinstance(tool, dict)
+            )
+            attempts.append((surface, kwargs.get("tool_choice"), tool_types))
+            if tool_types == ("function",):
+                return {"ok": True, "surface": surface}
+            error = RuntimeError("请求参数组合无效")
+            error.status_code = 400
+            raise error
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            call_type="aresponses",
+            input="hello",
+            stream=True,
+            tools=[
+                {
+                    "type": "namespace",
+                    "name": "fixture",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "inspect",
+                            "description": "Inspect the synthetic fixture.",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            ],
+            tool_choice={"type": "function", "name": "inspect"},
+        )
+
+        self.assertEqual(response, {"ok": True, "surface": "openai/responses"})
+        self.assertEqual(
+            attempts,
+            [
+                (
+                    "openai/responses",
+                    {"type": "function", "name": "inspect"},
+                    ("namespace",),
+                ),
+                ("openai/responses", "auto", ("namespace",)),
+                ("openai/responses", "auto", ("function",)),
+            ],
+        )
         self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
 
     async def test_failed_protocol_fallback_is_counted_once_and_returns_terminal_failure(self) -> None:
@@ -2090,6 +2417,74 @@ class HookPatchTests(HookTestCase):
                 ]
             ],
         )
+
+    async def test_order_peer_failover_exhausted_network_error_enters_recovery_stream(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        router_utils_module = types.ModuleType("litellm.router_utils")
+        fallback_handlers_module = types.ModuleType(
+            "litellm.router_utils.fallback_event_handlers"
+        )
+
+        async def run_async_fallback(*args, **kwargs):
+            raise AssertionError("an exhausted offline route must use recovery")
+
+        fallback_handlers_module.run_async_fallback = run_async_fallback
+
+        class Router:
+            max_fallbacks = 8
+
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"order": 1},
+                        "model_info": {"id": "offline-route", "order": 1},
+                    }
+                ]
+
+            async def async_function_with_fallbacks_common_utils(
+                self,
+                e,
+                disable_fallbacks,
+                fallbacks,
+                context_window_fallbacks,
+                content_policy_fallbacks,
+                model_group,
+                args,
+                kwargs,
+            ):
+                raise AssertionError("ordered failover must not expose the original error")
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        sys.modules["litellm.router_utils"] = router_utils_module
+        sys.modules["litellm.router_utils.fallback_event_handlers"] = fallback_handlers_module
+        hooks._install_order_peer_failover_patch()
+
+        error = ConnectionError("connection closed.")
+        error.failed_deployment_id = "offline-route"
+        error.failed_deployment_order = 1
+        error.excluded_deployment_ids = ["offline-route"]
+        response = await Router().async_function_with_fallbacks_common_utils(
+            error,
+            False,
+            None,
+            None,
+            None,
+            "default-chat",
+            (),
+            {
+                "model": "default-chat",
+                "call_type": "aresponses",
+                "input": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "model_info": {"id": "offline-route", "order": 1},
+                "_excluded_deployment_ids": ["offline-route"],
+            },
+        )
+
+        self.assertTrue(hooks._is_route_recovery_stream_response(response))
+        self.assertIs(response.exception, error)
 
     async def test_order_peer_failover_patch_accepts_and_forwards_fallback_errors_flag(self) -> None:
         hooks, _ = load_hook_module()

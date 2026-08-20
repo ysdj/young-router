@@ -1272,6 +1272,15 @@ class HookRoutingTests(HookTestCase):
         self.assertTrue(hooks._is_priority_deployment_failover_error(disconnected))
         self.assertTrue(hooks._should_retry_same_deployment_before_fallback(disconnected))
 
+        sending_request = RuntimeError("Connection failed: error sending request")
+        self.assertTrue(
+            hooks._is_network_recovery_exception(sending_request)
+        )
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(sending_request),
+            "recovery",
+        )
+
     async def test_deployment_cooldown_does_not_count_stream_start_timeout_after_chunks(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()
@@ -1544,6 +1553,36 @@ class HookRoutingTests(HookTestCase):
             "openai/vendor/model",
         )
 
+    def test_surface_adapter_relaxed_choice_removes_nested_forcing_copies(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "openai/vendor/model",
+            "tool_choice": {"type": "function", "name": "inspect"},
+            "extra_body": {
+                "tool_choice": {"type": "function", "name": "inspect"},
+                "function_call": {"name": "inspect"},
+                "keep": True,
+            },
+            "litellm_params": {
+                "tool_choice": {"type": "function", "name": "inspect"},
+                "function_call": {"name": "inspect"},
+                "keep": True,
+            },
+            hooks._PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY: True,
+        }
+
+        hooks._apply_surface_adapter_to_request(
+            request,
+            "openai/chat",
+            "openai/vendor/model",
+        )
+
+        self.assertEqual(request["tool_choice"], "auto")
+        for key in ("extra_body", "litellm_params"):
+            self.assertNotIn("tool_choice", request[key])
+            self.assertNotIn("function_call", request[key])
+            self.assertTrue(request[key]["keep"])
+
     def test_fallback_mode_starts_with_the_client_protocol(self) -> None:
         hooks, _ = load_hook_module()
         deployment = {
@@ -1757,6 +1796,72 @@ class HookRoutingTests(HookTestCase):
                 hooks._protocol_fallback_attempt_active(request)
             )
 
+    def test_protocol_fallback_wrapper_failure_does_not_count_cooldown_twice(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": "hello",
+            "stream": True,
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_litellm_menu_upstream_url_surface_deployment_id": "dual-protocol-route",
+            "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
+            "_litellm_menu_protocol_fallback_client_surface": "openai/responses",
+            "model_info": {
+                "id": "dual-protocol-route",
+                "order": 0,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+            "litellm_params": {
+                "model": "openai/vendor-model",
+                "order": 0,
+            },
+        }
+        first = RuntimeError("responses protocol failed")
+        first.status_code = 400
+        hooks._mark_exception_for_deployment_failover(first, request)
+
+        wrapper = RuntimeError("chat wrapper failed")
+        wrapper.status_code = 503
+        hooks._mark_exception_for_deployment_failover(wrapper, request)
+
+        state = hooks._DEPLOYMENT_COOLDOWNS["id:dual-protocol-route"]
+        self.assertEqual(state["failures"], 1)
+        self.assertEqual(state.get("cooldown_until", 0), 0)
+
+    def test_protocol_fallback_failure_marker_does_not_hide_a_different_route(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        request = {
+            "model": "default-chat",
+            "model_info": {
+                "id": "route-a",
+                "order": 0,
+                "upstream_url_surface": "openai/chat",
+            },
+            "litellm_params": {"model": "openai/vendor-model"},
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
+        }
+        first = RuntimeError("protocol chain failed")
+        first.status_code = 400
+        hooks._mark_exception_for_deployment_failover(first, request)
+
+        request["model_info"] = {
+            "id": "route-b",
+            "order": 1,
+            "upstream_url_surface": "openai/chat",
+        }
+        request["litellm_params"] = {"model": "openai/other-model"}
+        wrapper = RuntimeError("different route failed")
+        wrapper.status_code = 503
+        hooks._mark_exception_for_deployment_failover(wrapper, request)
+
+        self.assertEqual(hooks._DEPLOYMENT_COOLDOWNS["id:route-a"]["failures"], 1)
+        self.assertEqual(hooks._DEPLOYMENT_COOLDOWNS["id:route-b"]["failures"], 1)
+
     def test_successful_protocol_fallback_is_remembered_for_runtime_ttl(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -1956,6 +2061,63 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertFalse(
             hooks._is_current_upstream_surface_incompatible_error(policy_error, request)
+        )
+
+    def test_forced_tool_choice_rejection_uses_configured_protocol_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "tool_choice": {"type": "function", "name": "inspect"},
+            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "model_info": {
+                "id": "dual-protocol-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        error = RuntimeError(
+            "当前模型或上游不支持指定工具的强制选择方式，请改用 tool_choice=auto"
+        )
+        error.status_code = 400
+
+        self.assertTrue(
+            hooks._is_forced_tool_choice_unsupported_error(error, request)
+        )
+        self.assertTrue(
+            hooks._is_current_upstream_surface_incompatible_error(error, request)
+        )
+
+        auto_request = {**request, "tool_choice": "auto"}
+        self.assertFalse(
+            hooks._is_forced_tool_choice_unsupported_error(error, auto_request)
+        )
+        self.assertFalse(
+            hooks._is_current_upstream_surface_incompatible_error(error, auto_request)
+        )
+
+        no_choice_request = {
+            key: value for key, value in request.items() if key != "tool_choice"
+        }
+        self.assertFalse(
+            hooks._is_forced_tool_choice_unsupported_error(error, no_choice_request)
+        )
+
+    def test_ambiguous_forced_choice_retry_requires_a_tool_payload(self) -> None:
+        hooks, _ = load_hook_module()
+        error = RuntimeError("请求参数组合无效")
+        error.status_code = 400
+        request = {
+            "tool_choice": {"type": "function", "name": "inspect"},
+        }
+
+        self.assertFalse(
+            hooks._is_forced_tool_choice_auto_retry_error(error, request)
+        )
+
+        request["tools"] = [{"type": "function", "name": "inspect"}]
+        self.assertTrue(
+            hooks._is_forced_tool_choice_auto_retry_error(error, request)
         )
 
     def test_route_key_canonicalizes_api_base_host(self) -> None:
