@@ -24,6 +24,9 @@ function run(types) {
 }
 
 try {
+  assert.ok(original.includes('export type ProviderAuthKind = "api_key" | "openai_login" | "claude_login";'));
+  assert.ok(original.includes("auth_status?: ProviderAuthStatus;"));
+
   const valid = run(original);
   assert.equal(valid.status, 0, valid.stderr);
 

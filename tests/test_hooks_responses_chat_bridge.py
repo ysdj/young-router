@@ -885,7 +885,11 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 {
                     "type": "function",
                     "name": "valid_responses",
-                    "parameters": {"properties": {}},
+                    "parameters": {
+                        "properties": {},
+                        "type": "object",
+                        "required": [],
+                    },
                 },
                 {"type": "function", "function": {"description": "missing name"}},
                 {"type": "function", "name": "bad.name", "parameters": {}},
@@ -957,6 +961,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
                     "parameters": {
                         "type": "object",
                         "properties": {"path": {"type": "string"}},
+                        "required": [],
                     },
                     "description": "do a valid thing",
                     "strict": True,
@@ -964,7 +969,11 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 {
                     "type": "function",
                     "name": "valid_responses",
-                    "parameters": {"properties": {}},
+                    "parameters": {
+                        "properties": {},
+                        "type": "object",
+                        "required": [],
+                    },
                 },
             ],
         )
@@ -1402,6 +1411,41 @@ class HookResponsesChatBridgeTests(HookTestCase):
             )
         )
 
+    def test_explicit_anthropic_surface_bridges_hosted_search_to_pi_functions(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "kimi-k3",
+            "input": "上海今天的天气",
+            "stream": True,
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "auto",
+            "model_info": {
+                "provider": "tbtk",
+                "upstream_url_surface": "anthropic",
+            },
+            "_litellm_menu_upstream_url_surface": "anthropic",
+        }
+
+        bridge_kwargs = hooks._responses_chat_bridge_preemptive_kwargs(
+            request_kwargs,
+            include_hosted_web_search_unsupported=True,
+            include_client_tool_unsupported=True,
+            allow_selected_marker=True,
+        )
+
+        self.assertIsNotNone(bridge_kwargs)
+        assert bridge_kwargs is not None
+        self.assertTrue(bridge_kwargs["use_chat_completions_api"])
+        self.assertEqual(
+            [(tool.get("type"), tool.get("name")) for tool in bridge_kwargs["tools"]],
+            [("function", "web_search"), ("function", "fetch_content")],
+        )
+        self.assertEqual(
+            bridge_kwargs["litellm_metadata"]["responses_chat_bridge_preemptive_reason"],
+            "responses_endpoint_unsupported",
+        )
+
     async def test_direct_chat_bridge_stream_error_after_text_yields_failed_event(self) -> None:
         hooks, proxy_server = load_hook_module()
 
@@ -1709,7 +1753,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertTrue(metadata[hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY])
         self.assertEqual(
             [tool["name"] for tool in calls[1]["tools"]],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, "tool_search", "spawn_agent"],
+            ["web_search", "fetch_content", "tool_search", "spawn_agent"],
         )
         self.assertNotIn("web_search_options", calls[1])
         self.assertFalse(hasattr(error, "responses_endpoint_unsupported"))

@@ -40,7 +40,7 @@ import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type ButtonProps = {
   title: string;
-  symbol?: "check" | "close" | "copy" | "edit" | "import" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash";
+  symbol?: "check" | "close" | "copy" | "edit" | "import" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash" | "chevron-up" | "chevron-down";
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;
@@ -93,6 +93,11 @@ function nativeControlTextWidth(label: string): number {
     if (/\s/u.test(character)) return width + 4;
     return width + (/[^\u0000-\u024f]/u.test(character) ? 13 : 7.5);
   }, 0);
+}
+
+function isCompactGlyphTitle(title: string): boolean {
+  const trimmed = title.trim();
+  return trimmed.length > 0 && Array.from(trimmed).length <= 2 && !/[\p{L}\p{N}]/u.test(trimmed);
 }
 
 // Fabric lays out opaque native controls before AppKit/WinUI can report their
@@ -206,8 +211,11 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
     link: props.link === true,
   };
   // A caller may enlarge a button, but must never reduce a translated title to
-  // an ellipsis. Symbol-only buttons intentionally use their native icon size.
-  const titleWidth = !props.symbol ? { minWidth: nativeButtonMinimumWidth(props.title, compact), flexShrink: 0 } : undefined;
+  // an ellipsis. Symbol-only and compact glyph buttons intentionally use their
+  // caller/native icon size rather than the text-button minimum width.
+  const titleWidth = !props.symbol && !(compact && isCompactGlyphTitle(props.title))
+    ? { minWidth: nativeButtonMinimumWidth(props.title, compact), flexShrink: 0 }
+    : undefined;
   const style = [props.link ? styles.linkButton : styles.button, props.style, titleWidth];
   if (Platform.OS === "windows") {
     return <WinUIButton {...buttonProps} ref={ref as never} onPress={() => props.onPress?.()} style={style} />;
@@ -366,7 +374,7 @@ export function NativeSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpe
 }
 
 const styles = StyleSheet.create({
-  button: { minWidth: 72, height: 24 },
+  button: { minWidth: 28, height: 24 },
   controlText: { fontSize: UI_FONT_SIZE },
   linkButton: { minWidth: 72, minHeight: 22 },
   segmented: { minHeight: 24 },

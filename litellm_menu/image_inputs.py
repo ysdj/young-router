@@ -13,7 +13,11 @@ from .base import (
     _INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES,
     _INLINE_IMAGE_MANY_TARGET_BYTES,
     _INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES,
+    _CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+    _CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES,
+    _CODEX_VIEW_IMAGE_PREVIEW_TOTAL_TARGET_BYTES,
     _CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES,
+    _CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER,
     _INLINE_IMAGE_SINGLE_MAX_EDGE,
     _INLINE_IMAGE_SINGLE_TARGET_BYTES,
     _CODEX_VIEW_IMAGE_REFERENCE_MARKER,
@@ -383,6 +387,11 @@ def _bound_image_data_urls(value: Any, *, target_bytes: int, max_edge: int) -> t
             changed = changed or item_changed
         return (updated_items if changed else value), changed
     if isinstance(value, dict):
+        if (
+            value.get("type") == "custom_tool_call_output"
+            and _output_has_codex_view_image_original_references(value.get("output"))
+        ):
+            return value, False
         changed = False
         updated_dict: Dict[Any, Any] = {}
         for key, item in value.items():
@@ -409,14 +418,81 @@ def _output_has_codex_view_image_references(output: Any) -> bool:
     )
 
 
-def _bound_codex_view_image_previews(value: Any) -> tuple[Any, bool]:
-    """Keep one small inline preview while retaining a full-resolution path reference."""
+def _output_has_codex_view_image_original_references(output: Any) -> bool:
+    if not isinstance(output, list):
+        return False
+    return any(
+        isinstance(part, dict)
+        and part.get("type") == "input_text"
+        and isinstance(part.get("text"), str)
+        and _CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER in part["text"]
+        for part in output
+    )
+
+
+def _codex_view_image_preview_count(value: Any) -> int:
+    """Count inline images in mutable, path-backed ``view_image`` outputs."""
+
+    if isinstance(value, list):
+        return sum(_codex_view_image_preview_count(item) for item in value)
+    if not isinstance(value, dict):
+        return 0
+    if (
+        value.get("type") == "custom_tool_call_output"
+        and _output_has_codex_view_image_references(value.get("output"))
+        and not _output_has_codex_view_image_original_references(value.get("output"))
+    ):
+        output = value.get("output")
+        if not isinstance(output, list):
+            return 0
+        return sum(
+            1
+            for part in output
+            if isinstance(part, dict)
+            and part.get("type") == "input_image"
+            and _image_data_url_size(part.get("image_url"))
+        )
+    return sum(_codex_view_image_preview_count(item) for item in value.values())
+
+
+def _codex_view_image_preview_target(image_count: int) -> int:
+    """Choose a per-image preview target for one mutable multi-image batch.
+
+    Small batches get the maximum detail.  Larger batches share a 2.4 MB
+    budget, but never fall below 128 KB per image; above that count the budget
+    grows linearly so the lower bound remains meaningful.
+    """
+
+    if image_count <= 0:
+        return _CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES
+    total_target = max(
+        _CODEX_VIEW_IMAGE_PREVIEW_TOTAL_TARGET_BYTES,
+        image_count * _CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+    )
+    return min(
+        _CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES,
+        max(
+            _CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+            total_target // image_count,
+        ),
+    )
+
+
+def _bound_codex_view_image_previews(
+    value: Any,
+    *,
+    target_bytes: int = _CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES,
+) -> tuple[Any, bool]:
+    """Keep a medium inline preview while retaining a full-resolution path reference."""
 
     if isinstance(value, list):
         changed = False
         updated_items: List[Any] = []
         for item in value:
-            updated_item, item_changed = _bound_codex_view_image_previews(item)
+            updated_item, item_changed = _bound_codex_view_image_previews(
+                item,
+                target_bytes=target_bytes,
+            )
             updated_items.append(updated_item)
             changed = changed or item_changed
         return (updated_items if changed else value), changed
@@ -426,9 +502,11 @@ def _bound_codex_view_image_previews(value: Any) -> tuple[Any, bool]:
         value.get("type") == "custom_tool_call_output"
         and _output_has_codex_view_image_references(value.get("output"))
     ):
+        if _output_has_codex_view_image_original_references(value.get("output")):
+            return value, False
         updated_output, changed = _bound_image_data_urls(
             value["output"],
-            target_bytes=_CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES,
+            target_bytes=target_bytes,
             max_edge=_INLINE_IMAGE_MANY_MAX_EDGE,
         )
         if not changed:
@@ -439,10 +517,23 @@ def _bound_codex_view_image_previews(value: Any) -> tuple[Any, bool]:
     changed = False
     updated_value: Dict[Any, Any] = {}
     for key, item in value.items():
-        updated_item, item_changed = _bound_codex_view_image_previews(item)
+        updated_item, item_changed = _bound_codex_view_image_previews(
+            item,
+            target_bytes=target_bytes,
+        )
         updated_value[key] = updated_item
         changed = changed or item_changed
     return (updated_value if changed else value), changed
+
+
+def _collect_compressible_image_data_url_sizes(value: Any, sizes: List[int]) -> None:
+    if (
+        isinstance(value, dict)
+        and value.get("type") == "custom_tool_call_output"
+        and _output_has_codex_view_image_original_references(value.get("output"))
+    ):
+        return
+    _collect_image_data_url_sizes(value, sizes)
 
 
 def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
@@ -451,18 +542,30 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
     encrypted_prefix_inline_image_bytes = 0
     bounded_suffixes: Dict[str, Any] = {}
     preview_changed_by_key: Dict[str, bool] = {}
+    codex_preview_count = 0
     for key in ("input", "messages"):
         value = request_kwargs.get(key)
         suffix = _image_bounding_suffix(value)
-        bounded_suffix, preview_changed = _bound_codex_view_image_previews(suffix)
-        bounded_suffixes[key] = bounded_suffix
-        preview_changed_by_key[key] = preview_changed
-        _collect_image_data_url_sizes(bounded_suffix, sizes)
+        codex_preview_count += _codex_view_image_preview_count(suffix)
+        bounded_suffixes[key] = suffix
+        preview_changed_by_key[key] = False
         if isinstance(value, list):
             prefix = value[: len(value) - len(suffix)]
             prefix_stats = _image_input_stats(prefix)
             encrypted_prefix_image_count += prefix_stats["image_count"]
             encrypted_prefix_inline_image_bytes += prefix_stats["inline_image_bytes"]
+
+    codex_preview_target = _codex_view_image_preview_target(codex_preview_count)
+    for key in ("input", "messages"):
+        value = request_kwargs.get(key)
+        suffix = bounded_suffixes[key]
+        bounded_suffix, preview_changed = _bound_codex_view_image_previews(
+            suffix,
+            target_bytes=codex_preview_target,
+        )
+        bounded_suffixes[key] = bounded_suffix
+        preview_changed_by_key[key] = preview_changed
+        _collect_compressible_image_data_url_sizes(bounded_suffix, sizes)
     if not sizes:
         return None
 
@@ -476,10 +579,16 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
             - encrypted_prefix_inline_image_bytes,
         )
         remaining_per_image_bytes = remaining_history_bytes // len(sizes)
+        history_min_target = _INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES
+        if codex_preview_count:
+            history_min_target = max(
+                history_min_target,
+                _CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+            )
         target_bytes = min(
             _INLINE_IMAGE_MANY_TARGET_BYTES,
             max(
-                _INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES,
+                history_min_target,
                 remaining_per_image_bytes,
             ),
         )

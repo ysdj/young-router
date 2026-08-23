@@ -231,7 +231,7 @@ class HookTraceLoggingTests(HookTestCase):
                 "output": [
                     {
                         "type": "function_call",
-                        "name": "_litellm_web_search",
+                        "name": "web_search",
                         "call_id": "call_web",
                         "arguments": '{"query":"Sample City weather"}',
                     },
@@ -267,7 +267,7 @@ class HookTraceLoggingTests(HookTestCase):
         )
 
         self.assertEqual(summary["count"], 4)
-        self.assertIn("_litellm_web_search", summary["names"])
+        self.assertIn("web_search", summary["names"])
         self.assertIn("custom_lookup", summary["names"])
         self.assertIn("web_search", summary["names"])
         self.assertIn("lookup_order", summary["names"])

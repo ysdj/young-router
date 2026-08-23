@@ -4,6 +4,77 @@ from hook_test_utils import *
 
 
 class HookResponsesToolBridgeTests(HookTestCase):
+    def test_function_tool_bridge_preserves_provider_native_search_with_client_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        native_search = {"type": "openrouter:web_search"}
+        request = {
+            "call_type": "aresponses",
+            "model": "x-ai/grok-4.6",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "tools": [
+                                {"type": "function", "name": "list_agents"},
+                            ],
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Search."},
+            ],
+            "tools": [native_search],
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"request_kind\":\"turn\"}",
+            },
+            "model_info": {
+                "provider": "openrouter",
+                "upstream_url_surface": "openai/responses",
+            },
+        }
+
+        bridged = hooks._responses_function_tool_bridge_preemptive_kwargs(request)
+
+        self.assertIsNotNone(bridged)
+        assert bridged is not None
+        self.assertEqual(bridged["tools"][0], native_search)
+        self.assertEqual(bridged["tools"][1]["name"], "list_agents")
+        self.assertNotIn("web_search", {tool.get("name") for tool in bridged["tools"]})
+
+    def test_hosted_bridge_does_not_replace_provider_native_search(self) -> None:
+        hooks, _ = load_hook_module()
+        native_search = {"type": "openrouter:web_search"}
+
+        sanitized, _options, stats = hooks._responses_chat_bridge_sanitize_tools(
+            [native_search, {"type": "web_search"}],
+            bridge_web_search=True,
+        )
+
+        self.assertIsNotNone(sanitized)
+        assert sanitized is not None
+        self.assertIn(native_search, sanitized)
+        self.assertIn("web_search", {tool.get("name") for tool in sanitized})
+        self.assertEqual(stats["bridged_web_search_tools"], 1)
+
+    def test_provider_native_tool_choice_is_not_rewritten_to_pi(self) -> None:
+        hooks, _ = load_hook_module()
+        choice = {"type": "openrouter:web_search"}
+
+        self.assertEqual(
+            hooks._responses_chat_bridge_sanitize_tool_choice(choice, {"list_agents"}),
+            choice,
+        )
+        self.assertEqual(
+            hooks._responses_function_tool_bridge_sanitize_tool_choice(
+                choice, {"list_agents"}
+            ),
+            choice,
+        )
+
+
     def test_function_tool_bridge_normalizes_missing_parameter_object_members(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -148,6 +219,60 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertIs(attempts[0][0].get("strict"), False)
         self.assertFalse("strict" in attempts[1][0])
 
+    def test_native_pi_web_access_bridge_keeps_post_call_visibility(self) -> None:
+        hooks, _ = load_hook_module()
+        direct = {
+            "call_type": "aresponses",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "web_search",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+        chat_direct = {
+            "call_type": "chat",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "fetch_content",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+        hosted = {
+            "call_type": "aresponses",
+            "tools": [
+                {
+                    "type": "web_search",
+                }
+            ],
+        }
+
+        self.assertIs(
+            hooks._upstream_request_kwargs_for_web_search_bridge(direct),
+            direct,
+        )
+        self.assertIs(
+            hooks._upstream_request_kwargs_for_web_search_bridge(chat_direct),
+            chat_direct,
+        )
+        self.assertFalse(
+            hooks._tools_include_pi_web_access_tool(
+                hosted["tools"] + [{"type": "web_search", "name": "web_search"}]
+            )
+        )
+        suppressed = hooks._upstream_request_kwargs_for_web_search_bridge(hosted)
+        self.assertIsNot(suppressed, hosted)
+        self.assertTrue(
+            suppressed["litellm_metadata"][
+                hooks._WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY
+            ]
+        )
+
     def test_bridge_carries_relaxed_choice_marker_into_metadata(self) -> None:
         hooks, _ = load_hook_module()
         request = {
@@ -180,18 +305,18 @@ class HookResponsesToolBridgeTests(HookTestCase):
     def test_external_web_search_bridge_tool_exposes_url_read_without_pseudo_actions(self) -> None:
         hooks, _ = load_hook_module()
 
-        tool = hooks._responses_bridge_web_search_tool({"type": "web_search"})
-
-        self.assertIsNotNone(tool)
-        assert tool is not None
-        self.assertEqual(tool["name"], hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME)
-        dumped = json.dumps(tool)
+        tools = hooks._pi_web_access_tool_definitions()
+        self.assertEqual(
+            [tool.get("name") for tool in tools],
+            ["web_search", "fetch_content"],
+        )
+        tool = tools[0]
+        fetch_tool = tools[1]
+        dumped = json.dumps(tools)
         self.assertIn('"query"', dumped)
-        self.assertIn('"page"', dumped)
-        self.assertIn('"url"', dumped)
-        self.assertIn('"pattern"', dumped)
-        self.assertNotIn("openPage", dumped)
-        self.assertNotIn("findInPage", dumped)
+        self.assertIn('"url"', json.dumps(fetch_tool))
+        self.assertIn("fetch_content", json.dumps(tool))
+        self.assertNotIn("private_web_search_bridge", dumped)
         self.assertEqual(tool["parameters"].get("required"), [])
 
     def test_responses_tool_bridge_describes_codex_local_file_workflow(self) -> None:
@@ -388,13 +513,14 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual(bridge_kwargs["reasoning"]["effort"], "xhigh")
         self.assertEqual(
             [tool.get("type") for tool in bridge_kwargs["tools"]],
-            ["function", "custom", "tool_search", "namespace"],
+            ["function", "function", "custom", "tool_search", "namespace"],
         )
         self.assertEqual(
             bridge_kwargs["tools"][0]["name"],
-            hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+            "web_search",
         )
-        self.assertEqual(bridge_kwargs["tools"][1]["name"], "apply_patch")
+        self.assertEqual(bridge_kwargs["tools"][1]["name"], "fetch_content")
+        self.assertEqual(bridge_kwargs["tools"][2]["name"], "apply_patch")
         metadata = bridge_kwargs["litellm_metadata"]
         self.assertTrue(metadata[hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY])
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
@@ -426,14 +552,15 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual(
             [tool.get("name") for tool in responses_bridge_kwargs["tools"]],
             [
-                hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                "web_search",
+                "fetch_content",
                 "apply_patch",
                 "tool_search",
                 "spawn_agent",
             ],
         )
         self.assertEqual(
-            responses_bridge_kwargs["tools"][1][hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY],
+            responses_bridge_kwargs["tools"][2][hooks._RESPONSES_BRIDGE_CUSTOM_TOOL_KEY],
             True,
         )
         stats = metadata["responses_function_tool_bridge_tool_sanitized"]
@@ -563,6 +690,42 @@ class HookResponsesToolBridgeTests(HookTestCase):
             hooks._responses_function_tool_bridge_preemptive_kwargs(
                 request_kwargs
             )
+        )
+
+    def test_unknown_codex_client_tool_support_preemptively_bridges(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "input": "use tools",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [
+                        {"type": "custom", "name": "exec"},
+                    ],
+                }
+            ],
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "model_info": {
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        }
+
+        bridge_kwargs = hooks._responses_function_tool_bridge_preemptive_kwargs(
+            request_kwargs
+        )
+
+        self.assertIsNotNone(bridge_kwargs)
+        assert bridge_kwargs is not None
+        self.assertEqual(
+            [tool["name"] for tool in bridge_kwargs["tools"]],
+            ["exec"],
         )
 
     def test_unknown_nested_custom_tool_support_tries_native_first(self) -> None:

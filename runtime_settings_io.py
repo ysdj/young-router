@@ -20,6 +20,13 @@ RETIRED_PERSISTED_SETTINGS = frozenset(
     {
         "LITELLM_CONFIG_WATCH_INTERVAL",
         "LITELLM_CONFIG_WATCH_SETTLE_INTERVAL",
+        "LITELLM_MENU_VISION_BRIDGE_BACKEND",
+        "LITELLM_MENU_VISION_BRIDGE_API_BASE",
+        "LITELLM_MENU_VISION_BRIDGE_API_KEY",
+        "LITELLM_MENU_VISION_BRIDGE_MODEL",
+        "LITELLM_MENU_VISION_BRIDGE_TIMEOUT_SECONDS",
+        "LITELLM_MENU_VISION_BRIDGE_PROMPT",
+        "LITELLM_MENU_VISION_BRIDGE_LOCAL_FORMAT",
     }
 )
 
@@ -76,13 +83,17 @@ def _number_text(value: float) -> str:
 
 
 def _normalize_number(spec: RuntimeSettingSpec, raw: str) -> str:
-    text = raw.strip() or spec.default
-    if spec.kind == "int":
+    text = raw.strip()
+    if spec.kind.startswith("optional_") and not text:
+        return ""
+    text = text or spec.default
+    number_kind = spec.kind.removeprefix("optional_")
+    if number_kind == "int":
         if not re.fullmatch(r"\d+", text):
             raise PackageError(f"{spec.key} must be an integer.")
         numeric: float | int = int(text)
         normalized = str(numeric)
-    elif spec.kind == "mb":
+    elif number_kind == "mb":
         if not re.fullmatch(r"\d+(?:\.\d+)?", text):
             raise PackageError(f"{spec.key} must be a number of MB.")
         numeric = float(text)
@@ -137,7 +148,7 @@ def normalize_payload_value(spec: RuntimeSettingSpec, raw: object) -> str:
         raise PackageError(f"{spec.key} must be a string.")
     if raw == RETAIN_EXISTING_VALUE:
         raise PackageError(f"{spec.key} cannot use the retain-existing marker in a package.")
-    if spec.kind in {"int", "float", "mb"}:
+    if spec.kind in {"int", "float", "mb", "optional_int", "optional_float", "optional_mb"}:
         return _normalize_number(spec, raw)
     if spec.kind == "json":
         text = raw.strip() or spec.default
@@ -257,7 +268,10 @@ def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict
     values = {key: _default_payload_value(spec) for key, spec in specs.items()}
     for key, raw in raw_values.items():
         spec = specs[key]
-        if spec.kind == "mb":
+        if spec.kind in {"mb", "optional_mb"}:
+            if spec.kind == "optional_mb" and not raw.strip():
+                values[key] = ""
+                continue
             if not re.fullmatch(r"\d+", raw):
                 raise PackageError(f"{key} must be stored as integer bytes.")
             stored_bytes = int(raw)
@@ -294,5 +308,5 @@ def read_configured_settings_file(path: Path, specs: dict[str, RuntimeSettingSpe
     configured: dict[str, str] = {}
     for key, raw in raw_values.items():
         spec = specs[key]
-        configured[key] = raw if spec.kind == "mb" else effective[key]
+        configured[key] = raw if spec.kind in {"mb", "optional_mb"} else effective[key]
     return configured

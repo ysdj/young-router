@@ -11,7 +11,7 @@ from . import responses_output as _responses_output_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
 from . import trace as _trace_module
-from . import vision_bridge as _vision_bridge_module
+from . import dsh_vision_router as _dsh_vision_router_module
 
 
 from .base import (
@@ -35,6 +35,37 @@ from .base import (
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _normalize_response_completed_event_usage,
 )
+
+
+def _configured_model_fallbacks(
+    fallbacks: Optional[List],
+    model_group: Optional[str],
+) -> Optional[List[str]]:
+    """Return an explicitly configured LiteLLM model-group fallback chain.
+
+    Route recovery is appropriate when the selected model has no alternate
+    deployment.  It must not hide an explicit cross-model fallback configured
+    by the user, however: that fallback is the bounded path that can complete
+    the request while the original route is unavailable.
+    """
+    if not isinstance(fallbacks, list) or not isinstance(model_group, str):
+        return None
+    for item in fallbacks:
+        if not isinstance(item, dict):
+            continue
+        candidates = item.get(model_group)
+        if candidates is None:
+            candidates = item.get("*")
+        if not isinstance(candidates, list):
+            continue
+        normalized = [
+            candidate.strip()
+            for candidate in candidates
+            if isinstance(candidate, str) and candidate.strip()
+        ]
+        if normalized:
+            return normalized
+    return None
 
 
 _ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR = (
@@ -869,6 +900,42 @@ def _install_order_peer_failover_patch() -> None:
                 )
                 return await run_async_fallback(*args, **peer_kwargs)
 
+        configured_fallbacks = _configured_model_fallbacks(
+            fallbacks if fallbacks is not None else getattr(self, "fallbacks", None),
+            _responses_execution_module._request_model_group(kwargs) or model_group,
+        )
+        if configured_fallbacks is not None and disable_fallbacks is not True:
+            # LiteLLM's configured model-group fallback is an explicit
+            # cross-model route.  Run it before the Menu's long-lived
+            # deployment cooldown stream; otherwise a failed sole deployment
+            # would mask a healthy configured fallback indefinitely.
+            _trace_module._route_trace(
+                "configured_model_fallback_start",
+                request_id=_routing_module._trace_request_id(kwargs),
+                session=_routing_module._trace_session_context(kwargs),
+                model_group=_responses_execution_module._request_model_group(kwargs)
+                or model_group,
+                fallback_model_groups=configured_fallbacks,
+                exception=_routing_module._trace_exception(e),
+            )
+            original_args = (
+                self,
+                e,
+                disable_fallbacks,
+                fallbacks,
+                context_window_fallbacks,
+                content_policy_fallbacks,
+                model_group,
+                args,
+                kwargs,
+            )
+            if include_fallback_errors:
+                return await original_common_utils(
+                    *original_args,
+                    include_fallback_errors=True,
+                )
+            return await original_common_utils(*original_args)
+
         if _routing_module._is_request_scoped_priority_deployment_failover_error(
             e,
             kwargs,
@@ -987,6 +1054,7 @@ def _install_generic_deployment_failover_patch() -> None:
     ) -> Any:
         for update_request in (
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
+            _responses_request_module._with_codex_tool_registry_instruction,
             _responses_request_module._with_codex_descendant_cleanup_instruction,
             _responses_request_module._with_empty_tool_controls_removed,
             _responses_request_module._with_codex_compaction_controls,
@@ -1016,15 +1084,18 @@ def _install_generic_deployment_failover_patch() -> None:
                 method_name=_trace_module._trace_function_name(original_generic_function),
             ),
         )
+        wrapped_original_function = (
+            _responses_execution_module._wrap_generic_function_for_deployment_failover(
+                original_generic_function,
+                outer_request_kwargs=kwargs,
+            )
+        )
         while True:
             try:
                 response = await original_helper(
                     self,
                     model,
-                    _responses_execution_module._wrap_generic_function_for_deployment_failover(
-                        original_generic_function,
-                        outer_request_kwargs=kwargs,
-                    ),
+                    wrapped_original_function,
                     **kwargs,
                 )
                 marker = _routing_module._selected_deployment_marker_from_response(
@@ -1080,9 +1151,15 @@ def _install_generic_deployment_failover_patch() -> None:
                     ),
                     exception=_routing_module._trace_exception(exc),
                 )
-                if _vision_bridge_module.should_attempt_vision_bridge(exc, kwargs):
+                # The generic router callback may have rebuilt kwargs from the
+                # raw deployment and dropped model_info.  Reapply the selected
+                # deployment marker before deciding whether this was a
+                # text-only model; otherwise a vision-capable deployment could
+                # be rewritten solely because its callback omitted metadata.
+                _routing_module._apply_current_selected_deployment_to_request(kwargs)
+                if _dsh_vision_router_module.should_attempt_dsh_vision_router(exc, kwargs):
                     _trace_module._route_trace(
-                        "vision_bridge_fallback_start",
+                        "dsh_vision_router_fallback_start",
                         request_id=_routing_module._trace_request_id(kwargs),
                         session=_routing_module._trace_session_context(kwargs),
                         model_group=model,
@@ -1093,16 +1170,16 @@ def _install_generic_deployment_failover_patch() -> None:
                         exception=_routing_module._trace_exception(exc),
                     )
                     try:
-                        bridged_kwargs = await _vision_bridge_module.bridged_request_kwargs(kwargs)
-                        if bridged_kwargs is None:
-                            raise RuntimeError("vision bridge could not extract image references")
-                        bridged_kwargs.pop("model", None)
-                        kwargs = bridged_kwargs
+                        routed_kwargs = await _dsh_vision_router_module.dsh_vision_router_request_kwargs(kwargs)
+                        if routed_kwargs is None:
+                            raise RuntimeError("dsh-vision-router could not extract image references")
+                        routed_kwargs.pop("model", None)
+                        kwargs = routed_kwargs
                         target_order = kwargs.get("_target_order")
                         excluded_deployment_ids = kwargs.get("_excluded_deployment_ids")
                         retry_attempt = 0
                         _trace_module._route_trace(
-                            "vision_bridge_fallback_retry_start",
+                            "dsh_vision_router_fallback_retry_start",
                             request_id=_routing_module._trace_request_id(kwargs),
                             session=_routing_module._trace_session_context(kwargs),
                             model_group=model,
@@ -1114,14 +1191,14 @@ def _install_generic_deployment_failover_patch() -> None:
                             ),
                         )
                         continue
-                    except Exception as bridge_exc:
+                    except Exception as router_exc:
                         _trace_module._route_trace(
-                            "vision_bridge_fallback_error",
+                            "dsh_vision_router_fallback_error",
                             request_id=_routing_module._trace_request_id(kwargs),
                             session=_routing_module._trace_session_context(kwargs),
                             model_group=model,
                             original_exception=_routing_module._trace_exception(exc),
-                            exception=_routing_module._trace_exception(bridge_exc),
+                            exception=_routing_module._trace_exception(router_exc),
                         )
                 _responses_execution_module._restore_routing_constraints(
                     kwargs,
@@ -1192,6 +1269,13 @@ def _install_generic_deployment_failover_patch() -> None:
                     continue
                 if (
                     not external_web_search_internal
+                    and _configured_model_fallbacks(
+                        kwargs.get("fallbacks")
+                        if kwargs.get("fallbacks") is not None
+                        else getattr(self, "fallbacks", None),
+                        model,
+                    )
+                    is None
                     and _routing_module._should_return_route_recovery_stream(exc, decision_kwargs, self)
                 ):
                     if _routing_module._should_block_external_web_search_original_recovery(decision_kwargs):
@@ -1205,6 +1289,7 @@ def _install_generic_deployment_failover_patch() -> None:
                             exception=_routing_module._trace_exception(exc),
                         )
                         failed_stream_kwargs = _responses_execution_module._request_kwargs_with_model_group(model, kwargs)
+                        failed_stream_kwargs["original_generic_function"] = wrapped_original_function
                         return _routing_module._failed_responses_stream_response(failed_stream_kwargs, exc)
                     _trace_module._route_trace(
                         "route_recovery_stream_returned",
@@ -1246,6 +1331,7 @@ def _install_generic_deployment_failover_patch() -> None:
                         exception=_routing_module._trace_exception(exc),
                     )
                     failed_stream_kwargs = _responses_execution_module._request_kwargs_with_model_group(model, kwargs)
+                    failed_stream_kwargs["original_generic_function"] = wrapped_original_function
                     return _routing_module._failed_responses_stream_response(failed_stream_kwargs, exc)
                 if (
                     kwargs.get("stream") is True
@@ -1254,6 +1340,7 @@ def _install_generic_deployment_failover_patch() -> None:
                     and _routing_module._is_route_recovery_poll_error(exc)
                 ):
                     failed_stream_kwargs = _responses_execution_module._request_kwargs_with_model_group(model, kwargs)
+                    failed_stream_kwargs["original_generic_function"] = wrapped_original_function
                     return _routing_module._failed_responses_stream_response(failed_stream_kwargs, exc)
                 if _routing_module._should_sanitize_final_upstream_route_error(exc):
                     _routing_module._raise_sanitized_upstream_route_failure(model, exc, kwargs)

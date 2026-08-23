@@ -16,11 +16,11 @@ from .base import (
     _COMPUTER_FACADE_MCP_BACKEND,
     _HOSTED_GA_COMPUTER_TOOL_TYPES,
     _HOSTED_WEB_SEARCH_TOOL_TYPES,
+    _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY,
     _RESPONSES_BRIDGE_NAMESPACE_KEY,
     _RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY,
     _TOOL_SEARCH_BRIDGE_FUNCTION_NAME,
-    _WEB_SEARCH_BRIDGE_FUNCTION_NAME,
     copy,
     re,
 )
@@ -340,49 +340,129 @@ def _responses_bridge_web_search_options(tool: Any) -> Optional[dict]:
     return options
 
 
-def _responses_bridge_web_search_tool(tool: Any) -> Optional[dict]:
-    if not isinstance(tool, dict) or tool.get("type") not in {
-        "web_search",
-        "web_search_preview",
-    }:
+def _responses_bridge_provider_native_web_search_tool(tool: Any) -> Optional[dict]:
+    """Keep a provider server-tool declaration intact during tool bridging.
+
+    OpenRouter's ``openrouter:web_search`` is executed by the upstream
+    gateway, not by the local pi worker. It must never be replaced with the
+    local function pair merely because another client tool needs a Chat
+    compatibility bridge.
+    """
+
+    if not isinstance(tool, dict):
         return None
-    return {
-        "type": "function",
-        "name": _WEB_SEARCH_BRIDGE_FUNCTION_NAME,
-        "description": (
-            "Use this compatibility web search function for external or current "
-            "information. One call performs one action: provide query only for a "
-            "new lookup; provide url only to read a known result page; provide "
-            "url plus pattern to find text within that known page. Never put a "
-            "URL in query. Cite source URLs from the returned results. Do not use "
-            "this for local machine state such as this Mac's macOS version, local "
-            "files, installed apps, shell output, or current environment; use "
-            "local tools first."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The focused web search query to execute; never put a URL here.",
+    if tool.get("type") not in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
+        return None
+    return copy.deepcopy(tool)
+
+
+def _pi_web_access_tool_definitions() -> list[dict[str, Any]]:
+    """Return the model-facing function tools registered by pi-web-access.
+
+    The proxy executes these calls through the bundled pi-web-access worker.
+    Keep the public names and parameter shape aligned with the extension so a
+    model can choose them normally; do not replace them with a private proxy
+    function or an instruction that forces a call.
+    """
+    return [
+        {
+            "type": "function",
+            "name": "web_search",
+            "description": (
+                "Search the web using the configured pi-web-access providers. "
+                "Use query for one search or queries for several varied searches. "
+                "Returns source URLs and snippets; use fetch_content to read a "
+                "known result page."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Single search query.",
+                    },
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple varied search queries.",
+                    },
+                    "numResults": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Results per query (default 5, max 20).",
+                    },
+                    "includeContent": {
+                        "type": "boolean",
+                        "description": "Request full page content when supported.",
+                    },
+                    "recencyFilter": {
+                        "type": "string",
+                        "enum": ["day", "week", "month", "year"],
+                        "description": "Optional recency filter.",
+                    },
+                    "domainFilter": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional domain allow/deny list.",
+                    },
+                    "provider": {
+                        "description": "Optional configured provider or provider list.",
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
+                    },
+                    "workflow": {
+                        "type": "string",
+                        "enum": ["none", "summary-review", "auto-summary"],
+                        "description": "Search workflow; use none for a direct result set.",
+                    },
                 },
-                "page": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Result page for query; omit for the first page.",
-                },
-                "url": {
-                    "type": "string",
-                    "description": "A known source URL to read; use this instead of searching for the URL.",
-                },
-                "pattern": {
-                    "type": "string",
-                    "description": "Text to find within the page at url.",
-                },
+                "required": [],
+                "additionalProperties": False,
             },
-            "required": [],
         },
-    }
+        {
+            "type": "function",
+            "name": "fetch_content",
+            "description": (
+                "Fetch a known URL and extract readable content as markdown. "
+                "Use this after web_search when the snippets are insufficient."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Single URL to fetch."},
+                    "urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple URLs to fetch.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["readable", "raw", "answer"],
+                        "description": "Fetch mode; readable is the default.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Question for mode answer.",
+                    },
+                    "forceClone": {
+                        "type": "boolean",
+                        "description": "Force cloning a large GitHub repository.",
+                    },
+                    "answerModel": {"type": "string"},
+                    "timestamp": {"type": "string"},
+                    "frames": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "model": {"type": "string"},
+                    "auth": {"oneOf": [{"type": "string"}, {"type": "boolean"}]},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    ]
 
 
 def _responses_external_web_search_bridge_tools(
@@ -393,16 +473,15 @@ def _responses_external_web_search_bridge_tools(
 
     bridged_tools: list[dict] = []
     bridged_web_search_tools = 0
-    has_bridge_tool = _tools_module._tools_include_litellm_web_search_bridge(tools)
+    has_direct_search_tool = _tools_module._tools_include_pi_web_access_tool(tools)
     for tool in tools:
         if not isinstance(tool, dict):
             continue
-        if tool.get("type") in {"web_search", "web_search_preview"}:
+        if tool.get("type") in ({"web_search", "web_search_preview"} | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES):
             bridged_web_search_tools += 1
-            converted = _responses_bridge_web_search_tool(tool)
-            if converted is not None and not has_bridge_tool:
-                bridged_tools.append(converted)
-                has_bridge_tool = True
+            if not has_direct_search_tool:
+                bridged_tools.extend(_pi_web_access_tool_definitions())
+                has_direct_search_tool = True
             continue
         bridged_tools.append(copy.deepcopy(tool))
 
@@ -421,9 +500,12 @@ def _responses_external_web_search_bridge_tools(
 def _responses_external_web_search_bridge_tool_choice(tool_choice: Any) -> Any:
     if not isinstance(tool_choice, dict):
         return tool_choice
-    if tool_choice.get("type") not in {"web_search", "web_search_preview"}:
+    if tool_choice.get("type") not in ({"web_search", "web_search_preview"} | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES):
         return tool_choice
-    return _WEB_SEARCH_BRIDGE_FUNCTION_NAME
+    # A hosted tool choice cannot be represented after the fallback becomes an
+    # ordinary pi-web-access function. Keep the model's normal choice policy;
+    # do not force a particular local function call.
+    return "auto"
 
 
 def _responses_input_tool_search_output_tool_names(value: Any) -> list[str]:
@@ -719,17 +801,34 @@ def _responses_chat_bridge_sanitize_tools(
                 ):
                     bridged_namespace_tools += 1
             continue
+        provider_native_web_search = _responses_bridge_provider_native_web_search_tool(
+            tool
+        )
+        if provider_native_web_search is not None:
+            # Provider-native server tools do not have a Chat function name.
+            # Route them by their declared type and keep the complete
+            # declaration intact; neither a Hosted declaration nor a client
+            # function bridge may silently replace it with pi-web-access.
+            if provider_native_web_search not in sanitized:
+                sanitized.append(provider_native_web_search)
+            continue
         converted_web_search_options = _responses_bridge_web_search_options(tool)
         if converted_web_search_options is not None:
             if not bridge_web_search:
                 sanitized.append(copy.deepcopy(tool))
                 continue
-            converted_web_search_tool = _responses_bridge_web_search_tool(tool)
-            if converted_web_search_tool is not None and _append_unique_chat_tool(
-                sanitized,
-                converted_web_search_tool,
-                seen_tool_names,
-            ):
+            added_local_web_tools = False
+            for direct_tool in _pi_web_access_tool_definitions():
+                converted_direct_tool = _responses_bridge_function_tool(direct_tool)
+                if converted_direct_tool is not None and _append_unique_chat_tool(
+                    sanitized,
+                    converted_direct_tool,
+                    seen_tool_names,
+                ):
+                    added_local_web_tools = True
+            if added_local_web_tools:
+                # Count the hosted declaration being replaced, not each local
+                # function that represents it.
                 bridged_web_search_tools += 1
             continue
         if tool_type == "function":
@@ -855,34 +954,6 @@ def _current_time_context_instruction(request_kwargs: Optional[dict]) -> str:
         "and do not substitute a different year."
     )
 
-def _append_external_web_search_bridge_instruction(
-    retry_kwargs: dict,
-    stats: dict[str, Any],
-) -> None:
-    if not stats.get("bridged_web_search_tools"):
-        return
-    note = (
-        "Native web_search compatibility note: when the user asks to search, "
-        "look up, verify current/latest information, or answer real-time facts "
-        "such as weather, prices, news, scores, schedules, or regulations, use "
-        "the provided web search function tool instead of answering from memory. If a required "
-        "prerequisite is missing, such as a location for weather, ask for that "
-        "prerequisite instead of guessing. Do not use the web search function tool for "
-        "local machine state; use local tools first. If you call local tools, "
-        "treat their exact output as authoritative; for macOS, ProductVersion "
-        "is the OS version and BuildVersion is not the macOS major version."
-    )
-    time_note = _current_time_context_instruction(retry_kwargs)
-    if time_note:
-        note = f"{note} {time_note}"
-    existing = retry_kwargs.get("instructions")
-    if isinstance(existing, str) and existing.strip():
-        if note not in existing:
-            retry_kwargs["instructions"] = f"{existing.rstrip()}\n\n{note}"
-    else:
-        retry_kwargs["instructions"] = note
-
-
 def _responses_chat_bridge_sanitize_tool_choice(
     tool_choice: Any,
     kept_tool_names: set[str],
@@ -913,6 +984,12 @@ def _responses_chat_bridge_sanitize_tool_choice(
         if name in kept_tool_names:
             return {"type": "function", "function": {"name": name}}
         return "auto"
+
+    if tool_choice_type in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
+        # Provider-native server-tool choices have no function name. Preserve
+        # the caller's declaration so a client-tool bridge cannot redirect it
+        # to the local pi worker.
+        return copy.deepcopy(tool_choice)
 
     return "auto"
 
@@ -949,8 +1026,13 @@ def _responses_function_tool_bridge_sanitize_tool_choice(
         return "auto"
 
     if tool_choice_type in {"web_search", "web_search_preview"}:
-        if _WEB_SEARCH_BRIDGE_FUNCTION_NAME in kept_tool_names:
-            return {"type": "function", "name": _WEB_SEARCH_BRIDGE_FUNCTION_NAME}
+        # A hosted choice has no faithful representation after a fallback to
+        # local pi-web-access functions. Preserve normal model discretion.
         return "auto"
+
+    if tool_choice_type in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
+        # Provider-native server-tool choices have no function name. Preserve
+        # the caller's declaration instead of turning it into a local call.
+        return copy.deepcopy(tool_choice)
 
     return "auto"

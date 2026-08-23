@@ -462,27 +462,47 @@ async def _execute_responses_chat_bridge_call(
             active_bridge_kwargs,
             "litellm_metadata",
         ) or {}
-        direct_stream_response = await _responses_chat_bridge_direct_stream_response(
-            active_bridge_kwargs,
+        external_bridge_stream = (
+            active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
+            and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY)
+            is True
         )
-        if direct_stream_response is not None:
-            return direct_stream_response
+        if not external_bridge_stream:
+            direct_stream_response = await _responses_chat_bridge_direct_stream_response(
+                active_bridge_kwargs,
+            )
+            if direct_stream_response is not None:
+                return direct_stream_response
         upstream_kwargs = (
             _tools_module._with_external_web_search_post_call_suppressed(active_bridge_kwargs)
             if active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
             else active_bridge_kwargs
         )
-        response = None
-        if active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-            response = await _responses_web_search_bridge_module._external_web_search_chat_tool_response(
-                upstream_kwargs,
-                active_bridge_kwargs,
-                phase="initial",
-            )
-        if response is None:
+        if external_bridge_stream:
+            # The internal search/planner round is deliberately buffered. A
+            # few Chat/Anthropic compatibility endpoints return a Responses-
+            # shaped iterator without response.completed; passing that
+            # iterator through the outer stream makes the request appear
+            # hung forever. The final buffered result is still emitted as
+            # normal Responses SSE by the outer layer.
+            upstream_kwargs = upstream_kwargs.copy()
+            upstream_kwargs["stream"] = False
+            upstream_kwargs.pop("stream_options", None)
             response = original_function(**upstream_kwargs)
             if inspect.isawaitable(response):
                 response = await response
+        else:
+            response = None
+            if active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
+                response = await _responses_web_search_bridge_module._external_web_search_chat_tool_response(
+                    upstream_kwargs,
+                    active_bridge_kwargs,
+                    phase="initial",
+                )
+            if response is None:
+                response = original_function(**upstream_kwargs)
+                if inspect.isawaitable(response):
+                    response = await response
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
             response,
             active_bridge_kwargs,
@@ -490,12 +510,29 @@ async def _execute_responses_chat_bridge_call(
         should_intercept_external_web_search = _tools_module._request_should_intercept_external_web_search(
             active_bridge_kwargs,
         )
+        if external_bridge_stream:
+            if _responses_output_module._response_is_async_iterable(response):
+                # Some test doubles and Chat adapters ignore ``stream=False``
+                # and still return a Chat iterator. Adapt that iterator into a
+                # terminating Responses stream instead of handing the raw Chat
+                # chunks to the caller.
+                return _responses_chat_bridge_text_stream_from_chat_stream(
+                    response,
+                    active_bridge_kwargs,
+                )
+            if should_intercept_external_web_search:
+                return await _responses_web_search_bridge_module._resolve_web_search_function_calls(
+                    response,
+                    active_bridge_kwargs,
+                    original_function,
+                )
+            return response
         if (
             should_intercept_external_web_search
             and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY) is True
         ):
             if active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-                return _computer_facade_module._resolve_litellm_web_search_function_calls_stream_rounds(
+                return _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
                     response,
                     active_bridge_kwargs,
                     original_function,
@@ -511,7 +548,7 @@ async def _execute_responses_chat_bridge_call(
             should_intercept_external_web_search
             and active_bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True
         ):
-            response = await _responses_web_search_bridge_module._resolve_litellm_web_search_function_calls(
+            response = await _responses_web_search_bridge_module._resolve_web_search_function_calls(
                 response,
                 active_bridge_kwargs,
                 original_function,
@@ -602,10 +639,51 @@ async def _postprocess_generic_bridge_response(
         "litellm_metadata",
     ) or {}
     if request_kwargs.get("stream") is True:
+        if _tools_module._request_has_pi_web_access_tool(request_kwargs):
+            async def direct_pi_web_access_stream() -> Any:
+                actions = _responses_web_search_bridge_module._web_search_actions_for_request(
+                    response,
+                    request_kwargs,
+                )
+                if actions:
+                    async for chunk in _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
+                        response,
+                        request_kwargs,
+                        original_function,
+                    ):
+                        yield chunk
+                    return
+                payload = _streaming_module._jsonable(response)
+                if not isinstance(payload, dict):
+                    payload = _computer_facade_module._hosted_tool_unsupported_response(
+                        request_kwargs,
+                        _responses_output_module._response_text(response),
+                    )
+                async for chunk in _computer_facade_module._external_web_search_bridge_stream(
+                    payload
+                ):
+                    yield chunk
+
+            if not _responses_output_module._response_is_async_iterable(response):
+                return direct_pi_web_access_stream()
         if _responses_output_module._response_is_async_iterable(response):
+            # A preemptive function-tool bridge is executed before LiteLLM's
+            # normal streaming hook. That hook still receives the original
+            # request (which only contains Codex additional_tools), so it
+            # cannot see the native pi-web-access declarations that were
+            # added to request_kwargs here. Run the same guarded stream
+            # adapter at this boundary; otherwise a native web_search
+            # function_call is returned to Codex as an unexecuted tool call.
+            if _tools_module._request_should_intercept_external_web_search(
+                request_kwargs
+            ):
+                return _streaming_module._yield_start_buffered_stream_with_error_fallback(
+                    response,
+                    request_kwargs,
+                )
             return response
         if bridge_metadata.get(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY) is True:
-            return _computer_facade_module._resolve_litellm_web_search_function_calls_stream_rounds(
+            return _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
                 response,
                 request_kwargs,
                 original_function,
@@ -618,7 +696,7 @@ async def _postprocess_generic_bridge_response(
             )
         return _computer_facade_module._external_web_search_bridge_stream(response_payload)
 
-    return await _responses_web_search_bridge_module._resolve_litellm_web_search_function_calls(
+    return await _responses_web_search_bridge_module._resolve_web_search_function_calls(
         response,
         request_kwargs,
         original_function,
@@ -983,7 +1061,9 @@ async def _execute_responses_external_web_search_bridge_call(
     )
     async def execute_once(active_bridge_kwargs: dict) -> Any:
         response = original_function(
-            **_tools_module._with_external_web_search_post_call_suppressed(active_bridge_kwargs)
+            **_tools_module._upstream_request_kwargs_for_web_search_bridge(
+                active_bridge_kwargs
+            )
         )
         response = await _responses_request_module._await_streaming_fallback_candidate_response(
             response,
@@ -1074,6 +1154,36 @@ async def _execute_responses_external_web_search_bridge_call(
         raise exc
 
 
+async def _execute_responses_native_web_search_bridge_call(
+    original_function: Any,
+    bridge_kwargs: dict,
+    *,
+    original_request_kwargs: Optional[dict] = None,
+    outer_request_kwargs: Optional[dict] = None,
+) -> Any:
+    """Execute the post-rejection web-search bridge on the right surface.
+
+    Hosted Responses failures on Chat-surface deployments are converted to
+    ordinary function tools by the Chat bridge.  Responses-surface failures
+    use the dedicated external bridge.
+    """
+    if bridge_kwargs.get("use_chat_completions_api") is True:
+        return await _execute_responses_chat_bridge_call(
+            original_function,
+            bridge_kwargs,
+            original_request_kwargs=original_request_kwargs,
+            outer_request_kwargs=outer_request_kwargs,
+            start_event="responses_chat_bridge_native_web_search_fallback_start",
+            error_event="responses_chat_bridge_native_web_search_fallback_error",
+        )
+    return await _execute_responses_external_web_search_bridge_call(
+        original_function,
+        bridge_kwargs,
+        original_request_kwargs=original_request_kwargs,
+        outer_request_kwargs=outer_request_kwargs,
+    )
+
+
 async def _execute_responses_function_tool_bridge_call(
     original_function: Any,
     bridge_kwargs: dict,
@@ -1123,7 +1233,9 @@ async def _execute_responses_function_tool_bridge_call(
 
     async def execute_once(active_bridge_kwargs: dict) -> Any:
         response = original_function(
-            **_tools_module._with_external_web_search_post_call_suppressed(active_bridge_kwargs)
+            **_tools_module._upstream_request_kwargs_for_web_search_bridge(
+                active_bridge_kwargs
+            )
         )
         response = await _responses_request_module._await_streaming_fallback_candidate_response(
             response,
@@ -1225,7 +1337,7 @@ async def _execute_responses_function_tool_bridge_call(
             outer_request_kwargs,
         )
         if external_web_search_bridge_kwargs is not None:
-            return await _execute_responses_external_web_search_bridge_call(
+            return await _execute_responses_native_web_search_bridge_call(
                 original_function,
                 external_web_search_bridge_kwargs,
                 original_request_kwargs=original_request_kwargs or bridge_kwargs,
@@ -1263,6 +1375,8 @@ def _wrap_generic_function_for_deployment_failover(
 
     async def wrapped_generic_function(**kwargs: Any) -> Any:
         for update_request in (
+            _responses_request_module._with_codex_external_web_search_bridge_tool,
+            _responses_request_module._with_codex_tool_registry_instruction,
             _responses_request_module._with_codex_descendant_cleanup_instruction,
             _responses_request_module._with_empty_tool_controls_removed,
             _responses_request_module._with_codex_compaction_controls,
@@ -1272,6 +1386,12 @@ def _wrap_generic_function_for_deployment_failover(
             updated_kwargs = update_request(kwargs)
             if updated_kwargs is not None:
                 kwargs = updated_kwargs
+        # LiteLLM may rebuild the generic callback kwargs from the raw
+        # deployment and omit the selected deployment's model_info/surface.
+        # Apply the request-scoped marker before any protocol decision so an
+        # unsupported Responses route is bridged to its actual Chat/Anthropic
+        # surface on the first attempt, rather than advertising Hosted tools.
+        _routing_module._apply_current_selected_deployment_to_request(kwargs)
         async def surface_adapted_original_function(**call_kwargs: Any) -> Any:
             dispatch_kwargs = _routing_module._surface_adapted_dispatch_kwargs(
                 call_kwargs
@@ -1390,7 +1510,7 @@ def _wrap_generic_function_for_deployment_failover(
         )
         if external_web_search_bridge_kwargs is not None:
             try:
-                return await _execute_responses_external_web_search_bridge_call(
+                return await _execute_responses_native_web_search_bridge_call(
                     surface_adapted_original_function,
                     external_web_search_bridge_kwargs,
                     original_request_kwargs=kwargs,
@@ -1420,6 +1540,7 @@ def _wrap_generic_function_for_deployment_failover(
             outer_request_kwargs,
             include_hosted_web_search_unsupported=True,
             include_client_tool_unsupported=True,
+            allow_selected_marker=True,
         )
         if preemptive_bridge_kwargs is not None:
             try:
@@ -1538,6 +1659,24 @@ def _wrap_generic_function_for_deployment_failover(
                 return response
             if _routing_module._is_context_size_error(original_exception):
                 raise original_exception
+            # A Chat-surface route may reject the Responses Hosted
+            # ``web_search`` declaration with a schema-validation 400.
+            # Handle that explicit capability mismatch before generic
+            # surface-failover classification; otherwise the router cools
+            # down a healthy route and never gets to the ordinary function
+            # tool bridge.
+            external_web_search_bridge_kwargs = _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
+                exc,
+                kwargs,
+                outer_request_kwargs,
+            )
+            if external_web_search_bridge_kwargs is not None:
+                return await _execute_responses_native_web_search_bridge_call(
+                    surface_adapted_original_function,
+                    external_web_search_bridge_kwargs,
+                    original_request_kwargs=kwargs,
+                    outer_request_kwargs=outer_request_kwargs,
+                )
             if _routing_module._protocol_fallback_attempt_active(decision_kwargs):
                 _routing_module._mark_exception_for_deployment_failover(
                     exc,
@@ -1641,7 +1780,7 @@ def _wrap_generic_function_for_deployment_failover(
                 outer_request_kwargs,
             )
             if external_web_search_bridge_kwargs is not None:
-                return await _execute_responses_external_web_search_bridge_call(
+                return await _execute_responses_native_web_search_bridge_call(
                     surface_adapted_original_function,
                     external_web_search_bridge_kwargs,
                     original_request_kwargs=kwargs,

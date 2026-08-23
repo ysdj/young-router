@@ -114,14 +114,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title: "Codex" }, { id: "claude", title: "Claude"',
             'selected={settingsTab} disabled={busy}',
             'await flushPendingFields();',
-            'const stagedDomainsForRoute = (currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
+            'const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
             'if (settingsRoute) {',
             'return (["codex", "claude"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
             'const dirtyDomains = stagedDomainsForRoute(current);',
             'for (const name of dirtyDomains) {',
             "const claudeDeploymentDraftRef = useRef<ClaudeDeploymentDraft | undefined>(undefined);",
             "const hasClaudeDeploymentChanges = (currentSnapshot: CoreSnapshot | undefined)",
-            'const needsDiscardConfirmation = hasPendingFieldEdits()',
+            'const needsDiscardConfirmation = routeHasStagedChanges(current);',
             'if (!needsDiscardConfirmation) {',
             "claudeDeploymentDraftRef.current = next;",
             "claudeDeploymentDraftRef.current = undefined;",
@@ -129,6 +129,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '}, [route]);',
         ):
             self.assert_ui_has(marker)
+
+    def test_route_close_and_apply_share_one_dirty_projection(self) -> None:
+        for marker in (
+            'const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
+            'const actionSnapshot = latestSnapshot.current && latestSnapshot.current.revision > (snapshot?.revision ?? -1)',
+            'const routeHasStagedChanges = useCallback((currentSnapshot: CoreSnapshot | undefined): boolean => (',
+            'return (["relay_accounts", "providers_models"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
+            '|| hasPendingFieldEdits()',
+            'const needsDiscardConfirmation = routeHasStagedChanges(current);',
+            'disabled={busy || !routeHasStagedChanges(actionSnapshot)}',
+        ):
+            self.assert_ui_has(marker)
+        self.assertEqual(2, self.ui.count('disabled={busy || !routeHasStagedChanges(actionSnapshot)}'))
+        self.assertNotIn('disabled={busy || stagedDomainsForRoute(snapshot).length === 0}', self.ui)
+        self.assertNotIn('snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()', self.ui)
 
     def test_compatibility_claude_route_reuses_the_combined_native_window(self) -> None:
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
@@ -269,8 +284,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assert_ui_has(marker)
         self.assert_ui_has('providerInspector: { width: 280, minWidth: 280, maxWidth: 280')
         self.assertNotIn("<ScrollView contentContainerStyle={styles.providerEditorScroll}><ProviderEditor", self.ui)
-        self.assert_ui_has("providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingHorizontal: 12, paddingRight: 8, paddingBottom: 12")
-        self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 }')
+        self.assert_ui_has("providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingLeft: 0, paddingRight: 8, paddingBottom: 12")
+        self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
+        self.assert_ui_has('providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
+        self.assert_ui_has('inspectorContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 6')
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }")
         self.assert_ui_has("providerListPane: { width: 154, minWidth: 154, maxWidth: 154")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 88 }, { label: translate("providers.modelCount"), width: 64 }]}')
@@ -326,7 +343,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('secondaryCellKeys={routeSecondaryCellKeys}', self.ui)
         self.assertNotIn('<ScrollView contentContainerStyle={styles.inspectorContent}>', self.ui)
         self.assertNotIn('native.window.open("relay-accounts")', self.ui)
-        self.assert_ui_has('route === "relay-accounts" || route === "relay-add" ? <RelayAccountManager visible setupOnly={route === "relay-add"}')
+        self.assert_ui_has('route === "relay-accounts" ? <View style={serviceProviderStyles.workspace}')
+        self.assert_ui_has('route === "relay-accounts" ? <View style={serviceProviderStyles.workspace}')
+        self.assert_ui_has('rows={serviceProviderRows}')
+        self.assert_ui_has('serviceProviderSelection?.startsWith("provider:")')
+        self.assert_ui_has('renderRelayManager({ setupOnly: false, hideNavigation: true')
+        self.assert_ui_has('route === "relay-add" ? <RelayAccountManager visible setupOnly')
+        self.assertNotIn('serviceProviderTab', self.ui)
 
     def test_provider_empty_state_keeps_the_native_table_frames(self) -> None:
         for marker in (
@@ -767,7 +790,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"dataManagement.tab.export": "Export"',
             '"dataManagement.tab.webdav": "WebDAV Sync"',
             '"dataManagement.section.providersModels": "Providers & Models"',
-            '"dataManagement.section.relayAccounts": "Relay Management"',
+            '"dataManagement.section.relayAccounts": "Service Provider Management"',
             '"dataManagement.importHint": "Choose a file to detect its importable configuration automatically."',
             '"dataManagement.importRecognizedHint": "These configuration areas were detected in the selected file and are selected by default."',
             '"dataManagement.syncSettings": "Sync settings"',
@@ -779,7 +802,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"dataManagement.tab.export": "导出"',
             '"dataManagement.tab.webdav": "WebDAV 同步"',
             '"dataManagement.section.providersModels": "供应商与模型"',
-            '"dataManagement.section.relayAccounts": "中转站管理"',
+            '"dataManagement.section.relayAccounts": "服务商管理"',
             '"dataManagement.importHint": "选择文件后会自动识别可导入的配置项。"',
             '"dataManagement.importRecognizedHint": "以下为文件中识别到的配置项，默认全选。"',
             '"dataManagement.syncSettings": "同步设置"',
@@ -871,7 +894,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("spanningRowKeys,", self.native_controls)
         # The fetched-model picker is now a native modal leaf, so its old
         # React table no longer belongs to the shared window tree.
-        self.assertEqual(self.ui.count("<NativeTable"), 6)
+        self.assertEqual(self.ui.count("<NativeTable"), 8)
         self.assertEqual(self.ui.count("alternatingRows"), 0)
         self.assertNotIn("selectedKey={selectedRoute ?? \"\"} alternatingRows", self.ui)
         self.assertNotIn("striped={false}", self.ui)
@@ -1060,7 +1083,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("style={sizedStyle}", self.native_controls)
         self.assertIn('<NativeCheckbox label={label} labelVisible={false}', self.ui)
         self.assertIn('<Text numberOfLines={2} style={styles.runtimeFieldLabel}', self.ui)
-        self.assertIn('style={[styles.runtimeValueSlot, isMultiline && styles.runtimeMultilineValueSlot]}', self.ui)
+        self.assertIn('styles.runtimeMultilineEditor', self.ui)
         self.assertIn('runtimeBooleanControl: { width: 24, minWidth: 24, height: 24', self.ui)
         self.assertNotIn("runtimeBooleanSlot", self.ui)
         self.assertNotIn("runtimeBooleanHelpSlot", self.ui)
@@ -1068,11 +1091,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_native_text_buttons_reserve_full_titles_after_local_styles(self) -> None:
         """Translated command labels must not be reduced to an ellipsis."""
         self.assertIn(
+            "function isCompactGlyphTitle(title: string): boolean",
+            self.native_controls,
+        )
+        self.assertIn(
+            "return trimmed.length > 0 && Array.from(trimmed).length <= 2 && !/[\\p{L}\\p{N}]/u.test(trimmed);",
+            self.native_controls,
+        )
+        self.assertIn(
             "return Math.max(72, Math.ceil((compact ? 32 : 38) + nativeControlTextWidth(title) * 1.15));",
             self.native_controls,
         )
         self.assertIn(
-            "const titleWidth = !props.symbol ? { minWidth: nativeButtonMinimumWidth(props.title, compact), flexShrink: 0 } : undefined;",
+            "const titleWidth = !props.symbol && !(compact && isCompactGlyphTitle(props.title))",
             self.native_controls,
         )
         self.assertIn(
@@ -1083,6 +1114,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "return <AppKitButton {...buttonProps} ref={ref as never} style={[props.style, titleWidth]} />;",
             self.native_controls,
         )
+
+    def test_icon_buttons_do_not_reserve_text_button_width(self) -> None:
+        """Every compact glyph action must stay icon-sized across shared callers."""
+        self.assertIn('label === "+" ? "plus"', self.ui)
+        self.assertIn('label === "−" ? "minus"', self.ui)
+        self.assertIn('label === "⧉" ? "copy"', self.ui)
+        self.assertIn('label === "↑" ? "chevron-up"', self.ui)
+        self.assertIn('label === "↓" ? "chevron-down"', self.ui)
+        self.assertIn('iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22', self.ui)
+        self.assertIn('button: { minWidth: 28, height: 24 }', self.native_controls)
+        appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
+        self.assertIn('button: { minWidth: 28, height: 24 }', appkit_controls)
 
     def test_settings_workspaces_keep_their_legacy_layout_roots(self) -> None:
         expected_components = {
@@ -1255,16 +1298,47 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
 
+    def test_dsh_router_keeps_advanced_json_below_native_quick_controls(self) -> None:
+        schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
+        quick_keys = (
+            "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED",
+            "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND",
+            "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK",
+            "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
+            "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS",
+            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
+            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
+        )
+        advanced = schema.index("LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON")
+        for key in quick_keys:
+            self.assertLess(schema.index(key), advanced)
+        self.assertIn("<NativeCheckbox", self.ui)
+        self.assertIn("<NativePicker", self.ui)
+        self.assertIn("<RuntimeValueField", self.ui)
+        self.assertIn("<NativeSecretInputControl", self.ui)
+
     def test_runtime_metadata_has_complete_chinese_projection(self) -> None:
         schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(59, len(keys))
+        self.assertEqual(61, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
-        for category in ("Timeouts", "Recovery", "Web Search", "Vision Bridge", "Model Context", "Fallback", "Computer Facade", "MCP", "Logs", "Network", "Service"):
+        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "Computer Facade", "MCP", "Logs", "Network", "Service", "Relay"):
             self.assertIn(f'  "{category}":', localized)
+        self.assertNotIn("Vision Bridge", localized)
+        self.assertNotIn("LITELLM_MENU_VISION_BRIDGE_", schema)
+        for key in (
+            "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED",
+            "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND",
+            "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK",
+            "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
+            "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS",
+            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
+            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
+        ):
+            self.assertIn(f"  {key}: {{ label:", localized)
         self.assertIn("const optionValues = stringList(item.options);", self.ui)
         self.assertIn("const next = optionValues[nativeEvent.index];", self.ui)
         self.assertNotIn('const label = stringValue(item.label, key);', self.ui)
@@ -1574,9 +1648,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "runtimeFieldLabel:",
             'runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }',
             "runtimeValueSlot:",
-            "runtimeMultilineInputRow:",
-            "runtimeMultilineValueSlot:",
-            "runtimeMultilineActionSlot:",
+            "runtimeMultilineField:",
+            "runtimeMultilineHeader:",
+            "runtimeMultilineEditor:",
+            "runtimeMultilineHelpSlot:",
             'kind === "json"',
             "multiline plainText autoCommit",
             "nativeSecretTextArea:",
@@ -1587,6 +1662,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "runtimeOneColumnForm:",
             "runtimeField: { minWidth:",
             "runtimeHelpText:",
+            "runtimeJsonDefaultHint:",
             "<NativeCheckbox label={label}",
             "<NativePicker labels={optionLabels}",
             "<RuntimeValueField label={label}",
@@ -1639,9 +1715,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'return name === "default" ? translate("providers.defaultKey") : name;',
             'const sourceName = choice.source',
             'join("/")',
-            'const RELAY_KEY_ICON = "⇄";',
             'const accountLabel = username ? username.split("@", 1)[0].trim() || username : stringValue(account.label, accountID).trim();',
-            'return `${RELAY_KEY_ICON} ${sourceName || name}${multiplier}`;',
+            'return `${sourceName || name}${multiplier}`;',
         ):
             self.assert_ui_has(marker)
         self.assertNotIn('keys.length <= 1', self.ui)
@@ -1693,7 +1768,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_fetch_models_reports_empty_or_unavailable_results_and_does_not_open_stale_chooser(self) -> None:
         for marker in (
-            'const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain): Promise<CoreSnapshot | undefined>',
+            'const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined>',
             'const handleFetchedModels = (summary: UnknownRecord): void => {',
             'const providerIdentity = identifier(provider);',
             'summaryProviderId !== providerId && summaryProviderId !== providerIdentity',
@@ -1715,7 +1790,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'const [providerSourceModel, setProviderSourceModel] = useState<string>();',
             'function ProviderSourceFields(',
-            'label={translate("providers.providerType")} labelWidth={68}',
+            'label={translate("providers.endpointSource")} labelWidth={68}',
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: nextStationID })',
             'disabled={busy || providerType === "relay"}',
             'label={translate("providers.providerName")} labelWidth={68}',
@@ -1736,6 +1811,50 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('inspectorBody: { gap: 4 }')
         self.assert_ui_has('protocolSettings: { gap: 4 }')
         self.assert_ui_has('protocolHint: { marginLeft: 62')
+
+    def test_service_provider_management_owns_login_and_provider_editor_is_api_key_only(self) -> None:
+        types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'export type ProviderAuthKind = "api_key" | "openai_login" | "claude_login";',
+            types,
+        )
+        self.assertIn("auth_status?: ProviderAuthStatus;", types)
+        for marker in (
+            "function ServiceProviderManager(",
+            'dispatchWithOutcome("service_provider.add", { kind, name }, "providers_models")',
+            'dispatchWithOutcome("service_provider.auth_start", { provider_id: targetProviderID }, "providers_models")',
+            'dispatchWithOutcome("service_provider.delete", { provider_id: providerID }, "providers_models")',
+            'void dispatchWithOutcome("service_provider.auth_status", { provider_id: accountFingerprint }, "providers_models", true)',
+            '.then((next) => presentAuthChallenge(next, kind, label, accountFingerprint))',
+            'native.showProviderAuth({',
+            'field="provider_auth_token"',
+            'function providerAuthKind(',
+            'return candidates.filter((provider) => providerAuthKind(provider) === "api_key");',
+            'const activeAuthKind: ProviderAuthKind = "api_key";',
+            'auth_kind: "api_key"',
+            'create_default_api_key: true',
+        ):
+            self.assert_ui_has(marker)
+        self.assertIn('"providers.authTypeOpenAI": "通过 OpenAI 登录"', self.zh)
+        self.assertIn('"providers.authTypeClaude": "通过 Claude 登录"', self.zh)
+        self.assertIn('"providers.authTypeOpenAI": "Sign in with OpenAI"', self.en)
+        self.assertIn('"providers.authTypeClaude": "Sign in with Claude"', self.en)
+        self.assertIn('"providers.authStatusUnsupported": "暂不支持登录"', self.zh)
+        self.assertIn('"providers.authStatusUnsupported": "Sign-in is unavailable"', self.en)
+
+        # Provider & Models deliberately has no login picker; its wizard is
+        # API-key-only and the official account flow is in Service Provider
+        # Management.
+        self.assertIn('const addProvider = (): void => {\n    onOpenWizard();', self.ui)
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertNotIn('providers.wizard.authentication', wizard)
+        self.assertIn('label={translate("providers.wizard.baseUrl")}', wizard)
+        self.assertIn('const activeAuthKind: ProviderAuthKind = "api_key";', wizard)
+
+        editor = self.ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
+        self.assertNotIn("<ProviderAuthFields", editor)
+        self.assertIn("<ProviderSourceFields", editor)
 
     def test_logs_keep_the_legacy_dense_toolbar_and_table_frame(self) -> None:
         for marker in (
@@ -1912,7 +2031,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('case "login_expired": return translate("relay.resourcesLoginExpired")', relay)
         self.assertNotIn('title={translate("relay.importSelected")}', relay)
         self.assertIn("const accountType = chosenStation?.type ?? manualType ?? detected ?? detectedAddType;", relay)
-        self.assertIn("account = await addAccount(accountType, candidate, false, chosenStation ? {", relay)
+        self.assertIn("account = await addAccount(accountType, candidate, rememberPassword, chosenStation ? {", relay)
+        self.assertIn('translate("relay.rememberPassword")', relay)
+        self.assertIn('translate("relay.back")', relay)
         self.assertIn("await deleteAccount(account);", relay)
         self.assertIn("const beforeRelayState = asRecord(beforeRelay.state);", self.ui)
         self.assertIn("const existingIDs = new Set(beforeRelayAccounts.map((item) => stringValue(item.id)).filter(Boolean));", self.ui)
@@ -1925,16 +2046,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('disabled={setupControlsBusy || Boolean(selectedAddStation?.type)}', relay)
         self.assertIn('setOrigin("");\n      setAddStationName("");', relay)
         self.assertNotIn('title={translate("relay.importSelected")}', relay)
-        self.assertNotIn("NativeSegmentedControl", relay)
+        self.assertIn("NativeSegmentedControl", relay)
         self.assertNotIn("const restorationAttempts", relay)
         self.assertIn("const openedAccountIDs = useRef(new Set<string>());", relay)
         self.assertIn('type SavedSessionRestore = "signed_in" | "expired" | "unavailable";', relay)
         self.assertIn("const refreshLoginState = async (account: RelayAccount, automatic = false): Promise<void> => {", relay)
         self.assertIn("const canAutoLogin = account.rememberPassword && account.passwordSaved && Boolean(account.username.trim());", relay)
         self.assertIn("void refreshLoginState(selected, true);", relay)
-        self.assertIn('if (status === "signed_in") return "relay.status.signed_in";', relay)
-        self.assertIn('if (status === "signed_out") return "relay.status.signed_out";', relay)
-        self.assertIn('if (status === "expired") return "relay.status.expired";', relay)
+        self.assertNotIn('function statusKey(status: string): string', relay)
         self.assertIn('title={translate("common.refresh")}', relay)
         self.assertNotIn('title={translate("relay.login")}', relay)
         self.assertIn('const passwordStorageAvailable = true;', relay)
@@ -1962,7 +2081,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         self.assertNotIn('symbol="check"', relay)
         self.assertNotIn('title={translate("common.save")}', relay)
-        self.assertIn('onBlur={() => { if (!disabled) void onNameCommit(); }}', relay)
+        self.assertIn('onBlur={() => { if (!disabled && !autoGrouping) void onNameCommit(); }}', relay)
         self.assertIn('onNameCommit={() => runApiKeyAction("update", selectedResource.id)}', relay)
         self.assertIn('onBlur={() => { if (!controlsBusy) void stageStationUpdate(selectedStation.id); }}', relay)
         self.assertIn('void stageStationUpdate(selectedStation.id, { type: nextType });', relay)
@@ -1993,17 +2112,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('onPress={() => selectStation(selectedAccountStation.id)}', header)
         self.assertNotIn('relay.type', header)
         self.assertIn('<View style={styles.accountHeaderRight}>', header)
+        self.assertIn('<View style={styles.accountSessionSummary}>', header)
+        self.assertIn('styles.accountSessionValue', header)
+        self.assertIn('selectedHeaderSignedIn', header)
+        self.assertIn('selectedHeaderValue', header)
         self.assertIn('<NativeButton title={translate("common.refresh")}', header)
-        self.assertIn('style={styles.accountHeaderMetric}', header)
-        self.assertIn('style={styles.accountHeaderMetricLabel}', header)
-        self.assertLess(header.index('relay.rememberPassword'), header.index('relay.balance'))
-        self.assertLess(header.index('relay.balance'), header.index('common.status'))
+        self.assertNotIn('relay.balance', header)
+        self.assertNotIn('common.status', header)
+        self.assertLess(header.index('relay.rememberPassword'), header.index('accountSessionSummary'))
         self.assertNotIn('accountHeaderFields', header)
         self.assertNotIn('accountHeaderDivider', header)
-        self.assertIn('<View style={styles.accountStatusSlot}>', header)
+        self.assertNotIn('accountStatusSlot', header)
         self.assertIn('accountHeader: { minWidth: 0, minHeight: 38', relay)
         self.assertIn('accountBreadcrumb: { flex: 1, minWidth: 0, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }', relay)
-        self.assertIn('accountHeaderRight: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 }', relay)
+        self.assertIn('accountHeaderRight: { marginLeft: "auto", marginRight: -4, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4 }', relay)
+        self.assertIn('accountSessionSummary:', relay)
         self.assertNotIn('accountMetadata:', relay)
         self.assertNotIn('accountToolbar:', relay)
 
@@ -2031,7 +2154,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'key: `account:${account.id}`',
             'cells: [`  ${accountDisplayName(account, translate)}`',
             "const stageStationUpdate = async",
-            'const relayTableSelection = selectedStationID ? `station:${selectedStationID}` : selected?.id ? `account:${selected.id}` : "";',
+            'const relayTableSelection = effectiveSelectedStationID ? "station:" + effectiveSelectedStationID : selected?.id ? "account:" + selected.id : "";',
             "sidebarAddButton:",
             'symbol="minus"',
             "NativeTable",
@@ -2078,7 +2201,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "accountBreadcrumbSeparator",
             "accountBreadcrumbAccount",
             "accountHeaderRight",
-            "accountHeaderMetric",
+            "accountSessionSummary",
+            "accountSessionValue",
             "resourceEmptyText",
             'accountStationDisplay(selected)',
             'translate("relay.balance")',
@@ -2098,7 +2222,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const resourceTableRows = useMemo",
             "resourceSecondaryCellKeys",
             'rows={resourceTableRows}',
-            'selectedKey={selectedResourceID ?? ""}',
+            'selectedKey={selectedResource?.id ?? ""}',
             "secondaryCellKeys={resourceSecondaryCellKeys}",
             "onSelectionChange={setSelectedResourceID}",
             "resourceNativeTable:",
@@ -2138,7 +2262,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("          striped\n", resources_section)
         self.assertNotIn("ResourceImportDialog", resources_section)
         self.assertNotIn('translate("relay.importSelected")', resources_section)
-        self.assertNotIn("NativeCheckbox", resources_section)
+        self.assertIn("NativeCheckbox", resources_section)
+        self.assertIn('translate("relay.apiKeyAutoGrouping")', resources_section)
         for marker in (
             "resourceToolbarCrud",
             'symbol="plus"',
@@ -2177,7 +2302,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("onSelectionChange={selectRelayTableRow}", relay)
         self.assertIn('if (kind === "station") selectStation(id);', relay)
         self.assertIn('const separator = key.indexOf(":");', relay)
-        self.assertNotIn("spanning: true", relay)
         self.assertNotIn('key: `station:${station.id}`,\n      cells: [stationLabel, ""],\n      spanning: true,', relay)
         self.assertIn("style={styles.nativeRelayTable}", relay)
         self.assertIn("export function normalizeRelayOrigin(value: string): string {", relay_origin)
@@ -2226,13 +2350,39 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('const [importMode, setImportMode]', relay)
         self.assertIn('? "relay.apiKeyCreateStaged"', relay)
         self.assertIn('? "relay.apiKeyDetachStaged" : "relay.apiKeyDeleteStaged"', relay)
-        self.assertIn('translate("relay.pendingOperationsCount"', relay)
         self.assertNotIn("await refreshAccountResources(selected);", relay)
         self.assertNotIn('resource_ids: [resourceId]', self.ui)
         self.assertIn('accountStationFor(selected)', relay)
         self.assertIn('symbol="refresh"', relay)
         self.assertIn("accountRememberPassword: { minWidth: 78, flexShrink: 0 }", relay)
         self.assertIn("resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1", relay)
+
+    def test_auto_grouping_hides_stale_resources_and_uses_the_global_status_bar(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+
+        self.assertIn("const visibleResources = useMemo", relay)
+        self.assertIn("!selected?.autoGrouping || !resourceGroupUnavailable(resource, selectedGroups)", relay)
+        self.assertNotIn("autoGroupingTransitionAccountID", relay)
+        self.assertNotIn("resourceListLoading", relay)
+        self.assertNotIn('key: "resource-loading"', relay)
+        self.assertIn("const selectedResource = visibleResources.find((resource) => resource.id === selectedResourceID) ?? visibleResources[0];", relay)
+        self.assertIn("if (!selected.autoGrouping && selectedResource.groupID", relay)
+        self.assertIn("selectedKey={selectedResource?.id ?? \"\"}", relay)
+        self.assertIn("const result = await apiKeyActions.setAutoGrouping(accountID, enabled);", relay)
+        self.assertIn('if (result.draftStaged) publishGlobalFeedback(translate("relay.apiKeyAutoGroupingStaged"));', relay)
+        self.assertIn("else clearGlobalStatus();", relay)
+        self.assertNotIn("await refreshAccounts();", relay.split("const updateAutoGrouping", 1)[1].split("useEffect", 1)[0])
+        self.assertIn("disabled={disabled}\n            onPress={() => setShowAllModels", relay)
+        self.assertIn("onStatus?: (status?: string) => void;", relay)
+        self.assertIn("const publishGlobalFeedback = (message: string): void =>", relay)
+        self.assertIn("onStatus?.(message);", relay)
+        self.assertNotIn("resourcesFeedback", relay)
+        self.assertNotIn("pendingOperationBar", relay)
+        self.assertNotIn("accountPendingOperations", relay)
+        self.assertNotIn('translate("relay.pendingOperationsCount", { count: resource.pendingOperationCount })', relay)
+        self.assertIn("onStatus={setResult}", self.ui)
+        self.assertIn("status={result}", self.ui)
+        self.assertIn('return { draftStaged: next.drafts.relay_accounts?.dirty === true };', self.ui)
 
     def test_relay_dialogs_avoid_the_unregistered_macos_fabric_modal_host(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -2300,9 +2450,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, self.ui)
 
-        self.assertIn('"providers.providerKey": "供应商密钥"', self.zh)
+        self.assertIn('"providers.providerKey": "密钥名"', self.zh)
         self.assertIn('"providers.apiKeys": "密钥列表"', self.zh)
-        self.assertIn('"providers.relayKeyValueHint": "由中转站管理"', self.zh)
+        self.assertIn('"providers.relayKeyValueHint": "由服务商管理"', self.zh)
         self.assertNotIn('providers.bindingHealth', self.ui + self.zh + self.en)
         self.assertNotIn('providers.relayMultiplier', self.ui + self.zh + self.en)
         self.assertNotIn('providers.relayKeyBadge', self.ui + self.zh + self.en)
@@ -2381,17 +2531,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         for marker in (
-            'relayLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }',
+            'relayLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }',
             'sidebarIconButton: { width: 22, minWidth: 22, height: 22 }',
             'formRow: { width: "100%", minHeight: 34, flexDirection: "column", alignItems: "stretch", gap: 6 }',
             'bottomBar: { minHeight: 38, paddingHorizontal: 12, paddingVertical: 6, flexDirection: "row", flexWrap: "wrap"',
             'resourcesSection: { flex: 1, minWidth: 0, minHeight: 0, borderTopWidth: 1, borderTopColor: colors.separator, paddingTop: 4 }',
             'accountDetailContent: { flex: 1, minWidth: 0, minHeight: 0 }',
-            'accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", alignItems: "center", columnGap: 8, backgroundColor: colors.window }',
+            'accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", alignItems: "center", columnGap: 6, backgroundColor: colors.window }',
             'accountBreadcrumb: { flex: 1, minWidth: 0, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }',
-            'accountHeaderRight: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 }',
+            'accountHeaderRight: { marginLeft: "auto", marginRight: -4, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4 }',
             'resourcePane: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.window }',
             'resourceToolbar: { minHeight: 32, paddingHorizontal: 12, paddingVertical: 3, flexDirection: "row", alignItems: "center", gap: 8 }',
+            'resourceAutoGroupingCheckbox: { flexShrink: 0 }',
             'sidebarTableFrame: { flex: 1, minWidth: 0, minHeight: 0 }',
             'resourceListPane: { flex: 1, minWidth: 0, minHeight: 0 }',
             'resourceToolbarCrud: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }',
@@ -2417,13 +2568,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         setup = relay.split('<View style={[styles.formSection, setupOnly && styles.setupFormSection]}>', 1)[1].split('</View>', 1)[0]
 
-        self.assertLess(setup.index('label={translate("relay.station")}'), setup.index('label={translate("relay.origin")}'))
+        self.assertLess(setup.index('label={translate("relay.stationChoice")}'), setup.index('label={translate("relay.origin")}'))
+        self.assertIn('<NativeSegmentedControl labels={addStationModeLabels}', setup)
+        self.assertIn('translate("relay.stationExisting")', setup)
+        self.assertIn('addStationMode === "existing"', setup)
+        self.assertNotIn('<ScrollView', setup)
         self.assertLess(setup.index('label={translate("relay.origin")}'), setup.index('label={translate("relay.stationName")}'))
-        self.assertIn('const steps = [translate("relay.setupStepStation"), translate("relay.stepSignIn")];', relay)
+        self.assertIn('steps={[translate("relay.setupStepStation"), translate("relay.stepSignIn")]}', relay)
         self.assertIn('setupContent: { justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }', relay)
         self.assertIn('setupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }', relay)
         self.assertIn('setupFormSection: { maxWidth: 520, paddingVertical: 0, gap: 10 }', relay)
         self.assertIn('setupBottomBar: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, borderTopWidth: 0, backgroundColor: colors.window }', relay)
+        self.assertIn('const addStationModeLabels = stations.length > 0', relay)
+        self.assertIn('stationModeSelector: { width: "100%", minWidth: 0, maxWidth: 520', relay)
         self.assertNotIn('setupProgressConnector', relay)
         form_section = relay.split('formSection: {', 1)[1].split('},', 1)[0]
         self.assertNotIn('borderTopWidth', form_section)
@@ -2459,12 +2616,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "link: props.link === true,",
             "compact = true, onChange",
             "compact = true, followBottom",
-            "button: { minWidth: 72, height: 24 }",
+            "button: { minWidth: 28, height: 24 }",
             "selectableRow: { minHeight: 28",
         ):
             self.assertIn(marker, native_controls)
         for marker in (
-            "button: { minWidth: 72, height: 24 }",
+            "button: { minWidth: 28, height: 24 }",
             "segmented: { width: 224, height: 24 }",
             "picker: { minWidth: 160, height: 24 }",
             "textField: { minHeight: 24 }",
@@ -2484,13 +2641,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(2, relay.count("          striped\n"))
         self.assertNotIn("striped={false}", relay)
         for marker in (
-            'tableTitleRow: { height: 30, minHeight: 30, paddingHorizontal: 10',
+            'tableTitleRow: { height: 38, minHeight: 38, paddingHorizontal: 10',
             'accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5',
             'accountBreadcrumb: { flex: 1, minWidth: 0, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }',
-            'accountHeaderRight: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 }',
+            'accountHeaderRight: { marginLeft: "auto", marginRight: -4, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4 }',
             'resourceToolbar: { minHeight: 32, paddingHorizontal: 12',
             'resourceNativeTable: { flex: 1, minWidth: 0, minHeight: 0 }',
-            'resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 6, paddingHorizontal: 12',
+            'resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 6, paddingLeft: 0, paddingRight: 12',
         ):
             self.assertIn(marker, relay)
 

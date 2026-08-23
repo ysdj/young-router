@@ -139,6 +139,10 @@ NSImage *ButtonSymbolImage(const std::string &symbol)
     symbolName = @"arrow.clockwise";
   } else if (symbol == "trash") {
     symbolName = @"trash";
+  } else if (symbol == "chevron-up") {
+    symbolName = @"chevron.up";
+  } else if (symbol == "chevron-down") {
+    symbolName = @"chevron.down";
   }
   return symbolName == nil
       ? nil
@@ -1392,6 +1396,7 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 @end
 
 @interface LiteLLMAppKitTextFieldComponentView () <NSTextFieldDelegate, NSTextViewDelegate, RCTLiteLLMAppKitTextFieldViewProtocol>
+- (BOOL)activeControlIsEditing;
 @end
 
 @implementation LiteLLMAppKitTextFieldComponentView {
@@ -1483,9 +1488,17 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   const BOOL shouldUpdateDisabled = activeControlChanged || oldViewProps.disabled != newViewProps.disabled;
   NSString *value = StringFromStdString(newViewProps.value);
   NSString *placeholder = StringFromStdString(newViewProps.placeholder);
+  NSTextField *activeField = isMultiline ? nil : (newViewProps.secureTextEntry ? _secureField : _field);
+  NSString *activeValue = isMultiline ? _multilineField.string : activeField.stringValue;
+  // Fabric may recycle this component after clearing its AppKit backing
+  // control while the controlled React value is unchanged. Restore a blank
+  // native control only when it is not currently being edited; an active
+  // first responder must keep the user's local text until the next change
+  // commit arrives.
+  const BOOL recoverEmptyControl = value.length > 0 && activeValue.length == 0 && ![self activeControlIsEditing];
   _synchronizing = YES;
   if (isMultiline) {
-    if (shouldSynchronizeText && ![_multilineField.string isEqualToString:value]) {
+    if ((shouldSynchronizeText || recoverEmptyControl) && ![_multilineField.string isEqualToString:value]) {
       _multilineField.string = value;
     }
     if (shouldUpdateDisabled) {
@@ -1493,8 +1506,7 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
       _multilineField.selectable = !newViewProps.disabled;
     }
   } else {
-    NSTextField *activeField = newViewProps.secureTextEntry ? _secureField : _field;
-    if (shouldSynchronizeText && ![activeField.stringValue isEqualToString:value]) {
+    if ((shouldSynchronizeText || recoverEmptyControl) && ![activeField.stringValue isEqualToString:value]) {
       activeField.stringValue = value;
     }
     if (shouldUpdatePlaceholder) {
@@ -1515,6 +1527,8 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 - (void)prepareForRecycle
 {
   [super prepareForRecycle];
+  static const auto defaultProps = std::make_shared<const LiteLLMAppKitTextFieldProps>();
+  _props = defaultProps;
   _synchronizing = YES;
   _field.stringValue = @"";
   _secureField.stringValue = @"";
@@ -1527,6 +1541,21 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   _multilineField.editable = YES;
   _multilineField.selectable = YES;
   _host.activeControl = _field;
+}
+
+- (BOOL)activeControlIsEditing
+{
+  NSResponder *firstResponder = self.window.firstResponder;
+  if (firstResponder == nil) return NO;
+  NSView *activeControl = _host.activeControl == _scrollView ? _multilineField : _host.activeControl;
+  if (activeControl == nil) return NO;
+  if (firstResponder == activeControl) return YES;
+  if ([activeControl isKindOfClass:NSTextField.class] &&
+      firstResponder == [(NSTextField *)activeControl currentEditor]) {
+    return YES;
+  }
+  return [firstResponder isKindOfClass:NSView.class] &&
+      [(NSView *)firstResponder isDescendantOf:activeControl];
 }
 
 - (void)invalidate
@@ -2452,11 +2481,19 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTableCls(void)
 - (void)prepareForRecycle
 {
   [super prepareForRecycle];
+  static const auto defaultProps = std::make_shared<const LiteLLMAppKitTextEditorProps>();
+  _props = defaultProps;
   [_viewportStates removeAllObjects];
   _documentKey = @"";
   _synchronizingText = YES;
   _textView.string = @"";
   _synchronizingText = NO;
+  _textView.editable = YES;
+  _textView.selectable = YES;
+  _scrollView.hasHorizontalScroller = NO;
+  _textView.horizontallyResizable = NO;
+  _textView.autoresizingMask = NSViewWidthSizable;
+  _textView.textContainer.widthTracksTextView = YES;
 }
 
 - (void)textDidChange:(NSNotification *)notification
@@ -3005,6 +3042,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   BOOL _plainText;
   BOOL _secretDirty;
   BOOL _synchronizingField;
+  NSString *_lastSyncedPlainText;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -3062,6 +3100,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _label = @"";
     _lastStatus = @"";
     _lastError = @"";
+    _lastSyncedPlainText = @"";
   }
   return self;
 }
@@ -3096,6 +3135,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _lastPresent = NO;
     _lastStatus = @"ready";
     _lastError = @"";
+    _lastSyncedPlainText = @"";
   }
   _autoCommit = newViewProps.autoCommit;
   _plainText = newViewProps.plainText;
@@ -3119,6 +3159,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     _multilineField.string = @"";
     _synchronizingField = NO;
     _secretDirty = NO;
+    _lastSyncedPlainText = @"";
     if (!_stageInFlight) [self emitRevision:_lastRevision present:_lastPresent status:@"ready" error:@"" commitRequest:_lastCommitRequest];
   }
   if (newViewProps.commitRequest != oldViewProps.commitRequest &&
@@ -3133,7 +3174,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
        ([field isEqualToString:@"deployment_token"] || [field isEqualToString:@"desktop_gateway_api_key"]) &&
        target.length == 0) ||
       ([domain isEqualToString:@"runtime"] && [field isEqualToString:@"setting"] &&
-       [target isEqualToString:@"LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"]));
+       ([target isEqualToString:@"LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"] ||
+        [target isEqualToString:@"LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"])));
   if (identityChanged && readablePlainText) {
     [self loadPlainTextSecretForGeneration:_generation];
   }
@@ -3207,6 +3249,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
       [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"error" error:@"stage_failed" commitRequest:strongSelf->_lastCommitRequest];
       return;
     }
+    if (preservePlainText) strongSelf->_lastSyncedPlainText = [secret copy];
     [strongSelf emitRevision:revision.integerValue present:present.boolValue status:@"saved" error:@"" commitRequest:strongSelf->_lastCommitRequest];
   }];
 }
@@ -3230,8 +3273,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     }
     strongSelf->_synchronizingField = YES;
     [strongSelf setActiveText:value];
+    strongSelf->_lastSyncedPlainText = [value copy];
     strongSelf->_synchronizingField = NO;
     strongSelf->_secretDirty = NO;
+    [strongSelf emitRevision:strongSelf->_lastRevision present:strongSelf->_lastPresent status:@"ready" error:@"" commitRequest:strongSelf->_lastCommitRequest];
   }];
 }
 
@@ -3244,6 +3289,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 - (void)controlTextDidChange:(NSNotification *)notification
 {
   if (_synchronizingField || notification.object != [self activeControl]) return;
+  if ([self isPlainTextAutoCommitField] && [_lastSyncedPlainText isEqualToString:[self activeText]]) {
+    _secretDirty = NO;
+    return;
+  }
   _secretDirty = YES;
   [self emitRevision:_lastRevision present:_lastPresent status:@"dirty" error:@"" commitRequest:_lastCommitRequest];
 }
@@ -3257,6 +3306,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 - (void)textDidChange:(NSNotification *)notification
 {
   if (_synchronizingField || notification.object != _multilineField || _host.control != _scrollView) return;
+  if ([self isPlainTextAutoCommitField] && [_lastSyncedPlainText isEqualToString:[self activeText]]) {
+    _secretDirty = NO;
+    return;
+  }
   _secretDirty = YES;
   [self emitRevision:_lastRevision present:_lastPresent status:@"dirty" error:@"" commitRequest:_lastCommitRequest];
 }
@@ -3297,17 +3350,34 @@ doCommandBySelector:(SEL)commandSelector
 - (void)prepareForRecycle
 {
   [super prepareForRecycle];
+  static const auto defaultProps = std::make_shared<const LiteLLMAppKitSecureTextInputProps>();
+  _props = defaultProps;
   _generation += 1;
   _stageInFlight = NO;
   _autoCommit = NO;
   _plainText = NO;
   _secretDirty = NO;
+  _synchronizingField = YES;
   _field.stringValue = @"";
   _plainField.stringValue = @"";
   _multilineField.string = @"";
+  _synchronizingField = NO;
+  _host.control = _field;
+  _host.fillsHeight = NO;
+  _field.placeholderString = nil;
+  _plainField.placeholderString = nil;
+  _field.enabled = YES;
+  _plainField.enabled = YES;
+  _field.editable = YES;
+  _plainField.editable = YES;
+  _field.selectable = YES;
+  _plainField.selectable = YES;
+  _multilineField.editable = YES;
+  _multilineField.selectable = YES;
   _domain = @"";
   _secretField = @"";
   _target = @"";
+  _lastSyncedPlainText = @"";
   _lastStatus = @"";
   _lastError = @"";
 }
@@ -3315,6 +3385,8 @@ doCommandBySelector:(SEL)commandSelector
 - (void)invalidate
 {
   _generation += 1;
+  _secretDirty = NO;
+  _lastSyncedPlainText = @"";
   _field.stringValue = @"";
   _plainField.stringValue = @"";
   _multilineField.string = @"";
@@ -3370,7 +3442,8 @@ doCommandBySelector:(SEL)commandSelector
         ([_secretField isEqualToString:@"deployment_token"] || [_secretField isEqualToString:@"desktop_gateway_api_key"]));
   }
   return [_domain isEqualToString:@"runtime"] && [_secretField isEqualToString:@"setting"] &&
-      [_target isEqualToString:@"LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"];
+      ([_target isEqualToString:@"LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"] ||
+       [_target isEqualToString:@"LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"]);
 }
 
 - (NSView *)accessibilityElement

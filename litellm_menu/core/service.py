@@ -43,6 +43,7 @@ SUBSCRIPTION_QUEUE_LIMIT = 32
 
 _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("providers_models", "api_key"): True,
+    ("providers_models", "provider_auth_token"): True,
     ("codex", "api_key"): False,
     ("claude", "deployment_token"): False,
     ("claude", "desktop_gateway_api_key"): False,
@@ -54,6 +55,7 @@ _SECRET_FIELDS: dict[tuple[str, str], bool] = {
 
 _PLAINTEXT_SECRET_FIELDS = {
     ("providers_models", "api_key"),
+    ("providers_models", "provider_auth_token"),
     ("codex", "api_key"),
     ("claude", "deployment_token"),
     ("claude", "desktop_gateway_api_key"),
@@ -61,11 +63,21 @@ _PLAINTEXT_SECRET_FIELDS = {
     ("runtime", "setting"),
 }
 
-_MULTILINE_SECRET_TARGET = "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
+_MULTILINE_SECRET_TARGETS = frozenset({
+    "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON",
+    "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
+})
+_DSH_VISION_ROUTER_CONFIG_MAX_BYTES = 256 * 1024
 
 
 def _allows_multiline_secret(domain: str, field: str, target: str | None) -> bool:
-    return domain == "runtime" and field == "setting" and target == _MULTILINE_SECRET_TARGET
+    return domain == "runtime" and field == "setting" and target in _MULTILINE_SECRET_TARGETS
+
+
+def _secret_value_limit(domain: str, field: str, target: str | None) -> int:
+    if domain == "runtime" and field == "setting" and target == "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON":
+        return _DSH_VISION_ROUTER_CONFIG_MAX_BYTES
+    return 16_384
 
 # Keep the Core's direct and legacy IPC callers tolerant of route-shaped
 # domain names.  The unified UI emits canonical names, but older native
@@ -713,8 +725,10 @@ class CoreStore:
         from .domains.runtime import RuntimeSettingsDomain
         from .domains.webdav import WebDAVSettingsDomain
         from .operations import CoreServiceController
+        from .provider_auth import ProviderAuthManager
 
         controller = CoreServiceController(runtime_root)
+        provider_auth = ProviderAuthManager(runtime_root)
         if reset_transient_routing_state:
             controller.reset_transient_routing_state()
 
@@ -725,7 +739,7 @@ class CoreStore:
         )
         adapters: list[DomainAdapter] = []
         settings_factories: tuple[tuple[str, Callable[[], DomainAdapter]], ...] = (
-            ("providers_models", lambda: ProvidersModelsDomain(config_path)),
+            ("providers_models", lambda: ProvidersModelsDomain(config_path, auth_manager=provider_auth)),
             (
                 "codex",
                 lambda: CodexSettingsDomain(
@@ -1289,7 +1303,7 @@ class CoreStore:
             descriptor_key = (name, field_name)
             if descriptor_key not in _PLAINTEXT_SECRET_FIELDS:
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
-            if descriptor_key == ("runtime", "setting") and target != _MULTILINE_SECRET_TARGET:
+            if descriptor_key == ("runtime", "setting") and target not in _MULTILINE_SECRET_TARGETS:
                 raise CoreError("invalid_secret", "The requested secret field is unavailable")
             target_required = _SECRET_FIELDS[descriptor_key]
             if target_required and (
@@ -1311,7 +1325,7 @@ class CoreStore:
                 raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
             if (
                 not isinstance(value, str)
-                or len(value.encode("utf-8")) > 16_384
+                or len(value.encode("utf-8")) > _secret_value_limit(name, field_name, target_value)
                 or "\x00" in value
                 or (not _allows_multiline_secret(name, field_name, target_value) and any(character in value for character in "\r\n"))
             ):
@@ -1347,7 +1361,7 @@ class CoreStore:
                 raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
             if (
                 not isinstance(value, str)
-                or len(value.encode("utf-8")) > 16_384
+                or len(value.encode("utf-8")) > _secret_value_limit(str(descriptor["domain"]), str(descriptor["field"]), descriptor["target"])
                 or "\x00" in value
                 or (not _allows_multiline_secret(str(descriptor["domain"]), str(descriptor["field"]), descriptor["target"]) and any(character in value for character in "\r\n"))
             ):
@@ -1365,7 +1379,7 @@ class CoreStore:
     ) -> dict[str, Any]:
         """Stage a secret received only from an authenticated native control."""
 
-        if not isinstance(value, str) or len(value.encode("utf-8")) > 16_384 or "\x00" in value or (not _allows_multiline_secret(_canonical_domain(domain), field, target) and any(char in value for char in "\r\n")):
+        if not isinstance(value, str) or len(value.encode("utf-8")) > _secret_value_limit(_canonical_domain(domain), field, target) or "\x00" in value or (not _allows_multiline_secret(_canonical_domain(domain), field, target) and any(char in value for char in "\r\n")):
             raise CoreError("invalid_secret", "The secret value is invalid")
         with self._lock:
             self._check_revision(revision)
@@ -2389,7 +2403,7 @@ class CoreStore:
         payload = action.get("payload")
         forbidden: set[str] = set()
         if name == "providers_models":
-            forbidden = {"api_key", "api_keys"}
+            forbidden = {"api_key", "api_keys", "provider_auth_token"}
             if normalized in {"provider_clear_key", "clear_provider_key", "set_raw", "setraw"}:
                 raise CoreError("secret_requires_native", "Use the native secure input for this secret field")
         elif name == "codex":

@@ -30,6 +30,7 @@ _IMAGE_GENERATION_TOOL_FALLBACK_ATTEMPTS_METADATA_KEY = (
     "image_generation_tool_runtime_fallback_attempts"
 )
 _STREAM_ERROR_FALLBACK_METADATA_KEY = "streaming_error_fallback_attempted"
+_DSH_VISION_ROUTER_ATTEMPTED_METADATA_KEY = "dsh_vision_router_attempted"
 _ROUTE_RECOVERY_POLL_METADATA_KEY = "route_recovery_poll_attempt"
 _STREAM_IDLE_TIMEOUT_METADATA_KEY = "stream_idle_timeout_triggered"
 _STREAM_START_TIMEOUT_METADATA_KEY = "stream_start_timeout_triggered"
@@ -196,14 +197,20 @@ _XHIGH_REASONING_COMPAT_RETRY_METADATA_KEY = (
 _INLINE_IMAGE_MANY_TARGET_BYTES = 320_000
 _INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES = 2_400_000
 _INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES = 64_000
-# A path-backed ``view_image`` result only needs a tiny visual fallback.  The
-# full-resolution file remains reopenable through the path reference, so do not
-# spend the ordinary history thumbnail budget on these images.
-_CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES = 16_384
+# A path-backed ``view_image`` result keeps a medium preview for the current
+# request.  The target is selected per batch between these bounds; the full-
+# resolution file remains reopenable through the path reference on demand.
+_CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES = 128_000
+_CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES = _INLINE_IMAGE_MANY_TARGET_BYTES
+# Keep the old name as the public upper-bound constant used by diagnostics and
+# tests.  It is intentionally the maximum, not a fixed per-image size.
+_CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES = _CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES
+_CODEX_VIEW_IMAGE_PREVIEW_TOTAL_TARGET_BYTES = _INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES
 _INLINE_IMAGE_SINGLE_TARGET_BYTES = 900_000
 _INLINE_IMAGE_MANY_MAX_EDGE = 1400
 _INLINE_IMAGE_SINGLE_MAX_EDGE = 2200
 _CODEX_VIEW_IMAGE_REFERENCE_MARKER = "[litellm-menu image references]"
+_CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER = "[litellm-menu original image]"
 _GENERIC_HELPER_PATCH_ATTR = "_generic_deployment_failover_patch"
 _ORDER_PEER_FAILOVER_PATCH_ATTR = "_order_peer_failover_patch"
 _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR = "_selected_deployment_marker_patch"
@@ -244,7 +251,10 @@ _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY = (
     "responses_native_client_tool_passthrough"
 )
 _TOOL_SEARCH_BRIDGE_FUNCTION_NAME = "tool_search"
-_WEB_SEARCH_BRIDGE_FUNCTION_NAME = "_litellm_web_search"
+# Names registered by the bundled pi-web-access extension. Hosted
+# web_search is a different Responses tool type; the proxy never exposes
+# both representations in the same upstream request.
+_PI_WEB_ACCESS_TOOL_NAMES = frozenset({"web_search", "fetch_content"})
 _RESPONSES_BRIDGE_NAMESPACE_KEY = "x-litellm-menu-responses-namespace"
 _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY = "x-litellm-menu-responses-custom-tool"
 _WEB_SEARCH_EXTERNAL_BRIDGE_KEY = "external_web_search_bridge"
@@ -313,13 +323,7 @@ _EXTERNAL_WEB_SEARCH_MAX_ROUNDS_ENV = "LITELLM_MENU_WEB_SEARCH_MAX_ROUNDS"
 _EXTERNAL_WEB_SEARCH_MAX_QUERIES_ENV = "LITELLM_MENU_WEB_SEARCH_MAX_QUERIES"
 _EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_ENV = "LITELLM_MENU_WEB_SEARCH_MAX_OPEN_PAGES"
 _EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_ENV = "LITELLM_MENU_WEB_SEARCH_MAX_FIND_IN_PAGE"
-_VISION_BRIDGE_BACKEND_ENV = "LITELLM_MENU_VISION_BRIDGE_BACKEND"
-_VISION_BRIDGE_API_BASE_ENV = "LITELLM_MENU_VISION_BRIDGE_API_BASE"
-_VISION_BRIDGE_API_KEY_ENV = "LITELLM_MENU_VISION_BRIDGE_API_KEY"
-_VISION_BRIDGE_MODEL_ENV = "LITELLM_MENU_VISION_BRIDGE_MODEL"
-_VISION_BRIDGE_TIMEOUT_ENV = "LITELLM_MENU_VISION_BRIDGE_TIMEOUT_SECONDS"
-_VISION_BRIDGE_PROMPT_ENV = "LITELLM_MENU_VISION_BRIDGE_PROMPT"
-_VISION_BRIDGE_LOCAL_FORMAT_ENV = "LITELLM_MENU_VISION_BRIDGE_LOCAL_FORMAT"
+_DSH_VISION_ROUTER_CONFIG_ENV = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
 _EXTERNAL_WEB_SEARCH_MAX_RESULTS_DEFAULT = 5
 _EXTERNAL_WEB_SEARCH_READ_CHARS_DEFAULT = 1400
 _EXTERNAL_WEB_FETCH_TIMEOUT_DEFAULT = 12.0
@@ -327,15 +331,6 @@ _EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT = 4
 _EXTERNAL_WEB_SEARCH_MAX_QUERIES_DEFAULT = 16
 _EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_DEFAULT = 8
 _EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_DEFAULT = 12
-_VISION_BRIDGE_BACKEND_DEFAULT = "auto"
-_VISION_BRIDGE_API_BASE_DEFAULT = "http://127.0.0.1:11434/v1"
-_VISION_BRIDGE_MODEL_DEFAULT = "qwen2.5vl:3b"
-_VISION_BRIDGE_TIMEOUT_DEFAULT = 45.0
-_VISION_BRIDGE_PROMPT_DEFAULT = (
-    "Describe the image accurately for a text-only language model. "
-    "Include visible text, UI elements, layout, objects, and any important details."
-)
-_VISION_BRIDGE_LOCAL_FORMAT_DEFAULT = "compact"
 _INTERNAL_CONTEXT_PREFIXES = (
     "another language model started to solve this problem",
     "<codex_internal_context",
@@ -604,7 +599,20 @@ _RESPONSES_STREAM_INCOMPLETE_TYPES = {
     "response.cancelled",
 }
 _RESPONSES_STREAM_INCOMPLETE_STATUSES = {"failed", "incomplete", "cancelled"}
-_HOSTED_WEB_SEARCH_TOOL_TYPES = {"web_search", "web_search_preview"}
+# OpenAI's Hosted Responses tools use the first two wire types. OpenRouter's
+# server-side web-search tool is provider-native but still participates in the
+# same hosted-tool planning/fallback decisions; it is not a pi-web-access
+# function declaration.
+_PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES = {
+    "openrouter:web_search",
+    "openrouter.web_search",
+    "openrouter_web_search",
+}
+_HOSTED_WEB_SEARCH_TOOL_TYPES = {
+    "web_search",
+    "web_search_preview",
+}
+_WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY = "native_web_search_event_seen"
 _HOSTED_GA_COMPUTER_TOOL_TYPES = {"computer"}
 
 

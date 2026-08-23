@@ -65,6 +65,10 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         leaf.open(route: route)
     }
 
+    @objc func cancelRelayLogin() {
+        leaf.cancelRelayLogin()
+    }
+
     @objc(setWindowContentSize:width:height:resolver:rejecter:)
     func setWindowContentSize(
         _ route: String,
@@ -147,6 +151,44 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 closeTitle: closeLabel,
                 language: language,
                 html: html,
+                completion: { resolve(nil) }
+            )
+        }
+    }
+
+    @objc(showProviderAuth:resolver:rejecter:)
+    func showProviderAuth(
+        _ options: [String: Any],
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard Set(options.keys).isSubset(of: ["provider", "fingerprint", "verificationURL", "userCode", "title", "closeLabel"]),
+              let provider = options["provider"] as? String,
+              (options["fingerprint"] == nil || options["fingerprint"] is String),
+              let verificationURL = options["verificationURL"] as? String,
+              let userCode = options["userCode"] as? String,
+              let title = options["title"] as? String,
+              let closeLabel = options["closeLabel"] as? String,
+              ["openai", "claude"].contains(provider),
+              !verificationURL.isEmpty,
+              verificationURL.utf8.count <= 2_048,
+              !userCode.isEmpty,
+              userCode.utf8.count <= 128,
+              !title.isEmpty,
+              title.utf8.count <= 320,
+              !closeLabel.isEmpty,
+              closeLabel.utf8.count <= 160 else {
+            reject("E_NATIVE_PROVIDER_AUTH_INPUT", "The provider authentication request is invalid.", nil)
+            return
+        }
+        DispatchQueue.main.async {
+            self.leaf.showProviderAuth(
+                provider: provider,
+                fingerprint: options["fingerprint"] as? String,
+                verificationURL: verificationURL,
+                userCode: userCode,
+                title: title,
+                closeTitle: closeLabel,
                 completion: { resolve(nil) }
             )
         }

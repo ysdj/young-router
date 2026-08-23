@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, PlatformColor, ScrollView, StyleSheet, Text, View, type StyleProp, type ViewStyle } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter } from "../types";
-import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeTable, NativeTextField } from "./NativeControls";
+import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSegmentedControl, NativeSecureTextInput, NativeTable, NativeTextField } from "./NativeControls";
 import { normalizeRelayOrigin, suggestedRelayStationName } from "./relayOrigin";
 import { UI_FONT_SIZE } from "./typography";
 
@@ -23,6 +23,7 @@ type RelayAccount = {
   loginStatus: string;
   rememberPassword: boolean;
   passwordSaved: boolean;
+  autoGrouping: boolean;
   balance: number | null;
   resourceStatus: "idle" | "ready" | "unavailable";
   resourceError: "none" | "login_expired" | "no_api_keys" | "no_models" | "unavailable";
@@ -64,12 +65,6 @@ type RelayResource = {
   pendingOperationCount: number;
 };
 
-type RelayPendingOperation = {
-  id: string;
-  action: string;
-  status: "staged" | "remote_applied" | "local_pending" | "completed";
-};
-
 type LocalRemovalIntent =
   | { kind: "station"; station: RelayStation }
   | { kind: "account"; account: RelayAccount };
@@ -77,6 +72,7 @@ type LocalRemovalIntent =
 type RemoteKeyDeleteIntent = { account: RelayAccount; resource: RelayResource };
 
 type AddedRelayAccount = Pick<RelayAccount, "id" | "type" | "label" | "origin" | "username" | "rememberPassword">;
+type AutoGroupingUpdateResult = { draftStaged: boolean };
 export type AddAccountOptions = {
   stationID?: string;
   stationOrigin?: string;
@@ -95,6 +91,8 @@ export type RelayApiKeyActions = {
   update?: (accountID: string, resourceID: string, name: string) => Promise<void>;
   setEnabled?: (accountID: string, resourceID: string, enabled: boolean) => Promise<void>;
   setGroup?: (accountID: string, resourceID: string, groupID: string) => Promise<void>;
+  setAutoGrouping?: (accountID: string, enabled: boolean) => Promise<AutoGroupingUpdateResult>;
+  alignAutoGrouping?: (accountID: string) => Promise<void>;
   remove?: (accountID: string, resourceID: string, dependencyPolicy: Exclude<RemoteDeletePolicy, "detach_only">) => Promise<void>;
   detach?: (accountID: string, resourceID: string) => Promise<void>;
 };
@@ -112,6 +110,7 @@ type ResourceRefreshTarget = { id: string; resources?: RelayResource[] };
 type AddStep = "origin" | "sign-in";
 type StationDraft = Partial<Pick<RelayStation, "name" | "origin" | "type">>;
 const INLINE_MODEL_LIMIT = 5;
+const COLUMN_GAP = 8;
 
 function record(value: unknown): UnknownRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : {};
@@ -156,6 +155,27 @@ function resourceGroupLabel(resource: RelayResource, groups: RelayGroup[], trans
   return `${resourceGroupName(resource, groups, translate)} / ${resourceGroupMultiplier(resource, groups, translate)}`;
 }
 
+function resourceGroupUnavailable(resource: RelayResource, groups: RelayGroup[]): boolean {
+  return Boolean(resource.groupID) && !resourceGroup(resource, groups);
+}
+
+function runtimeSettingNumber(snapshot: CoreSnapshot | undefined, key: string, fallback: number): number {
+  const domain = record(snapshot?.domains.runtime);
+  const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
+  const fields = Array.isArray(state.fields)
+    ? state.fields
+    : Array.isArray(state.settings)
+      ? state.settings
+      : [];
+  const field = fields.map(record).find((item) => text(item.key) === key);
+  const value = typeof field?.value === "number" ? field.value : Number(field?.value);
+  return Number.isFinite(value) && value >= 1 ? Math.round(value) : fallback;
+}
+
+function relayAutoGroupIntervalMinutes(snapshot: CoreSnapshot | undefined): number {
+  return runtimeSettingNumber(snapshot, "LITELLM_MENU_RELAY_AUTO_GROUP_INTERVAL_MINUTES", 30);
+}
+
 function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
   const domain = record(snapshot?.domains.relay_accounts);
   const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
@@ -177,6 +197,7 @@ function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
       loginStatus: text(item.login_status) || "unknown",
       rememberPassword: item.remember_password === true,
       passwordSaved: item.password_saved === true,
+      autoGrouping: item.auto_grouping === true,
       balance: typeof item.balance === "number" && Number.isFinite(item.balance) ? item.balance : null,
       resourceStatus: item.resource_status === "ready" || item.resource_status === "unavailable" ? item.resource_status : "idle",
       resourceError: item.resource_error === "login_expired" || item.resource_error === "no_api_keys" || item.resource_error === "no_models" || item.resource_error === "unavailable" ? item.resource_error : "none",
@@ -285,25 +306,6 @@ function stationsFromSnapshot(snapshot: CoreSnapshot | undefined, accounts: Rela
   return stations;
 }
 
-function pendingOperationsFromSnapshot(snapshot?: CoreSnapshot): RelayPendingOperation[] {
-  const domain = record(snapshot?.domains.relay_accounts);
-  const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
-  const values = Array.isArray(state.pending_operations) ? state.pending_operations : Array.isArray(domain.pending_operations) ? domain.pending_operations : [];
-  return values.flatMap((value) => {
-    const item = record(value);
-    const status = item.status === "remote_applied" || item.status === "local_pending" || item.status === "completed" ? item.status : "staged";
-    const id = text(item.id) || text(item.operation_id);
-    const action = text(item.action) || text(item.type);
-    return id && action ? [{ id, action, status }] : [];
-  });
-}
-
-function relayPendingOperationCount(snapshot?: CoreSnapshot): number {
-  const domain = record(snapshot?.domains.relay_accounts);
-  const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
-  return count(state.pending_operation_count ?? domain.pending_operation_count);
-}
-
 function translateStationName(account?: RelayAccount): string {
   return account ? stationName(account) : "";
 }
@@ -319,13 +321,6 @@ function credentialCleanupsFromSnapshot(snapshot?: CoreSnapshot): PendingCredent
     if (!accountID || !label || !kind) return [];
     return [{ accountID, label, kind }];
   }) : [];
-}
-
-function statusKey(status: string): string {
-  if (status === "signed_in") return "relay.status.signed_in";
-  if (status === "signed_out") return "relay.status.signed_out";
-  if (status === "expired") return "relay.status.expired";
-  return "relay.status.unknown";
 }
 
 function relayTypeLabel(type: RelayType, translate: Translate): string {
@@ -394,6 +389,54 @@ function accountDetailTitle(account: RelayAccount, translate: Translate): string
   return account.username.trim() || accountDisplayName(account, translate);
 }
 
+export type RelayNavigationItem = {
+  key: string;
+  kind: "station" | "account";
+  id: string;
+  label: string;
+  secondary: string;
+  accountID?: string;
+  stationID?: string;
+};
+
+/** Masked relay metadata used by the unified service-provider navigation.
+ * Credentials and generated API keys never enter this projection. */
+export function relayNavigationItems(snapshot: CoreSnapshot | undefined, translate: Translate): RelayNavigationItem[] {
+  const accounts = accountsFromSnapshot(snapshot);
+  const stations = stationsFromSnapshot(snapshot, accounts);
+  return stations.flatMap((station) => {
+    const rows: RelayNavigationItem[] = [{
+      key: "relay:station:" + station.id,
+      kind: "station",
+      id: station.id,
+      stationID: station.id,
+      label: stationDisplayName(station, translate),
+      secondary: translate("relay.station"),
+    }];
+    for (const accountID of station.accountIDs) {
+      const account = accounts.find((candidate) => candidate.id === accountID);
+      if (!account) continue;
+      const statusKey = account.loginStatus === "signed_in"
+        ? "relay.status.signed_in"
+        : account.loginStatus === "signed_out"
+          ? "relay.status.signed_out"
+          : account.loginStatus === "expired"
+            ? "relay.status.expired"
+            : "relay.status.unknown";
+      rows.push({
+        key: "relay:account:" + account.id,
+        kind: "account",
+        id: account.id,
+        accountID: account.id,
+        stationID: station.id,
+        label: accountDisplayName(account, translate),
+        secondary: relayTypeLabel(account.type, translate) + " · " + translate(statusKey),
+      });
+    }
+    return rows;
+  });
+}
+
 function accountStationLabel(account: RelayAccount): string {
   const value = account.stationName.trim() || stationName(account);
   return /^https?:\/\//iu.test(value) ? originHostLabel(value) : value;
@@ -408,16 +451,14 @@ function visibleResourceModels(resource: RelayResource, showAll: boolean): strin
   return resource.models.slice(0, INLINE_MODEL_LIMIT);
 }
 
-function FormRow({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
+export function NativeFormRow({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
   return <View style={[styles.formRow, compactStyles.formRow]}>
     <Text style={styles.formLabel}>{label}</Text>
     <View style={[styles.formValue, compactStyles.formValue]}>{children}</View>
   </View>;
 }
 
-function SetupProgress({ step, translate }: { step: AddStep; translate: Translate }): React.JSX.Element {
-  const activeIndex = step === "origin" ? 0 : 1;
-  const steps = [translate("relay.setupStepStation"), translate("relay.stepSignIn")];
+export function NativeWizardProgress({ steps, activeIndex }: { steps: string[]; activeIndex: number }): React.JSX.Element {
   return <View style={styles.setupProgress} accessibilityLabel={steps.map((label, index) => `${index + 1} ${label}`).join(", ")}>
     {steps.map((label, index) => <View key={label} style={styles.setupProgressStep}>
       <View style={[styles.setupProgressBadge, index === activeIndex && styles.setupProgressBadgeCurrent, index < activeIndex && styles.setupProgressBadgeDone]}>
@@ -428,11 +469,21 @@ function SetupProgress({ step, translate }: { step: AddStep; translate: Translat
   </View>;
 }
 
-function ResourceInspector({ account, resource, signedIn, disabled, nameValue, resourceGroups, selectedResourceGroupLabel, onNameChange, onNameCommit, onGroupChange, onEnabledChange, onCopy, translate }: {
+function FormRow({ label, children }: { label: string; children: React.ReactNode }): React.JSX.Element {
+  return <NativeFormRow label={label}>{children}</NativeFormRow>;
+}
+
+function SetupProgress({ step, translate }: { step: AddStep; translate: Translate }): React.JSX.Element {
+  return <NativeWizardProgress activeIndex={step === "origin" ? 0 : 1} steps={[translate("relay.setupStepStation"), translate("relay.stepSignIn")]} />;
+}
+
+function ResourceInspector({ account, resource, signedIn, disabled, autoGrouping, groupUnavailable, nameValue, resourceGroups, selectedResourceGroupLabel, onNameChange, onNameCommit, onGroupChange, onEnabledChange, onCopy, translate }: {
   account: RelayAccount;
   resource: RelayResource;
   signedIn: boolean;
   disabled: boolean;
+  autoGrouping: boolean;
+  groupUnavailable: boolean;
   nameValue: string;
   resourceGroups: RelayGroup[];
   selectedResourceGroupLabel: string;
@@ -463,22 +514,18 @@ function ResourceInspector({ account, resource, signedIn, disabled, nameValue, r
     </View>
     <View style={styles.resourceInspectorForm}>
       <View style={styles.resourceInspectorToggleRow}>
-        <NativeCheckbox label={resource.enabled ? translate("common.enable") : translate("common.disable")} value={resource.enabled} disabled={disabled} onValueChange={onEnabledChange} />
+        <NativeCheckbox label={resource.enabled ? translate("common.enable") : translate("common.disable")} value={resource.enabled} disabled={disabled || autoGrouping || groupUnavailable} onValueChange={onEnabledChange} />
       </View>
       <View style={styles.resourceInspectorRow}>
         <Text style={styles.resourceInspectorLabel}>{translate("common.name")}</Text>
         <View style={styles.resourceInspectorControlRow}>
-          <NativeTextField value={nameValue} placeholder={translate("relay.apiKeyNamePlaceholder")} editable={!disabled} accessibilityLabel={`${translate("relay.apiKeyName")}: ${nameValue}`} onChangeText={onNameChange} onBlur={() => { if (!disabled) void onNameCommit(); }} style={styles.resourceInspectorTextInput} />
+          <NativeTextField value={nameValue} placeholder={translate("relay.apiKeyNamePlaceholder")} editable={!disabled && !autoGrouping} accessibilityLabel={`${translate("relay.apiKeyName")}: ${nameValue}`} onChangeText={onNameChange} onBlur={() => { if (!disabled && !autoGrouping) void onNameCommit(); }} style={styles.resourceInspectorTextInput} />
         </View>
       </View>
       <View style={styles.resourceInspectorRow}>
         <Text style={styles.resourceInspectorLabel}>{translate("relay.apiKeyGroup")}</Text>
-        {groupLabels.length > 0 ? <NativePicker labels={groupLabels} selectedValue={selectedResourceGroupLabel} disabled={disabled} onChange={({ nativeEvent }) => { const group = resourceGroups[nativeEvent.index]; if (group) onGroupChange(group.id); }} style={styles.resourceInspectorPicker} /> : <Text style={styles.resourceInspectorReadOnly}>{translate("common.none")}</Text>}
+        {groupLabels.length > 0 ? <NativePicker labels={groupLabels} selectedValue={selectedResourceGroupLabel} disabled={disabled || autoGrouping} onChange={({ nativeEvent }) => { const group = resourceGroups[nativeEvent.index]; if (group) onGroupChange(group.id); }} style={styles.resourceInspectorPicker} /> : <Text style={styles.resourceInspectorReadOnly}>{translate("common.none")}</Text>}
       </View>
-      {resource.pendingOperationCount > 0 ? <View style={styles.resourceInspectorRow}>
-        <Text style={styles.resourceInspectorLabel}>{translate("relay.pendingOperations")}</Text>
-        <Text style={styles.resourceInspectorReadOnly}>{translate("relay.pendingOperationsCount", { count: resource.pendingOperationCount })}</Text>
-      </View> : null}
       <View style={[styles.resourceInspectorRow, styles.resourceInspectorMultilineRow]}>
         <Text style={styles.resourceInspectorLabel}>{translate("providers.models")}</Text>
         <View style={styles.resourceInspectorModelValue}>
@@ -636,11 +683,15 @@ function RelayTablePane({ title, actions, style, children }: { title: string; ac
 export function RelayAccountManager({
   visible,
   setupOnly = false,
+  hideNavigation = false,
+  selectedNavigationKey,
+  onNavigationSelectionChange,
   snapshot,
   native,
   busy,
   translate,
   onClose,
+  onStatus,
   commit,
   detectType,
   refreshResources,
@@ -651,11 +702,16 @@ export function RelayAccountManager({
   /** RN macOS renders this component in the ordinary route tree. */
   visible?: boolean;
   setupOnly?: boolean;
+  /** Render only the detail pane when a parent owns the unified navigation. */
+  hideNavigation?: boolean;
+  selectedNavigationKey?: string;
+  onNavigationSelectionChange?: (key: string) => void;
   snapshot?: CoreSnapshot;
   native: NativeLeafAdapter;
   busy: boolean;
   translate: Translate;
   onClose?: () => void;
+  onStatus?: (status?: string) => void;
   commit: (type: string, payload?: UnknownRecord, domain?: "relay_accounts") => Promise<void>;
   detectType: (origin: string) => Promise<RelayType | undefined>;
   refreshResources: (accountId: string) => Promise<"ready" | "unavailable">;
@@ -666,8 +722,12 @@ export function RelayAccountManager({
   const accounts = useMemo(() => accountsFromSnapshot(snapshot), [snapshot]);
   const stations = useMemo(() => stationsFromSnapshot(snapshot, accounts), [snapshot, accounts]);
   const pendingCredentialCleanups = useMemo(() => credentialCleanupsFromSnapshot(snapshot), [snapshot]);
-  const pendingOperations = useMemo(() => pendingOperationsFromSnapshot(snapshot), [snapshot]);
-  const pendingOperationCount = relayPendingOperationCount(snapshot) || pendingOperations.filter((operation) => operation.status !== "completed").length;
+  const snapshotAutoGroupIntervalMinutes = relayAutoGroupIntervalMinutes(snapshot);
+  const appliedAutoGroupIntervalMinutes = useRef(30);
+  const runtimeDraftDirty = Boolean(snapshot?.drafts.runtime?.dirty);
+  useEffect(() => {
+    if (!runtimeDraftDirty) appliedAutoGroupIntervalMinutes.current = snapshotAutoGroupIntervalMinutes;
+  }, [runtimeDraftDirty, snapshotAutoGroupIntervalMinutes]);
   const [selectedID, setSelectedID] = useState<string>();
   const [selectedStationID, setSelectedStationID] = useState<string>();
   const [adding, setAdding] = useState(setupOnly);
@@ -675,6 +735,7 @@ export function RelayAccountManager({
   const [addStationID, setAddStationID] = useState("__custom__");
   const [origin, setOrigin] = useState("");
   const [addStationName, setAddStationName] = useState("");
+  const [rememberPassword, setRememberPassword] = useState(false);
   const [stationNameEdited, setStationNameEdited] = useState(false);
   const [typeDetection, setTypeDetection] = useState<RelayTypeDetection>();
   const [manualType, setManualType] = useState<RelayType>();
@@ -711,8 +772,22 @@ export function RelayAccountManager({
   const controlsBusy = busy || formBusy || cleanupBusy || stationFormBusy;
   const setupControlsBusy = controlsBusy || loginBusy;
   const passwordStorageAvailable = true;
-  const selected = selectedStationID ? undefined : accounts.find((account) => account.id === selectedID) ?? accounts[0];
+  const externalSelection = hideNavigation ? selectedNavigationKey : undefined;
+  const externalIsStation = externalSelection?.startsWith("relay:station:") === true;
+  const externalAccountID = externalIsStation
+    ? externalSelection?.slice("relay:station:".length)
+    : externalSelection?.startsWith("relay:account:")
+      ? externalSelection.slice("relay:account:".length)
+      : undefined;
+  const effectiveSelectedID = externalSelection && !externalIsStation ? externalAccountID : selectedID;
+  const effectiveSelectedStationID = externalIsStation ? externalAccountID : selectedStationID;
+  const selected = effectiveSelectedStationID ? undefined : accounts.find((account) => account.id === effectiveSelectedID) ?? accounts[0];
   const selectedGroups = selected?.groups ?? [];
+  const clearGlobalStatus = (): void => onStatus?.(undefined);
+  const publishGlobalFeedback = (message: string): void => {
+    setFeedback(undefined);
+    onStatus?.(message);
+  };
   const setApiKeyNameDraft = (resourceID: string, value: string): void => {
     const current = apiKeyNameDraftsRef.current;
     if (current[resourceID] === value) return;
@@ -723,32 +798,45 @@ export function RelayAccountManager({
   const resourceDisplayName = (resource: RelayResource): string => apiKeyNameDrafts[resource.id] !== undefined
     ? apiKeyNameDrafts[resource.id]
     : resource.apiName || resource.name;
-  const resourceTableRows = useMemo(() => (selected?.resources ?? []).map((resource) => ({
+  const visibleResources = useMemo(() => (selected?.resources ?? []).filter((resource) => (
+    !selected?.autoGrouping || !resourceGroupUnavailable(resource, selectedGroups)
+  )), [selected?.autoGrouping, selected?.resources, selectedGroups]);
+  const resourceTableRows = useMemo(() => visibleResources.map((resource) => ({
     key: resource.id,
     cells: [
       resourceDisplayName(resource),
       resourceGroupName(resource, selectedGroups, translate),
       resourceGroupMultiplier(resource, selectedGroups, translate),
     ],
-  })), [apiKeyNameDrafts, selectedGroups, selected?.resources, translate]);
-  const resourceSecondaryCellKeys = useMemo(() => (selected?.resources ?? []).flatMap((resource) => !resource.enabled
+  })), [apiKeyNameDrafts, selectedGroups, translate, visibleResources]);
+  const resourceSecondaryCellKeys = useMemo(() => visibleResources.flatMap((resource) => !resource.enabled || resourceGroupUnavailable(resource, selectedGroups)
     ? [`${resource.id}\x1f0`, `${resource.id}\x1f1`, `${resource.id}\x1f2`]
-    : []), [selected?.resources]);
-  const selectedResource = selected?.resources.find((resource) => resource.id === selectedResourceID) ?? selected?.resources[0];
+    : []), [selectedGroups, visibleResources]);
+  const resourceUnavailableRowKeys = useMemo(() => visibleResources
+    .filter((resource) => resourceGroupUnavailable(resource, selectedGroups))
+    .map((resource) => resource.id), [selectedGroups, visibleResources]);
+  const selectedResource = visibleResources.find((resource) => resource.id === selectedResourceID) ?? visibleResources[0];
   const resourceGroups = useMemo(() => {
     if (!selected || !selectedResource) return [];
     const groups = selected.groups.filter((group) => group.id !== "");
-    if (selectedResource.groupID && !groups.some((group) => group.id === selectedResource.groupID)) {
+    if (!selected.autoGrouping && selectedResource.groupID && !groups.some((group) => group.id === selectedResource.groupID)) {
       groups.push({ id: selectedResource.groupID, name: selectedResource.groupName || selectedResource.groupID, multiplier: null });
     }
     return groups;
-  }, [selected?.groups, selectedResource?.groupID, selectedResource?.groupName]);
+  }, [selected?.autoGrouping, selected?.groups, selectedResource?.groupID, selectedResource?.groupName]);
   const selectedResourceGroup = resourceGroups.find((group) => group.id === selectedResource?.groupID);
   const selectedResourceGroupLabel = selectedResourceGroup
     ? groupLabel(selectedResourceGroup, translate)
     : selectedResource ? resourceGroupLabel(selectedResource, selected?.groups ?? [], translate) : translate("relay.apiKeyUngrouped");
+  const selectedResourceGroupUnavailable = Boolean(selectedResource && resourceGroupUnavailable(selectedResource, selectedGroups));
+  // Runtime settings are staged until Apply. Keep the last clean interval
+  // while another runtime draft is being edited so an unapplied value cannot
+  // change the auto-grouping cadence.
+  const autoGroupIntervalMinutes = runtimeDraftDirty
+    ? appliedAutoGroupIntervalMinutes.current
+    : snapshotAutoGroupIntervalMinutes;
   const selectedRememberPassword = selected ? rememberPasswordDrafts[selected.id] ?? selected.rememberPassword : false;
-  const selectedStation = selectedStationID ? stations.find((station) => station.id === selectedStationID) : undefined;
+  const selectedStation = effectiveSelectedStationID ? stations.find((station) => station.id === effectiveSelectedStationID) : undefined;
   const projectedStation = (station: RelayStation): RelayStation => {
     const draft = stationDrafts[station.id];
     if (!draft) return station;
@@ -799,6 +887,11 @@ export function RelayAccountManager({
     if (account.loginStatus === "signed_in" || account.loginStatus === "signed_out" || account.loginStatus === "expired") return account.loginStatus;
     return "unknown";
   };
+  const selectedHeaderSignedIn = Boolean(selected && effectiveLoginStatus(selected) === "signed_in");
+  const selectedHeaderShowsBalance = Boolean(selected && selectedHeaderSignedIn && selected.balance !== null);
+  const selectedHeaderValue = selectedHeaderShowsBalance && selected
+    ? balanceLabel(selected, translate)
+    : translate("relay.status.loading");
   const updateAccountLoading = (accountID: string, kind: keyof AccountLoadingState, loading: boolean): void => {
     const current = accountLoadingRef.current;
     const previous = current[accountID] ?? { session: false, resources: false };
@@ -839,9 +932,9 @@ export function RelayAccountManager({
     }
     return rows;
   }), [stations, accounts, stationDrafts, translate]);
-  const relayTableSelection = selectedStationID ? `station:${selectedStationID}` : selected?.id ? `account:${selected.id}` : "";
+  const relayTableSelection = effectiveSelectedStationID ? "station:" + effectiveSelectedStationID : selected?.id ? "account:" + selected.id : "";
   useEffect(() => {
-    if (selectedStationID && !stations.some((station) => station.id === selectedStationID)) {
+    if (effectiveSelectedStationID && !stations.some((station) => station.id === effectiveSelectedStationID)) {
       setSelectedStationID(undefined);
       return;
     }
@@ -869,13 +962,13 @@ export function RelayAccountManager({
       }
       return next;
     });
-  }, [stations, selectedStationID, translate]);
+  }, [effectiveSelectedStationID, stations, selectedStationID, translate]);
   useEffect(() => {
     const route = setupOnly ? "relay-add" : "relay-accounts";
     const showingLoginStep = setupOnly && adding && addStep === "sign-in";
     const width = setupOnly ? (showingLoginStep ? 900 : 620) : 820;
     const height = setupOnly
-      ? (showingLoginStep ? 760 : 350)
+      ? (showingLoginStep ? 620 : 460)
       : Math.min(680, Math.max(440, 170 + relayTableRows.length * 22));
     void native.window.setContentSize?.(route, width, height);
   }, [addStep, adding, native.window, relayTableRows.length, setupOnly]);
@@ -893,8 +986,9 @@ export function RelayAccountManager({
       apiKeyNameDraftsRef.current = next;
       return next;
     });
-    setSelectedResourceID((current) => selected.resources.some((resource) => resource.id === current) ? current : selected.resources[0]?.id);
-  }, [selected?.id, selected?.resources]);
+    const firstSelectable = selected.resources.find((resource) => !resourceGroupUnavailable(resource, selected.groups)) ?? selected.resources[0];
+    setSelectedResourceID((current) => selected.resources.some((resource) => resource.id === current) ? current : firstSelectable?.id);
+  }, [selected?.id, selected?.resources, selected?.groups]);
   useEffect(() => {
     setRememberPasswordDrafts((current) => {
       let next = current;
@@ -930,6 +1024,7 @@ export function RelayAccountManager({
     setAddStationID("__custom__");
     setOrigin("");
     setAddStationName("");
+    setRememberPassword(false);
     setStationNameEdited(false);
     setTypeDetection(undefined);
     setManualType(undefined);
@@ -1016,7 +1111,7 @@ export function RelayAccountManager({
         setFeedback(translate("relay.typeNotDetected"));
         return;
       }
-      account = await addAccount(accountType, candidate, false, chosenStation ? {
+      account = await addAccount(accountType, candidate, rememberPassword, chosenStation ? {
         stationID: chosenStation.id,
         stationOrigin: chosenStation.origin,
         stationName: chosenStation.name,
@@ -1049,6 +1144,12 @@ export function RelayAccountManager({
     } finally {
       setFormBusy(false);
     }
+  };
+  const returnToStationStep = (): void => {
+    if (!setupOnly || !adding || addStep !== "sign-in") return;
+    native.cancelRelayLogin();
+    setAddStep("origin");
+    setFeedback(undefined);
   };
   const pendingCleanups = pendingCredentialCleanups;
   const retryCredentialCleanup = async (cleanup: PendingCredentialCleanup): Promise<void> => {
@@ -1093,11 +1194,12 @@ export function RelayAccountManager({
       return;
     }
     setSelectedID(undefined);
+    if (hideNavigation) onNavigationSelectionChange?.("");
     await clearRemovedAccountCredentials([account.id]);
     setCleanupBusy(false);
   };
   const openLocalRemoval = (): void => {
-    const intent = selectedStationID && selectedStation
+    const intent = effectiveSelectedStationID && selectedStation
       ? { kind: "station" as const, station: selectedStation }
       : selected
         ? { kind: "account" as const, account: selected }
@@ -1126,6 +1228,7 @@ export function RelayAccountManager({
       return;
     }
     setSelectedStationID(undefined);
+    if (hideNavigation) onNavigationSelectionChange?.("");
     await clearRemovedAccountCredentials(localRemoval.station.accountIDs);
     setCleanupBusy(false);
     setLocalRemoval(undefined);
@@ -1226,12 +1329,16 @@ export function RelayAccountManager({
   }, [visible, adding, selected?.id]);
   const runApiKeyAction = async (kind: "create" | "update" | "setEnabled" | "setGroup", resourceID?: string, value?: boolean | string | { name: string; groupID?: string; enabled: boolean }): Promise<void> => {
     if (!selected || (kind !== "create" && !resourceID)) return;
+    if (selected.autoGrouping) return;
+    const targetResource = resourceID ? selected.resources.find((resource) => resource.id === resourceID) : undefined;
+    if (targetResource && resourceGroupUnavailable(targetResource, selectedGroups)) return;
     if (kind === "create" && (!apiKeyActions?.create || !value || typeof value === "boolean" || typeof value === "string")) return;
     if (kind === "update" && !apiKeyActions?.update) return;
     if (kind === "setEnabled" && (!apiKeyActions?.setEnabled || typeof value !== "boolean")) return;
     if (kind === "setGroup" && (!apiKeyActions?.setGroup || typeof value !== "string")) return;
     setFormBusy(true);
     setFeedback(undefined);
+    clearGlobalStatus();
     try {
       if (kind === "create") {
         await apiKeyActions?.create?.(selected.id, value as { name: string; groupID?: string; enabled: boolean });
@@ -1253,47 +1360,91 @@ export function RelayAccountManager({
         : kind === "setEnabled"
           ? (value ? "relay.apiKeyEnableStaged" : "relay.apiKeyDisableStaged")
           : "relay.apiKeyUpdateStaged";
-      setFeedback(translate(feedbackKey));
+      publishGlobalFeedback(translate(feedbackKey));
     } catch {
-      setFeedback(translate("relay.operationFailed"));
+      publishGlobalFeedback(translate("relay.operationFailed"));
     } finally {
       setFormBusy(false);
     }
   };
+  const updateAutoGrouping = async (enabled: boolean): Promise<void> => {
+    if (!selected || !apiKeyActions?.setAutoGrouping) return;
+    const accountID = selected.id;
+    setSelectedResourceID(undefined);
+    setFormBusy(true);
+    setFeedback(undefined);
+    clearGlobalStatus();
+    try {
+      const result = await apiKeyActions.setAutoGrouping(accountID, enabled);
+      if (result.draftStaged) publishGlobalFeedback(translate("relay.apiKeyAutoGroupingStaged"));
+      else clearGlobalStatus();
+    } catch {
+      publishGlobalFeedback(translate("relay.operationFailed"));
+    } finally {
+      setFormBusy(false);
+    }
+  };
+  useEffect(() => {
+    if (setupOnly || visible === false || !selected?.autoGrouping || !apiKeyActions?.alignAutoGrouping) return;
+    let active = true;
+    const interval = setInterval(() => {
+      if (!active || controlsBusy || isAccountLoading(selected.id)) return;
+      void (async () => {
+        const status = await refreshAccountResources(selected, true);
+        if (!active || status !== "ready" || isAccountLoading(selected.id)) return;
+        try {
+          await apiKeyActions.alignAutoGrouping?.(selected.id);
+          if (active) await refreshAccounts();
+        } catch {
+          // Keep the staged state visible; the next interval can retry.
+        }
+      })();
+    }, autoGroupIntervalMinutes * 60_000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [apiKeyActions, autoGroupIntervalMinutes, controlsBusy, refreshAccounts, selected?.autoGrouping, selected?.id, setupOnly, visible]);
   const openRemoteKeyDelete = (account: RelayAccount, resource: RelayResource): void => {
+    if (account.autoGrouping || resourceGroupUnavailable(resource, account.groups)) return;
     setRemoteDeletePolicy("detach_disabled");
     setRemoteKeyDelete({ account, resource });
   };
   const executeRemoteKeyDelete = async (): Promise<void> => {
     if (!remoteKeyDelete) return;
     const { account, resource } = remoteKeyDelete;
+    if (account.autoGrouping || resourceGroupUnavailable(resource, account.groups)) {
+      setRemoteKeyDelete(undefined);
+      return;
+    }
     setFormBusy(true);
     setFeedback(undefined);
+    clearGlobalStatus();
     try {
       if (remoteDeletePolicy === "detach_only") await apiKeyActions?.detach?.(account.id, resource.id);
       else await apiKeyActions?.remove?.(account.id, resource.id, remoteDeletePolicy);
       await refreshAccounts();
       if (resource.id === selectedResourceID) setSelectedResourceID(undefined);
-      setFeedback(translate(remoteDeletePolicy === "detach_only" ? "relay.apiKeyDetachStaged" : "relay.apiKeyDeleteStaged"));
+      publishGlobalFeedback(translate(remoteDeletePolicy === "detach_only" ? "relay.apiKeyDetachStaged" : "relay.apiKeyDeleteStaged"));
       setRemoteKeyDelete(undefined);
     } catch {
-      setFeedback(translate("relay.operationFailed"));
+      publishGlobalFeedback(translate("relay.operationFailed"));
     } finally {
       setFormBusy(false);
     }
   };
   const copyApiKey = async (resource: RelayResource): Promise<void> => {
     if (!selected) return;
-    setFeedback(undefined);
+    clearGlobalStatus();
     try {
       const copied = await native.copySecret({
         domain: "relay_accounts",
         field: "api_key",
         target: `${selected.id}:${resource.id}`,
       });
-      setFeedback(translate(copied ? "relay.apiKeyCopied" : "relay.operationFailed"));
+      publishGlobalFeedback(translate(copied ? "relay.apiKeyCopied" : "relay.operationFailed"));
     } catch {
-      setFeedback(translate("relay.operationFailed"));
+      publishGlobalFeedback(translate("relay.operationFailed"));
     }
   };
   const updateRememberPassword = async (next: boolean): Promise<void> => {
@@ -1332,7 +1483,7 @@ export function RelayAccountManager({
       }
     }
   };
-  const stageStationUpdate = async (stationID = selectedStationID, overrides: { name?: string; origin?: string; type?: RelayType } = {}): Promise<void> => {
+  const stageStationUpdate = async (stationID = effectiveSelectedStationID, overrides: { name?: string; origin?: string; type?: RelayType } = {}): Promise<void> => {
     const station = stationID ? stations.find((item) => item.id === stationID) : undefined;
     if (!station) return;
     const draft = stationDraftsRef.current[station.id] ?? {};
@@ -1365,6 +1516,7 @@ export function RelayAccountManager({
   if (visible === false) return <View style={styles.hidden} />;
 
   const selectAccount = (accountID: string): void => {
+    if (hideNavigation) onNavigationSelectionChange?.("relay:account:" + accountID);
     setSelectedID(accountID);
     setSelectedStationID(undefined);
     setAdding(false);
@@ -1372,6 +1524,7 @@ export function RelayAccountManager({
     setFeedback(undefined);
   };
   const selectStation = (stationID: string): void => {
+    if (hideNavigation) onNavigationSelectionChange?.("relay:station:" + stationID);
     const station = stations.find((item) => item.id === stationID);
     setSelectedID(undefined);
     setSelectedStationID(stationID);
@@ -1404,10 +1557,12 @@ export function RelayAccountManager({
   };
   const detectedAddType = typeDetection !== "checking" && typeDetection !== "unknown" ? typeDetection : undefined;
   const selectedAddType = manualType ?? detectedAddType;
-  const addStationPickerLabels = [translate("relay.stationCustom"), ...stations.map((station) => stationPickerLabel(projectedStation(station), translate))];
-  const addStationPickerValue = selectedAddStation ? stationPickerLabel(projectedStation(selectedAddStation), translate) : translate("relay.stationCustom");
+  const addStationMode = selectedAddStation ? "existing" : "custom";
+  const addStationModeLabels = stations.length > 0
+    ? [translate("relay.stationCustom"), translate("relay.stationExisting")]
+    : [translate("relay.stationCustom")];
   const selectAddStation = (index: number): void => {
-    const station = stations[index - 1];
+    const station = stations[index];
     typeDetectionRequest.current += 1;
     if (!station) {
       setAddStationID("__custom__");
@@ -1424,6 +1579,19 @@ export function RelayAccountManager({
     setStationNameEdited(false);
     setTypeDetection(station.type);
     setManualType(station.type);
+  };
+  const selectAddStationMode = (index: number): void => {
+    if (index === 0) {
+      typeDetectionRequest.current += 1;
+      setAddStationID("__custom__");
+      setOrigin("");
+      setAddStationName("");
+      setTypeDetection(undefined);
+      setManualType(undefined);
+      setStationNameEdited(false);
+      return;
+    }
+    if (stations.length > 0) selectAddStation(0);
   };
   const localPolicyOptions: Array<PolicyOption<LocalDependencyPolicy>> = [
     { value: "detach", label: translate("relay.policyRelease"), hint: translate("relay.policyReleaseHint") },
@@ -1449,18 +1617,14 @@ export function RelayAccountManager({
   const selectedStationModelCount = selectedStation?.linkedModelCount
     || selectedStationAccounts.reduce((total, account) => total + account.linkedModelCount, 0);
   return <View style={styles.workspace} accessibilityLabel={translate("relay.title")}>
-    {pendingOperationCount > 0 ? <View style={styles.pendingOperationBar} accessibilityLiveRegion="polite">
-      <Text style={styles.pendingOperationTitle}>{translate("relay.pendingOperations")}</Text>
-      <Text numberOfLines={1} style={styles.pendingOperationText}>{translate("relay.pendingOperationsCount", { count: pendingOperationCount })}</Text>
-    </View> : null}
-    {pendingCleanups.length > 0 ? <ScrollView style={styles.pendingCleanupList} contentContainerStyle={styles.pendingCleanupListContent} showsVerticalScrollIndicator={pendingCleanups.length > 2}>
+    {!setupOnly && pendingCleanups.length > 0 ? <ScrollView style={styles.pendingCleanupList} contentContainerStyle={styles.pendingCleanupListContent} showsVerticalScrollIndicator={pendingCleanups.length > 2}>
       {pendingCleanups.map((cleanup) => <View key={cleanup.accountID} style={styles.pendingCleanup}>
         <Text numberOfLines={2} style={styles.pendingCleanupText}>{translate("relay.credentialsCleanupPending", { label: cleanup.label })}</Text>
         <NativeButton title={translate("relay.retryCleanup")} compact disabled={cleanupBusy} onPress={() => { void retryCredentialCleanup(cleanup); }} />
       </View>)}
     </ScrollView> : null}
     <View style={styles.relayLayout}>
-      {!setupOnly ? <RelayTablePane title={translate("relay.accountsHeader")} style={styles.sidebar} actions={<>
+      {!setupOnly && !hideNavigation ? <RelayTablePane title={translate("relay.accountsHeader")} style={styles.sidebar} actions={<>
         <NativeButton title={translate("relay.addAccount")} symbol="plus" toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} compact disabled={adding} onPress={beginAdding} style={styles.sidebarAddButton} />
         <NativeButton title={translate("relay.removeLocal")} symbol="minus" toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} destructive compact disabled={(!selected && !selectedStation) || adding} onPress={openLocalRemoval} style={styles.sidebarIconButton} />
       </>}>
@@ -1488,7 +1652,13 @@ export function RelayAccountManager({
               <View style={styles.signInWaiting}><Text style={styles.formHint}>{translate("relay.loginWorking")}</Text></View>
             </View>
           </View>
-          <View style={[styles.bottomBar, compactStyles.bottomBar, setupOnly && styles.setupBottomBar]}><Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.bottomStatus}>{feedback ?? translate("relay.loginWorking")}</Text></View>
+          <View style={[styles.bottomBar, compactStyles.bottomBar, setupOnly && styles.setupBottomBar]}>
+            <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.bottomStatus}>{feedback ?? translate("relay.loginWorking")}</Text>
+            {setupOnly ? <View style={[styles.bottomActions, styles.setupBottomActions]}>
+              <NativeButton title={translate("relay.back")} disabled={setupControlsBusy && !loginBusy} onPress={returnToStationStep} />
+              {onClose ? <NativeButton title={translate("menu.close")} onPress={onClose} /> : null}
+            </View> : null}
+          </View>
         </View> : <View style={styles.detailWorkspace}>
           <View style={[styles.detailContent, styles.fixedDetailPane, compactStyles.detailContent, setupOnly && styles.setupContent, setupControlsBusy && styles.loadingSurface]}>
             <View style={setupOnly ? styles.setupSurface : undefined}>
@@ -1497,10 +1667,12 @@ export function RelayAccountManager({
                 <Text style={styles.detailTitle}>{translate("relay.addAccount")}</Text>
               </View>
               <View style={[styles.formSection, setupOnly && styles.setupFormSection]}>
-                {stations.length > 0 ? <FormRow label={translate("relay.station")}><NativePicker labels={addStationPickerLabels} selectedValue={addStationPickerValue} disabled={setupControlsBusy} onChange={({ nativeEvent }) => selectAddStation(nativeEvent.index)} style={styles.typeSelector} /></FormRow> : null}
+                <FormRow label={translate("relay.stationChoice")}><NativeSegmentedControl labels={addStationModeLabels} selectedValue={addStationMode === "existing" ? translate("relay.stationExisting") : translate("relay.stationCustom")} disabled={setupControlsBusy} onChange={({ nativeEvent }) => selectAddStationMode(nativeEvent.index)} style={styles.stationModeSelector} /></FormRow>
+                {addStationMode === "existing" && selectedAddStation ? <FormRow label={translate("relay.station")}><NativePicker labels={stations.map((station) => stationPickerLabel(projectedStation(station), translate))} selectedValue={stationPickerLabel(projectedStation(selectedAddStation), translate)} disabled={setupControlsBusy} onChange={({ nativeEvent }) => selectAddStation(nativeEvent.index)} style={styles.typeSelector} /></FormRow> : null}
                 <FormRow label={translate("relay.origin")}><NativeTextField value={origin} placeholder={translate("relay.originPlaceholder")} editable={!setupControlsBusy && !selectedAddStation} accessibilityLabel={translate("relay.origin")} autoCapitalize="none" autoCorrect={false} onChangeText={updateAddOrigin} style={[styles.control, compactStyles.control]} /></FormRow>
                 <FormRow label={translate("relay.stationName")}><NativeTextField value={addStationName} placeholder={translate("relay.stationNamePlaceholder")} editable={!setupControlsBusy && !selectedAddStation} accessibilityLabel={translate("relay.stationName")} onChangeText={updateAddStationName} style={[styles.control, compactStyles.control]} /></FormRow>
                 <FormRow label={translate("relay.type")}><NativePicker labels={[relayTypeLabel("newapi", translate), relayTypeLabel("sub2api", translate)]} selectedValue={selectedAddType ? relayTypeLabel(selectedAddType, translate) : ""} disabled={setupControlsBusy || Boolean(selectedAddStation?.type)} onChange={({ nativeEvent }) => { setManualType(nativeEvent.index === 1 ? "sub2api" : "newapi"); }} style={styles.typeSelector} /></FormRow>
+                {passwordStorageAvailable ? <View style={styles.rememberPasswordRow}><NativeCheckbox label={translate("relay.rememberPassword")} value={rememberPassword} disabled={setupControlsBusy} onValueChange={setRememberPassword} /></View> : <Text style={styles.formHint}>{translate("relay.passwordNotSaved")}</Text>}
               </View>
             </View>
           </View>
@@ -1538,6 +1710,9 @@ export function RelayAccountManager({
                 <NativePicker labels={[relayTypeLabel("newapi", translate), relayTypeLabel("sub2api", translate)]} selectedValue={stationTypeDraft ? relayTypeLabel(stationTypeDraft, translate) : ""} disabled={controlsBusy} onChange={({ nativeEvent }) => { const nextType = nativeEvent.index === 1 ? "sub2api" : "newapi"; setStationDraft(selectedStation.id, { type: nextType }); void stageStationUpdate(selectedStation.id, { type: nextType }); }} style={[styles.stationSettingsControl, compactStyles.control]} />
               </View>
             </View>
+            {hideNavigation ? <View style={styles.embeddedAccountActions}>
+              <NativeButton title={translate("relay.removeLocal")} symbol="minus" destructive compact disabled={controlsBusy || !selectedStation} onPress={openLocalRemoval} />
+            </View> : null}
             {feedback ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.stationSettingsFeedback}>{feedback}</Text> : null}
           </View>
         </View> : !setupOnly && selected ? <View style={styles.detailWorkspace}>
@@ -1557,21 +1732,16 @@ export function RelayAccountManager({
               </View>
               <View style={styles.accountHeaderRight}>
                 {passwordStorageAvailable ? <NativeCheckbox label={translate("relay.rememberPassword")} value={selectedRememberPassword} disabled={controlsBusy} onValueChange={(next) => { void updateRememberPassword(next); }} style={styles.accountRememberPassword} /> : <Text style={styles.formHint}>{translate("relay.passwordNotSaved")}</Text>}
-                <View style={styles.accountHeaderMetric}>
-                  <Text style={styles.accountHeaderMetricLabel}>{translate("relay.balance")}:</Text>
-                  <Text accessibilityLabel={`${translate("relay.balance")}: ${balanceLabel(selected, translate)}`} selectable numberOfLines={1} style={styles.accountHeaderMetricValue}>{balanceLabel(selected, translate)}</Text>
+                <View style={styles.accountSessionSummary}>
+                  <View style={[styles.statusDot, selectedHeaderSignedIn ? styles.statusDotOnline : styles.statusDotLoading]} />
+                  <Text accessibilityLiveRegion="polite" accessibilityLabel={selectedHeaderValue} selectable={selectedHeaderShowsBalance} numberOfLines={1} style={[styles.accountSessionValue, !selectedHeaderShowsBalance && styles.loadingTip]}>{selectedHeaderValue}</Text>
+                  <NativeButton title={translate("common.refresh")} symbol="refresh" compact disabled={controlsBusy} toolTip={translate("common.refresh")} accessibilityLabel={translate("common.refresh")} onPress={() => { if (!isAccountLoading(selected.id)) void refreshLoginState(selected); }} style={styles.accountRefreshButton} />
                 </View>
-                {selected.pendingOperationCount > 0 ? <Text numberOfLines={1} style={styles.accountPendingOperations}>{translate("relay.pendingOperationsCount", { count: selected.pendingOperationCount })}</Text> : null}
-                <View style={styles.accountStatusSlot}>
-                  <View style={styles.statusLine}>
-                    <Text style={styles.accountHeaderMetricLabel}>{translate("common.status")}:</Text>
-                    <View style={[styles.statusDot, selectedStatusLoading ? styles.statusDotLoading : effectiveLoginStatus(selected) === "signed_in" ? styles.statusDotOnline : styles.statusDotExpired]} />
-                    <Text accessibilityLiveRegion="polite" numberOfLines={1} style={[styles.statusText, selectedStatusLoading && styles.loadingTip]}>{translate(selectedStatusLoading ? "relay.status.loading" : statusKey(effectiveLoginStatus(selected)))}</Text>
-                  </View>
-                </View>
-                <NativeButton title={translate("common.refresh")} symbol="refresh" compact disabled={controlsBusy} toolTip={translate("common.refresh")} accessibilityLabel={translate("common.refresh")} onPress={() => { if (!isAccountLoading(selected.id)) void refreshLoginState(selected); }} style={styles.accountRefreshButton} />
               </View>
             </View>
+            {hideNavigation ? <View style={styles.embeddedAccountActions}>
+              <NativeButton title={translate("relay.removeLocal")} symbol="minus" destructive compact disabled={controlsBusy || !selected} onPress={openLocalRemoval} />
+            </View> : null}
             <View style={[styles.resourcesSection, compactStyles.resourcesSection]}>
               <View style={styles.resourcePane}>
                 <View style={styles.resourceBody}>
@@ -1580,17 +1750,24 @@ export function RelayAccountManager({
                       <View style={[styles.resourceToolbar, compactStyles.resourceToolbar]}>
                         <View style={styles.resourceToolbarHeading}>
                           <Text style={styles.resourceToolbarTitle}>{translate("relay.apiKeysTitle")}</Text>
+                          <NativeCheckbox
+                            label={translate("relay.apiKeyAutoGrouping")}
+                            value={selected.autoGrouping}
+                            disabled={controlsBusy || !apiKeyActions?.setAutoGrouping}
+                            onValueChange={(enabled) => { void updateAutoGrouping(enabled); }}
+                            style={styles.resourceAutoGroupingCheckbox}
+                          />
                           <View style={styles.resourceToolbarCrud}>
-                            <NativeButton title={translate("relay.apiKeyCreate")} symbol="plus" compact disabled={controlsBusy || !apiKeyActions?.create} toolTip={translate("relay.apiKeyCreate")} accessibilityLabel={translate("relay.apiKeyCreate")} onPress={() => setApiKeyCreateOpen(true)} style={styles.resourceToolbarCrudButton} />
-                            <NativeButton title={translate("relay.apiKeyDelete")} symbol="minus" compact destructive disabled={controlsBusy || (!apiKeyActions?.remove && !apiKeyActions?.detach) || !selectedResource} toolTip={translate("relay.apiKeyDelete")} accessibilityLabel={selectedResource ? `${translate("relay.apiKeyDelete")}: ${resourceDisplayName(selectedResource)}` : translate("relay.apiKeyDelete")} onPress={() => { if (selectedResource) openRemoteKeyDelete(selected, selectedResource); }} style={styles.resourceToolbarCrudButton} />
+                            <NativeButton title={translate("relay.apiKeyCreate")} symbol="plus" compact disabled={controlsBusy || selected.autoGrouping || !apiKeyActions?.create} toolTip={translate("relay.apiKeyCreate")} accessibilityLabel={translate("relay.apiKeyCreate")} onPress={() => setApiKeyCreateOpen(true)} style={styles.resourceToolbarCrudButton} />
+                            <NativeButton title={translate("relay.apiKeyDelete")} symbol="minus" compact destructive disabled={controlsBusy || selected.autoGrouping || (!apiKeyActions?.remove && !apiKeyActions?.detach) || !selectedResource} toolTip={translate("relay.apiKeyDelete")} accessibilityLabel={selectedResource ? `${translate("relay.apiKeyDelete")}: ${resourceDisplayName(selectedResource)}` : translate("relay.apiKeyDelete")} onPress={() => { if (selectedResource) openRemoteKeyDelete(selected, selectedResource); }} style={styles.resourceToolbarCrudButton} />
                           </View>
                         </View>
                       </View>
-                      {feedback ? <Text accessibilityLiveRegion="polite" style={styles.resourcesFeedback}>{feedback}</Text> : null}
                       <NativeTable
                         columns={[{ label: translate("common.name"), width: 116 }, { label: translate("relay.apiKeyGroup"), width: 124 }, { label: translate("relay.apiKeyMultiplier"), width: 64 }]}
                         rows={resourceTableRows}
-                        selectedKey={selectedResourceID ?? ""}
+                        selectedKey={selectedResource?.id ?? ""}
+                        disabledRowKeys={resourceUnavailableRowKeys}
                         secondaryCellKeys={resourceSecondaryCellKeys}
                         compact
                         striped
@@ -1601,21 +1778,25 @@ export function RelayAccountManager({
                         style={styles.resourceNativeTable}
                       />
                     </View>
-                    <View style={styles.resourceInspectorPane}>{selectedResource ? <ResourceInspector
-                      account={selected}
-                      resource={selectedResource}
-                      signedIn={!selectedStatusLoading && effectiveLoginStatus(selected) === "signed_in"}
-                      disabled={controlsBusy}
-                      nameValue={resourceDisplayName(selectedResource)}
-                      resourceGroups={resourceGroups}
-                      selectedResourceGroupLabel={selectedResourceGroupLabel}
-                      onNameChange={(value) => setApiKeyNameDraft(selectedResource.id, value)}
-                      onNameCommit={() => runApiKeyAction("update", selectedResource.id)}
-                      onGroupChange={(groupID) => { void runApiKeyAction("setGroup", selectedResource.id, groupID); }}
-                      onEnabledChange={(enabled) => { void runApiKeyAction("setEnabled", selectedResource.id, enabled); }}
-                      onCopy={() => { void copyApiKey(selectedResource); }}
-                      translate={translate}
-                    /> : <View style={styles.resourceEmpty}><Text style={styles.resourceEmptyTitle}>{translate(selected.resourceError === "no_api_keys" && !selectedLoading.resources && !selectedLoading.session ? "relay.resourcesEmptyTitle" : "relay.resources")}</Text><Text style={styles.resourceEmptyText}>{selectedLoading.resources || selectedLoading.session ? translate("relay.resourcesChecking") : resourceHint(selected, translate)}</Text></View>}</View>
+                    <View style={styles.resourceInspectorPane}>
+                      {selectedResource ? <ResourceInspector
+                        account={selected}
+                        resource={selectedResource}
+                        signedIn={!selectedStatusLoading && effectiveLoginStatus(selected) === "signed_in"}
+                        disabled={controlsBusy}
+                        autoGrouping={selected.autoGrouping}
+                        groupUnavailable={selectedResourceGroupUnavailable}
+                        nameValue={resourceDisplayName(selectedResource)}
+                        resourceGroups={resourceGroups}
+                        selectedResourceGroupLabel={selectedResourceGroupLabel}
+                        onNameChange={(value) => setApiKeyNameDraft(selectedResource.id, value)}
+                        onNameCommit={() => runApiKeyAction("update", selectedResource.id)}
+                        onGroupChange={(groupID) => { void runApiKeyAction("setGroup", selectedResource.id, groupID); }}
+                        onEnabledChange={(enabled) => { void runApiKeyAction("setEnabled", selectedResource.id, enabled); }}
+                        onCopy={() => { void copyApiKey(selectedResource); }}
+                        translate={translate}
+                      /> : <View style={styles.resourceEmpty}><Text style={styles.resourceEmptyTitle}>{translate(selected.resourceError === "no_api_keys" && !selectedLoading.resources && !selectedLoading.session ? "relay.resourcesEmptyTitle" : "relay.resources")}</Text><Text style={styles.resourceEmptyText}>{selectedLoading.resources || selectedLoading.session ? translate("relay.resourcesChecking") : resourceHint(selected, translate)}</Text></View>}
+                    </View>
                   </View>
                 </View>
               </View>
@@ -1658,10 +1839,10 @@ const compactStyles = StyleSheet.create({
 const styles = StyleSheet.create({
   hidden: { display: "none" },
   workspace: { flex: 1, minHeight: 0, minWidth: 0, overflow: "hidden", backgroundColor: colors.window },
-  relayLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 },
+  relayLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP },
   setupDetail: { width: "100%" },
-  tablePane: { minWidth: 0, minHeight: 0, gap: 8 },
-  tableTitleRow: { height: 30, minHeight: 30, paddingHorizontal: 10, flexDirection: "row", alignItems: "center" },
+  tablePane: { minWidth: 0, minHeight: 0, gap: 0 },
+  tableTitleRow: { height: 38, minHeight: 38, paddingHorizontal: 10, flexDirection: "row", alignItems: "center" },
   tableTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   tableActions: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 6 },
   sidebar: { width: 200, minWidth: 200, maxWidth: 200, flexGrow: 0, flexShrink: 0 },
@@ -1702,6 +1883,7 @@ const styles = StyleSheet.create({
   stationSettingsLabel: { width: 72, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
   stationSettingsControl: { flex: 1, minWidth: 160, height: 26 },
   stationSettingsFeedback: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 17 },
+  embeddedAccountActions: { flexDirection: "row", justifyContent: "flex-end", gap: 6 },
   accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", alignItems: "center", columnGap: 6, backgroundColor: colors.window },
   accountBreadcrumb: { flex: 1, minWidth: 0, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 },
   accountBreadcrumbStation: { flexShrink: 1, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
@@ -1709,28 +1891,24 @@ const styles = StyleSheet.create({
   accountBreadcrumbSeparator: { flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18 },
   accountBreadcrumbAccount: { minWidth: 0, flexShrink: 1, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18 },
   accountHeaderRight: { marginLeft: "auto", marginRight: -4, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4 },
-  accountHeaderMetric: { flexShrink: 0, flexDirection: "row", alignItems: "baseline", gap: 3 },
-  accountHeaderMetricLabel: { flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18 },
-  accountHeaderMetricValue: { flexShrink: 0, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18, fontWeight: "500" },
-  accountPendingOperations: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18 },
   accountRememberPassword: { minWidth: 78, flexShrink: 0 },
-  accountStatusSlot: { width: 80, minWidth: 80, height: 22, flexShrink: 0, justifyContent: "center" },
+  accountSessionSummary: { flexShrink: 0, minHeight: 22, flexDirection: "row", alignItems: "center", gap: 5 },
+  accountSessionValue: { flexShrink: 0, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18, fontWeight: "500" },
   detailHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 },
   detailTitle: { flexShrink: 1, color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18, fontWeight: "600" },
   detailSubtitle: { flexShrink: 1, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 15 },
-  statusLine: { minHeight: 22, flexDirection: "row", alignItems: "center", gap: 5 },
-  statusText: { color: colors.secondary, fontSize: UI_FONT_SIZE },
   loadingTip: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18 },
   statusDot: { width: 7, height: 7, borderRadius: 4 },
   statusDotOnline: { backgroundColor: colors.success },
-  statusDotExpired: { backgroundColor: colors.warning },
   statusDotLoading: { backgroundColor: colors.secondary },
   accountRefreshButton: { width: 22, minWidth: 22, height: 22 },
   control: { width: "100%", minWidth: 0, height: 32 },
+  stationModeSelector: { width: "100%", minWidth: 0, maxWidth: 520, alignSelf: "stretch" },
   typeSelector: { width: "100%", minWidth: 0, maxWidth: 520, alignSelf: "stretch" },
   formSection: { width: "100%", maxWidth: 720, minWidth: 0, paddingVertical: 0, gap: 8, backgroundColor: colors.window },
   formRow: { width: "100%", minHeight: 34, flexDirection: "column", alignItems: "stretch", gap: 6 },
-  formLabel: { width: "100%", minWidth: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  rememberPasswordRow: { minHeight: 24, justifyContent: "center" },
+  formLabel: { width: "100%", minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   formValue: { width: "100%", minWidth: 0, minHeight: 30, justifyContent: "center", gap: 4 },
   formHint: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 17, paddingVertical: 5 },
   signInWaiting: { minHeight: 160, alignItems: "center", justifyContent: "center", paddingHorizontal: 20 },
@@ -1739,11 +1917,11 @@ const styles = StyleSheet.create({
   resourceToolbar: { minHeight: 32, paddingHorizontal: 12, paddingVertical: 3, flexDirection: "row", alignItems: "center", gap: 8 },
   resourceToolbarHeading: { flex: 1, minWidth: 110, flexDirection: "row", alignItems: "center", gap: 6 },
   resourceToolbarTitle: { color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  resourceAutoGroupingCheckbox: { flexShrink: 0 },
   resourceToolbarCrud: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 },
   resourceToolbarCrudButton: { width: 22, minWidth: 22, height: 22 },
-  resourcesFeedback: { paddingHorizontal: 12, paddingVertical: 4, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 18, backgroundColor: colors.window },
   resourceBody: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.window },
-  resourceColumns: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 },
+  resourceColumns: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP },
   resourceListPane: { flex: 1, minWidth: 0, minHeight: 0 },
   resourceNativeTable: { flex: 1, minWidth: 0, minHeight: 0 },
   relayDialogLayer: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 100 },
@@ -1792,7 +1970,7 @@ const styles = StyleSheet.create({
   resourceInspectorPane: { width: 266, minWidth: 244, maxWidth: 266, flexGrow: 0, flexShrink: 0, minHeight: 0 },
   resourceInspectorScroll: { flex: 1, minWidth: 0, backgroundColor: colors.window },
   resourceInspectorScrollIndicator: { position: "absolute", width: 0, height: 0 },
-  resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 6, paddingHorizontal: 12, paddingRight: 12, paddingBottom: 12, gap: 8 },
+  resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 6, paddingLeft: 0, paddingRight: 12, paddingBottom: 12, gap: 8 },
   resourceInspectorHeaderBlock: { minWidth: 0 },
   resourceInspectorHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
   resourceInspectorHeading: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "baseline", gap: 5 },
@@ -1827,9 +2005,6 @@ const styles = StyleSheet.create({
   pendingCleanupListContent: { paddingHorizontal: 18, paddingVertical: 8, gap: 6 },
   pendingCleanup: { minHeight: 30, flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 12 },
   pendingCleanupText: { flex: 1, flexBasis: 260, minWidth: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 16 },
-  pendingOperationBar: { minHeight: 30, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", alignItems: "center", gap: 8, borderBottomWidth: 1, borderBottomColor: colors.separator, backgroundColor: colors.panel },
-  pendingOperationTitle: { flexShrink: 0, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
-  pendingOperationText: { flex: 1, minWidth: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   loadingSurface: { opacity: 0.55 },
   empty: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 19, textAlign: "center" },
   blank: { flex: 1, minHeight: 240, alignItems: "center", justifyContent: "center", gap: 14, paddingHorizontal: 28, backgroundColor: colors.window },

@@ -298,6 +298,17 @@ def _trace_detail(raw: Mapping[str, Any]) -> str:
             ("reason", reason, ""),
         )
 
+    if event in {
+        "dsh_vision_router_fallback_start",
+        "dsh_vision_router_fallback_retry_start",
+        "dsh_vision_router_fallback_error",
+    }:
+        return _trace_detail_parts(
+            ("order", raw.get("target_order"), ""),
+            ("excluded", excluded, ""),
+            ("reason", reason, ""),
+        )
+
     if event == "fallback_deployment_cooldown_filter":
         return _trace_detail_parts(
             ("cooling", _trace_count(raw.get("cooldown_deployments")), ""),

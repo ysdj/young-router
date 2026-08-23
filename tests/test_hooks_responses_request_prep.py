@@ -105,6 +105,155 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "tools": [],
         }
 
+    def test_codex_tool_registry_instruction_lists_only_declared_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+
+        modified = hooks._with_codex_tool_registry_instruction(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        instructions = modified["instructions"]
+        self.assertIn(hooks._CODEX_TOOL_REGISTRY_MARKER, instructions)
+        self.assertIn("tools.list_agents", instructions)
+        self.assertIn("collaboration.list_agents", instructions)
+        self.assertIn("tools.web__run` is unavailable", instructions)
+        self.assertEqual(
+            original["instructions"],
+            "Keep the requested implementation complete and tested.",
+        )
+        self.assertIsNone(hooks._with_codex_tool_registry_instruction(modified))
+
+    def test_codex_external_web_search_bridge_is_advertised(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        bridge_tools = [
+            tool
+            for tool in modified["tools"]
+            if isinstance(tool, dict)
+            and tool.get("name") in {"web_search", "fetch_content"}
+        ]
+        self.assertEqual(
+            {tool["name"] for tool in bridge_tools},
+            {"web_search", "fetch_content"},
+        )
+        self.assertIn("query", next(tool for tool in bridge_tools if tool["name"] == "web_search")["parameters"]["properties"])
+        self.assertNotIn("private_web_search_bridge", {tool["name"] for tool in bridge_tools})
+        self.assertEqual(original["instructions"], modified["instructions"])
+        self.assertIsNone(
+            hooks._with_codex_external_web_search_bridge_tool(modified)
+        )
+
+    def test_codex_external_web_search_bridge_is_not_advertised_on_function_unsupported_route(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "supports_responses_function_tools": False,
+        }
+
+        self.assertIsNone(
+            hooks._with_codex_external_web_search_bridge_tool(original)
+        )
+
+    def test_codex_provider_native_search_does_not_add_pi_bridge_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["tools"] = [{"type": "openrouter:web_search"}]
+        original["model_info"] = {
+            "provider": "openrouter",
+            "upstream_url_surface": "openai/responses",
+        }
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNone(modified)
+        self.assertEqual(original["tools"], [{"type": "openrouter:web_search"}])
+
+    def test_codex_openrouter_search_capable_route_does_not_add_pi_bridge_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "provider": "openrouter",
+            "upstream_url_surface": "openai/responses",
+        }
+
+        self.assertIsNone(
+            hooks._with_codex_external_web_search_bridge_tool(original)
+        )
+
+    def test_codex_openrouter_explicit_search_unsupported_keeps_pi_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "provider": "openrouter",
+            "upstream_url_surface": "openai/responses",
+            "supports_responses_web_search": False,
+        }
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            {tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)},
+            {"web_search", "fetch_content"},
+        )
+
+    def test_codex_tool_registry_instruction_flattens_function_namespace(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        request["input"][0]["tools"].insert(
+            0,
+            {
+                "type": "namespace",
+                "name": "functions",
+                "tools": [
+                    {"type": "custom", "name": "exec"},
+                    {"type": "function", "name": "wait"},
+                ],
+            },
+        )
+
+        modified = hooks._with_codex_tool_registry_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        instructions = modified["instructions"]
+        self.assertIn("tools.exec", instructions)
+        self.assertIn("tools.wait", instructions)
+        self.assertIn("functions.exec", instructions)
+        self.assertIn("functions.wait", instructions)
+
+    def test_codex_tool_registry_instruction_ignores_non_codex_requests(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        request.pop("client_metadata")
+
+        self.assertIsNone(hooks._with_codex_tool_registry_instruction(request))
+
+    async def test_pre_call_injects_codex_tool_registry_instruction(self) -> None:
+        hooks, _ = load_hook_module()
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            self._codex_collaboration_request(),
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertIn(hooks._CODEX_TOOL_REGISTRY_MARKER, modified["instructions"])
+        self.assertNotIn("tools.web_search", modified["instructions"])
+        self.assertNotIn("tools.fetch_content", modified["instructions"])
+        self.assertNotIn("tools.private_web_search_bridge", modified["instructions"])
+        self.assertEqual(
+            {tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)},
+            {"collaboration", "web_search", "fetch_content"},
+        )
+
     def test_codex_descendant_cleanup_instruction_is_enabled_by_default(self) -> None:
         hooks, _ = load_hook_module()
         original = self._codex_collaboration_request()
@@ -273,7 +422,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "active_descendants",
         )
 
-    def test_codex_root_without_snapshot_must_list_before_completion(self) -> None:
+    def test_codex_root_without_descendant_history_keeps_requested_choice(self) -> None:
         hooks, _ = load_hook_module()
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
@@ -283,10 +432,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(
-            modified["tool_choice"],
-            {"type": "function", "name": "list_agents"},
-        )
+        self.assertEqual(modified["tool_choice"], "auto")
         self.assertEqual(
             modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
             "snapshot_missing",
@@ -319,7 +465,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             {"state": "snapshot_missing", "tool_call_required": True},
         )
 
-    def test_codex_root_missing_snapshot_narrows_existing_required_choice(self) -> None:
+    def test_codex_root_missing_snapshot_preserves_existing_required_choice(self) -> None:
         hooks, _ = load_hook_module()
         request = self._as_root_collaboration_request(
             self._codex_collaboration_request()
@@ -330,10 +476,26 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        self.assertEqual(
-            modified["tool_choice"],
+        self.assertEqual(modified["tool_choice"], "required")
+
+    def test_codex_tool_registry_instruction_survives_promoted_top_level_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._codex_collaboration_request()
+        request["input"] = [{"role": "user", "content": "Implement the change."}]
+        request["tools"] = [
+            {"type": "function", "name": "exec"},
+            {"type": "function", "name": "wait"},
             {"type": "function", "name": "list_agents"},
-        )
+        ]
+
+        modified = hooks._with_codex_tool_registry_instruction(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        instructions = modified["instructions"]
+        self.assertIn("tools.exec", instructions)
+        self.assertIn("tools.list_agents", instructions)
+        self.assertIn("tools.web__run` is unavailable", instructions)
 
     def test_codex_root_clean_snapshot_allows_tool_free_completion(self) -> None:
         hooks, _ = load_hook_module()
@@ -784,7 +946,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(modified["input"][-1], original["input"][-1])
         self.assertEqual(
             [tool["name"] for tool in modified["tools"]],
-            ["exec", "wait", "request_user_input"],
+            ["web_search", "fetch_content", "exec", "wait", "request_user_input"],
         )
         self.assertNotIn("additional_tools", json.dumps(modified["input"]))
 
@@ -978,6 +1140,128 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIn("/tmp/mutable.png", mutable_parts[0]["text"])
         self.assertEqual(mutable_parts[1], mutable_output["output"][0])
 
+    def test_codex_view_image_reopen_marks_repeated_path_as_original(self) -> None:
+        hooks, _ = load_hook_module()
+        path = "/tmp/original.png"
+        previous_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-first",
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        f"{hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
+                        f"Inline images below are reduced previews.\n1. {path}"
+                    ),
+                }
+            ],
+        }
+        current_call = {
+            "type": "custom_tool_call",
+            "call_id": "call-reopen",
+            "name": "exec",
+            "input": f'await tools.view_image({{path:"{path}", detail:"high"}});',
+        }
+        current_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-reopen",
+            "output": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,abc",
+                }
+            ],
+        }
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [previous_output, current_call, current_output],
+        }
+
+        modified = hooks._with_codex_view_image_output_paths(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        text = modified["input"][2]["output"][0]["text"]
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER, text)
+
+    def test_codex_view_image_original_detail_is_explicit(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertTrue(
+            hooks._codex_view_image_call_requests_original(
+                {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": 'await tools.view_image({path:"/tmp/a.png", detail:"original"});',
+                }
+            )
+        )
+        self.assertFalse(
+            hooks._codex_view_image_call_requests_original(
+                {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": 'await tools.view_image({path:"/tmp/a.png", detail:"high"});',
+                }
+            )
+        )
+
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-original",
+                    "name": "exec",
+                    "input": (
+                        'await tools.view_image({path:"/tmp/a.png", '
+                        'detail:"original"});'
+                    ),
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-original",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,abc",
+                        }
+                    ],
+                },
+            ],
+        }
+        modified = hooks._with_codex_view_image_output_paths(request)
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertIn(
+            hooks._CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER,
+            modified["input"][1]["output"][0]["text"],
+        )
+
+    def test_codex_view_image_preview_target_scales_between_128_and_320_kb(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertEqual(
+            hooks._codex_view_image_preview_target(1),
+            hooks._CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES,
+        )
+        self.assertEqual(hooks._codex_view_image_preview_target(8), 300_000)
+        self.assertEqual(hooks._codex_view_image_preview_target(12), 200_000)
+        self.assertEqual(
+            hooks._codex_view_image_preview_target(19),
+            hooks._CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+        )
+        self.assertGreaterEqual(
+            hooks._codex_view_image_preview_target(100),
+            hooks._CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+        )
+
     async def test_pre_call_view_image_output_uses_path_backed_preview_budget(self) -> None:
         import base64
         import io
@@ -1032,7 +1316,195 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._image_data_url_size(output[1]["image_url"]),
             hooks._CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES,
         )
+        self.assertGreater(
+            hooks._image_data_url_size(output[1]["image_url"]),
+            16_384,
+        )
         self.assertEqual(original["input"][1]["output"][0]["image_url"], original_url)
+
+    async def test_pre_call_explicit_reopen_preserves_original_resolution(self) -> None:
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        hooks, _ = load_hook_module()
+        path = "/Users/example/project/qa/original.png"
+        image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        original_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        previous_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-first",
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        f"{hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
+                        f"Inline images below are reduced previews.\n1. {path}"
+                    ),
+                }
+            ],
+        }
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                previous_output,
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-reopen",
+                    "name": "exec",
+                    "input": (
+                        "const original = await tools.view_image({path:"
+                        f'"{path}", detail:"original"}}); '
+                        "image(original.image_url);"
+                    ),
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-reopen",
+                    "output": [
+                        {"type": "input_image", "image_url": original_url},
+                    ],
+                },
+            ],
+        }
+
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        output = modified["input"][2]["output"]
+        self.assertIn(
+            hooks._CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER,
+            output[0]["text"],
+        )
+        self.assertEqual(output[1]["image_url"], original_url)
+
+    async def test_iterative_original_image_becomes_immutable_after_encrypted_boundary(self) -> None:
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        hooks, _ = load_hook_module()
+        path = "/Users/example/project/qa/iterative-original.png"
+        image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        original_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        first_request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-first",
+                    "name": "exec",
+                    "input": (
+                        "const preview = await tools.view_image({path:"
+                        f'"{path}", detail:"high"}}); '
+                        "image(preview.image_url);"
+                    ),
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-first",
+                    "output": [
+                        {"type": "input_image", "image_url": original_url},
+                    ],
+                },
+            ],
+        }
+        first = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            first_request,
+            call_type="aresponses",
+        )
+        self.assertIsNotNone(first)
+        assert first is not None
+        first_preview = first["input"][1]["output"][1]["image_url"]
+        self.assertLessEqual(
+            hooks._image_data_url_size(first_preview),
+            hooks._CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES,
+        )
+        second_request = {
+            **first,
+            "input": [
+                *first["input"],
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-original",
+                    "name": "exec",
+                    "input": (
+                        "const original = await tools.view_image({path:"
+                        f'"{path}", detail:"original"}}); '
+                        "image(original.image_url);"
+                    ),
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-original",
+                    "output": [
+                        {"type": "input_image", "image_url": original_url},
+                    ],
+                },
+            ],
+        }
+        second = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            second_request,
+            call_type="aresponses",
+        )
+        self.assertIsNotNone(second)
+        assert second is not None
+        second_output = next(
+            item
+            for item in second["input"]
+            if item.get("call_id") == "call-original"
+            and item.get("type") == "custom_tool_call_output"
+        )
+        self.assertEqual(second_output["output"][1]["image_url"], original_url)
+
+        third_request = {
+            **second,
+            "input": [
+                *second["input"],
+                {"type": "reasoning", "encrypted_content": "opaque-history"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue."}],
+                },
+            ],
+        }
+        third = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            third_request,
+            call_type="aresponses",
+        )
+        third_input = third["input"] if third is not None else third_request["input"]
+        third_output = next(
+            item
+            for item in third_input
+            if item.get("call_id") == "call-original"
+            and item.get("type") == "custom_tool_call_output"
+        )
+        self.assertEqual(third_output["output"][1]["image_url"], original_url)
 
     async def test_pre_call_does_not_inject_truncation_for_oversized_signed_image_history(self) -> None:
         import base64
@@ -1132,7 +1604,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         assert modified is not None
         self.assertEqual(
             [tool["name"] for tool in modified["tools"]],
-            ["exec", "wait", "request_user_input"],
+            ["web_search", "fetch_content", "exec", "wait", "request_user_input"],
         )
         self.assertNotIn("additional_tools", json.dumps(modified["input"]))
         self.assertEqual(modified["input"][-1], original["input"][-1])

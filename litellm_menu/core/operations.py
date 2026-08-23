@@ -51,9 +51,24 @@ MACOS_DEFAULT_WORKERS = "16"
 PROXY_STOP_GRACE_SECONDS = 2.0
 SERVICE_STATUS_CACHE_SECONDS = 10.0
 _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
-    {"LITELLM_MENU_CODEX_DESCENDANT_CLEANUP"}
+    {
+        "LITELLM_MENU_CODEX_DESCENDANT_CLEANUP",
+        "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
+    }
 )
 _PI_WEB_ACCESS_CONFIG_KEY = "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
+_DSH_VISION_ROUTER_CONFIG_KEY = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+_DSH_VISION_ROUTER_QUICK_KEYS = {
+    "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED": "enabled",
+    "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND": "backend",
+    "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK": "freeFallback",
+    "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS": "timeoutSeconds",
+    "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS": "maxTokens",
+}
+_DSH_VISION_ROUTER_LOCAL_QUICK_KEYS = {
+    "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED": "localOllama",
+    "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED": "localLmStudio",
+}
 
 
 @dataclass(frozen=True)
@@ -412,13 +427,44 @@ class CoreServiceController:
     def _runtime_env(self, *, strict: bool = True) -> dict[str, str]:
         env = os.environ.copy()
         env.update(self._environment)
-        # This optional credential is file-owned: clearing it in Runtime
-        # Settings must override an inherited host environment.
-        env.pop("LITELLM_MENU_VISION_BRIDGE_API_KEY", None)
+        # Subscription-login credentials remain in the Core-owned private
+        # vault. Only the managed proxy child receives the resolved values;
+        # config.yaml contains opaque environment references.
+        from .provider_auth import ProviderAuthManager
+
+        env.update(ProviderAuthManager(self.paths.root).environment())
+        # The old vision-bridge settings were replaced by the single
+        # dsh-vision-router JSON document. Do not let retired host variables
+        # leak into the proxy process.
+        for key in (
+            "LITELLM_MENU_VISION_BRIDGE_BACKEND",
+            "LITELLM_MENU_VISION_BRIDGE_API_BASE",
+            "LITELLM_MENU_VISION_BRIDGE_API_KEY",
+            "LITELLM_MENU_VISION_BRIDGE_MODEL",
+            "LITELLM_MENU_VISION_BRIDGE_TIMEOUT_SECONDS",
+            "LITELLM_MENU_VISION_BRIDGE_PROMPT",
+            "LITELLM_MENU_VISION_BRIDGE_LOCAL_FORMAT",
+        ):
+            env.pop(key, None)
         # pi-web-access configuration is also file-owned. Do not forward raw
         # JSON settings from a host environment into every proxy worker.
         env.pop(_PI_WEB_ACCESS_CONFIG_KEY, None)
         env.pop("LITELLM_MENU_WEB_SEARCH_CONFIG_JSON", None)
+        # dsh-vision-router settings are file-owned as well.  A stale host
+        # environment value must not activate or reconfigure the fallback
+        # when Runtime Settings has no persisted value for this key.
+        for key in (
+            "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
+            "LITELLM_MENU_VISION_ROUTER_CONFIG_JSON",
+            "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED",
+            "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND",
+            "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK",
+            "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
+            "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS",
+            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
+            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
+        ):
+            env.pop(key, None)
         configured = self._configured_runtime_values(strict=strict)
         pi_web_access_config = configured.pop(_PI_WEB_ACCESS_CONFIG_KEY, "{}")
         try:
@@ -431,6 +477,46 @@ class CoreServiceController:
             if strict:
                 raise RuntimeError("Runtime settings are invalid")
             pi_web_access_payload = {}
+        dsh_quick_values: dict[str, str] = {}
+        for key in (*_DSH_VISION_ROUTER_QUICK_KEYS, *_DSH_VISION_ROUTER_LOCAL_QUICK_KEYS):
+            raw = configured.pop(key, None)
+            if raw not in {None, "", "inherit"}:
+                dsh_quick_values[key] = raw
+        if dsh_quick_values:
+            try:
+                dsh_payload = json.loads(configured.get(_DSH_VISION_ROUTER_CONFIG_KEY, "{}"))
+            except (TypeError, ValueError):
+                if strict:
+                    raise RuntimeError("Runtime settings are invalid") from None
+                dsh_payload = {}
+            if not isinstance(dsh_payload, dict):
+                if strict:
+                    raise RuntimeError("Runtime settings are invalid")
+                dsh_payload = {}
+            for key, json_key in _DSH_VISION_ROUTER_QUICK_KEYS.items():
+                if key not in dsh_quick_values:
+                    continue
+                raw = dsh_quick_values[key]
+                if json_key in {"enabled", "freeFallback"}:
+                    dsh_payload[json_key] = raw == "on"
+                elif json_key in {"timeoutSeconds", "maxTokens"}:
+                    dsh_payload[json_key] = int(raw)
+                else:
+                    dsh_payload[json_key] = raw
+            for key, json_key in _DSH_VISION_ROUTER_LOCAL_QUICK_KEYS.items():
+                if key not in dsh_quick_values:
+                    continue
+                local = dsh_payload.get(json_key)
+                if not isinstance(local, dict):
+                    local = {}
+                local["enabled"] = dsh_quick_values[key] == "on"
+                dsh_payload[json_key] = local
+            configured[_DSH_VISION_ROUTER_CONFIG_KEY] = json.dumps(
+                dsh_payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
         if strict:
             try:
                 web_search_config = self.paths.root / "web-search.json"

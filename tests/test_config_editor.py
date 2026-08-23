@@ -354,6 +354,82 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertEqual("relay", reloaded["provider_type"])
         self.assertEqual("station-example", reloaded["relay_station_id"])
 
+    def test_login_auth_metadata_and_chatgpt_adapter_round_trip_without_api_key(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              openai-account:
+                x-litellm-menu-provider-auth:
+                  kind: openai_login
+                  credential_ref: provider-auth-example
+            model_list:
+              - model_name: gpt-5.4
+                litellm_params:
+                  model: chatgpt/gpt-5.4
+                  order: 1
+                model_info:
+                  id: "00000003"
+                  provider: openai-account
+                  upstream_url_surface: openai/responses
+                  upstream_protocol_mode: fixed
+            """
+        )
+
+        payload = config_load.load_config(path)
+        provider = payload["providers"][0]
+        self.assertEqual("openai_login", provider["auth_kind"])
+        self.assertEqual("provider-auth-example", provider["auth_credential_ref"])
+        self.assertEqual([], provider["api_keys"])
+        self.assertEqual("chatgpt/gpt-5.4", provider["models"][0]["litellm_model"])
+
+        config_api.save_config(payload["providers"], path)
+
+        saved = config_schema._load_yaml(path)
+        self.assertNotIn("api_keys", saved["providers"]["openai-account"])
+        self.assertEqual(
+            {"kind": "openai_login", "credential_ref": "provider-auth-example"},
+            saved["providers"]["openai-account"]["x-litellm-menu-provider-auth"],
+        )
+        self.assertEqual(
+            "chatgpt/gpt-5.4",
+            saved["model_list"][0]["litellm_params"]["model"],
+        )
+
+    def test_claude_login_round_trip_uses_only_environment_reference(self) -> None:
+        path = self.write_config(
+            """
+            providers:
+              claude-account:
+                api_keys:
+                  - name: claude-oauth
+                    value: os.environ/LITELLM_MENU_AUTH_EXAMPLE
+                x-litellm-menu-provider-auth:
+                  kind: claude_login
+                  credential_ref: provider-auth-claude
+            model_list:
+              - model_name: claude-sonnet
+                litellm_params:
+                  model: anthropic/claude-sonnet-4-5
+                  api_key: os.environ/LITELLM_MENU_AUTH_EXAMPLE
+                  order: 1
+                model_info:
+                  id: "00000004"
+                  provider: claude-account
+                  api_key_name: claude-oauth
+                  upstream_url_surface: anthropic
+                  upstream_protocol_mode: fixed
+            """
+        )
+
+        payload = config_load.load_config(path)
+        provider = payload["providers"][0]
+        self.assertEqual("claude_login", provider["auth_kind"])
+        config_api.save_config(payload["providers"], path)
+        source = path.read_text(encoding="utf-8")
+
+        self.assertIn("os.environ/LITELLM_MENU_AUTH_EXAMPLE", source)
+        self.assertNotIn("sk-ant-oat", source)
+
     def test_save_round_trip_keeps_multiple_providers_nested(self) -> None:
         path = self.write_config(
             """

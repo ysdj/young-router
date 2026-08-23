@@ -30,6 +30,7 @@ from .base import (
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
     _RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY,
     _RESPONSES_IMAGE_INPUT_SUPPORT_KEY,
+    _DSH_VISION_ROUTER_ATTEMPTED_METADATA_KEY,
     _ROUTE_TRACE_LIST_SCAN_ITEMS,
     _ROUTE_TRACE_LOGGER,
     _ROUTE_TRACE_PREVIEW_CHARS_ENV,
@@ -773,7 +774,7 @@ def _trace_tools_summary(request_kwargs: Optional[dict]) -> dict[str, Any]:
         "has_web_search_tool": _tools_module._request_has_web_search_tool(
             effective_request
         ),
-        "has_litellm_web_search_bridge": _tools_module._request_has_litellm_web_search_bridge(
+        "has_pi_web_access_tool": _tools_module._request_has_pi_web_access_tool(
             effective_request
         ),
         "has_image_generation_tool": _tools_module._request_has_image_generation_tool(
@@ -812,6 +813,7 @@ def _trace_metadata_flags(request_kwargs: Optional[dict]) -> dict[str, Any]:
         _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY,
         "responses_chat_bridge_preemptive_reason",
         _RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY,
+        _DSH_VISION_ROUTER_ATTEMPTED_METADATA_KEY,
     )
     flags: dict[str, Any] = {}
     for metadata_key in ("litellm_metadata", "metadata"):
@@ -1079,7 +1081,7 @@ def _trace_tool_call_summary(
 
     visit(payload)
     if request_kwargs is not None:
-        for call in _responses_web_search_bridge_module._litellm_web_search_function_calls(response):
+        for call in _responses_web_search_bridge_module._web_search_function_calls(response):
             add(call)
 
     types: list[str] = []
@@ -1108,7 +1110,7 @@ def _trace_response_summary(
         "tool_calls": _trace_tool_call_summary(response, request_kwargs),
     }
     if request_kwargs is not None:
-        actions = _responses_web_search_bridge_module._litellm_web_search_actions_for_request(response, request_kwargs)
+        actions = _responses_web_search_bridge_module._web_search_actions_for_request(response, request_kwargs)
         if actions:
             summary["web_search_actions"] = actions
     return summary

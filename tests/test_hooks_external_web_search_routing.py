@@ -11,10 +11,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         hooks, _ = load_hook_module()
 
         self.assertEqual(
-            hooks._litellm_web_search_action_from_call(
+            hooks._web_search_action_from_call(
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": "openPage: https://example.test/articles/fulltext",
                 }
             ),
@@ -24,10 +24,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             },
         )
         self.assertEqual(
-            hooks._litellm_web_search_action_from_call(
+            hooks._web_search_action_from_call(
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps(
                         {
                             "query": "openPage: https://example.test/articles/secondary",
@@ -45,10 +45,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         hooks, _ = load_hook_module()
 
         self.assertEqual(
-            hooks._litellm_web_search_action_from_call(
+            hooks._web_search_action_from_call(
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps(
                         {"url": "https://example.test/article"}
                     ),
@@ -57,10 +57,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             {"type": "openPage", "url": "https://example.test/article"},
         )
         self.assertEqual(
-            hooks._litellm_web_search_action_from_call(
+            hooks._web_search_action_from_call(
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps(
                         {"url": "https://example.test/article", "pattern": "factor A"}
                     ),
@@ -77,10 +77,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         hooks, _ = load_hook_module()
 
         self.assertEqual(
-            hooks._litellm_web_search_action_from_call(
+            hooks._web_search_action_from_call(
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps(
                         {"query": "https://example.test/weather"}
                     ),
@@ -89,10 +89,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             {"type": "openPage", "url": "https://example.test/weather"},
         )
         self.assertEqual(
-            hooks._litellm_web_search_action_from_call(
+            hooks._web_search_action_from_call(
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps(
                         {
                             "query": "https://example.test/weather",
@@ -112,10 +112,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         hooks, _ = load_hook_module()
 
         self.assertEqual(
-            hooks._litellm_web_search_action_from_call(
+            hooks._web_search_action_from_call(
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps(
                         {
                             "query": (
@@ -136,10 +136,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
     def test_external_web_search_structured_query_keeps_model_selected_result_page(self) -> None:
         hooks, _ = load_hook_module()
 
-        action = hooks._litellm_web_search_action_from_call(
+        action = hooks._web_search_action_from_call(
             {
                 "type": "function_call",
-                "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                "name": "web_search",
                 "arguments": json.dumps(
                     {"query": "平顶山今天天气", "page": 2}
                 ),
@@ -166,10 +166,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         hooks, _ = load_hook_module()
 
         self.assertIsNone(
-            hooks._litellm_web_search_action_from_call(
+            hooks._web_search_action_from_call(
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": '{"url": "https://example.test'}),
                 }
             )
@@ -266,7 +266,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             "input": "Use web_search for Sample City weather.",
             "stream": False,
             "tools": [
-                {"type": "function", "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME}
+                {"type": "function", "name": "web_search"}
             ],
             "litellm_metadata": {
                 hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
@@ -331,7 +331,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             "input": "Use web_search for Sample City weather. Answer briefly with source URLs.",
             "stream": False,
             "tools": [
-                {"type": "function", "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME}
+                {"type": "function", "name": "web_search"}
             ],
             "litellm_metadata": {
                 hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
@@ -390,7 +390,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             "input": "Use web_search for sample subject Signal. Answer briefly with source URLs.",
             "stream": True,
             "tools": [
-                {"type": "function", "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME}
+                {"type": "function", "name": "web_search"}
             ],
             "litellm_metadata": {
                 hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
@@ -446,7 +446,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             "input": "Use web_search for Sample City weather.",
             "stream": False,
             "tools": [
-                {"type": "function", "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME}
+                {"type": "function", "name": "web_search"}
             ],
             "litellm_metadata": {
                 hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
@@ -635,10 +635,10 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
 
         self.assertTrue(hooks._response_is_async_iterable(response))
         self.assertEqual(len(calls), 1)
-        self.assertEqual([tool.get("type") for tool in calls[0]["tools"]], ["function", "function"])
+        self.assertEqual([tool.get("type") for tool in calls[0]["tools"]], ["function", "function", "function"])
         self.assertEqual(
             calls[0]["tools"][0]["name"],
-            hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+            "web_search",
         )
 
         chunks = []
@@ -659,7 +659,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_empty_search",
                     "call_id": "call_empty_search",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": "{}",
                     "status": "completed",
                 },
@@ -697,7 +697,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             "tools": [
                 {
                     "type": "function",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "parameters": {"type": "object"},
                 }
             ],
@@ -810,6 +810,94 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         assert bridge_kwargs is not None
         self.assertTrue(bridge_kwargs["litellm_metadata"][hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY])
 
+    def test_native_web_search_schema_error_is_classified_for_bridge_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+
+        class ProviderBadRequest(Exception):
+            status_code = 400
+
+        exception = ProviderBadRequest(
+            'OpenAIException - {"error":{"message":"tools.0.input_schema 类型错误"}}'
+        )
+        self.assertFalse(hooks._is_native_responses_web_search_unsupported_error(exception))
+
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "deepseek-v4-pro",
+            "input": "Search the web.",
+            "stream": True,
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "auto",
+            "model_info": {
+                "id": "deepseek-chat-surface",
+                "upstream_url_surface": "openai/chat",
+                "supports_responses_function_tools": True,
+            },
+        }
+        bridge_kwargs = hooks._with_responses_external_web_search_bridge_after_native_error(
+            exception, request_kwargs
+        )
+        self.assertIsNotNone(bridge_kwargs)
+        assert bridge_kwargs is not None
+        self.assertTrue(bridge_kwargs.get("use_chat_completions_api"))
+        self.assertEqual(
+            [tool.get("type") for tool in bridge_kwargs.get("tools", [])],
+            ["function", "function"],
+        )
+        self.assertEqual(
+            [tool.get("name") for tool in bridge_kwargs.get("tools", [])],
+            ["web_search", "fetch_content"],
+        )
+        self.assertNotIn("web_search_options", bridge_kwargs)
+        self.assertTrue(
+            bridge_kwargs["litellm_metadata"]["external_web_search_native_error_fallback"]
+        )
+
+    async def test_native_web_search_chat_bridge_dispatch_preserves_stream_completion(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def chat_stream():
+            yield {"choices": [{"delta": {"content": "OK"}}]}
+
+        async def original_function(**kwargs):
+            calls.append(kwargs)
+            return chat_stream()
+
+        bridge_kwargs = {
+            "call_type": "aresponses",
+            "model": "deepseek-v4-pro",
+            "input": "Search the web.",
+            "stream": True,
+            "tools": [
+                {"type": "function", "name": "web_search", "parameters": {"type": "object"}},
+                {"type": "function", "name": "fetch_content", "parameters": {"type": "object"}},
+            ],
+            "use_chat_completions_api": True,
+            "litellm_metadata": {
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
+                "external_web_search_native_error_fallback": True,
+            },
+            "model_info": {
+                "id": "deepseek-chat-surface",
+                "upstream_url_surface": "openai/chat",
+            },
+        }
+        response = await hooks._execute_responses_native_web_search_bridge_call(
+            original_function,
+            bridge_kwargs,
+            original_request_kwargs=bridge_kwargs,
+            outer_request_kwargs=bridge_kwargs,
+        )
+        chunks = [chunk async for chunk in response]
+        self.assertTrue(
+            any(
+                isinstance(chunk, dict) and chunk.get("type") == "response.completed"
+                for chunk in chunks
+            )
+        )
+
     async def test_external_web_search_unknown_native_support_falls_back_after_tool_error(self) -> None:
         hooks, _ = load_hook_module()
         calls = []
@@ -866,8 +954,8 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         self.assertEqual(chunks[0]["delta"], "OK")
         self.assertEqual(len(calls), 2)
         self.assertEqual([tool.get("type") for tool in calls[0]["tools"]], ["web_search"])
-        self.assertEqual([tool.get("type") for tool in calls[1]["tools"]], ["function"])
-        self.assertEqual(calls[1]["tools"][0]["name"], hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME)
+        self.assertEqual([tool.get("type") for tool in calls[1]["tools"]], ["function", "function"])
+        self.assertEqual(calls[1]["tools"][0]["name"], "web_search")
         self.assertTrue(calls[1]["litellm_metadata"][hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY])
         self.assertTrue(calls[1]["litellm_metadata"]["external_web_search_native_error_fallback"])
 
@@ -1245,7 +1333,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
                 f"Original user request:\n{expected}\n\n"
                 "Web actions completed so far:\n- trial comparison\n\n"
                 "Retrieved evidence observed so far:\nEvidence from a previous round.\n\n"
-                "Decide the next step now: call the web search bridge function.\n\n"
+                "Decide the next step now using the available lookup functions.\n\n"
                 "Retrieved evidence:\nEvidence from synthesis.\n\n"
                 "Now answer the original user request directly. Do not call tools."
             )
@@ -1294,7 +1382,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         self.assertNotEqual(continuation_kwargs["model"], "openai/vendor-chat")
         self.assertEqual(
             [tool.get("name") for tool in continuation_kwargs["tools"]],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search", "fetch_content"],
         )
         continuation_surface = json.dumps(
             {
@@ -1304,7 +1392,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
             }
         )
         self.assertIn("url", continuation_surface)
-        self.assertIn("pattern", continuation_surface)
+        self.assertIn("fetch_content", continuation_surface)
         self.assertNotIn("custom_tools", continuation_kwargs)
         self.assertNotIn("functions", continuation_kwargs)
         self.assertNotIn("mcp_servers", continuation_kwargs)

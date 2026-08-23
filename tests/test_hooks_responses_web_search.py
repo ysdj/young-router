@@ -4,6 +4,23 @@ from hook_test_utils import *
 
 
 class HookResponsesWebSearchBridgeTests(HookTestCase):
+    def test_hidden_search_adapter_preserves_terminal_responses_failure(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "model": "deepseek-v4-pro",
+            "input": "Search.",
+            "stream": True,
+            "tools": [{"type": "web_search"}],
+        }
+        error = RuntimeError("unsupported web search schema")
+        failed = hooks._failed_responses_stream_response(request, error)
+
+        self.assertIs(
+            hooks._adapt_provider_hidden_web_search_stream(failed, request),
+            failed,
+        )
+
     def test_external_search_response_marks_final_answer_phase(self) -> None:
         hooks, _ = load_hook_module()
         response = hooks._external_web_search_message_response(
@@ -720,7 +737,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                                             "id": "call_search",
                                             "type": "function",
                                             "function": {
-                                                "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                                                "name": "web_search",
                                                 "arguments": json.dumps(
                                                     {
                                                         "query": (
@@ -812,7 +829,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             )
         self.assertEqual(
             chat_calls[0]["tools"][0]["function"]["name"],
-            hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+            "web_search",
         )
         self.assertEqual(chat_calls[1]["stream"], False)
         self.assertEqual(
@@ -1163,14 +1180,11 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         self.assertNotIn("use_chat_completions_api", calls[0])
         self.assertIn(
             calls[0]["tool_choice"],
-            (
-                hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
-                {"type": "function", "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME},
-            ),
+            ("auto",),
         )
         self.assertEqual(
             [tool.get("name") for tool in calls[0]["tools"]],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search", "fetch_content"],
         )
         metadata = calls[0]["litellm_metadata"]
         self.assertTrue(metadata[hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY])
@@ -1181,7 +1195,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
         stats = metadata["responses_external_web_search_tool_sanitized"]
         self.assertEqual(stats["bridged_web_search_tools"], 1)
-        self.assertEqual(stats["kept_tool_names"], [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME])
+        self.assertEqual(stats["kept_tool_names"], ["web_search", "fetch_content"])
 
     async def test_plain_responses_404_is_not_deployment_failover_error(self) -> None:
         hooks, _ = load_hook_module()
@@ -1411,3 +1425,110 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         self.assertEqual([tool["name"] for tool in calls[1]["tools"]], ["spawn_agent"])
         stats = calls[1]["litellm_metadata"]["responses_chat_bridge_tool_sanitized"]
         self.assertEqual(stats["bridged_tool_search_output_tools"], 1)
+
+    async def test_openrouter_native_web_search_declaration_is_passed_through(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"id": "resp_openrouter", "status": "completed"}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        native_tool = {"type": "web_search", "search_context_size": "high"}
+        await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="x-ai/grok-4",
+            input="What is today's news?",
+            tools=[native_tool],
+            tool_choice={"type": "web_search"},
+            api_base="https://openrouter.ai/api/v1",
+            model_info={
+                "provider": "openrouter",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tools"], [native_tool])
+        self.assertEqual(calls[0]["tool_choice"], {"type": "web_search"})
+        self.assertNotIn("external_web_search_bridge", calls[0].get("litellm_metadata", {}))
+
+    async def test_openrouter_request_without_search_tool_is_not_augmented(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"id": "resp_openrouter_no_search", "status": "completed"}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="x-ai/grok-4",
+            input="Please answer briefly.",
+            api_base="https://openrouter.ai/api/v1",
+            model_info={
+                "provider": "openrouter",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("tools", calls[0])
+        self.assertEqual(calls[0]["input"], "Please answer briefly.")
+        self.assertNotIn("openrouter:web_search", json.dumps(calls[0]))
+        self.assertNotIn("search the web", json.dumps(calls[0]).lower())
+
+    async def test_openrouter_native_web_search_is_kept_on_chat_surface(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"id": "resp_openrouter", "status": "completed", "output_text": "ok"}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="x-ai/grok-4",
+            input="Search if needed.",
+            stream=True,
+            use_chat_completions_api=True,
+            tools=[{"type": "openrouter:web_search"}],
+            api_base="https://openrouter.ai/api/v1",
+            model_info={
+                "provider": "openrouter",
+                "upstream_url_surface": "openai/chat",
+            },
+        )
+
+        self.assertEqual(response["output_text"], "ok")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].get("use_chat_completions_api"))
+        self.assertEqual(calls[0]["tools"], [{"type": "openrouter:web_search"}])
+        self.assertNotIn("external_web_search_bridge", calls[0].get("litellm_metadata", {}))
+
+    def test_openrouter_explicit_false_uses_local_fallback_contract(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "model": "x-ai/grok-4",
+            "input": "Search.",
+            "tools": [{"type": "web_search"}],
+            "api_base": "https://openrouter.ai/api/v1",
+            "model_info": {
+                "provider": "openrouter",
+                "supports_responses_web_search": False,
+            },
+        }
+
+        bridge = hooks._responses_external_web_search_bridge_kwargs(request)
+        self.assertIsNotNone(bridge)
+        assert bridge is not None
+        self.assertEqual(
+            [tool.get("name") for tool in bridge["tools"]],
+            ["web_search", "fetch_content"],
+        )

@@ -38,7 +38,7 @@ HOOK_MODULE_NAMES = (
     "tools",
     "computer_facade",
     "image_generation",
-    "vision_bridge",
+    "dsh_vision_router",
     "streaming",
     "pi_web_access",
     "hook",
@@ -60,7 +60,6 @@ class HookTestNamespace:
         owner = self._owners.get(name)
         if owner is not None:
             setattr(owner, name, value)
-
 
 def load_hook_module():
     for name in [

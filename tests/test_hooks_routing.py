@@ -1552,6 +1552,16 @@ class HookRoutingTests(HookTestCase):
             hooks._surface_adapter_model("openai/vendor/model", "openai/responses"),
             "openai/vendor/model",
         )
+        self.assertEqual(
+            hooks._surface_adapter_model("chatgpt/gpt-5.4", "openai/responses"),
+            "chatgpt/gpt-5.4",
+        )
+        request = {"litellm_params": {"model": "chatgpt/gpt-5.4"}}
+        hooks._apply_surface_adapter_to_request(
+            request, "openai/responses", "chatgpt/gpt-5.4"
+        )
+        self.assertEqual(request["custom_llm_provider"], "chatgpt")
+        self.assertEqual(request["litellm_params"]["model"], "chatgpt/gpt-5.4")
 
     def test_surface_adapter_relaxed_choice_removes_nested_forcing_copies(self) -> None:
         hooks, _ = load_hook_module()

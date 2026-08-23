@@ -54,6 +54,69 @@ future_top_level:
 
 
 class ProvidersModelsDomainTests(unittest.TestCase):
+    def test_account_login_provider_stages_adapter_and_private_claude_token(self) -> None:
+        from litellm_menu.core.provider_auth import ProviderAuthManager
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "config.yaml"
+            path.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            domain = ProvidersModelsDomain(path, auth_manager=ProviderAuthManager(root))
+
+            snapshot = domain.dispatch(
+                "service_provider.add",
+                {
+                    "provider": {
+                        "name": "account-provider",
+                        "auth_kind": "openai_login",
+                    }
+                },
+            )
+            provider = snapshot["providers"][0]
+            self.assertEqual("openai_login", provider["auth_kind"])
+            self.assertEqual([], provider["api_key_names"])
+            self.assertEqual("signed_out", provider["auth_status"])
+
+            snapshot = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider["id"],
+                    "model": {"name": "gpt-5.4", "upstream_model": "gpt-5.4"},
+                },
+            )
+            model = snapshot["providers"][0]["models"][0]
+            self.assertEqual("chatgpt/gpt-5.4", model["litellm_model"])
+            self.assertEqual("openai/responses", model["upstream_url_surface"])
+            self.assertEqual("fixed", model["upstream_protocol_mode"])
+
+            snapshot = domain.dispatch(
+                "service_provider.add",
+                {
+                    "provider": {
+                        "name": "account-claude",
+                        "auth_kind": "claude_login",
+                    }
+                },
+            )
+            provider = next(item for item in snapshot["providers"] if item["name"] == "account-claude")
+            self.assertEqual("claude_login", provider["auth_kind"])
+            self.assertEqual(["claude-oauth"], provider["api_key_names"])
+            self.assertEqual("anthropic/claude-sonnet-4-5", provider["models"][0]["litellm_model"])
+            token = "sk-ant-oat" + "synthetic0" * 4
+            domain.stage_secret("provider_auth_token", provider["id"], token)
+            signed_in = next(
+                item
+                for item in domain.snapshot()["providers"]
+                if item["name"] == "account-claude"
+            )
+            self.assertEqual("signed_in", signed_in["auth_status"])
+            self.assertNotIn(token, json.dumps(signed_in))
+
+            domain.apply()
+            saved = path.read_text(encoding="utf-8")
+            self.assertIn("os.environ/LITELLM_MENU_AUTH_", saved)
+            self.assertNotIn(token, saved)
+
     def test_relay_provider_source_sets_name_and_url_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -351,6 +414,76 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual(3, len(added))
             self.assertEqual([0, 0, 0], [model["order"] for model in added])
             self.assertEqual(3, len({model["editor_id"] for model in added}))
+
+    def test_new_model_uses_public_name_as_upstream_when_route_is_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+
+            added = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "draft-chat"},
+                },
+            )["providers"][0]["models"][-1]
+            self.assertEqual("draft-chat", added["name"])
+            self.assertEqual("draft-chat", added["upstream_model"])
+            self.assertEqual("openai/draft-chat", added["litellm_model"])
+
+            blank_route = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "empty-route", "litellm_model": ""},
+                },
+            )["providers"][0]["models"][-1]
+            self.assertEqual("empty-route", blank_route["upstream_model"])
+
+    def test_model_name_patch_fills_only_an_empty_upstream_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+            added = domain.dispatch(
+                "model.add",
+                {"provider_id": provider_id, "model": {"name": ""}},
+            )["providers"][0]["models"][-1]
+
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": added["editor_id"],
+                    "changes": {"name": "named-route"},
+                },
+            )
+            patched = domain.snapshot()["providers"][0]["models"][-1]
+            self.assertEqual("named-route", patched["name"])
+            self.assertEqual("named-route", patched["upstream_model"])
+
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": patched["editor_id"],
+                    "changes": {"upstream_model": "different-route"},
+                },
+            )
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": patched["editor_id"],
+                    "changes": {"name": "renamed-route"},
+                },
+            )
+            explicit = domain.snapshot()["providers"][0]["models"][-1]
+            self.assertEqual("renamed-route", explicit["name"])
+            self.assertEqual("different-route", explicit["upstream_model"])
 
     def test_provider_and_model_editor_ids_survive_in_place_edits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1290,6 +1423,11 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
             endpoint["result"] = ([], True)
             codex._catalog_source_checked_at = 0.0
+            # Endpoint-backed model-set repairs require two consecutive
+            # observations so a transient worker view cannot rewrite the
+            # managed catalog or prompt for a restart.
+            core.snapshot()
+            codex._catalog_source_checked_at = 0.0
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             self.assertEqual([], snapshot["public_models"])
@@ -1516,6 +1654,22 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
 
 class RuntimeSettingsDomainTests(unittest.TestCase):
+    def test_optional_runtime_numbers_allow_empty_inherit_and_enforce_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
+            key = "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS"
+            projected = next(item for item in domain.snapshot()["settings"] if item["key"] == key)
+            self.assertEqual("integer", projected["kind"])
+            self.assertEqual("optional_int", projected["storage_kind"])
+            self.assertEqual("", projected["value"])
+
+            domain.dispatch("set_setting", {"key": key, "value": "45"})
+            self.assertEqual("45", domain.draft_state()[key])
+            domain.dispatch("set_setting", {"key": key, "value": ""})
+            self.assertEqual("", domain.draft_state()[key])
+            with self.assertRaisesRegex(DomainError, "invalid"):
+                domain.dispatch("set_setting", {"key": key, "value": "0"})
+
     def test_runtime_schema_loads_from_an_isolated_bundled_core_without_service_shells(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1657,7 +1811,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             self.assertIn("LITELLM_PORT=4100", saved)
             self.assertNotIn("LITELLM_CONFIG_WATCH", saved)
 
-    def test_runtime_secret_is_redacted_and_external_change_conflicts(self) -> None:
+    def test_retired_vision_bridge_settings_are_removed_on_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime-settings.env"
             path.write_text(
@@ -1665,27 +1819,9 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
                 encoding="utf-8",
             )
             domain = RuntimeSettingsDomain(path)
-            secret = next(
-                item
-                for item in domain.snapshot()["settings"]
-                if item["key"] == "LITELLM_MENU_VISION_BRIDGE_API_KEY"
-            )
-            self.assertTrue(secret["retained"])
-            self.assertFalse(secret["will_clear"])
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_VISION_BRIDGE_API_KEY", "value": "replace-me-secret"})
-            self.assertNotIn("replace-me-secret", json.dumps(domain.snapshot()))
-            domain.dispatch("clear_setting", {"key": "LITELLM_MENU_VISION_BRIDGE_API_KEY"})
-            cleared = next(
-                item
-                for item in domain.snapshot()["settings"]
-                if item["key"] == "LITELLM_MENU_VISION_BRIDGE_API_KEY"
-            )
-            self.assertTrue(cleared["retained"])
-            self.assertTrue(cleared["will_clear"])
-            path.write_text("LITELLM_PORT=4200\n", encoding="utf-8")
-
-            with self.assertRaisesRegex(DomainError, "changed on disk"):
-                domain.apply()
+            self.assertNotIn("LITELLM_MENU_VISION_BRIDGE_API_KEY", {item["key"] for item in domain.snapshot()["settings"]})
+            domain.apply()
+            self.assertNotIn("LITELLM_MENU_VISION_BRIDGE_API_KEY", path.read_text(encoding="utf-8"))
 
     def test_pi_web_access_json_default_is_not_reported_as_configured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

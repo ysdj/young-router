@@ -45,8 +45,10 @@ MENU_RELAY_SOURCE_MODEL_KEY = "x-litellm-menu-relay-source-model"
 MENU_ORDER_MODE_KEY = "x-litellm-menu-order-mode"
 MENU_MANUAL_ORDER_KEY = "x-litellm-menu-manual-order"
 MENU_PROVIDER_SOURCE_KEY = "x-litellm-menu-provider-source"
+MENU_PROVIDER_AUTH_KEY = "x-litellm-menu-provider-auth"
 PROVIDER_KEY_SOURCE_KINDS = {"independent", "relay"}
 PROVIDER_SOURCE_KINDS = {"custom", "relay"}
+PROVIDER_AUTH_KINDS = {"api_key", "openai_login", "claude_login"}
 MODEL_CATALOG_MODES = {"independent", "relay_linked"}
 MODEL_ORDER_MODES = {"manual", "relay_multiplier"}
 RANDOM_DEPLOYMENT_ID_RE = re.compile(r"^[0-9a-f]{8}$")
@@ -263,6 +265,30 @@ def _provider_source(value: Any, *, required: bool = False) -> dict[str, str]:
     }
 
 
+def _provider_auth(value: Any, *, required: bool = False) -> dict[str, str]:
+    """Validate secret-free provider authentication metadata."""
+
+    if value is None:
+        if required:
+            raise ValueError("Provider authentication is invalid")
+        return {"kind": "api_key"}
+    if not isinstance(value, dict) or set(value).difference({"kind", "credential_ref"}):
+        raise ValueError("Provider authentication is invalid")
+    kind = value.get("kind", "api_key")
+    if not isinstance(kind, str) or kind not in PROVIDER_AUTH_KINDS:
+        raise ValueError("Provider authentication is invalid")
+    credential_ref = _menu_metadata_text(
+        value.get("credential_ref"),
+        "Provider credential reference",
+        required=kind != "api_key",
+    )
+    if kind == "api_key":
+        if credential_ref:
+            raise ValueError("API key authentication cannot reference a login credential")
+        return {"kind": "api_key"}
+    return {"kind": kind, "credential_ref": credential_ref}
+
+
 def _stable_provider_key_id(provider_name: Any, api_key_name: Any) -> str:
     """Derive a migration-safe ID without ever using the credential value."""
 
@@ -366,7 +392,7 @@ def infer_upstream_fallback_surface(value: Any) -> str:
     return "openai/chat"
 
 
-def canonical_litellm_model(value: Any, surface: str) -> str:
+def canonical_litellm_model(value: Any, surface: str, adapter: str | None = None) -> str:
     """Store a LiteLLM adapter prefix derived from the selected upstream surface."""
 
     model = _string_value(value).strip()
@@ -374,11 +400,13 @@ def canonical_litellm_model(value: Any, surface: str) -> str:
         return ""
     if "/" in model:
         existing_prefix, raw_model = model.split("/", 1)
-        if existing_prefix in {"openai", "anthropic"}:
+        if existing_prefix in {"openai", "anthropic", "chatgpt"}:
             model = raw_model.strip()
     if not model:
         return ""
-    prefix = "anthropic" if surface == "anthropic" else "openai"
+    if adapter is not None and adapter not in {"openai", "anthropic", "chatgpt"}:
+        raise ValueError("LiteLLM adapter is invalid")
+    prefix = adapter or ("anthropic" if surface == "anthropic" else "openai")
     return f"{prefix}/{model}"
 
 
@@ -508,6 +536,14 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
             except ValueError as exc:
                 raise ValueError(
                     f"{path.name} provider {provider_name} {MENU_PROVIDER_SOURCE_KEY} is invalid"
+                ) from exc
+        provider_auth = provider.get(MENU_PROVIDER_AUTH_KEY)
+        if provider_auth is not None:
+            try:
+                _provider_auth(provider_auth, required=True)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{path.name} provider {provider_name} {MENU_PROVIDER_AUTH_KEY} is invalid"
                 ) from exc
 
     section_names = (DISABLED_MODELS_KEY,) if is_disabled_file else ("model_list",)

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -18,12 +19,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from config_editor_core.schema import (
+    MENU_PROVIDER_AUTH_KEY,
     MENU_PROVIDER_SOURCE_KEY,
     MENU_RELAY_KEYS_KEY,
     MENU_RELAY_KEYS_VERSION,
     MODEL_ORDER_MODES,
     _menu_order,
     _provider_key_id,
+    _provider_auth,
     _provider_source,
     _relay_source,
     _stable_provider_key_id,
@@ -58,8 +61,9 @@ class ProvidersModelsDomain:
     _MAX_MODEL_PROBE_BYTES = 256 * 1024
     _API_KEY_TARGET_SEPARATOR = "\x1f"
 
-    def __init__(self, config_path: Path | str | None = None):
+    def __init__(self, config_path: Path | str | None = None, *, auth_manager: object | None = None):
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
+        self.auth_manager = auth_manager
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._probe_overlay: dict[str, dict[str, dict[str, Any]]] = {}
@@ -69,6 +73,13 @@ class ProvidersModelsDomain:
         self._model_editor_ids: dict[int, str] = {}
         self.revision = 0
         self.reload()
+
+    def _auth_manager(self):
+        if self.auth_manager is None:
+            from ..provider_auth import ProviderAuthManager
+
+            self.auth_manager = ProviderAuthManager(self.config_path.parent)
+        return self.auth_manager
 
     @staticmethod
     def _empty_document() -> dict[str, str | None]:
@@ -196,7 +207,18 @@ class ProvidersModelsDomain:
         return self._editor_id(model, model=True)
 
     @staticmethod
-    def _upstream_model_prefix(model: Mapping[str, Any]) -> str:
+    def _upstream_model_prefix(
+        model: Mapping[str, Any], provider: Mapping[str, Any] | None = None
+    ) -> str:
+        if provider is not None:
+            try:
+                auth_kind = ProvidersModelsDomain._provider_auth_state(provider)["kind"]
+            except DomainError:
+                auth_kind = "api_key"
+            if auth_kind == "openai_login":
+                return "chatgpt"
+            if auth_kind == "claude_login":
+                return "anthropic"
         surface = str(model.get("upstream_url_surface", "")).strip()
         return "anthropic" if surface == "anthropic" else "openai"
 
@@ -205,21 +227,30 @@ class ProvidersModelsDomain:
         provider: Mapping[str, Any],
         model: Mapping[str, Any],
     ) -> str:
-        del provider
+        auth_kind = ProvidersModelsDomain._provider_auth_state(provider)["kind"]
+        if auth_kind == "claude_login":
+            return "anthropic"
+        if auth_kind == "openai_login":
+            return "openai/responses"
         return infer_upstream_fallback_surface(model.get("litellm_model"))
 
     @classmethod
-    def _canonical_upstream_model(cls, value: object, model: Mapping[str, Any]) -> str:
+    def _canonical_upstream_model(
+        cls,
+        value: object,
+        model: Mapping[str, Any],
+        provider: Mapping[str, Any] | None = None,
+    ) -> str:
         name = str(value or "").strip()
         if not name:
             return ""
         if "/" in name:
             existing_prefix, raw_name = name.split("/", 1)
-            if existing_prefix in {"openai", "anthropic"}:
+            if existing_prefix in {"openai", "anthropic", "chatgpt"}:
                 name = raw_name.strip()
         if not name:
             return ""
-        prefix = cls._upstream_model_prefix(model)
+        prefix = cls._upstream_model_prefix(model, provider)
         return f"{prefix}/{name}"
 
     @staticmethod
@@ -267,12 +298,16 @@ class ProvidersModelsDomain:
                 "name": "",
                 "enabled": False,
                 "provider_type": "custom",
+                "auth_kind": "api_key",
+                "auth_status": "signed_out",
+                "auth_active": False,
                 "relay_station_id": "",
                 "api_key_names": [],
                 "models": [],
             }
         name = str(provider.get("name", "")).strip()
         provider_source = self._provider_source_state(provider)
+        provider_auth = self._provider_auth_state(provider)
         keys = self._provider_api_keys(provider)
         configured_key = bool(provider.get("api_key"))
         api_key_names: list[str] = []
@@ -400,6 +435,10 @@ class ProvidersModelsDomain:
             "enabled": provider.get("enabled") is not False,
             "provider_type": provider_source["kind"],
             "relay_station_id": provider_source.get("station_id", ""),
+            "auth_kind": provider_auth["kind"],
+            "auth_status": self._provider_auth_status(provider, provider_auth),
+            "auth_configured": self._provider_auth_configured(provider, provider_auth),
+            "auth_active": self._provider_auth_active(provider_auth),
             "api_base": REDACT_TEXT(str(provider.get("api_base", ""))),
             "api_key_configured": configured_key,
             "api_key_names": api_key_names,
@@ -1090,6 +1129,100 @@ class ProvidersModelsDomain:
             raise DomainError("Provider source is invalid") from None
 
     @staticmethod
+    def _provider_auth_state(provider: Mapping[str, Any]) -> dict[str, str]:
+        """Read secret-free authentication metadata independently of endpoint source."""
+
+        extra = provider.get("extra")
+        raw = extra.get(MENU_PROVIDER_AUTH_KEY) if isinstance(extra, Mapping) else None
+        kind = provider.get("auth_kind")
+        credential_ref = provider.get("auth_credential_ref")
+        if kind is not None or credential_ref is not None:
+            raw = {
+                "kind": str(kind or "api_key"),
+                **({"credential_ref": str(credential_ref)} if credential_ref else {}),
+            }
+        try:
+            return _provider_auth(raw)
+        except ValueError:
+            raise DomainError("Provider authentication is invalid") from None
+
+    def _provider_auth_configured(self, provider: Mapping[str, Any], auth: Mapping[str, Any]) -> bool:
+        if auth.get("kind") in {"openai_login", "claude_login"}:
+            credential_ref = str(auth.get("credential_ref", "")).strip()
+            if not credential_ref:
+                return False
+            try:
+                return bool(
+                    self._auth_manager().status(str(auth["kind"]), credential_ref).get("configured")
+                )
+            except Exception:
+                return False
+        _name, value = self._provider_credential(provider)
+        return bool(value)
+
+    def _provider_auth_status(self, provider: Mapping[str, Any], auth: Mapping[str, Any]) -> str:
+        kind = str(auth.get("kind", "api_key"))
+        if kind in {"openai_login", "claude_login"}:
+            credential_ref = str(auth.get("credential_ref", "")).strip()
+            if not credential_ref:
+                return "signed_out"
+            try:
+                status = str(self._auth_manager().status(kind, credential_ref).get("status", "signed_out"))
+            except Exception:
+                return "error"
+            return status if status in {"signed_out", "authorizing", "signed_in", "expired", "error", "unsupported"} else "error"
+        return "signed_in" if self._provider_auth_configured(provider, auth) else "signed_out"
+
+    def _provider_auth_active(self, auth: Mapping[str, Any]) -> bool:
+        if auth.get("kind") != "openai_login":
+            return False
+        ref = str(auth.get("credential_ref", "")).strip()
+        if not ref:
+            return False
+        try:
+            return bool(self._auth_manager().status("openai_login", ref).get("active"))
+        except Exception:
+            return False
+
+    def _openai_runtime_slot_error(self, providers: object) -> str:
+        """Reject drafts that would route multiple accounts through one ChatGPT slot.
+
+        LiteLLM's ChatGPT adapter reads one process-global token directory.  A
+        disabled account can remain in the service-provider registry, but at
+        most one OpenAI login provider may be enabled in an applied config and
+        it must match the selected active credential when one exists.
+        """
+
+        if not isinstance(providers, list):
+            return ""
+        enabled: list[tuple[str, str]] = []
+        for provider in providers:
+            if not isinstance(provider, Mapping) or provider.get("enabled") is False:
+                continue
+            try:
+                auth = self._provider_auth_state(provider)
+            except DomainError:
+                return "Provider authentication is invalid"
+            if auth.get("kind") != "openai_login":
+                continue
+            ref = str(auth.get("credential_ref", "")).strip()
+            if not ref:
+                return "OpenAI login provider credential is unavailable"
+            enabled.append((str(provider.get("name", "")).strip(), ref))
+        if len(enabled) > 1:
+            return "Only one OpenAI login provider can be enabled at a time"
+        if not enabled:
+            return ""
+        try:
+            active_value = self._auth_manager().active_openai_ref()
+            active = active_value.strip() if isinstance(active_value, str) else ""
+        except Exception:
+            active = ""
+        if active and active != enabled[0][1]:
+            return "Enable the active OpenAI login provider before applying"
+        return ""
+
+    @staticmethod
     def _set_provider_source(provider: dict[str, Any], value: object) -> dict[str, str]:
         try:
             source = _provider_source(value, required=True)
@@ -1101,6 +1234,117 @@ class ProvidersModelsDomain:
         extra[MENU_PROVIDER_SOURCE_KEY] = copy.deepcopy(source)
         provider["extra"] = extra
         return source
+
+    @staticmethod
+    def _set_provider_auth(provider: dict[str, Any], value: object) -> dict[str, str]:
+        try:
+            auth = _provider_auth(value, required=True)
+        except ValueError:
+            raise DomainError("Provider authentication is invalid") from None
+        provider["auth_kind"] = auth["kind"]
+        provider["auth_credential_ref"] = auth.get("credential_ref", "")
+        extra = dict(provider.get("extra", {})) if isinstance(provider.get("extra"), Mapping) else {}
+        if auth["kind"] == "api_key":
+            extra.pop(MENU_PROVIDER_AUTH_KEY, None)
+            provider.pop("auth_credential_ref", None)
+        else:
+            extra[MENU_PROVIDER_AUTH_KEY] = copy.deepcopy(auth)
+        provider["extra"] = extra
+        return auth
+
+    @staticmethod
+    def _new_provider_auth_ref() -> str:
+        return f"provider-auth-{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _provider_auth_env_value(credential_ref: str) -> str:
+        from ..provider_auth import credential_env_name
+
+        return f"os.environ/{credential_env_name(credential_ref)}"
+
+    @classmethod
+    def _configure_provider_auth(
+        cls,
+        provider: dict[str, Any],
+        kind: object,
+        *,
+        existing_refs: set[str] | None = None,
+    ) -> dict[str, str]:
+        auth_kind = str(kind or "api_key").strip() or "api_key"
+        try:
+            current = cls._provider_auth_state(provider)
+        except DomainError:
+            current = {"kind": "api_key"}
+        credential_ref = (
+            current.get("credential_ref", "")
+            if current.get("kind") == auth_kind
+            else ""
+        )
+        if auth_kind != "api_key" and not credential_ref:
+            credential_ref = cls._new_provider_auth_ref()
+            if existing_refs:
+                base_ref = credential_ref
+                suffix = 2
+                while credential_ref in existing_refs:
+                    credential_ref = f"{base_ref}-{suffix}"
+                    suffix += 1
+        auth = cls._set_provider_auth(
+            provider,
+            {
+                "kind": auth_kind,
+                **({"credential_ref": credential_ref} if credential_ref else {}),
+            },
+        )
+        if auth_kind == "openai_login":
+            provider["api_base"] = ""
+            cls._sync_primary_api_key(provider, [])
+        elif auth_kind == "claude_login":
+            provider["api_base"] = ""
+            cls._sync_primary_api_key(
+                provider,
+                [
+                    {
+                        "id": cls._new_provider_key_id(),
+                        "name": "claude-oauth",
+                        "value": cls._provider_auth_env_value(credential_ref),
+                        "source": {"kind": "independent"},
+                    }
+                ],
+            )
+        if auth_kind in {"openai_login", "claude_login"}:
+            models = provider.get("models")
+            if isinstance(models, list):
+                for model in models:
+                    if isinstance(model, dict):
+                        model["api_base"] = ""
+        return auth
+
+    @classmethod
+    def _apply_auth_to_models(cls, provider: dict[str, Any], auth_kind: str) -> None:
+        models = provider.get("models")
+        if not isinstance(models, list):
+            return
+        keys = cls._provider_api_keys(provider)
+        selected_key = keys[0] if auth_kind == "claude_login" and keys else None
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            if auth_kind == "openai_login":
+                model["upstream_url_surface"] = "openai/responses"
+                model["upstream_protocol_mode"] = "fixed"
+            elif auth_kind == "claude_login":
+                model["upstream_url_surface"] = "anthropic"
+                model["upstream_protocol_mode"] = "fixed"
+            else:
+                model["upstream_url_surface"] = infer_upstream_fallback_surface(
+                    model.get("litellm_model")
+                )
+                model["upstream_protocol_mode"] = "fallback"
+            model["litellm_model"] = cls._canonical_upstream_model(
+                model.get("litellm_model"), model, provider
+            )
+            model["provider_key_id"] = selected_key["id"] if selected_key else ""
+            model["api_key_name"] = selected_key["name"] if selected_key else ""
 
     @staticmethod
     def _sync_provider_identity_to_models(provider: dict[str, Any]) -> None:
@@ -1323,6 +1567,8 @@ class ProvidersModelsDomain:
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
         provider = self._copy_provider_for_edit(providers[provider_index])
+        if self._provider_auth_state(provider)["kind"] != "api_key":
+            raise DomainError("Provider keys are unavailable for account login")
         keys = self._provider_api_keys(provider)
 
         if action == "provider_key_add":
@@ -1398,6 +1644,8 @@ class ProvidersModelsDomain:
     def _stage_provider_secret(self, provider_index: int, key_name: str | None, value: str) -> None:
         providers = self._draft["providers"]
         provider = self._copy_provider_for_edit(providers[provider_index])
+        if self._provider_auth_state(provider)["kind"] != "api_key":
+            raise DomainError("Provider keys are unavailable for account login")
         keys = self._provider_api_keys(provider)
         if key_name is None:
             if keys:
@@ -1440,9 +1688,279 @@ class ProvidersModelsDomain:
             raise DomainError("A provider with this name already exists")
         provider["name"] = station_name
         provider["api_base"] = station_origin
+        previous_auth = self._provider_auth_state(provider)
+        if previous_auth["kind"] != "api_key":
+            try:
+                self._auth_manager().logout(
+                    previous_auth["kind"], previous_auth["credential_ref"]
+                )
+            except Exception:
+                pass
+        self._configure_provider_auth(provider, "api_key")
         self._set_provider_source(provider, {"kind": "relay", "station_id": station_id})
         self._sync_provider_identity_to_models(provider)
         providers[provider_index] = provider
+
+    # Login-backed providers are deliberately created and managed through the
+    # Service Provider Management surface. The normal Providers & Models
+    # editor remains API-key-only, while the persisted provider shape stays
+    # compatible with the LiteLLM config writer and older installations that
+    # already contain login metadata.
+    _SERVICE_PROVIDER_KINDS = frozenset({"openai_login", "claude_login"})
+    _SERVICE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
+        "openai_login": {
+            "name": "OpenAI",
+            "model_name": "gpt-5.4",
+            "upstream_model": "gpt-5.4",
+        },
+        "claude_login": {
+            "name": "Claude",
+            "model_name": "claude-sonnet-4-5",
+            "upstream_model": "claude-sonnet-4-5",
+        },
+    }
+
+    @classmethod
+    def _service_provider_kind(cls, value: object) -> str:
+        kind = str(value or "").strip().lower()
+        if kind not in cls._SERVICE_PROVIDER_KINDS:
+            raise DomainError("Service provider login type is unavailable")
+        return kind
+
+    def _service_provider_index(self, data: Mapping[str, Any]) -> int:
+        index = self._provider_index(data)
+        provider = self._draft["providers"][index]
+        if not isinstance(provider, Mapping):
+            raise DomainError("The selected service provider is unavailable")
+        if self._provider_auth_state(provider)["kind"] not in self._SERVICE_PROVIDER_KINDS:
+            raise DomainError("The selected provider is managed in Providers & Models")
+        return index
+
+    def _dispatch_service_provider_add(self, data: Mapping[str, Any]) -> None:
+        value = data.get("provider", data.get("value", data))
+        supplied = _copy_mapping(value, "service provider")
+        unsupported = set(supplied).difference(
+            {"kind", "auth_kind", "name", "enabled", "models", "model"}
+        )
+        if unsupported:
+            raise DomainError(
+                "Service provider login accepts only a name and model selection"
+            )
+        kind = self._service_provider_kind(
+            supplied.get("auth_kind", supplied.get("kind"))
+        )
+        defaults = self._SERVICE_PROVIDER_DEFAULTS[kind]
+        name = str(supplied.get("name", "")).strip() or defaults["name"]
+        if any(
+            isinstance(candidate, Mapping)
+            and str(candidate.get("name", "")).strip().casefold() == name.casefold()
+            for candidate in self._draft.get("providers", [])
+        ):
+            raise DomainError("A provider with this name already exists")
+
+        provider: dict[str, Any] = copy.deepcopy(supplied)
+        # kind is an action convenience alias, never persisted as provider
+        # config. Never accept a credential or endpoint from this action.
+        provider.pop("kind", None)
+        provider.pop("auth_kind", None)
+        provider.pop("auth_credential_ref", None)
+        provider.pop("api_key", None)
+        provider.pop("api_keys", None)
+        provider.pop("provider_type", None)
+        provider.pop("relay_station_id", None)
+        provider["name"] = name
+        provider["enabled"] = provider.get("enabled") is not False
+        # OpenAI's ChatGPT adapter has one process-global token directory.
+        # The first account owns that slot by default; subsequent accounts
+        # remain in the registry but start disabled until activation.
+        if kind == "openai_login":
+            has_openai_account = any(
+                isinstance(candidate, Mapping)
+                and self._provider_auth_state(candidate).get("kind") == "openai_login"
+                for candidate in self._draft.get("providers", [])
+            )
+            provider["enabled"] = not has_openai_account
+        provider["api_base"] = ""
+        provider["models"] = []
+        self._set_provider_source(provider, {"kind": "custom"})
+        existing_refs = {
+            str(self._provider_auth_state(candidate).get("credential_ref", "")).strip()
+            for candidate in self._draft.get("providers", [])
+            if isinstance(candidate, Mapping)
+            and self._provider_auth_state(candidate).get("kind") in self._SERVICE_PROVIDER_KINDS
+        }
+        self._configure_provider_auth(provider, kind, existing_refs=existing_refs)
+
+        # A newly added account gets one useful default model unless the caller
+        # explicitly supplied a model list. The model list remains editable by
+        # the service-management surface, but no raw secret crosses IPC.
+        raw_models = supplied.get("models")
+        if raw_models is None:
+            raw_model = supplied.get("model")
+            raw_models = [raw_model] if isinstance(raw_model, Mapping) else [
+                {
+                    "name": defaults["model_name"],
+                    "upstream_model": defaults["upstream_model"],
+                    "enabled": True,
+                    "order": 1,
+                }
+            ]
+        if not isinstance(raw_models, Sequence) or isinstance(raw_models, (str, bytes, bytearray)):
+            raise DomainError("Service provider models must be a list")
+        used_deployment_ids = {
+            str(model.get("deployment_id", "")).strip().lower()
+            for candidate in self._draft.get("providers", [])
+            if isinstance(candidate, Mapping)
+            for model in candidate.get("models", [])
+            if isinstance(model, Mapping) and str(model.get("deployment_id", "")).strip()
+        }
+        models = provider["models"]
+        for raw_model in raw_models:
+            if not isinstance(raw_model, Mapping):
+                raise DomainError("Service provider models must be objects")
+            if set(raw_model).intersection(
+                {"api_key", "api_keys", "token", "access_token", "credential", "credential_ref"}
+            ):
+                raise DomainError("Service provider model credentials must use native secure input")
+            models.append(self._new_model(provider, raw_model, used_deployment_ids))
+        self._apply_auth_to_models(provider, kind)
+        self._register_new_provider(provider)
+        self._draft["providers"].append(provider)
+        self._last_operation = {
+            "operation": "service_provider_add",
+            "provider_id": self._safe_provider(provider, len(self._draft["providers"]) - 1)["id"],
+            "auth_kind": kind,
+            "auth_status": self._provider_auth_status(
+                provider, self._provider_auth_state(provider)
+            ),
+        }
+
+    def _dispatch_service_provider_patch(self, data: Mapping[str, Any]) -> None:
+        index = self._service_provider_index(data)
+        providers = self._draft["providers"]
+        provider = self._copy_provider_for_edit(providers[index])
+        changes = self._changes(data, "provider")
+        current_auth = self._provider_auth_state(provider)
+        requested_kind = changes.pop("auth_kind", changes.pop("kind", None))
+        if requested_kind is not None and self._service_provider_kind(requested_kind) != current_auth["kind"]:
+            raise DomainError("Change the login type through a new service provider")
+        changes.pop("auth_credential_ref", None)
+        for forbidden in ("api_key", "api_keys", "api_base", "endpoint", "provider_type", "relay_station_id"):
+            if forbidden in changes:
+                raise DomainError("Login provider endpoint and API keys are managed separately")
+        unsupported = set(changes).difference({"name", "enabled"})
+        if unsupported:
+            raise DomainError("Only the service provider name and enabled state are editable here")
+        if "name" in changes:
+            next_name = str(changes["name"]).strip()
+            if not next_name:
+                raise DomainError("A service provider name is required")
+            if any(
+                candidate_index != index
+                and isinstance(candidate, Mapping)
+                and str(candidate.get("name", "")).strip().casefold() == next_name.casefold()
+                for candidate_index, candidate in enumerate(providers)
+            ):
+                raise DomainError("A provider with this name already exists")
+            changes["name"] = next_name
+        if changes.get("enabled") is True and current_auth["kind"] == "openai_login":
+            try:
+                active = str(self._auth_manager().active_openai_ref()).strip()
+            except Exception:
+                active = ""
+            if active and active != current_auth.get("credential_ref", ""):
+                raise DomainError("Activate this OpenAI account before enabling it")
+            if any(
+                candidate_index != index
+                and isinstance(candidate, Mapping)
+                and candidate.get("enabled") is not False
+                and self._provider_auth_state(candidate).get("kind") == "openai_login"
+                for candidate_index, candidate in enumerate(providers)
+            ):
+                raise DomainError("Only one OpenAI login provider can be enabled at a time")
+        provider.update(changes)
+        self._sync_provider_identity_to_models(provider)
+        providers[index] = provider
+        self._last_operation = {
+            "operation": "service_provider_patch",
+            "provider_id": self._safe_provider(provider, index)["id"],
+            "auth_kind": current_auth["kind"],
+        }
+
+    def _dispatch_service_provider(self, action: str, data: Mapping[str, Any]) -> None:
+        if action in {"service_provider_add", "service_add_provider"}:
+            self._dispatch_service_provider_add(data)
+            return
+        if action in {"service_provider_patch", "service_patch_provider"}:
+            self._dispatch_service_provider_patch(data)
+            return
+        if action in {"service_provider_activate", "service_activate_provider", "service_provider_auth_activate"}:
+            index = self._service_provider_index(data)
+            provider = self._draft["providers"][index]
+            auth = self._provider_auth_state(provider)
+            if auth["kind"] != "openai_login":
+                raise DomainError("Only OpenAI login accounts have an active runtime slot")
+            try:
+                result = self._auth_manager().activate(
+                    auth["kind"], auth["credential_ref"]
+                )
+            except Exception:
+                raise DomainError("The OpenAI service provider could not be activated") from None
+            self._last_operation = {
+                "operation": action,
+                "provider_id": self._safe_provider(provider, index)["id"],
+                "auth_kind": auth["kind"],
+                "auth_status": str(result.get("status", "signed_in")),
+                "auth_active": True,
+                "requires_restart": True,
+            }
+            # Keep the persisted draft truthful: all other OpenAI login
+            # accounts remain available for management but are not routable
+            # through LiteLLM's single ChatGPT runtime slot.
+            for candidate_index, candidate in enumerate(self._draft.get("providers", [])):
+                if not isinstance(candidate, dict):
+                    continue
+                if self._provider_auth_state(candidate).get("kind") == "openai_login":
+                    candidate["enabled"] = candidate_index == index
+            return
+        if action in {
+            "service_provider_auth_start",
+            "service_provider_auth_cancel",
+            "service_provider_auth_logout",
+            "service_provider_auth_status",
+        }:
+            self._service_provider_index(data)
+            provider_action = action.removeprefix("service_")
+            self._provider_auth_operation(provider_action, data)
+            if provider_action == "provider_auth_logout":
+                index = self._service_provider_index(data)
+                provider = self._draft["providers"][index]
+                if isinstance(provider, dict) and self._provider_auth_state(provider).get("kind") == "openai_login":
+                    provider["enabled"] = False
+            if isinstance(getattr(self, "_last_operation", None), dict):
+                self._last_operation["operation"] = action
+            return
+        if action in {"service_provider_delete", "service_delete_provider"}:
+            index = self._service_provider_index(data)
+            removed = self._draft["providers"][index]
+            removed_id = self._safe_provider(removed, index)["id"]
+            removed_auth = self._provider_auth_state(removed)
+            self._draft["providers"].pop(index)
+            if isinstance(removed, Mapping):
+                self._probe_overlay.pop(str(removed.get("name", "")).strip(), None)
+                try:
+                    self._auth_manager().logout(
+                        removed_auth["kind"], removed_auth["credential_ref"]
+                    )
+                except Exception:
+                    pass
+            self._last_operation = {
+                "operation": "service_provider_delete",
+                "provider_id": removed_id,
+                "auth_kind": removed_auth["kind"],
+            }
+            return
+        raise DomainError("The requested service provider action is unavailable")
 
     def _dispatch_provider(self, action: str, data: Mapping[str, Any]) -> None:
         providers = self._draft["providers"]
@@ -1450,6 +1968,11 @@ class ProvidersModelsDomain:
             self._dispatch_provider_key(action, data)
             return
         if action == "provider_select_relay_station":
+            provider_index = self._provider_index(data)
+            if self._provider_auth_state(providers[provider_index])["kind"] != "api_key":
+                raise DomainError(
+                    "Login providers are managed in Service Provider Management"
+                )
             self._select_provider_relay_station(data)
             return
         if action in {"provider_add", "add_provider"}:
@@ -1459,14 +1982,26 @@ class ProvidersModelsDomain:
             # UI-created providers may request a safe key slot before their
             # first native-secret edit. The intent marker is consumed here;
             # React never constructs or transports a credential value.
-            if create_default_api_key and "api_keys" not in provider:
+            requested_auth_kind = str(provider.get("auth_kind", "api_key")).strip() or "api_key"
+            if "auth_kind" not in provider and requested_auth_kind == "api_key":
+                try:
+                    requested_auth_kind = self._provider_auth_state(provider)["kind"]
+                except DomainError:
+                    requested_auth_kind = "api_key"
+            if requested_auth_kind != "api_key":
+                raise DomainError(
+                    "Account login is managed in Service Provider Management"
+                )
+            if create_default_api_key and requested_auth_kind == "api_key" and "api_keys" not in provider:
                 provider["api_keys"] = [{"name": "default", "value": ""}]
-            if "api_keys" in provider:
+            if "api_keys" in provider and requested_auth_kind == "api_key":
                 self._sync_primary_api_key(provider, self._provider_api_keys(provider))
             source = self._provider_source_state(provider)
             if source["kind"] != "custom":
                 raise DomainError("Select a relay station to create a relay provider")
             self._set_provider_source(provider, {"kind": "custom"})
+            auth = self._configure_provider_auth(provider, requested_auth_kind)
+            self._apply_auth_to_models(provider, auth["kind"])
             providers.append(provider)
             self._register_new_provider(provider)
             return
@@ -1475,9 +2010,23 @@ class ProvidersModelsDomain:
             provider = self._copy_provider_for_edit(providers[index])
             previous_name = str(provider.get("name", "")).strip()
             current_source = self._provider_source_state(provider)
+            current_auth = self._provider_auth_state(provider)
+            if current_auth["kind"] != "api_key":
+                raise DomainError(
+                    "Login providers are managed in Service Provider Management"
+                )
             changes = self._changes(data, "provider")
             if "endpoint" in changes:
                 changes["api_base"] = changes.pop("endpoint")
+            auth_requested = "auth_kind" in changes
+            requested_auth_kind = changes.pop("auth_kind", None)
+            changes.pop("auth_credential_ref", None)
+            if auth_requested:
+                requested_auth_kind = str(requested_auth_kind or "").strip() or "api_key"
+                if requested_auth_kind != current_auth["kind"]:
+                    raise DomainError(
+                        "Account login is managed in Service Provider Management"
+                    )
             source_requested = "provider_type" in changes or "relay_station_id" in changes
             next_source = current_source
             if source_requested:
@@ -1511,12 +2060,30 @@ class ProvidersModelsDomain:
                 provider["api_keys"] = keys
                 provider["api_key"] = api_key
             provider.update(changes)
+            if auth_requested and requested_auth_kind != current_auth["kind"]:
+                if current_auth["kind"] != "api_key":
+                    try:
+                        self._auth_manager().logout(
+                            current_auth["kind"], current_auth["credential_ref"]
+                        )
+                    except Exception:
+                        pass
+                if requested_auth_kind == "api_key":
+                    self._sync_primary_api_key(provider, [])
+            auth = (
+                self._configure_provider_auth(provider, requested_auth_kind)
+                if auth_requested
+                else self._provider_auth_state(provider)
+            )
+            if auth_requested:
+                self._apply_auth_to_models(provider, auth["kind"])
             if {"name", "api_base"}.intersection(changes):
                 self._sync_provider_identity_to_models(provider)
             # ``extra`` is user-editable metadata.  Always write the
             # authoritative source state last so a single patch cannot leave
             # its top-level source fields and persisted metadata disagreeing.
             self._set_provider_source(provider, next_source)
+            self._set_provider_auth(provider, auth)
             current_name = str(provider.get("name", "")).strip()
             if current_name != previous_name:
                 if previous_name in self._probe_overlay:
@@ -1538,22 +2105,143 @@ class ProvidersModelsDomain:
         if action in {"provider_clear_key", "clear_provider_key"}:
             index = self._provider_index(data)
             provider = self._copy_provider_for_edit(providers[index])
+            if self._provider_auth_state(provider)["kind"] != "api_key":
+                raise DomainError("Provider keys are unavailable for account login")
             self._sync_primary_api_key(provider, [])
             providers[index] = provider
             return
         if action in {"provider_delete", "delete_provider"}:
-            removed = providers.pop(self._provider_index(data))
+            provider_index = self._provider_index(data)
+            if self._provider_auth_state(providers[provider_index])["kind"] != "api_key":
+                raise DomainError(
+                    "Login providers are managed in Service Provider Management"
+                )
+            removed = providers.pop(provider_index)
             if isinstance(removed, Mapping):
                 name = str(removed.get("name", "")).strip()
                 self._probe_overlay.pop(name, None)
+                auth = self._provider_auth_state(removed)
+                if auth["kind"] != "api_key":
+                    try:
+                        self._auth_manager().logout(auth["kind"], auth["credential_ref"])
+                    except Exception:
+                        pass
             return
         if action in {"provider_move", "move_provider"}:
             source = data.get("from", data.get("source"))
             if type(source) is not int:
                 source = self._provider_index(data)
+            if self._provider_auth_state(providers[_index(source, len(providers), "provider")])["kind"] != "api_key":
+                raise DomainError(
+                    "Login providers are managed in Service Provider Management"
+                )
             _move(providers, source, _direction_destination(source, len(providers), data), "provider")
             return
         raise DomainError("The requested provider action is unavailable")
+
+    def _provider_auth_operation(self, action: str, data: Mapping[str, Any]) -> dict[str, Any]:
+        provider_index = self._provider_index(data)
+        provider = self._draft["providers"][provider_index]
+        if not isinstance(provider, Mapping):
+            raise DomainError("The selected provider is unavailable")
+        auth = self._provider_auth_state(provider)
+        kind = auth["kind"]
+        credential_ref = auth.get("credential_ref", "")
+        if kind == "api_key" or not credential_ref:
+            raise DomainError("Account login is unavailable for this provider")
+        manager = self._auth_manager()
+        try:
+            if action == "provider_auth_start":
+                # Wait briefly for the device challenge so the native UI can
+                # display it in the same action result. The worker continues
+                # polling in the background after this bounded wait.
+                result = self.trusted_provider_auth_start(
+                    self._safe_provider(provider, provider_index)["id"]
+                )
+            elif action == "provider_auth_cancel":
+                result = manager.cancel(credential_ref)
+            elif action == "provider_auth_logout":
+                result = manager.logout(kind, credential_ref)
+            elif action == "provider_auth_status":
+                result = manager.status(kind, credential_ref)
+            else:
+                raise DomainError("The requested provider login action is unavailable")
+        except DomainError:
+            raise
+        except Exception:
+            raise DomainError("Provider login could not be completed") from None
+        status = "error"
+        if isinstance(result, Mapping):
+            # trusted_provider_auth_start returns the public auth_status key;
+            # manager operations use status. Keep the IPC summary consistent.
+            status = str(result.get("status", result.get("auth_status", "error")))
+        summary = {
+            "operation": action,
+            "provider_id": self._safe_provider(provider, provider_index)["id"],
+            "auth_kind": kind,
+            "auth_status": status,
+            "configured": bool(result.get("configured")) if isinstance(result, Mapping) else False,
+        }
+        if isinstance(result, Mapping):
+            for key in ("verification_uri", "user_code"):
+                value = result.get(key)
+                if isinstance(value, str) and value:
+                    summary[key] = value
+        if (
+            kind == "openai_login"
+            and action in {"provider_auth_cancel", "provider_auth_logout"}
+        ):
+            provider_copy = self._copy_provider_for_edit(provider)
+            provider_copy["enabled"] = False
+            self._draft["providers"][provider_index] = provider_copy
+        elif (
+            kind == "openai_login"
+            and action == "provider_auth_status"
+            and isinstance(result, Mapping)
+        ):
+            if result.get("status") == "signed_in" and result.get("active") is True:
+                for candidate_index, candidate in enumerate(self._draft.get("providers", [])):
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_auth = self._provider_auth_state(candidate)
+                    if candidate_auth.get("kind") == "openai_login":
+                        candidate["enabled"] = candidate_auth.get("credential_ref") == credential_ref
+            elif result.get("status") != "signed_in":
+                provider_copy = self._copy_provider_for_edit(provider)
+                provider_copy["enabled"] = False
+                self._draft["providers"][provider_index] = provider_copy
+        self._last_operation = summary
+        return summary
+
+    def trusted_provider_auth_start(self, provider_id: object) -> dict[str, Any]:
+        """Start login for the native host and return only the short-lived challenge."""
+
+        index = self._provider_index({"provider_id": provider_id})
+        provider = self._draft["providers"][index]
+        if not isinstance(provider, Mapping):
+            raise DomainError("The selected provider is unavailable")
+        auth = self._provider_auth_state(provider)
+        if auth["kind"] == "api_key" or not auth.get("credential_ref"):
+            raise DomainError("Account login is unavailable for this provider")
+        manager = self._auth_manager()
+        manager.start(auth["kind"], auth["credential_ref"])
+        # Device-code generation is asynchronous. Return promptly with the
+        # current authorizing state; the UI polls auth_status and opens the
+        # WebView as soon as the challenge is available.
+        deadline = time.monotonic() + 2
+        result: Mapping[str, Any] = {}
+        while time.monotonic() < deadline:
+            result = manager.status(auth["kind"], auth["credential_ref"])
+            if result.get("user_code") or result.get("status") != "authorizing":
+                break
+            time.sleep(0.05)
+        return {
+            "provider_id": self._safe_provider(provider, index)["id"],
+            "auth_kind": auth["kind"],
+            "auth_status": str(result.get("status", "error")),
+            **({"verification_uri": str(result["verification_uri"])} if result.get("verification_uri") else {}),
+            **({"user_code": str(result["user_code"])} if result.get("user_code") else {}),
+        }
 
     def _new_model(
         self,
@@ -1564,8 +2252,22 @@ class ProvidersModelsDomain:
         model = _copy_mapping(value, "model")
         if "name" in model and "model_name" not in model:
             model["model_name"] = model.pop("name")
-        if "upstream_model" in model and "litellm_model" not in model:
-            model["litellm_model"] = model.pop("upstream_model")
+        if "upstream_model" in model:
+            # ``upstream_model`` is the public IPC alias for LiteLLM's
+            # canonical ``litellm_model`` field.  Resolve it even when a
+            # caller supplied an empty canonical field, otherwise the empty
+            # value would hide a valid alias.
+            upstream_model = model.pop("upstream_model")
+            if not str(model.get("litellm_model", "")).strip():
+                model["litellm_model"] = upstream_model
+        if (
+            str(model.get("model_name") or "").strip()
+            and not str(model.get("litellm_model") or "").strip()
+        ):
+            # A newly added model is commonly entered by its public name
+            # alone.  Use that name as the upstream route until the user
+            # explicitly chooses a different upstream model.
+            model["litellm_model"] = model["model_name"]
         if "model_enabled" in model:
             model["enabled"] = model["model_enabled"]
         elif "enabled" in model:
@@ -1579,9 +2281,15 @@ class ProvidersModelsDomain:
         if not str(model.get("upstream_url_surface", "")).strip():
             model["upstream_url_surface"] = self._default_upstream_surface(provider, model)
         if not str(model.get("upstream_protocol_mode", "")).strip():
-            model["upstream_protocol_mode"] = "fallback"
+            model["upstream_protocol_mode"] = (
+                "fixed"
+                if self._provider_auth_state(provider)["kind"] != "api_key"
+                else "fallback"
+            )
         if "litellm_model" in model:
-            model["litellm_model"] = self._canonical_upstream_model(model["litellm_model"], model)
+            model["litellm_model"] = self._canonical_upstream_model(
+                model["litellm_model"], model, provider
+            )
         self._normalize_model_binding(provider, model)
         deployment_id = str(model.get("deployment_id", "")).strip().lower()
         if not deployment_id:
@@ -2805,10 +3513,22 @@ class ProvidersModelsDomain:
                 raise DomainError("Relay association is selected through a provider key")
             provider_key_changed = "provider_key_id" in changes
             api_key_name_changed = "api_key_name" in changes
+            public_name_changed = "name" in changes or "model_name" in changes
+            explicit_upstream_change = "upstream_model" in changes or "litellm_model" in changes
             if "name" in changes:
                 changes["model_name"] = changes.pop("name")
             if "upstream_model" in changes:
                 changes["litellm_model"] = changes.pop("upstream_model")
+            if (
+                public_name_changed
+                and not explicit_upstream_change
+                and str(changes.get("model_name") or "").strip()
+                and not str(model.get("litellm_model") or "").strip()
+            ):
+                # Keep the draft usable when the UI commits only the public
+                # name of a just-created (initially blank) model.  An
+                # explicit upstream change always wins, including clearing it.
+                changes["litellm_model"] = changes["model_name"]
             current_order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
             next_order_mode = str(changes.get("order_mode", current_order_mode)).strip() or "manual"
             if "order" in changes and "manual_order" not in changes and next_order_mode == "manual":
@@ -2905,9 +3625,13 @@ class ProvidersModelsDomain:
                     )
                 model["source_model_id"] = ""
             if "litellm_model" in changes:
-                model["litellm_model"] = self._canonical_upstream_model(model["litellm_model"], model)
+                model["litellm_model"] = self._canonical_upstream_model(
+                    model["litellm_model"], model, provider
+                )
             if "upstream_url_surface" in changes:
-                model["litellm_model"] = self._canonical_upstream_model(model.get("litellm_model"), model)
+                model["litellm_model"] = self._canonical_upstream_model(
+                    model.get("litellm_model"), model, provider
+                )
             self._normalize_model_binding(provider, model)
             models[index] = model
         elif action in {"model_delete", "delete_model"}:
@@ -3009,6 +3733,15 @@ class ProvidersModelsDomain:
             self._probe_overlay.clear()
         elif name in {"routes_reorder_group", "route_reorder_group"}:
             self._reorder_route_group(data)
+        elif name in {"provider_auth_start", "provider_auth_cancel", "provider_auth_logout", "provider_auth_status"}:
+            self._provider_auth_operation(name, data)
+        elif name.startswith("service_provider_") or name in {
+            "service_add_provider",
+            "service_patch_provider",
+            "service_delete_provider",
+            "service_activate_provider",
+        }:
+            self._dispatch_service_provider(name, data)
         elif name in {"relay_dependency_policy", "relay_apply_dependency_policy"}:
             self._last_operation = self._apply_relay_dependency_policy(
                 data.get("resources", data.get("source", data)),
@@ -3032,6 +3765,18 @@ class ProvidersModelsDomain:
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if field == "import_link" and target is None:
             return False
+        if field == "provider_auth_token" and isinstance(target, str):
+            index = self._provider_index({"provider_id": target})
+            provider = self._draft["providers"][index]
+            if not isinstance(provider, Mapping):
+                return False
+            auth = self._provider_auth_state(provider)
+            if auth["kind"] != "claude_login":
+                raise DomainError("The requested secret field is unavailable")
+            try:
+                return bool(self._auth_manager().status(auth["kind"], auth["credential_ref"]).get("configured"))
+            except Exception:
+                return False
         if field != "api_key" or not isinstance(target, str):
             raise DomainError("The requested secret field is unavailable")
         index, key_name = self._secret_target(target)
@@ -3078,6 +3823,23 @@ class ProvidersModelsDomain:
             self._import_link(value)
             self.revision += 1
             return
+        if field == "provider_auth_token" and isinstance(target, str):
+            index = self._provider_index({"provider_id": target})
+            provider = self._draft["providers"][index]
+            if not isinstance(provider, Mapping):
+                raise DomainError("The selected provider is unavailable")
+            auth = self._provider_auth_state(provider)
+            if auth["kind"] != "claude_login":
+                raise DomainError("The requested secret field is unavailable")
+            try:
+                if value:
+                    self._auth_manager().import_claude_token(auth["credential_ref"], value)
+                else:
+                    self._auth_manager().logout(auth["kind"], auth["credential_ref"])
+            except Exception:
+                raise DomainError("Claude OAuth token is invalid") from None
+            self.revision += 1
+            return
         if field != "api_key" or not isinstance(target, str):
             raise DomainError("The requested secret field is unavailable")
         index, key_name = self._secret_target(target)
@@ -3117,6 +3879,9 @@ class ProvidersModelsDomain:
                 ):
                     return {"valid": False, "errors": ["Every API key needs a value"]}
         candidate_providers = copy.deepcopy(providers)
+        runtime_slot_error = self._openai_runtime_slot_error(candidate_providers)
+        if runtime_slot_error:
+            return {"valid": False, "errors": [runtime_slot_error]}
         if allow_unmaterialized_relay_keys and isinstance(candidate_providers, list):
             for provider in candidate_providers:
                 if not isinstance(provider, dict):

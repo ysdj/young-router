@@ -21,6 +21,7 @@ from .schema import (
     MENU_MODEL_ENABLED_KEY,
     MENU_ORDER_MODE_KEY,
     MENU_PROVIDER_KEY_ID_KEY,
+    MENU_PROVIDER_AUTH_KEY,
     MENU_PROVIDER_SOURCE_KEY,
     MENU_RELAY_CATALOG_MODE_KEY,
     MENU_RELAY_KEYS_KEY,
@@ -35,6 +36,7 @@ from .schema import (
     _as_list,
     _bool_value,
     _provider_key_id,
+    _provider_auth,
     _provider_source,
     _relay_source,
     _stable_provider_key_id,
@@ -281,6 +283,19 @@ def _dump_providers_section(providers: list[dict[str, Any]]) -> str:
             }
         source = _provider_source(raw_source)
         extra[MENU_PROVIDER_SOURCE_KEY] = source
+        raw_auth = extra.get(MENU_PROVIDER_AUTH_KEY)
+        auth_kind = _string_value(provider.get("auth_kind")).strip()
+        credential_ref = _string_value(provider.get("auth_credential_ref")).strip()
+        if auth_kind or credential_ref:
+            raw_auth = {
+                "kind": auth_kind or "api_key",
+                **({"credential_ref": credential_ref} if credential_ref else {}),
+            }
+        auth = _provider_auth(raw_auth)
+        if auth["kind"] == "api_key":
+            extra.pop(MENU_PROVIDER_AUTH_KEY, None)
+        else:
+            extra[MENU_PROVIDER_AUTH_KEY] = auth
         for key, value in extra.items():
             lines.append(f"    {key}: {_plain_scalar(value)}")
     if len(lines) == 1:
@@ -309,9 +324,27 @@ def _entry_from_editor(
     upstream_protocol_mode = _upstream_protocol_mode(
         model.get("upstream_protocol_mode")
     )
+    auth = _provider_auth(
+        {
+            "kind": provider.get("auth_kind", "api_key"),
+            **(
+                {"credential_ref": provider.get("auth_credential_ref")}
+                if provider.get("auth_credential_ref")
+                else {}
+            ),
+        }
+    )
+    adapter = (
+        "chatgpt"
+        if auth["kind"] == "openai_login"
+        else "anthropic"
+        if auth["kind"] == "claude_login"
+        else None
+    )
     litellm_model = canonical_litellm_model(
         model.get("litellm_model", ""),
         upstream_url_surface,
+        adapter,
     )
 
     if not provider_name:

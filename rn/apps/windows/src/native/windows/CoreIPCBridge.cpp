@@ -377,7 +377,9 @@ std::optional<std::string> CoreIPCBridge::ReadPlainTextSecret(
   if (!capability) return std::nullopt;
   return ReadSecret(
       capability->token,
-      domain == "runtime" && field == "setting" && target && *target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON");
+      domain == "runtime" && field == "setting" && target &&
+          (*target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON" ||
+           *target == "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"));
 }
 
 std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(

@@ -1378,7 +1378,7 @@ def _response_item_is_web_search_call(item: Any) -> bool:
         return False
     if json_item.get("type") == "web_search_call":
         return True
-    return _responses_web_search_bridge_module._is_litellm_web_search_call_item(json_item)
+    return _responses_web_search_bridge_module._is_web_search_function_call_item(json_item)
 
 
 def _response_item_is_codex_compaction(item: Any) -> bool:
@@ -4655,7 +4655,7 @@ class _ResponsesStreamCompletionState:
         item_id = _stream_output_item_key(json_item)
         if item_id and (
             json_item.get("type") == "function_call"
-            or _responses_web_search_bridge_module._is_litellm_web_search_call_item(json_item)
+            or _responses_web_search_bridge_module._is_web_search_function_call_item(json_item)
         ):
             existing_args = json_item.get("arguments")
             if existing_args is None:
@@ -4667,7 +4667,7 @@ class _ResponsesStreamCompletionState:
         if chunk_type == "response.output_item.done":
             self.output_by_index[index] = json_item
             self.pending_by_index.pop(index, None)
-        elif json_item.get("type") == "function_call" or _responses_web_search_bridge_module._is_litellm_web_search_call_item(json_item):
+        elif json_item.get("type") == "function_call" or _responses_web_search_bridge_module._is_web_search_function_call_item(json_item):
             self.pending_by_index[index] = json_item
 
     def _remember_function_arguments(self, dumped: dict[str, Any], chunk_type: str) -> None:
@@ -5101,7 +5101,7 @@ async def _yield_guarded_original_stream(
         )
 
     def should_consume_bridge_calls() -> bool:
-        return _tools_module._request_should_consume_litellm_web_search_function_call(request_data)
+        return _tools_module._request_should_consume_web_search_function_call(request_data)
 
     def internal_bridge_item_from_chunk(chunk: Any) -> Optional[dict[str, Any]]:
         dumped = _stream_chunk_dump(chunk)
@@ -5111,7 +5111,7 @@ async def _yield_guarded_original_stream(
         }:
             return None
         item = _jsonable(dumped.get("item"))
-        if isinstance(item, dict) and _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
+        if isinstance(item, dict) and _responses_web_search_bridge_module._is_web_search_function_call_item(item):
             return item
         return None
 
@@ -5145,14 +5145,14 @@ async def _yield_guarded_original_stream(
         ):
             return None
         payload = completion_state.completed_payload(request_data)
-        if _responses_web_search_bridge_module._has_litellm_web_search_actions_for_request(payload, request_data):
+        if _responses_web_search_bridge_module._has_web_search_actions_for_request(payload, request_data):
             return payload
         return None
 
     def bridge_payload_for_chunk(chunk: Any) -> Optional[dict[str, Any]]:
         if not should_consume_bridge_calls():
             return None
-        if _responses_web_search_bridge_module._has_litellm_web_search_actions_for_request(chunk, request_data):
+        if _responses_web_search_bridge_module._has_web_search_actions_for_request(chunk, request_data):
             return completion_state.completed_payload(request_data)
         dumped = _stream_chunk_dump(chunk)
         if _stream_chunk_type(dumped) in {
@@ -5166,7 +5166,7 @@ async def _yield_guarded_original_stream(
         trigger_chunk: Any,
         payload: dict[str, Any],
     ) -> AsyncIterator[Any]:
-        actions = _responses_web_search_bridge_module._litellm_web_search_actions_for_request(payload, request_data)
+        actions = _responses_web_search_bridge_module._web_search_actions_for_request(payload, request_data)
         _trace_module._route_trace(
             "external_web_search_bridge_guarded_stream_function_call_intercept",
             request_id=_routing_module._trace_request_id(request_data),
@@ -5180,7 +5180,7 @@ async def _yield_guarded_original_stream(
             stream_event_count=completion_state.event_count,
         )
         original_function = _responses_execution_module._responses_bridge_original_function(request_data)
-        async for resolved_chunk in _computer_facade_module._resolve_litellm_web_search_function_calls_stream_rounds(
+        async for resolved_chunk in _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
             payload,
             request_data,
             original_function,
@@ -5254,7 +5254,7 @@ async def _yield_guarded_original_stream(
             return False
         if json_item.get("type") == "web_search_call":
             return True
-        return _responses_web_search_bridge_module._is_litellm_web_search_call_item(json_item)
+        return _responses_web_search_bridge_module._is_web_search_function_call_item(json_item)
 
     def output_item_has_visible_assistant_text(item: Any) -> bool:
         return _response_item_has_assistant_text(item)
@@ -5400,6 +5400,7 @@ async def _yield_guarded_original_stream(
             return False
         return _routing_module._is_native_responses_web_search_unsupported_error(
             exception,
+            request_data,
         )
 
     def web_search_missing_answer_failed_event(
@@ -5648,6 +5649,11 @@ async def _yield_guarded_original_stream(
         reason: str,
         exception: Optional[Exception] = None,
     ) -> AsyncIterator[Any]:
+        if _responses_web_search_bridge_module._request_has_provider_native_web_search_event(
+            request_data
+        ):
+            yield web_search_missing_answer_failed_event(reason, exception)
+            return
         if not external_web_search_recovery_allowed(exception):
             yield web_search_missing_answer_failed_event(reason, exception)
             return
@@ -5789,7 +5795,7 @@ async def _yield_guarded_original_stream(
         for item in recovered_payload.get("output", []):
             if not isinstance(item, dict):
                 continue
-            if item.get("type") == "web_search_call" or _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
+            if item.get("type") == "web_search_call" or _responses_web_search_bridge_module._is_web_search_function_call_item(item):
                 continue
             item = _responses_web_search_bridge_module._final_answer_message_item(item)
             final_output.append(item)
@@ -5824,7 +5830,7 @@ async def _yield_guarded_original_stream(
         for item_id in list(internal_bridge_item_ids):
             pending_tool_items.pop(item_id, None)
         for output_index, item in list(completed_output_items.items()):
-            if _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
+            if _responses_web_search_bridge_module._is_web_search_function_call_item(item):
                 completed_output_items.pop(output_index, None)
 
     def completed_terminal_event(
@@ -5938,6 +5944,9 @@ async def _yield_guarded_original_stream(
         return _synthesized_failed_response_event(request_data, failure)
 
     for chunk in buffer:
+        _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+            request_data, chunk
+        )
         sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
         if sanitized_chunk is None:
             continue
@@ -6050,6 +6059,9 @@ async def _yield_guarded_original_stream(
             saw_visible_output=visible_output_seen,
             initial_chunk_count=len(buffer),
         ):
+            _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+                request_data, chunk
+            )
             sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
             if sanitized_chunk is None:
                 continue
@@ -6314,7 +6326,22 @@ async def _yield_streaming_error_fallback_or_raise(
     route_recovery_poll_payload = litellm_metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True
     if is_responses_stream and _routing_module._is_context_size_error(exception):
         raise exception
-    if _routing_module._should_block_external_web_search_original_recovery(request_data):
+    native_web_search_unsupported = (
+        is_responses_stream
+        and _routing_module._is_native_responses_web_search_unsupported_error(
+            exception,
+            request_data,
+        )
+        and not _responses_web_search_bridge_module._request_has_provider_native_web_search_event(
+            request_data
+        )
+    )
+    if (
+        _routing_module._should_block_external_web_search_original_recovery(
+            request_data
+        )
+        and not native_web_search_unsupported
+    ):
         _trace_module._route_trace(
             "external_web_search_original_stream_fallback_blocked",
             request_id=_routing_module._trace_request_id(request_data),
@@ -6325,12 +6352,7 @@ async def _yield_streaming_error_fallback_or_raise(
         )
         yield _external_web_search_missing_answer_failed_event(request_data, exception)
         return
-    if (
-        is_responses_stream
-        and _routing_module._is_native_responses_web_search_unsupported_error(
-            exception,
-        )
-    ):
+    if native_web_search_unsupported:
         from . import responses_surfaces as _responses_surfaces_module
 
         external_web_search_bridge_kwargs = (
@@ -6344,7 +6366,7 @@ async def _yield_streaming_error_fallback_or_raise(
         )
         if external_web_search_bridge_kwargs is not None and original_function is not None:
             try:
-                bridge_response = await _responses_execution_module._execute_responses_external_web_search_bridge_call(
+                bridge_response = await _responses_execution_module._execute_responses_native_web_search_bridge_call(
                     original_function,
                     external_web_search_bridge_kwargs,
                     original_request_kwargs=request_data,
@@ -6359,6 +6381,27 @@ async def _yield_streaming_error_fallback_or_raise(
                 ):
                     yield chunk
                 return
+        if (
+            _routing_module._should_block_external_web_search_original_recovery(
+                request_data
+            )
+            and not native_web_search_unsupported
+        ):
+            _trace_module._route_trace(
+                "external_web_search_original_stream_fallback_blocked",
+                request_id=_routing_module._trace_request_id(request_data),
+                session=_routing_module._trace_session_context(request_data),
+                model_group=_responses_execution_module._request_model_group(
+                    request_data
+                ),
+                request=_trace_module._trace_request_summary(request_data),
+                exception=_routing_module._trace_exception(exception),
+            )
+            yield _external_web_search_missing_answer_failed_event(
+                request_data,
+                exception,
+            )
+            return
     fallback_start_buffer: List[Any] = []
     fallback_started_delivery = False
     fallback_delivered_terminal_or_visible = False
@@ -6612,6 +6655,44 @@ async def _yield_start_buffered_stream_with_error_fallback(
             yield chunk
         return
     if _routing_module._is_failed_responses_stream_response(response):
+        failed_exception = getattr(response, "exception", None)
+        failed_request = getattr(response, "request_data", None)
+        if (
+            isinstance(failed_exception, Exception)
+            and isinstance(failed_request, dict)
+            and _routing_module._is_native_responses_web_search_unsupported_error(
+                failed_exception,
+                failed_request,
+            )
+            and not _responses_web_search_bridge_module._request_has_provider_native_web_search_event(
+                failed_request
+            )
+        ):
+            from . import responses_surfaces as _responses_surfaces_module
+
+            bridge_kwargs = (
+                _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
+                    failed_exception,
+                    failed_request,
+                    failed_request,
+                )
+            )
+            original_function = _responses_execution_module._responses_bridge_original_function(
+                failed_request
+            )
+            if bridge_kwargs is not None and original_function is not None:
+                bridge_response = await _responses_execution_module._execute_responses_native_web_search_bridge_call(
+                    original_function,
+                    bridge_kwargs,
+                    original_request_kwargs=failed_request,
+                    outer_request_kwargs=failed_request,
+                )
+                async for chunk in _yield_start_buffered_stream_with_error_fallback(
+                    bridge_response,
+                    bridge_kwargs,
+                ):
+                    yield chunk
+                return
         async for chunk in response:
             yield chunk
         return
@@ -6649,7 +6730,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
     saw_visible_output = False
     should_delay_web_search_preamble = (
         is_responses_stream
-        and _tools_module._request_should_consume_litellm_web_search_function_call(request_data)
+        and _tools_module._request_should_consume_web_search_function_call(request_data)
     )
     stream_exhausted = True
     stream_started_at = time.monotonic()
@@ -6669,6 +6750,9 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 stream_started_at=stream_started_at,
             )
         async for chunk in stream:
+            _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+                request_data, chunk
+            )
             sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
             if sanitized_chunk is None:
                 continue
@@ -6711,8 +6795,8 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 completion_state.remember(chunk)
             if (
                 is_responses_stream
-                and _tools_module._request_should_consume_litellm_web_search_function_call(request_data)
-                and _responses_web_search_bridge_module._has_litellm_web_search_actions_for_request(
+                and _tools_module._request_should_consume_web_search_function_call(request_data)
+                and _responses_web_search_bridge_module._has_web_search_actions_for_request(
                     completion_state.completed_payload(request_data),
                     request_data,
                 )
@@ -6727,12 +6811,12 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     route_key=_routing_module._deployment_route_key_from_request(request_data),
                     request=_trace_module._trace_request_summary(request_data),
                     response=_trace_module._trace_response_summary(payload, request_data),
-                    actions=_responses_web_search_bridge_module._litellm_web_search_actions_for_request(payload, request_data),
+                    actions=_responses_web_search_bridge_module._web_search_actions_for_request(payload, request_data),
                     buffered_chunks=len(buffer),
                 )
                 await _close_async_iterator_safely(response)
                 original_function = _responses_execution_module._responses_bridge_original_function(request_data)
-                async for resolved_chunk in _computer_facade_module._resolve_litellm_web_search_function_calls_stream_rounds(
+                async for resolved_chunk in _computer_facade_module._resolve_web_search_function_calls_stream_rounds(
                     payload,
                     request_data,
                     original_function,

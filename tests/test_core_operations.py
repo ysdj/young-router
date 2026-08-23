@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,7 @@ from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
 from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
 from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
 from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
+from litellm_menu.core.domains._shared import DomainError
 from litellm_menu.core.operations import CoreServiceController
 from litellm_menu.core.persistence import PersistenceError
 
@@ -504,7 +506,11 @@ class CoreOperationsTests(unittest.TestCase):
             )
             controller = CoreServiceController(
                 root,
-                environment={"LITELLM_MENU_VISION_BRIDGE_API_KEY": "test-inherited-secret"},
+                environment={
+                    "LITELLM_MENU_VISION_BRIDGE_API_KEY": "test-inherited-secret",
+                    "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON": '{"enabled":false}',
+                    "LITELLM_MENU_VISION_ROUTER_CONFIG_JSON": '{"enabled":false}',
+                },
             )
             environment = controller._runtime_env()
 
@@ -513,8 +519,195 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertNotIn("LITELLM_CONFIG_WATCH_INTERVAL", environment)
             self.assertNotIn("LITELLM_CONFIG_WATCH_SETTLE_INTERVAL", environment)
             self.assertNotIn("LITELLM_MENU_VISION_BRIDGE_API_KEY", environment)
+            self.assertEqual(
+                json.loads(environment["LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"]),
+                {
+                    "enabled": True,
+                    "backend": "auto",
+                    "freeFallback": True,
+                    "timeoutSeconds": 45,
+                    "maxTokens": 4096,
+                    "providers": [],
+                    "httpProviders": [],
+                    "localOllama": {"enabled": False},
+                    "localLmStudio": {"enabled": False},
+                },
+            )
+            self.assertNotIn("LITELLM_MENU_VISION_ROUTER_CONFIG_JSON", environment)
             with mock.patch.object(controller, "_health", return_value=True):
                 self.assertEqual("unknown", controller.status()["state"])
+
+    def test_dsh_quick_runtime_settings_merge_into_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RuntimeSettingsDomain(root / "runtime-settings.env")
+            json_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            domain.dispatch(
+                "set_setting",
+                {
+                    "key": json_key,
+                    "value": json.dumps(
+                        {
+                            "enabled": True,
+                            "backend": "api",
+                            "freeFallback": True,
+                            "timeoutSeconds": 9,
+                            "maxTokens": 321,
+                            "localOllama": {"enabled": False, "model": "custom-local"},
+                        }
+                    ),
+                },
+            )
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", "value": "off"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND", "value": "local"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK", "value": "off"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "27"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS", "value": "2048"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "off"})
+            domain.apply()
+
+            environment = CoreServiceController(root)._runtime_env()
+            merged = json.loads(environment[json_key])
+            self.assertEqual(
+                {
+                    "enabled": False,
+                    "backend": "local",
+                    "freeFallback": False,
+                    "timeoutSeconds": 27,
+                    "maxTokens": 2048,
+                    "localOllama": {"enabled": False, "model": "custom-local"},
+                },
+                merged,
+            )
+            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", environment)
+            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_BACKEND", environment)
+
+    def test_dsh_json_values_remain_when_quick_settings_are_unconfigured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RuntimeSettingsDomain(root / "runtime-settings.env")
+            json_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            custom = {
+                "enabled": False,
+                "backend": "local",
+                "freeFallback": False,
+                "timeoutSeconds": 9,
+                "maxTokens": 321,
+                "localOllama": {"enabled": True, "model": "custom-local"},
+            }
+            domain.dispatch("set_setting", {"key": json_key, "value": json.dumps(custom)})
+            domain.apply()
+
+            environment = CoreServiceController(root)._runtime_env()
+            self.assertEqual(custom, json.loads(environment[json_key]))
+
+    def test_dsh_quick_inherit_values_restore_advanced_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RuntimeSettingsDomain(root / "runtime-settings.env")
+            json_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            custom = {
+                "enabled": False,
+                "backend": "api",
+                "freeFallback": False,
+                "timeoutSeconds": 13,
+                "maxTokens": 513,
+                "localOllama": {"enabled": True, "model": "custom-local"},
+            }
+            domain.dispatch("set_setting", {"key": json_key, "value": json.dumps(custom)})
+            # Explicit values override JSON, including values that previously
+            # collided with schema defaults.
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", "value": "on"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "45"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS", "value": "4096"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "off"})
+            domain.apply()
+
+            overridden = json.loads(CoreServiceController(root)._runtime_env()[json_key])
+            self.assertTrue(overridden["enabled"])
+            self.assertEqual(45, overridden["timeoutSeconds"])
+            self.assertEqual(4096, overridden["maxTokens"])
+            self.assertFalse(overridden["localOllama"]["enabled"])
+
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", "value": "inherit"})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": ""})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS", "value": ""})
+            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "inherit"})
+            domain.apply()
+
+            inherited = json.loads(CoreServiceController(root)._runtime_env()[json_key])
+            self.assertEqual(custom, inherited)
+
+    def test_dsh_inherit_and_empty_quick_values_do_not_reach_proxy_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            json_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            config = '{"enabled":false,"timeoutSeconds":13}'
+            encoded = base64.urlsafe_b64encode(config.encode("utf-8")).decode("ascii").rstrip("=")
+            (root / "runtime-settings.env").write_text(
+                f"{json_key}=base64:{encoded}\n"
+                "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED=inherit\n"
+                "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS=\n",
+                encoding="utf-8",
+            )
+
+            environment = CoreServiceController(root)._runtime_env()
+            self.assertEqual(json.loads(config), json.loads(environment[json_key]))
+            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", environment)
+            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", environment)
+
+    def test_dsh_quick_controls_and_json_are_one_bidirectional_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RuntimeSettingsDomain(root / "runtime-settings.env")
+            config_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            enabled_key = "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED"
+            backend_key = "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND"
+
+            fields = {item["key"]: item for item in domain.snapshot()["fields"]}
+            self.assertEqual("on", fields[enabled_key]["value"])
+            self.assertEqual("on", fields[enabled_key]["default"])
+            self.assertNotIn("inherit", fields[enabled_key]["options"])
+
+            domain.dispatch("set_setting", {"key": enabled_key, "value": "off"})
+            quick_updated = json.loads(domain.trusted_secret_value("setting", config_key))
+            self.assertFalse(quick_updated["enabled"])
+            with self.assertRaisesRegex(DomainError, "Runtime settings are invalid"):
+                domain.dispatch(
+                    "set_setting",
+                    {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "0"},
+                )
+
+            domain.stage_secret(
+                "setting",
+                config_key,
+                json.dumps({"enabled": True, "backend": "local", "timeoutSeconds": 12}),
+            )
+            fields = {item["key"]: item for item in domain.snapshot()["fields"]}
+            self.assertEqual("on", fields[enabled_key]["value"])
+            self.assertEqual("local", fields[backend_key]["value"])
+            self.assertEqual("12", fields["LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS"]["value"])
+
+            domain.dispatch("clear_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS"})
+            cleared = json.loads(domain.trusted_secret_value("setting", config_key))
+            self.assertNotIn("timeoutSeconds", cleared)
+
+    def test_invalid_dsh_json_stops_runtime_environment_materialization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "runtime-settings.env").write_text(
+                "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON=base64:not-valid-json\n"
+                "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED=0\n",
+                encoding="utf-8",
+            )
+            controller = CoreServiceController(root)
+
+            with self.assertRaisesRegex(RuntimeError, "Runtime settings are invalid"):
+                controller._runtime_env()
+
+            fallback = controller._runtime_env(strict=False)
+            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON", fallback)
+            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", fallback)
 
     def test_codex_descendant_cleanup_uses_runtime_settings_value(self) -> None:
         key = "LITELLM_MENU_CODEX_DESCENDANT_CLEANUP"

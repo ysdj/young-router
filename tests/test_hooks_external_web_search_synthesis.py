@@ -182,7 +182,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
+        resolved = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -215,7 +215,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
+        resolved = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -236,7 +236,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"',
                     "status": "completed",
                 }
@@ -244,7 +244,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         }
 
         with self.assertRaises(RuntimeError) as context:
-            await hooks._resolve_litellm_web_search_function_calls(
+            await hooks._resolve_web_search_function_calls(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -279,7 +279,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                                         "id": f"call_{len(calls)}",
                                         "type": "function",
                                         "function": {
-                                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                                            "name": "web_search",
                                             "arguments": arguments,
                                         },
                                     }
@@ -293,7 +293,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         call_kwargs = {
             "model": "openai/vendor-chat",
             "input": "Use web_search for Sample City weather.",
-            "tools": [hooks._external_web_search_bridge_chat_tool()],
+            "tools": [hooks._pi_web_access_tool_definitions()[0]],
             "model_info": {
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat"],
@@ -309,7 +309,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("malformed or truncated", calls[1]["messages"][0]["content"])
         self.assertEqual(
-            hooks._litellm_web_search_actions_from_response(response),
+            hooks._web_search_actions_from_response(response),
             [{"type": "search", "query": "Sample City current weather"}],
         )
 
@@ -319,7 +319,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "model": "openai/vendor-chat",
             "input": "请查上海今天天气。",
             "tools": [
-                hooks._external_web_search_bridge_chat_tool(),
+                hooks._pi_web_access_tool_definitions()[0],
                 {
                     "type": "function",
                     "name": "exec_command",
@@ -343,13 +343,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             phase="continuation",
         )
 
-        self.assertEqual(
-            initial["tool_choice"],
-            {
-                "type": "function",
-                "function": {"name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME},
-            },
-        )
+        self.assertEqual(initial["tool_choice"], "auto")
         self.assertNotIn("tool_choice", continuation)
 
     def test_external_web_search_initial_current_fact_keeps_kimi_search_optional(self) -> None:
@@ -358,7 +352,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "model": "openai/kimi-k3",
             "input": "请查上海今天天气。",
             "reasoning": {"effort": "low"},
-            "tools": [hooks._external_web_search_bridge_chat_tool()],
+            "tools": [hooks._pi_web_access_tool_definitions()[0]],
             "model_info": {
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat"],
@@ -374,10 +368,10 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertEqual(payload["tool_choice"], "auto")
         self.assertEqual(
             [tool["function"]["name"] for tool in payload["tools"]],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search"],
         )
         self.assertEqual(payload["max_completion_tokens"], 512)
-        self.assertIn("optional and weak", payload["messages"][0]["content"])
+        self.assertIn("optional", payload["messages"][0]["content"])
 
     def test_external_web_search_non_gpt_current_fact_keeps_search_optional(self) -> None:
         hooks, _ = load_hook_module()
@@ -385,7 +379,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "model": "openai/kimi-k3",
             "input": "上海前天天气",
             "reasoning": {"effort": "low"},
-            "tools": [hooks._external_web_search_bridge_chat_tool()],
+            "tools": [hooks._pi_web_access_tool_definitions()[0]],
             "model_info": {
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat"],
@@ -401,7 +395,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         self.assertEqual(payload["tool_choice"], "auto")
         self.assertEqual(payload["max_completion_tokens"], 512)
-        self.assertIn("optional and weak", payload["messages"][0]["content"])
+        self.assertIn("optional", payload["messages"][0]["content"])
 
     def test_external_web_search_continuation_slims_codex_deferred_tools(self) -> None:
         hooks, _ = load_hook_module()
@@ -428,7 +422,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         self.assertEqual(
             continuation_kwargs["tools"],
-            [hooks._external_web_search_bridge_chat_tool()],
+            hooks._pi_web_access_tool_definitions(),
         )
         self.assertEqual(
             continuation_kwargs["max_output_tokens"],
@@ -456,8 +450,34 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         self.assertEqual(
             hooks._external_web_search_continuation_tools(request_kwargs),
-            [hooks._external_web_search_bridge_chat_tool()],
+            hooks._pi_web_access_tool_definitions(),
         )
+
+    def test_external_web_search_continuation_keeps_native_pi_tools_without_legacy_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "model": "openai/vendor-responses",
+            "input": "上海今天天气",
+            "tools": [
+                {"type": "function", "name": "web_search", "parameters": {"type": "object"}},
+                {"type": "function", "name": "fetch_content", "parameters": {"type": "object"}},
+            ],
+        }
+
+        continuation = hooks._external_web_search_continuation_kwargs(
+            request_kwargs,
+            search_results="Web search results for query: 上海今天天气",
+            queries=["上海今天天气"],
+            completed_actions=[{"type": "search", "query": "上海今天天气"}],
+            round_number=1,
+        )
+
+        self.assertEqual(
+            {tool.get("name") for tool in continuation["tools"]},
+            {"web_search", "fetch_content"},
+        )
+        self.assertNotIn("private_web_search_bridge", continuation["instructions"])
+        self.assertNotIn("private lookup function", continuation["input"])
 
     async def test_external_web_search_continuation_keeps_active_chat_surface(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -492,7 +512,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                                             "id": "call_initial",
                                             "type": "function",
                                             "function": {
-                                                "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                                                "name": "web_search",
                                                 "arguments": json.dumps(
                                                     {"query": "上海天气 今天"}
                                                 ),
@@ -527,7 +547,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "stream": True,
             "use_chat_completions_api": True,
             "_litellm_menu_upstream_url_surface": "openai/chat",
-            "tools": [hooks._external_web_search_bridge_chat_tool()],
+            "tools": [hooks._pi_web_access_tool_definitions()[0]],
             "litellm_metadata": {
                 hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
                 hooks._WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY: True,
@@ -543,7 +563,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             phase="initial",
         )
         self.assertEqual(
-            hooks._litellm_web_search_actions_from_response(initial),
+            hooks._web_search_actions_from_response(initial),
             [{"type": "search", "query": "上海天气 今天"}],
         )
         self.assertEqual(
@@ -638,7 +658,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                     "name": "exec",
                     "description": "Run JavaScript in the task runtime.",
                 },
-                hooks._external_web_search_bridge_chat_tool(),
+                hooks._pi_web_access_tool_definitions()[0],
             ],
             bridge_web_search=True,
         )
@@ -767,7 +787,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                     "name": "exec_command",
                     "parameters": {"type": "object"},
                 },
-                hooks._external_web_search_bridge_chat_tool(),
+                hooks._pi_web_access_tool_definitions()[0],
             ],
             "model_info": {
                 "upstream_url_surface": "openai/chat",
@@ -1186,7 +1206,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 "tools": [
                     {
                         "type": "function",
-                        "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                        "name": "web_search",
                         "parameters": {"type": "object"},
                     }
                 ],
@@ -1406,7 +1426,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         tool_names = [tool.get("name") for tool in continuation_kwargs.get("tools", [])]
         self.assertNotIn("web_search", tool_types)
         self.assertIn("namespace", tool_types)
-        self.assertIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, tool_names)
+        self.assertIn("web_search", tool_names)
         self.assertIn("Decide the next step", continuation_kwargs.get("instructions", ""))
 
         chat_payload = hooks._external_web_search_chat_tool_payload(
@@ -1419,7 +1439,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         ]
         self.assertIn("exec_command", chat_tool_names)
         self.assertIn("browser_open", chat_tool_names)
-        self.assertIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, chat_tool_names)
+        self.assertIn("web_search", chat_tool_names)
 
     async def test_external_web_search_stream_empty_continuation_does_not_route_recover(self) -> None:
         hooks, _ = load_hook_module()
@@ -1502,7 +1522,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample subject transporter"}),
                     "status": "completed",
                 }
@@ -1511,7 +1531,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -1582,14 +1602,14 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample marker context"}),
                     "status": "completed",
                 }
             ],
         }
 
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
+        resolved = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -1704,7 +1724,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.assertTrue(recovery_request["stream"])
         self.assertEqual(
             [tool.get("name") for tool in recovery_request["tools"]],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search", "fetch_content"],
         )
 
     async def test_external_web_search_continuation_async_stream_timeout_keeps_continuation_recovery(self) -> None:
@@ -1804,7 +1824,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"Sample City weather"}',
                     "status": "completed",
                 }
@@ -1815,51 +1835,13 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "model": "balanced-chat",
             "input": "use web_search",
             "tools": [
-                {"type": "function", "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME}
+                {"type": "function", "name": "web_search"}
             ],
             "litellm_metadata": {
                 hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
                 hooks._WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY: True,
             },
             "use_chat_completions_api": True,
-        }
-
-        result = await hook.async_post_call_success_deployment_hook(
-            request_data,
-            response,
-            "aresponses",
-        )
-
-        self.assertIs(result, response)
-
-    async def test_unmarked_internal_web_search_bridge_post_call_skips_hook(self) -> None:
-        hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
-        response = {
-            "id": "resp_raw",
-            "object": "response",
-            "status": "completed",
-            "output": [
-                {
-                    "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
-                    "arguments": '{"query":"Sample City weather"}',
-                    "status": "completed",
-                }
-            ],
-        }
-        request_data = {
-            "call_type": "aresponses",
-            "model": "vendor-chat",
-            "input": "Use web_search for Sample City weather.",
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
-                    },
-                }
-            ],
         }
 
         result = await hook.async_post_call_success_deployment_hook(
@@ -1968,7 +1950,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 "output": [
                     {
                         "type": "function_call",
-                        "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                        "name": "web_search",
                         "arguments": '{"query":"Sample City weather"}',
                         "status": "completed",
                     }
@@ -1980,7 +1962,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "model": "openai/vendor-chat",
             "input": "Use web_search for Sample City weather.",
             "tools": [
-                {"type": "function", "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME}
+                {"type": "function", "name": "web_search"}
             ],
             "litellm_metadata": {
                 hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY: True,
@@ -2079,7 +2061,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                         "output": [
                             {
                                 "type": "function_call",
-                                "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                                "name": "web_search",
                                 "arguments": json.dumps(
                                     {
                                         "url": "https://example.test/article",
@@ -2117,14 +2099,14 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"url": "https://example.test/article"}),
                     "status": "completed",
                 }
             ],
         }
 
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
+        resolved = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -2226,19 +2208,19 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample subject factor A factor B"}),
                     "status": "completed",
                 },
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"url": "https://example.test/source"}),
                     "status": "completed",
                 },
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps(
                         {
                             "url": "https://example.test/source",
@@ -2250,7 +2232,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
+        resolved = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -2332,7 +2314,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                     "output": [
                         {
                             "type": "function_call",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": json.dumps(
                                 {"query": "sample city weather", "page": 2}
                             ),
@@ -2367,14 +2349,14 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample city weather"}),
                     "status": "completed",
                 }
             ],
         }
 
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
+        resolved = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -2462,19 +2444,19 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample subject factor A factor B"}),
                     "status": "completed",
                 },
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"url": "https://example.test/source"}),
                     "status": "completed",
                 },
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps(
                         {
                             "url": "https://example.test/source",
@@ -2488,7 +2470,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -2572,7 +2554,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             self.assertNotIn("external_web_search_synthesis", metadata)
             self.assertEqual(
                 [tool.get("name") for tool in pending.get("tools", [])],
-                [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+                ["web_search", "fetch_content"],
             )
             self.assertIn("Decide the next step now", pending.get("input", ""))
             self.assertIn("Retrieved page content for URL: https://example.test/source", pending.get("input", ""))
@@ -2638,13 +2620,13 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample subject factor A factor B"}),
                     "status": "completed",
                 },
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"url": "https://example.test/source"}),
                     "status": "completed",
                 },
@@ -2653,7 +2635,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -2777,13 +2759,13 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample subject factor A factor B"}),
                     "status": "completed",
                 },
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"url": "https://example.test/source"}),
                     "status": "completed",
                 },
@@ -2792,7 +2774,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -2849,7 +2831,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                     "output": [
                         {
                             "type": "function_call",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": json.dumps({"query": "retry query"}),
                             "status": "completed",
                         }
@@ -2881,7 +2863,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "failed query"}),
                     "status": "completed",
                 }
@@ -2889,7 +2871,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         }
 
         self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MAX_ROUNDS", "2")
-        result = await hooks._resolve_litellm_web_search_function_calls(
+        result = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -2947,7 +2929,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                     "output": [
                         {
                             "type": "function_call",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": json.dumps({"query": "retry query"}),
                             "status": "completed",
                         }
@@ -2978,7 +2960,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "failed query"}),
                     "status": "completed",
                 }
@@ -2988,7 +2970,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MAX_ROUNDS", "3")
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -3068,14 +3050,14 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "OpenAI homepage URL"}),
                     "status": "completed",
                 }
             ],
         }
 
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
+        resolved = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -3297,7 +3279,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                     "output": [
                         {
                             "type": "function_call",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": json.dumps(
                                 {"url": "https://example.test/sample-subject-factor-a"}
                             ),
@@ -3314,14 +3296,14 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample subject factor A inhibition"}),
                     "status": "completed",
                 }
             ],
         }
 
-        resolved = await hooks._resolve_litellm_web_search_function_calls(
+        resolved = await hooks._resolve_web_search_function_calls(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -3356,13 +3338,13 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 },
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"Sample City weather"}',
                 },
             ]
         }
 
-        calls = hooks._litellm_web_search_function_calls(response)
+        calls = hooks._web_search_function_calls(response)
 
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["name"], hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME)
+        self.assertEqual(calls[0]["name"], "web_search")

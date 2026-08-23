@@ -108,7 +108,7 @@ export function AppKitSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpe
 }
 
 const styles = StyleSheet.create({
-  button: { minWidth: 72, height: 24 },
+  button: { minWidth: 28, height: 24 },
   linkButton: { minWidth: 72, minHeight: 22 },
   segmented: { width: 224, height: 24 },
   picker: { minWidth: 160, height: 24 },

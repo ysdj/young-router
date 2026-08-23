@@ -15,10 +15,13 @@ from .base import (
     _BROWSER_COMPATIBLE_HEADERS,
     _BROWSER_COMPATIBLE_HEADER_HOSTS,
     _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY,
+    _CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER,
     _CODEX_VIEW_IMAGE_REFERENCE_MARKER,
     _CHAT_COMPAT_REASONING_EFFORT,
     _FALLBACK_BROWSER_USER_AGENT,
     _MAX_COMPAT_REASONING_EFFORT,
+    _PI_WEB_ACCESS_TOOL_NAMES,
+    _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _HOSTED_TOOL_UNSUPPORTED_MESSAGE_KEY,
     _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
@@ -1184,6 +1187,101 @@ def _codex_declared_tools(request_kwargs: Optional[dict]) -> list[dict]:
     return declared
 
 
+def _request_is_openrouter_route(request_kwargs: Optional[dict]) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    provider = model_info.get("provider") or request_kwargs.get("custom_llm_provider")
+    if isinstance(provider, str) and provider.strip().lower() == "openrouter":
+        return True
+    return _api_base_host(_request_api_base(request_kwargs)) in {
+        "openrouter.ai",
+        "www.openrouter.ai",
+    }
+
+
+def _with_codex_external_web_search_bridge_tool(
+    request_kwargs: dict,
+) -> Optional[dict]:
+    """Expose pi-web-access functions to Codex model turns.
+
+    Codex's standalone ``/alpha/search`` endpoint is not represented in the
+    Responses model tool list.  Expose the bundled pi-web-access functions as
+    ordinary Responses tools so the model can choose them from their schemas.
+    This hook deliberately does not alter ``instructions`` or require a tool
+    call; execution remains driven by the model's normal function-call output.
+    """
+    if not _request_has_responses_shape(request_kwargs):
+        return None
+    if _request_is_codex_compaction(request_kwargs):
+        return None
+    if not _request_has_codex_client_evidence(request_kwargs):
+        return None
+
+    # Keep the direct worker contract attached to turns that already carry a
+    # client tool registry (or a Hosted search declaration). A plain Codex
+    # text turn should not gain two extra tools merely because its transport
+    # contains Codex headers.
+    declared_tools = _codex_declared_tools(request_kwargs)
+    if not declared_tools:
+        return None
+
+    # OpenRouter-capable models (for example Grok) may use the provider's
+    # server-side search according to their own capabilities and request
+    # semantics. Do not add the local pi-web-access pair to an otherwise
+    # search-agnostic Codex turn: doing so makes the model choose the wrong
+    # route and turns a native search event into a local bridge call. An
+    # explicit supports_*_web_search: false capability flag still opts into
+    # the local fallback contract.
+    if _request_is_openrouter_route(request_kwargs):
+        model_info = _request_context_module._request_model_info(request_kwargs)
+        if not (
+            model_info.get("supports_responses_web_search") is False
+            or model_info.get("supports_web_search") is False
+        ):
+            return None
+
+    # These are ordinary client-side function tools backed by the local
+    # pi-web-access worker, not a claim that the selected upstream exposes
+    # hosted web search. If the selected route explicitly cannot accept
+    # Responses function tools, do not advertise functions that it cannot
+    # receive.
+    from . import responses_surfaces as _responses_surfaces_module
+
+    if not _responses_surfaces_module._request_supports_responses_function_tools(
+        request_kwargs
+    ):
+        return None
+
+    tools = request_kwargs.get("tools")
+    for tool in declared_tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") in (
+            {"web_search", "web_search_preview"}
+            | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES
+        ):
+            return None
+        if _codex_tool_definition_name(tool) in {
+            "web_search",
+            "fetch_content",
+        }:
+            return None
+
+    # Keep the canonical pi-web-access schemas in the Responses tool module;
+    # the local import avoids a module cycle during startup.
+    from . import responses_tools as _responses_tools_module
+
+    direct_tools = _responses_tools_module._pi_web_access_tool_definitions()
+    if not direct_tools:
+        return None
+    updated_tools = list(tools) if isinstance(tools, list) else []
+    updated_tools.extend(direct_tools)
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["tools"] = updated_tools
+    return modified_kwargs
+
+
 def _codex_tool_output_text(output: Any) -> str:
     if isinstance(output, str):
         return output
@@ -1237,6 +1335,7 @@ _CODEX_VIEW_IMAGE_EXTENSIONS = (
     ".tif",
     ".tiff",
 )
+_CODEX_VIEW_IMAGE_REFERENCE_PATH_LINE = re.compile(r"^\s*\d+\.\s+(.+?)\s*$")
 
 
 def _codex_view_image_paths_from_call(item: Any) -> list[str]:
@@ -1271,6 +1370,23 @@ def _codex_view_image_paths_from_call(item: Any) -> list[str]:
     return paths
 
 
+def _codex_view_image_call_requests_original(item: Any) -> bool:
+    if (
+        not isinstance(item, dict)
+        or item.get("type") != "custom_tool_call"
+        or item.get("name") != "exec"
+        or not isinstance(item.get("input"), str)
+    ):
+        return False
+    return bool(
+        re.search(
+            r"(?:detail|['\"]detail['\"])[\s:]+['\"]original['\"]",
+            item["input"],
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _codex_view_image_output_parts(output: Any) -> list[dict]:
     if not isinstance(output, list):
         return []
@@ -1282,6 +1398,38 @@ def _codex_view_image_output_parts(output: Any) -> list[dict]:
         and isinstance(part.get("image_url"), str)
         and part["image_url"].startswith("data:image/")
     ]
+
+
+def _codex_view_image_referenced_paths(value: Any) -> set[str]:
+    """Read path references already emitted in mutable tool-output text."""
+
+    if isinstance(value, list):
+        paths: set[str] = set()
+        for item in value:
+            paths.update(_codex_view_image_referenced_paths(item))
+        return paths
+    if not isinstance(value, dict):
+        return set()
+    if value.get("type") == "input_text" and isinstance(value.get("text"), str):
+        text = value["text"]
+        if _CODEX_VIEW_IMAGE_REFERENCE_MARKER not in text:
+            return set()
+        paths: set[str] = set()
+        for line in text.splitlines():
+            match = _CODEX_VIEW_IMAGE_REFERENCE_PATH_LINE.match(line)
+            if not match:
+                continue
+            path = match.group(1).strip()
+            if (
+                (path.startswith("/") or re.match(r"^[A-Za-z]:[\\\\/]", path))
+                and path.lower().endswith(_CODEX_VIEW_IMAGE_EXTENSIONS)
+            ):
+                paths.add(path)
+        return paths
+    paths: set[str] = set()
+    for item in value.values():
+        paths.update(_codex_view_image_referenced_paths(item))
+    return paths
 
 
 def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
@@ -1305,6 +1453,8 @@ def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
         default=-1,
     )
     call_paths: dict[str, list[str]] = {}
+    call_original_paths: dict[str, list[str]] = {}
+    referenced_paths: set[str] = set()
     updated_items = list(input_items)
     changed = False
     for index, item in enumerate(input_items):
@@ -1315,8 +1465,15 @@ def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
             paths = _codex_view_image_paths_from_call(item)
             if isinstance(call_id, str) and paths:
                 call_paths[call_id] = paths
+                if _codex_view_image_call_requests_original(item):
+                    call_original_paths[call_id] = paths
+                else:
+                    call_original_paths[call_id] = [
+                        path for path in paths if path in referenced_paths
+                    ]
             continue
         if index <= last_encrypted_index or item.get("type") != "custom_tool_call_output":
+            referenced_paths.update(_codex_view_image_referenced_paths(item))
             continue
         output = item.get("output")
         if not isinstance(output, list) or any(
@@ -1325,28 +1482,44 @@ def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
             and _CODEX_VIEW_IMAGE_REFERENCE_MARKER in part["text"]
             for part in output
         ):
+            referenced_paths.update(_codex_view_image_referenced_paths(item))
             continue
         call_id = item.get("call_id") or item.get("id")
         paths = call_paths.get(call_id) if isinstance(call_id, str) else None
+        original_paths = (
+            call_original_paths.get(call_id) if isinstance(call_id, str) else None
+        ) or []
         image_parts = _codex_view_image_output_parts(output)
         if not paths or len(paths) != len(image_parts):
+            referenced_paths.update(_codex_view_image_referenced_paths(item))
             continue
         references = "\n".join(
             f"{number}. {path}" for number, path in enumerate(paths, start=1)
         )
-        reference_part = {
-            "type": "input_text",
-            "text": (
+        if original_paths:
+            reference_text = (
+                f"{_CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER}\n"
+                "Original-resolution image requested for this explicit re-open; "
+                "the inline image below is intentionally not reduced.\n"
+                f"{_CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
+                f"{references}"
+            )
+        else:
+            reference_text = (
                 f"{_CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
                 "Inline images below are reduced previews. For full detail, call "
                 "view_image again on the matching local path:\n"
                 f"{references}"
-            ),
+            )
+        reference_part = {
+            "type": "input_text",
+            "text": reference_text,
         }
         updated_item = item.copy()
         updated_item["output"] = [reference_part, *output]
         updated_items[index] = updated_item
         changed = True
+        referenced_paths.update(_codex_view_image_referenced_paths(updated_item))
 
     if not changed:
         return None
@@ -1623,6 +1796,30 @@ def _codex_descendant_cleanup_runtime_state(request_kwargs: dict) -> Optional[st
     return None
 
 
+def _codex_descendant_cleanup_has_history(request_kwargs: dict) -> bool:
+    """Return whether this replay contains a descendant-management call.
+
+    A root Codex request can expose the collaboration namespace without ever
+    spawning a child.  In that ordinary case there is no cleanup barrier to
+    enforce yet; forcing ``list_agents`` on the first request makes otherwise
+    valid providers reject the request before the model can answer.  Once a
+    lifecycle call or a prior root snapshot appears in the replay, the barrier
+    is meaningful and may be required again after the next turn.
+    """
+    input_value = request_kwargs.get("input")
+    if not isinstance(input_value, list):
+        return False
+    tracked_names = _CODEX_DESCENDANT_LIFECYCLE_TOOLS | {"list_agents"}
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"function_call", "custom_tool_call"}:
+            continue
+        if _codex_tool_definition_name(item) in tracked_names:
+            return True
+    return False
+
+
 def _codex_declared_tool_names(request_kwargs: Optional[dict]) -> set[str]:
     names: set[str] = set()
 
@@ -1640,6 +1837,111 @@ def _codex_declared_tool_names(request_kwargs: Optional[dict]) -> set[str]:
     for tool in _codex_declared_tools(request_kwargs):
         visit(tool)
     return names
+
+
+_CODEX_TOOL_REGISTRY_MARKER = "<litellm_menu_codex_tool_registry>"
+_CODEX_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CODEX_TOOL_PATH_PATTERN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
+)
+
+
+def _codex_declared_tool_registry(
+    request_kwargs: Optional[dict],
+) -> tuple[list[str], list[str]]:
+    """Return direct Codex tool keys and their declared namespace paths."""
+    direct_names: list[str] = []
+    qualified_names: list[str] = []
+
+    def append(target: list[str], name: Any) -> None:
+        if (
+            isinstance(name, str)
+            and (
+                _CODEX_TOOL_NAME_PATTERN.fullmatch(name)
+                or _CODEX_TOOL_PATH_PATTERN.fullmatch(name)
+            )
+            and name not in target
+        ):
+            target.append(name)
+
+    def visit(tool: Any, namespace: str = "") -> None:
+        if not isinstance(tool, dict):
+            return
+        name = _codex_tool_definition_name(tool)
+        tool_type = tool.get("type")
+        if tool_type == "namespace":
+            next_namespace = name if isinstance(name, str) else ""
+            if namespace and next_namespace:
+                next_namespace = f"{namespace}.{next_namespace}"
+            children = tool.get("tools")
+            if isinstance(children, list) and children:
+                for child in children:
+                    visit(child, next_namespace)
+                return
+        if not isinstance(name, str):
+            return
+        # These are Responses function tools backed by the proxy's bundled
+        # pi-web-access runtime, not keys on the host-side ``tools`` object.
+        # Keeping them out of this registry prevents the model from trying
+        # ``tools.web_search``/``tools.fetch_content`` through ``exec``.
+        if name in _PI_WEB_ACCESS_TOOL_NAMES:
+            return
+        append(direct_names, name)
+        qualified = f"{namespace}.{name}" if namespace else name
+        append(qualified_names, qualified)
+
+    for tool in _codex_declared_tools(request_kwargs):
+        visit(tool)
+    return direct_names, qualified_names
+
+
+def _with_codex_tool_registry_instruction(
+    request_kwargs: dict,
+) -> Optional[dict]:
+    """Tell Codex-backed models which callable tool keys exist in this request."""
+    if not _request_has_responses_shape(request_kwargs):
+        return None
+    if _request_is_codex_compaction(request_kwargs):
+        return None
+    if not _request_has_codex_client_evidence(request_kwargs):
+        return None
+    direct_names, qualified_names = _codex_declared_tool_registry(request_kwargs)
+    if not direct_names:
+        return None
+    instructions = request_kwargs.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        return None
+    instructions = instructions or ""
+    if _CODEX_TOOL_REGISTRY_MARKER in instructions:
+        return None
+
+    direct_text = ", ".join(f"tools.{name}" for name in direct_names)
+    qualified_text = ", ".join(qualified_names)
+    web_search_is_declared = any(
+        name.rsplit(".", 1)[-1] == "web__run"
+        for name in (*direct_names, *qualified_names)
+    )
+    unavailable_web_search_hint = (
+        " In particular, `tools.web__run` is unavailable in this request."
+        if not web_search_is_declared
+        else ""
+    )
+    note = (
+        f"{_CODEX_TOOL_REGISTRY_MARKER}\n"
+        "This request's complete callable tool registry is fixed by the tools "
+        f"declared below. The available direct keys are: {direct_text}. "
+        f"Their declared namespace paths are: {qualified_text}. "
+        "Only these keys exist on the `tools` object. Never call or invent an "
+        f"unlisted name.{unavailable_web_search_hint} Do not retry an "
+        "unlisted tool. If the required capability is absent, "
+        "say that it is unavailable or continue without it.\n"
+        f"</litellm_menu_codex_tool_registry>"
+    )
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["instructions"] = (
+        f"{instructions.rstrip()}\n\n{note}" if instructions.strip() else note
+    )
+    return modified_kwargs
 
 
 def _with_codex_descendant_cleanup_instruction(
@@ -1696,8 +1998,12 @@ def _with_codex_descendant_cleanup_instruction(
         # pre-call hook.  The marker is request-scoped and is set only after
         # the concrete compatibility error, so ordinary calls retain the
         # strict cleanup barrier below.
+        barrier_required = runtime_state in {"active_descendants", "snapshot_invalidated"}
+        if runtime_state == "snapshot_missing":
+            barrier_required = _codex_descendant_cleanup_has_history(request_kwargs)
         if (
-            not _routing_module._protocol_fallback_relax_tool_choice(request_kwargs)
+            barrier_required
+            and not _routing_module._protocol_fallback_relax_tool_choice(request_kwargs)
             and _codex_tool_choice_name(request_kwargs.get("tool_choice")) is None
         ):
             # Snapshot recovery has one valid action. Generic ``required`` lets

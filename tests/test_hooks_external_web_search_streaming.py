@@ -277,20 +277,20 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "slow query"}),
                     "status": "completed",
                 },
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "fast query"}),
                     "status": "completed",
                 },
             ],
         }
 
-        stream = hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+        stream = hooks._resolve_web_search_function_calls_stream_rounds(
             response,
             {
                 "model": "openai/vendor-chat",
@@ -421,7 +421,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "output": [
                         {
                             "type": "function_call",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": json.dumps(
                                 {"url": "https://example.test/sample-subject-factor-a"}
                             ),
@@ -438,7 +438,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample subject factor A inhibition"}),
                     "status": "completed",
                 }
@@ -447,7 +447,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -506,7 +506,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"Sample City weather"}',
                     "status": "completed",
                 },
@@ -522,7 +522,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"Sample City weather"}',
                             "status": "completed",
                         }
@@ -638,7 +638,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             "output": [
                 {
                     "type": "function_call",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": json.dumps({"query": "sample route signal marker direct MEK"}),
                     "status": "completed",
                 }
@@ -647,7 +647,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
         chunks = [
             hooks._jsonable(chunk)
-            async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -690,7 +690,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
         chunks = [
             hooks._jsonable(chunk)
-            async for chunk in hooks._resolve_litellm_web_search_function_calls_stream_rounds(
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
                 response,
                 {
                     "model": "openai/vendor-chat",
@@ -995,7 +995,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"example transporter inhibitor 2026"}',
                     "status": "completed",
                 },
@@ -1033,7 +1033,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"example transporter inhibitor 2026"}',
                             "status": "completed",
                         },
@@ -1100,7 +1100,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertNotIn("Let我继续搜索 example transporter", dumped)
         self.assertNotIn("function_call_output", dumped)
         self.assertNotIn("internal bridge output must stay hidden", dumped)
-        self.assertNotIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, dumped)
+        self.assertNotIn('\"type\": \"function_call\"', dumped)
         self.assertIn('"type": "web_search_call"', dumped)
         self.assertIn("response.web_search_call.completed", dumped)
         self.assertIn("example transporter final answer. https://example.test/mrp1", dumped)
@@ -1142,7 +1142,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "status": "in_progress",
                 },
             }
@@ -1216,7 +1216,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         ]
 
         dumped = json.dumps(chunks)
-        self.assertNotIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, dumped)
+        self.assertNotIn('\"type\": \"function_call\"', dumped)
         self.assertNotIn('"type": "function_call", "id": "call_web"', dumped)
         self.assertIn('"type": "web_search_call"', dumped)
         self.assertIn("response.web_search_call.completed", dumped)
@@ -1263,7 +1263,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "status": "in_progress",
                 },
             }
@@ -1331,7 +1331,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             self.assertIn("slow visible search", dumped)
             self.assertNotIn("response.web_search_call.completed", dumped)
             self.assertNotIn("Done after visible progress.", dumped)
-            self.assertNotIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, dumped)
+            self.assertNotIn('\"type\": \"function_call\"', dumped)
         finally:
             release_search.set()
             await stream.aclose()
@@ -1437,7 +1437,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"Sample City weather"}',
                     "status": "completed",
                 },
@@ -1453,7 +1453,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"Sample City weather"}',
                             "status": "completed",
                         }
@@ -1595,7 +1595,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"sample subject factor A factor B inhibition"}',
                     "status": "completed",
                 },
@@ -1611,7 +1611,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"sample subject factor A factor B inhibition"}',
                             "status": "completed",
                         }
@@ -1646,12 +1646,12 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertNotIn("external_web_search_synthesis", recovery_request["litellm_metadata"])
         self.assertEqual(
             [tool.get("name") for tool in recovery_request["tools"]],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search", "fetch_content"],
         )
         self.assertIn("Decide the next step now", recovery_request["input"])
         dumped = json.dumps(chunks)
         self.assertIn("Recovered final answer. https://example.test/one", dumped)
-        self.assertNotIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, dumped)
+        self.assertNotIn('\"type\": \"function_call\"', dumped)
         self.assertNotIn('"type": "function_call", "id": "call_web"', dumped)
 
     async def test_streaming_external_web_search_missing_answer_preserves_inner_continuation_payload(self) -> None:
@@ -1731,7 +1731,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
             "tools": [
                 {
                     "type": "function",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "parameters": {"type": "object", "properties": {}},
                 }
             ],
@@ -1800,7 +1800,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertIn("Decide the next step now", recovery_request["input"])
         self.assertEqual(
             [tool.get("name") for tool in recovery_request["tools"]],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search"],
         )
         dumped = json.dumps(chunks)
         self.assertIn("Recovered final answer. https://www.python.org/downloads/", dumped)
@@ -1843,7 +1843,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_duplicate",
                             "call_id": "call_duplicate",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"sample subject factor A factor B inhibition"}',
                             "status": "completed",
                         }
@@ -1913,7 +1913,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"sample subject factor A factor B inhibition"}',
                             "status": "completed",
                         }
@@ -1994,7 +1994,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_followup",
                             "call_id": "call_followup",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"sample subject factor A factor B follow-up"}',
                             "status": "completed",
                         }
@@ -2065,7 +2065,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"sample subject factor A factor B inhibition"}',
                             "status": "completed",
                         }
@@ -2195,7 +2195,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"Sample City weather"}',
                     "status": "completed",
                 },
@@ -2211,7 +2211,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"Sample City weather"}',
                             "status": "completed",
                         }
@@ -2275,7 +2275,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertEqual(len(recovery_requests), 1)
         self.assertEqual(
             [tool.get("name") for tool in recovery_requests[0].get("tools", [])],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search", "fetch_content"],
         )
         self.assertTrue(
             recovery_requests[0]["litellm_metadata"]["external_web_search_continuation"]
@@ -2384,7 +2384,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"Sample City weather"}',
                     "status": "completed",
                 },
@@ -2400,7 +2400,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"Sample City weather"}',
                             "status": "completed",
                         }
@@ -2454,7 +2454,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertTrue(any(hooks._is_route_recovery_sse_keepalive(chunk) for chunk in chunks))
         self.assertEqual(
             [tool.get("name") for tool in recovery_requests[0].get("tools", [])],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search", "fetch_content"],
         )
         self.assertTrue(
             recovery_requests[0]["litellm_metadata"]["external_web_search_continuation"]
@@ -2527,7 +2527,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"Sample City weather"}',
                     "status": "completed",
                 },
@@ -2543,7 +2543,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "function_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "arguments": '{"query":"Sample City weather"}',
                             "status": "completed",
                         }
@@ -2752,7 +2752,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         dumped = json.dumps(chunks)
         self.assertEqual(recovery_requests, [])
         self.assertIn('"type": "response.failed"', dumped)
-        self.assertNotIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, dumped)
+        self.assertNotIn('\"type\": \"function_call\"', dumped)
         self.assertNotIn("external_web_search_continuation", dumped)
         self.assertNotIn("Retrieved evidence observed so far", dumped)
         self.assertNotIn("Top results:", dumped)
@@ -2834,7 +2834,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(
             [tool.get("name") for tool in calls[0].get("tools", [])],
-            [hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME],
+            ["web_search", "fetch_content"],
         )
         self.assertTrue(
             calls[0]["litellm_metadata"].get("external_web_search_native_error_fallback")
@@ -3250,7 +3250,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                     "type": "custom_tool_call",
                     "id": "call_web",
                     "call_id": "call_web",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "input": '{"query":"Sample City weather"}',
                     "status": "completed",
                 },
@@ -3266,7 +3266,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
                             "type": "custom_tool_call",
                             "id": "call_web",
                             "call_id": "call_web",
-                            "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                            "name": "web_search",
                             "input": '{"query":"Sample City weather"}',
                             "status": "completed",
                         }
@@ -3325,7 +3325,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         ]
 
         dumped = json.dumps(chunks)
-        self.assertNotIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, dumped)
+        self.assertNotIn('\"type\": \"function_call\"', dumped)
         self.assertNotIn('"type": "custom_tool_call", "id": "call_web"', dumped)
         self.assertIn('"type": "web_search_call"', dumped)
         self.assertIn("response.web_search_call.completed", dumped)
@@ -3476,6 +3476,84 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertNotIn("LiteLLM fallback retries", dumped)
         self.assertNotIn("Retry later", dumped)
         assert_upstream_route_failed_terminal(self, chunks)
+
+    async def test_openrouter_native_search_event_never_enters_pi_recovery(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        original_run_action = hooks._external_web_search_run_action
+        streaming_module = importlib.import_module("litellm_menu.streaming")
+        original_route_recovery_poll = streaming_module._stream_route_recovery_poll
+        run_action_called = False
+        recovery_requests = []
+
+        async def forbidden_run_action(*_args, **_kwargs):
+            nonlocal run_action_called
+            run_action_called = True
+            raise AssertionError("provider-native search must not call pi-web-access")
+
+        async def forbidden_recovery(request_data, exception):
+            recovery_requests.append(copy.deepcopy(request_data))
+            raise AssertionError("provider-native search must not enter route recovery")
+            yield
+
+        hooks._external_web_search_run_action = forbidden_run_action
+        streaming_module._stream_route_recovery_poll = forbidden_recovery
+        self.addCleanup(setattr, hooks, "_external_web_search_run_action", original_run_action)
+        self.addCleanup(
+            setattr, streaming_module, "_stream_route_recovery_poll", original_route_recovery_poll
+        )
+
+        async def upstream_stream():
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "or_native_search",
+                    "type": "openrouter:web_search",
+                    "status": "in_progress",
+                    "query": "Shanghai weather",
+                    "results": [],
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "or_native_search",
+                    "type": "openrouter:web_search",
+                    "status": "completed",
+                    "query": "Shanghai weather",
+                    "results": [],
+                },
+            }
+            raise TimeoutError("provider stream disconnected after native search")
+
+        request_data = {
+            "call_type": "aresponses",
+            "model": "x-ai/grok-4",
+            "input": "Search Shanghai weather and answer.",
+            "stream": True,
+            "tools": [{"type": "web_search"}],
+            "api_base": "https://openrouter.ai/api/v1",
+            "model_info": {"provider": "openrouter"},
+        }
+        chunks = [
+            hooks._jsonable(chunk)
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=upstream_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        dumped = json.dumps(chunks)
+        self.assertTrue(request_data["litellm_metadata"].get(
+            hooks._WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY
+        ))
+        self.assertFalse(run_action_called)
+        self.assertEqual(recovery_requests, [])
+        self.assertIn('"type": "web_search_call"', dumped)
+        self.assertIn('"type": "response.failed"', dumped)
 
 
 if __name__ == "__main__":

@@ -161,6 +161,174 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             self.assertEqual("/api/v1/keys/key-one", client.calls[-1][1])
             self.assertNotIn("replace-secret", json.dumps(domain.snapshot()))
 
+    def test_auto_grouping_keeps_first_existing_key_and_deletes_group_duplicates(self) -> None:
+        client = RelayMutationHTTPClient(
+            {
+                "/api/v1/user/profile": {"data": {"balance": 4.5}},
+                "/api/v1/keys?page=1&page_size=100": {
+                    "data": {
+                        "items": [
+                            {
+                                "id": "key-first",
+                                "name": "old-first",
+                                "status": "inactive",
+                                "key": "replace-first",
+                                "group_id": 2,
+                                "group": {"name": "Balanced"},
+                            },
+                            {
+                                "id": "key-duplicate",
+                                "name": "duplicate",
+                                "status": "active",
+                                "key": "replace-duplicate",
+                                "group_id": 2,
+                                "group": {"name": "Balanced"},
+                            },
+                            {
+                                "id": "key-fast",
+                                "name": "Fast",
+                                "status": "active",
+                                "key": "replace-fast",
+                                "group_id": 3,
+                                "group": {"name": "Fast"},
+                            },
+                            {
+                                "id": "key-stale",
+                                "name": "old-invalid-group",
+                                "status": "active",
+                                "key": "replace-stale",
+                                "group_id": 99,
+                                "group": {"name": "Removed"},
+                            },
+                        ]
+                    }
+                },
+                "/api/v1/groups/available": {
+                    "data": [
+                        {"id": 2, "name": "Balanced", "rate_multiplier": 1.25},
+                        {"id": 3, "name": "Fast", "rate_multiplier": 2},
+                    ]
+                },
+                "/api/v1/groups/rates": {"data": {"3": 1.5}},
+                "/api/v1/channels/available": {"data": [{"platforms": [{"supported_models": ["model-test"]}]}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person@example.test", cookie="session=fixture")
+            domain.refresh_resources(account["id"])
+            before_toggle = domain.snapshot()["accounts"][0]
+
+            snapshot = domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": True},
+            )
+            resources = snapshot["accounts"][0]["resources"]
+            first = next(item for item in resources if item["id"] == "sub2api-key-first")
+            duplicate = next(item for item in resources if item["id"] == "sub2api-key-duplicate")
+            stale = next(item for item in resources if item["id"] == "sub2api-key-stale")
+            self.assertEqual("Balanced", first["name"])
+            self.assertTrue(first["enabled"])
+            self.assertEqual("duplicate", duplicate["name"])
+            self.assertEqual("old-invalid-group", stale["name"])
+
+            prepared = domain.prepare_apply()
+            self.assertEqual(
+                ["sub2api-key-duplicate", "sub2api-key-stale"],
+                sorted(operation["resource_id"] for operation in prepared["destructive"]),
+            )
+            self.assertNotIn("api_key_create", [operation["kind"] for operation in prepared["operations"]])
+
+            restored = domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": False},
+            )["accounts"][0]
+            self.assertFalse(restored["auto_grouping"])
+            self.assertEqual(before_toggle["resources"], restored["resources"])
+            self.assertEqual(before_toggle["groups"], restored["groups"])
+            self.assertEqual(0, restored["pending_operation_count"])
+            self.assertEqual([], client.calls)
+
+            snapshot = domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": True},
+            )
+
+            # The periodic alignment pass is idempotent while Apply is still
+            # pending; it must not enqueue another delete for the same key.
+            domain.dispatch(
+                "api_key.auto_group_align",
+                {"account_id": account["id"]},
+            )
+            prepared_again = domain.prepare_apply()
+            self.assertEqual(
+                ["sub2api-key-duplicate", "sub2api-key-stale"],
+                sorted(operation["resource_id"] for operation in prepared_again["destructive"]),
+            )
+
+            # The stale key is remote-deleted only when Apply enters its
+            # destructive phase; alignment itself only stages the operation.
+            domain.execute_pending_operations(prepared_again, phase="destructive")
+            self.assertIn(
+                ("DELETE", "/api/v1/keys/key-stale", "https://relay.example.test", {"Cookie": "session=fixture"}, None),
+                client.calls,
+            )
+
+    def test_auto_grouping_disable_after_apply_keeps_the_applied_grouping(self) -> None:
+        client = RelayMutationHTTPClient(
+            {
+                "/api/v1/user/profile": {"data": {"balance": 4.5}},
+                "/api/v1/keys?page=1&page_size=100": {
+                    "data": {
+                        "items": [
+                            {
+                                "id": "key-one",
+                                "name": "Balanced",
+                                "status": "active",
+                                "key": "replace-key",
+                                "group_id": 2,
+                                "group": {"name": "Balanced"},
+                            }
+                        ]
+                    }
+                },
+                "/api/v1/groups/available": {
+                    "data": [{"id": 2, "name": "Balanced", "rate_multiplier": 1.25}]
+                },
+                "/api/v1/groups/rates": {"data": {}},
+                "/api/v1/channels/available": {"data": [{"platforms": []}]},
+                "/v1/models": {"data": {"data": []}},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person@example.test", cookie="session=fixture")
+            domain.refresh_resources(account["id"])
+
+            domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": True},
+            )
+            domain.apply()
+            applied = domain.snapshot()["accounts"][0]
+            self.assertTrue(applied["auto_grouping"])
+
+            disabled = domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": False},
+            )["accounts"][0]
+            self.assertFalse(disabled["auto_grouping"])
+            self.assertEqual(applied["resources"], disabled["resources"])
+            self.assertEqual(applied["groups"], disabled["groups"])
+
     def test_disabled_keys_remain_visible_but_cannot_be_imported(self) -> None:
         client = RelayMutationHTTPClient(
             {

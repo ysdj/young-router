@@ -21,6 +21,7 @@ from ..model_catalog import (
     write_catalog,
 )
 from ..model_contexts import ModelContextRegistry, default_context_cache_path
+from ..persistence import PersistenceError, atomic_write_json, read_json
 from ..security import redact
 from ._shared import (
     DomainError,
@@ -79,6 +80,12 @@ class CodexSettingsDomain:
         configured_home = os.environ.get("CODEX_HOME", "").strip()
         resolved_home = self.codex_home or (Path(configured_home).expanduser() if configured_home else Path.home() / ".codex")
         self.model_catalog_path = managed_catalog_path(resolved_home)
+        # The native host may recreate Core after a failed IPC request or
+        # subscription. Keep the user's "later" acknowledgement outside the
+        # process so that the same catalog signature is not shown again.
+        self.model_catalog_ack_path = self.model_catalog_path.with_name(
+            "litellm-menu-model-catalog-state.json"
+        )
         self._context_registry = ModelContextRegistry(
             runtime_config_path=self.runtime_config_path,
             runtime_settings_path=runtime_settings_path,
@@ -88,12 +95,59 @@ class CodexSettingsDomain:
         self._catalog_restart_required = False
         self._catalog_change_reason: str | None = None
         self._catalog_change_event = 0
+        # A deferred restart acknowledges the current public-model set. Keep
+        # that acknowledgement in memory so a later catalog repair/snapshot
+        # cannot manufacture a new prompt for the same model IDs. A genuine
+        # model-set (or enabled-state) change still creates a new event.
+        self._catalog_pending_signature: tuple[bool, tuple[str, ...]] | None = None
+        self._catalog_acknowledged_signature: tuple[bool, tuple[str, ...]] | None = (
+            self._load_catalog_acknowledgement()
+        )
+        # Endpoint-backed repairs are noisy during proxy reloads: /v1/models
+        # can briefly alternate between adjacent worker views. Require two
+        # consecutive observations of the same repaired model set before
+        # asking Codex to restart. Explicit enable/disable actions bypass this
+        # observation gate and remain immediate.
+        self._catalog_repair_observed_signature: tuple[bool, tuple[str, ...]] | None = None
+        self._catalog_repair_observation_count = 0
         self._catalog_source_checked_at = 0.0
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._baseline: tuple[str, str] = ("", "{}\n")
         self.revision = 0
         self.reload()
+
+    def _load_catalog_acknowledgement(self) -> tuple[bool, tuple[str, ...]] | None:
+        """Read the last deferred-restart catalog signature, if available.
+
+        This sidecar contains only the enabled flag and public model IDs. It
+        is optional local state: an unreadable or malformed file is ignored so
+        that a stale acknowledgement cannot prevent Core from starting.
+        """
+
+        try:
+            payload = read_json(self.model_catalog_ack_path, default={})
+        except PersistenceError:
+            return None
+        enabled = payload.get("enabled")
+        names = payload.get("models")
+        if type(enabled) is not bool or not isinstance(names, list):
+            return None
+        if any(not isinstance(name, str) or not name.strip() for name in names):
+            return None
+        return self._catalog_signature(names, enabled=enabled)
+
+    def _persist_catalog_acknowledgement(
+        self,
+        signature: tuple[bool, tuple[str, ...]],
+    ) -> None:
+        try:
+            atomic_write_json(
+                self.model_catalog_ack_path,
+                {"enabled": signature[0], "models": list(signature[1])},
+            )
+        except PersistenceError:
+            raise DomainError("Codex catalog acknowledgement could not be saved") from None
 
     def _load_editor(self) -> dict[str, Any]:
         import codex_config
@@ -158,12 +212,12 @@ class CodexSettingsDomain:
 
         return payload.get("litellm_menu_enabled") is True
 
-    def _refresh_live_catalog_source(self, *, force: bool = False) -> None:
+    def _refresh_live_catalog_source(self, *, force: bool = False) -> bool:
         """Refresh the endpoint-backed catalog source without replacing drafts."""
 
         now = time.monotonic()
         if not force and now - self._catalog_source_checked_at < _CATALOG_SOURCE_REFRESH_SECONDS:
-            return
+            return False
         self._catalog_source_checked_at = now
         try:
             payload = self._load_editor()
@@ -181,6 +235,7 @@ class CodexSettingsDomain:
             if source_available:
                 state["exposed_models"] = copy.deepcopy(exposed_models)
             state["litellm_menu_enabled"] = source_available
+        return True
 
     def _catalog_model_ids_changed(self, names: list[str]) -> bool:
         """Return whether the Codex-visible model IDs changed, ignoring priority order."""
@@ -188,30 +243,86 @@ class CodexSettingsDomain:
         existing_names = catalog_model_names(self.model_catalog_path)
         return existing_names is not None and set(existing_names) != set(names)
 
-    def _queue_catalog_restart(self, reason: str) -> None:
+    @staticmethod
+    def _catalog_signature(
+        names: list[str] | tuple[str, ...],
+        *,
+        enabled: bool,
+    ) -> tuple[bool, tuple[str, ...]]:
+        # Catalog restart decisions are about model IDs, not endpoint order.
+        return enabled, tuple(sorted(set(names)))
+
+    def _reset_catalog_repair_observation(self) -> None:
+        self._catalog_repair_observed_signature = None
+        self._catalog_repair_observation_count = 0
+
+    def _queue_catalog_restart(
+        self,
+        reason: str,
+        *,
+        names: list[str] | tuple[str, ...] | None = None,
+        enabled: bool | None = None,
+        force: bool = False,
+    ) -> bool:
+        current_enabled = self._is_catalog_enabled(self._raw) if enabled is None else enabled
+        current_names = names
+        if current_names is None:
+            current_names = self._catalog_model_names(self._raw) if current_enabled else []
+        signature = self._catalog_signature(current_names, enabled=current_enabled)
+        # Stability is enforced only by snapshot's external observation path.
+        # Apply and provider refresh call this method with an already-known
+        # model set and therefore must remain immediate.
+        self._reset_catalog_repair_observation()
+        if not force and signature == self._catalog_acknowledged_signature:
+            return False
+        if self._catalog_restart_required and signature == self._catalog_pending_signature:
+            return False
         self._catalog_restart_required = True
         self._catalog_change_reason = reason
         self._catalog_change_event += 1
+        self._catalog_pending_signature = signature
+        return True
 
     def _ensure_model_catalog_current(
         self,
         *,
         notify: bool,
         force_source_refresh: bool = False,
+        require_stable_repair: bool = False,
     ) -> bool:
         if not self._is_catalog_enabled(self._raw):
+            self._reset_catalog_repair_observation()
             return False
-        self._refresh_live_catalog_source(force=force_source_refresh)
+        source_refreshed = self._refresh_live_catalog_source(force=force_source_refresh)
         if not self._catalog_source_is_available(self._raw):
+            self._reset_catalog_repair_observation()
             return False
         names = self._catalog_model_names(self._raw)
         self._context_registry.refresh_if_due()
+        model_ids_changed = self._catalog_model_ids_changed(names)
+        if require_stable_repair and notify and model_ids_changed:
+            if not source_refreshed:
+                # Do not count repeated snapshots of the same cached probe as
+                # separate endpoint observations.
+                return False
+            signature = self._catalog_signature(names, enabled=True)
+            if signature != self._catalog_repair_observed_signature:
+                self._catalog_repair_observed_signature = signature
+                self._catalog_repair_observation_count = 1
+                # A single endpoint view is not enough to rewrite the managed
+                # catalog: worker reloads can briefly expose 9/10 or 10/9.
+                return False
+            self._catalog_repair_observation_count += 1
+            if self._catalog_repair_observation_count < 2:
+                return False
+        else:
+            self._reset_catalog_repair_observation()
+
         if catalog_is_current(self.model_catalog_path, names, registry=self._context_registry):
             return False
-        model_ids_changed = self._catalog_model_ids_changed(names)
         write_catalog(self.model_catalog_path, names, registry=self._context_registry)
         if notify and model_ids_changed:
-            self._queue_catalog_restart("catalog_repaired")
+            self._queue_catalog_restart("catalog_repaired", names=names, enabled=True)
         self.revision += 1
         return True
 
@@ -221,6 +332,7 @@ class CodexSettingsDomain:
         return self._ensure_model_catalog_current(
             notify=True,
             force_source_refresh=True,
+            require_stable_repair=False,
         )
 
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
@@ -247,7 +359,7 @@ class CodexSettingsDomain:
         }
 
     def snapshot(self) -> dict[str, Any]:
-        self._ensure_model_catalog_current(notify=True)
+        self._ensure_model_catalog_current(notify=True, require_stable_repair=True)
         return self._safe_snapshot(self._draft, self.revision)
 
     def draft_state(self) -> object:
@@ -292,6 +404,15 @@ class CodexSettingsDomain:
         if name in {"acknowledge_model_catalog_restart", "acknowledgemodelcatalogrestart"}:
             self._catalog_restart_required = False
             self._catalog_change_reason = None
+            acknowledged = self._catalog_pending_signature
+            if acknowledged is None:
+                enabled = self._is_catalog_enabled(self._raw)
+                names = self._catalog_model_names(self._raw) if enabled else []
+                acknowledged = self._catalog_signature(names, enabled=enabled)
+            self._persist_catalog_acknowledgement(acknowledged)
+            self._catalog_acknowledged_signature = acknowledged
+            self._catalog_pending_signature = None
+            self._reset_catalog_repair_observation()
         elif name in {"set_raw", "setraw"}:
             document = data.get("document")
             text = data.get("text")
@@ -413,10 +534,16 @@ class CodexSettingsDomain:
             raise _safe_problem(exc, "Codex settings could not be saved") from None
         self.reload()
         if will_be_enabled and (not was_enabled or catalog_model_ids_changed):
-            self._queue_catalog_restart("enabled" if not was_enabled else "catalog_repaired")
+            names = catalog_models if catalog_models is not None else self._catalog_model_names(self._raw)
+            self._queue_catalog_restart(
+                "enabled" if not was_enabled else "catalog_repaired",
+                names=names,
+                enabled=True,
+                force=not was_enabled,
+            )
             self.revision += 1
         elif was_enabled and not will_be_enabled:
-            self._queue_catalog_restart("disabled")
+            self._queue_catalog_restart("disabled", names=[], enabled=False, force=True)
             self.revision += 1
         return {"applied": True, **self.snapshot()}
 
@@ -495,10 +622,16 @@ class CodexSettingsDomain:
         if draft_next != draft_before:
             self._draft = draft_next
         if enabled and (not was_enabled or catalog_model_ids_changed):
-            self._queue_catalog_restart("enabled" if not was_enabled else "catalog_repaired")
+            names = catalog_models if catalog_models is not None else self._catalog_model_names(self._raw)
+            self._queue_catalog_restart(
+                "enabled" if not was_enabled else "catalog_repaired",
+                names=names,
+                enabled=True,
+                force=not was_enabled,
+            )
             self.revision += 1
         elif was_enabled and not enabled:
-            self._queue_catalog_restart("disabled")
+            self._queue_catalog_restart("disabled", names=[], enabled=False, force=True)
             self.revision += 1
         return self.snapshot()
 

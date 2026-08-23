@@ -32,6 +32,14 @@ export interface NativeLeafBridge {
   showActionMenu(title: string, items: string[], anchor: NativeMenuAnchor): Promise<number | undefined>;
   showConfirmation(title: string, message: string, confirmLabel: string): Promise<boolean>;
   showReadOnlyText(title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string): Promise<void>;
+  showProviderAuth?(options: {
+    provider: "openai" | "claude";
+    fingerprint?: string;
+    verificationURL: string;
+    userCode: string;
+    title: string;
+    closeLabel: string;
+  }): Promise<void>;
   showCodexRestartConfirmation(title: string, message: string, restartLabel: string, laterLabel: string): Promise<"restart" | "later" | undefined>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
   editSecret(
@@ -57,6 +65,7 @@ export interface NativeLeafBridge {
     rememberPassword: boolean;
     embedded?: boolean;
   }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
+  cancelRelayLogin?: () => void;
   restoreRelaySession(options: {
     accountId: string;
     type: "newapi" | "sub2api";
@@ -121,12 +130,16 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     showActionMenu: ({ title, items, anchor }) => bridge.showActionMenu(title, items, anchor),
     showConfirmation: ({ title, message, confirmLabel }) => bridge.showConfirmation(title, message, confirmLabel),
     showReadOnlyText: ({ title, text, closeLabel, language, html }) => bridge.showReadOnlyText(title, text, closeLabel, language, html),
+    showProviderAuth: bridge.showProviderAuth
+      ? (options) => bridge.showProviderAuth!(options)
+      : undefined,
     showCodexRestartConfirmation: ({ title, message, restartLabel, laterLabel }) => bridge.showCodexRestartConfirmation(title, message, restartLabel, laterLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
     editSecret: ({ domain, field, target, title, allowClear }) => bridge.editSecret(domain, field, target, title, allowClear),
     clearSecret: ({ domain, field, target }) => bridge.clearSecret(domain, field, target),
     copySecret: ({ domain, field, target }) => bridge.copySecret(domain, field, target),
     relayLogin: (options) => bridge.relayLogin(options),
+    cancelRelayLogin: () => bridge.cancelRelayLogin?.(),
     restoreRelaySession: (options) => bridge.restoreRelaySession(options),
     openRelayLogs: (options) => bridge.openRelayLogs(options),
     clearRelayPassword: (accountId) => bridge.clearRelayPassword(accountId),

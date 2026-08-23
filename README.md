@@ -58,17 +58,26 @@ If a capable deployment returns an empty response or an explicit image-tool-unav
 
 Standalone image model routes (`/v1/images/generations`) are handled separately from the Responses image generation tool.
 
-### Vision Bridge
+### dsh-vision-router fallback
 
-When a request contains image input and the selected route fails with a vision-unsupported error, the vision bridge rewrites the request to replace image content with textual visual context and retries the original route.
+The bundled dsh-vision-router-compatible chain is a text-only fallback for image
+requests. LiteLLM Menu first sends the original image request to the selected
+deployment. If that deployment explicitly rejects image input, the chain tries
+the configured local Ollama/LM Studio providers, ordered HTTP providers, and the
+optional free fallback chain; the resulting visual context is appended as text
+and the same deployment is retried. A deployment that advertises vision receives
+the original image unchanged and never enters this fallback.
 
-The bridge operates in three modes:
-
-- **`auto`** (default) — tries a configured OpenAI-compatible vision endpoint first, then falls back to the bundled local Vision OCR helper in the portable Core.
-- **`api`** — uses only the configured vision endpoint.
-- **`local`** — uses only the bundled `Core/bin/vision_ocr` binary, which leverages macOS Vision framework for OCR text recognition and rectangle detection to produce layout summaries. Development hosts may override it with `LITELLM_MENU_VISION_HELPER`.
-
-The bridge does not switch the user's model group to an unrelated chat route. It removes image parts from the original request, appends the visual context as text, and retries the same route.
+Configure it in Runtime Settings with the quick controls for enabled state,
+backend, free fallback, timeout, max tokens, Ollama, and LM Studio. Each quick
+control has a `Follow advanced JSON`/`inherit` choice, so it does not overwrite
+custom values in the advanced `dsh-vision-router config` JSON textarea
+(`LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON`). The JSON document remains the
+place for ordered `httpProviders`, dsh-style `{provider,model,fallbacks}`
+entries, provider endpoints/models, `apiKeyEnv`, and `prompt`. Raw API keys are
+not stored in the configuration document. Invalid configuration is rejected by
+Runtime Settings and disables the direct router path rather than silently
+selecting a different provider.
 
 ### Web Search Bridge
 
@@ -80,6 +89,27 @@ When a Responses API request includes `web_search` tool usage:
 The external bridge executes the bundled [pi-web-access](https://github.com/nicobailon/pi-web-access) extension through its Pi SDK worker. Search and page-fetch parameters are configurable through runtime settings; the extension's provider, routing, credentials, and SSRF policy are supplied as a private `web-search.json` configuration. The Runtime Settings field `LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON` accepts that JSON object and never exports it as a plain process setting.
 
 The bridge exposes focused search queries and source URLs to the model. Query planning is model-driven; the bridge does not add request-specific query rewrites.
+
+Hosted search and pi-web-access use different wire shapes even though both
+mention web search: hosted search is `type: "web_search"` (or
+`type: "web_search_preview"`), while the direct worker contract is an
+ordinary `type: "function"` named `web_search` plus `fetch_content`.
+When hosted search is unavailable, the fallback replaces the hosted
+declaration with those direct functions; it never sends both forms or
+advertises the removed private bridge name.
+
+OpenRouter is a separate native-server-tool route: when the caller/model
+already declares `type: "openrouter:web_search"`, the adapter passes that
+declaration through unchanged. It does not select a tool, add an instruction,
+or force OpenRouter search for models such as Grok. Raw provider-native search
+events are normalized for delivery, and are mutually exclusive with the
+pi-web-access fallback; only an explicit unsupported error before native search
+activity may enter that fallback.
+On an OpenRouter Codex turn with no explicit search declaration, the adapter
+also leaves the local pi pair out so the model/provider can apply its own
+search capability and request semantics without an injected competing tool; an
+explicit capability flag of `supports_*_web_search: false` is the opt-in for the
+local fallback.
 
 ### Computer Facade
 
@@ -108,7 +138,7 @@ Optional bidirectional configuration sync via WebDAV. The sync compares local st
 
 ### Route Trace and Observability
 
-Route trace logging records deployment selection, fallback decisions, surface bridging, vision bridge rewrites, web search bridge activity, image generation fallback, and streaming error recovery. The trace is viewable as an HTML report with per-request cards showing deployment metadata, event timeline, tool call details, and session context.
+Route trace logging records deployment selection, fallback decisions, surface bridging, dsh-vision-router fallbacks, web search bridge activity, image generation fallback, and streaming error recovery. The trace is viewable as an HTML report with per-request cards showing deployment metadata, event timeline, tool call details, and session context.
 
 A recent requests log stores routing and status metadata in JSONL format. Prompt bodies, message content, authorization headers, and API keys are not stored.
 
@@ -176,7 +206,7 @@ pnpm run build:windows
 
 1. Open LiteLLM Menu from its menu bar icon.
 2. The application starts the local LiteLLM proxy and Python Core from its bundled runtime.
-3. Click **Providers & Models...** to configure providers, API keys, models, and deployment order.
+3. Click **Service Provider Management...** to sign in to official OpenAI/Claude accounts or manage relay-station accounts. Click **Providers & Models...** to configure API-key providers, API keys, models, and deployment order.
 4. Click **Apply Config** to stage and activate the configuration.
 5. To use Codex through LiteLLM, open **Codex Settings...**, choose a LiteLLM deployment in **Connection & model**, and choose **Apply**. The change is staged first, then updates only the user-level Codex `config.toml` / `auth.json` fields you selected while preserving unrelated values and the model group's LiteLLM route order.
 
@@ -195,6 +225,8 @@ The primary configuration file is `~/.litellm-menu/config.yaml`. A sanitized exa
 - **`general_settings`** — master key, UI toggle.
 
 The model editor keeps the client-facing public model name separate from the exact upstream model ID. It derives LiteLLM's internal provider prefix from the selected upstream protocol (`openai` for OpenAI Responses or Chat, `anthropic` for Anthropic Messages), so there is no separate adapter setting. This permits mappings such as a GPT-compatible public route backed by a differently named OpenAI-compatible upstream model without changing the upstream ID.
+
+Provider endpoint source and authentication are separate concerns. **Service Provider Management** owns account login: official OpenAI login uses LiteLLM's device-code flow and a native sign-in window, while Claude uses the official `claude setup-token` flow or a native secure token field. Login credentials stay in private runtime storage; the YAML configuration contains only opaque authentication metadata and environment references. **Providers & Models** is deliberately API-key-only: its add-provider wizard starts with the API-key step and never asks for an account-login method or a login URL.
 
 ### Providers & Models Editor
 
@@ -238,8 +270,8 @@ Adjustable through the menu without editing config files:
 | Deployment cooldown seconds | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
 | Web search max results | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 5 |
 | Web fetch timeout | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
-| Vision bridge backend | `LITELLM_MENU_VISION_BRIDGE_BACKEND` | auto |
-| Vision bridge model | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
+| dsh-vision-router quick controls | `LITELLM_MENU_DSH_VISION_ROUTER_ENABLED`, `..._BACKEND`, `..._FREE_FALLBACK`, `..._TIMEOUT_SECONDS`, `..._MAX_TOKENS`, `..._LOCAL_OLLAMA_ENABLED`, `..._LOCAL_LM_STUDIO_ENABLED` | inherit / empty (keep advanced JSON) |
+| dsh-vision-router config JSON | `LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON` | built-in fallback chain |
 | Computer facade backend | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
 | Computer facade max steps | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
 | MCP auto-approval | `LITELLM_MENU_MCP_AUTO_APPROVE` | 0 (off) |
@@ -304,7 +336,7 @@ MIT License. See [LICENSE](LICENSE).
 
 # LiteLLM Menu（中文）
 
-LiteLLM Menu 是一个 macOS 与 Windows 原生桌面应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、视觉桥接、网页搜索桥接、图像生成工具适配，以及可选择模型的 Codex 配置整合到一个由应用管理的本地端点中。
+LiteLLM Menu 是一个 macOS 与 Windows 原生桌面应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、dsh-vision-router 视觉回退、网页搜索桥接、图像生成工具适配，以及可选择模型的 Codex 配置整合到一个由应用管理的本地端点中。
 
 ---
 
@@ -354,17 +386,11 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 
 独立图像模型路由（`/v1/images/generations`）与 Responses 图像生成工具分开处理。
 
-### 视觉桥接
+### dsh-vision-router 视觉回退
 
-当请求包含图像输入且所选路由返回视觉不支持的错误时，视觉桥接器将请求中的图像内容替换为文本视觉上下文，并重试原始路由。
+当请求包含图像输入且所选路由明确返回不支持视觉输入时，dsh-vision-router 才会将图像转换为文本视觉上下文，并重试原始路由。模型元数据明确支持 vision 时始终沿用原模型并保留原图。
 
-桥接器有三种模式：
-
-- **`auto`**（默认）— 先尝试已配置的 OpenAI 兼容视觉端点，失败后回退到可迁移 Core 中的内置本地 Vision OCR 辅助工具。
-- **`api`** — 仅使用已配置的视觉端点。
-- **`local`** — 仅使用内置 `Core/bin/vision_ocr` 二进制工具，该工具利用 macOS Vision 框架进行 OCR 文本识别和矩形检测，生成布局摘要。开发宿主可用 `LITELLM_MENU_VISION_HELPER` 覆盖该路径。
-
-桥接器不会将用户的模型组切换到无关的聊天路由。它移除原始请求中的图像部分，以文本形式附加视觉上下文，并重试同一路由。
+运行时设置中除了 **dsh-vision-router 配置 JSON**，还提供启用状态、后端、免费回退、超时、最大 token、Ollama 和 LM Studio 的快捷设置。快捷项选择“跟随高级 JSON”时不会覆盖 JSON 中的自定义值；JSON 配置框仍用于有序 `httpProviders` / `providers`、provider/model、端点、`apiKeyEnv`、`fallbacks` 和 `prompt`。清除 JSON 后恢复内置模板。
 
 ### 网页搜索桥接
 
@@ -376,6 +402,18 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 外部桥接通过 Pi SDK worker 执行内置的 [pi-web-access](https://github.com/nicobailon/pi-web-access) 扩展，并读取模型选定的来源页面。搜索与页面抓取参数可通过运行时设置配置；扩展的 provider、路由、凭据和 SSRF 策略写入私有 `web-search.json` 配置。运行时设置 `LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON` 可直接录入该 JSON 对象，配置不会作为明文进程设置导出。
 
 桥接器向模型暴露聚焦的搜索查询和来源 URL。查询规划由模型驱动：模型决定是否直接回答、换词、查看下一页或打开某个来源；默认四个动作轮次让它在多次换词后仍有机会查看刚找到的来源。桥接器不添加特定于请求的查询重写。
+
+托管搜索与 pi-web-access 虽然都出现 `web_search` 字样，但线路形状不同：托管工具是
+`type: "web_search"`（或 `type: "web_search_preview"`），直接 worker 合约是普通的
+`type: "function"`，名称为 `web_search`，并配套 `fetch_content`。托管搜索不可用时，
+`fallback` 会把托管声明替换为这两个直接函数，不会同时发送两种形状，也不会暴露已删除的私有桥接名称。
+
+OpenRouter 的原生服务端搜索是第三种线路：调用方或模型已经声明
+`type: "openrouter:web_search"` 时，适配器原样透传，不替模型选择工具、不添加指令，
+也不强迫 Grok 等模型搜索。上游原生 search 事件只做交付层标准化，并与 pi-web-access 回退互斥；
+只有在原生搜索活动出现之前收到明确“不支持”错误时才允许进入回退。
+OpenRouter Codex 请求如果没有显式 search 声明，适配器也不会补入本地 pi 工具对，交由模型/供应商按自身能力和请求语义处理，避免注入竞争工具；只有显式设置
+`supports_*_web_search: false` 才启用本地回退工具。
 
 ### Computer Facade
 
@@ -404,7 +442,7 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 
 ### 路由追踪与可观测性
 
-路由追踪日志记录部署选择、回退决策、接口桥接、视觉桥接重写、网页搜索桥接活动、图像生成回退和流式错误恢复。追踪以 HTML 报告形式查看，包含每个请求的卡片，展示部署元数据、事件时间线、工具调用详情和会话上下文。
+路由追踪日志记录部署选择、回退决策、接口桥接、dsh-vision-router 重写、网页搜索桥接活动、图像生成回退和流式错误恢复。追踪以 HTML 报告形式查看，包含每个请求的卡片，展示部署元数据、事件时间线、工具调用详情和会话上下文。
 
 最近请求日志以 JSONL 格式存储路由和状态元数据。不存储提示词正文、消息内容、授权头和 API 密钥。
 
@@ -472,7 +510,7 @@ pnpm run build:windows
 
 1. 从菜单栏图标（"LL" 状态项）打开 LiteLLM Menu。
 2. 应用从内置运行时启动本地 LiteLLM 代理和 Python Core。
-3. 点击 **Providers & Models...** 配置供应商、API 密钥、模型和部署顺序。
+3. 点击 **服务商管理...** 登录 OpenAI/Claude 官方账号或管理中转站账号；点击 **Providers & Models...** 配置 API-key 供应商、API 密钥、模型和部署顺序。
 4. 点击 **Apply Config** 暂存并激活配置。
 5. 如需让 Codex 通过 LiteLLM 运行，点击 **Codex Settings...**，在 **Connection & model** 中选择一个已配置的 provider/model 部署，然后点击 **Apply**。
 
@@ -491,6 +529,8 @@ pnpm run build:windows
 - **`general_settings`** — 主密钥、UI 开关。
 
 模型编辑器将客户端看到的公开模型名与上游原始模型 ID 分开保存。LiteLLM 内部供应商前缀由已选上游协议自动派生（OpenAI Responses 或 Chat 使用 `openai`，Anthropic Messages 使用 `anthropic`），不再单独配置 adapter。这样可以把 GPT 兼容的公开路由映射到名称不同的 OpenAI-compatible 上游模型，同时保持上游 ID 不变。
+
+供应商端点来源与认证方式分属两个页面。**服务商管理**负责账号登录：OpenAI 使用 LiteLLM 设备码流程并打开原生登录窗口，Claude 使用官方 `claude setup-token` 流程，或通过原生安全输入框录入 token。登录凭据只保存在私有运行时目录，YAML 只记录不含密钥的认证元数据和环境引用。**Providers & Models** 明确只管理 API key：新增供应商向导直接进入 API key 步骤，不再出现账号登录方式，也不会要求先填登录 URL。
 
 ### Providers & Models 编辑器
 
@@ -534,8 +574,8 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 | 部署冷却秒数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
 | 网页搜索最大结果数 | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 5 |
 | 网页获取超时 | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
-| 视觉桥接后端 | `LITELLM_MENU_VISION_BRIDGE_BACKEND` | auto |
-| 视觉桥接模型 | `LITELLM_MENU_VISION_BRIDGE_MODEL` | qwen2.5vl:3b |
+| dsh-vision-router 快捷设置 | `LITELLM_MENU_DSH_VISION_ROUTER_ENABLED`、`..._BACKEND`、`..._FREE_FALLBACK`、`..._TIMEOUT_SECONDS`、`..._MAX_TOKENS`、`..._LOCAL_OLLAMA_ENABLED`、`..._LOCAL_LM_STUDIO_ENABLED` | 跟随高级 JSON / 留空 |
+| dsh-vision-router 配置 JSON | `LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON` | 内置回退链 |
 | Computer facade 后端 | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
 | Computer facade 最大步数 | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
 | MCP 自动同意 | `LITELLM_MENU_MCP_AUTO_APPROVE` | 0（关闭） |

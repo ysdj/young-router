@@ -13,11 +13,12 @@ export const ROUTES: readonly RouteDefinition[] = [
   { id: "relay-accounts", titleKey: "menu.relay" },
   { id: "data-management", titleKey: "menu.dataManagement" },
   { id: "relay-add", titleKey: "relay.addAccount" },
+  { id: "provider-wizard", titleKey: "providers.wizard.title" },
   { id: "logs", titleKey: "menu.logs" },
 ];
 
 export const MENU_ROUTES: readonly RouteDefinition[] = ROUTES.filter(
-  ({ id }) => id !== "claude-settings" && id !== "relay-add",
+  ({ id }) => id !== "claude-settings" && id !== "relay-add" && id !== "provider-wizard",
 );
 
 export function routeMenuActions(

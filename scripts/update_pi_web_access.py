@@ -20,6 +20,7 @@ matching command-line options exist for offline/unit-test fixtures.
 from __future__ import annotations
 
 import argparse
+import http.client
 import io
 import json
 import os
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -68,11 +70,17 @@ class UpdateError(RuntimeError):
 
 def _request_bytes(url: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> bytes:
     request = urllib.request.Request(url, headers={"Accept": "*/*", "User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
-    except (OSError, urllib.error.URLError, TimeoutError) as exc:
-        raise UpdateError(f"Could not download {url}: {exc}") from exc
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except (http.client.IncompleteRead, OSError, urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+            if attempt == 2:
+                break
+            time.sleep(0.5 * (attempt + 1))
+    raise UpdateError(f"Could not download {url}: {last_error}") from last_error
 
 
 def _request_json(url: str) -> Any:

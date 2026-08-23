@@ -251,6 +251,8 @@ struct ButtonComponentView final
       else if (symbol == "play") icon.Glyph(L"\xE768");
       else if (symbol == "plus") icon.Glyph(L"\xE710");
       else if (symbol == "refresh") icon.Glyph(L"\xE72C");
+      else if (symbol == "chevron-up") icon.Glyph(L"\xE70E");
+      else if (symbol == "chevron-down") icon.Glyph(L"\xE70D");
       else icon.Glyph(L"\xE74D");
       button_.Content(icon);
     }
@@ -1552,7 +1554,8 @@ struct SecureTextInputComponentView final
           (props.field == "deployment_token" || props.field == "desktop_gateway_api_key");
     }
     return props.domain == "runtime" && props.field == "setting" &&
-        props.target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON";
+        (props.target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON" ||
+         props.target == "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON");
   }
 
   bool IsPlainTextAutoCommitField() const noexcept {

@@ -24,6 +24,7 @@ export type AppRoute =
   | "data-management"
   | "relay-accounts"
   | "relay-add"
+  | "provider-wizard"
   | "logs";
 
 export type LogTab =
@@ -156,6 +157,10 @@ export interface RelayPendingOperationSummary {
   linked_model_count?: number;
 }
 
+export type ProviderAuthKind = "api_key" | "openai_login" | "claude_login";
+
+export type ProviderAuthStatus = "signed_out" | "authorizing" | "signed_in" | "expired" | "error" | "unsupported";
+
 export interface ProviderSummary {
   id: string;
   display_name: string;
@@ -165,6 +170,9 @@ export interface ProviderSummary {
   endpoint: string;
   provider_type?: "custom" | "relay";
   relay_station_id?: string;
+  auth_kind?: ProviderAuthKind;
+  auth_status?: ProviderAuthStatus;
+  auth_active?: boolean;
   key_states?: ProviderKeySummary[];
   models?: ProviderModelSummary[];
 }
@@ -459,7 +467,12 @@ export interface NativeLocalization {
   routeDataManagement: string;
   routeRelayAccounts: string;
   routeRelayAdd: string;
+  routeProviderWizard: string;
   routeLogs: string;
+  providerAuthInstruction?: string;
+  providerAuthCode?: string;
+  providerAuthCopy?: string;
+  providerAuthBlocked?: string;
   modelChooserTitle: string;
   modelChooserHeading: string;
   modelChooserProvider: string;
@@ -488,6 +501,20 @@ export interface NativeLeafAdapter {
   showActionMenu(options: { title: string; items: string[]; anchor: NativeMenuAnchor }): Promise<number | undefined>;
   showConfirmation(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
   showReadOnlyText(options: { title: string; text: string; closeLabel: string; language: "json" | "toml" | "text"; html: string }): Promise<void>;
+  /**
+   * Show an official provider device-code login in a native, isolated WebView.
+   * The native host displays the one-time code but never returns page fields,
+   * cookies, tokens, or other credential material to the shared UI.
+   */
+  showProviderAuth?(options: {
+    provider: "openai" | "claude";
+    /** Stable per-account identity used to isolate concurrent native auth windows. */
+    fingerprint?: string;
+    verificationURL: string;
+    userCode: string;
+    title: string;
+    closeLabel: string;
+  }): Promise<void>;
   showCodexRestartConfirmation(options: {
     title: string;
     message: string;
@@ -526,6 +553,7 @@ export interface NativeLeafAdapter {
     rememberPassword: boolean;
     embedded?: boolean;
   }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
+  cancelRelayLogin(): void;
   restoreRelaySession(options: {
     accountId: string;
     type: "newapi" | "sub2api";

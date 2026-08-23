@@ -445,7 +445,9 @@ import Foundation
     @nonobjc func readPlainTextSecret(domain: String, field: String, target: String?) throws -> String {
         try readSecret(
             createSecretReadCapability(domain: domain, field: field, target: target).token,
-            allowMultiline: domain == "runtime" && field == "setting" && target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
+            allowMultiline: domain == "runtime" && field == "setting" &&
+                (target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON" ||
+                 target == "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON")
         )
     }
 

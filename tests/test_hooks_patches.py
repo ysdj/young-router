@@ -339,6 +339,36 @@ class HookPatchTests(HookTestCase):
         )
         self.assertEqual(request_kwargs["model_info"]["model_group"], "legacy-chat")
 
+    def test_selected_deployment_marker_keeps_explicit_surface_after_callback_rewrite(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {
+                "model": "anthropic/kimi-k3",
+                "api_base": "https://chat-provider.example/v1",
+            },
+            "model_info": {
+                "id": "kimi-chat-route",
+                "provider": "tbtk",
+                "upstream_url_surface": "anthropic",
+            },
+        }
+        hooks._remember_selected_deployment(deployment, surface="anthropic")
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "kimi-k3",
+            "input": "weather",
+            "_litellm_menu_upstream_url_surface": "openai/responses",
+        }
+
+        hooks._remember_selected_deployment_for_request(request_kwargs, deployment)
+
+        self.assertEqual(
+            request_kwargs["_litellm_menu_upstream_url_surface"], "anthropic"
+        )
+        self.assertEqual(
+            request_kwargs["model_info"]["upstream_url_surface"], "anthropic"
+        )
+
     async def test_generic_helper_patch_wraps_bound_original_generic_function(self) -> None:
         hooks, _ = load_hook_module()
         router_module = types.ModuleType("litellm.router")
@@ -940,7 +970,7 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(response["input"][2]["call_id"], "call_function")
         self.assertEqual(response["input"][3]["call_id"], "call_function")
 
-    async def test_generic_helper_patch_retries_image_unsupported_with_vision_bridge(self) -> None:
+    async def test_generic_helper_retries_image_unsupported_with_dsh_vision_router(self) -> None:
         hooks, _ = load_hook_module()
         router_module = types.ModuleType("litellm.router")
 
@@ -961,13 +991,13 @@ class HookPatchTests(HookTestCase):
 
         seen = {"attempts": []}
 
-        async def bridged_request_kwargs(request_kwargs):
-            bridged = dict(request_kwargs)
-            bridged["messages"] = [{"role": "user", "content": "vision text"}]
-            bridged["litellm_metadata"] = {"vision_bridge_attempted": True}
-            return bridged
+        async def dsh_vision_router_request_kwargs(request_kwargs):
+            routed = dict(request_kwargs)
+            routed["messages"] = [{"role": "user", "content": "vision text"}]
+            routed["litellm_metadata"] = {"dsh_vision_router_attempted": True}
+            return routed
 
-        hooks.bridged_request_kwargs = bridged_request_kwargs
+        hooks.dsh_vision_router_request_kwargs = dsh_vision_router_request_kwargs
 
         async def original_generic_function(**kwargs):
             seen["attempts"].append(kwargs)

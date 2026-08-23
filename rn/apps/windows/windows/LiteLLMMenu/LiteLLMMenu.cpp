@@ -23,7 +23,7 @@ namespace {
 std::wstring AllowedRoute(std::wstring route) {
   static constexpr std::wstring_view allowed[] = {
       L"home", L"providers-models", L"codex-settings", L"claude-settings",
-      L"runtime-settings", L"relay-accounts", L"data-management",
+      L"runtime-settings", L"relay-accounts", L"data-management", L"provider-wizard",
       L"logs"};
   return std::find(std::begin(allowed), std::end(allowed), route) == std::end(allowed)
       ? std::wstring{} : route;

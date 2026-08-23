@@ -398,7 +398,7 @@ class HookStreamingToolEventTests(HookTestCase):
         )
         computer_facade_module = importlib.import_module("litellm_menu.computer_facade")
         original_resolve = (
-            computer_facade_module._resolve_litellm_web_search_function_calls_stream_rounds
+            computer_facade_module._resolve_web_search_function_calls_stream_rounds
         )
         captured: dict[str, object] = {}
 
@@ -422,7 +422,7 @@ class HookStreamingToolEventTests(HookTestCase):
         streaming_module._ResponsesStreamCompletionState.completed_payload = (
             fake_completed_payload
         )
-        computer_facade_module._resolve_litellm_web_search_function_calls_stream_rounds = fake_resolve
+        computer_facade_module._resolve_web_search_function_calls_stream_rounds = fake_resolve
         self.addCleanup(
             setattr,
             streaming_module,
@@ -432,7 +432,7 @@ class HookStreamingToolEventTests(HookTestCase):
         self.addCleanup(
             setattr,
             computer_facade_module,
-            "_resolve_litellm_web_search_function_calls_stream_rounds",
+            "_resolve_web_search_function_calls_stream_rounds",
             original_resolve,
         )
         self.addCleanup(
@@ -463,7 +463,7 @@ class HookStreamingToolEventTests(HookTestCase):
                     "type": "function_call",
                     "id": "call_search",
                     "call_id": "call_search",
-                    "name": hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME,
+                    "name": "web_search",
                     "arguments": '{"query":"node memory leak"}',
                     "status": "in_progress",
                 },
@@ -702,7 +702,7 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertEqual(recovery_requests, [])
         self.assertEqual(chunks[-1]["type"], "response.failed")
         self.assertNotIn("Recovered search-only answer.", dumped)
-        self.assertNotIn(hooks._WEB_SEARCH_BRIDGE_FUNCTION_NAME, dumped)
+        self.assertNotIn('\"type\": \"function_call\"', dumped)
         self.assertNotIn("external_web_search_continuation", dumped)
         self.assertIn('"type": "response.failed"', dumped)
         self.assertNotIn("Temporary upstream route failure", dumped)

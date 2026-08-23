@@ -3,10 +3,11 @@ import type { Translator } from "./types";
 type RuntimeCopy = { label: string; help: string };
 
 const categories: Record<string, string> = {
+  "Relay": "中转站",
   "Timeouts": "超时",
   "Recovery": "恢复",
   "Web Search": "网页搜索",
-  "Vision Bridge": "视觉桥接",
+  "Vision Router": "视觉路由",
   "Model Context": "模型上下文",
   "Fallback": "故障转移",
   "Computer Facade": "计算机操作",
@@ -38,6 +39,7 @@ const units: Record<string, string> = {
 };
 
 const zh: Record<string, RuntimeCopy> = {
+  LITELLM_MENU_RELAY_AUTO_GROUP_INTERVAL_MINUTES: { label: "自动分组间隔", help: "服务商管理界面刷新并暂存自动 API 密钥分组的间隔。修改会在点击“应用”后生效。" },
   LITELLM_MENU_REQUEST_TIMEOUT_SECONDS: { label: "请求超时", help: "上游模型请求、续写合成和每次恢复探测的总超时。设为 0 可取消本地请求上限。" },
   LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS: { label: "首事件超时", help: "普通请求等待首个上游流事件的最长时间。设为 0 时回退到请求超时。" },
   LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS: { label: "压缩首事件超时", help: "结构化 Codex 压缩请求等待首个事件的最长时间。设为 0 时回退到请求超时。" },
@@ -63,13 +65,14 @@ const zh: Record<string, RuntimeCopy> = {
   LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRIES: { label: "模型重试", help: "模型规划或综合桥接网页搜索时，对临时限流错误的重试次数。" },
   LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS: { label: "模型重试间隔", help: "临时网页搜索模型重试之间的基础等待时间。" },
   LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON: { label: "pi-web-access 配置 JSON", help: "传给 pi-web-access 的 JSON 配置。配置会私密保存，并在代理启动前写入托管的 web-search.json 文件。" },
-  LITELLM_MENU_VISION_BRIDGE_BACKEND: { label: "后端", help: "自动模式先尝试已配置的 OpenAI 兼容端点，失败后使用内置本地视觉 OCR。本地模式跳过外部视觉端点；API 模式要求可访问的 OpenAI 兼容视觉服务；关闭则不做图像转文本回退。" },
-  LITELLM_MENU_VISION_BRIDGE_API_BASE: { label: "API 地址", help: "OpenAI 兼容的本地视觉端点，例如 Ollama /v1 或其他本地 API URL 桥接服务。" },
-  LITELLM_MENU_VISION_BRIDGE_MODEL: { label: "模型", help: "仅在重试原始路由前用于将图像转换为文本的视觉模型。" },
-  LITELLM_MENU_VISION_BRIDGE_API_KEY: { label: "API 密钥", help: "视觉桥接端点的可选 Bearer 令牌。保持不变会保留已保存令牌；清空会移除令牌。" },
-  LITELLM_MENU_VISION_BRIDGE_TIMEOUT_SECONDS: { label: "超时", help: "每次本地图像转文本桥接调用的超时。" },
-  LITELLM_MENU_VISION_BRIDGE_LOCAL_FORMAT: { label: "本地格式", help: "紧凑模式会缩短本地回退摘要以节省令牌；详细模式包含更完整的区域和元素说明。" },
-  LITELLM_MENU_VISION_BRIDGE_PROMPT: { label: "提示词", help: "将图像转为文本时发送给本地视觉模型的指令。" },
+  LITELLM_MENU_DSH_VISION_ROUTER_ENABLED: { label: "启用视觉回退", help: "视觉回退总开关；此控件与高级 JSON 中的 enabled 会相互更新。" },
+  LITELLM_MENU_DSH_VISION_ROUTER_BACKEND: { label: "视觉回退后端", help: "此控件与高级 JSON 中的 backend 会相互更新；自动会尝试本地和 HTTP 提供方，本地仅使用本地提供方 / OCR，API 仅使用配置的 HTTP 提供方。" },
+  LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK: { label: "使用免费回退链", help: "在允许的后端中追加内置免密 HTTP 回退链；此控件与高级 JSON 中的 freeFallback 会相互更新。" },
+  LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS: { label: "视觉回退超时", help: "每个视觉回退提供方请求允许的最长时间；此控件与高级 JSON 中的 timeoutSeconds 会相互更新。" },
+  LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS: { label: "视觉回退标记数", help: "视觉回退请求最多生成的标记数；此控件与高级 JSON 中的 maxTokens 会相互更新。" },
+  LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED: { label: "启用本地 Ollama", help: "在配置的 HTTP 提供方前尝试本地 Ollama；此控件与高级 JSON 中的 localOllama.enabled 会相互更新，端点和模型仍在高级 JSON 中设置。" },
+  LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED: { label: "启用本地 LM Studio", help: "在配置的 HTTP 提供方前尝试本地 LM Studio；此控件与高级 JSON 中的 localLmStudio.enabled 会相互更新，端点和模型仍在高级 JSON 中设置。" },
+  LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON: { label: "dsh-vision-router 配置", help: "可直接粘贴 JSON 的多行配置框，设置 backend（auto/local/api/off）、localOllama、localLmStudio、按顺序排列的 httpProviders（支持 apiKeyEnv），或 providers 中的 {provider,model,fallbacks}（vision-http/ovh 会映射到内置 HTTP 链；未知适配器会跳过），以及 freeFallback、prompt、timeoutSeconds 和 maxTokens。上方快捷控件与对应 JSON 字段会相互更新。仅当所选模型拒绝图像输入时运行；明确支持 vision 的模型仍直接收到原图。" },
   LITELLM_MENU_UNKNOWN_MODEL_CONTEXT_WINDOW: { label: "未知模型原始上下文", help: "当内置配置、实际路由、LiteLLM 与上游元数据都无法识别模型时，供 Codex 使用的原始上下文窗口。默认 272000，按 Codex 95% 的有效窗口策略会显示约 258k。" },
   LITELLM_MENU_MODEL_CONTEXT_REFRESH_HOURS: { label: "模型上下文刷新间隔", help: "托管 Codex 模型目录刷新公开上下文元数据的间隔。设为 0 后仅使用内置配置与已有缓存，不访问上游。" },
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES: { label: "冷却失败阈值", help: "同一部署 / 协议对连续失败多少次后临时跳过。该部署的其他已配置协议仍可使用。设为 0 可关闭冷却。" },
@@ -100,7 +103,14 @@ const zh: Record<string, RuntimeCopy> = {
 };
 
 const options: Record<string, Record<string, string>> = {
-  "*": { auto: "自动", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却", compact: "紧凑", detailed: "详细", mcp: "MCP", browser: "内置浏览器", chrome: "Chrome", playwright: "Playwright", mock: "模拟" },
+  "*": { on: "开启", auto: "自动", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却", compact: "紧凑", detailed: "详细", mcp: "MCP", browser: "内置浏览器", chrome: "Chrome", playwright: "Playwright", mock: "模拟" },
+};
+const englishOptions: Record<string, string> = {
+  on: "On",
+  off: "Off",
+  auto: "Auto",
+  local: "Local",
+  api: "API",
 };
 
 function isChinese(translate: Translator): boolean {
@@ -124,7 +134,7 @@ export function runtimeUnitLabel(value: string, translate: Translator): string {
 }
 
 export function runtimeOptionLabel(key: string, value: string, translate: Translator): string {
-  return isChinese(translate) ? options[key]?.[value] ?? options["*"][value] ?? value : value;
+  return isChinese(translate) ? options[key]?.[value] ?? options["*"][value] ?? value : englishOptions[value] ?? value;
 }
 
 export const runtimeLocalizedKeys = Object.freeze(Object.keys(zh));

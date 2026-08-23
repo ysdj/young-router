@@ -6,7 +6,8 @@ import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptio
 import { canonicalWindowRoute, LOG_TABS, routeMenuActions, ROUTES } from "../routes";
 import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeSplitView, NativeTable, NativeTextField } from "./NativeControls";
 import { CODE_EDITOR_HTML, CodeEditorWebView } from "./code-editor/CodeEditorWebView";
-import { normalizeRelayOrigin, RelayAccountManager, stationOriginKey } from "./RelayAccountManager";
+import { NativeFormRow, NativeWizardProgress, normalizeRelayOrigin, relayNavigationItems, RelayAccountManager, stationOriginKey } from "./RelayAccountManager";
+import { suggestedRelayStationName } from "./relayOrigin";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import type {
   AppRoute,
@@ -20,6 +21,8 @@ import type {
   NativeLeafAdapter,
   ProbeSurfaceName,
   ProviderSummary,
+  ProviderAuthKind,
+  ProviderAuthStatus,
   ServiceStatus,
   ValidationSummary,
 } from "../types";
@@ -62,6 +65,19 @@ type RawEditorDocument = "config" | "auth" | "settings" | "desktop" | "developer
 type ClaudeDeploymentDraft = { model: string; base_url: string };
 type DataManagementTab = "import" | "export" | "webdav";
 type WebDavSyncAction = "sync" | "push" | "pull";
+
+const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login"] as const satisfies readonly ProviderAuthKind[];
+
+function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {
+  const value = stringValue(provider?.auth_kind, "api_key");
+  return PROVIDER_AUTH_OPTIONS.includes(value as ProviderAuthKind) ? value as ProviderAuthKind : "api_key";
+}
+
+function providerAuthStatus(provider: UnknownRecord | undefined): ProviderAuthStatus {
+  const value = stringValue(provider?.auth_status, "signed_out");
+  const statuses: readonly ProviderAuthStatus[] = ["signed_out", "authorizing", "signed_in", "expired", "error", "unsupported"];
+  return statuses.includes(value as ProviderAuthStatus) ? value as ProviderAuthStatus : "signed_out";
+}
 
 const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
   { domain: "providers_models", labelKey: "dataManagement.section.providersModels" },
@@ -132,7 +148,26 @@ const ROUTE_TRACE_SCROLLBAR_MIN_THUMB_WIDTH = 32;
 const SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH = 420;
 const WEBDAV_FORM_LABEL_WIDTH = 108;
 const SETTINGS_STRUCTURED_SCROLLBAR_GUTTER = 18;
-const RELAY_KEY_ICON = "⇄";
+const COLUMN_GAP = 8;
+const DSH_VISION_ROUTER_QUICK_KEYS = [
+  "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED",
+  "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND",
+  "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK",
+  "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
+  "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS",
+  "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
+  "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
+] as const;
+const DSH_VISION_ROUTER_CONFIG_KEY = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON";
+const DSH_VISION_ROUTER_QUICK_DEFAULTS: Record<string, string> = {
+  LITELLM_MENU_DSH_VISION_ROUTER_ENABLED: "on",
+  LITELLM_MENU_DSH_VISION_ROUTER_BACKEND: "auto",
+  LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK: "on",
+  LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS: "45",
+  LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS: "4096",
+  LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED: "off",
+  LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED: "off",
+};
 // Ordinary configuration text stays local until blur, submit, or Apply. Core
 // publishes a full settings snapshot for every staged change, so committing
 // active typing would make every settings surface pay for unrelated edits.
@@ -296,6 +331,12 @@ function relaySourcesForBaseUrl(value: string, relaySources: RelaySourceOption[]
   return relaySources.filter((source) => source.enabled && stationOriginKey(source.baseURL) === target);
 }
 
+function relayStationForBaseUrl(value: string, relayStations: RelayStationOption[]): RelayStationOption | undefined {
+  const target = stationOriginKey(value);
+  if (!target) return undefined;
+  return relayStations.find((station) => stationOriginKey(station.baseURL) === target);
+}
+
 function providerKeyStates(provider: UnknownRecord): ProviderKeyState[] {
   return asRecords(provider.key_states).flatMap((value) => {
     const source = asRecord(value.source);
@@ -359,10 +400,10 @@ function providerKeyChoiceLabel(choice: Pick<ProviderKeyChoice, "name" | "kind" 
   const name = apiKeyDisplayName(choice.name, translate);
   if (choice.kind !== "relay") return name;
   const sourceName = choice.source
-    ? [choice.source.stationLabel, choice.source.accountLabel, choice.source.resourceLabel].filter(Boolean).join("/")
+    ? [choice.source.accountLabel, choice.source.resourceLabel].filter(Boolean).join("/")
     : name;
   const multiplier = choice.source && Number.isFinite(choice.source.multiplier) ? ` (${choice.source.multiplier}x)` : "";
-  return `${RELAY_KEY_ICON} ${sourceName || name}${multiplier}`;
+  return `${sourceName || name}${multiplier}`;
 }
 
 function modelOrderMode(model: UnknownRecord): "manual" | "relay_multiplier" {
@@ -429,9 +470,20 @@ function codexModelCatalogState(snapshot: CoreSnapshot | undefined): UnknownReco
   return asRecord(domainState(snapshot, "codex").model_catalog);
 }
 
+function codexModelCatalogRestartSignature(catalog: UnknownRecord): string {
+  const models = Array.isArray(catalog.public_models)
+    ? Array.from(new Set(catalog.public_models
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => value.trim())
+        .filter(Boolean))).sort()
+    : [];
+  return JSON.stringify({ enabled: booleanValue(catalog.enabled), models });
+}
+
 function domainForRoute(route: AppRoute): ConfigDomain | undefined {
   switch (route) {
     case "providers-models": return "providers_models";
+    case "provider-wizard": return "providers_models";
     case "codex-settings": return "codex";
     case "claude-settings": return "claude";
     case "runtime-settings": return "runtime";
@@ -523,7 +575,11 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
   const startupAttempted = useRef(false);
   const serviceOperationQueue = useRef<Promise<void>>(Promise.resolve());
   const acceptedSnapshotRevision = useRef<number>(initialSnapshot?.revision ?? -1);
-  const presentedCatalogRestartEvent = useRef(0);
+  // Core can be recreated after an IPC/subscription recovery, so its local
+  // change_event counter may start over. Deduplicate by the actual catalog
+  // signature instead of by that process-local counter.
+  const presentedCatalogRestartSignature = useRef<string | undefined>(undefined);
+  const acknowledgedCatalogRestartSignature = useRef<string | undefined>(undefined);
   const catalogRestartConfirmationOpen = useRef(false);
 
   const recordMenuAction = useCallback(async (action: string): Promise<void> => {
@@ -604,7 +660,10 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
       routeHome: translate("route.home"), routeProvidersModels: translate("card.providersModels"),
       routeCodexSettings: translate("menu.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
-      routeDataManagement: translate("card.dataManagement"), routeRelayAccounts: translate("route.relayAccounts"), routeRelayAdd: translate("relay.addAccount"), routeLogs: translate("card.logs"),
+      routeDataManagement: translate("card.dataManagement"), routeRelayAccounts: translate("route.relayAccounts"), routeRelayAdd: translate("relay.addAccount"), routeProviderWizard: translate("providers.wizard.title"), routeLogs: translate("card.logs"),
+      providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
+      providerAuthCode: translate("providers.authUserCode"),
+      providerAuthCopy: translate("common.copy"),
       modelChooserTitle: translate("modelChooser.title"), modelChooserHeading: translate("modelChooser.heading"),
       modelChooserProvider: translate("modelChooser.provider"), modelChooserKey: translate("modelChooser.key"),
       modelChooserSearch: translate("modelChooser.search"), modelChooserAll: translate("modelChooser.all"),
@@ -747,11 +806,50 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
   useEffect(() => {
     if (!isPrimaryHost || Platform.OS !== "macos" || !snapshot) return;
     const catalog = codexModelCatalogState(snapshot);
-    const event = numberValue(catalog.change_event);
-    if (!booleanValue(catalog.restart_required) || event <= presentedCatalogRestartEvent.current || catalogRestartConfirmationOpen.current) return;
-    presentedCatalogRestartEvent.current = event;
+    const signature = codexModelCatalogRestartSignature(catalog);
+    if (!booleanValue(catalog.restart_required)) {
+      presentedCatalogRestartSignature.current = undefined;
+      return;
+    }
+    if (signature === presentedCatalogRestartSignature.current
+      || signature === acknowledgedCatalogRestartSignature.current
+      || catalogRestartConfirmationOpen.current) return;
+    presentedCatalogRestartSignature.current = signature;
     catalogRestartConfirmationOpen.current = true;
     void (async () => {
+      let acknowledgementCommitted = false;
+      const acknowledge = async (): Promise<void> => {
+        try {
+          await ipc.dispatch({ domain: "codex", type: "acknowledge_model_catalog_restart", payload: {} });
+          // The Core action is committed before it emits a snapshot. Do not
+          // turn a follow-up projection failure into a second prompt.
+          acknowledgementCommitted = true;
+          acknowledgedCatalogRestartSignature.current = signature;
+        } catch (reason) {
+          // A Core action can be committed while its post-action emission
+          // fails (for example while the service status is transient). Read
+          // the authoritative snapshot before deciding to present again.
+          try {
+            const current = await ipc.snapshot();
+            const currentCatalog = codexModelCatalogState(current);
+            receiveSnapshot(current);
+            if (!booleanValue(currentCatalog.restart_required)) {
+              acknowledgementCommitted = true;
+              acknowledgedCatalogRestartSignature.current = codexModelCatalogRestartSignature(currentCatalog);
+              return;
+            }
+          } catch {
+            // Preserve the original failure below.
+          }
+          throw reason;
+        }
+        try {
+          receiveSnapshot(await ipc.snapshot());
+        } catch {
+          // The acknowledgement is already committed; the next subscription
+          // event or explicit snapshot will refresh the UI state.
+        }
+      };
       try {
         let restartFailed = false;
         for (;;) {
@@ -764,8 +862,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
             laterLabel: translate("codex.modelCatalogRestartLater"),
           });
           if (choice !== "restart" || await native.restartCodex()) {
-            await ipc.dispatch({ domain: "codex", type: "acknowledge_model_catalog_restart", payload: {} });
-            receiveSnapshot(await ipc.snapshot());
+            await acknowledge();
             return;
           }
           restartFailed = true;
@@ -775,7 +872,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
         // those windows usable if its acknowledgement is temporarily
         // unavailable, then present the same outstanding event again when
         // the next Core snapshot arrives.
-        presentedCatalogRestartEvent.current = event - 1;
+        if (!acknowledgementCommitted) presentedCatalogRestartSignature.current = undefined;
       } finally {
         catalogRestartConfirmationOpen.current = false;
       }
@@ -815,7 +912,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
   return (
     <View style={styles.root} accessibilityLabel={translate("app.title")}>
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {!error && route !== "home" && snapshot ? <RouteSurface route={route} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onClose={() => setRoute("home")} /> : null}
+      {!error && route !== "home" && snapshot ? <RouteSurface route={route} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute(route === "provider-wizard" && Platform.OS === "windows" ? "providers-models" : "home")} /> : null}
       {!error && route === "home" ? <View style={styles.menuBarHost} /> : null}
     </View>
   );
@@ -829,8 +926,10 @@ function DialogFooter({ status, leading, children, compact = false, borderless =
   return <View style={[styles.footer, compact && styles.footerCompact, borderless && styles.footerBorderless]}>{leading ?? (status ? <Text numberOfLines={1} style={styles.footerStatus}>{status}</Text> : <View />)}<View style={styles.footerSpacer} /><View style={styles.footerButtons}>{children}</View></View>;
 }
 
-function IconButton({ label, symbol, title, disabled, onPress }: { label: string; symbol?: "pause" | "play" | "trash"; title: string; disabled?: boolean; onPress: () => void }): React.JSX.Element {
-  return <NativeButton title={label} symbol={symbol} toolTip={title} accessibilityLabel={title} compact disabled={disabled} onPress={onPress} style={styles.iconButton} />;
+function IconButton({ label, symbol, title, disabled, onPress }: { label: string; symbol?: "chevron-up" | "chevron-down" | "copy" | "minus" | "pause" | "play" | "plus" | "trash"; title: string; disabled?: boolean; onPress: () => void }): React.JSX.Element {
+  const nativeSymbol: "chevron-up" | "chevron-down" | "copy" | "minus" | "pause" | "play" | "plus" | "trash" | undefined = symbol
+    ?? (label === "+" ? "plus" : label === "−" ? "minus" : label === "⧉" ? "copy" : label === "↑" ? "chevron-up" : label === "↓" ? "chevron-down" : undefined);
+  return <NativeButton title={label} symbol={nativeSymbol} toolTip={title} accessibilityLabel={title} compact disabled={disabled} onPress={onPress} style={styles.iconButton} />;
 }
 
 function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: { values: Array<{ id: string; title: string }>; selected: string; disabled?: boolean; onSelect: (id: string) => void; style?: StyleProp<ViewStyle>; nativeRef?: React.Ref<HostInstance> }): React.JSX.Element {
@@ -839,9 +938,11 @@ function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: 
   return <NativeSegmentedControl ref={nativeRef} labels={labels} selectedValue={selectedValue} disabled={disabled} onChange={({ nativeEvent }) => { const next = values[nativeEvent.index]; if (next) onSelect(next.id); }} style={[styles.windowTabs, style]} />;
 }
 
-function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onClose }: { route: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; nativeAction?: { id: string; sequence: number }; onSnapshot: (next: CoreSnapshot) => void; onClose: () => void }): React.JSX.Element {
+function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onNavigate, onClose }: { route: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; nativeAction?: { id: string; sequence: number }; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void }): React.JSX.Element {
   const settingsRoute = isAssistantSettingsRoute(route);
   const [settingsTab, setSettingsTab] = useState<AssistantSettingsDomain>(route === "claude-settings" ? "claude" : "codex");
+  const [serviceProviderSelection, setServiceProviderSelection] = useState<string>();
+  const serviceProviderAddButtonRef = useRef<HostInstance | null>(null);
   const [claudeDeploymentDraft, setClaudeDeploymentDraft] = useState<ClaudeDeploymentDraft>();
   const claudeDeploymentDraftRef = useRef<ClaudeDeploymentDraft | undefined>(undefined);
   const domain = settingsRoute ? settingsTab : domainForRoute(route);
@@ -873,7 +974,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   );
   // Relay CRUD and linked imports are one coordinated draft. The relay route
   // therefore applies both domains together whenever either side is dirty.
-  const stagedDomainsForRoute = (currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {
+  const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {
     if (settingsRoute) {
       return (["codex", "claude"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);
     }
@@ -884,7 +985,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       return (["relay_accounts", "providers_models"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);
     }
     return domain && currentSnapshot?.drafts[domain]?.dirty ? [domain] : [];
-  };
+  }, [domain, route, settingsRoute]);
   const setPendingFieldDirty = useCallback((id: symbol, dirty: boolean): void => {
     const current = pendingFieldDirtyIdsRef.current;
     if (current.has(id) === dirty) return;
@@ -922,6 +1023,39 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       setClaudeDeploymentDraft(undefined);
     }
   }, [route]);
+
+  const serviceProviderRows = useMemo(() => {
+    const statusLabels: Record<ProviderAuthStatus, string> = {
+      signed_out: translate("providers.authStatusSignedOut"),
+      authorizing: translate("providers.authStatusAuthorizing"),
+      signed_in: translate("providers.authStatusSignedIn"),
+      expired: translate("providers.authStatusExpired"),
+      error: translate("providers.authStatusError"),
+      unsupported: translate("providers.authStatusUnsupported"),
+    };
+    const officialRows = serviceProviderRecords(snapshot).map((provider) => {
+      const kind = providerAuthKind(provider) === "claude_login" ? "claude_login" : "openai_login";
+      return {
+        key: "provider:" + editorIdentifier(provider),
+        cells: [stringValue(provider.display_name, stringValue(provider.name, serviceProviderKindLabel(kind, translate))), serviceProviderKindLabel(kind, translate), statusLabels[providerAuthStatus(provider)]],
+      };
+    });
+    const relayRows = relayNavigationItems(snapshot, translate).map((item) => ({
+      key: item.key,
+      // Keep the station → account hierarchy visible in the compact unified
+      // list. NativeTable preserves the leading spaces in the first cell.
+      cells: [item.kind === "account" ? "  " + item.label : item.label, item.secondary, item.kind === "account" ? item.secondary.split(" · ").slice(-1)[0] : translate("relay.station")],
+    }));
+    return [...officialRows, ...relayRows];
+  }, [snapshot, translate]);
+  useEffect(() => {
+    if (route !== "relay-accounts") {
+      setServiceProviderSelection(undefined);
+      return;
+    }
+    if (serviceProviderSelection && serviceProviderRows.some((row) => row.key === serviceProviderSelection)) return;
+    setServiceProviderSelection(serviceProviderRows[0]?.key);
+  }, [route, serviceProviderRows, serviceProviderSelection]);
 
   const refresh = async (): Promise<CoreSnapshot> => {
     const next = await ipc.snapshot();
@@ -1020,14 +1154,55 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   // Refresh each committed action so toggles and pickers also project their
   // new Core state immediately instead of waiting for the disk watcher.
   }, null, true);
-  const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain): Promise<CoreSnapshot | undefined> => {
+  const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined> => {
     let succeeded = false;
+    let outcome: CoreSnapshot | undefined;
     await run(async () => {
       const staged = await enqueueDispatch(type, payload, targetDomain);
       succeeded = true;
+      // Capture the refresh belonging to this action. Reading
+      // latestSnapshot.current after run() returns is racy with the
+      // authorisation status poll, which can overwrite its operation summary.
+      outcome = await refresh();
       return staged;
-    }, null);
-    return succeeded ? latestSnapshot.current : undefined;
+    }, null, keepControlsEnabled, false);
+    return succeeded ? outcome : undefined;
+  };
+  const addOfficialAccount = async (kind: ServiceProviderKind): Promise<void> => {
+    const currentProviders = serviceProviderRecords(latestSnapshot.current ?? snapshot);
+    const name = nextServiceProviderName(currentProviders, kind);
+    const next = await dispatchWithOutcome("service_provider.add", { kind, name }, "providers_models");
+    if (!next) return;
+    const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+    const summaryID = stringValue(summary.provider_id);
+    const added = serviceProviderRecords(next).find((provider) => {
+      const displayName = stringValue(provider.display_name, stringValue(provider.name)).trim();
+      return displayName === name;
+    });
+    const providerID = summaryID || (added ? editorIdentifier(added) : "");
+    if (!providerID) throw new Error("service_provider.add did not return provider_id");
+    setServiceProviderSelection("provider:" + providerID);
+    await dispatchWithOutcome("service_provider.auth_start", { provider_id: providerID }, "providers_models");
+  };
+  const openServiceProviderAddMenu = (): void => {
+    const items = [
+      serviceProviderKindLabel("openai_login", translate) + " " + translate("relay.officialProviderAddLogin"),
+      serviceProviderKindLabel("claude_login", translate) + " " + translate("relay.officialProviderAddLogin"),
+      translate("relay.addAccount"),
+    ];
+    const choose = (index: number | undefined): void => {
+      if (index === 0) void addOfficialAccount("openai_login").catch((reason) => setResult(errorMessage(reason, translate)));
+      else if (index === 1) void addOfficialAccount("claude_login").catch((reason) => setResult(errorMessage(reason, translate)));
+      else if (index === 2) native.window.open("relay-add");
+    };
+    const button = serviceProviderAddButtonRef.current;
+    if (!button || typeof button.measureInWindow !== "function") {
+      void native.showActionMenu({ title: translate("relay.chooseProviderType"), items, anchor: { x: 0, y: 0, width: 0, height: 0 } }).then(choose);
+      return;
+    }
+    button.measureInWindow((x, y, width, height) => {
+      void native.showActionMenu({ title: translate("relay.chooseProviderType"), items, anchor: { x, y, width, height } }).then(choose);
+    });
   };
   const commitRelayMetadata: Dispatch = async (type, payload = {}, targetDomain = domain) => {
     // Relay credential cleanup needs the Core acknowledgement itself, not the
@@ -1050,6 +1225,19 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   };
   const hasPendingFieldEdits = useCallback((): boolean => pendingFieldDirtyIdsRef.current.size > 0
     || [...pendingFields.current.values()].some((field) => field.isDirty?.() === true), []);
+  // Actions can finish with a fresh Core snapshot before the parent route has
+  // rendered it into `snapshot`. Keep the footer and close decision on the
+  // same newest projection so Apply cannot look enabled while Close sees a
+  // clean draft (or vice versa). Equal revisions prefer the prop: it is the
+  // rendered source of truth and may contain a newer same-revision projection.
+  const actionSnapshot = latestSnapshot.current && latestSnapshot.current.revision > (snapshot?.revision ?? -1)
+    ? latestSnapshot.current
+    : snapshot;
+  const routeHasStagedChanges = useCallback((currentSnapshot: CoreSnapshot | undefined): boolean => (
+    stagedDomainsForRoute(currentSnapshot).length > 0
+    || hasPendingFieldEdits()
+    || (settingsRoute && hasClaudeDeploymentChanges(currentSnapshot))
+  ), [hasPendingFieldEdits, settingsRoute, stagedDomainsForRoute]);
   const monitoredDiskDomains = useMemo<EditableDiskDomain[]>(() => {
     if (!isSettingsRoute(route)) return [];
     if (settingsRoute) return ["codex", "claude"];
@@ -1245,6 +1433,38 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       return result;
     });
   };
+  const activateProviderAndRestart = async (): Promise<boolean> => {
+    let completed = false;
+    await run(async () => {
+      await flushPendingFields();
+      await dispatchQueue.current;
+      const refreshed = await ipc.snapshot();
+      revision.current = refreshed.revision;
+      latestSnapshot.current = refreshed;
+      onSnapshot(refreshed);
+      if (refreshed.drafts.providers_models?.dirty !== true) return { cancelled: true };
+      const diskChanged = refreshed.disk.providers_models?.changed === true;
+      if (diskChanged) {
+        const accepted = await native.showConfirmation({
+          title: translate("settings.diskChangedTitle"),
+          message: translate("settings.overwriteDiskConfirm"),
+          confirmLabel: translate("settings.keepDraft"),
+        });
+        if (!accepted) return { cancelled: true };
+      }
+      const applied = await ipc.applyDomains(["providers_models"], refreshed.revision, diskChanged ? ["overwrite_external_providers_models"] : undefined);
+      revision.current = applied.revision;
+      const afterApply = await refresh();
+      if (applied.status === "applied" && ["running", "unhealthy", "starting"].includes(afterApply.service.state)) {
+        const restarted = await ipc.dispatch({ type: "service.restart" }, revision.current ?? afterApply.revision);
+        revision.current = restarted.revision;
+        await refresh();
+      }
+      completed = applied.status === "applied";
+      return applied;
+    }, null, false, false);
+    return completed;
+  };
   const applyDataManagement = (selectedSections: ConfigDomain[]): Promise<void> => runDataManagement("import", async () => {
     await flushPendingFields();
     const refreshed = await ipc.snapshot();
@@ -1425,6 +1645,13 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       setClaudeDeploymentDraft(undefined);
     }
     if (route === "data-management") importPlanToken.current = undefined;
+    if (route === "provider-wizard" && Platform.OS === "windows") {
+      // Windows currently owns one React host window. Restore the parent
+      // route in that host instead of hiding it as a second native window.
+      native.window.open("providers-models");
+      onClose();
+      return;
+    }
     try {
       native.window.close(canonicalWindowRoute(route));
     } finally {
@@ -1432,16 +1659,22 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     }
   };
   const requestClose = (): void => {
+    // The provider wizard is a native modal child window. Its Cancel button
+    // and title-bar close both dismiss that child directly; partial staged
+    // provider edits remain in Core just as they did when the wizard was an
+    // in-window surface.
+    if (route === "provider-wizard") {
+      closeRoute();
+      return;
+    }
     const restoreWindow = (): void => {
       const windowRoute = canonicalWindowRoute(route);
       native.window.open(windowRoute);
       native.window.focus(windowRoute);
     };
-    const current = latestSnapshot.current ?? snapshot;
+    const current = actionSnapshot;
     const dirtyDomains = stagedDomainsForRoute(current);
-    const needsDiscardConfirmation = hasPendingFieldEdits()
-      || dirtyDomains.length > 0
-      || (settingsRoute && hasClaudeDeploymentChanges(current));
+    const needsDiscardConfirmation = routeHasStagedChanges(current);
     if (!needsDiscardConfirmation) {
       closeRoute();
       return;
@@ -1491,20 +1724,16 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const windowTitle = settingsRoute
     ? translate(settingsTab === "claude" ? "card.claudeSettings" : "card.codexSettings")
     : translate(definition?.titleKey ?? "app.title");
-  return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
-    {route !== "providers-models" && route !== "logs" && route !== "relay-accounts" && route !== "relay-add" && route !== "data-management" ? <WindowTitle title={windowTitle} validation={issues.length > 0 ? `${issues.length} ${translate("common.validationIssues")}` : undefined} /> : null}
-    {route === "providers-models" || settingsRoute || route === "logs" || route === "relay-accounts" || route === "relay-add" || route === "runtime-settings" || route === "data-management" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "providers-models" && styles.providersContent, settingsRoute && styles.settingsContent, route === "logs" && styles.logsContent, (route === "relay-accounts" || route === "relay-add") && styles.relayAccountsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
-    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} /> : null}
-    {settingsRoute ? <><View style={styles.settingsTabBar}><WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]} selected={settingsTab} disabled={busy} onSelect={(next) => switchSettingsTab(next as AssistantSettingsDomain)} style={styles.settingsTabs} /></View>{settingsTab === "codex" ? <CodexWorkspace snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onEditorConflict={resolveRawEditorConflict} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} /> : <ClaudeScreen snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onEditorConflict={resolveRawEditorConflict} deployment={claudeDeployment} onDeploymentChange={(key, value) => {
-      const next = { ...(claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(snapshot)), [key]: value };
-      claudeDeploymentDraftRef.current = next;
-      setClaudeDeploymentDraft(next);
-      return enqueueDispatch("patch_deployment", { [key]: value }, "claude").then(() => {
-        setSettingsRawReloadToken((current) => current + 1);
-      });
-    }} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} />}</> : null}
-    {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
-    {route === "relay-accounts" || route === "relay-add" ? <RelayAccountManager visible setupOnly={route === "relay-add"} snapshot={snapshot} native={native} busy={busy} translate={translate} onClose={closeRoute} commit={commitRelayMetadata} detectType={async (origin) => {
+  const providerWizardProviders = useMemo(() => {
+    const state = domainState(snapshot, "providers_models");
+    const details = asRecords(state.providers);
+    const candidates = details.length > 0 ? details : (snapshot?.providers_models.providers ?? []).map(providerRecord);
+    return candidates.filter((provider) => stringValue(provider.auth_kind, "api_key") === "api_key");
+  }, [snapshot]);
+  const providerWizardRelaySources = useMemo(() => relaySourcesFromSnapshot(snapshot), [snapshot]);
+ const providerWizardRelayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
+  const renderRelayManager = (options: { setupOnly: boolean; hideNavigation?: boolean; selectedNavigationKey?: string; onNavigationSelectionChange?: (key: string) => void }): React.JSX.Element => (
+<RelayAccountManager visible setupOnly={options.setupOnly} hideNavigation={options.hideNavigation} selectedNavigationKey={options.selectedNavigationKey} onNavigationSelectionChange={options.onNavigationSelectionChange} snapshot={snapshot} native={native} busy={busy} translate={translate} onClose={closeRoute} onStatus={setResult} commit={commitRelayMetadata} detectType={async (origin) => {
       const staged = await enqueueDispatch("account.detect_type", { origin }, "relay_accounts");
       revision.current = staged.revision;
       const next = await refresh();
@@ -1531,6 +1760,150 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       },
       setGroup: async (accountId, resourceId, groupId) => {
         await commitRelayMetadata("api_key.set_group", { account_id: accountId, resource_id: resourceId, group_id: groupId }, "relay_accounts");
+      },
+      setAutoGrouping: async (accountId, enabled) => {
+        await enqueueDispatch("api_key.set_auto_grouping", { account_id: accountId, enabled }, "relay_accounts");
+        try {
+          const next = await refresh();
+          return { draftStaged: next.drafts.relay_accounts?.dirty === true };
+        } catch {
+          // Core accepted the toggle; keep the staged message until the next
+          // snapshot can confirm whether the draft was reverted.
+          return { draftStaged: true };
+        }
+      },
+      alignAutoGrouping: async (accountId) => {
+        await commitRelayMetadata("api_key.auto_group_align", { account_id: accountId }, "relay_accounts");
+      },
+      remove: async (accountId, resourceId, dependencyPolicy) => {
+        await commitRelayMetadata("api_key.delete", {
+          account_id: accountId,
+          resource_id: resourceId,
+          dependency_policy: dependencyPolicy,
+        }, "relay_accounts");
+      },
+      detach: async (accountId, resourceId) => {
+        await commitRelayMetadata("api_key.detach", { account_id: accountId, resource_id: resourceId }, "relay_accounts");
+      },
+    }} addAccount={async (type, origin, rememberPassword, stationOptions = {}) => {
+      const before = await refresh();
+      const beforeRelay = asRecord(before.domains.relay_accounts);
+      const beforeRelayState = asRecord(beforeRelay.state);
+      const beforeRelayAccounts = asRecords(beforeRelayState.accounts ?? beforeRelay.accounts);
+      const existingIDs = new Set(beforeRelayAccounts.map((item) => stringValue(item.id)).filter(Boolean));
+      const normalizedOrigin = normalizeRelayOrigin(origin);
+      const originKey = stationOriginKey(normalizedOrigin);
+      const staged = await enqueueDispatch("account.add", {
+        type,
+        label: origin,
+        origin: normalizedOrigin,
+        remember_password: rememberPassword,
+        ...(stationOptions.stationID ? { station_id: stationOptions.stationID } : {}),
+        ...(stationOptions.stationOrigin ? { station_origin: stationOptions.stationOrigin } : {}),
+        ...(stationOptions.stationName ? { station_name: stationOptions.stationName } : {}),
+        ...(stationOptions.stationType ? { station_type: stationOptions.stationType } : {}),
+      }, "relay_accounts");
+      revision.current = staged.revision;
+      const next = await refresh();
+      const nextRelay = asRecord(next.domains.relay_accounts);
+      const nextRelayState = asRecord(nextRelay.state);
+      const accounts = asRecords(nextRelayState.accounts ?? nextRelay.accounts);
+      const account = accounts.find((item) => {
+        const id = stringValue(item.id);
+        return Boolean(id && !existingIDs.has(id) && stationOriginKey(stringValue(item.origin)) === originKey && item.type === type);
+      });
+      if (!account) return undefined;
+      const id = stringValue(account.id);
+      const label = stringValue(account.label);
+      if (!id || !label) return undefined;
+      return {
+        id,
+        type,
+        label,
+        origin: stringValue(account.origin),
+        username: stringValue(account.username),
+        rememberPassword: account.remember_password === true,
+      };
+    }} refreshAccounts={async () => {
+      await refresh();
+    }} />
+  );
+  return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
+    {route !== "providers-models" && route !== "logs" && route !== "relay-accounts" && route !== "relay-add" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} validation={issues.length > 0 ? `${issues.length} ${translate("common.validationIssues")}` : undefined} /> : null}
+    {route === "providers-models" || route === "provider-wizard" || settingsRoute || route === "logs" || route === "relay-accounts" || route === "relay-add" || route === "runtime-settings" || route === "data-management" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.settingsContent, route === "logs" && styles.logsContent, (route === "relay-accounts" || route === "relay-add") && styles.relayAccountsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
+    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} /> : null}
+    {route === "provider-wizard" ? <ProviderSetupWizard providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} /> : null}
+    {settingsRoute ? <><View style={styles.settingsTabBar}><WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]} selected={settingsTab} disabled={busy} onSelect={(next) => switchSettingsTab(next as AssistantSettingsDomain)} style={styles.settingsTabs} /></View>{settingsTab === "codex" ? <CodexWorkspace snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onEditorConflict={resolveRawEditorConflict} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} /> : <ClaudeScreen snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onEditorConflict={resolveRawEditorConflict} deployment={claudeDeployment} onDeploymentChange={(key, value) => {
+      const next = { ...(claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(snapshot)), [key]: value };
+      claudeDeploymentDraftRef.current = next;
+      setClaudeDeploymentDraft(next);
+      return enqueueDispatch("patch_deployment", { [key]: value }, "claude").then(() => {
+        setSettingsRawReloadToken((current) => current + 1);
+      });
+    }} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} />}</> : null}
+    {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
+    {route === "relay-accounts" ? <View style={serviceProviderStyles.workspace}>
+      <View style={serviceProviderStyles.unifiedHeader}>
+        <View style={serviceProviderStyles.intro}><Text style={serviceProviderStyles.heading}>{translate("route.relayAccounts")}</Text><Text style={serviceProviderStyles.hint}>{translate("relay.officialAccountsHint")}</Text></View>
+        <NativeButton ref={serviceProviderAddButtonRef} title="" symbol="plus" compact toolTip={translate("relay.chooseProviderType")} accessibilityLabel={translate("relay.chooseProviderType")} primary disabled={busy} onPress={openServiceProviderAddMenu} />
+      </View>
+      <View style={serviceProviderStyles.columns}>
+        <View style={serviceProviderStyles.listPane}>
+          <NativeTable
+            columns={[{ label: translate("common.name"), width: 118 }, { label: translate("providers.authentication"), width: 72 }, { label: translate("common.status"), width: 78 }]}
+            rows={serviceProviderRows}
+            selectedKey={serviceProviderSelection ?? ""}
+            compact
+            onSelectionChange={setServiceProviderSelection}
+            style={serviceProviderStyles.table}
+          />
+        </View>
+        <View style={serviceProviderStyles.detailPane}>
+          {serviceProviderSelection?.startsWith("provider:") ? <ServiceProviderManager snapshot={snapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onActivateAndRestart={activateProviderAndRestart} onStatus={setResult} onSecretState={onSecretState} hideNavigation selectedNavigationKey={serviceProviderSelection} onNavigationSelectionChange={setServiceProviderSelection} /> : serviceProviderSelection?.startsWith("relay:") ? renderRelayManager({ setupOnly: false, hideNavigation: true, selectedNavigationKey: serviceProviderSelection, onNavigationSelectionChange: setServiceProviderSelection }) : <View style={serviceProviderStyles.emptyDetail}><Text style={serviceProviderStyles.detailTitle}>{translate("route.relayAccounts")}</Text><Text style={serviceProviderStyles.hint}>{translate("relay.empty")}</Text></View>}
+        </View>
+      </View>
+    </View> : null}
+    {route === "relay-add" ? <RelayAccountManager visible setupOnly snapshot={snapshot} native={native} busy={busy} translate={translate} onClose={closeRoute} onStatus={setResult} commit={commitRelayMetadata} detectType={async (origin) => {
+      const staged = await enqueueDispatch("account.detect_type", { origin }, "relay_accounts");
+      revision.current = staged.revision;
+      const next = await refresh();
+      const detected = asRecord(next.action_summaries?.relay_accounts).detected_type;
+      return detected === "newapi" || detected === "sub2api" ? detected : undefined;
+    }} refreshResources={async (accountId) => {
+      const staged = await enqueueDispatch("resources.refresh", { account_id: accountId }, "relay_accounts");
+      revision.current = staged.revision;
+      return asRecord(staged).resource_status === "ready" ? "ready" : "unavailable";
+    }} apiKeyActions={{
+      create: async (accountId, options) => {
+        await commitRelayMetadata("api_key.create", {
+          account_id: accountId,
+          name: options.name,
+          ...(options.groupID ? { group_id: options.groupID } : {}),
+          enabled: options.enabled,
+        }, "relay_accounts");
+      },
+      update: async (accountId, resourceId, name) => {
+        await commitRelayMetadata("api_key.update", { account_id: accountId, resource_id: resourceId, name }, "relay_accounts");
+      },
+      setEnabled: async (accountId, resourceId, enabled) => {
+        await commitRelayMetadata("api_key.set_enabled", { account_id: accountId, resource_id: resourceId, enabled }, "relay_accounts");
+      },
+      setGroup: async (accountId, resourceId, groupId) => {
+        await commitRelayMetadata("api_key.set_group", { account_id: accountId, resource_id: resourceId, group_id: groupId }, "relay_accounts");
+      },
+      setAutoGrouping: async (accountId, enabled) => {
+        await enqueueDispatch("api_key.set_auto_grouping", { account_id: accountId, enabled }, "relay_accounts");
+        try {
+          const next = await refresh();
+          return { draftStaged: next.drafts.relay_accounts?.dirty === true };
+        } catch {
+          // Core accepted the toggle; keep the staged message until the next
+          // snapshot can confirm whether the draft was reverted.
+          return { draftStaged: true };
+        }
+      },
+      alignAutoGrouping: async (accountId) => {
+        await commitRelayMetadata("api_key.auto_group_align", { account_id: accountId }, "relay_accounts");
       },
       remove: async (accountId, resourceId, dependencyPolicy) => {
         await commitRelayMetadata("api_key.delete", {
@@ -1588,7 +1961,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} busy={busy} webDavOperationBusy={webDavOperationBusy} statuses={dataManagementStatuses} hasPendingChanges={hasPendingFieldEdits()} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onResize={resizeDataManagement} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onApplyImported={applyDataManagement} onProbeWebDav={probeWebDav} onApplyWebDav={applyWebDav} onSyncWebDav={syncWebDav} /> : null}
     {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
     </View> : null}
-    {route === "relay-accounts" ? <DialogFooter compact borderless status={result}><ActionButton title={translate("menu.close")} onPress={requestClose} /><ActionButton primary title={translate("menu.apply")} disabled={busy || stagedDomainsForRoute(snapshot).length === 0} onPress={apply} /></DialogFooter> : route !== "logs" && route !== "relay-add" && route !== "data-management" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || (settingsRoute ? !(snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()) : domain ? !(snapshot?.drafts[domain]?.dirty || hasPendingFieldEdits()) : false)} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
+    {route === "relay-accounts" ? <DialogFooter compact borderless status={result}><ActionButton title={translate("menu.close")} onPress={requestClose} /><ActionButton primary title={translate("menu.apply")} disabled={busy || !routeHasStagedChanges(actionSnapshot)} onPress={apply} /></DialogFooter> : route !== "logs" && route !== "relay-add" && route !== "provider-wizard" && route !== "data-management" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || !routeHasStagedChanges(actionSnapshot)} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -1603,14 +1976,619 @@ function riskCodes(snapshot: CoreSnapshot, domain: ConfigDomain): string[] {
   return Array.isArray(settings.risk_confirmations) ? settings.risk_confirmations.filter((item): item is string => typeof item === "string") : [];
 }
 
-function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface }): React.JSX.Element {
+const PROVIDER_WIZARD_NEW_PROVIDER = "__provider_wizard_new_provider__";
+const PROVIDER_WIZARD_NEW_KEY = "__provider_wizard_new_key__";
+
+type ServiceProviderKind = "openai_login" | "claude_login";
+
+function serviceProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRecord[] {
+  const state = domainState(snapshot, "providers_models");
+  const details = asRecords(state.providers);
+  const candidates = details.length > 0 ? details : (snapshot?.providers_models.providers ?? []).map(providerRecord);
+  return candidates.filter((provider) => {
+    const kind = providerAuthKind(provider);
+    return kind === "openai_login" || kind === "claude_login";
+  });
+}
+
+function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translate): string {
+  return kind === "openai_login" ? translate("relay.officialProviderOpenAI") : translate("relay.officialProviderClaude");
+}
+
+function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind): string {
+  const base = kind === "openai_login" ? "OpenAI" : "Claude";
+  const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
+  if (!names.has(base.toLocaleLowerCase())) return base;
+  let suffix = 2;
+  while (names.has(`${base} ${suffix}`.toLocaleLowerCase())) suffix += 1;
+  return `${base} ${suffix}`;
+}
+
+function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, dispatchWithOutcome, onActivateAndRestart, onStatus, onSecretState, hideNavigation = false, selectedNavigationKey, onNavigationSelectionChange }: {
+  snapshot?: CoreSnapshot;
+  native: NativeLeafAdapter;
+  busy: boolean;
+  translate: Translate;
+  dispatch: Dispatch;
+  dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>;
+  onActivateAndRestart: () => Promise<boolean>;
+  onStatus: (status?: string) => void;
+  onSecretState: (state: SecretState) => void;
+  hideNavigation?: boolean;
+  selectedNavigationKey?: string;
+  onNavigationSelectionChange?: (key: string) => void;
+}): React.JSX.Element {
+  const providers = serviceProviderRecords(snapshot);
+  const [localSelectedProviderID, setLocalSelectedProviderID] = useState<string>();
+  const selectedProviderID = hideNavigation && selectedNavigationKey?.startsWith("provider:")
+    ? selectedNavigationKey.slice("provider:".length)
+    : localSelectedProviderID;
+  const selected = providers.find((provider) => editorIdentifier(provider) === selectedProviderID) ?? (selectedProviderID ? undefined : providers[0]);
+  const selectedKind: ServiceProviderKind = selected && (providerAuthKind(selected) === "openai_login" || providerAuthKind(selected) === "claude_login")
+    ? providerAuthKind(selected) as ServiceProviderKind
+    : "openai_login";
+  const status = providerAuthStatus(selected);
+  const active = booleanValue(selected?.auth_active);
+  const statusLabels: Record<ProviderAuthStatus, string> = {
+    signed_out: translate("providers.authStatusSignedOut"),
+    authorizing: translate("providers.authStatusAuthorizing"),
+    signed_in: translate("providers.authStatusSignedIn"),
+    expired: translate("providers.authStatusExpired"),
+    error: translate("providers.authStatusError"),
+    unsupported: translate("providers.authStatusUnsupported"),
+  };
+  const displayName = selected
+    ? stringValue(selected.display_name, stringValue(selected.name, selectedKind === "openai_login" ? "OpenAI" : "Claude"))
+    : selectedKind === "openai_login" ? translate("relay.officialProviderOpenAI") : translate("relay.officialProviderClaude");
+  const model = selected ? asRecords(selected.models)[0] : undefined;
+  const modelName = model ? stringValue(model.display_name, stringValue(model.name, stringValue(model.upstream_model, translate("common.notAvailable")))) : translate("common.notAvailable");
+  const providerID = selected ? editorIdentifier(selected) : "";
+  const shownChallenge = useRef<Record<string, string>>({});
+
+  useEffect(() => {
+    if (hideNavigation) return;
+    if (selectedProviderID && !providers.some((provider) => editorIdentifier(provider) === selectedProviderID)) {
+      setLocalSelectedProviderID(providers[0] ? editorIdentifier(providers[0]) : undefined);
+    } else if (!selectedProviderID && providers.length > 0) {
+      setLocalSelectedProviderID(editorIdentifier(providers[0]));
+    }
+  }, [hideNavigation, providers, selectedProviderID]);
+
+  const presentAuthChallenge = (next: CoreSnapshot | undefined, kind: ServiceProviderKind, label: string, accountFingerprint: string): void => {
+    const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
+    const verificationURL = stringValue(summary.verification_uri);
+    const userCode = stringValue(summary.user_code);
+    if (!verificationURL || !userCode) return;
+    const fingerprint = `${accountFingerprint}|${kind}|${verificationURL}|${userCode}`;
+    if (shownChallenge.current[accountFingerprint] === fingerprint) return;
+    shownChallenge.current[accountFingerprint] = fingerprint;
+    const options = {
+      title: label + " " + translate("relay.officialProviderLogin"),
+      closeLabel: translate("menu.close"),
+    };
+    if (native.showProviderAuth) {
+      void native.showProviderAuth({
+        provider: kind === "openai_login" ? "openai" : "claude",
+        fingerprint: accountFingerprint,
+        verificationURL,
+        userCode,
+        ...options,
+      }).catch(() => undefined);
+    } else {
+      void native.showReadOnlyText({
+        ...options,
+        text: [verificationURL, userCode].join("\n"),
+        language: "text",
+        html: CODE_EDITOR_HTML,
+      });
+    }
+  };
+
+  useEffect(() => {
+    const authorizing = providers.filter((provider) => providerAuthStatus(provider) === "authorizing");
+    if (authorizing.length === 0) return;
+    const timer = setInterval(() => {
+      for (const provider of authorizing) {
+        const kind = providerAuthKind(provider);
+        if (kind !== "openai_login" && kind !== "claude_login") continue;
+        const label = stringValue(provider.display_name, stringValue(provider.name, kind === "openai_login" ? translate("relay.officialProviderOpenAI") : translate("relay.officialProviderClaude")));
+        const accountFingerprint = editorIdentifier(provider);
+        void dispatchWithOutcome("service_provider.auth_status", { provider_id: accountFingerprint }, "providers_models", true)
+          .then((next) => presentAuthChallenge(next, kind, label, accountFingerprint))
+          .catch(() => undefined);
+      }
+    }, 1_000);
+    return () => clearInterval(timer);
+  }, [dispatchWithOutcome, providers, translate]);
+
+  const startLogin = async (targetProviderID = providerID): Promise<void> => {
+    if (!targetProviderID) return;
+    const target = serviceProviderRecords(snapshot).find((provider) => editorIdentifier(provider) === targetProviderID);
+    const targetKind = target && providerAuthKind(target) === "claude_login" ? "claude_login" : "openai_login";
+    const targetLabel = target ? stringValue(target.display_name, stringValue(target.name, serviceProviderKindLabel(targetKind, translate))) : serviceProviderKindLabel(targetKind, translate);
+    delete shownChallenge.current[targetProviderID];
+    const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: targetProviderID }, "providers_models");
+    presentAuthChallenge(next, targetKind, targetLabel, targetProviderID);
+  };
+
+  const deleteProvider = async (): Promise<void> => {
+    if (!providerID) return;
+    const confirmed = await native.showConfirmation({
+      title: translate("relay.officialProviderDelete"),
+      message: displayName,
+      confirmLabel: translate("common.delete"),
+    });
+    if (!confirmed) return;
+    await dispatchWithOutcome("service_provider.delete", { provider_id: providerID }, "providers_models");
+    if (hideNavigation) onNavigationSelectionChange?.("");
+    onStatus(undefined);
+  };
+ const activateProvider = async (): Promise<void> => {
+   if (!providerID || selectedKind !== "openai_login") return;
+    const activated = await dispatchWithOutcome("service_provider.auth_activate", { provider_id: providerID }, "providers_models");
+    if (!activated) return;
+    try {
+      if (await onActivateAndRestart()) onStatus(translate("relay.officialProviderActive"));
+    } catch (reason) {
+      onStatus(errorMessage(reason, translate));
+    }
+  };
+
+  const authAction = status === "signed_in"
+    ? "service_provider.auth_logout"
+    : status === "authorizing"
+      ? "service_provider.auth_cancel"
+      : "service_provider.auth_start";
+  const authLabel = status === "signed_in"
+    ? translate("relay.officialProviderLogout")
+    : status === "authorizing"
+      ? translate("relay.officialProviderCancel")
+      : translate("relay.officialProviderLogin");
+  const rows = providers.map((provider) => {
+    const kind = providerAuthKind(provider);
+    const loginKind = kind === "claude_login" ? "claude_login" : "openai_login";
+    const label = stringValue(provider.display_name, stringValue(provider.name, serviceProviderKindLabel(loginKind, translate)));
+    return {
+      key: editorIdentifier(provider),
+      cells: [label, serviceProviderKindLabel(loginKind, translate), statusLabels[providerAuthStatus(provider)]],
+    };
+  });
+
+  return <View style={serviceProviderStyles.pane}>
+      <View style={serviceProviderStyles.intro}><Text style={serviceProviderStyles.heading}>{translate("relay.officialAccounts")}</Text><Text style={serviceProviderStyles.hint}>{translate("relay.officialAccountsHint")}</Text></View>
+      <View style={serviceProviderStyles.columns}>
+        {!hideNavigation ? <View style={serviceProviderStyles.listPane}>
+          <NativeTable columns={[{ label: translate("providers.provider"), width: 150 }, { label: translate("providers.authentication"), width: 92 }, { label: translate("relay.officialProviderStatus"), width: 118 }]} rows={rows} selectedKey={providerID} compact onSelectionChange={(key) => setLocalSelectedProviderID(key)} style={serviceProviderStyles.table} />
+        </View> : null}
+        <View style={serviceProviderStyles.detailPane}>
+          <View style={serviceProviderStyles.detailHeader}><Text style={serviceProviderStyles.detailTitle}>{displayName}</Text><Text style={serviceProviderStyles.status}>{statusLabels[status]}</Text></View>
+          <View style={serviceProviderStyles.rule} />
+          <Text style={serviceProviderStyles.detailLine}>{translate("relay.officialProviderModels")}: {modelName}</Text>
+          <Text style={serviceProviderStyles.hint}>{selectedKind === "openai_login" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderCliHint")}</Text>
+          {selectedKind === "claude_login" ? <Text style={serviceProviderStyles.hint}>{translate("relay.officialProviderTokenHint")}</Text> : null}
+          {selectedKind === "openai_login" && active ? <Text style={serviceProviderStyles.activeHint}>{translate("relay.officialProviderActive")}</Text> : null}
+          {selectedKind === "openai_login" && selected && status === "signed_in" && !active ? <Text style={serviceProviderStyles.hint}>{translate("relay.officialProviderRestartHint")}</Text> : null}
+          <View style={serviceProviderStyles.actions}>
+            {selected ? <>
+              {selectedKind === "openai_login" && status === "signed_in" && !active ? <NativeButton title={translate("relay.officialProviderActivate")} compact disabled={busy} onPress={() => { void activateProvider(); }} /> : null}
+              <NativeButton title={authLabel} primary compact disabled={busy} onPress={() => { if (authAction === "service_provider.auth_start") void startLogin(); else void dispatch(authAction, { provider_id: providerID }, "providers_models"); }} />
+              <NativeButton title={translate("relay.officialProviderDelete")} compact disabled={busy || status === "authorizing"} onPress={() => { void deleteProvider(); }} />
+            </> : null}
+          </View>
+          {selectedKind === "claude_login" && selected && (status === "unsupported" || status === "error") ? <NativeSecretField autoCommit label={translate("providers.authTypeClaude")} hint={translate("relay.officialProviderTokenHint")} busy={busy} disabled={busy} domain="providers_models" field="provider_auth_token" target={providerID} onSecretState={onSecretState} /> : null}
+        </View>
+      </View>
+    </View>;
+}
+
+function ProviderSetupWizard({ providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose }: { providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void }): React.JSX.Element {
+  type WizardStep = "provider" | "apiKey" | "model";
+  const [step, setStep] = useState<WizardStep>("provider");
+  const [providerMode, setProviderMode] = useState<"new" | "existing">("new");
+  const [providerSelection, setProviderSelection] = useState(PROVIDER_WIZARD_NEW_PROVIDER);
+  const [providerName, setProviderName] = useState("");
+  const [providerBaseURL, setProviderBaseURL] = useState("");
+  const [keySelection, setKeySelection] = useState("");
+  const [keyName, setKeyName] = useState("");
+  const [keyReady, setKeyReady] = useState(false);
+  const [modelName, setModelName] = useState("");
+  const [upstreamModel, setUpstreamModel] = useState("");
+  const [fetchedModelCandidates, setFetchedModelCandidates] = useState<string[]>([]);
+  const [selectedModels, setSelectedModels] = useState<string[]>([]);
+  const [manualModels, setManualModels] = useState<Array<{ id: string; name: string; upstream_model: string }>>([]);
+  const [selectedManualModelIDs, setSelectedManualModelIDs] = useState<string[]>([]);
+  const [modelFetchState, setModelFetchState] = useState<"idle" | "loading" | "ready" | "empty" | "unavailable">("idle");
+  const modelFetchRequest = useRef(0);
+  const manualModelID = useRef(0);
+  const [processing, setProcessing] = useState(false);
+  const [validation, setValidation] = useState("");
+  // Authentication is intentionally not selectable in this surface anymore.
+  // Official account login lives in Service Provider Management; this wizard
+  // creates and edits API-key providers only.
+  const activeAuthKind: ProviderAuthKind = "api_key";
+  const isNewProvider = providerMode === "new";
+  const selectedProvider = providers.find((entry) => editorIdentifier(entry) === providerSelection);
+  const providerID = selectedProvider ? editorIdentifier(selectedProvider) : "";
+  const selectedProviderName = selectedProvider
+    ? stringValue(selectedProvider.display_name, stringValue(selectedProvider.name, providerID))
+    : providerName.trim();
+  const activeProviderBaseURL = selectedProvider
+    ? stringValue(selectedProvider.endpoint, stringValue(selectedProvider.api_base))
+    : providerBaseURL;
+  const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySources, activeProviderBaseURL) : [];
+  const keyOptions = [
+    { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
+    ...keyChoices.map((choice) => ({ value: choice.id, label: providerKeyChoiceLabel(choice, translate) })),
+  ];
+  const activeKeySelection = keySelection || keyChoices[0]?.id || PROVIDER_WIZARD_NEW_KEY;
+  const selectedKeyChoice = keyChoices.find((choice) => choice.id === activeKeySelection);
+  const selectedKeyName = selectedKeyChoice?.name ?? (activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? keyName.trim() : "");
+  const selectedKeyReady = Boolean(selectedKeyChoice && (selectedKeyChoice.kind === "relay" || selectedKeyChoice.state?.configured)) || keyReady;
+  const modelCandidates = useMemo(() => {
+    const values = [...(selectedKeyChoice?.source?.models ?? []), ...fetchedModelCandidates];
+    return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+  }, [fetchedModelCandidates, selectedKeyChoice?.source?.models]);
+  const providerOptions = providers.map((entry) => {
+      const id = editorIdentifier(entry);
+      return { value: id, label: stringValue(entry.display_name, stringValue(entry.name, id)) };
+    });
+
+  useEffect(() => {
+    if (!selectedProvider || processing || keySelection === PROVIDER_WIZARD_NEW_KEY || keyChoices.some((choice) => choice.id === keySelection)) return;
+    setKeySelection(keyChoices[0]?.id ?? PROVIDER_WIZARD_NEW_KEY);
+    setKeyReady(false);
+  }, [keyChoices, keySelection, processing, selectedProvider]);
+
+  useEffect(() => {
+    modelFetchRequest.current += 1;
+    setModelName("");
+    setUpstreamModel("");
+    setFetchedModelCandidates([]);
+    setSelectedModels([]);
+    setManualModels([]);
+    setSelectedManualModelIDs([]);
+    setModelFetchState("idle");
+  }, [activeKeySelection, providerID]);
+
+  const chooseExistingProvider = (value: string): void => {
+    const nextProvider = providers.find((entry) => editorIdentifier(entry) === value);
+    setProviderMode("existing");
+    setProviderSelection(value);
+    setKeySelection("");
+    setKeyName("");
+    setKeyReady(false);
+    setValidation("");
+  };
+  const chooseProviderMode = (value: "new" | "existing"): void => {
+    const nextProvider = value === "existing" ? providers[0] : undefined;
+    setProviderMode(value);
+    setProviderSelection(value === "new" ? PROVIDER_WIZARD_NEW_PROVIDER : editorIdentifier(nextProvider ?? {}));
+    setKeySelection("");
+    setKeyName("");
+    setKeyReady(false);
+    setValidation("");
+  };
+  const updateProviderBaseURL = (value: string): void => {
+    setProviderBaseURL(value);
+    if (!providerName.trim()) setProviderName(suggestedRelayStationName(value));
+  };
+  const updateProviderName = (value: string): void => {
+    setProviderName(value);
+  };
+  const addManualModel = (): void => {
+    const name = modelName.trim();
+    const upstream = upstreamModel.trim();
+    if (!name || !upstream) {
+      setValidation(translate("providers.wizard.required"));
+      return;
+    }
+    const existing = manualModels.find((model) => model.name === name && model.upstream_model === upstream);
+    if (existing) {
+      setSelectedManualModelIDs((current) => current.includes(existing.id) ? current : [...current, existing.id]);
+      setModelName("");
+      setUpstreamModel("");
+      setValidation("");
+      return;
+    }
+    const id = `manual-${++manualModelID.current}`;
+    setManualModels((current) => [...current, { id, name, upstream_model: upstream }]);
+    setSelectedManualModelIDs((current) => [...current, id]);
+    setModelName("");
+    setUpstreamModel("");
+    setValidation("");
+  };
+  const removeManualModel = (id: string): void => {
+    setManualModels((current) => current.filter((model) => model.id !== id));
+    setSelectedManualModelIDs((current) => current.filter((modelID) => modelID !== id));
+  };
+  const fetchWizardModels = async (): Promise<void> => {
+    if (activeAuthKind !== "api_key") return;
+    const keyChoice = selectedKeyChoice;
+    const keyName = selectedKeyName.trim();
+    if (!providerID || !keyName) return;
+    const request = ++modelFetchRequest.current;
+    setModelFetchState("loading");
+    const relaySource = keyChoice?.kind === "relay" ? keyChoice.source : undefined;
+    const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";
+    const payload = relaySource ? {
+      provider_id: providerID,
+      station_id: relaySource.stationID,
+      account_id: relaySource.accountID,
+      resource_id: relaySource.resourceID,
+    } : {
+      provider_id: providerID,
+      api_key_name: keyName,
+    };
+    try {
+      const next = await dispatchWithOutcome(action, payload);
+      if (request !== modelFetchRequest.current) return;
+      const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
+      const summaryProviderID = stringValue(summary.provider_id);
+      const providerIdentity = selectedProvider ? identifier(selectedProvider) : "";
+      if (stringValue(summary.operation) !== "fetch_models"
+        || (summaryProviderID !== providerID && summaryProviderID !== providerIdentity)) {
+        setModelFetchState("unavailable");
+        return;
+      }
+      if (summary.available === false) {
+        setModelFetchState("unavailable");
+        return;
+      }
+      const candidates = [...new Set(stringList(summary.models).map((value) => value.trim()).filter(Boolean))];
+      if (candidates.length === 0) {
+        setModelFetchState("empty");
+        return;
+      }
+      setFetchedModelCandidates(candidates);
+      const available = new Set([...(selectedKeyChoice?.source?.models ?? []), ...candidates]);
+      setSelectedModels((current) => current.filter((model) => available.has(model)));
+      setModelFetchState("ready");
+    } catch {
+      if (request === modelFetchRequest.current) {
+        setModelFetchState("unavailable");
+      }
+    }
+  };
+  const createProvider = async (): Promise<boolean> => {
+    const name = providerName.trim();
+    const baseURL = providerBaseURL.trim();
+    if (!name || (activeAuthKind === "api_key" && !baseURL)) {
+      setValidation(translate("providers.wizard.required"));
+      return false;
+    }
+    const existingIDs = new Set(providers.map(editorIdentifier));
+    setProcessing(true);
+    try {
+      const next = await dispatchWithOutcome("provider.add", { provider: { name, api_base: baseURL, auth_kind: "api_key", enabled: true, models: [], create_default_api_key: true } });
+      if (!next) return false;
+      const nextState = domainState(next, "providers_models");
+      const nextProviders = asRecords(nextState.providers).length > 0
+        ? asRecords(nextState.providers)
+        : (next.providers_models.providers ?? []).map(providerRecord);
+      const added = nextProviders.find((entry) => !existingIDs.has(editorIdentifier(entry)))
+        ?? nextProviders.find((entry) => stringValue(entry.name).trim() === name);
+      if (!added) return false;
+      const relayStation = relayStationForBaseUrl(baseURL, relayStations);
+      if (relayStation) {
+        const rebound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: editorIdentifier(added), station_id: relayStation.id });
+        if (!rebound) return false;
+      }
+      setProviderMode("existing");
+      setProviderSelection(editorIdentifier(added));
+      setValidation("");
+      setStep(activeAuthKind === "api_key" ? "apiKey" : "model");
+      return true;
+    } finally {
+      setProcessing(false);
+    }
+  };
+  const createKey = async (): Promise<boolean> => {
+    if (!providerID || !keyName.trim()) {
+      setValidation(translate("providers.wizard.required"));
+      return false;
+    }
+    const name = keyName.trim();
+    setProcessing(true);
+    try {
+      const next = await dispatchWithOutcome("provider.key_add", { provider_id: providerID, name });
+      if (!next) return false;
+      const nextState = domainState(next, "providers_models");
+      const nextProviders = asRecords(nextState.providers).length > 0
+        ? asRecords(nextState.providers)
+        : (next.providers_models.providers ?? []).map(providerRecord);
+      const nextProvider = nextProviders.find((entry) => editorIdentifier(entry) === providerID);
+      const addedKey = nextProvider ? providerKeyStates(nextProvider).find((entry) => entry.name === name) : undefined;
+      setKeySelection(addedKey?.id ?? PROVIDER_WIZARD_NEW_KEY);
+      setKeyReady(false);
+      setValidation("");
+      return true;
+    } finally {
+      setProcessing(false);
+    }
+  };
+  const goNext = async (): Promise<void> => {
+    setValidation("");
+    if (step === "provider") {
+      if (isNewProvider) {
+        await createProvider();
+      } else if (providerID) {
+        setStep(activeAuthKind === "api_key" ? "apiKey" : "model");
+      } else {
+        setValidation(translate("providers.wizard.required"));
+      }
+      return;
+    }
+    if (step === "apiKey") {
+      if (!selectedProvider) {
+        setValidation(translate("providers.wizard.required"));
+        return;
+      }
+      if (activeKeySelection === PROVIDER_WIZARD_NEW_KEY) {
+        if (await createKey()) return;
+        return;
+      }
+      if (!selectedKeyChoice || !selectedKeyReady) {
+        setValidation(translate("providers.wizard.required"));
+        return;
+      }
+      setStep("model");
+      if (modelCandidates.length === 0) void fetchWizardModels();
+      return;
+    }
+    const draftModelName = modelName.trim();
+    const draftUpstreamModel = upstreamModel.trim();
+    if ((draftModelName && !draftUpstreamModel) || (!draftModelName && draftUpstreamModel)) {
+      setValidation(translate("providers.wizard.required"));
+      return;
+    }
+    const draftModel = draftModelName && draftUpstreamModel
+      ? { name: draftModelName, upstream_model: draftUpstreamModel }
+      : undefined;
+    const requestedModels = [
+      ...modelCandidates
+        .filter((name) => selectedModels.includes(name))
+        .map((name) => ({ name, upstream_model: name })),
+      ...manualModels
+        .filter((model) => selectedManualModelIDs.includes(model.id))
+        .map(({ name, upstream_model }) => ({ name, upstream_model })),
+      ...(draftModel ? [draftModel] : []),
+    ];
+    const uniqueRequestedModels = requestedModels.filter((model, index, all) => all.findIndex((candidate) => candidate.name === model.name && candidate.upstream_model === model.upstream_model) === index);
+    if (!providerID || (activeAuthKind === "api_key" && !selectedKeyName) || uniqueRequestedModels.length === 0) {
+      setValidation(translate("providers.wizard.selectAtLeastOneModel"));
+      return;
+    }
+    setProcessing(true);
+    try {
+      const existingModelIDs = selectedProvider ? new Set(asRecords(selectedProvider.models).map(modelRecord).map(editorIdentifier)) : new Set<string>();
+      const transientRelaySource = activeAuthKind === "api_key" && selectedKeyChoice?.kind === "relay" && !selectedKeyChoice.state ? selectedKeyChoice.source : undefined;
+      const modelPayload = uniqueRequestedModels.map((model, index) => ({
+        ...model,
+        api_key_name: selectedKeyName,
+        ...(selectedKeyChoice?.id && !transientRelaySource ? { provider_key_id: selectedKeyChoice.id } : {}),
+        enabled: true,
+        order: index + 1,
+      }));
+      const next = await dispatchWithOutcome("model.add_many", { provider_id: providerID, models: modelPayload });
+      if (!next) return;
+      if (transientRelaySource) {
+        const nextState = domainState(next, "providers_models");
+        const nextProviders = asRecords(nextState.providers).length > 0
+          ? asRecords(nextState.providers)
+          : (next.providers_models.providers ?? []).map(providerRecord);
+        const nextProvider = nextProviders.find((entry) => editorIdentifier(entry) === providerID);
+        const addedModels = nextProvider ? asRecords(nextProvider.models).map(modelRecord) : [];
+        for (const requested of uniqueRequestedModels) {
+          const addedModel = addedModels.find((entry) => !existingModelIDs.has(editorIdentifier(entry)) && stringValue(entry.name).trim() === requested.name);
+          if (!addedModel) return;
+          const relayed = await dispatchWithOutcome("model.select_relay_resource", {
+            provider_id: providerID,
+            model_id: editorIdentifier(addedModel),
+            source: {
+              kind: "relay",
+              station_id: transientRelaySource.stationID,
+              account_id: transientRelaySource.accountID,
+              resource_id: transientRelaySource.resourceID,
+            },
+          });
+          if (!relayed) return;
+        }
+      }
+      onStatus(translate("providers.wizard.complete"));
+      onClose();
+    } finally {
+      setProcessing(false);
+    }
+  };
+  const goBack = (): void => {
+    setValidation("");
+    if (step === "model") setStep(activeAuthKind === "api_key" ? "apiKey" : "provider");
+    else if (step === "apiKey") setStep("provider");
+  };
+  const stepItems: Array<{ id: WizardStep; title: string }> = [
+    { id: "provider", title: translate("providers.wizard.stepProvider") },
+    ...(activeAuthKind === "api_key" ? [{ id: "apiKey" as const, title: translate("providers.wizard.stepApiKey") }] : []),
+    { id: "model", title: translate("providers.wizard.stepModel") },
+  ];
+  const providerPickerLabels = providerOptions.map((option) => option.label);
+  const selectedProviderPickerLabel = providerOptions.find((option) => option.value === providerSelection)?.label ?? providerPickerLabels[0] ?? "";
+  const keyPickerLabels = keyOptions.map((option) => option.label);
+  const selectedKeyPickerLabel = keyOptions.find((option) => option.value === activeKeySelection)?.label ?? keyPickerLabels[0] ?? "";
+  return <View style={styles.providerWizardSurface} accessibilityViewIsModal>
+    <View style={styles.providerWizardSetupContent}>
+      <View style={[styles.providerWizardSetupSurface, step === "model" && styles.providerWizardSetupSurfaceModel]}>
+        <NativeWizardProgress steps={stepItems.map((item) => item.title)} activeIndex={stepItems.findIndex((item) => item.id === step)} />
+        <View style={styles.providerWizardHeader}>
+          <Text style={styles.providerWizardTitle}>{translate("providers.wizard.title")}</Text>
+          <Text style={styles.providerWizardDescription}>{translate("providers.wizard.description")}</Text>
+        </View>
+        {step === "provider" ? <View style={styles.providerWizardFormSection}>
+          <NativeFormRow label={translate("providers.wizard.provider")}>
+            <NativeSegmentedControl labels={providers.length > 0 ? [translate("providers.wizard.addProvider"), translate("providers.wizard.selectProvider")] : [translate("providers.wizard.addProvider")]} selectedValue={isNewProvider ? translate("providers.wizard.addProvider") : translate("providers.wizard.selectProvider")} disabled={busy || processing} onChange={({ nativeEvent }) => { chooseProviderMode(providers.length > 0 && nativeEvent.index === 1 ? "existing" : "new"); }} style={styles.providerWizardModeControl} />
+          </NativeFormRow>
+          {!isNewProvider ? <NativeFormRow label={translate("providers.wizard.selectProvider")}><NativePicker labels={providerPickerLabels} selectedValue={selectedProviderPickerLabel} disabled={busy || processing} onChange={({ nativeEvent }) => { const option = providerOptions[nativeEvent.index]; if (option) chooseExistingProvider(option.value); }} style={styles.providerWizardPicker} /></NativeFormRow> : null}
+          {isNewProvider ? <>
+            <NativeFormRow label={translate("providers.wizard.baseUrl")}><NativeTextField value={providerBaseURL} placeholder={translate("providers.wizard.baseUrlPlaceholder")} editable={!busy && !processing} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderBaseURL} accessibilityLabel={translate("providers.wizard.baseUrl")} style={styles.providerWizardInput} /></NativeFormRow>
+            <NativeFormRow label={translate("providers.wizard.providerName")}><NativeTextField value={providerName} placeholder={translate("providers.wizard.providerNamePlaceholder")} editable={!busy && !processing} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderName} accessibilityLabel={translate("providers.wizard.providerName")} style={styles.providerWizardInput} /></NativeFormRow>
+          </> : <Text numberOfLines={1} style={styles.providerWizardHint}>{activeProviderBaseURL || translate("common.notAvailable")}</Text>}
+        </View> : null}
+        {step === "apiKey" && activeAuthKind === "api_key" ? <View style={styles.providerWizardFormSection}>
+          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.apiKey")}</Text><Text style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
+          <NativeFormRow label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={busy || processing} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); setKeyReady(false); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
+          {activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? <NativeFormRow label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!busy && !processing} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
+            : selectedKeyChoice?.kind === "relay" ? <Text style={styles.providerWizardHint}>{translate("relay.apiKeyPreviewHint")}</Text>
+              : selectedKeyChoice && !selectedKeyReady ? <NativeFormRow label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={`${providerID}\x1f${selectedKeyChoice.name}`} plainText autoCommit disabled={busy || processing} onSecretState={(state) => { setKeyReady(state.present); onSecretState(state); }} style={styles.providerWizardSecretInput} /></NativeFormRow>
+                : <Text style={styles.providerWizardHint}>{selectedKeyChoice?.name ?? translate("providers.wizard.selectApiKey")}</Text>}
+        </View> : null}
+        {step === "model" ? <ScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
+          <View style={styles.providerWizardFormSection}>
+            <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
+            {activeAuthKind === "api_key" ? <View style={styles.providerWizardModelToolbar}>
+              <Text numberOfLines={2} style={styles.providerWizardHint}>{modelFetchState === "loading" ? translate("providers.wizard.fetchingModels") : modelCandidates.length > 0 ? translate("providers.wizard.modelsFound", { count: modelCandidates.length }) : modelFetchState === "unavailable" ? translate("providers.wizard.modelsUnavailable") : modelFetchState === "empty" ? translate("providers.wizard.modelsEmpty") : translate("providers.wizard.noModels")}</Text>
+              <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={busy || processing || modelFetchState === "loading" || !providerID || !selectedKeyName} onPress={() => { void fetchWizardModels(); }} />
+            </View> : null}
+            {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
+              <View style={styles.providerWizardModelGroupHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.discoveredModels")}</Text><Text style={styles.providerWizardHint}>{translate("providers.wizard.selectedModels", { count: selectedModels.length })}</Text></View>
+              <View style={styles.providerWizardModelList}>
+                {modelCandidates.map((name) => <NativeCheckbox key={`discovered:${name}`} label={name} value={selectedModels.includes(name)} disabled={busy || processing} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+              </View>
+            </View> : null}
+            <View style={styles.providerWizardModelGroup}>
+              <Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.manualModels")}</Text>
+              {manualModels.map((model) => <View key={model.id} style={styles.providerWizardManualModelRow}>
+                <NativeCheckbox label={model.name} value={selectedManualModelIDs.includes(model.id)} disabled={busy || processing} onValueChange={(checked) => { setSelectedManualModelIDs((current) => checked ? (current.includes(model.id) ? current : [...current, model.id]) : current.filter((item) => item !== model.id)); setValidation(""); }} style={styles.providerWizardManualModelCheckbox} />
+                <Text numberOfLines={1} style={styles.providerWizardManualModelUpstream}>{model.upstream_model}</Text>
+                <NativeButton title={translate("providers.wizard.removeManualModel")} compact link disabled={busy || processing} onPress={() => removeManualModel(model.id)} />
+              </View>)}
+              <NativeFormRow label={translate("providers.wizard.modelName")}><NativeTextField value={modelName} placeholder={translate("providers.wizard.modelNamePlaceholder")} editable={!busy && !processing} autoCapitalize="none" autoCorrect={false} onChangeText={setModelName} accessibilityLabel={translate("providers.wizard.modelName")} style={styles.providerWizardInput} /></NativeFormRow>
+              <NativeFormRow label={translate("providers.wizard.upstreamModel")}><NativeTextField value={upstreamModel} placeholder={translate("providers.wizard.upstreamModelPlaceholder")} editable={!busy && !processing} autoCapitalize="none" autoCorrect={false} onChangeText={setUpstreamModel} accessibilityLabel={translate("providers.wizard.upstreamModel")} style={styles.providerWizardInput} /></NativeFormRow>
+              <NativeButton title={translate("providers.wizard.addManualModel")} compact link disabled={busy || processing} onPress={addManualModel} />
+            </View>
+            <Text style={styles.providerWizardModelSummary}>{translate("providers.wizard.modelsToAdd", { count: selectedModels.length + selectedManualModelIDs.length + Number(Boolean(modelName.trim() && upstreamModel.trim())) })}</Text>
+          </View>
+        </ScrollView> : null}
+        {validation ? <Text style={styles.providerWizardValidation}>{validation}</Text> : null}
+      </View>
+    </View>
+    <View style={styles.providerWizardFooter}>
+      {validation ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{validation}</Text> : <View style={styles.providerWizardFooterSpacer} />}
+      <View style={styles.providerWizardFooterActions}>
+        <NativeButton title={translate("menu.close")} disabled={processing} onPress={onClose} />
+        {step !== "provider" ? <NativeButton title={translate("providers.wizard.back")} disabled={busy || processing} onPress={goBack} /> : null}
+        <NativeButton primary title={processing ? translate("providers.wizard.creating") : step === "model" ? translate("providers.wizard.finish") : translate("providers.wizard.next")} disabled={busy || processing} onPress={() => { void goNext(); }} />
+      </View>
+    </View>
+  </View>;
+}
+
+function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, onOpenWizard }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; onOpenWizard: () => void }): React.JSX.Element {
   const state = domainState(snapshot, "providers_models");
   const relaySources = useMemo(() => relaySourcesFromSnapshot(snapshot), [snapshot]);
   const relayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
   const providers = useMemo(() => {
     const details = asRecords(state.providers);
-    if (details.length > 0) return details;
-    return (snapshot?.providers_models.providers ?? []).map(providerRecord);
+    const candidates = details.length > 0 ? details : (snapshot?.providers_models.providers ?? []).map(providerRecord);
+    return candidates.filter((provider) => providerAuthKind(provider) === "api_key");
   }, [snapshot?.providers_models.providers, state.providers]);
   const [selectedProvider, setSelectedProvider] = useState<string>();
   const [providerNameDrafts, setProviderNameDrafts] = useState<Record<string, string>>({});
@@ -1647,13 +2625,33 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       ? providerBaseUrlDrafts[entryID]
       : stringValue(entry.endpoint, stringValue(entry.api_base));
   }, [providerBaseUrlDrafts]);
+  const autoRelaySelectionKeys = useRef(new Set<string>());
+  useEffect(() => {
+    const activeKeys = new Set<string>();
+    if (!busy) {
+      for (const entry of providers) {
+        if (stringValue(entry.provider_type, "custom") === "relay") continue;
+        const baseURL = stringValue(entry.endpoint, stringValue(entry.api_base)).trim();
+        const station = relayStationForBaseUrl(baseURL, relayStations);
+        if (!station) continue;
+        const providerID = editorIdentifier(entry);
+        const selectionKey = `${providerID}\x1f${station.id}\x1f${stationOriginKey(baseURL)}`;
+        activeKeys.add(selectionKey);
+        if (autoRelaySelectionKeys.current.has(selectionKey)) continue;
+        autoRelaySelectionKeys.current.add(selectionKey);
+        void dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id });
+      }
+    }
+    for (const selectionKey of autoRelaySelectionKeys.current) {
+      if (!activeKeys.has(selectionKey)) autoRelaySelectionKeys.current.delete(selectionKey);
+    }
+  }, [busy, dispatch, providers, relayStations]);
   const providerKeyDisplayName = useCallback((entryProviderID: string, keyID: string, fallback: string): string => {
     const draft = providerKeyNameDrafts[providerKeyDraftKey(entryProviderID, keyID)];
     return draft !== undefined
       ? draft
       : fallback;
   }, [providerKeyNameDrafts]);
-  const pendingProviderIds = useRef<Set<string> | undefined>(undefined);
   const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);
   const provider = useMemo(
     () => providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0],
@@ -1715,17 +2713,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     return { probing: probingModelKeys.current.has(key), probeResult: probeResults[key] };
   };
   useEffect(() => {
-    const pending = pendingProviderIds.current;
-    if (pending) {
-      const added = providers.find((item) => !pending.has(editorIdentifier(item)));
-      if (added) {
-        setSelectedProvider(editorIdentifier(added));
-        setSelectedModel(undefined);
-        setProviderSourceModel(undefined);
-        pendingProviderIds.current = undefined;
-        return;
-      }
-    }
     if (providers.length === 0) {
       if (selectedProvider !== undefined) setSelectedProvider(undefined);
       return;
@@ -1784,9 +2771,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       });
     }).catch(() => undefined);
   };
+  // The provider-list plus button follows the same auth-first wizard as the
+  // dedicated “Add with wizard” action. This prevents an implicit API-key
+  // provider from being created before the user chooses account login.
   const addProvider = (): void => {
-    pendingProviderIds.current = new Set(providers.map(editorIdentifier));
-    void dispatch("provider.add", { provider: { name: "", enabled: true, models: [], create_default_api_key: true } });
+    onOpenWizard();
   };
   const addModel = (): void => {
     if (!provider) return;
@@ -2023,6 +3012,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     <View style={styles.providerLeftColumn}>
       <View style={styles.providerToolbar}>
         <WindowTabs values={[{ id: "providers", title: translate("providers.providers") }, { id: "routes", title: translate("providers.routes") }]} selected={viewMode} onSelect={(value) => chooseViewMode(value as "providers" | "routes")} />
+        <ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />
         <View style={styles.toolbarSpacer} />
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
@@ -2036,7 +3026,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           </TablePane>
           <TablePane style={styles.modelListPane} title={translate("providers.models")} actions={<><IconButton label="+" title={translate("providers.newModel")} disabled={busy || !provider} onPress={addModel} /><IconButton label="⧉" title={translate("common.copy")} disabled={busy || !model} onPress={duplicateModel} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !model} onPress={confirmDeleteModel} /></>}>
             <NativeTable columns={[{ label: translate("providers.model"), width: 96 }, { label: translate("providers.upstream"), width: 112 }, { label: translate("providers.providerKey"), width: 128 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
-            <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={selectedFetchLabel} disabled={busy || !provider || fetchKeyChoices.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} disabled={busy || !provider || !selectedFetchKey} onPress={fetchModels} /></View>
+            {provider && providerAuthKind(provider) === "api_key" ? <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={selectedFetchLabel} disabled={busy || fetchKeyChoices.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} disabled={busy || !selectedFetchKey} onPress={fetchModels} /></View> : null}
           </TablePane>
         </View>
       </View>}
@@ -2057,7 +3047,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const upstreamName = drafts?.modelUpstreamDisplay(providerId, model) ?? upstreamModelLabel(model);
   const upstreamFieldValue = upstreamName;
   const providerBaseUrl = drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
-  const keyStates = providerKeyStates(provider);
+  const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider) : [];
   const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
   const usesRelayKey = selectedProviderKey?.source.kind === "relay";
@@ -2068,7 +3058,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const displayedOrder = followsMultiplier
     ? String(relayMultiplier ?? modelEffectiveOrder(model))
     : drafts?.modelOrderText(providerId, model) ?? String(manualOrder);
-  const matchingRelaySources = relaySourcesForBaseUrl(providerBaseUrl, relaySources);
+  const matchingRelaySources = providerAuthKind(provider) === "api_key" ? relaySourcesForBaseUrl(providerBaseUrl, relaySources) : [];
   const persistedRelaySourceIDs = new Set(keyStates.filter((key) => key.source.kind === "relay").map((key) => relaySourceSelectionID(key.source)));
   const providerKeyOptions = [...keyStates.map((key) => ({
     value: key.id,
@@ -2079,7 +3069,10 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   }))];
   const probePresentation = modelProbePresentation(model, probeResult, translate);
   const probeDetailHint = translate("providers.probeDetailsHint");
-  const probeReady = Boolean(providerBaseUrl.trim() && upstreamName.trim() && booleanValue(model.api_key_configured));
+  const authenticationReady = providerAuthKind(provider) === "api_key"
+    ? booleanValue(model.api_key_configured)
+    : providerAuthStatus(provider) === "signed_in";
+  const probeReady = Boolean(providerBaseUrl.trim() && upstreamName.trim() && authenticationReady);
   const openProbeDetails = (): void => {
     if (!probePresentation.full) return;
     void native.showReadOnlyText({
@@ -2172,6 +3165,11 @@ function providerRecord(provider: ProviderSummary): UnknownRecord {
     enabled: provider.enabled,
     endpoint: provider.endpoint,
     model_count: provider.model_count,
+    provider_type: provider.provider_type ?? "custom",
+    relay_station_id: provider.relay_station_id ?? "",
+    auth_kind: provider.auth_kind ?? "api_key",
+    auth_status: provider.auth_status ?? "signed_out",
+    auth_active: provider.auth_active ?? false,
     key_states: provider.key_states ?? [],
     api_key_names: provider.key_states?.map((key) => key.name) ?? [],
     models: provider.models ?? [],
@@ -2234,13 +3232,13 @@ function ProviderSourceFields({ provider, providerID, relayStations, busy, trans
   const providerType = stringValue(provider.provider_type, "custom") === "relay" ? "relay" : "custom";
   const stationID = stringValue(provider.relay_station_id).trim();
   const selectedStation = relayStations.find((station) => station.id === stationID);
-  const stationOptions = relayStations.map((station) => ({ value: `relay:${station.id}`, label: `${station.name} · ${station.baseURL}` }));
+  const stationOptions = relayStations.map((station) => ({ value: `relay:${station.id}`, label: `${translate("providers.endpointSourceRelay")}: ${station.name}` }));
   const selectedValue = providerType === "relay" ? `relay:${stationID}` : CUSTOM_BASE_URL_SOURCE;
   const sourceOptions: AssistantSettingOption[] = [
-    { value: CUSTOM_BASE_URL_SOURCE, label: translate("providers.providerTypeCustom") },
+    { value: CUSTOM_BASE_URL_SOURCE, label: translate("providers.endpointSourceCustom") },
     ...stationOptions,
     ...(providerType === "relay" && stationID && !stationOptions.some((option) => option.value === selectedValue)
-      ? [{ value: selectedValue, label: stationID }]
+      ? [{ value: selectedValue, label: `${translate("providers.endpointSourceRelay")}: ${stationID}` }]
       : []),
   ];
   const providerName = drafts?.providerDisplayName(provider) ?? stringValue(provider.name, stringValue(provider.display_name));
@@ -2256,9 +3254,17 @@ function ProviderSourceFields({ provider, providerID, relayStations, busy, trans
     if (!nextStationID) return;
     void dispatch("provider.select_relay_station", { provider_id: providerID, station_id: nextStationID });
   };
+  const commitBaseURL = (endpoint: string): void | Promise<void> => {
+    if (providerType !== "custom") return;
+    const station = relayStationForBaseUrl(endpoint, relayStations);
+    if (station) {
+      return dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id });
+    }
+    return dispatch("provider.patch", { provider_id: providerID, changes: { endpoint } });
+  };
   return <View style={styles.providerSourceFields}>
-    <PickerField label={translate("providers.providerType")} labelWidth={68} value={selectedValue} values={sourceOptions} disabled={busy} onSelect={selectSource} />
-    <TextField label={translate("providers.baseUrl")} labelWidth={68} value={effectiveBaseURL} disabled={busy || providerType === "relay"} onDraftChange={onBaseUrlDraftChange} onCommit={(endpoint) => providerType === "custom" ? dispatch("provider.patch", { provider_id: providerID, changes: { endpoint } }) : undefined} />
+    <PickerField label={translate("providers.endpointSource")} labelWidth={68} value={selectedValue} values={sourceOptions} disabled={busy} onSelect={selectSource} />
+    <TextField label={translate("providers.baseUrl")} labelWidth={68} value={effectiveBaseURL} disabled={busy || providerType === "relay"} onDraftChange={onBaseUrlDraftChange} onCommit={commitBaseURL} />
     <TextField label={translate("providers.providerName")} labelWidth={68} value={effectiveName} disabled={busy || providerType === "relay"} onDraftChange={onNameDraftChange} onCommit={(name) => providerType === "custom" ? dispatch("provider.patch", { provider_id: providerID, changes: { name } }) : undefined} />
   </View>;
 }
@@ -2336,7 +3342,8 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   }));
   return <View style={styles.providerEditorContent}>
     <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerLabel}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
-    <View style={styles.providerEditorSection}><View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch("provider.patch", { provider_id: id, changes: { enabled } })} /></View>
+    <View style={styles.providerEditorSection}>
+    <View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch("provider.patch", { provider_id: id, changes: { enabled } })} /></View>
     <ProviderSourceFields provider={provider} providerID={id} relayStations={relayStations} busy={busy} translate={translate} dispatch={dispatch} onBaseUrlDraftChange={(value) => drafts?.setProviderBaseUrlDraft(id, value)} onNameDraftChange={(value) => { if (drafts) drafts.setProviderNameDraft(id, value); else onNameDraftChange?.(value); }} />
     <View style={styles.providerKeysEditor}>
       <View style={styles.providerKeysHeader}>
@@ -2666,7 +3673,8 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
   const groups = groupBy(settings, (item) => stringValue(item.category, translate("runtime.categories")));
   const [contentWidth, setContentWidth] = useState(0);
   const oneColumn = contentWidth > 0 && contentWidth < 1_000;
-  return <View style={styles.runtimeWorkspaceFrame}><ScrollView style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace} onLayout={({ nativeEvent }) => setContentWidth(nativeEvent.layout.width)}>{Object.keys(groups).length === 0 ? <EmptyState translate={translate} /> : Object.entries(groups).map(([category, entries]) => <Section key={category} title={runtimeCategoryLabel(category, translate)}><View style={[styles.runtimeTwoColumnForm, oneColumn && styles.runtimeOneColumnForm]}>{entries.map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} />)}</View></Section>)}</ScrollView></View>;
+  const dshSyncToken = DSH_VISION_ROUTER_QUICK_KEYS.map((key) => `${key}:${stringValue(settings.find((item) => identifier(item) === key)?.value)}`).join("|");
+  return <View style={styles.runtimeWorkspaceFrame}><ScrollView style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace} onLayout={({ nativeEvent }) => setContentWidth(nativeEvent.layout.width)}>{Object.keys(groups).length === 0 ? <EmptyState translate={translate} /> : Object.entries(groups).map(([category, entries]) => <Section key={category} title={runtimeCategoryLabel(category, translate)}><View style={[styles.runtimeTwoColumnForm, oneColumn && styles.runtimeOneColumnForm]}>{entries.map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}</View></Section>)}</ScrollView></View>;
 }
 
 function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses, hasPendingChanges, translate, dispatch, onSecretState, onResize, onFlushPendingFields, onTabSwitchError, onInspectImport, onImport, onConfirmImportReplace, onExport, onApplyImported, onProbeWebDav, onApplyWebDav, onSyncWebDav }: {
@@ -2830,9 +3838,16 @@ function DataManagementGroup({ children, style }: { children?: React.ReactNode; 
   </View>;
 }
 
-function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSecret }: { item: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
+function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSecret, dshSyncToken }: { item: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; dshSyncToken: string }): React.JSX.Element {
   const [jsonResetToken, setJsonResetToken] = useState(0);
   const key = identifier(item);
+  const previousDshSyncToken = useRef(dshSyncToken);
+  useEffect(() => {
+    if (key === DSH_VISION_ROUTER_CONFIG_KEY && previousDshSyncToken.current !== dshSyncToken) {
+      setJsonResetToken((current) => current + 1);
+    }
+    previousDshSyncToken.current = dshSyncToken;
+  }, [dshSyncToken, key]);
   const label = runtimeFieldLabel(key, stringValue(item.label, key), translate);
   const kind = stringValue(item.kind, "text");
   const storageKind = stringValue(item.storage_kind, kind);
@@ -2844,34 +3859,51 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     control = <NativeCheckbox label={label} labelVisible={false} value={booleanValue(item.value)} disabled={busy} onValueChange={(next) => dispatch("set_setting", { key, value: kind === "bool_auto" ? (next ? "auto" : "off") : next })} style={styles.runtimeBooleanControl} />;
   } else if (kind === "select" || kind === "choice" || kind === "enum") {
     const optionValues = stringList(item.options);
-    const optionLabels = optionValues.map((option) => runtimeOptionLabel(key, option, translate));
-    const selectedIndex = optionValues.indexOf(value);
-    control = <NativePicker labels={optionLabels} selectedValue={optionLabels[selectedIndex] ?? optionLabels[0] ?? ""} disabled={busy} onChange={({ nativeEvent }) => { const next = optionValues[nativeEvent.index]; if (next !== undefined) void dispatch("set_setting", { key, value: next }); }} style={styles.runtimeValueControl} />;
+    const visibleOptionValues = optionValues.filter((option) => !(DSH_VISION_ROUTER_QUICK_KEYS.some((quickKey) => quickKey === key) && option === "inherit"));
+    const optionLabels = visibleOptionValues.map((option) => runtimeOptionLabel(key, option, translate));
+    const selectedIndex = visibleOptionValues.indexOf(value);
+    control = <NativePicker labels={optionLabels} selectedValue={optionLabels[selectedIndex] ?? optionLabels[0] ?? ""} disabled={busy} onChange={({ nativeEvent }) => { const next = optionValues[nativeEvent.index]; const visibleNext = visibleOptionValues[nativeEvent.index] ?? next; if (visibleNext !== undefined) void dispatch("set_setting", { key, value: visibleNext }); }} style={styles.runtimeValueControl} />;
   } else if (kind === "json") {
     // JSON may contain provider credentials. Keep the document in the native
     // editor and stage it through the one-time Core secret capability while
     // still giving the user a real multiline textarea.
-    control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} multiline plainText autoCommit resetToken={jsonResetToken} onSecretState={onSecretState} />;
+    control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : translate("runtime.jsonPlaceholder")} busy={busy} domain="runtime" field="setting" target={key} multiline plainText autoCommit resetToken={jsonResetToken} onSecretState={onSecretState} />;
     action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => { void clearSecret({ domain: "runtime", field: "setting", target: key }).then(() => setJsonResetToken((current) => current + 1)); }} />;
   } else if (item.secret === true) {
     control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} onSecretState={onSecretState} setTitle={translate("common.set")} />;
     action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => clearSecret({ domain: "runtime", field: "setting", target: key })} />;
   } else {
-    control = <RuntimeValueField label={label} value={value} keyboardType={["number", "integer", "int", "float", "mb"].includes(storageKind) ? "numeric" : undefined} onCommit={(next) => dispatch("set_setting", { key, value: next })} />;
+    control = <RuntimeValueField label={label} value={value} keyboardType={["number", "integer", "int", "float", "mb", "optional_int", "optional_float", "optional_mb"].includes(storageKind) ? "numeric" : undefined} onCommit={(next) => dispatch("set_setting", { key, value: next })} />;
   }
   const isBoolean = kind === "boolean" || kind === "toggle" || kind === "bool" || kind === "bool_auto";
   const isMultiline = kind === "json";
-  return <View style={styles.runtimeField}><View style={[styles.runtimeInputRow, isMultiline && styles.runtimeMultilineInputRow]}><Text numberOfLines={2} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</Text><View style={[styles.runtimeValueSlot, isMultiline && styles.runtimeMultilineValueSlot]}>{control}</View>{!isBoolean && unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}{!isBoolean ? <View style={[styles.runtimeActionSlot, isMultiline && styles.runtimeMultilineActionSlot]}>{action}</View> : null}</View><RuntimeFieldMeta item={item} translate={translate} /></View>;
+  if (isMultiline) {
+    return <View style={[styles.runtimeField, styles.runtimeMultilineField]}>
+      <View style={styles.runtimeMultilineHeader}>
+        <Text style={styles.runtimeMultilineLabel} accessibilityLabel={label}>{label}</Text>
+        {action ? <View style={styles.runtimeMultilineHeaderActions}>{action}</View> : null}
+      </View>
+      <View style={styles.runtimeMultilineEditor}>{control}</View>
+      <RuntimeFieldMeta item={item} translate={translate} multiline />
+    </View>;
+  }
+  return <View style={styles.runtimeField}><View style={styles.runtimeInputRow}><Text numberOfLines={2} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</Text><View style={styles.runtimeValueSlot}>{control}</View>{!isBoolean && unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}{!isBoolean ? <View style={styles.runtimeActionSlot}>{action}</View> : null}</View><RuntimeFieldMeta item={item} translate={translate} /></View>;
 }
 
-function RuntimeFieldMeta({ item, translate }: { item: UnknownRecord; translate: Translate }): React.JSX.Element {
+function RuntimeFieldMeta({ item, translate, multiline = false }: { item: UnknownRecord; translate: Translate; multiline?: boolean }): React.JSX.Element {
   const key = identifier(item);
   const kind = stringValue(item.kind, "text");
-  const rawDefaultValue = stringValue(item.default, translate("common.empty"));
+  const rawDefaultValue = DSH_VISION_ROUTER_QUICK_DEFAULTS[key] ?? stringValue(item.default, translate("common.empty"));
   const defaultValue = kind === "select" || kind === "choice" || kind === "enum"
     ? runtimeOptionLabel(key, rawDefaultValue, translate)
     : rawDefaultValue;
   const help = runtimeFieldHelp(key, stringValue(item.help), translate);
+  if (multiline) {
+    return <View style={[styles.runtimeHelpSlot, styles.runtimeMultilineHelpSlot]}>
+      <Text style={styles.runtimeJsonDefaultHint}>{translate("runtime.jsonDefaultHint")}</Text>
+      {help ? <Text style={styles.runtimeHelpText}>{help}</Text> : null}
+    </View>;
+  }
   return <View style={styles.runtimeHelpSlot}><Text style={styles.runtimeHelpText}>{translate("common.default")}: {defaultValue}{help ? `\n${help}` : ""}</Text></View>;
 }
 
@@ -4661,6 +5693,29 @@ const systemColors = {
   brown: semanticColor("systemBrownColor", undefined, "#6f5500"),
 } as const;
 
+const serviceProviderStyles = StyleSheet.create({
+  workspace: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 },
+  unifiedHeader: { minHeight: 36, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 4, gap: 8 },
+  tabBar: { minHeight: 34, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  tabs: { width: 280, height: 26, alignSelf: "center" },
+  pane: { flex: 1, minWidth: 0, minHeight: 0, paddingHorizontal: 4, gap: 8 },
+  intro: { gap: 3, paddingVertical: 2 },
+  heading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  hint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  columns: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP },
+  listPane: { width: 270, minWidth: 230, maxWidth: 290, minHeight: 0 },
+  table: { flex: 1, minHeight: 0 },
+  detailPane: { flex: 1, minWidth: 300, minHeight: 0, paddingHorizontal: 12, paddingVertical: 4, gap: 8 },
+  emptyDetail: { flex: 1, minHeight: 160, alignItems: "center", justifyContent: "center", gap: 8 },
+  detailHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 },
+  detailTitle: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  status: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  activeHint: { flexShrink: 0, color: systemColors.green, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  rule: { height: 1, backgroundColor: systemColors.separator },
+  detailLine: { color: systemColors.label, fontSize: UI_FONT_SIZE },
+  actions: { flexDirection: "row", alignItems: "center", gap: 6 },
+});
+
 // Data-management is a utility window, but its active pane still needs a
 // readable rhythm. Keep these adjustments together so the three panes share
 // the same inset, helper-copy treatment, and native-preference spacing.
@@ -4759,20 +5814,22 @@ const styles = StyleSheet.create({
   routeTraceInfoText: { color: systemColors.label },
   root: { flex: 1, minWidth: 420, backgroundColor: systemColors.window },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
+  windowSurface: { flex: 1, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
   footer: { height: 52, minHeight: 52, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 6 }, footerCompact: { height: 48, minHeight: 48, paddingHorizontal: 14, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.control }, footerBorderless: { borderTopWidth: 0 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
-  providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, settingsTabBar: { minHeight: 36, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsTabs: { alignSelf: "flex-start", width: 250 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
+  providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, settingsTabBar: { minHeight: 36, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsTabs: { alignSelf: "flex-start", width: 250 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
+  providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardValidation: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
-  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: 6 }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 154, minWidth: 154, maxWidth: 154, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 280 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 280, minWidth: 280, maxWidth: 280, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingHorizontal: 12, paddingRight: 8, paddingBottom: 12, gap: 6 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingTop: 3, paddingHorizontal: 12, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, probeSummaryTrigger: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, probeSummaryTriggerPressed: { opacity: 0.65 }, probeSummary: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
+  providerAuthFields: { minWidth: 0, gap: 4, paddingTop: 2 },
+  providerAuthStatusRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
+  providerAuthStatusLabel: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  providerAuthStatusValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 154, minWidth: 154, maxWidth: 154, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 280 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 280, minWidth: 280, maxWidth: 280, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingLeft: 0, paddingRight: 8, paddingBottom: 12, gap: 6 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, probeSummaryTrigger: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, probeSummaryTriggerPressed: { opacity: 0.65 }, probeSummary: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
   codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, codexSplit: { flex: 1, minWidth: 0, minHeight: 0 }, codexStructuredPane: { flex: 1, minWidth: 0, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }, codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch", gap: 14, paddingLeft: 16, paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER, paddingTop: 10, paddingBottom: 16 }, codexStructuredWithHorizontalScrollbar: { paddingBottom: 32 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
-  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanControl: { width: 24, minWidth: 24, height: 24, alignSelf: "flex-start" }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 134, paddingTop: 4 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanControl: { width: 24, minWidth: 24, height: 24, alignSelf: "flex-start" }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 134, paddingTop: 4, minWidth: 0 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, minWidth: 0 }, runtimeMultilineField: { minWidth: 486, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minHeight: 0 }, dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, dataManagementTabs: { width: 280, height: 24, alignSelf: "center", flexShrink: 0 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: 10, paddingHorizontal: 4, paddingBottom: 14 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementImportFileLabel: { width: 72, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSyncScopeLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementDirectionLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementDirectionPicker: { width: 210, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   webDavForm: { flexGrow: 0, paddingHorizontal: 2 }, webdavFormBody: { gap: 6 }, webdavStateRow: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "flex-start" }, webdavSyncArea: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionRow: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavActionSpacer: { flex: 1 }, webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: "flex-start" }, webdavStateSpacer: { flex: 1 }, webdavStateStatus: { maxWidth: 180, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right", lineHeight: 15 }, webdavFormRows: { width: "60%", gap: 5 }, webdavPasswordInput: { width: "100%", minHeight: 26 },
   relayAccountsContent: { paddingBottom: 6, gap: 6 }, logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: "100%", minWidth: 0, height: 28, flexShrink: 0, marginTop: 0, marginBottom: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },
   form: { gap: 6 }, structuredForm: { gap: 6 }, featureGrid: { flexDirection: "row", flexWrap: "wrap", columnGap: 12, rowGap: 4 }, featureGridItem: { flexGrow: 1, flexBasis: 180, minWidth: 180 }, field: { gap: 5, minWidth: 220, flexGrow: 1, flexBasis: 300 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, inputWithAction: { flexDirection: "row", alignItems: "center", gap: 6 }, inputFlex: { flex: 1 }, toggleRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, toggleControl: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, toggleNativeControl: { width: "100%", minWidth: 220, minHeight: 22 }, actions: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, nativeSecretSetButton: { minWidth: 42, height: 26 }, action: {}, actionPrimary: {}, actionDanger: {}, actionDisabled: {}, actionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, actionTextPrimary: {}, actionTextDanger: {}, tabStrip: { flexDirection: "row", flexWrap: "wrap", gap: 6 }, tab: {}, tabSelected: {}, inlineMeta: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 6 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, infoPair: { gap: 2, minWidth: 160 }, rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 }, logRecords: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, maxHeight: 360, overflow: "scroll", padding: 10, gap: 6 }, logRecord: { color: systemColors.label, fontFamily: "Menlo", fontSize: UI_FONT_SIZE }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, result: { color: systemColors.green, fontSize: UI_FONT_SIZE }, warning: { color: systemColors.brown, fontSize: UI_FONT_SIZE, backgroundColor: systemColors.control, padding: 8, borderRadius: 4 }, issueBox: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.control, padding: 12, gap: 5 }, issue: { color: systemColors.red, fontSize: UI_FONT_SIZE }, cardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
-  runtimeMultilineInputRow: { minHeight: 108, alignItems: "flex-start" },
-  runtimeMultilineValueSlot: { height: 108, justifyContent: "flex-start" },
-  runtimeMultilineActionSlot: { minHeight: 108, justifyContent: "flex-start" },
   nativeSecretMultilineControl: { alignItems: "flex-start", minHeight: 108 },
   nativeSecretTextArea: { minHeight: 108, height: 108, alignSelf: "stretch" },
   secretActionButton: { width: 64, minWidth: 64, height: 26, flexShrink: 0 },

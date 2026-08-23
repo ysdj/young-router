@@ -441,6 +441,7 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
     if resource_error not in RESOURCE_ERRORS:
         resource_error = "none"
     remember_password = raw.get("remember_password") is True
+    auto_grouping = raw.get("auto_grouping") is True
     raw_session = raw.get("session", {})
     if raw_session is None:
         raw_session = {}
@@ -466,6 +467,7 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         "username": _text(raw.get("username", ""), "Relay username", limit=320, required=False),
         "login_status": status,
         "remember_password": remember_password,
+        "auto_grouping": auto_grouping,
         "password": _text(raw.get("password", ""), "Relay password", limit=4096, required=False) if remember_password else "",
         "session": session,
         "balance": _balance(raw.get("balance")),
@@ -501,6 +503,7 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
         "username": str(account.get("username", "")),
         "login_status": str(account.get("login_status", "unknown")),
         "remember_password": account.get("remember_password") is True,
+        "auto_grouping": account.get("auto_grouping") is True,
         "password_saved": bool(account.get("password")),
         "balance": _balance(account.get("balance")),
         "last_updated_at": str(account.get("last_updated_at", "")),
@@ -937,6 +940,11 @@ class RelayAccountsDomain:
         # and metadata refresh may update the same in-memory state, but never
         # smuggle a draft change across the persistence boundary.
         self._pending_operations: list[dict[str, Any]] = []
+        # Keep the pre-toggle resource state only while an automatic-grouping
+        # toggle is still part of the unapplied draft. Turning it off before
+        # Apply must undo the local alignment preview; after Apply the baseline
+        # is discarded so manual edits continue from the current grouping.
+        self._auto_grouping_draft_baselines: dict[str, dict[str, Any]] = {}
         self._draft_staged = False
         self._import_staged = False
         # Binding counts are derived by the provider/model domain. They are
@@ -1030,6 +1038,7 @@ class RelayAccountsDomain:
             "resource_secret_cache": copy.deepcopy(self._resource_secret_cache),
             "pending_credential_cleanups": copy.deepcopy(self._pending_credential_cleanups),
             "pending_operations": copy.deepcopy(self._pending_operations),
+            "auto_grouping_draft_baselines": copy.deepcopy(self._auto_grouping_draft_baselines),
             "draft_staged": self._draft_staged,
             "import_staged": self._import_staged,
             "binding_summary": copy.deepcopy(self._binding_summary),
@@ -1045,6 +1054,7 @@ class RelayAccountsDomain:
         resource_secrets = checkpoint.get("resource_secret_cache")
         pending_cleanups = checkpoint.get("pending_credential_cleanups")
         pending_operations = checkpoint.get("pending_operations")
+        auto_grouping_draft_baselines = checkpoint.get("auto_grouping_draft_baselines")
         draft_staged = checkpoint.get("draft_staged")
         import_staged = checkpoint.get("import_staged")
         binding_summary = checkpoint.get("binding_summary")
@@ -1059,6 +1069,7 @@ class RelayAccountsDomain:
             or not isinstance(resource_secrets, Mapping)
             or not isinstance(pending_cleanups, list)
             or not isinstance(pending_operations, list)
+            or not isinstance(auto_grouping_draft_baselines, Mapping)
             or type(draft_staged) is not bool
             or type(import_staged) is not bool
             or not isinstance(binding_summary, Mapping)
@@ -1073,6 +1084,7 @@ class RelayAccountsDomain:
         self._resource_secret_cache = copy.deepcopy(dict(resource_secrets))
         self._pending_credential_cleanups = copy.deepcopy(pending_cleanups)
         self._pending_operations = copy.deepcopy(pending_operations)
+        self._auto_grouping_draft_baselines = copy.deepcopy(dict(auto_grouping_draft_baselines))
         self._draft_staged = draft_staged
         self._import_staged = import_staged
         self._binding_summary = copy.deepcopy(dict(binding_summary))
@@ -1465,6 +1477,7 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay account storage is invalid")
         migrated = self._replace_storage_state(loaded)
         self._pending_operations = self._read_journal()
+        self._auto_grouping_draft_baselines = {}
         self._draft_staged = bool(self._pending_operations)
         self._import_staged = False
         self._last_action = {}
@@ -1954,6 +1967,15 @@ class RelayAccountsDomain:
                 data.get("group_id"),
             )
             details = {"kind": "api_key_set_group", "account_id": str(data.get("account_id", data.get("id", ""))), "resource_id": str(data.get("resource_id", data.get("key_id", "")))}
+        elif name in {"api_key_set_auto_grouping", "relay_api_key_set_auto_grouping", "account_api_key_set_auto_grouping", "account_set_auto_grouping", "relay_account_set_auto_grouping"}:
+            account_id = str(data.get("account_id", data.get("id", "")))
+            enabled = data.get("enabled")
+            self.set_auto_grouping(account_id, enabled)
+            details = {"kind": "api_key_set_auto_grouping", "account_id": account_id}
+        elif name in {"api_key_auto_group_align", "relay_api_key_auto_group_align", "account_auto_group_align", "relay_account_auto_group_align"}:
+            account_id = str(data.get("account_id", data.get("id", "")))
+            self.align_auto_grouping(account_id)
+            details = {"kind": "api_key_auto_group_align", "account_id": account_id}
         elif name in {"api_key_delete", "relay_api_key_delete", "account_api_key_delete"}:
             account_id = str(data.get("account_id", data.get("id", "")))
             resource_id = _resource_id(data.get("resource_id", data.get("key_id")))
@@ -2586,6 +2608,7 @@ class RelayAccountsDomain:
         if self._read_storage_bytes() != self._baseline_bytes:
             raise RelayAccountsError("Relay accounts changed on disk; reload before applying")
         self._persist(force=True)
+        self._auto_grouping_draft_baselines.clear()
         self._import_staged = False
         self._draft_staged = any(
             operation.get("state") in {"staged", "failed"}
@@ -3362,9 +3385,12 @@ class RelayAccountsDomain:
         *,
         kind: str,
         changes: Mapping[str, Any],
+        _allow_auto_grouping: bool = False,
     ) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
+        if account.get("auto_grouping") is True and not _allow_auto_grouping:
+            raise RelayAccountsError("Relay API keys are managed by automatic grouping")
         selected_id = _resource_id(resource_id)
         self._selected_resource(account, selected_id)
         pending = self._pending_for_resource(account["id"], selected_id)
@@ -3399,9 +3425,12 @@ class RelayAccountsDomain:
         *,
         group_id: object = None,
         enabled: object = True,
+        _allow_auto_grouping: bool = False,
     ) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
+        if account.get("auto_grouping") is True and not _allow_auto_grouping:
+            raise RelayAccountsError("Relay API keys are managed by automatic grouping")
         if not isinstance(enabled, bool):
             raise RelayAccountsError("Relay API key status is invalid")
         existing = account.get("resources", [])
@@ -3456,17 +3485,34 @@ class RelayAccountsDomain:
         self._draft_staged = True
         return _public_account(self._accounts[index])
 
-    def update_api_key(self, account_id: str, resource_id: object, name: object) -> dict[str, Any]:
+    def update_api_key(
+        self,
+        account_id: str,
+        resource_id: object,
+        name: object,
+        *,
+        _allow_auto_grouping: bool = False,
+    ) -> dict[str, Any]:
         return self._stage_resource_change(
             account_id,
             resource_id,
             kind="api_key_update",
             changes={"name": self._api_key_name(name)},
+            _allow_auto_grouping=_allow_auto_grouping,
         )
 
-    def set_api_key_group(self, account_id: str, resource_id: object, group_id: object) -> dict[str, Any]:
+    def set_api_key_group(
+        self,
+        account_id: str,
+        resource_id: object,
+        group_id: object,
+        *,
+        _allow_auto_grouping: bool = False,
+    ) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
+        if account.get("auto_grouping") is True and not _allow_auto_grouping:
+            raise RelayAccountsError("Relay API keys are managed by automatic grouping")
         selected_group = _group_id(group_id, required=account["type"] == "sub2api")
         groups = account.get("groups", [])
         if not isinstance(groups, list) or selected_group not in {
@@ -3478,17 +3524,223 @@ class RelayAccountsDomain:
             resource_id,
             kind="api_key_set_group",
             changes={"group_id": selected_group},
+            _allow_auto_grouping=_allow_auto_grouping,
         )
 
-    def set_api_key_enabled(self, account_id: str, resource_id: object, enabled: object) -> dict[str, Any]:
+    def set_api_key_enabled(
+        self,
+        account_id: str,
+        resource_id: object,
+        enabled: object,
+        *,
+        _allow_auto_grouping: bool = False,
+    ) -> dict[str, Any]:
         if not isinstance(enabled, bool):
             raise RelayAccountsError("Relay API key status is invalid")
+        index = self._index(account_id)
+        account = self._accounts[index]
+        if account.get("auto_grouping") is True and not _allow_auto_grouping:
+            raise RelayAccountsError("Relay API keys are managed by automatic grouping")
+        resource = self._selected_resource(account, resource_id)
+        group_id = str(resource.get("group_id", "")).strip()
+        if enabled and group_id:
+            groups = account.get("groups", [])
+            if not isinstance(groups, list) or not any(
+                isinstance(group, Mapping) and str(group.get("id", "")) == group_id
+                for group in groups
+            ):
+                raise RelayAccountsError("Relay API group is unavailable")
         return self._stage_resource_change(
             account_id,
             resource_id,
             kind="api_key_set_enabled",
             changes={"enabled": enabled},
+            _allow_auto_grouping=_allow_auto_grouping,
         )
+
+    def align_auto_grouping(self, account_id: str) -> dict[str, Any]:
+        """Stage one enabled, group-named key for every current relay group.
+
+        Existing keys are preferred over newly-created keys.  When a group
+        already has multiple keys, the first key in the relay's stable list is
+        retained and every later key is staged for deletion. Keys that still
+        reference a group removed from the current group list are also staged
+        for deletion; ungrouped keys are left untouched.
+        """
+
+        index = self._index(account_id)
+        account = self._accounts[index]
+        if account.get("auto_grouping") is not True:
+            return _public_account(account)
+        groups = [
+            group for group in account.get("groups", [])
+            if isinstance(group, Mapping) and str(group.get("id", ""))
+        ]
+        resources = [
+            resource for resource in account.get("resources", [])
+            if isinstance(resource, Mapping)
+        ]
+        before_resources = tuple(
+            (
+                str(resource.get("id", "")),
+                str(resource.get("name", "")),
+                str(resource.get("group_id", "")),
+                resource.get("enabled") is True,
+            )
+            for resource in resources
+        )
+        before_operations = tuple(
+            (
+                str(operation.get("id", "")),
+                str(operation.get("kind", "")),
+                str(operation.get("resource_id", "")),
+                tuple(sorted((str(key), repr(value)) for key, value in dict(operation.get("changes", {})).items())),
+            )
+            for operation in self._pending_operations
+        )
+        valid_group_ids = {str(group.get("id", "")) for group in groups}
+        for resource in resources:
+            resource_id = str(resource.get("id", ""))
+            resource_group_id = str(resource.get("group_id", ""))
+            if not resource_id or not resource_group_id or resource_group_id in valid_group_ids:
+                continue
+            if any(
+                operation.get("kind") == "api_key_delete"
+                for operation in self._pending_for_resource(account["id"], resource_id)
+            ):
+                continue
+            self.delete_api_key(
+                account_id,
+                resource_id,
+                dependency_policy="delete_models",
+                _allow_auto_grouping=True,
+            )
+        for group in groups:
+            group_id = str(group.get("id", ""))
+            group_name = _resource_name(group.get("name"), group_id)
+            matching = [
+                resource for resource in resources
+                if str(resource.get("group_id", "")) == group_id
+            ]
+            if not matching:
+                self.create_api_key(
+                    account_id,
+                    group_name,
+                    group_id=group_id,
+                    enabled=True,
+                    _allow_auto_grouping=True,
+                )
+                continue
+            pending_deletes = {
+                str(operation.get("resource_id", ""))
+                for resource in matching
+                for operation in self._pending_for_resource(
+                    account["id"], str(resource.get("id", ""))
+                )
+                if operation.get("kind") == "api_key_delete"
+            }
+            available = [
+                resource for resource in matching
+                if str(resource.get("id", "")) not in pending_deletes
+            ]
+            if not available:
+                # A previous alignment may already have submitted every
+                # duplicate for deletion.  Wait for Apply/reconciliation
+                # before creating a replacement key for this group.
+                continue
+            primary = available[0]
+            for duplicate in available[1:]:
+                duplicate_id = str(duplicate.get("id", ""))
+                if duplicate_id:
+                    self.delete_api_key(
+                        account_id,
+                        duplicate_id,
+                        dependency_policy="delete_models",
+                        _allow_auto_grouping=True,
+                    )
+            resource_id = str(primary.get("id", ""))
+            if str(primary.get("name", "")) != group_name:
+                self.update_api_key(
+                    account_id,
+                    resource_id,
+                    group_name,
+                    _allow_auto_grouping=True,
+                )
+            if primary.get("enabled") is not True:
+                self.set_api_key_enabled(
+                    account_id,
+                    resource_id,
+                    True,
+                    _allow_auto_grouping=True,
+                )
+        self._accounts[index]["auto_grouping"] = True
+        self._accounts[index] = _private_account(self._accounts[index])
+        after_resources = tuple(
+            (
+                str(resource.get("id", "")),
+                str(resource.get("name", "")),
+                str(resource.get("group_id", "")),
+                resource.get("enabled") is True,
+            )
+            for resource in self._accounts[index].get("resources", [])
+            if isinstance(resource, Mapping)
+        )
+        after_operations = tuple(
+            (
+                str(operation.get("id", "")),
+                str(operation.get("kind", "")),
+                str(operation.get("resource_id", "")),
+                tuple(sorted((str(key), repr(value)) for key, value in dict(operation.get("changes", {})).items())),
+            )
+            for operation in self._pending_operations
+        )
+        if before_resources != after_resources or before_operations != after_operations:
+            self._draft_staged = True
+        return _public_account(self._accounts[index])
+
+    def _restore_auto_grouping_draft(self, account_id: str) -> dict[str, Any] | None:
+        baseline = self._auto_grouping_draft_baselines.pop(account_id, None)
+        if baseline is None:
+            return None
+        index = self._index(account_id)
+        restored = copy.deepcopy(self._accounts[index])
+        restored["resources"] = copy.deepcopy(baseline["resources"])
+        restored["groups"] = copy.deepcopy(baseline["groups"])
+        restored["auto_grouping"] = baseline["auto_grouping"] is True
+        self._accounts[index] = _private_account(restored)
+        self._pending_operations = copy.deepcopy(baseline["pending_operations"])
+        self._persist_journal()
+        self._draft_staged = bool(baseline["draft_staged"]) or bool(self._pending_operations)
+        return _public_account(self._accounts[index])
+
+    def set_auto_grouping(self, account_id: str, enabled: object) -> dict[str, Any]:
+        if not isinstance(enabled, bool):
+            raise RelayAccountsError("Relay automatic grouping setting is invalid")
+        index = self._index(account_id)
+        account = self._accounts[index]
+        canonical_account_id = str(account["id"])
+        if not enabled:
+            restored = self._restore_auto_grouping_draft(canonical_account_id)
+            if restored is not None:
+                return restored
+        if enabled and not account.get("auto_grouping"):
+            self._auto_grouping_draft_baselines.setdefault(
+                canonical_account_id,
+                {
+                    "resources": copy.deepcopy(account.get("resources", [])),
+                    "groups": copy.deepcopy(account.get("groups", [])),
+                    "auto_grouping": account.get("auto_grouping") is True,
+                    "pending_operations": copy.deepcopy(self._pending_operations),
+                    "draft_staged": self._draft_staged,
+                },
+            )
+        account = copy.deepcopy(account)
+        account["auto_grouping"] = enabled
+        self._accounts[index] = _private_account(account)
+        self._draft_staged = True
+        if enabled:
+            return self.align_auto_grouping(account_id)
+        return _public_account(self._accounts[index])
 
     def delete_api_key(
         self,
@@ -3496,9 +3748,12 @@ class RelayAccountsDomain:
         resource_id: object,
         *,
         dependency_policy: object = "delete_models",
+        _allow_auto_grouping: bool = False,
     ) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
+        if account.get("auto_grouping") is True and not _allow_auto_grouping:
+            raise RelayAccountsError("Relay API keys are managed by automatic grouping")
         selected_id = _resource_id(resource_id)
         self._selected_resource(account, selected_id)
         policy = _dependency_policy(dependency_policy, default="delete_models")
@@ -3540,6 +3795,8 @@ class RelayAccountsDomain:
     def detach_api_key(self, account_id: str, resource_id: object) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
+        if account.get("auto_grouping") is True:
+            raise RelayAccountsError("Relay API keys are managed by automatic grouping")
         selected_id = _resource_id(resource_id)
         self._selected_resource(account, selected_id)
         pending = self._pending_for_resource(account["id"], selected_id)

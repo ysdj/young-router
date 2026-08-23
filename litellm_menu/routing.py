@@ -46,6 +46,8 @@ from .base import (
     _IMAGE_GENERATION_TOOL_UNSUPPORTED_LOCK,
     _IMAGE_GENERATION_TOOL_UNSUPPORTED_METADATA_KEY,
     _IMAGE_GENERATION_TOOL_UNSUPPORTED_TTL_SECONDS_ENV,
+    _HOSTED_WEB_SEARCH_TOOL_TYPES,
+    _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
     _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
     _PROTOCOL_FALLBACK_DEFAULT_TTL_SECONDS,
@@ -2400,9 +2402,15 @@ def _surface_adapter_model(model: Any, surface: str) -> Any:
     if not isinstance(model, str) or not model.strip():
         return model
     upstream = model.strip()
+    # Subscription-backed adapters carry their authentication transport in
+    # the LiteLLM model prefix. Do not collapse ChatGPT OAuth routes into the
+    # ordinary OpenAI API adapter merely because both speak Responses.
+    if upstream.startswith("chatgpt/") and surface != _UPSTREAM_URL_SURFACE_ANTHROPIC:
+        return upstream
     for prefix in (
         "anthropic/",
         "openai/",
+        "chatgpt/",
     ):
         if upstream.startswith(prefix):
             upstream = upstream[len(prefix):]
@@ -2422,9 +2430,14 @@ def _apply_surface_adapter_to_request(
         return
     adapted_model = _surface_adapter_model(upstream_model, surface)
     request_kwargs["model"] = adapted_model
-    request_kwargs["custom_llm_provider"] = (
-        "anthropic" if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC else "openai"
+    adapter = (
+        "chatgpt"
+        if isinstance(adapted_model, str) and adapted_model.startswith("chatgpt/")
+        else "anthropic"
+        if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC
+        else "openai"
     )
+    request_kwargs["custom_llm_provider"] = adapter
     if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
         request_kwargs.pop("use_chat_completions_api", None)
     else:
@@ -2690,11 +2703,23 @@ def _remember_selected_deployment_for_request(
     request_kwargs: Optional[dict],
     deployment: Any,
 ) -> None:
-    marker = _selected_deployment_request_marker(deployment)
+    deployment_marker = _selected_deployment_request_marker(deployment)
+    marker = _selected_deployment_marker_from_box()
+    deployment_id = _responses_request_module._deployment_id(deployment)
+    marker_id = (marker.get("model_info") or {}).get("id") if isinstance(marker, dict) else None
+    if (
+        not isinstance(marker, dict)
+        or (deployment_id and marker_id and marker_id != deployment_id)
+    ):
+        marker = deployment_marker
     if marker is not None and isinstance(request_kwargs, dict):
-        surface = _request_current_upstream_surface(request_kwargs)
-        if surface:
-            marker[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
+        selected_surface = _normalized_request_surface(
+            marker.get(_CURRENT_UPSTREAM_URL_SURFACE_KEY)
+        )
+        if not selected_surface:
+            surface = _request_current_upstream_surface(request_kwargs)
+            if surface:
+                marker[_CURRENT_UPSTREAM_URL_SURFACE_KEY] = surface
     _apply_selected_deployment_marker_to_request(
         request_kwargs,
         marker,
@@ -3371,7 +3396,24 @@ def _is_image_parameter_or_capability_bad_request_error(exception: Exception) ->
     )
 
 
-def _is_native_responses_web_search_unsupported_error(exception: Exception) -> bool:
+def _request_contains_hosted_web_search_tool(request_kwargs: Optional[dict]) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    tools = request_kwargs.get("tools")
+    if not isinstance(tools, list):
+        return False
+    return any(
+        isinstance(tool, dict)
+        and tool.get("type")
+        in (_HOSTED_WEB_SEARCH_TOOL_TYPES | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES)
+        for tool in tools
+    )
+
+
+def _is_native_responses_web_search_unsupported_error(
+    exception: Exception,
+    request_kwargs: Optional[dict] = None,
+) -> bool:
     status_code = _exception_status_code(exception)
     if status_code is not None and status_code not in {400, 404, 422}:
         return False
@@ -3380,6 +3422,9 @@ def _is_native_responses_web_search_unsupported_error(exception: Exception) -> b
     text = _exception_text(exception)
     if not text:
         return False
+    request_has_hosted_web_search = _request_contains_hosted_web_search_tool(
+        request_kwargs
+    )
     if not any(
         marker in text
         for marker in (
@@ -3388,7 +3433,7 @@ def _is_native_responses_web_search_unsupported_error(exception: Exception) -> b
             "web_search_preview",
             "hosted web search",
         )
-    ):
+    ) and not request_has_hosted_web_search:
         return False
     return any(
         marker in text
@@ -3406,6 +3451,15 @@ def _is_native_responses_web_search_unsupported_error(exception: Exception) -> b
             "not found",
             "unrecognized",
             "unknown",
+            # Some OpenAI-compatible gateways reject Hosted web-search
+            # declarations at schema validation time instead of returning a
+            # conventional "unsupported tool" message. Keep these markers
+            # behind the web-search guard above so unrelated schema errors do
+            # not enter the web-search bridge.
+            "input_schema",
+            "input schema",
+            "schema type error",
+            "类型错误",
         )
     )
 

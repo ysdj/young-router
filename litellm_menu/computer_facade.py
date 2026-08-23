@@ -529,12 +529,12 @@ async def _external_web_search_bridge_stream(
         })
     yield encode({"type": "response.completed", "response": response})
 
-async def _resolve_litellm_web_search_function_calls_stream(
+async def _resolve_web_search_function_calls_stream(
     response: Any,
     request_kwargs: Optional[dict],
     original_function: Optional[Any] = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    actions = _responses_web_search_bridge_module._litellm_web_search_actions_for_request(response, request_kwargs)
+    actions = _responses_web_search_bridge_module._web_search_actions_for_request(response, request_kwargs)
     payload = _streaming_module._jsonable(response)
     if not isinstance(payload, dict):
         payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
@@ -672,7 +672,7 @@ async def _resolve_litellm_web_search_function_calls_stream(
             continue
         if item.get("type") == "web_search_call":
             continue
-        if _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
+        if _responses_web_search_bridge_module._is_web_search_function_call_item(item):
             continue
         final_output.append(item)
         index = len(final_output) - 1
@@ -921,7 +921,7 @@ async def _external_web_search_stream_route_recovery_or_fallback(
                     original_exception=_routing_module._trace_exception(exception),
                     exception=_routing_module._trace_exception(recovery_exc),
                 )
-            if _responses_web_search_bridge_module._has_litellm_web_search_actions_for_request(
+            if _responses_web_search_bridge_module._has_web_search_actions_for_request(
                 recovered_payload,
                 recovery_request,
             ):
@@ -1061,7 +1061,7 @@ def _external_web_search_output_items_from_response(
     return payload, output_items
 
 
-async def _resolve_litellm_web_search_function_calls_stream_rounds(
+async def _resolve_web_search_function_calls_stream_rounds(
     response: Any,
     request_kwargs: Optional[dict],
     original_function: Optional[Any] = None,
@@ -1069,7 +1069,7 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
     payload = _streaming_module._jsonable(response)
     if not isinstance(payload, dict):
         payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
-    initial_actions = _responses_web_search_bridge_module._litellm_web_search_actions_for_request(response, request_kwargs)
+    initial_actions = _responses_web_search_bridge_module._web_search_actions_for_request(response, request_kwargs)
     if not initial_actions:
         _responses_web_search_bridge_module._external_web_search_raise_if_invalid_initial_no_action_response(
             response,
@@ -1242,7 +1242,7 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
 
     for round_number in range(1, max_rounds + 1):
         round_actions = _responses_web_search_bridge_module._external_web_search_budgeted_actions(
-            _responses_web_search_bridge_module._litellm_web_search_actions_for_request(current_response, request_kwargs),
+            _responses_web_search_bridge_module._web_search_actions_for_request(current_response, request_kwargs),
             completed_actions,
         )
         if not round_actions:
@@ -1355,7 +1355,7 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
             finally:
                 if not recovery_task.done():
                     recovery_task.cancel()
-            if _responses_web_search_bridge_module._has_litellm_web_search_actions_for_request(
+            if _responses_web_search_bridge_module._has_web_search_actions_for_request(
                 final_response,
                 request_kwargs,
             ):
@@ -1423,7 +1423,7 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
             continue
         if item.get("type") == "web_search_call":
             continue
-        if _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
+        if _responses_web_search_bridge_module._is_web_search_function_call_item(item):
             continue
         item = _responses_web_search_bridge_module._final_answer_message_item(item)
         final_output.append(item)
@@ -1488,7 +1488,7 @@ async def _resolve_litellm_web_search_function_calls_stream_rounds(
                     continue
                 if item.get("type") == "web_search_call":
                     continue
-                if _responses_web_search_bridge_module._is_litellm_web_search_call_item(item):
+                if _responses_web_search_bridge_module._is_web_search_function_call_item(item):
                     continue
                 item = _responses_web_search_bridge_module._final_answer_message_item(item)
                 final_output.append(item)

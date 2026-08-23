@@ -92,6 +92,8 @@ class LiteLLMMenuHook(CustomLogger):
             _image_inputs_module._with_bounded_image_inputs,
             _responses_request_module._with_internal_litellm_metadata,
             _responses_request_module._with_mcp_auto_approval,
+            _responses_request_module._with_codex_external_web_search_bridge_tool,
+            _responses_request_module._with_codex_tool_registry_instruction,
             _responses_request_module._with_codex_descendant_cleanup_instruction,
             _responses_request_module._with_empty_tool_controls_removed,
             _responses_request_module._with_codex_compaction_controls,
@@ -240,16 +242,17 @@ class LiteLLMMenuHook(CustomLogger):
         if request_data.get("stream") is not True:
             _routing_module._record_deployment_success_for_cooldown(request_data)
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
+        _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+            request_data, response
+        )
         response = _responses_web_search_bridge_module._sanitize_response_stream_payload(
             response,
             request_data,
         )
-        if _tools_module._request_is_unmarked_internal_web_search_bridge_post_call(request_data):
-            return response
         if (
             not _tools_module._request_suppresses_external_web_search_post_call(request_data)
-            and _tools_module._request_should_consume_litellm_web_search_function_call(request_data)
-            and _responses_web_search_bridge_module._has_litellm_web_search_actions_for_request(response, request_data)
+            and _tools_module._request_should_consume_web_search_function_call(request_data)
+            and _responses_web_search_bridge_module._has_web_search_actions_for_request(response, request_data)
         ):
             original_function = _responses_execution_module._responses_bridge_original_function(request_data)
             _trace_module._route_trace(
@@ -262,9 +265,9 @@ class LiteLLMMenuHook(CustomLogger):
                 has_original_function=original_function is not None,
                 request=_trace_module._trace_request_summary(request_data, call_type=call_type),
                 response=_trace_module._trace_response_summary(response, request_data),
-                actions=_responses_web_search_bridge_module._litellm_web_search_actions_for_request(response, request_data),
+                actions=_responses_web_search_bridge_module._web_search_actions_for_request(response, request_data),
             )
-            return await _responses_web_search_bridge_module._resolve_litellm_web_search_function_calls(
+            return await _responses_web_search_bridge_module._resolve_web_search_function_calls(
                 response,
                 request_data,
                 original_function,
@@ -323,6 +326,10 @@ class LiteLLMMenuHook(CustomLogger):
             )
 
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
+        if not _responses_output_module._response_is_async_iterable(response):
+            _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+                request_data, response
+            )
         if (
             _tools_module._request_has_web_search_tool(request_data)
             and _responses_output_module._response_is_async_iterable(response)
@@ -361,6 +368,9 @@ class LiteLLMMenuHook(CustomLogger):
 
         try:
             async for chunk in _streaming_module._stream_with_idle_timeout(response, request_data):
+                _responses_web_search_bridge_module._mark_provider_native_web_search_event(
+                    request_data, chunk
+                )
                 sanitized_chunk = _responses_web_search_bridge_module._sanitize_web_search_stream_chunk(chunk)
                 if sanitized_chunk is None:
                     continue

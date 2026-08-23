@@ -13,6 +13,7 @@ from .schema import (
     MENU_MODEL_ENABLED_KEY,
     MENU_ORDER_MODE_KEY,
     MENU_PROVIDER_KEY_ID_KEY,
+    MENU_PROVIDER_AUTH_KEY,
     MENU_RELAY_CATALOG_MODE_KEY,
     MENU_RELAY_KEYS_KEY,
     MENU_RELAY_KEYS_VERSION,
@@ -30,6 +31,7 @@ from .schema import (
     _jsonable,
     _menu_order,
     _provider_key_id,
+    _provider_auth,
     _provider_source,
     _relay_source,
     _stable_provider_key_id,
@@ -50,6 +52,7 @@ def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
     api_keys = _provider_api_keys_from_raw(name, provider)
     api_key = api_keys[0]["value"] if api_keys else ""
     source = _provider_source(provider.get(MENU_PROVIDER_SOURCE_KEY))
+    auth = _provider_auth(provider.get(MENU_PROVIDER_AUTH_KEY))
     extra = {
         key: _jsonable(raw_value)
         for key, raw_value in provider.items()
@@ -69,6 +72,8 @@ def _provider_to_editor(name: str, value: Any) -> dict[str, Any]:
         "extra": extra,
         "provider_type": source["kind"],
         "relay_station_id": source.get("station_id", ""),
+        "auth_kind": auth["kind"],
+        "auth_credential_ref": auth.get("credential_ref", ""),
     }
 
 
