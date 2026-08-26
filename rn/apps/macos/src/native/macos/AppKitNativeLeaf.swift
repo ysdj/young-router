@@ -624,7 +624,9 @@ private enum NativeRelayOriginPolicy {
             return
         }
         guard let url = NativeProviderAuthPolicy.url(provider: provider, string: verificationURL),
-              NativeProviderAuthPolicy.callbackURL(provider: provider, string: callbackURL),
+              (callbackURL == nil || NativeProviderAuthPolicy.callbackURL(provider: provider, string: callbackURL) != nil),
+              (userCode == nil || (userCode.map(NativeProviderAuthPolicy.validCode) ?? false)),
+              (userCode != nil || callbackURL != nil),
               !title.isEmpty,
               !closeTitle.isEmpty else {
             completion()
@@ -640,7 +642,7 @@ private enum NativeRelayOriginPolicy {
             }
             authFingerprint = normalized
         } else {
-            authFingerprint = "\(provider)|\(url.absoluteString)|\(callbackURL ?? \"\")"
+            authFingerprint = "\(provider)|\(url.absoluteString)|\(callbackURL ?? "")"
         }
         // Re-presentation for the same account replaces its stale challenge;
         // other account fingerprints remain visible and independent.
@@ -2267,7 +2269,28 @@ private enum NativeProviderAuthPolicy {
         return url
     }
 
-    static func allows(provider: String, url: URL) -> Bool {
+    static func callbackURL(provider: String, string: String?) -> URL? {
+        guard let string, !string.isEmpty,
+              let url = URL(string: string),
+              provider == "claude",
+              url.scheme?.lowercased() == "http",
+              let host = url.host?.lowercased(), host == "localhost" || host == "127.0.0.1",
+              url.user == nil, url.password == nil, url.fragment == nil,
+              url.path == "/callback",
+              let port = url.port, port > 0, port <= 65_535 else {
+            return nil
+        }
+        return url
+    }
+
+    static func allows(provider: String, url: URL, callbackURL: URL? = nil) -> Bool {
+        if let callbackURL,
+           url.scheme?.lowercased() == callbackURL.scheme?.lowercased(),
+           url.host?.lowercased() == callbackURL.host?.lowercased(),
+           url.port == callbackURL.port,
+           url.path == callbackURL.path {
+            return true
+        }
         guard url.scheme?.lowercased() == "https",
               let host = url.host?.lowercased(),
               !host.isEmpty,
@@ -2292,13 +2315,10 @@ private enum NativeProviderAuthPolicy {
             }
             return false
         case "claude":
-            // Claude setup-token currently completes in the official CLI. If
-            // a future device-code endpoint is supplied, keep it constrained
-            // to Anthropic's first-party auth surfaces.
-            if host == "claude.ai" {
-                return path == "/" || path.hasPrefix("/login") || path.hasPrefix("/oauth") || path.hasPrefix("/auth")
+            if host == "claude.com" || host == "claude.ai" {
+                return path == "/" || path == "/cai/oauth/authorize" || path.hasPrefix("/login") || path.hasPrefix("/oauth") || path.hasPrefix("/auth") || path.hasPrefix("/cai/")
             }
-            if host == "console.anthropic.com" || host == "auth.anthropic.com" {
+            if host == "platform.claude.com" || host == "console.anthropic.com" || host == "auth.anthropic.com" {
                 return path == "/" || path.hasPrefix("/login") || path.hasPrefix("/oauth") || path.hasPrefix("/auth")
             }
             return false
@@ -2317,7 +2337,8 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
 
     private let provider: String
     private let url: URL
-    private let userCode: String
+    private let userCode: String?
+    private let callbackURL: URL?
     private let webView: WKWebView
     private var onClose: ((NativeProviderAuthController) -> Void)?
     private var stopped = false
@@ -2325,7 +2346,8 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
     init(
         provider: String,
         url: URL,
-        userCode: String,
+        userCode: String?,
+        callbackURL: String?,
         title: String,
         closeTitle: String,
         instructionText: String,
@@ -2337,6 +2359,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         self.provider = provider
         self.url = url
         self.userCode = userCode
+        self.callbackURL = NativeProviderAuthPolicy.callbackURL(provider: provider, string: callbackURL)
         self.onClose = onClose
 
         let configuration = WKWebViewConfiguration()
@@ -2384,7 +2407,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         let codeLabel = NSTextField(labelWithString: codeLabelText)
         codeLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
 
-        let codeField = NSTextField(labelWithString: userCode)
+        let codeField = NSTextField(labelWithString: userCode ?? "")
         codeField.isSelectable = true
         codeField.isEditable = false
         codeField.font = NSFont.monospacedSystemFont(ofSize: 17, weight: .medium)
@@ -2415,29 +2438,31 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         closeButton.bezelStyle = .rounded
         closeButton.keyEquivalent = "\u{1b}"
 
-        [titleLabel, instructionLabel, codeLabel, codeField, copyButton, browserFrame, closeButton].forEach {
+        let hasUserCode = !(userCode?.isEmpty ?? true)
+        if !hasUserCode {
+            codeLabel.isHidden = true
+            codeField.isHidden = true
+            copyButton.isHidden = true
+        }
+        var controls: [NSView] = [titleLabel, instructionLabel, browserFrame, closeButton]
+        if hasUserCode {
+            controls.insert(codeLabel, at: 2)
+            controls.insert(codeField, at: 3)
+            controls.insert(copyButton, at: 4)
+        }
+        controls.forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview($0)
         }
-        NSLayoutConstraint.activate([
+        var constraints: [NSLayoutConstraint] = [
             titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
             titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
             titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
             instructionLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             instructionLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
             instructionLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
-            codeLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            codeLabel.topAnchor.constraint(equalTo: instructionLabel.bottomAnchor, constant: 12),
-            codeField.leadingAnchor.constraint(equalTo: codeLabel.trailingAnchor, constant: 10),
-            codeField.centerYAnchor.constraint(equalTo: codeLabel.centerYAnchor),
-            codeField.widthAnchor.constraint(greaterThanOrEqualToConstant: 250),
-            codeField.heightAnchor.constraint(equalToConstant: 32),
-            copyButton.leadingAnchor.constraint(equalTo: codeField.trailingAnchor, constant: 8),
-            copyButton.trailingAnchor.constraint(lessThanOrEqualTo: titleLabel.trailingAnchor),
-            copyButton.centerYAnchor.constraint(equalTo: codeField.centerYAnchor),
             browserFrame.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             browserFrame.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-            browserFrame.topAnchor.constraint(equalTo: codeField.bottomAnchor, constant: 14),
             browserFrame.bottomAnchor.constraint(equalTo: closeButton.topAnchor, constant: -14),
             webView.leadingAnchor.constraint(equalTo: browserFrame.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: browserFrame.trailingAnchor),
@@ -2446,7 +2471,24 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
             closeButton.centerXAnchor.constraint(equalTo: content.centerXAnchor),
             closeButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
             closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
-        ])
+        ]
+        if hasUserCode {
+            constraints += [
+                codeLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+                codeLabel.topAnchor.constraint(equalTo: instructionLabel.bottomAnchor, constant: 12),
+                codeField.leadingAnchor.constraint(equalTo: codeLabel.trailingAnchor, constant: 10),
+                codeField.centerYAnchor.constraint(equalTo: codeLabel.centerYAnchor),
+                codeField.widthAnchor.constraint(greaterThanOrEqualToConstant: 250),
+                codeField.heightAnchor.constraint(equalToConstant: 32),
+                copyButton.leadingAnchor.constraint(equalTo: codeField.trailingAnchor, constant: 8),
+                copyButton.trailingAnchor.constraint(lessThanOrEqualTo: titleLabel.trailingAnchor),
+                copyButton.centerYAnchor.constraint(equalTo: codeField.centerYAnchor),
+                browserFrame.topAnchor.constraint(equalTo: codeField.bottomAnchor, constant: 14),
+            ]
+        } else {
+            constraints.append(browserFrame.topAnchor.constraint(equalTo: instructionLabel.bottomAnchor, constant: 14))
+        }
+        NSLayoutConstraint.activate(constraints)
         panel.initialFirstResponder = webView
     }
 
@@ -2463,6 +2505,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
     @objc private func copyCode(_ sender: Any?) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
+        guard let userCode, !userCode.isEmpty else { return }
         _ = pasteboard.setString(userCode, forType: .string)
     }
 
@@ -2476,7 +2519,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         // Cloudflare's managed challenge is a first-party iframe. Validate
         // every frame URL, but do not require it to be the main frame.
         guard let targetURL = navigationAction.request.url,
-              NativeProviderAuthPolicy.allows(provider: provider, url: targetURL) else {
+              NativeProviderAuthPolicy.allows(provider: provider, url: targetURL, callbackURL: callbackURL) else {
             decisionHandler(.cancel)
             return
         }
@@ -2493,7 +2536,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
             return
         }
         guard let responseURL = navigationResponse.response.url,
-              NativeProviderAuthPolicy.allows(provider: provider, url: responseURL) else {
+              NativeProviderAuthPolicy.allows(provider: provider, url: responseURL, callbackURL: callbackURL) else {
             decisionHandler(.cancel)
             return
         }
@@ -2507,7 +2550,7 @@ private final class NativeProviderAuthController: NSObject, NSWindowDelegate, WK
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         guard let targetURL = navigationAction.request.url,
-              NativeProviderAuthPolicy.allows(provider: provider, url: targetURL) else {
+              NativeProviderAuthPolicy.allows(provider: provider, url: targetURL, callbackURL: callbackURL) else {
             return nil
         }
         webView.load(navigationAction.request)

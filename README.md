@@ -226,7 +226,7 @@ The primary configuration file is `~/.litellm-menu/config.yaml`. A sanitized exa
 
 The model editor keeps the client-facing public model name separate from the exact upstream model ID. It derives LiteLLM's internal provider prefix from the selected upstream protocol (`openai` for OpenAI Responses or Chat, `anthropic` for Anthropic Messages), so there is no separate adapter setting. This permits mappings such as a GPT-compatible public route backed by a differently named OpenAI-compatible upstream model without changing the upstream ID.
 
-Provider endpoint source and authentication are separate concerns. **Service Provider Management** owns account login: official OpenAI login uses LiteLLM's device-code flow and a native sign-in window, while Claude uses the official `claude setup-token` flow or a native secure token field. Login credentials stay in private runtime storage; the YAML configuration contains only opaque authentication metadata and environment references. **Providers & Models** is deliberately API-key-only: its add-provider wizard starts with the API-key step and never asks for an account-login method or a login URL.
+Provider endpoint source and authentication are separate concerns. **Service Provider Management** owns account login: official OpenAI login uses LiteLLM's device-code flow and a native sign-in window, while Claude uses the official browser OAuth flow with a loopback callback. Login credentials stay in private runtime storage; the YAML configuration contains only opaque authentication metadata and environment references. **Providers & Models** is deliberately API-key-only: its add-provider wizard starts with the API-key step and never asks for an account-login method or a login URL.
 
 ### Providers & Models Editor
 
@@ -530,7 +530,7 @@ pnpm run build:windows
 
 模型编辑器将客户端看到的公开模型名与上游原始模型 ID 分开保存。LiteLLM 内部供应商前缀由已选上游协议自动派生（OpenAI Responses 或 Chat 使用 `openai`，Anthropic Messages 使用 `anthropic`），不再单独配置 adapter。这样可以把 GPT 兼容的公开路由映射到名称不同的 OpenAI-compatible 上游模型，同时保持上游 ID 不变。
 
-供应商端点来源与认证方式分属两个页面。**服务商管理**负责账号登录：OpenAI 使用 LiteLLM 设备码流程并打开原生登录窗口，Claude 使用官方 `claude setup-token` 流程，或通过原生安全输入框录入 token。登录凭据只保存在私有运行时目录，YAML 只记录不含密钥的认证元数据和环境引用。**Providers & Models** 明确只管理 API key：新增供应商向导直接进入 API key 步骤，不再出现账号登录方式，也不会要求先填登录 URL。
+供应商端点来源与认证方式分属两个页面。**服务商管理**负责账号登录：OpenAI 使用 LiteLLM 设备码流程并打开原生登录窗口，Claude 使用官方网页 OAuth 流程并通过本机回调自动完成授权。登录凭据只保存在私有运行时目录，YAML 只记录不含密钥的认证元数据和环境引用。**Providers & Models** 明确只管理 API key：新增供应商向导直接进入 API key 步骤，不再出现账号登录方式，也不会要求先填登录 URL。
 
 ### Providers & Models 编辑器
 

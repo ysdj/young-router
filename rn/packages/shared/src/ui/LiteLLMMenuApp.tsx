@@ -2045,8 +2045,9 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
     const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
     const verificationURL = stringValue(summary.verification_uri);
     const userCode = stringValue(summary.user_code);
-    if (!verificationURL || !userCode) return;
-    const fingerprint = `${accountFingerprint}|${kind}|${verificationURL}|${userCode}`;
+    const callbackURL = stringValue(summary.redirect_uri);
+    if (!verificationURL || (!userCode && !callbackURL)) return;
+    const fingerprint = `${accountFingerprint}|${kind}|${verificationURL}|${userCode}|${callbackURL}`;
     if (shownChallenge.current[accountFingerprint] === fingerprint) return;
     shownChallenge.current[accountFingerprint] = fingerprint;
     const options = {
@@ -2058,13 +2059,14 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
         provider: kind === "openai_login" ? "openai" : "claude",
         fingerprint: accountFingerprint,
         verificationURL,
-        userCode,
+        ...(userCode ? { userCode } : {}),
+        ...(callbackURL ? { callbackURL } : {}),
         ...options,
       }).catch(() => undefined);
     } else {
       void native.showReadOnlyText({
         ...options,
-        text: [verificationURL, userCode].join("\n"),
+        text: [verificationURL, userCode || callbackURL].join("\n"),
         language: "text",
         html: CODE_EDITOR_HTML,
       });
@@ -2158,7 +2160,6 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
           <View style={serviceProviderStyles.rule} />
           <Text style={serviceProviderStyles.detailLine}>{translate("relay.officialProviderModels")}: {modelName}</Text>
           <Text style={serviceProviderStyles.hint}>{selectedKind === "openai_login" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderCliHint")}</Text>
-          {selectedKind === "claude_login" ? <Text style={serviceProviderStyles.hint}>{translate("relay.officialProviderTokenHint")}</Text> : null}
           {selectedKind === "openai_login" && active ? <Text style={serviceProviderStyles.activeHint}>{translate("relay.officialProviderActive")}</Text> : null}
           {selectedKind === "openai_login" && selected && status === "signed_in" && !active ? <Text style={serviceProviderStyles.hint}>{translate("relay.officialProviderRestartHint")}</Text> : null}
           <View style={serviceProviderStyles.actions}>
@@ -2167,7 +2168,7 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
               <NativeButton title={authLabel} primary compact disabled={busy} onPress={() => { if (authAction === "service_provider.auth_start") void startLogin(); else void dispatch(authAction, { provider_id: providerID }, "providers_models"); }} />
             </> : null}
           </View>
-          {selectedKind === "claude_login" && selected && (status === "unsupported" || status === "error") ? <NativeSecretField autoCommit label={translate("providers.authTypeClaude")} hint={translate("relay.officialProviderTokenHint")} busy={busy} disabled={busy} domain="providers_models" field="provider_auth_token" target={providerID} onSecretState={onSecretState} /> : null}
+          {selectedKind === "claude_login" && selected && status === "error" ? <NativeSecretField autoCommit label={translate("providers.authTypeClaude")} hint={translate("relay.officialProviderTokenHint")} busy={busy} disabled={busy} domain="providers_models" field="provider_auth_token" target={providerID} onSecretState={onSecretState} /> : null}
         </View>
       </View>
     </View>;
