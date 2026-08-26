@@ -34,7 +34,6 @@ _CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
 _CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _CLAUDE_OAUTH_SCOPES = (
-    "org:create_api_key",
     "user:profile",
     "user:inference",
     "user:sessions:claude_code",
@@ -332,6 +331,20 @@ class ProviderAuthManager:
             }
         if kind == "claude_login":
             record = self._read(ref)
+            with self._lock:
+                state = dict(self._states.get(ref, {}))
+            transient_status = state.get("status")
+            if transient_status in {"authorizing", "signed_out", "error"}:
+                result: dict[str, Any] = {
+                    "status": transient_status,
+                    "configured": False,
+                }
+                if transient_status == "authorizing":
+                    for key in ("verification_uri", "user_code", "redirect_uri"):
+                        value = state.get(key)
+                        if isinstance(value, str) and value:
+                            result[key] = value
+                return result
             token = record.get("token")
             if _valid_claude_token(token):
                 if _claude_token_expired(record):
@@ -345,8 +358,6 @@ class ProviderAuthManager:
                     "configured": True,
                     **({"expires_at": record["expires_at"]} if isinstance(record.get("expires_at"), (int, float)) else {}),
                 }
-            with self._lock:
-                state = dict(self._states.get(ref, {}))
             status = state.get("status", "signed_out")
             result: dict[str, Any] = {
                 "status": status if status in _SAFE_STATUS else "signed_out",
@@ -384,6 +395,23 @@ class ProviderAuthManager:
             )
         return {"status": "signed_in", "configured": True}
 
+    def _prepare_claude_start(self, ref: str) -> None:
+        existing = self._read(ref)
+        if existing.get("kind") not in (None, "claude_login"):
+            raise ValueError("Provider credential profile belongs to another login method")
+        state = {
+            "kind": "claude_login",
+            "status": "authorizing",
+            "configured": False,
+            "last_error": "",
+            "updated_at": int(time.time()),
+        }
+        self._write(
+            ref,
+            state,
+        )
+        self._states[ref] = dict(state)
+
     def start(self, kind: str, credential_ref: str) -> dict[str, Any]:
         ref = self._canonical_ref(kind, credential_ref)
         if kind not in {"openai_login", "claude_login"}:
@@ -393,7 +421,10 @@ class ProviderAuthManager:
             if existing is not None and existing.is_alive():
                 return self.status(kind, ref)
             self._cancel.discard(ref)
-            self._set_state(ref, kind=kind, status="authorizing", configured=False, last_error="")
+            if kind == "claude_login":
+                self._prepare_claude_start(ref)
+            else:
+                self._set_state(ref, kind=kind, status="authorizing", configured=False, last_error="")
             target = self._run_chatgpt if kind == "openai_login" else self._run_claude
             thread = threading.Thread(target=target, args=(ref,), daemon=True, name=f"litellm-auth-{ref}")
             self._threads[ref] = thread
@@ -410,7 +441,26 @@ class ProviderAuthManager:
             if isinstance(wakeup, threading.Event):
                 wakeup.set()
         try:
-            self._set_state(ref, status="signed_out", configured=False, user_code="", verification_uri="")
+            record = self._read(ref)
+            if record.get("kind") == "claude_login":
+                self._write(
+                    ref,
+                    {
+                        "kind": "claude_login",
+                        "status": "signed_out",
+                        "configured": False,
+                        "last_error": "",
+                        "updated_at": int(time.time()),
+                    },
+                )
+                with self._lock:
+                    self._states[ref] = {
+                        "kind": "claude_login",
+                        "status": "signed_out",
+                        "configured": False,
+                    }
+            else:
+                self._set_state(ref, status="signed_out", configured=False, user_code="", verification_uri="")
         except Exception:
             pass
         return {"status": "signed_out", "configured": False}
@@ -665,22 +715,29 @@ class ProviderAuthManager:
                 if ref in self._cancel:
                     self._set_state(ref, status="signed_out", configured=False)
                     return
-                self._set_state(
+                self._write(
                     ref,
-                    kind="claude_login",
-                    token=access_token,
-                    refresh_token=refresh_token,
-                    expires_at=expires_at,
-                    refresh_token_expires_at=refresh_expires_at,
-                    scopes=scopes,
-                    client_id=_CLAUDE_OAUTH_CLIENT_ID,
-                    status="signed_in",
-                    configured=True,
-                    last_error="",
-                    verification_uri="",
-                    user_code="",
-                    redirect_uri="",
+                    {
+                        "kind": "claude_login",
+                        "token": access_token,
+                        "refresh_token": refresh_token,
+                        "expires_at": expires_at,
+                        "refresh_token_expires_at": refresh_expires_at,
+                        "scopes": scopes,
+                        "client_id": _CLAUDE_OAUTH_CLIENT_ID,
+                        "status": "signed_in",
+                        "configured": True,
+                        "last_error": "",
+                        "updated_at": int(time.time()),
+                    },
                 )
+                self._states[ref] = {
+                    "kind": "claude_login",
+                    "status": "signed_in",
+                    "configured": True,
+                    "last_error": "",
+                    "updated_at": int(time.time()),
+                }
         except TimeoutError:
             if self._is_cancelled(ref):
                 self._set_state(ref, kind="claude_login", status="signed_out", configured=False)
