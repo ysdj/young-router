@@ -6,6 +6,45 @@ from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    async def test_chat_route_exhaustion_propagates_error_instead_of_cancellation(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["litellm_menu.streaming"]
+        original_fallback = streaming_module._stream_streaming_error_fallback
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_streaming_error_fallback",
+            original_fallback,
+        )
+        # Isolate the terminal propagation branch; route-recovery exhaustion
+        # with an active polling budget is covered by route-recovery tests.
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
+
+        class NoDeploymentsError(Exception):
+            pass
+
+        async def failed_fallback(_request_data, _exception):
+            raise NoDeploymentsError("No deployments available for selected model")
+            yield None
+
+        streaming_module._stream_streaming_error_fallback = failed_fallback
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+
+        with self.assertRaisesRegex(
+            NoDeploymentsError,
+            "No deployments available for selected model",
+        ):
+            async for _chunk in hooks._yield_streaming_error_fallback_or_raise(
+                request_data,
+                RuntimeError("upstream failed"),
+            ):
+                pass
+
     async def test_chat_completions_clean_eof_before_terminal_falls_back(self) -> None:
         hooks, proxy_server = load_hook_module()
         hooks._DEPLOYMENT_COOLDOWNS.clear()

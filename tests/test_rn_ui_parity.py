@@ -98,7 +98,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"service.status": "状态: {status}"',
             '"common.empty": "(空)"',
             '"providers.probeApplyTitle": "使用推荐协议?"',
-            '"settings.rawLiveDraft": "原始文件 - 实时草稿"',
             '"relay.typeDetected": "已识别: {type}"',
         ):
             self.assertIn(marker, chinese)
@@ -106,29 +105,48 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('{translate("common.default")}: {defaultValue}', self.ui)
         self.assertIn('return details.join(" | ");', self.ui)
 
-    def test_assistant_settings_use_one_tabbed_surface_with_active_domain_actions(self) -> None:
+    def test_assistant_settings_use_one_shared_surface_with_active_domain_actions(self) -> None:
         for marker in (
             'type AssistantSettingsDomain = "codex" | "claude";',
             'const settingsRoute = isAssistantSettingsRoute(route);',
-            'const domain = settingsRoute ? settingsTab : domainForRoute(route);',
-            'title: "Codex" }, { id: "claude", title: "Claude"',
-            'selected={settingsTab} disabled={busy}',
+            'const domain = settingsRoute ? undefined : domainForRoute(route);',
+            '<AssistantSettingsWorkspace',
+            'assistantSettingsScroll',
+            'assistantQuickGrid',
+            'assistantRawGrid',
             'await flushPendingFields();',
             'const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
             'if (settingsRoute) {',
             'return (["codex", "claude"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
             'const dirtyDomains = stagedDomainsForRoute(current);',
             'for (const name of dirtyDomains) {',
-            "const claudeDeploymentDraftRef = useRef<ClaudeDeploymentDraft | undefined>(undefined);",
-            "const hasClaudeDeploymentChanges = (currentSnapshot: CoreSnapshot | undefined)",
             'const needsDiscardConfirmation = routeHasStagedChanges(current);',
             'if (!needsDiscardConfirmation) {',
-            "claudeDeploymentDraftRef.current = next;",
-            "claudeDeploymentDraftRef.current = undefined;",
-            'if (reloadDomain === "claude") {',
-            '}, [route]);',
         ):
             self.assert_ui_has(marker)
+        self.assertNotIn('selected={settingsTab}', self.ui)
+        self.assertNotIn('<WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]}', self.ui)
+        self.assertNotIn('patch_deployment', self.ui)
+    def test_apply_serializes_pending_core_field_commits(self) -> None:
+        flush = self.ui.split("const flushPendingFields = async (): Promise<void> => {", 1)[1].split(
+            "const hasPendingFieldEdits",
+            1,
+        )[0]
+        self.assertIn("for (const field of [...pendingFields.current.values()])", flush)
+        self.assertIn("await field.commit();", flush)
+        self.assertNotIn(
+            "Promise.all([...pendingFields.current.values()].map((field) => field.commit()))",
+            flush,
+        )
+
+    def test_shared_assistant_apply_is_not_blocked_by_the_undefined_default_domain(self) -> None:
+        apply_body = self.ui.split('const apply = (): Promise<void> => {', 1)[1].split(
+            "const applyDataManagement",
+            1,
+        )[0]
+        self.assertIn('if ((!settingsRoute && route !== "relay-accounts" && !domain) || domain === "logs")', apply_body)
+        self.assertIn('settingsRoute || route === "relay-accounts"', apply_body)
+        self.assertIn("stagedDomainsForRoute(refreshed)", apply_body)
 
     def test_route_close_and_apply_share_one_dirty_projection(self) -> None:
         for marker in (
@@ -810,29 +828,42 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(value, chinese)
 
     def test_claude_permission_picker_includes_the_official_delegate_mode(self) -> None:
-        english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
-        chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
-        self.assert_ui_has('"bypassPermissions", "delegate"]')
-        self.assertIn('"claude.permission.delegate": "Delegate"', english)
-        self.assertIn('"claude.permission.delegate": "委派"', chinese)
+        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
+            "function AssistantSettingsWorkspace", 1
+        )[0]
+        self.assertIn('translate("claude.desktopProvider")', claude)
+        self.assertNotIn('translate("claude.permissions")', claude)
+        self.assertNotIn("CLAUDE_PERMISSION_MODES", claude)
 
     def test_claude_structured_forms_are_named_for_their_single_column_layout(self) -> None:
-        self.assert_ui_has("styles.structuredForm")
-        self.assert_ui_has("structuredForm: { gap: 6 }")
+        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
+            "function AssistantSettingsWorkspace", 1
+        )[0]
+        self.assertIn("assistantSettingsStyles.domainBody", claude)
+        self.assertIn("assistantSettingsStyles.quickFields", claude)
+        self.assertIn("assistantQuickGrid", self.ui)
         self.assertNotIn("twoColumnForm", self.ui)
 
     def test_claude_settings_expose_only_the_compact_safe_capability_controls(self) -> None:
+        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
+            "function AssistantSettingsWorkspace", 1
+        )[0]
         for marker in (
-            'translate("claude.disableBypassPermissions")',
-            'translate("claude.capabilities")',
-            'translate("claude.disableBundledSkills")',
-            'translate("claude.disableClaudeAiConnectors")',
-            'translate("claude.disableRemoteControl")',
-            'translate("claude.disableAllHooks")',
-            'translate("claude.desktopRawJson")',
-            'translate("claude.codeRawJson")',
+            'translate("claude.desktopProvider")',
+            'translate("common.model")',
+            'translate("claude.desktopGateway")',
+            'field="desktop_gateway_api_key"',
         ):
-            self.assert_ui_has(marker)
+            self.assertIn(marker, claude)
+        self.assertNotIn('translate("claude.deployment")', claude)
+        self.assertNotIn('field="deployment_token"', claude)
+        for removed in (
+            'translate("claude.permissions")',
+            'translate("claude.capabilities")',
+            'translate("claude.sandbox")',
+            'translate("claude.memory")',
+        ):
+            self.assertNotIn(removed, claude)
 
     def test_relay_metadata_commits_before_native_credential_cleanup_and_persists_a_retry(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -894,7 +925,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("spanningRowKeys,", self.native_controls)
         # The fetched-model picker is now a native modal leaf, so its old
         # React table no longer belongs to the shared window tree.
-        self.assertEqual(self.ui.count("<NativeTable"), 8)
+        self.assertEqual(self.ui.count("<NativeTable"), 7)
         self.assertEqual(self.ui.count("alternatingRows"), 0)
         self.assertNotIn("selectedKey={selectedRoute ?? \"\"} alternatingRows", self.ui)
         self.assertNotIn("striped={false}", self.ui)
@@ -1129,7 +1160,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_settings_workspaces_keep_their_legacy_layout_roots(self) -> None:
         expected_components = {
-            "CodexWorkspace": ("codexWorkspace:", "codexRawPane:"),
+            "CodexWorkspace": ("codexWorkspace:",),
             "RuntimeWorkspace": ("runtimeWorkspace:", "runtimeScrollSurface:"),
             "DataManagementWorkspace": ("dataManagementWorkspace:", "dataManagementTabs:"),
             "WebDavWorkspace": ("webDavForm:", "webdavFormRows:"),
@@ -1145,67 +1176,47 @@ class ReactNativeUiParityTests(unittest.TestCase):
             for marker in markers:
                 self.assert_ui_has(marker)
 
-    def test_assistant_settings_tabs_have_a_dedicated_aligned_tab_bar(self) -> None:
+    def test_assistant_settings_have_one_outer_scroll_surface_without_tabs(self) -> None:
         for marker in (
-            "<View style={styles.settingsTabBar}>",
-            '<WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]}',
-            "style={styles.settingsTabs}",
-            "settingsTabBar:",
-            "settingsTabs:",
-            "borderBottomWidth: 1",
-            "alignSelf: \"flex-start\"",
+            '<ScrollView style={styles.assistantSettingsScroll}',
+            "assistantSettingsScrollContent",
+            "assistantQuickSection",
+            "assistantFileSurfaceStyles.filesSection",
+            'translate("settings.files")',
         ):
             self.assert_ui_has(marker)
+        self.assertNotIn("settingsTabBar", self.ui)
+        self.assertNotIn("settingsTabs", self.ui)
+        self.assertNotIn('<WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]}', self.ui)
 
     def test_codex_provider_editor_actions_have_a_clear_textual_hierarchy(self) -> None:
+        codex = self.ui.split("function CodexWorkspace", 1)[1].split(
+            "function SettingsWorkspace", 1
+        )[0]
         for marker in (
-            "codexProviderEditor",
-            "codexProviderToolbar",
-            "codexProviderToolbarTitle",
-            "codexProviderActions",
-            "codexProviderActionButton",
-            "codexProviderSplit",
-            'translate("screen.configured")',
-            'title={translate("common.add")}',
-            'symbol="plus"',
-            'title={translate("common.delete")}',
-            'symbol="minus"',
+            'translate("codex.provider")',
+            'translate("common.model")',
+            'translate("codex.gateway")',
+            'field="api_key"',
+            "const commitProvider",
+            "const commitGateway",
+            '<TextField label={translate("codex.provider")} value={directProvider}',
         ):
-            self.assert_ui_has(marker)
+            self.assertIn(marker, codex)
+        self.assertNotIn('<PickerField label={translate("codex.provider")}', codex)
         self.assertNotIn("<View style={styles.listToolRail}>", self.ui)
 
     def test_codex_provider_url_is_only_edited_in_the_provider_detail(self) -> None:
         codex = self.ui.split("function CodexWorkspace", 1)[1].split(
             "function SettingsWorkspace", 1
         )[0]
-        self.assertIn(
-            'const selectedProviderID = selectedProvider ?? directProvider;', codex
-        )
-        self.assertIn(
-            'setSelectedProvider(configuredProvider ? nextProvider : undefined)', codex
-        )
-        self.assertIn(
-            '{directProvider === "openai" ? <TextField label={translate("codex.gateway")}',
-            codex,
-        )
-        self.assertIn(
-            '{ label: translate("providers.displayName"), width: 230 }', codex
-        )
-        self.assertIn(
-            'cells: [providerDisplayID(item), providerDisplayName(item), stringValue(item.auth_mode, "none")]',
-            codex,
-        )
-        self.assertNotIn(
-            '{ label: translate("providers.baseUrl"), width: 230 }', codex
-        )
-        self.assertIn(
-            '<TextField label={translate("providers.baseUrl")} value={stringValue(provider.base_url)}',
-            codex,
-        )
-        self.assertNotIn(
-            '<TextField label={translate("common.endpoint")} value={stringValue(provider.base_url)}',
-            codex,
-        )
+        self.assertIn("const directProvider = stringValue(structured.model_provider);", codex)
+        self.assertIn("const provider = providerRows.find((item) => identifier(item) === directProvider);", codex)
+        self.assertIn('const gateway = directProvider === "openai"', codex)
+        self.assertIn('label={translate("codex.gateway")}', codex)
+        self.assertIn("const commitGateway", codex)
+        self.assertNotIn('label={translate("providers.baseUrl")}', codex)
+        self.assertNotIn('label={translate("common.endpoint")}', codex)
 
     def test_codex_model_picker_tracks_the_saved_model_without_duplicate_labels(self) -> None:
         codex = self.ui.split("function CodexWorkspace", 1)[1].split(
@@ -1216,7 +1227,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             codex,
         )
         self.assertIn(
-            '<PickerField label={translate("codex.activeDeployment")} value={displayedModel} values={deploymentModels.length > 0 ? deploymentModels',
+            '<PickerField label={translate("common.model")} value={displayedModel} values={deploymentModels}',
+            codex,
+        )
+        self.assertIn(
+            '<TextField label={translate("common.model")} value={displayedModel} disabled={busy} onDraftChange={setModelDraft}',
             codex,
         )
         self.assertIn(
@@ -1231,15 +1246,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "selection: { model: selection.model, provider: selection.provider, deployment_id: selection.deployment_id }",
             codex,
         )
-        self.assertIn('"codex.activeDeployment": "从 LiteLLM 选择"', self.zh)
-        self.assertIn('"codex.activeDeployment": "Select from LiteLLM"', self.en)
+        self.assertNotIn('translate("codex.activeDeployment")', codex)
 
     def test_assistant_plaintext_credentials_have_no_set_or_clear_buttons(self) -> None:
         codex = self.ui.split("function CodexWorkspace", 1)[1].split(
             "function SettingsWorkspace", 1
         )[0]
         claude = self.ui.split("function ClaudeScreen", 1)[1].split(
-            "function claudePermissionLabel", 1
+            "function AssistantSettingsWorkspace", 1
         )[0]
         for screen in (codex, claude):
             self.assertIn("<NativeSecretField plainText autoCommit", screen)
@@ -1252,31 +1266,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function SettingsWorkspace", 1
         )[0]
         claude = self.ui.split("function ClaudeScreen", 1)[1].split(
-            "function RuntimeField", 1
+            "function AssistantSettingsWorkspace", 1
         )[0]
         for screen in (codex, claude):
-            self.assertIn("const [structuredWidth, setStructuredWidth] = useState(470);", screen)
-            self.assertIn("<SettingsWorkspace", screen)
-            self.assertIn("structuredWidth={structuredWidth}", screen)
-        self.assertIn("minPaneWidth={minStructuredWidth}", self.ui)
-        self.assertIn("const rawPaneMinimum = 344;", self.ui)
-        self.assertIn("const minStructuredWidth = 360;", self.ui)
-        self.assertIn("const SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH = 420;", self.ui)
-        self.assertIn("Math.max(minStructuredWidth, Math.min(680, workspaceWidth - rawPaneMinimum))", self.ui)
-        self.assertIn("const paneWidth = Math.max(minStructuredWidth, Math.min(structuredWidth, maxStructuredWidth));", self.ui)
-        self.assertIn("paneWidth={paneWidth}", self.ui)
-        self.assertIn("paneWidth={paneWidth}", self.ui)
-        self.assertIn("const [structuredViewportWidth, setStructuredViewportWidth] = useState(0);", self.ui)
-        self.assertIn("const hasStructuredHorizontalOverflow = structuredViewportWidth > 0 && structuredViewportWidth < SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH;", self.ui)
-        self.assertIn("horizontal={false}", self.ui)
-        self.assertIn("alwaysBounceHorizontal={false}", self.ui)
-        self.assertIn("showsHorizontalScrollIndicator={hasStructuredHorizontalOverflow}", self.ui)
-        self.assertIn("onLayout={({ nativeEvent }) => setStructuredViewportWidth(nativeEvent.layout.width)}", self.ui)
-        self.assertIn('<NativePersistentScrollIndicator style={styles.codexStructuredScrollIndicator} />', self.ui)
-        self.assertIn('codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }', self.ui)
-        self.assertIn('codexStructuredPane: { flex: 1, minWidth: 0,', self.ui)
-        self.assertIn('codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch"', self.ui)
-        self.assertIn('paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER', self.ui)
+            self.assertIn("assistantSettingsStyles.domainBody", screen)
+            self.assertIn("assistantSettingsStyles.quickFields", screen)
+        self.assertIn("assistantSettingsScroll", self.ui)
+        self.assertIn("assistantQuickGrid", self.ui)
+        self.assertIn("assistantFileSurfaceStyles.fileGroups", self.ui)
+        self.assertIn('horizontal={false}', self.ui)
+        self.assertIn('showsHorizontalScrollIndicator={false}', self.ui)
+        self.assertIn('assistantSettingsLayoutStyles.boundedContent', self.ui)
 
     def test_runtime_uses_core_projection_kinds_and_adaptive_layout(self) -> None:
         for marker in (
@@ -1348,8 +1348,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         codex_config = (ROOT / "codex_config.py").read_text(encoding="utf-8")
         for feature in re.findall(r'"([a-z0-9_]+)",', codex_config.split("SUPPORTED_FEATURE_KEYS =", 1)[1].split(")", 1)[0]):
             self.assertIn(f"  {feature}: ", assistant_i18n)
-        self.assertIn("function FeatureToggles", self.ui)
-        self.assertIn("label={codexFeatureLabel(key, translate)}", self.ui)
+        self.assertNotIn("function FeatureToggles", self.ui)
+        self.assertNotIn("codexFeatureLabel", self.ui)
         self.assertNotIn("label={key}", self.ui)
         self.assertIn("function PickerField", self.ui)
         self.assertIn("function ensureSelectedOption", self.ui)
@@ -1359,9 +1359,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("values: Array<string | AssistantSettingOption>", self.ui)
         self.assertIn("const option = options[nativeEvent.index];", self.ui)
         self.assertIn("if (option) onSelect(option.value);", self.ui)
-        self.assertIn("function SegmentedField", self.ui)
         self.assertIn("assistantSettingOptions(values, translate)", self.ui)
-        self.assertIn('translate(settingsTab === "claude" ? "card.claudeSettings" : "card.codexSettings")', self.ui)
+        self.assertIn('translate("card.codexSettings")', self.ui)
+        self.assertIn('translate("card.claudeSettings")', self.ui)
         self.assertIn("localizeCodexValidationMessage(message, translate)", self.ui)
 
     def test_sensitive_settings_use_inline_native_password_controls(self) -> None:
@@ -1370,7 +1370,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "<NativeSecureTextInput domain={domain}",
             'domain="runtime" field="setting"',
             'domain="webdav" field="password"',
-            'domain="claude" field="deployment_token"',
             'domain="codex" field="api_key"',
             'domain="providers_models" field="api_key"',
             'placeholder={hint ?? ""}',
@@ -1462,7 +1461,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("baseline={baseline}", raw_editor)
         self.assertIn("showDiff", raw_editor)
         self.assertIn("const resetBaseline = !initializedRef.current", raw_editor)
-        self.assertIn("if (resetBaseline) {", raw_editor)
+        self.assertIn("if (resetBaseline || descriptor.baseline !== baselineRef.current) {", raw_editor)
+        self.assertIn("baselineRef.current = descriptor.baseline;", raw_editor)
+        self.assertIn("setBaseline(descriptor.baseline);", raw_editor)
+        self.assertNotIn("baselineRef.current = descriptor.text;", raw_editor)
         self.assertIn('setDocumentKey([domain, document].join(":"));', raw_editor)
         self.assertNotIn('setDocumentKey("")', raw_editor)
         self.assertIn("draftRef.current = text;", raw_editor)
@@ -1471,11 +1473,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("setDraft(text)", raw_editor)
         self.assertIn("onChange={(text) => {", raw_editor)
         self.assertIn("const RAW_EDITOR_SYNC_INTERVAL_MS = 120;", self.ui)
+        self.assertIn("const flushAssistantEditorFields = async (): Promise<void> => {", self.ui)
+        self.assertIn("field.flushBeforeAssistantEditor === true && field.isDirty?.() === true", self.ui)
+        self.assertIn("flushBeforeAssistantEditor: true", self.ui)
+        self.assertIn("const openAssistantFile = (target: AssistantFileTarget): void => {", self.ui)
+        self.assertIn("void flushAssistantEditorFields()", self.ui)
+        self.assertIn(".then(() => setActiveAssistantFile(target))", self.ui)
+        self.assertIn("onOpenFile={openAssistantFile}", self.ui)
+        self.assertLess(
+            self.ui.index("void flushAssistantEditorFields()"),
+            self.ui.index(".then(() => setActiveAssistantFile(target))"),
+        )
         self.assertIn("void stageLatest(false).catch(() => undefined);", raw_editor)
         self.assertIn("}, RAW_EDITOR_SYNC_INTERVAL_MS);", raw_editor)
         self.assertNotIn("`+${diff.added}  ~${diff.changed}  -${diff.deleted}`", raw_editor)
         self.assertIn('style={styles.rawEditorOverlay}', raw_editor)
-        self.assertIn('disabled={reloadDisabled} onPress={reloadEditor}', raw_editor)
+        self.assertIn('showLabel = true', raw_editor)
+        self.assertIn('syncRevision', raw_editor)
+        self.assertNotIn('showReload', raw_editor)
+        self.assertNotIn('onPress={reloadEditor}', raw_editor)
         self.assertNotIn("NativeSecureTextEditor", raw_editor)
 
     def test_code_editor_preserves_language_diff_and_host_contract(self) -> None:
@@ -1569,54 +1585,26 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_logs_show_empty_state_after_a_loaded_but_missing_log_source(self) -> None:
         self.assertIn('active ? translate("logs.empty") : translate("logs.loading")', self.ui)
 
-    def test_claude_settings_separates_desktop_and_code_sources_without_inventing_saved_defaults(self) -> None:
+    def test_claude_settings_keep_desktop_basics_and_raw_code_sources_without_inventing_saved_defaults(self) -> None:
         for marker in (
-            "function claudeDeploymentFromSnapshot(snapshot: CoreSnapshot | undefined)",
-            "deployment: ClaudeDeploymentDraft",
-            "onDeploymentChange(key, value)",
-            "const next = { ...(claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(snapshot)), [key]: value };",
-            'enqueueDispatch("patch_deployment", { [key]: value }, "claude")',
             'translate("settings.claudeUnavailable")',
             "const desktop = asRecord(state.desktop);",
-            'translate("claude.desktop")',
-            'dispatch("desktop_patch", { inferenceProvider: inferenceProvider || null })',
-            'dispatch("desktop_patch", { inferenceGatewayBaseUrl })',
+            'dispatch("desktop_patch", { inferenceProvider: inferenceProvider || null }, "claude")',
+            'dispatch("desktop_patch", { inferenceGatewayBaseUrl }, "claude")',
             "const desktopModelNames = stringList(desktop.model_names);",
-            'translate("claude.desktopModels")',
-            'translate("claude.desktopModelsHint")',
-            'dispatch("desktop_models_patch", { model_names: splitLines(value) })',
+            'dispatch("desktop_models_patch", { model_names: splitLines(value) }, "claude")',
             'field="desktop_gateway_api_key"',
-            'field="deployment_token"',
-            'plainText autoCommit label={translate("claude.desktopApiKey")}',
-            'plainText autoCommit label={translate("claude.token")}',
-            'translate("claude.desktopDeveloperMode")',
-            'dispatch("developer_patch", { allowDevTools })',
-            'document="desktop"',
-            'document="developer"',
-            'document="settings"',
-            "function claudePermissionLabel(value: string, translate: Translate)",
-            '<PickerField label={translate("claude.permissions")}',
-            'const permissionMode = stringValue(permissions.defaultMode);',
-            'defaultMode: defaultMode || null',
-            'const CLAUDE_PERMISSION_MODES = ["default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions", "delegate"];',
-            'translate("claude.permission.unknown", { value })',
-            'translate("claude.sandboxFailIfUnavailable")',
-            'translate("claude.sandboxAutoAllowBash")',
-            'translate("claude.sandboxAllowUnsandboxed")',
-            'translate("claude.filesystem")',
-            'translate("claude.modelBehavior")',
-            'translate("claude.fallbackModel")',
-            'translate("claude.effortLevel")',
-            'translate("claude.capabilities")',
-            'translate("claude.disableAllHooks")',
-            'function hasBooleanSetting(value: UnknownRecord, key: string): boolean',
-            'hasBooleanSetting(settings, "autoMemoryEnabled")',
-            'hasBooleanSetting(sandbox, "enabled")',
-            'hasBooleanSetting(filesystem, "disabled")',
-            'hasBooleanSetting(settings, "autoCompactEnabled")',
-            'hasBooleanSetting(settings, "disableAllHooks")',
+            'translate("claude.desktopSection")',
+            'translate("claude.codeSection")',
+            'document: "desktop"',
+            'document: "developer"',
+            'document: "settings"',
+            "function AssistantFileEditorDialog",
         ):
             self.assert_ui_has(marker)
+        self.assertNotIn('translate("claude.deployment")', self.ui)
+        self.assertNotIn('field="deployment_token"', self.ui)
+        self.assertNotIn('patch_deployment', self.ui)
         for invented_default in (
             "booleanValue(settings.autoMemoryEnabled, true)",
             "booleanValue(sandbox.autoAllowBashIfSandboxed, true)",
@@ -1628,19 +1616,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertNotIn(invented_default, self.ui)
 
     def test_claude_settings_keep_the_compact_memory_permission_sandbox_and_capability_groups(self) -> None:
-        for marker in (
+        claude = self.ui.split("function ClaudeScreen", 1)[1].split(
+            "function AssistantSettingsWorkspace", 1
+        )[0]
+        for removed in (
             'translate("claude.memory")',
-            'translate("claude.autoMemory")',
             'translate("claude.permissions")',
-            'translate("claude.disableBypassPermissions")',
             'translate("claude.sandbox")',
-            'translate("claude.modelBehavior")',
             'translate("claude.capabilities")',
+            'hasBooleanSetting',
         ):
-            self.assert_ui_has(marker)
-        self.assertIn('translate("codex.network")', self.ui)
-        self.assertIn('hasBooleanSetting(permissions, "network_access")', self.ui)
-        self.assertNotIn('translate("claude.network")', self.ui)
+            self.assertNotIn(removed, claude)
+        self.assertIn('translate("claude.desktopSection")', claude)
+        self.assertIn('translate("claude.codeSection")', claude)
+        self.assertIn('translate("settings.claudeDesktopFilesHint")', self.ui)
+        self.assertIn('translate("settings.claudeCodeFilesHint")', self.ui)
 
     def test_runtime_form_rows_keep_labels_and_controls_aligned_when_reflowed(self) -> None:
         for marker in (
@@ -1754,6 +1744,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'panel.minSize = NSSize(width: 520, height: 340)',
             'let contentWidth: CGFloat = 620',
             'let rowHeight: CGFloat = 28',
+            'controller.focusSearchField()',
+            'let searchField = NativeInstantFocusSearchField()',
+            'searchField.focusRingType = .none',
+            'showsInstantFocusBorder = true',
+            'field.showsInstantFocusBorder = false',
+            'private let focusBorderView = NativeInstantFocusBorderView(frame: .zero)',
+            'layer?.borderWidth = borderVisible ? 3 : 0',
+            'func updateVisibleRows()',
+            'private var rowButtons: [Int: NSButton] = [:]',
+            'foldedTitle: $0.folding(options:',
             'let selectAllButton = modelChooserButton(title: localized("modelChooserAll"',
             'let invertButton = modelChooserButton(title: localized("modelChooserInvert"',
             'let addButton = modelChooserButton(title: "+"',
@@ -1784,6 +1784,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.fetchFailed": "Could not fetch models: {detail}"', self.en)
         self.assertIn('"providers.fetchEmpty": "The provider returned no models."', self.en)
         self.assertIn('"providers.fetch": "Fetch models"', self.en)
+
+    def test_selecting_a_provider_does_not_stage_an_implicit_relay_conversion(self) -> None:
+        workspace = self.ui.split("function ProviderWorkspace(", 1)[1].split(
+            "function TablePane(",
+            1,
+        )[0]
+        self.assertNotIn("autoRelaySelectionKeys", workspace)
+        self.assertNotIn('dispatch("provider.select_relay_station"', workspace)
+        self.assertIn(
+            'onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }}',
+            workspace,
+        )
 
     def test_provider_inspector_keeps_the_compact_provider_form_and_return_link(self) -> None:
         """The provider editor uses compact, consistently aligned rows and a source-model return link."""
@@ -1855,6 +1867,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         editor = self.ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
         self.assertNotIn("<ProviderAuthFields", editor)
         self.assertIn("<ProviderSourceFields", editor)
+
+    def test_service_provider_crud_controls_live_above_the_unified_list(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        route = self.ui.split(
+            '{route === "relay-accounts" ? <View style={serviceProviderStyles.workspace}>',
+            1,
+        )[1].split('{route === "relay-add"', 1)[0]
+
+        self.assertNotIn('translate("relay.officialAccountsHint")', route)
+        self.assertIn('<View style={serviceProviderStyles.listToolbar}>', route)
+        self.assertIn('symbol="plus"', route)
+        self.assertIn('symbol="minus"', route)
+        self.assertLess(route.index('symbol="plus"'), route.index('symbol="minus"'))
+        self.assertLess(route.index('symbol="minus"'), route.index('<NativeTable'))
+        self.assertIn('removeRequest={serviceProviderRemoveRequest}', route)
+        self.assertIn('removeRequest: serviceProviderRemoveRequest', route)
+        self.assertNotIn("embeddedAccountActions", relay)
+        self.assertIn("const handledRemoveRequest = useRef(removeRequest ?? 0);", relay)
 
     def test_logs_keep_the_legacy_dense_toolbar_and_table_frame(self) -> None:
         for marker in (
@@ -2764,13 +2794,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("modelUpstreamDisplay", self.ui)
         self.assertIn("providerKeyDisplayName", self.ui)
         self.assertIn('value={drafts?.providerKeyDisplayName(id, selectedChoice.id, selectedChoice.name)', self.ui)
-        self.assertIn("providerFieldDrafts", self.ui)
-        self.assertIn("const providerFieldDraftsRef = useRef(providerFieldDrafts);", self.ui)
-        self.assertIn("value={providerDisplayID(provider)}", self.ui)
-        self.assertIn("value={providerDisplayName(provider)}", self.ui)
-        self.assertIn("const draft = providerFieldDraftsRef.current[currentProviderId] ?? {};", self.ui)
+        self.assertIn("const providerRows = asRecords(structured.providers).map(editableRecord);", self.ui)
+        self.assertIn("const commitGateway = (base_url: string): Promise<void>", self.ui)
+        self.assertIn("providers: providerRows.map((item) => identifier(item) === directProvider ? { ...item, base_url } : item)", self.ui)
         self.assertIn("onDraftChange={setModelDraft}", self.ui)
-        self.assertIn('cells: [providerDisplayID(item), providerDisplayName(item), stringValue(item.auth_mode, "none")]', self.ui)
         self.assertIn('value={displayedModel}', self.ui)
         self.assertNotIn("const INPUT_SYNC_INTERVAL_MS", self.ui)
         self.assertNotIn("const INPUT_COMMIT_DEBOUNCE_MS", self.ui)
@@ -2803,10 +2830,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_codex_raw_editors_share_height_and_follow_disk_generation(self) -> None:
         for marker in (
-            "const [structuredWidth, setStructuredWidth] = useState(470);",
-            "showReload={false} codexPane style={styles.codexRawEditor}",
-            "codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0",
-            "codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0",
+            "showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRaw}",
+            "assistantFileSurfaceStyles.fileGroups",
+            "assistantFileSurfaceStyles.editorDialog",
+            "function AssistantFileEditorDialog",
             "const [settingsRawReloadToken, setSettingsRawReloadToken] = useState(0);",
             "const [settingsRawBaselineToken, setSettingsRawBaselineToken] = useState(0);",
             'if (reloadDomain === "codex" || reloadDomain === "claude") setSettingsRawBaselineToken((current) => current + 1);',

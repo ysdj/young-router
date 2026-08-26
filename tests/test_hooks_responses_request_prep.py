@@ -80,6 +80,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "call_type": "aresponses",
             "model": "default-chat",
             "stream": True,
+            "model_info": {
+                "supports_responses_web_search": False,
+            },
             "instructions": "Keep the requested implementation complete and tested.",
             "client_metadata": {
                 "x-codex-turn-metadata": '{"request_kind":"turn"}',
@@ -127,6 +130,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
     def test_codex_external_web_search_bridge_is_advertised(self) -> None:
         hooks, _ = load_hook_module()
         original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "supports_responses_web_search": False,
+        }
 
         modified = hooks._with_codex_external_web_search_bridge_tool(original)
 
@@ -148,6 +154,30 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIsNone(
             hooks._with_codex_external_web_search_bridge_tool(modified)
         )
+
+    def test_codex_responses_unknown_search_capability_keeps_native_route(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "upstream_url_surface": "openai/responses",
+        }
+
+        self.assertIsNone(
+            hooks._with_codex_external_web_search_bridge_tool(original)
+        )
+        self.assertEqual(original["tools"], [])
+
+    def test_codex_responses_native_search_capability_keeps_native_route(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "supports_responses_web_search": True,
+        }
+
+        self.assertIsNone(
+            hooks._with_codex_external_web_search_bridge_tool(original)
+        )
+        self.assertEqual(original["tools"], [])
 
     def test_codex_external_web_search_bridge_is_not_advertised_on_function_unsupported_route(self) -> None:
         hooks, _ = load_hook_module()
@@ -905,6 +935,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "call_type": "aresponses",
             "model": "default-chat",
             "stream": True,
+            "model_info": {
+                "supports_responses_web_search": False,
+            },
             "client_metadata": {
                 "x-codex-turn-metadata": '{"request_kind":"turn"}',
             },
@@ -974,6 +1007,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "call_type": "aresponses",
             "model": "default-chat",
             "stream": True,
+            "model_info": {
+                "supports_responses_web_search": False,
+            },
             "client_metadata": {
                 "x-codex-turn-metadata": '{"request_kind":"turn"}',
             },
@@ -1030,6 +1066,53 @@ class HookResponsesRequestPrepTests(HookTestCase):
         }
 
         self.assertIsNone(hooks._with_codex_function_call_output_text(original))
+
+    async def test_pre_call_repairs_stream_placeholder_arguments_only_in_mutable_suffix(self) -> None:
+        hooks, _ = load_hook_module()
+        signed_call = {
+            "type": "function_call",
+            "call_id": "call-signed",
+            "name": "exec_command",
+            "arguments": '{}{"cmd":"printf signed"}',
+        }
+        encrypted_reasoning = {
+            "type": "reasoning",
+            "encrypted_content": "opaque-encrypted-reasoning",
+        }
+        mutable_call = {
+            "type": "function_call",
+            "call_id": "call-current",
+            "name": "exec_command",
+            "arguments": '{}{"cmd":"printf current"}',
+        }
+        invalid_call = {
+            "type": "function_call",
+            "call_id": "call-invalid",
+            "name": "exec_command",
+            "arguments": "{}not-json",
+        }
+        original = {
+            "call_type": "aresponses",
+            "model": "default-chat",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [signed_call, encrypted_reasoning, mutable_call, invalid_call],
+        }
+
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertIs(modified["input"][0], signed_call)
+        self.assertEqual(modified["input"][0]["arguments"], signed_call["arguments"])
+        self.assertIs(modified["input"][1], encrypted_reasoning)
+        self.assertEqual(modified["input"][2]["arguments"], '{"cmd":"printf current"}')
+        self.assertEqual(modified["input"][3]["arguments"], "{}not-json")
+        self.assertEqual(mutable_call["arguments"], '{}{"cmd":"printf current"}')
 
     def test_codex_view_image_output_keeps_reopenable_paths(self) -> None:
         hooks, _ = load_hook_module()
@@ -1565,6 +1648,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "call_type": "aresponses",
             "model": "default-chat",
             "stream": True,
+            "model_info": {
+                "supports_responses_web_search": False,
+            },
             "client_metadata": {
                 "x-codex-turn-metadata": '{"request_kind":"turn"}',
             },

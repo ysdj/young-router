@@ -686,6 +686,7 @@ export function RelayAccountManager({
   hideNavigation = false,
   selectedNavigationKey,
   onNavigationSelectionChange,
+  removeRequest,
   snapshot,
   native,
   busy,
@@ -706,6 +707,7 @@ export function RelayAccountManager({
   hideNavigation?: boolean;
   selectedNavigationKey?: string;
   onNavigationSelectionChange?: (key: string) => void;
+  removeRequest?: number;
   snapshot?: CoreSnapshot;
   native: NativeLeafAdapter;
   busy: boolean;
@@ -758,6 +760,7 @@ export function RelayAccountManager({
   const [stationFormBusy, setStationFormBusy] = useState(false);
   const [localRemoval, setLocalRemoval] = useState<LocalRemovalIntent>();
   const [localDependencyPolicy, setLocalDependencyPolicy] = useState<LocalDependencyPolicy>("detach");
+  const handledRemoveRequest = useRef(removeRequest ?? 0);
   const [remoteKeyDelete, setRemoteKeyDelete] = useState<RemoteKeyDeleteIntent>();
   const [remoteDeletePolicy, setRemoteDeletePolicy] = useState<RemoteDeletePolicy>("detach_disabled");
   const [loginFailureIDs, setLoginFailureIDs] = useState<Set<string>>(() => new Set());
@@ -1208,6 +1211,12 @@ export function RelayAccountManager({
     setLocalDependencyPolicy("detach");
     setLocalRemoval(intent);
   };
+  useEffect(() => {
+    const request = removeRequest ?? 0;
+    if (request <= handledRemoveRequest.current) return;
+    handledRemoveRequest.current = request;
+    openLocalRemoval();
+  }, [removeRequest, selected?.id, selectedStation?.id]);
   const executeLocalRemoval = async (): Promise<void> => {
     if (!localRemoval) return;
     if (localRemoval.kind === "account") {
@@ -1710,9 +1719,6 @@ export function RelayAccountManager({
                 <NativePicker labels={[relayTypeLabel("newapi", translate), relayTypeLabel("sub2api", translate)]} selectedValue={stationTypeDraft ? relayTypeLabel(stationTypeDraft, translate) : ""} disabled={controlsBusy} onChange={({ nativeEvent }) => { const nextType = nativeEvent.index === 1 ? "sub2api" : "newapi"; setStationDraft(selectedStation.id, { type: nextType }); void stageStationUpdate(selectedStation.id, { type: nextType }); }} style={[styles.stationSettingsControl, compactStyles.control]} />
               </View>
             </View>
-            {hideNavigation ? <View style={styles.embeddedAccountActions}>
-              <NativeButton title={translate("relay.removeLocal")} symbol="minus" destructive compact disabled={controlsBusy || !selectedStation} onPress={openLocalRemoval} />
-            </View> : null}
             {feedback ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.stationSettingsFeedback}>{feedback}</Text> : null}
           </View>
         </View> : !setupOnly && selected ? <View style={styles.detailWorkspace}>
@@ -1739,9 +1745,6 @@ export function RelayAccountManager({
                 </View>
               </View>
             </View>
-            {hideNavigation ? <View style={styles.embeddedAccountActions}>
-              <NativeButton title={translate("relay.removeLocal")} symbol="minus" destructive compact disabled={controlsBusy || !selected} onPress={openLocalRemoval} />
-            </View> : null}
             <View style={[styles.resourcesSection, compactStyles.resourcesSection]}>
               <View style={styles.resourcePane}>
                 <View style={styles.resourceBody}>
@@ -1883,7 +1886,6 @@ const styles = StyleSheet.create({
   stationSettingsLabel: { width: 72, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
   stationSettingsControl: { flex: 1, minWidth: 160, height: 26 },
   stationSettingsFeedback: { color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 17 },
-  embeddedAccountActions: { flexDirection: "row", justifyContent: "flex-end", gap: 6 },
   accountHeader: { minWidth: 0, minHeight: 38, paddingHorizontal: 12, paddingVertical: 5, flexDirection: "row", alignItems: "center", columnGap: 6, backgroundColor: colors.window },
   accountBreadcrumb: { flex: 1, minWidth: 0, minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 },
   accountBreadcrumbStation: { flexShrink: 1, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },

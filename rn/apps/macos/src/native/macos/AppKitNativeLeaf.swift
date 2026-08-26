@@ -602,7 +602,8 @@ private enum NativeRelayOriginPolicy {
         provider: String,
         fingerprint: String?,
         verificationURL: String,
-        userCode: String,
+        userCode: String?,
+        callbackURL: String?,
         title: String,
         closeTitle: String,
         completion: @escaping () -> Void
@@ -614,6 +615,7 @@ private enum NativeRelayOriginPolicy {
                     fingerprint: fingerprint,
                     verificationURL: verificationURL,
                     userCode: userCode,
+                    callbackURL: callbackURL,
                     title: title,
                     closeTitle: closeTitle,
                     completion: completion
@@ -622,7 +624,7 @@ private enum NativeRelayOriginPolicy {
             return
         }
         guard let url = NativeProviderAuthPolicy.url(provider: provider, string: verificationURL),
-              NativeProviderAuthPolicy.validCode(userCode),
+              NativeProviderAuthPolicy.callbackURL(provider: provider, string: callbackURL),
               !title.isEmpty,
               !closeTitle.isEmpty else {
             completion()
@@ -638,7 +640,7 @@ private enum NativeRelayOriginPolicy {
             }
             authFingerprint = normalized
         } else {
-            authFingerprint = "\(provider)|\(url.absoluteString)|\(userCode)"
+            authFingerprint = "\(provider)|\(url.absoluteString)|\(callbackURL ?? \"\")"
         }
         // Re-presentation for the same account replaces its stale challenge;
         // other account fingerprints remain visible and independent.
@@ -647,6 +649,7 @@ private enum NativeRelayOriginPolicy {
             provider: provider,
             url: url,
             userCode: userCode,
+            callbackURL: callbackURL,
             title: title,
             closeTitle: closeTitle,
             instructionText: localized("providerAuthInstruction", fallback: "Complete sign-in on the official provider page. The code below is shown only for this device-code flow."),
@@ -961,6 +964,10 @@ private enum NativeRelayOriginPolicy {
 
         NSApp.activate(ignoringOtherApps: true)
         withoutAnimations { panel.makeKeyAndOrderFront(nil) }
+        // `initialFirstResponder` is not guaranteed to win when a panel is
+        // entered through a nested modal run loop. Establish the editor after
+        // the panel is key so the insertion caret is present on first paint.
+        controller.focusSearchField()
         guard NSApp.runModal(for: panel) == .OK else { return nil }
         return controller.selectedModels
     }
@@ -994,10 +1001,16 @@ private enum NativeRelayOriginPolicy {
         let subtitleLabel = NSTextField(labelWithString: "\(localized("modelChooserProvider", fallback: "Provider")): \(providerName)    \(localized("modelChooserKey", fallback: "Key")): \(keyName)")
         subtitleLabel.textColor = .secondaryLabelColor
         subtitleLabel.lineBreakMode = .byTruncatingMiddle
-        let searchField = NSSearchField()
+        subtitleLabel.usesSingleLineMode = true
+        subtitleLabel.toolTip = subtitleLabel.stringValue
+        let searchField = NativeInstantFocusSearchField()
         searchField.placeholderString = localized("modelChooserSearch", fallback: "Search models")
         searchField.sendsSearchStringImmediately = true
         searchField.sendsWholeSearchString = false
+        searchField.focusRingType = .none
+        searchField.usesSingleLineMode = true
+        searchField.cell?.wraps = false
+        searchField.cell?.isScrollable = true
 
         let selectionControls = NSStackView()
         selectionControls.orientation = .horizontal
@@ -1018,6 +1031,7 @@ private enum NativeRelayOriginPolicy {
         resultCountLabel.textColor = .secondaryLabelColor
         resultCountLabel.alignment = .right
         resultCountLabel.usesSingleLineMode = true
+        resultCountLabel.lineBreakMode = .byTruncatingTail
         resultCountLabel.setContentHuggingPriority(.required, for: .horizontal)
         resultCountLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         selectionControls.addArrangedSubview(resultCountLabel)
@@ -1031,8 +1045,10 @@ private enum NativeRelayOriginPolicy {
         scroll.usesPredominantAxisScrolling = true
         scroll.verticalScrollElasticity = .none
         scroll.documentView = controller.listView
+        scroll.modelListView = controller.listView
         controller.listView.frame = NSRect(x: 0, y: 0, width: contentWidth - 36, height: max(listHeight, CGFloat(modelCount) * controller.listView.rowHeight))
         controller.listView.autoresizingMask = [.width]
+        controller.listView.updateVisibleRows()
 
         let cancelButton = NSButton(title: localized("cancel", fallback: "Cancel"), target: controller, action: #selector(NativeModelChooserController.cancelAction(_:)))
         cancelButton.bezelStyle = .rounded
@@ -1753,7 +1769,112 @@ final class NativeSegmentedControl: NSSegmentedControl {
     }
 }
 
+private final class NativeInstantFocusBorderView: NSView {
+    var borderVisible = false {
+        didSet {
+            guard borderVisible != oldValue else { return }
+            updateBorder()
+        }
+    }
+    var borderCornerRadius: CGFloat = 0 {
+        didSet {
+            guard borderCornerRadius != oldValue else { return }
+            updateBorder()
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        updateBorder()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        updateBorder()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private func updateBorder() {
+        withoutAnimations {
+            layer?.cornerRadius = borderCornerRadius
+            layer?.borderColor = NSColor.keyboardFocusIndicatorColor.cgColor
+            layer?.borderWidth = borderVisible ? 3 : 0
+        }
+    }
+}
+
+private final class NativeInstantFocusSearchField: NSSearchField {
+    private let focusBorderView = NativeInstantFocusBorderView(frame: .zero)
+    var showsInstantFocusBorder = false {
+        didSet {
+            guard showsInstantFocusBorder != oldValue else { return }
+            updateFocusBorder()
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureFocusBorder()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureFocusBorder()
+    }
+
+    override func layout() {
+        super.layout()
+        focusBorderView.frame = bounds
+        updateFocusBorder()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, window?.firstResponder === currentEditor() else { return }
+                showsInstantFocusBorder = true
+            }
+        }
+        return accepted
+    }
+
+    private func configureFocusBorder() {
+        focusBorderView.frame = bounds
+        focusBorderView.autoresizingMask = [.width, .height]
+        addSubview(focusBorderView, positioned: .above, relativeTo: nil)
+        updateFocusBorder()
+    }
+
+    private func updateFocusBorder() {
+        focusBorderView.borderCornerRadius = bounds.height / 2
+        focusBorderView.borderVisible = showsInstantFocusBorder
+    }
+}
+
 private final class NativeModelChooserScrollView: NSScrollView {
+    weak var modelListView: NativeModelChooserListView?
+
+    override func reflectScrolledClipView(_ cClipView: NSClipView) {
+        super.reflectScrolledClipView(cClipView)
+        modelListView?.updateVisibleRows()
+    }
+
+    override func layout() {
+        super.layout()
+        guard let listView = (documentView as? NativeModelChooserListView) ?? modelListView else { return }
+        let viewportWidth = contentView.bounds.width
+        if viewportWidth > 0, abs(listView.frame.width - viewportWidth) > 0.5 {
+            var frame = listView.frame
+            frame.size.width = viewportWidth
+            listView.frame = frame
+        }
+        listView.updateVisibleRows()
+    }
+
     override func scrollWheel(with event: NSEvent) {
         guard event.hasPreciseScrollingDeltas, let documentView else {
             super.scrollWheel(with: event)
@@ -1765,17 +1886,25 @@ private final class NativeModelChooserScrollView: NSScrollView {
         origin.x = 0
         contentView.scroll(to: origin)
         reflectScrolledClipView(contentView)
+        (documentView as? NativeModelChooserListView ?? modelListView)?.updateVisibleRows()
     }
 }
 
 private final class NativeModelChooserListView: NSView {
-    private struct Row { let title: String; var selected: Bool }
+    private struct Row {
+        let title: String
+        let foldedTitle: String
+        var selected: Bool
+    }
     private var rows: [Row]
     private var visibleRowIndexes: [Int]
     private var searchQuery = ""
     private var minimumDocumentHeight: CGFloat = 0
     private let emptyLabel: String
     private let noMatchesLabel: String
+    private var rowButtons: [Int: NSButton] = [:]
+    private var emptyStateLabel: NSTextField?
+    private var updatingVisibleRows = false
     var stateDidChange: (() -> Void)?
     let rowHeight: CGFloat = 28
 
@@ -1784,12 +1913,17 @@ private final class NativeModelChooserListView: NSView {
     override var isOpaque: Bool { true }
 
     init(models: [String], width: CGFloat, emptyLabel: String, noMatchesLabel: String) {
-        rows = models.map { Row(title: $0, selected: false) }
+        rows = models.map {
+            Row(
+                title: $0,
+                foldedTitle: $0.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current),
+                selected: false
+            )
+        }
         visibleRowIndexes = Array(models.indices)
         self.emptyLabel = emptyLabel
         self.noMatchesLabel = noMatchesLabel
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: max(rowHeight, CGFloat(models.count) * rowHeight)))
-        rebuildRows()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -1798,40 +1932,81 @@ private final class NativeModelChooserListView: NSView {
     func setSearchQuery(_ query: String) {
         searchQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let terms = searchQuery.split(whereSeparator: { $0.isWhitespace }).map { String($0).folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current) }
-        visibleRowIndexes = terms.isEmpty ? Array(rows.indices) : rows.indices.filter { index in
-            let title = rows[index].title.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
-            return terms.allSatisfy(title.contains)
-        }
+        visibleRowIndexes = terms.isEmpty ? Array(rows.indices) : rows.indices.filter { index in terms.allSatisfy(rows[index].foldedTitle.contains) }
         updateDocumentHeight()
-        rebuildRows()
+        updateVisibleRows()
         stateDidChange?()
     }
-    func selectAll() { for index in visibleRowIndexes { rows[index].selected = true }; rebuildRows(); stateDidChange?() }
-    func invertSelection() { for index in visibleRowIndexes { rows[index].selected.toggle() }; rebuildRows(); stateDidChange?() }
+    func selectAll() { for index in visibleRowIndexes { rows[index].selected = true }; updateVisibleRows(); stateDidChange?() }
+    func invertSelection() { for index in visibleRowIndexes { rows[index].selected.toggle() }; updateVisibleRows(); stateDidChange?() }
     private func updateDocumentHeight() { setFrameSize(NSSize(width: frame.width, height: max(minimumDocumentHeight, CGFloat(max(1, visibleRowIndexes.count)) * rowHeight))) }
-    private func rebuildRows() {
-        subviews.forEach { $0.removeFromSuperview() }
-        if visibleRowIndexes.isEmpty {
-            let label = NSTextField(labelWithString: searchQuery.isEmpty ? emptyLabel : noMatchesLabel)
-            label.textColor = .secondaryLabelColor
-            label.alignment = .center
-            label.frame = NSRect(x: 16, y: max(20, floor((bounds.height - 20) / 2)), width: max(0, bounds.width - 32), height: 20)
-            label.autoresizingMask = [.width]
-            addSubview(label)
-            return
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        updateVisibleRows()
+    }
+
+    func updateVisibleRows() {
+        guard !updatingVisibleRows else { return }
+        updatingVisibleRows = true
+        defer { updatingVisibleRows = false }
+        let visibleRect = self.visibleRect
+        let firstVisible = max(0, Int(floor(visibleRect.minY / rowHeight)) - 2)
+        let lastVisible = min(visibleRowIndexes.count, Int(ceil(visibleRect.maxY / rowHeight)) + 2)
+        let neededIndexes = visibleRowIndexes.isEmpty ? Set<Int>() : Set(firstVisible..<max(firstVisible, lastVisible))
+        let staleIndexes = rowButtons.keys.filter { !neededIndexes.contains($0) }
+        for visibleIndex in staleIndexes {
+            guard let button = rowButtons[visibleIndex] else { continue }
+            button.removeFromSuperview()
+            rowButtons.removeValue(forKey: visibleIndex)
         }
-        for (visibleIndex, rowIndex) in visibleRowIndexes.enumerated() {
-            let checkbox = NSButton(checkboxWithTitle: rows[rowIndex].title, target: self, action: #selector(toggleRow(_:)))
-            checkbox.state = rows[rowIndex].selected ? .on : .off
+        for visibleIndex in neededIndexes {
+            guard visibleIndex >= 0, visibleIndex < visibleRowIndexes.count else { continue }
+            let rowIndex = visibleRowIndexes[visibleIndex]
+            let checkbox = rowButtons[visibleIndex] ?? makeRowButton(rowIndex: rowIndex)
             checkbox.tag = rowIndex
-            checkbox.font = NSFont.systemFont(ofSize: nativeUIFontSize)
-            checkbox.lineBreakMode = .byTruncatingMiddle
+            checkbox.title = rows[rowIndex].title
+            checkbox.state = rows[rowIndex].selected ? .on : .off
             checkbox.toolTip = rows[rowIndex].title
             checkbox.setAccessibilityLabel(rows[rowIndex].title)
             checkbox.frame = NSRect(x: 10, y: CGFloat(visibleIndex) * rowHeight + 2, width: max(0, bounds.width - 20), height: rowHeight - 4)
             checkbox.autoresizingMask = [.width]
-            addSubview(checkbox)
+            if rowButtons[visibleIndex] == nil {
+                rowButtons[visibleIndex] = checkbox
+                addSubview(checkbox)
+            }
         }
+        let label = emptyStateLabel ?? makeEmptyStateLabel()
+        label.stringValue = searchQuery.isEmpty ? emptyLabel : noMatchesLabel
+        let labelHeight = min(40, max(rowHeight, bounds.height))
+        label.frame = NSRect(x: 12, y: max(0, floor((bounds.height - labelHeight) / 2)), width: max(0, bounds.width - 24), height: labelHeight)
+        label.isHidden = !visibleRowIndexes.isEmpty
+    }
+
+    private func makeRowButton(rowIndex: Int) -> NSButton {
+        let checkbox = NSButton(checkboxWithTitle: rows[rowIndex].title, target: self, action: #selector(toggleRow(_:)))
+        checkbox.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        checkbox.lineBreakMode = .byTruncatingMiddle
+        return checkbox
+    }
+
+    private func makeEmptyStateLabel() -> NSTextField {
+        let label = NSTextField(labelWithString: "")
+        label.textColor = .secondaryLabelColor
+        label.alignment = .center
+        label.usesSingleLineMode = false
+        label.maximumNumberOfLines = 2
+        label.lineBreakMode = .byWordWrapping
+        label.cell?.wraps = true
+        label.cell?.isScrollable = false
+        label.autoresizingMask = [.width, .height]
+        emptyStateLabel = label
+        addSubview(label)
+        return label
+    }
+
+    override func layout() {
+        super.layout()
+        updateVisibleRows()
     }
     @objc private func toggleRow(_ sender: NSButton) {
         guard sender.tag >= 0, sender.tag < rows.count else { return }
@@ -1848,7 +2023,7 @@ private final class NativeModelChooserListView: NSView {
 private final class NativeModelChooserController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     private var didStopModal = false
     weak var modalWindow: NSWindow?
-    weak var searchField: NSSearchField?
+    weak var searchField: NativeInstantFocusSearchField?
     weak var scrollView: NSScrollView?
     weak var resultCountLabel: NSTextField?
     weak var selectAllButton: NSButton?
@@ -1868,7 +2043,7 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
         listView.stateDidChange = { [weak self] in self?.refreshControls() }
     }
 
-    func configureControls(searchField: NSSearchField, scrollView: NSScrollView, resultCountLabel: NSTextField, selectAllButton: NSButton, invertSelectionButton: NSButton, addButton: NSButton, minimumListHeight: CGFloat) {
+    func configureControls(searchField: NativeInstantFocusSearchField, scrollView: NSScrollView, resultCountLabel: NSTextField, selectAllButton: NSButton, invertSelectionButton: NSButton, addButton: NSButton, minimumListHeight: CGFloat) {
         self.searchField = searchField
         self.scrollView = scrollView
         self.resultCountLabel = resultCountLabel
@@ -1879,10 +2054,33 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
         listView.setMinimumDocumentHeight(minimumListHeight)
         refreshControls()
     }
+
+    func focusSearchField() {
+        guard let window = modalWindow, let field = searchField else { return }
+        window.makeFirstResponder(field)
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === modalWindow else { return }
+        DispatchQueue.main.async { [weak self] in self?.focusSearchField() }
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let field = obj.object as? NativeInstantFocusSearchField, field === searchField else { return }
+        field.showsInstantFocusBorder = false
+    }
+
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSSearchField, field === searchField else { return }
+        // Filtering uses cached folded model names and only updates the rows
+        // inside the viewport, so it is safe to run in AppKit's text callback.
+        // Keeping this synchronous also preserves NSSearchField's editing
+        // transaction and its insertion caret inside the modal run loop.
         listView.setSearchQuery(field.stringValue)
-        scrollView?.contentView.scroll(to: .zero)
+        if let scrollView = self.scrollView {
+            scrollView.contentView.scroll(to: .zero)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
     }
     private func refreshControls() {
         var summary = listView.hasActiveSearch

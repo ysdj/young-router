@@ -2772,6 +2772,10 @@ _EXTERNAL_WEB_SEARCH_SYNTHESIS_OUTPUT_TOKENS = 1536
 _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION_ID: dict[int, dict[str, Any]] = {}
 _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_MAX = 256
 _EXTERNAL_WEB_SEARCH_ORIGINAL_USER_TEXT_KEY = "external_web_search_original_user_text"
+_EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY = (
+    "external_web_search_conversation_context"
+)
+_EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_MAX_CHARS = 8000
 _EXTERNAL_WEB_SEARCH_PENDING_RECOVERY_REQUEST_KEY = (
     "external_web_search_pending_recovery_request"
 )
@@ -4168,6 +4172,66 @@ def _external_web_search_user_prompt_text(request_kwargs: Optional[dict]) -> str
         text = _external_web_search_request_text(request_kwargs)
     return _external_web_search_normalize_user_prompt_text(text)
 
+
+def _external_web_search_conversation_context(
+    request_kwargs: Optional[dict],
+) -> str:
+    """Keep recent plain conversation text when the bridge compacts input."""
+
+    metadata = _external_web_search_metadata(request_kwargs)
+    stored_context = metadata.get(_EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY)
+    if isinstance(stored_context, str) and stored_context.strip():
+        return stored_context.strip()
+
+    if not isinstance(request_kwargs, dict):
+        return ""
+    source = request_kwargs.get("input")
+    if source is None:
+        source = request_kwargs.get("messages")
+    if isinstance(source, list):
+        blocks: list[dict[str, Any]] = []
+        for item in source:
+            blocks.extend(_trace_module._trace_text_blocks(item))
+    else:
+        blocks = _trace_module._trace_text_blocks(source)
+    context_blocks: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("kind") == "internal_context":
+            continue
+        role = str(block.get("role") or "").strip().lower()
+        if role not in {"user", "human", "assistant", "tool"}:
+            continue
+        text = str(block.get("text") or "").strip()
+        if text:
+            context_blocks.append(f"{role}: {text}")
+
+    if not context_blocks:
+        return ""
+
+    retained: list[str] = []
+    retained_chars = 0
+    for block in reversed(context_blocks):
+        projected = retained_chars + len(block) + (1 if retained else 0)
+        if projected > _EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_MAX_CHARS:
+            break
+        retained.append(block)
+        retained_chars = projected
+    return "\n".join(reversed(retained))
+
+
+def _external_web_search_conversation_context_prefix(
+    request_kwargs: Optional[dict],
+) -> str:
+    context = _external_web_search_conversation_context(request_kwargs)
+    if not context:
+        return ""
+    return (
+        "Recent conversation context from the current thread. The latest user "
+        "entry is the current request; use the surrounding assistant/user entries "
+        "to resolve short follow-ups:\n"
+        f"{context}\n\n"
+    )
+
 async def _external_web_search_synthesize_or_fallback(
     *,
     request_kwargs: Optional[dict],
@@ -4274,8 +4338,13 @@ def _external_web_search_continuation_kwargs(
     metadata = _request_context_module._request_metadata_dict(continuation_kwargs, "litellm_metadata") or {}
     continuation_metadata = metadata.copy()
     original_request = _external_web_search_user_prompt_text(request_kwargs)
+    conversation_context = _external_web_search_conversation_context(request_kwargs)
     if original_request:
         continuation_metadata[_EXTERNAL_WEB_SEARCH_ORIGINAL_USER_TEXT_KEY] = original_request
+    if conversation_context:
+        continuation_metadata[_EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY] = (
+            conversation_context
+        )
     continuation_metadata["external_web_search_continuation"] = True
     continuation_metadata["external_web_search_round"] = round_number
     continuation_metadata["external_web_search_completed_actions"] = copy.deepcopy(
@@ -4334,7 +4403,8 @@ def _external_web_search_continuation_kwargs(
         "query, a source URL to read, or a URL plus pattern to find text."
     )
     continuation_kwargs["input"] = (
-        "Original user request:\n"
+        _external_web_search_conversation_context_prefix(request_kwargs)
+        + "Original user request:\n"
         f"{original_request or '(no user text extracted)'}\n\n"
         f"{time_context_lines}"
         "Web actions completed so far:\n"
@@ -4869,8 +4939,13 @@ def _external_web_search_synthesis_kwargs(
     metadata = _request_context_module._request_metadata_dict(synthesis_kwargs, "litellm_metadata") or {}
     synthesis_metadata = metadata.copy()
     original_request = _external_web_search_user_prompt_text(request_kwargs)
+    conversation_context = _external_web_search_conversation_context(request_kwargs)
     if original_request:
         synthesis_metadata[_EXTERNAL_WEB_SEARCH_ORIGINAL_USER_TEXT_KEY] = original_request
+    if conversation_context:
+        synthesis_metadata[_EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY] = (
+            conversation_context
+        )
     synthesis_metadata.pop(_WEB_SEARCH_EXTERNAL_BRIDGE_KEY, None)
     synthesis_metadata.pop(_WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY, None)
     synthesis_metadata.pop(_RESPONSES_CHAT_BRIDGE_PREEMPTIVE_METADATA_KEY, None)
@@ -4903,7 +4978,8 @@ def _external_web_search_synthesis_kwargs(
     if time_note:
         time_context_lines = f"Authoritative time context:\n{time_note}\n\n"
     synthesis_input = (
-        "Original user request. Any instruction to call or use web_search has "
+        _external_web_search_conversation_context_prefix(request_kwargs)
+        + "Original user request. Any instruction to call or use web_search has "
         "already been satisfied by the compatibility bridge:\n"
         f"{original_request or '(no user text extracted)'}\n\n"
         f"{time_context_lines}"

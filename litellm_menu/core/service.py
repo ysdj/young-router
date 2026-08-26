@@ -1180,6 +1180,7 @@ class CoreStore:
                 "document": document,
                 "revision": self._revision,
                 "text": self._trusted_editor_text_unlocked(domain, document),
+                "baseline": self._trusted_editor_baseline_text_unlocked(domain, document),
             }
 
     def _trusted_editor_text_unlocked(self, domain: str, document: str) -> str:
@@ -1201,6 +1202,45 @@ class CoreStore:
             raise
         except Exception as exc:
             raise CoreError("editor_unavailable", safe_exception_message(exc)) from None
+        if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
+            raise CoreError("editor_unavailable", "The requested editor is unavailable")
+        return text
+
+    def _trusted_editor_baseline_text_unlocked(self, domain: str, document: str) -> str:
+        """Render one editor document from Core's last applied draft state.
+
+        Raw editors are allowed to read sensitive text only through this
+        authenticated path.  The normal document text is the staged draft;
+        the matching baseline must instead remain the last applied/reloaded
+        state so structured UI edits are included in the diff.
+        """
+
+        name, _adapter = self._editor_adapter(domain, document)
+        state = self._baselines.get(name)
+        try:
+            if name == "codex":
+                if not isinstance(state, Mapping):
+                    raise ValueError
+                key = "config_text" if document == "config" else "auth_text"
+                text = state.get(key)
+            else:
+                if not isinstance(state, Mapping):
+                    raise ValueError
+                if document == "settings":
+                    # A standalone Claude Code domain stores its draft object
+                    # directly. When a Claude Desktop source is enabled,
+                    # ``draft_state`` wraps it under ``settings``.
+                    value = state.get("settings") if "desktop" in state or "developer" in state else state
+                elif document == "desktop":
+                    desktop = state.get("desktop")
+                    value = desktop.get("config") if isinstance(desktop, Mapping) else None
+                else:
+                    value = state.get("developer")
+                if not isinstance(value, Mapping):
+                    raise ValueError
+                text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        except (TypeError, ValueError, UnicodeError):
+            raise CoreError("editor_unavailable", "The requested editor is unavailable") from None
         if not isinstance(text, str) or len(text.encode("utf-8")) > 2 * 1024 * 1024:
             raise CoreError("editor_unavailable", "The requested editor is unavailable")
         return text
@@ -1250,11 +1290,15 @@ class CoreStore:
                 payload = {"document": document, "text": text}
             else:
                 payload = {"document": document, "raw_json": text}
-            return self.dispatch(
+            result = self.dispatch(
                 {"domain": name, "type": "set_raw", "payload": payload},
                 expected_revision=revision,
                 _trusted_native_capability=True,
             )
+            return {
+                **result,
+                "baseline": self._trusted_editor_baseline_text_unlocked(domain, document),
+            }
 
     def secret_descriptor(self, domain: str, field: str, target: object | None = None) -> dict[str, Any]:
         """Validate one native-only secret slot without returning its value."""

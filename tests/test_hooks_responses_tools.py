@@ -319,6 +319,49 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertNotIn("private_web_search_bridge", dumped)
         self.assertEqual(tool["parameters"].get("required"), [])
 
+    def test_chat_bridge_converts_custom_tool_history_to_function_history(self) -> None:
+        hooks, _ = load_hook_module()
+        source = 'text(await tools.exec_command({"cmd":"pwd"}));'
+        canonical = [
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_exec",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": source,
+                "status": "completed",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco_exec",
+                "call_id": "call_exec",
+                "output": "ok",
+            },
+        ]
+
+        bridged, stats = hooks._responses_chat_bridge_input(canonical)
+
+        self.assertEqual(canonical[0]["type"], "custom_tool_call")
+        self.assertEqual(canonical[0]["id"], "ctc_exec")
+        self.assertEqual(canonical[0]["input"], source)
+        self.assertEqual(canonical[1]["id"], "ctco_exec")
+        self.assertEqual(bridged[0]["type"], "function_call")
+        self.assertEqual(bridged[0]["id"], "fc_exec")
+        self.assertNotIn("input", bridged[0])
+        self.assertEqual(json.loads(bridged[0]["arguments"]), {"input": source})
+        self.assertEqual(bridged[1]["type"], "function_call_output")
+        self.assertEqual(bridged[1]["id"], "fco_exec")
+        self.assertEqual(bridged[1]["output"], "ok")
+        self.assertEqual(
+            stats,
+            {
+                "changed": True,
+                "dropped_tool_search_items": 0,
+                "converted_custom_tool_calls": 1,
+                "converted_custom_tool_outputs": 1,
+            },
+        )
+
     def test_responses_tool_bridge_describes_codex_local_file_workflow(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -935,6 +978,161 @@ class HookResponsesToolBridgeTests(HookTestCase):
         )
 
         self.assertIsNone(bridge_kwargs)
+
+    def test_selected_chat_route_does_not_honor_stale_function_bridge_marker(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "openai/oai-deepseek-v4-pro",
+            "input": "use tools",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [{"type": "function", "name": "list_agents"}],
+                }
+            ],
+            "model_info": {
+                "id": "chat-route",
+                "provider": "atlas",
+                "upstream_url_surface": "openai/chat",
+            },
+            "litellm_metadata": {
+                hooks._RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY: True,
+            },
+        }
+
+        self.assertIsNone(
+            hooks._responses_function_tool_bridge_preemptive_kwargs(request_kwargs)
+        )
+        chat_bridge_kwargs = hooks._responses_chat_bridge_preemptive_kwargs(
+            request_kwargs,
+            include_client_tool_unsupported=True,
+            allow_selected_marker=True,
+        )
+        self.assertIsNotNone(chat_bridge_kwargs)
+        assert chat_bridge_kwargs is not None
+        self.assertTrue(chat_bridge_kwargs["use_chat_completions_api"])
+
+    async def test_successful_chat_bridge_remembers_protocol_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "routing.json"
+            self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(state_path))
+            self.set_env(hooks._PROTOCOL_FALLBACK_TTL_SECONDS_ENV, "600")
+            bridge_kwargs = {
+                "call_type": "aresponses",
+                "model": "openai/oai-deepseek-v4-pro",
+                "input": "hello",
+                "use_chat_completions_api": True,
+                "_litellm_menu_upstream_url_surface": "openai/chat",
+                "_litellm_menu_upstream_url_surface_deployment_id": "chat-route",
+                "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
+                "_litellm_menu_protocol_fallback_client_surface": "openai/responses",
+                "model_info": {
+                    "id": "chat-route",
+                    "upstream_url_surface": "openai/chat",
+                    "upstream_protocol_mode": "fallback",
+                },
+            }
+
+            async def original_function(**_kwargs):
+                return {
+                    "id": "resp_ok",
+                    "object": "response",
+                    "status": "completed",
+                    "output_text": "ok",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ok"}],
+                        }
+                    ],
+                }
+
+            response = await hooks._execute_responses_chat_bridge_call(
+                original_function,
+                bridge_kwargs,
+                original_request_kwargs=bridge_kwargs,
+                start_event="responses_chat_bridge_preemptive_start",
+                error_event="responses_chat_bridge_preemptive_error",
+            )
+
+            self.assertEqual(response["output_text"], "ok")
+            self.assertEqual(
+                bridge_kwargs["_litellm_menu_protocol_fallback_from_surface"],
+                "openai/responses",
+            )
+            deployment = {
+                "litellm_params": {"model": "openai/oai-deepseek-v4-pro"},
+                "model_info": bridge_kwargs["model_info"],
+            }
+            self.assertEqual(
+                hooks._request_surface_for_deployment(
+                    {"call_type": "aresponses", "input": "again"},
+                    deployment,
+                ),
+                "openai/chat",
+            )
+
+    async def test_chat_bridge_inherits_protocol_fallback_state_from_outer_request(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "routing.json"
+            self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(state_path))
+            self.set_env(hooks._PROTOCOL_FALLBACK_TTL_SECONDS_ENV, "600")
+            bridge_kwargs = {
+                "call_type": "aresponses",
+                "model": "openai/oai-deepseek-v4-pro",
+                "input": "hello",
+                "use_chat_completions_api": True,
+                "_litellm_menu_upstream_url_surface": "openai/chat",
+                "_litellm_menu_upstream_url_surface_deployment_id": "chat-route",
+                "model_info": {
+                    "id": "chat-route",
+                    "upstream_url_surface": "openai/chat",
+                    "upstream_protocol_mode": "fallback",
+                },
+            }
+            outer_request = {
+                "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
+                "_litellm_menu_protocol_fallback_client_surface": "openai/responses",
+                "_litellm_menu_upstream_url_surface_deployment_id": "chat-route",
+                "model_info": bridge_kwargs["model_info"],
+            }
+
+            async def original_function(**_kwargs):
+                return {
+                    "id": "resp_outer_state_ok",
+                    "object": "response",
+                    "status": "completed",
+                    "output_text": "ok",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ok"}],
+                        }
+                    ],
+                }
+
+            response = await hooks._execute_responses_chat_bridge_call(
+                original_function,
+                bridge_kwargs,
+                original_request_kwargs=outer_request,
+                start_event="responses_chat_bridge_preemptive_start",
+                error_event="responses_chat_bridge_preemptive_error",
+            )
+
+            self.assertEqual(response["output_text"], "ok")
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["protocol_fallbacks"]["chat-route|openai/responses"][
+                    "fallback_surface"
+                ],
+                "openai/chat",
+            )
 
     async def test_selected_chat_surface_retries_xhigh_only_after_explicit_error(self) -> None:
         hooks, _ = load_hook_module()

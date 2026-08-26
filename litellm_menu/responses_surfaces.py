@@ -1204,14 +1204,22 @@ def _responses_function_tool_bridge_preemptive_kwargs(
         return None
     if _responses_request_module._request_is_codex_compaction(request_kwargs):
         return None
-    if _request_has_preemptive_responses_function_tool_bridge(request_kwargs):
-        return request_kwargs
-
     outer_for_tool_plan = (
         None
         if _tools_module._request_is_external_web_search_synthesis(request_kwargs)
         else outer_request_kwargs
     )
+    # Check the selected route before honoring an inherited preemptive marker.
+    # LiteLLM may reuse the original Responses kwargs for a fallback callback;
+    # that marker must not force a Responses function bridge onto a Chat route.
+    if _current_route_responses_endpoint_unsupported(
+        request_kwargs,
+        outer_for_tool_plan,
+    ):
+        return None
+    if _request_has_preemptive_responses_function_tool_bridge(request_kwargs):
+        return request_kwargs
+
     plan = _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
     reason = _responses_function_tool_bridge_preemptive_reason(
         request_kwargs,

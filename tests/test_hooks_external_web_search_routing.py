@@ -1226,6 +1226,62 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         self.assertNotIn(large_page, evidence)
         self.assertTrue(continuation_kwargs["stream"])
 
+    def test_external_web_search_continuation_preserves_recent_conversation_context(self) -> None:
+        hooks, _ = load_hook_module()
+        request_kwargs = {
+            "call_type": "aresponses",
+            "model": "openai/vendor-chat",
+            "input": [
+                {
+                    "role": "user",
+                    "content": "先整理这篇论文的证据。",
+                },
+                {
+                    "role": "assistant",
+                    "content": "上一轮已经整理出结论：需要补充验证来源并修正结论。",
+                },
+                *({"type": "reasoning"} for _ in range(45)),
+                {
+                    "role": "user",
+                    "content": "改",
+                },
+            ],
+            "stream": True,
+        }
+
+        continuation_kwargs = hooks._external_web_search_continuation_kwargs(
+            request_kwargs,
+            search_results=(
+                "Web search results for query: paper evidence\n"
+                "Title: Source\n"
+                "URL: https://example.test/source\n"
+                "Snippet: Relevant evidence."
+            ),
+            queries=["paper evidence"],
+            round_number=1,
+        )
+
+        context = continuation_kwargs["litellm_metadata"][
+            hooks._EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY
+        ]
+        self.assertIn("assistant: 上一轮已经整理出结论", context)
+        self.assertIn("user: 改", context)
+        self.assertIn("assistant: 上一轮已经整理出结论", continuation_kwargs["input"])
+        self.assertIn("user: 改", continuation_kwargs["input"])
+
+        synthesis_kwargs = hooks._external_web_search_synthesis_kwargs(
+            continuation_kwargs,
+            "Retrieved page content for URL: https://example.test/source\nEvidence.",
+        )
+        self.assertEqual(
+            synthesis_kwargs["litellm_metadata"][
+                hooks._EXTERNAL_WEB_SEARCH_CONVERSATION_CONTEXT_KEY
+            ],
+            context,
+        )
+        self.assertIn("assistant: 上一轮已经整理出结论", synthesis_kwargs["input"])
+        self.assertIn("user: 改", synthesis_kwargs["input"])
+
     def test_external_web_search_continuation_drops_original_large_instructions(self) -> None:
         hooks, _ = load_hook_module()
         large_instructions = "Repository developer instruction. " * 700

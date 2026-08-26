@@ -976,6 +976,53 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_fetch_models_accepts_a_model_catalog_larger_than_512_kib(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = json.dumps(
+                    {
+                        "object": "list",
+                        "data": [
+                            {"id": "model-a", "description": "x" * (600 * 1024)},
+                            {"id": "model-b"},
+                        ],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = PROVIDER_CONFIG.replace(
+                "https://example.test/v1",
+                f"http://127.0.0.1:{port}/v1",
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(config).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+
+                fetched = domain.dispatch(
+                    "providers.fetch_models",
+                    {"provider_id": "primary"},
+                )["operation_summary"]
+
+            self.assertTrue(fetched["available"])
+            self.assertEqual(["model-a", "model-b"], fetched["models"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_model_probe_checks_all_protocols_in_one_action(self) -> None:
         requests: list[tuple[str, str, str]] = []
 

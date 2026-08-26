@@ -80,6 +80,8 @@ std::string StdStringFromString(NSString *value)
 
 void ConfigureSingleLineTextField(NSTextField *field)
 {
+  // AppKit animates its native focus ring. The field subclasses below overlay
+  // the same focus-colored border without replacing the native gray bezel.
   field.focusRingType = NSFocusRingTypeNone;
   field.maximumNumberOfLines = 1;
   field.usesSingleLineMode = YES;
@@ -415,14 +417,93 @@ static BOOL HandleLiteLLMTabCommand(NSView *source, SEL commandSelector)
 
 @end
 
+@interface LiteLLMInstantFocusBorderView : NSView
+@property(nonatomic) BOOL borderVisible;
+@end
+
+@implementation LiteLLMInstantFocusBorderView
+
+- (instancetype)initWithFrame:(NSRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    ConfigureImmediateView(self);
+    self.accessibilityElement = NO;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.layer.cornerRadius = 6.0;
+    self.layer.borderColor = NSColor.keyboardFocusIndicatorColor.CGColor;
+    self.layer.borderWidth = 0.0;
+    [CATransaction commit];
+  }
+  return self;
+}
+
+- (NSView *)hitTest:(__unused NSPoint)point
+{
+  return nil;
+}
+
+- (void)setBorderVisible:(BOOL)borderVisible
+{
+  if (_borderVisible == borderVisible) return;
+  _borderVisible = borderVisible;
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  self.layer.borderWidth = borderVisible ? 3.0 : 0.0;
+  [CATransaction commit];
+}
+
+@end
+
+static LiteLLMInstantFocusBorderView *InstallInstantFocusBorder(NSView *field)
+{
+  LiteLLMInstantFocusBorderView *border =
+      [[LiteLLMInstantFocusBorderView alloc] initWithFrame:field.bounds];
+  border.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [field addSubview:border positioned:NSWindowAbove relativeTo:nil];
+  return border;
+}
+
 @interface LiteLLMTabTextField : NSTextField
+@property(nonatomic) BOOL liteLLMShowsFocusBorder;
+@property(nonatomic, strong) LiteLLMInstantFocusBorderView *liteLLMFocusBorderView;
 @end
 
 @implementation LiteLLMTabTextField
 
+- (instancetype)initWithFrame:(NSRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    _liteLLMFocusBorderView = InstallInstantFocusBorder(self);
+  }
+  return self;
+}
+
 - (BOOL)acceptsFirstResponder
 {
   return self.enabled && self.editable;
+}
+
+- (BOOL)becomeFirstResponder
+{
+  const BOOL accepted = [super becomeFirstResponder];
+  if (accepted) {
+    __weak LiteLLMTabTextField *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      LiteLLMTabTextField *strongSelf = weakSelf;
+      if (strongSelf != nil && strongSelf.window.firstResponder == strongSelf.currentEditor) {
+        strongSelf.liteLLMShowsFocusBorder = YES;
+      }
+    });
+  }
+  return accepted;
+}
+
+- (void)setLiteLLMShowsFocusBorder:(BOOL)showsFocusBorder
+{
+  if (_liteLLMShowsFocusBorder == showsFocusBorder) return;
+  _liteLLMShowsFocusBorder = showsFocusBorder;
+  _liteLLMFocusBorderView.borderVisible = showsFocusBorder;
 }
 
 - (void)resetCursorRects
@@ -436,13 +517,45 @@ static BOOL HandleLiteLLMTabCommand(NSView *source, SEL commandSelector)
 @end
 
 @interface LiteLLMTabSecureTextField : NSSecureTextField
+@property(nonatomic) BOOL liteLLMShowsFocusBorder;
+@property(nonatomic, strong) LiteLLMInstantFocusBorderView *liteLLMFocusBorderView;
 @end
 
 @implementation LiteLLMTabSecureTextField
 
+- (instancetype)initWithFrame:(NSRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    _liteLLMFocusBorderView = InstallInstantFocusBorder(self);
+  }
+  return self;
+}
+
 - (BOOL)acceptsFirstResponder
 {
   return self.enabled && self.editable;
+}
+
+- (BOOL)becomeFirstResponder
+{
+  const BOOL accepted = [super becomeFirstResponder];
+  if (accepted) {
+    __weak LiteLLMTabSecureTextField *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      LiteLLMTabSecureTextField *strongSelf = weakSelf;
+      if (strongSelf != nil && strongSelf.window.firstResponder == strongSelf.currentEditor) {
+        strongSelf.liteLLMShowsFocusBorder = YES;
+      }
+    });
+  }
+  return accepted;
+}
+
+- (void)setLiteLLMShowsFocusBorder:(BOOL)showsFocusBorder
+{
+  if (_liteLLMShowsFocusBorder == showsFocusBorder) return;
+  _liteLLMShowsFocusBorder = showsFocusBorder;
+  _liteLLMFocusBorderView.borderVisible = showsFocusBorder;
 }
 
 - (void)resetCursorRects
@@ -1401,8 +1514,8 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 
 @implementation LiteLLMAppKitTextFieldComponentView {
   LiteLLMAppKitTextFieldHostView *_host;
-  NSTextField *_field;
-  NSSecureTextField *_secureField;
+  LiteLLMTabTextField *_field;
+  LiteLLMTabSecureTextField *_secureField;
   NSScrollView *_scrollView;
   NSTextView *_multilineField;
   BOOL _synchronizing;
@@ -1476,6 +1589,8 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   NSView *activeControl = isMultiline ? _scrollView : (newViewProps.secureTextEntry ? _secureField : _field);
   const BOOL activeControlChanged = _host.activeControl != activeControl;
   if (activeControlChanged) {
+    _field.liteLLMShowsFocusBorder = NO;
+    _secureField.liteLLMShowsFocusBorder = NO;
     _host.activeControl = activeControl;
   }
 
@@ -1538,6 +1653,8 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   _secureField.placeholderString = nil;
   _field.enabled = YES;
   _secureField.enabled = YES;
+  _field.liteLLMShowsFocusBorder = NO;
+  _secureField.liteLLMShowsFocusBorder = NO;
   _multilineField.editable = YES;
   _multilineField.selectable = YES;
   _host.activeControl = _field;
@@ -1560,6 +1677,8 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 
 - (void)invalidate
 {
+  _field.liteLLMShowsFocusBorder = NO;
+  _secureField.liteLLMShowsFocusBorder = NO;
   _field.delegate = nil;
   _secureField.delegate = nil;
   _multilineField.delegate = nil;
@@ -1576,7 +1695,11 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 
 - (void)controlTextDidEndEditing:(NSNotification *)notification
 {
-  if (notification.object == _field || notification.object == _secureField) {
+  if (notification.object == _field) {
+    _field.liteLLMShowsFocusBorder = NO;
+    [self emitBlur];
+  } else if (notification.object == _secureField) {
+    _secureField.liteLLMShowsFocusBorder = NO;
     [self emitBlur];
   }
 }
@@ -3021,8 +3144,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 @end
 
 @implementation LiteLLMAppKitSecureTextInputComponentView {
-  NSSecureTextField *_field;
-  NSTextField *_plainField;
+  LiteLLMTabSecureTextField *_field;
+  LiteLLMTabTextField *_plainField;
   NSScrollView *_scrollView;
   LiteLLMTabTextView *_multilineField;
   LiteLLMAppKitControlHostView *_host;
@@ -3115,7 +3238,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
   NSString *label = StringFromStdString(newViewProps.label);
   const BOOL isMultiline = newViewProps.multiline;
   NSView *activeControl = isMultiline ? _scrollView : (newViewProps.plainText ? _plainField : _field);
-  if (_host.control != activeControl) _host.control = activeControl;
+  if (_host.control != activeControl) {
+    _field.liteLLMShowsFocusBorder = NO;
+    _plainField.liteLLMShowsFocusBorder = NO;
+    _host.control = activeControl;
+  }
   _host.fillsHeight = isMultiline;
   BOOL identityChanged = ![_domain isEqualToString:domain] || ![_secretField isEqualToString:field] ||
       ![_target isEqualToString:target];
@@ -3299,6 +3426,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
 
 - (void)controlTextDidEndEditing:(NSNotification *)notification
 {
+  if (notification.object == _field) {
+    _field.liteLLMShowsFocusBorder = NO;
+  } else if (notification.object == _plainField) {
+    _plainField.liteLLMShowsFocusBorder = NO;
+  }
   if (_synchronizingField || notification.object != [self activeControl] || !_autoCommit || !_secretDirty) return;
   [self stageCurrentSecretForRequest:_lastCommitRequest + 1];
 }
@@ -3368,6 +3500,8 @@ doCommandBySelector:(SEL)commandSelector
   _plainField.placeholderString = nil;
   _field.enabled = YES;
   _plainField.enabled = YES;
+  _field.liteLLMShowsFocusBorder = NO;
+  _plainField.liteLLMShowsFocusBorder = NO;
   _field.editable = YES;
   _plainField.editable = YES;
   _field.selectable = YES;
@@ -3389,6 +3523,8 @@ doCommandBySelector:(SEL)commandSelector
   _lastSyncedPlainText = @"";
   _field.stringValue = @"";
   _plainField.stringValue = @"";
+  _field.liteLLMShowsFocusBorder = NO;
+  _plainField.liteLLMShowsFocusBorder = NO;
   _multilineField.string = @"";
   _multilineField.delegate = nil;
   [super invalidate];

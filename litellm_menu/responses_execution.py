@@ -389,6 +389,48 @@ async def _single_chat_completion_chunk_stream(response: Any) -> Any:
     }
 
 
+def _inherit_protocol_fallback_state_for_bridge(
+    bridge_kwargs: dict,
+    *request_sources: Optional[dict],
+) -> dict:
+    """Keep fallback state across LiteLLM's bridge kwargs copy boundary."""
+    metadata = _request_context_module._request_metadata_dict(
+        bridge_kwargs,
+        "litellm_metadata",
+    ) or {}
+    updated_metadata = metadata.copy()
+    changed = False
+    for key in (
+        _PROTOCOL_FALLBACK_FROM_SURFACE_KEY,
+        _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
+        _PROTOCOL_FALLBACK_CACHE_HIT_KEY,
+        _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
+    ):
+        if key in bridge_kwargs:
+            continue
+        value = metadata.get(key)
+        if value is None:
+            for source in request_sources:
+                if not isinstance(source, dict):
+                    continue
+                value = source.get(key)
+                if value is None:
+                    source_metadata = _request_context_module._request_metadata_dict(
+                        source,
+                        "litellm_metadata",
+                    ) or {}
+                    value = source_metadata.get(key)
+                if value is not None:
+                    break
+        if value is not None:
+            bridge_kwargs[key] = value
+            updated_metadata[key] = value
+            changed = True
+    if changed:
+        bridge_kwargs["litellm_metadata"] = updated_metadata
+    return bridge_kwargs
+
+
 async def _execute_responses_chat_bridge_call(
     original_function: Any,
     bridge_kwargs: dict,
@@ -561,8 +603,27 @@ async def _execute_responses_chat_bridge_call(
         )
         return response
 
+    async def execute_once_and_remember_fallback(
+        active_bridge_kwargs: dict,
+    ) -> Any:
+        _inherit_protocol_fallback_state_for_bridge(
+            active_bridge_kwargs,
+            original_request_kwargs,
+            outer_request_kwargs,
+        )
+        response = await execute_once(active_bridge_kwargs)
+        # A streaming provider call is established before its iterator is
+        # consumed. Record the working alternate protocol now so the next
+        # request does not repeat the known-incompatible client surface. Use a
+        # copy because the live request must retain its fallback state: a later
+        # stream error needs that state to clear the optimistic cache entry.
+        _routing_module._record_protocol_fallback_success(
+            active_bridge_kwargs.copy()
+        )
+        return response
+
     try:
-        return await execute_once(bridge_kwargs)
+        return await execute_once_and_remember_fallback(bridge_kwargs)
     except Exception as bridge_exc:
         forced_choice_retry_kwargs = _forced_tool_choice_auto_retry_kwargs(
             bridge_exc,
@@ -572,7 +633,7 @@ async def _execute_responses_chat_bridge_call(
         if forced_choice_retry_kwargs is not None:
             bridge_kwargs = forced_choice_retry_kwargs
             try:
-                return await execute_once(bridge_kwargs)
+                return await execute_once_and_remember_fallback(bridge_kwargs)
             except Exception as retry_exc:
                 bridge_exc = retry_exc
         xhigh_retry_kwargs = _responses_request_module._xhigh_reasoning_compat_retry_kwargs(
@@ -581,7 +642,9 @@ async def _execute_responses_chat_bridge_call(
         )
         if xhigh_retry_kwargs is not None:
             try:
-                return await execute_once(xhigh_retry_kwargs)
+                return await execute_once_and_remember_fallback(
+                    xhigh_retry_kwargs
+                )
             except Exception as retry_exc:
                 _trace_module._route_trace(
                     "xhigh_reasoning_compat_retry_error",
@@ -1374,6 +1437,12 @@ def _wrap_generic_function_for_deployment_failover(
         return original_function
 
     async def wrapped_generic_function(**kwargs: Any) -> Any:
+        # LiteLLM may rebuild the generic callback kwargs from the raw
+        # deployment and omit the selected deployment's model_info/surface.
+        # Restore it before capability-aware request adapters run, otherwise
+        # an explicitly unsupported route is misclassified as unknown and a
+        # native-capable route can receive the local search pair.
+        _routing_module._apply_current_selected_deployment_to_request(kwargs)
         for update_request in (
             _responses_request_module._with_codex_external_web_search_bridge_tool,
             _responses_request_module._with_codex_tool_registry_instruction,
@@ -1386,12 +1455,6 @@ def _wrap_generic_function_for_deployment_failover(
             updated_kwargs = update_request(kwargs)
             if updated_kwargs is not None:
                 kwargs = updated_kwargs
-        # LiteLLM may rebuild the generic callback kwargs from the raw
-        # deployment and omit the selected deployment's model_info/surface.
-        # Apply the request-scoped marker before any protocol decision so an
-        # unsupported Responses route is bridged to its actual Chat/Anthropic
-        # surface on the first attempt, rather than advertising Hosted tools.
-        _routing_module._apply_current_selected_deployment_to_request(kwargs)
         async def surface_adapted_original_function(**call_kwargs: Any) -> Any:
             dispatch_kwargs = _routing_module._surface_adapted_dispatch_kwargs(
                 call_kwargs

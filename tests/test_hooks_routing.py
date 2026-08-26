@@ -1794,9 +1794,7 @@ class HookRoutingTests(HookTestCase):
             hooks._mark_exception_for_deployment_failover(error, request)
             hooks._mark_exception_for_deployment_failover(error, request)
 
-            state = hooks._DEPLOYMENT_COOLDOWNS["id:dual-protocol-route"]
-            self.assertEqual(state["failures"], 1)
-            self.assertEqual(state.get("cooldown_until", 0), 0)
+            self.assertNotIn("id:dual-protocol-route", hooks._DEPLOYMENT_COOLDOWNS)
             self.assertEqual(
                 hooks._recovery_policy_for_exception(error),
                 hooks._RECOVERY_POLICY_ERROR,
@@ -1805,6 +1803,43 @@ class HookRoutingTests(HookTestCase):
             self.assertFalse(
                 hooks._protocol_fallback_attempt_active(request)
             )
+
+    def test_protocol_fallback_request_error_cooldown_requires_explicit_policy(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(
+            hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": "hello",
+            "stream": True,
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
+            "_litellm_menu_protocol_fallback_client_surface": "openai/responses",
+            "_litellm_menu_upstream_url_surface_deployment_id": "dual-protocol-route",
+            "model_info": {
+                "id": "dual-protocol-route",
+                "order": 0,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+            "litellm_params": {"model": "openai/vendor-model", "order": 0},
+        }
+        error = RuntimeError("fallback request rejected")
+        error.status_code = 400
+
+        hooks._mark_exception_for_deployment_failover(error, request)
+
+        state = hooks._DEPLOYMENT_COOLDOWNS["id:dual-protocol-route"]
+        self.assertEqual(state["failures"], 1)
+        self.assertGreater(state.get("cooldown_until", 0), 0)
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(error),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
 
     def test_protocol_fallback_wrapper_failure_does_not_count_cooldown_twice(self) -> None:
         hooks, _ = load_hook_module()
@@ -1869,7 +1904,7 @@ class HookRoutingTests(HookTestCase):
         wrapper.status_code = 503
         hooks._mark_exception_for_deployment_failover(wrapper, request)
 
-        self.assertEqual(hooks._DEPLOYMENT_COOLDOWNS["id:route-a"]["failures"], 1)
+        self.assertNotIn("id:route-a", hooks._DEPLOYMENT_COOLDOWNS)
         self.assertEqual(hooks._DEPLOYMENT_COOLDOWNS["id:route-b"]["failures"], 1)
 
     def test_successful_protocol_fallback_is_remembered_for_runtime_ttl(self) -> None:

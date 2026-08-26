@@ -1328,6 +1328,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("func chooseModelsToAdd(models: [String]", mac_leaf)
         self.assertIn("NSPanel(", mac_leaf)
         self.assertIn("NSApp.runModal(for: panel)", mac_leaf)
+        self.assertIn("let searchField = NativeInstantFocusSearchField()", mac_leaf)
+        self.assertIn("searchField.focusRingType = .none", mac_leaf)
+        self.assertIn("showsInstantFocusBorder = true", mac_leaf)
+        self.assertIn("field.showsInstantFocusBorder = false", mac_leaf)
+        self.assertIn("private let focusBorderView = NativeInstantFocusBorderView(frame: .zero)", mac_leaf)
+        self.assertIn("layer?.borderWidth = borderVisible ? 3 : 0", mac_leaf)
         self.assertIn('modelChooserButton(title: localized("modelChooserAll"', mac_leaf)
         self.assertIn('modelChooserButton(title: localized("modelChooserInvert"', mac_leaf)
         self.assertIn('modelChooserButton(title: "+"', mac_leaf)
@@ -1410,8 +1416,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertIn("plainText?: WithDefault<boolean, false>;", spec)
             self.assertNotIn("onChangeText", spec)
             self.assertIn("onSecretState", spec)
-        self.assertIn("NSSecureTextField *_field", mac)
-        self.assertIn("NSTextField *_plainField", mac)
+        self.assertIn("LiteLLMTabSecureTextField *_field", mac)
+        self.assertIn("LiteLLMTabTextField *_plainField", mac)
         self.assertIn("LiteLLMTabTextView *_multilineField", mac)
         self.assertIn("NSTextViewDelegate", mac)
         self.assertIn("loadPlainTextSecretForGeneration", mac)
@@ -1597,6 +1603,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         single_line = controls.split("void ConfigureSingleLineTextField", 1)[1].split("NSInteger SegmentIndex", 1)[0]
         self.assertIn("field.focusRingType = NSFocusRingTypeNone;", single_line)
+        self.assertNotIn("NSFocusRingTypeDefault", single_line)
+        self.assertIn("InstallInstantFocusBorder(self);", controls)
+        self.assertIn("[CATransaction setDisableActions:YES];", controls)
+        self.assertIn("self.layer.borderWidth = borderVisible ? 3.0 : 0.0;", controls)
+        self.assertIn("[field addSubview:border positioned:NSWindowAbove relativeTo:nil];", controls)
+        self.assertNotIn("ConfigureImmediateView(field);", controls)
+        self.assertIn("NSColor.keyboardFocusIndicatorColor", controls)
+        self.assertIn("strongSelf.liteLLMShowsFocusBorder = YES;", controls)
+        self.assertIn("_field.liteLLMShowsFocusBorder = NO;", controls)
+        self.assertIn("strongSelf.window.firstResponder == strongSelf.currentEditor", controls)
 
         self.assertIn("@interface LiteLLMAppKitControlHostView : NSView", controls)
         self.assertIn("NSMidY(bounds) - height / 2.0", controls)
@@ -1604,6 +1620,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("[_activeControl isKindOfClass:NSScrollView.class]", controls)
         text_host = controls.split("@implementation LiteLLMAppKitTextFieldHostView", 1)[1].split("@end", 1)[0]
         self.assertNotIn("[_activeControl isKindOfClass:NSTextField.class]", text_host)
+        self.assertNotIn("ConfigureImmediateView", text_host)
         self.assertIn("_host.fillsHeight = NO;", controls)
         for native_control in (
             "_host.control = _button;",

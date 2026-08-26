@@ -1187,19 +1187,6 @@ def _codex_declared_tools(request_kwargs: Optional[dict]) -> list[dict]:
     return declared
 
 
-def _request_is_openrouter_route(request_kwargs: Optional[dict]) -> bool:
-    if not isinstance(request_kwargs, dict):
-        return False
-    model_info = _request_context_module._request_model_info(request_kwargs)
-    provider = model_info.get("provider") or request_kwargs.get("custom_llm_provider")
-    if isinstance(provider, str) and provider.strip().lower() == "openrouter":
-        return True
-    return _api_base_host(_request_api_base(request_kwargs)) in {
-        "openrouter.ai",
-        "www.openrouter.ai",
-    }
-
-
 def _with_codex_external_web_search_bridge_tool(
     request_kwargs: dict,
 ) -> Optional[dict]:
@@ -1226,28 +1213,28 @@ def _with_codex_external_web_search_bridge_tool(
     if not declared_tools:
         return None
 
-    # OpenRouter-capable models (for example Grok) may use the provider's
-    # server-side search according to their own capabilities and request
-    # semantics. Do not add the local pi-web-access pair to an otherwise
-    # search-agnostic Codex turn: doing so makes the model choose the wrong
-    # route and turns a native search event into a local bridge call. An
-    # explicit supports_*_web_search: false capability flag still opts into
-    # the local fallback contract.
-    if _request_is_openrouter_route(request_kwargs):
-        model_info = _request_context_module._request_model_info(request_kwargs)
-        if not (
-            model_info.get("supports_responses_web_search") is False
-            or model_info.get("supports_web_search") is False
-        ):
-            return None
+    from . import responses_surfaces as _responses_surfaces_module
+
+    # Native search must get the first opportunity. An unknown capability on
+    # a Responses route is deliberately treated the same way: adding local
+    # functions before the upstream attempt lets the model choose the bridge
+    # and prevents a native web-search event from ever being produced. The
+    # local pair is therefore an explicit unsupported-capability fallback.
+    if (
+        _responses_surfaces_module._request_supports_native_responses_web_search(
+            request_kwargs
+        )
+        or _responses_surfaces_module._request_should_try_unknown_native_responses_web_search(
+            request_kwargs
+        )
+    ):
+        return None
 
     # These are ordinary client-side function tools backed by the local
     # pi-web-access worker, not a claim that the selected upstream exposes
     # hosted web search. If the selected route explicitly cannot accept
     # Responses function tools, do not advertise functions that it cannot
     # receive.
-    from . import responses_surfaces as _responses_surfaces_module
-
     if not _responses_surfaces_module._request_supports_responses_function_tools(
         request_kwargs
     ):
@@ -1559,6 +1546,62 @@ def _with_codex_function_call_output_text(request_kwargs: dict) -> Optional[dict
             continue
         updated_item = item.copy()
         updated_item["output"] = "\n".join(chunks)
+        updated_items[index] = updated_item
+        changed = True
+
+    if not changed:
+        return None
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = updated_items
+    return modified_kwargs
+
+
+def _codex_repaired_function_arguments(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.startswith("{}"):
+        return None
+    suffix = value[2:].lstrip()
+    if not suffix:
+        return None
+    try:
+        parsed = json.loads(suffix)
+    except (TypeError, ValueError):
+        return None
+    return suffix if isinstance(parsed, dict) else None
+
+
+def _with_codex_function_call_arguments_repaired(
+    request_kwargs: dict,
+) -> Optional[dict]:
+    """Repair the empty-object placeholder emitted before streamed deltas."""
+
+    if (
+        not _request_has_responses_shape(request_kwargs)
+        or not _request_has_codex_client_evidence(request_kwargs)
+    ):
+        return None
+    input_items = request_kwargs.get("input")
+    if not isinstance(input_items, list):
+        return None
+
+    last_encrypted_index = max(
+        (
+            index
+            for index, item in enumerate(input_items)
+            if _value_has_encrypted_content(item)
+        ),
+        default=-1,
+    )
+    updated_items = list(input_items)
+    changed = False
+    for index in range(last_encrypted_index + 1, len(input_items)):
+        item = input_items[index]
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        repaired_arguments = _codex_repaired_function_arguments(item.get("arguments"))
+        if repaired_arguments is None:
+            continue
+        updated_item = item.copy()
+        updated_item["arguments"] = repaired_arguments
         updated_items[index] = updated_item
         changed = True
 

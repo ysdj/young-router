@@ -238,7 +238,7 @@ class CoreProtocolTests(unittest.TestCase):
             "snapshot": {"snapshot": {}},
             "disk_state": {"revision": 0, "disk": {}},
             "logs": {"changed": True, "revision": 1, "log": {"tab": "requests", "available": False, "paused": False, "line_count": 0, "records": [], "filter": "", "limit": 10000}},
-            "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0, "text": "model = \"example\"\n"},
+            "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0, "text": "model = \"example\"\n", "baseline": "model = \"example\"\n"},
             "dispatch": {"revision": 0},
             "subscribe": {"subscription_id": "subscription"},
             "validate": {"validate": {}},
@@ -715,6 +715,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertEqual("settings", editor["document"])
             self.assertIn("editor_token", editor)
             self.assertIn("synthetic-token", editor["text"])
+            self.assertEqual(editor["text"], editor["baseline"])
 
             staged = client.call(
                 "editor",
@@ -723,11 +724,40 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertEqual("claude", staged["domain"])
             self.assertEqual("settings", staged["document"])
             self.assertEqual('{"model":"updated"}\n', staged["text"])
+            self.assertEqual(editor["baseline"], staged["baseline"])
             self.assertNotEqual(editor["editor_token"], staged["editor_token"])
             self.assertGreater(staged["revision"], editor["revision"])
             self.assertEqual("updated", core.snapshot()["domains"]["claude"]["settings"]["model"])
             with self.assertRaises(Exception):
                 client.call("editor", {"editor_token": editor["editor_token"], "text": "{}\n"})
+
+    def test_editor_diff_baseline_keeps_structured_staged_changes_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "settings.json"
+            settings.write_text('{"model":"disk-model"}\n', encoding="utf-8")
+            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+
+            core = CoreStore(domains=[ClaudeSettingsDomain(settings)])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            opened = client.call("editor", {"domain": "claude", "document": "settings"})
+            core.dispatch(
+                {"domain": "claude", "type": "patch", "payload": {"model": "structured-model"}},
+                expected_revision=core.revision,
+            )
+            staged = client.call("editor", {"domain": "claude", "document": "settings"})
+
+            self.assertIn('"model": "structured-model"', staged["text"])
+            self.assertEqual(opened["baseline"], staged["baseline"])
+            self.assertNotEqual(staged["text"], staged["baseline"])
+
+            core.apply("claude", revision=core.revision)
+            applied = client.call("editor", {"domain": "claude", "document": "settings"})
+            self.assertEqual(applied["text"], applied["baseline"])
 
     def test_claude_desktop_developer_and_code_raw_editors_stage_their_own_documents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -897,7 +927,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                 {"editor_token": original_token, "text": '{"model":"first"}\n'},
             )
             self.assertEqual(
-                {"domain", "document", "revision", "editor_token", "text"}, set(first)
+                {"domain", "document", "revision", "editor_token", "text", "baseline"}, set(first)
             )
             self.assertEqual("claude", first["domain"])
             self.assertEqual("settings", first["document"])
@@ -1550,6 +1580,85 @@ class CoreIPCTests(unittest.TestCase):
             response.error,
         )
         self.assertNotIn(secret, body.decode("utf-8"))
+
+    def test_apply_response_keeps_the_complete_result_contract(self) -> None:
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        endpoint = server.start()
+        self.addCleanup(server.stop)
+        client = CoreIPCClient(endpoint, server.bootstrap_token)
+        self.addCleanup(client.close)
+
+        staged = client.call(
+            "dispatch",
+            {
+                "action": {"domain": "language", "type": "set", "payload": {"choice": "en"}},
+                "revision": core.revision,
+            },
+        )
+        result = client.call("apply", {"domain": "language", "revision": staged["revision"]})
+
+        self.assertTrue(result["applied"])
+        self.assertEqual("applied", result["status"])
+        self.assertEqual(0, result["completed_operations"])
+        self.assertEqual(0, result["pending_operations"])
+        self.assertEqual([], result["issues"])
+        self.assertEqual(["language"], result["domains"])
+
+    def test_provider_apply_with_auth_manager_survives_transaction_checkpoint(self) -> None:
+        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+        from litellm_menu.core.provider_auth import ProviderAuthManager
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  primary:\n"
+                "    api_base: https://example.test/v1\n"
+                "    api_keys:\n"
+                "      - name: default\n"
+                "        value: replace-me\n"
+                "model_list: []\n",
+                encoding="utf-8",
+            )
+            provider = ProvidersModelsDomain(
+                config_path,
+                auth_manager=ProviderAuthManager(root),
+            )
+            reloads: list[str] = []
+            core = CoreStore(
+                domains=[provider],
+                service_handlers={
+                    "status": lambda _operation: {"state": "running"},
+                    "reload": lambda operation: (reloads.append(operation) or {"state": "running"}),
+                },
+            )
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            snapshot = client.call("snapshot")
+            provider_id = snapshot["snapshot"]["domains"]["providers_models"]["providers"][0]["id"]
+            staged = client.call(
+                "dispatch",
+                {
+                    "action": {
+                        "domain": "providers_models",
+                        "type": "provider.patch",
+                        "payload": {"provider_id": provider_id, "changes": {"name": "renamed"}},
+                    },
+                    "revision": core.revision,
+                },
+            )
+            result = client.call("apply", {"domain": "providers_models", "revision": staged["revision"]})
+
+            self.assertTrue(result["applied"])
+            self.assertEqual("applied", result["status"])
+            self.assertEqual(["reload"], reloads)
+            self.assertIn("renamed", config_path.read_text(encoding="utf-8"))
 
     def test_authenticated_host_shutdown_stops_the_owned_service(self) -> None:
         calls: list[str] = []

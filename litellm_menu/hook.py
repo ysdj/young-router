@@ -87,6 +87,7 @@ class LiteLLMMenuHook(CustomLogger):
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
             _reasoning_module._with_model_reasoning_mapping,
             _responses_request_module._with_plaintext_agent_message_content_restored,
+            _responses_request_module._with_codex_function_call_arguments_repaired,
             _responses_request_module._with_codex_view_image_output_paths,
             _responses_request_module._with_codex_function_call_output_text,
             _image_inputs_module._with_bounded_image_inputs,
@@ -325,6 +326,30 @@ class LiteLLMMenuHook(CustomLogger):
                 request_data,
             )
 
+        emit_image_generation_saved_paths = (
+            _responses_request_module._request_has_codex_client_evidence(request_data)
+            or (
+                _responses_request_module._request_is_responses_api(request_data)
+                and _image_generation_module._image_generation_session_component(request_data)
+                != "unknown-session"
+            )
+        )
+        image_generation_saved_paths: list[str] = []
+
+        async def deliver_stream(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
+            async for stream_chunk in stream:
+                for image_chunk in image_generation_chunks_for_delivery(stream_chunk):
+                    yield deliver_chunk(image_chunk)
+
+        def image_generation_chunks_for_delivery(stream_chunk: Any) -> list[Any]:
+            if not emit_image_generation_saved_paths:
+                return [stream_chunk]
+            return _image_generation_module._image_generation_stream_chunks_for_delivery(
+                stream_chunk,
+                request_data,
+                image_generation_saved_paths,
+            )
+
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
         if not _responses_output_module._response_is_async_iterable(response):
             _responses_web_search_bridge_module._mark_provider_native_web_search_event(
@@ -349,11 +374,11 @@ class LiteLLMMenuHook(CustomLogger):
                 )
             )
         ):
-            async for chunk in _streaming_module._yield_start_buffered_stream_with_error_fallback(
+            async for chunk in deliver_stream(_streaming_module._yield_start_buffered_stream_with_error_fallback(
                 response,
                 request_data,
-            ):
-                yield deliver_chunk(chunk)
+            )):
+                yield chunk
             return
 
         buffer: List[Any] = []
@@ -362,8 +387,10 @@ class LiteLLMMenuHook(CustomLogger):
         should_passthrough = False
 
         if not _responses_output_module._response_is_async_iterable(response):
-            async for chunk in _streaming_module._non_streaming_response_as_stream(response, request_data):
-                yield deliver_chunk(chunk)
+            async for chunk in deliver_stream(
+                _streaming_module._non_streaming_response_as_stream(response, request_data)
+            ):
+                yield chunk
             return
 
         try:
@@ -381,7 +408,8 @@ class LiteLLMMenuHook(CustomLogger):
                         request_data,
                         chunk_exception,
                     ):
-                        yield deliver_chunk(fallback_chunk)
+                        for delivered_chunk in image_generation_chunks_for_delivery(fallback_chunk):
+                            yield deliver_chunk(delivered_chunk)
                     return
                 buffer.append(chunk)
                 if _image_generation_module._response_has_image_generation_activity(chunk):
@@ -404,12 +432,15 @@ class LiteLLMMenuHook(CustomLogger):
                 request_data,
                 exc,
             ):
-                yield deliver_chunk(fallback_chunk)
+                for delivered_chunk in image_generation_chunks_for_delivery(fallback_chunk):
+                    yield deliver_chunk(delivered_chunk)
             return
 
         if should_passthrough:
-            async for chunk in _streaming_module._yield_guarded_original_stream(buffer, response, request_data):
-                yield deliver_chunk(chunk)
+            async for chunk in deliver_stream(
+                _streaming_module._yield_guarded_original_stream(buffer, response, request_data)
+            ):
+                yield chunk
             return
 
         if not should_fallback and _image_generation_module._response_should_trigger_image_generation_fallback({"output_text": text}):
@@ -428,7 +459,8 @@ class LiteLLMMenuHook(CustomLogger):
                     request_data,
                     fallback_exception,
                 ):
-                    yield deliver_chunk(fallback_chunk)
+                    for delivered_chunk in image_generation_chunks_for_delivery(fallback_chunk):
+                        yield deliver_chunk(delivered_chunk)
                 return
 
             payload = _streaming_module._build_forced_image_generation_payload(
@@ -440,21 +472,26 @@ class LiteLLMMenuHook(CustomLogger):
                     "image_generation forced probe payload could not be built"
                 )
             try:
-                async for chunk in _streaming_module._stream_forced_image_generation_payload(
-                    payload
+                async for chunk in deliver_stream(
+                    _streaming_module._stream_forced_image_generation_payload(payload)
                 ):
-                    yield deliver_chunk(chunk)
+                    yield chunk
                 return
             except Exception as exc:
                 async for fallback_chunk in _streaming_module._yield_streaming_error_fallback_or_raise(
                     request_data,
                     exc,
                 ):
-                    yield deliver_chunk(fallback_chunk)
+                    for delivered_chunk in image_generation_chunks_for_delivery(fallback_chunk):
+                        yield deliver_chunk(delivered_chunk)
                 return
 
-        async for chunk in _streaming_module._yield_guarded_original_stream(buffer, _streaming_module._empty_async_iterator(), request_data):
-            yield deliver_chunk(chunk)
+        async for chunk in deliver_stream(
+            _streaming_module._yield_guarded_original_stream(
+                buffer, _streaming_module._empty_async_iterator(), request_data
+            )
+        ):
+            yield chunk
 
 
 def _trace_codex_fast_tier_result(
