@@ -668,6 +668,11 @@ class ProviderAuthManager:
                 auth_method="web_oauth",
                 last_error="",
             )
+            with self._lock:
+                private = self._read(ref)
+                for key in ("verification_uri", "user_code", "redirect_uri", "auth_method"):
+                    private.pop(key, None)
+                self._write(ref, private)
             deadline = time.monotonic() + _CLAUDE_OAUTH_TIMEOUT_SECONDS
             while not wakeup.wait(timeout=0.25):
                 if self._is_cancelled(ref):
