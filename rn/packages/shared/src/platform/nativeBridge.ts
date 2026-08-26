@@ -36,7 +36,8 @@ export interface NativeLeafBridge {
     provider: "openai" | "claude";
     fingerprint?: string;
     verificationURL: string;
-    userCode: string;
+    userCode?: string;
+    callbackURL?: string;
     title: string;
     closeLabel: string;
   }): Promise<void>;

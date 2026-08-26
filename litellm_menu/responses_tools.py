@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import request_context as _request_context_module
 from . import routing as _routing_module
@@ -577,6 +579,17 @@ def _responses_input_additional_tools(value: Any) -> list[dict]:
     return tools
 
 
+def _responses_function_tool_item_id(value: Any, *, output: bool = False) -> Any:
+    if not isinstance(value, str) or not value:
+        return value
+    expected_prefix = "fco_" if output else "fc_"
+    if value.startswith(expected_prefix):
+        return value
+    replaced_prefix = "ctco_" if output else "ctc_"
+    suffix = value[len(replaced_prefix) :] if value.startswith(replaced_prefix) else value
+    return f"{expected_prefix}{suffix}"
+
+
 def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
     if not isinstance(value, list):
         return value, {"changed": False, "dropped_tool_search_items": 0}
@@ -584,6 +597,8 @@ def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
     filtered: list[Any] = []
     dropped_tool_search = 0
     dropped_additional_tools = 0
+    converted_custom_tool_calls = 0
+    converted_custom_tool_outputs = 0
     for item in value:
         if isinstance(item, dict) and item.get("type") in {
             "tool_search_call",
@@ -594,9 +609,47 @@ def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
         if isinstance(item, dict) and item.get("type") == "additional_tools":
             dropped_additional_tools += 1
             continue
-        filtered.append(copy.deepcopy(item))
+        updated_item = copy.deepcopy(item)
+        # Custom declarations become ordinary functions with an ``input``
+        # parameter at this bridge boundary. Normalize replay items here too;
+        # otherwise LiteLLM serializes the raw custom payload under ``content``
+        # and the history contradicts the function schema sent upstream.
+        if (
+            isinstance(updated_item, dict)
+            and updated_item.get("type") == "custom_tool_call"
+            and isinstance(updated_item.get("input"), str)
+        ):
+            raw_input = updated_item.pop("input")
+            updated_item["type"] = "function_call"
+            if "id" in updated_item:
+                updated_item["id"] = _responses_function_tool_item_id(
+                    updated_item.get("id")
+                )
+            updated_item["arguments"] = json.dumps(
+                {"input": raw_input},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            converted_custom_tool_calls += 1
+        elif (
+            isinstance(updated_item, dict)
+            and updated_item.get("type") == "custom_tool_call_output"
+        ):
+            updated_item["type"] = "function_call_output"
+            if "id" in updated_item:
+                updated_item["id"] = _responses_function_tool_item_id(
+                    updated_item.get("id"),
+                    output=True,
+                )
+            converted_custom_tool_outputs += 1
+        filtered.append(updated_item)
 
-    if dropped_tool_search == 0 and dropped_additional_tools == 0:
+    if (
+        dropped_tool_search == 0
+        and dropped_additional_tools == 0
+        and converted_custom_tool_calls == 0
+        and converted_custom_tool_outputs == 0
+    ):
         return value, {"changed": False, "dropped_tool_search_items": 0}
     stats = {
         "changed": True,
@@ -604,6 +657,10 @@ def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
     }
     if dropped_additional_tools:
         stats["dropped_additional_tools_items"] = dropped_additional_tools
+    if converted_custom_tool_calls:
+        stats["converted_custom_tool_calls"] = converted_custom_tool_calls
+    if converted_custom_tool_outputs:
+        stats["converted_custom_tool_outputs"] = converted_custom_tool_outputs
     return filtered, stats
 
 

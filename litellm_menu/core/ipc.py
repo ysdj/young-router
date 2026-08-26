@@ -751,6 +751,7 @@ class CoreIPCServer:
             "document": replacement.document,
             "editor_token": replacement_token,
             "text": text,
+            "baseline": result["baseline"],
         }
 
     def start(self) -> IpcEndpoint:
@@ -1063,7 +1064,6 @@ class CoreIPCServer:
                     revision=revision if type(revision) is int else None,
                     confirmation=confirmation,
                 )
-                result = {"revision": result.get("revision", self.core.revision), "applied": True, "domains": result.get("domains", [domain] if domain is not None else list(domains or []))}
             elif request.method == "reload":
                 domain = params.get("domain")
                 if domain is not None and not isinstance(domain, str):

@@ -2220,6 +2220,61 @@ class HookRouteRecoveryTests(HookTestCase):
             b": litellm_menu route_recovery phase=cooldown attempt=1\n\n",
         )
 
+    async def test_chat_route_recovery_exhaustion_emits_native_error_chunk(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.01")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        calls = []
+
+        class ServiceUnavailableError(Exception):
+            status_code = 503
+
+        class NoDeploymentsError(Exception):
+            status_code = 503
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"model": "openai/default-chat"},
+                        "model_info": {"id": "chat-route"},
+                    }
+                ]
+
+            async def acompletion(self, **payload):
+                calls.append(payload)
+                raise NoDeploymentsError(
+                    "No deployments available for selected model"
+                )
+
+        proxy_server.llm_router = Router()
+        request_data = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+            "model_info": {"id": "chat-route"},
+        }
+        first_exception = ServiceUnavailableError("temporary upstream failure")
+
+        response = hooks._route_recovery_stream_response(request_data, first_exception)
+        chunks = [
+            chunk
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=response,
+                request_data=request_data,
+            )
+        ]
+
+        self.assertGreaterEqual(len(calls), 1)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(
+            chunks[0]["error"]["code"],
+            "upstream_route_failure",
+        )
+        self.assertEqual(chunks[0]["error"]["type"], "server_error")
+
     async def test_anthropic_messages_stream_enters_route_recovery_with_native_sse(
         self,
     ) -> None:

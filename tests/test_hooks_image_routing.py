@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 
 from hook_test_utils import *
 
@@ -16,6 +17,303 @@ class HookImageRoutingTests(HookTestCase):
 
         self.assertTrue(definitions)
         self.assertTrue(all("image_generation" in name for name in definitions), definitions)
+
+    def test_image_generation_result_validation_rejects_text_and_accepts_png(self) -> None:
+        hooks, _ = load_hook_module()
+
+        self.assertFalse(hooks._image_generation_result_is_valid("base64-image"))
+        self.assertTrue(hooks._image_generation_result_is_valid(VALID_IMAGE_RESULT))
+
+    def test_image_generation_stream_materializes_png_and_attaches_saved_path(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            item = {
+                "id": "ig_fixture",
+                "type": "image_generation_call",
+                "status": "completed",
+                "result": VALID_IMAGE_RESULT,
+            }
+            delivered = hooks._image_generation_stream_chunks_for_delivery(
+                item,
+                {"client_metadata": {"headers": {"session-id": "thread-fixture"}}},
+            )
+            self.assertEqual(delivered[0]["type"], "image_generation_call")
+            saved_path = Path(delivered[0]["saved_path"])
+            self.assertEqual(
+                saved_path,
+                Path(codex_home) / "generated_images" / "thread-fixture" / "ig_fixture.png",
+            )
+            self.assertTrue(saved_path.is_file())
+            self.assertEqual(saved_path.read_bytes(), base64.b64decode(VALID_IMAGE_RESULT))
+            self.assertEqual(delivered[0]["saved_path"], str(saved_path))
+
+    def test_image_generation_stream_does_not_emit_path_for_invalid_result(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            item = {
+                "id": "ig_invalid",
+                "type": "image_generation_call",
+                "status": "generating",
+                "result": "not-an-image",
+            }
+            delivered = hooks._image_generation_stream_chunks_for_delivery(
+                item,
+                {"client_metadata": {"headers": {"session-id": "thread-fixture"}}},
+            )
+            self.assertEqual(delivered, [item])
+            hooks._normalize_image_generation_result_status(item)
+            self.assertEqual(item["status"], "generating")
+            self.assertFalse((Path(codex_home) / "generated_images").exists())
+
+    def test_image_generation_stream_attaches_path_inside_responses_done_event(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            chunk = {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "ig_nested",
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "result": VALID_IMAGE_RESULT,
+                },
+            }
+            delivered = hooks._image_generation_stream_chunks_for_delivery(
+                chunk,
+                {"call_type": "aresponses", "client_metadata": {"headers": {"session-id": "thread-nested"}}},
+            )
+            saved_path = Path(delivered[0]["item"]["saved_path"])
+            self.assertEqual(
+                saved_path,
+                Path(codex_home) / "generated_images" / "thread-nested" / "ig_nested.png",
+            )
+            self.assertEqual(saved_path.read_bytes(), base64.b64decode(VALID_IMAGE_RESULT))
+
+    def test_image_generation_stream_attaches_path_to_sse_json_frame(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            frame = (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "id": "ig_sse",
+                            "type": "image_generation_call",
+                            "status": "completed",
+                            "result": VALID_IMAGE_RESULT,
+                        },
+                    }
+                )
+                + "\n\n"
+            )
+            delivered = hooks._image_generation_stream_chunks_for_delivery(
+                frame,
+                {"call_type": "aresponses", "client_metadata": {"headers": {"session-id": "thread-sse"}}},
+            )
+            payload = json.loads(delivered[0].split("data: ", 1)[1])
+            saved_path = Path(payload["item"]["saved_path"])
+            self.assertEqual(
+                saved_path,
+                Path(codex_home) / "generated_images" / "thread-sse" / "ig_sse.png",
+            )
+            self.assertEqual(saved_path.read_bytes(), base64.b64decode(VALID_IMAGE_RESULT))
+
+    def test_image_generation_stream_preserves_multiple_sse_events_when_attaching_path(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            frame = (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "id": "ig_multi",
+                            "type": "image_generation_call",
+                            "status": "completed",
+                            "result": VALID_IMAGE_RESULT,
+                        },
+                    }
+                )
+                + "\n\n"
+                + "data: "
+                + json.dumps({"type": "response.output_text.delta", "delta": "kept"})
+                + "\n\n"
+            )
+            delivered = hooks._image_generation_stream_chunks_for_delivery(
+                frame,
+                {"call_type": "aresponses", "client_metadata": {"headers": {"session-id": "thread-multi"}}},
+            )[0]
+            frames = [line for line in delivered.splitlines() if line.startswith("data:")]
+            self.assertEqual(len(frames), 2)
+            image_payload = json.loads(frames[0].split("data: ", 1)[1])
+            text_payload = json.loads(frames[1].split("data: ", 1)[1])
+            self.assertTrue(Path(image_payload["item"]["saved_path"]).is_file())
+            self.assertEqual(text_payload, {"type": "response.output_text.delta", "delta": "kept"})
+
+    def test_image_generation_stream_rewrites_stale_markdown_path_after_result(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            request_data = {
+                "call_type": "aresponses",
+                "client_metadata": {"headers": {"session-id": "thread-rewrite"}},
+            }
+            saved_paths: list[str] = []
+            image_chunk = hooks._image_generation_stream_chunks_for_delivery(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "id": "ig_rewrite",
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "result": VALID_IMAGE_RESULT,
+                    },
+                },
+                request_data,
+                saved_paths,
+            )[0]
+            saved_path = image_chunk["item"]["saved_path"]
+            stale_link = (
+                "![参考图](/synthetic/codex/generated_images/unknown-session/"
+                "image-generation.png)"
+            )
+            text_chunk = hooks._image_generation_stream_chunks_for_delivery(
+                {
+                    "type": "response.output_text.delta",
+                    "delta": stale_link,
+                },
+                request_data,
+                saved_paths,
+            )[0]
+            self.assertEqual(text_chunk["delta"], f"![参考图]({saved_path})")
+            self.assertTrue(Path(saved_path).is_file())
+
+    def test_image_generation_stream_adds_reference_when_message_has_no_image_link(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            request_data = {
+                "call_type": "aresponses",
+                "client_metadata": {"headers": {"session-id": "thread-append"}},
+            }
+            saved_paths: list[str] = []
+            image_chunk = hooks._image_generation_stream_chunks_for_delivery(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "id": "ig_append",
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "result": VALID_IMAGE_RESULT,
+                    },
+                },
+                request_data,
+                saved_paths,
+            )[0]
+            saved_path = image_chunk["item"]["saved_path"]
+            message_chunk = hooks._image_generation_stream_chunks_for_delivery(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "已生成。"}],
+                    },
+                },
+                request_data,
+                saved_paths,
+            )[0]
+            self.assertEqual(
+                message_chunk["item"]["content"][0]["text"],
+                f"已生成。\n\n![Generated image]({saved_path})",
+            )
+
+    def test_image_generation_stream_attaches_path_to_model_dump_chunk(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            payload = {
+                "type": "response.output_item.done",
+                "item": {
+                    "id": "ig_model",
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "result": VALID_IMAGE_RESULT,
+                },
+            }
+
+            class ModelChunk:
+                def model_dump(self):
+                    return payload
+
+            delivered = hooks._image_generation_stream_chunks_for_delivery(
+                ModelChunk(),
+                {"call_type": "aresponses", "client_metadata": {"headers": {"session-id": "thread-model"}}},
+            )
+            saved_path = Path(delivered[0]["item"]["saved_path"])
+            self.assertEqual(
+                saved_path,
+                Path(codex_home) / "generated_images" / "thread-model" / "ig_model.png",
+            )
+            self.assertEqual(saved_path.read_bytes(), base64.b64decode(VALID_IMAGE_RESULT))
+
+    async def test_streaming_hook_delivers_saved_path_for_responses_session(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            async def upstream_stream():
+                yield {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "ig_hook",
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "result": VALID_IMAGE_RESULT,
+                    },
+                }
+                yield {
+                    "type": "response.output_text.delta",
+                    "delta": (
+                        "![参考图](/synthetic/codex/generated_images/unknown-session/"
+                        "image-generation.png)"
+                    ),
+                }
+
+            request_data = {
+                "call_type": "aresponses",
+                "model": "default-chat",
+                "input": "generate an image",
+                "stream": True,
+                "litellm_params": {
+                    "metadata": {"headers": {"session-id": "thread-hook"}},
+                },
+            }
+            chunks = [
+                chunk
+                async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=None,
+                    response=upstream_stream(),
+                    request_data=request_data,
+                )
+            ]
+            delivered = jsonable_stream_chunk(chunks[0])
+            saved_path = Path(delivered["item"]["saved_path"])
+            self.assertEqual(
+                saved_path,
+                Path(codex_home) / "generated_images" / "thread-hook" / "ig_hook.png",
+            )
+            self.assertEqual(saved_path.read_bytes(), base64.b64decode(VALID_IMAGE_RESULT))
+            self.assertEqual(
+                jsonable_stream_chunk(chunks[1])["delta"],
+                f"![参考图]({saved_path})",
+            )
 
     async def test_responses_api_image_generation_tool_does_not_use_static_capability_filter(self) -> None:
         hooks, _ = load_hook_module()
@@ -761,7 +1059,7 @@ class HookImageRoutingTests(HookTestCase):
                     "output": [
                         {
                             "type": "image_generation_call",
-                            "result": "base64-image",
+                            "result": VALID_IMAGE_RESULT,
                         }
                     ]
                 }

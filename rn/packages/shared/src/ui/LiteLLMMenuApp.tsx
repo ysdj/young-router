@@ -1,10 +1,10 @@
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState, useContext } from "react";
 import { AppState, FlatList, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
-import { assistantSettingOptions, codexFeatureLabel, localizeCodexValidationMessage, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
+import { assistantSettingOptions, localizeCodexValidationMessage, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
 import { canonicalWindowRoute, LOG_TABS, routeMenuActions, ROUTES } from "../routes";
-import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeSplitView, NativeTable, NativeTextField } from "./NativeControls";
+import { NativeButton, NativeCheckbox, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField } from "./NativeControls";
 import { CODE_EDITOR_HTML, CodeEditorWebView } from "./code-editor/CodeEditorWebView";
 import { NativeFormRow, NativeWizardProgress, normalizeRelayOrigin, relayNavigationItems, RelayAccountManager, stationOriginKey } from "./RelayAccountManager";
 import { suggestedRelayStationName } from "./relayOrigin";
@@ -37,7 +37,7 @@ type NativeSecretClear = (options: {
   target?: string;
 }) => Promise<void>;
 type SecretState = { revision: number; present: boolean; status: string; error: string; commitRequest: number };
-type PendingField = { commit: () => void | Promise<void>; reset: () => void; isDirty?: () => boolean };
+type PendingField = { commit: () => void | Promise<void>; reset: () => void; isDirty?: () => boolean; flushBeforeAssistantEditor?: boolean };
 type PendingFieldRegistry = {
   register: (id: symbol, field?: PendingField) => void;
   setDirty: (id: symbol, dirty: boolean) => void;
@@ -57,12 +57,17 @@ type ProviderWorkspaceDraftProjection = {
   setProviderKeyNameDraft: (providerID: string, keyID: string, value: string) => void;
 };
 type ServiceOperation = "start" | "stop" | "restart" | "reload" | "health";
-type AssistantSettingsDomain = "codex" | "claude";
-type EditableDiskDomain = AssistantSettingsDomain | "providers_models" | "runtime" | "webdav";
+type EditableDiskDomain = "codex" | "claude" | "providers_models" | "runtime" | "webdav";
 type RawEditorConflictResolution = "reload" | "keep";
+type AssistantSettingsDomain = "codex" | "claude";
 type RawEditorConflictHandler = (domain: AssistantSettingsDomain, document: RawEditorDocument) => Promise<RawEditorConflictResolution>;
 type RawEditorDocument = "config" | "auth" | "settings" | "desktop" | "developer";
-type ClaudeDeploymentDraft = { model: string; base_url: string };
+type AssistantFileTarget = {
+  domain: AssistantSettingsDomain;
+  document: RawEditorDocument;
+  language: "toml" | "json";
+  label: string;
+};
 type DataManagementTab = "import" | "export" | "webdav";
 type WebDavSyncAction = "sync" | "push" | "pull";
 
@@ -145,8 +150,8 @@ const ROUTE_TRACE_REQUEST_ROW_HEIGHT = 70;
 const ROUTE_TRACE_SCROLL_IDLE_MS = 150;
 const ROUTE_TRACE_TIMELINE_MIN_WIDTH = 400;
 const ROUTE_TRACE_SCROLLBAR_MIN_THUMB_WIDTH = 32;
-const SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH = 420;
 const WEBDAV_FORM_LABEL_WIDTH = 108;
+const SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH = 360;
 const SETTINGS_STRUCTURED_SCROLLBAR_GUTTER = 18;
 const COLUMN_GAP = 8;
 const DSH_VISION_ROUTER_QUICK_KEYS = [
@@ -502,15 +507,6 @@ function isSettingsRoute(route: AppRoute): boolean {
 
 function isEditableDiskDomain(value: ConfigDomain | undefined): value is EditableDiskDomain {
   return value === "providers_models" || value === "codex" || value === "claude" || value === "runtime" || value === "webdav";
-}
-
-function claudeDeploymentFromSnapshot(snapshot: CoreSnapshot | undefined): ClaudeDeploymentDraft {
-  const settings = asRecord(domainState(snapshot, "claude").settings);
-  return { model: stringValue(settings.model), base_url: stringValue(settings.gateway_url) };
-}
-
-function sameClaudeDeployment(left: ClaudeDeploymentDraft, right: ClaudeDeploymentDraft): boolean {
-  return left.model === right.model && left.base_url === right.base_url;
 }
 
 function ensureSelectedOption(options: AssistantSettingOption[], value: string): AssistantSettingOption[] {
@@ -940,18 +936,20 @@ function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: 
 
 function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onNavigate, onClose }: { route: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; nativeAction?: { id: string; sequence: number }; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void }): React.JSX.Element {
   const settingsRoute = isAssistantSettingsRoute(route);
-  const [settingsTab, setSettingsTab] = useState<AssistantSettingsDomain>(route === "claude-settings" ? "claude" : "codex");
   const [serviceProviderSelection, setServiceProviderSelection] = useState<string>();
+  const [serviceProviderRemoveRequest, setServiceProviderRemoveRequest] = useState(0);
   const serviceProviderAddButtonRef = useRef<HostInstance | null>(null);
-  const [claudeDeploymentDraft, setClaudeDeploymentDraft] = useState<ClaudeDeploymentDraft>();
-  const claudeDeploymentDraftRef = useRef<ClaudeDeploymentDraft | undefined>(undefined);
-  const domain = settingsRoute ? settingsTab : domainForRoute(route);
+  // The Codex and Claude settings routes are aliases for one shared surface.
+  // Both domains stay visible and staged together, so there is no active tab
+  // that can hide the other assistant's draft.
+  const domain = settingsRoute ? undefined : domainForRoute(route);
   const [busy, setBusy] = useState(false);
   const [webDavOperationBusy, setWebDavOperationBusy] = useState(false);
   const [result, setResult] = useState<string>();
   const [issues, setIssues] = useState<ValidationSummary["issues"]>([]);
   const [settingsRawReloadToken, setSettingsRawReloadToken] = useState(0);
   const [settingsRawBaselineToken, setSettingsRawBaselineToken] = useState(0);
+  const [activeAssistantFile, setActiveAssistantFile] = useState<AssistantFileTarget>();
   const [dataManagementStatuses, setDataManagementStatuses] = useState<Partial<Record<DataManagementTab, string>>>({});
   const [keptDiskGeneration, setKeptDiskGeneration] = useState<Partial<Record<EditableDiskDomain, number>>>({});
   const promptedDiskGeneration = useRef<Partial<Record<EditableDiskDomain, number>>>({});
@@ -967,11 +965,9 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const pendingFields = useRef(new Map<symbol, PendingField>());
   const [, forcePendingFieldDirtyRender] = useState(0);
   const pendingFieldDirtyIdsRef = useRef<ReadonlySet<symbol>>(new Set());
-  const claudeDeployment = claudeDeploymentDraft ?? claudeDeploymentFromSnapshot(snapshot);
-  const hasClaudeDeploymentChanges = (currentSnapshot: CoreSnapshot | undefined): boolean => !sameClaudeDeployment(
-    claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(currentSnapshot),
-    claudeDeploymentFromSnapshot(currentSnapshot),
-  );
+  useEffect(() => {
+    if (!settingsRoute) setActiveAssistantFile(undefined);
+  }, [settingsRoute]);
   // Relay CRUD and linked imports are one coordinated draft. The relay route
   // therefore applies both domains together whenever either side is dirty.
   const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {
@@ -1013,17 +1009,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     }
   }, [snapshot]);
 
-  useEffect(() => {
-    if (isAssistantSettingsRoute(route)) {
-      setSettingsTab(route === "claude-settings" ? "claude" : "codex");
-      claudeDeploymentDraftRef.current = undefined;
-      setClaudeDeploymentDraft(undefined);
-    } else {
-      claudeDeploymentDraftRef.current = undefined;
-      setClaudeDeploymentDraft(undefined);
-    }
-  }, [route]);
-
   const serviceProviderRows = useMemo(() => {
     const statusLabels: Record<ProviderAuthStatus, string> = {
       signed_out: translate("providers.authStatusSignedOut"),
@@ -1056,6 +1041,15 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     if (serviceProviderSelection && serviceProviderRows.some((row) => row.key === serviceProviderSelection)) return;
     setServiceProviderSelection(serviceProviderRows[0]?.key);
   }, [route, serviceProviderRows, serviceProviderSelection]);
+  const selectedOfficialServiceProvider = serviceProviderSelection?.startsWith("provider:")
+    ? serviceProviderRecords(snapshot).find((provider) => editorIdentifier(provider) === serviceProviderSelection.slice("provider:".length))
+    : undefined;
+  const serviceProviderRemoveTitle = selectedOfficialServiceProvider
+    ? translate("relay.officialProviderDelete")
+    : translate("relay.removeLocal");
+  const serviceProviderRemoveDisabled = busy
+    || !serviceProviderSelection
+    || (selectedOfficialServiceProvider !== undefined && providerAuthStatus(selectedOfficialServiceProvider) === "authorizing");
 
   const refresh = async (): Promise<CoreSnapshot> => {
     const next = await ipc.snapshot();
@@ -1219,9 +1213,34 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     }
   };
   const flushPendingFields = async (): Promise<void> => {
-    await Promise.all([...pendingFields.current.values()].map((field) => field.commit()));
+    // Text fields and native secret fields advance the same Core revision, but
+    // native secret commits use a separate host bridge. Waiting for each field
+    // before starting the next one prevents a secret capability from becoming
+    // stale while another pending field is being dispatched.
+    for (const field of [...pendingFields.current.values()]) {
+      await field.commit();
+    }
     await dispatchQueue.current;
     if (lastDispatchError.current !== undefined) throw lastDispatchError.current;
+  };
+  const flushAssistantEditorFields = async (): Promise<void> => {
+    const fields = [...pendingFields.current.values()].filter((field) => (
+      field.flushBeforeAssistantEditor === true && field.isDirty?.() === true
+    ));
+    if (fields.length === 0) return;
+    for (const field of fields) {
+      await field.commit();
+    }
+    await dispatchQueue.current;
+    if (lastDispatchError.current !== undefined) throw lastDispatchError.current;
+  };
+  const openAssistantFile = (target: AssistantFileTarget): void => {
+    // Native button actions can run before the focused AppKit field emits its
+    // blur. Commit React-owned text drafts first so the first editor render
+    // already includes every structured UI change for that document.
+    void flushAssistantEditorFields()
+      .then(() => setActiveAssistantFile(target))
+      .catch((reason: unknown) => setResult(errorMessage(reason, translate)));
   };
   const hasPendingFieldEdits = useCallback((): boolean => pendingFieldDirtyIdsRef.current.size > 0
     || [...pendingFields.current.values()].some((field) => field.isDirty?.() === true), []);
@@ -1236,8 +1255,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const routeHasStagedChanges = useCallback((currentSnapshot: CoreSnapshot | undefined): boolean => (
     stagedDomainsForRoute(currentSnapshot).length > 0
     || hasPendingFieldEdits()
-    || (settingsRoute && hasClaudeDeploymentChanges(currentSnapshot))
-  ), [hasPendingFieldEdits, settingsRoute, stagedDomainsForRoute]);
+  ), [hasPendingFieldEdits, stagedDomainsForRoute]);
   const monitoredDiskDomains = useMemo<EditableDiskDomain[]>(() => {
     if (!isSettingsRoute(route)) return [];
     if (settingsRoute) return ["codex", "claude"];
@@ -1321,19 +1339,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     };
   }, [busy, domain, hasPendingFieldEdits, ipc, monitoredDiskDomains, native, onSnapshot, snapshot?.disk.codex?.generation, snapshot?.disk.claude?.generation, snapshot?.disk.providers_models?.generation, snapshot?.disk.runtime?.generation, snapshot?.disk.webdav?.generation, translate]);
   const discardPendingFields = (): void => pendingFields.current.forEach((field) => field.reset());
-  const switchSettingsTab = (next: AssistantSettingsDomain): void => {
-    if (next === settingsTab) return;
-    const previous = settingsTab;
-    // Start pending commits before changing the tree so the focused field is
-    // not discarded, but change the tab immediately so the native segmented
-    // control never appears inert while an IPC write is in flight.
-    const pending = flushPendingFields();
-    setSettingsTab(next);
-    void pending.catch((reason: unknown) => {
-      setSettingsTab(previous);
-      setResult(errorMessage(reason, translate));
-    });
-  };
   const reload = (reloadDomain = domain): Promise<void> => {
     if (!reloadDomain) return Promise.resolve();
     if (reloadDomain === domain) discardPendingFields();
@@ -1343,10 +1348,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       // Core invalidates editor revisions when a domain reloads. Make both raw
       // Codex editors fetch fresh documents only after that reload succeeds.
       if (reloadDomain === "codex" || reloadDomain === "claude") setSettingsRawBaselineToken((current) => current + 1);
-      if (reloadDomain === "claude") {
-        claudeDeploymentDraftRef.current = undefined;
-        setClaudeDeploymentDraft(undefined);
-      }
       if (isEditableDiskDomain(reloadDomain)) {
         setKeptDiskGeneration((current) => ({ ...current, [reloadDomain]: undefined }));
       }
@@ -1363,7 +1364,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     const useLatest = await native.showConfirmation({
       title: translate(diskChanged ? "settings.diskChangedTitle" : "settings.editorChangedTitle"),
       message: translate(diskChanged ? "settings.diskChangedBody" : "settings.editorChangedBody"),
-      confirmLabel: translate("menu.reload"),
+      confirmLabel: translate("settings.useDisk"),
     });
     if (useLatest) {
       if (diskChanged) {
@@ -1385,7 +1386,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     return "keep";
   }, [ipc, native, onSnapshot, translate]);
   const apply = (): Promise<void> => {
-    if ((route !== "relay-accounts" && !domain) || domain === "logs") return Promise.resolve();
+    if ((!settingsRoute && route !== "relay-accounts" && !domain) || domain === "logs") return Promise.resolve();
     return run(async () => {
       await flushPendingFields();
       // Inline relay edits stage through the shared dispatch queue when their
@@ -1424,10 +1425,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
           const reloaded = await ipc.dispatch({ type: "service.reload" }, result.revision);
           revision.current = reloaded.revision;
         }
-      }
-      if (domains.includes("claude")) {
-        claudeDeploymentDraftRef.current = undefined;
-        setClaudeDeploymentDraft(undefined);
       }
       if (diskConflicts.length > 0) setKeptDiskGeneration({});
       return result;
@@ -1496,10 +1493,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       }
     }
     if (domains.includes("codex") || domains.includes("claude")) setSettingsRawBaselineToken((current) => current + 1);
-    if (domains.includes("claude")) {
-      claudeDeploymentDraftRef.current = undefined;
-      setClaudeDeploymentDraft(undefined);
-    }
     if (diskConflicts.length > 0) setKeptDiskGeneration({});
     return applied;
   }, "common.applied");
@@ -1640,10 +1633,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const closeRoute = (): void => {
     // Keep the React route close independent from the native window registry.
     // A stale/missing native window must not strand the route on screen.
-    if (settingsRoute) {
-      claudeDeploymentDraftRef.current = undefined;
-      setClaudeDeploymentDraft(undefined);
-    }
     if (route === "data-management") importPlanToken.current = undefined;
     if (route === "provider-wizard" && Platform.OS === "windows") {
       // Windows currently owns one React host window. Restore the parent
@@ -1691,9 +1680,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
           return;
         }
         discardPendingFields();
-        if (settingsRoute) {
-          claudeDeploymentDraftRef.current = undefined;
-        }
         closeRoute();
         for (const name of dirtyDomains) {
           try {
@@ -1722,7 +1708,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   }, [nativeAction?.sequence]);
   const definition = ROUTES.find((item) => item.id === route);
   const windowTitle = settingsRoute
-    ? translate(settingsTab === "claude" ? "card.claudeSettings" : "card.codexSettings")
+    ? translate("menu.codex")
     : translate(definition?.titleKey ?? "app.title");
   const providerWizardProviders = useMemo(() => {
     const state = domainState(snapshot, "providers_models");
@@ -1732,7 +1718,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   }, [snapshot]);
   const providerWizardRelaySources = useMemo(() => relaySourcesFromSnapshot(snapshot), [snapshot]);
  const providerWizardRelayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
-  const renderRelayManager = (options: { setupOnly: boolean; hideNavigation?: boolean; selectedNavigationKey?: string; onNavigationSelectionChange?: (key: string) => void }): React.JSX.Element => (
+  const renderRelayManager = (options: { setupOnly: boolean; hideNavigation?: boolean; selectedNavigationKey?: string; onNavigationSelectionChange?: (key: string) => void; removeRequest?: number }): React.JSX.Element => (
 <RelayAccountManager visible setupOnly={options.setupOnly} hideNavigation={options.hideNavigation} selectedNavigationKey={options.selectedNavigationKey} onNavigationSelectionChange={options.onNavigationSelectionChange} snapshot={snapshot} native={native} busy={busy} translate={translate} onClose={closeRoute} onStatus={setResult} commit={commitRelayMetadata} detectType={async (origin) => {
       const staged = await enqueueDispatch("account.detect_type", { origin }, "relay_accounts");
       revision.current = staged.revision;
@@ -1785,7 +1771,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       detach: async (accountId, resourceId) => {
         await commitRelayMetadata("api_key.detach", { account_id: accountId, resource_id: resourceId }, "relay_accounts");
       },
-    }} addAccount={async (type, origin, rememberPassword, stationOptions = {}) => {
+    }} removeRequest={options.removeRequest} addAccount={async (type, origin, rememberPassword, stationOptions = {}) => {
       const before = await refresh();
       const beforeRelay = asRecord(before.domains.relay_accounts);
       const beforeRelayState = asRecord(beforeRelay.state);
@@ -1833,22 +1819,20 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     {route === "providers-models" || route === "provider-wizard" || settingsRoute || route === "logs" || route === "relay-accounts" || route === "relay-add" || route === "runtime-settings" || route === "data-management" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.settingsContent, route === "logs" && styles.logsContent, (route === "relay-accounts" || route === "relay-add") && styles.relayAccountsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} /> : null}
-    {settingsRoute ? <><View style={styles.settingsTabBar}><WindowTabs values={[{ id: "codex", title: "Codex" }, { id: "claude", title: "Claude" }]} selected={settingsTab} disabled={busy} onSelect={(next) => switchSettingsTab(next as AssistantSettingsDomain)} style={styles.settingsTabs} /></View>{settingsTab === "codex" ? <CodexWorkspace snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onEditorConflict={resolveRawEditorConflict} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} /> : <ClaudeScreen snapshot={snapshot} ipc={ipc} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onEditorConflict={resolveRawEditorConflict} deployment={claudeDeployment} onDeploymentChange={(key, value) => {
-      const next = { ...(claudeDeploymentDraftRef.current ?? claudeDeploymentFromSnapshot(snapshot)), [key]: value };
-      claudeDeploymentDraftRef.current = next;
-      setClaudeDeploymentDraft(next);
-      return enqueueDispatch("patch_deployment", { [key]: value }, "claude").then(() => {
-        setSettingsRawReloadToken((current) => current + 1);
-      });
-    }} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} />}</> : null}
+    {settingsRoute ? <AssistantSettingsWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "relay-accounts" ? <View style={serviceProviderStyles.workspace}>
       <View style={serviceProviderStyles.unifiedHeader}>
-        <View style={serviceProviderStyles.intro}><Text style={serviceProviderStyles.heading}>{translate("route.relayAccounts")}</Text><Text style={serviceProviderStyles.hint}>{translate("relay.officialAccountsHint")}</Text></View>
-        <NativeButton ref={serviceProviderAddButtonRef} title="" symbol="plus" compact toolTip={translate("relay.chooseProviderType")} accessibilityLabel={translate("relay.chooseProviderType")} primary disabled={busy} onPress={openServiceProviderAddMenu} />
+        <View style={serviceProviderStyles.intro}><Text style={serviceProviderStyles.heading}>{translate("route.relayAccounts")}</Text></View>
       </View>
       <View style={serviceProviderStyles.columns}>
         <View style={serviceProviderStyles.listPane}>
+          <View style={serviceProviderStyles.listToolbar}>
+            <View style={serviceProviderStyles.listActions}>
+              <NativeButton ref={serviceProviderAddButtonRef} title="" symbol="plus" compact toolTip={translate("relay.chooseProviderType")} accessibilityLabel={translate("relay.chooseProviderType")} primary disabled={busy} onPress={openServiceProviderAddMenu} style={serviceProviderStyles.listActionButton} />
+              <NativeButton title="" symbol="minus" compact destructive toolTip={serviceProviderRemoveTitle} accessibilityLabel={serviceProviderRemoveTitle} disabled={serviceProviderRemoveDisabled} onPress={() => setServiceProviderRemoveRequest((current) => current + 1)} style={serviceProviderStyles.listActionButton} />
+            </View>
+          </View>
           <NativeTable
             columns={[{ label: translate("common.name"), width: 118 }, { label: translate("providers.authentication"), width: 72 }, { label: translate("common.status"), width: 78 }]}
             rows={serviceProviderRows}
@@ -1859,7 +1843,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
           />
         </View>
         <View style={serviceProviderStyles.detailPane}>
-          {serviceProviderSelection?.startsWith("provider:") ? <ServiceProviderManager snapshot={snapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onActivateAndRestart={activateProviderAndRestart} onStatus={setResult} onSecretState={onSecretState} hideNavigation selectedNavigationKey={serviceProviderSelection} onNavigationSelectionChange={setServiceProviderSelection} /> : serviceProviderSelection?.startsWith("relay:") ? renderRelayManager({ setupOnly: false, hideNavigation: true, selectedNavigationKey: serviceProviderSelection, onNavigationSelectionChange: setServiceProviderSelection }) : <View style={serviceProviderStyles.emptyDetail}><Text style={serviceProviderStyles.detailTitle}>{translate("route.relayAccounts")}</Text><Text style={serviceProviderStyles.hint}>{translate("relay.empty")}</Text></View>}
+          {serviceProviderSelection?.startsWith("provider:") ? <ServiceProviderManager snapshot={snapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onActivateAndRestart={activateProviderAndRestart} onStatus={setResult} onSecretState={onSecretState} hideNavigation selectedNavigationKey={serviceProviderSelection} onNavigationSelectionChange={setServiceProviderSelection} removeRequest={serviceProviderRemoveRequest} /> : serviceProviderSelection?.startsWith("relay:") ? renderRelayManager({ setupOnly: false, hideNavigation: true, selectedNavigationKey: serviceProviderSelection, onNavigationSelectionChange: setServiceProviderSelection, removeRequest: serviceProviderRemoveRequest }) : <View style={serviceProviderStyles.emptyDetail}><Text style={serviceProviderStyles.detailTitle}>{translate("route.relayAccounts")}</Text><Text style={serviceProviderStyles.hint}>{translate("relay.empty")}</Text></View>}
         </View>
       </View>
     </View> : null}
@@ -1962,6 +1946,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
     </View> : null}
     {route === "relay-accounts" ? <DialogFooter compact borderless status={result}><ActionButton title={translate("menu.close")} onPress={requestClose} /><ActionButton primary title={translate("menu.apply")} disabled={busy || !routeHasStagedChanges(actionSnapshot)} onPress={apply} /></DialogFooter> : route !== "logs" && route !== "relay-add" && route !== "provider-wizard" && route !== "data-management" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || !routeHasStagedChanges(actionSnapshot)} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
+    {settingsRoute ? <AssistantFileEditorDialog target={activeAssistantFile} ipc={ipc} busy={busy} translate={translate} onEditorConflict={resolveRawEditorConflict} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} syncRevision={activeAssistantFile ? snapshot?.revision : undefined} onFlushPendingFields={flushPendingFields} onClose={() => setActiveAssistantFile(undefined)} /> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -2004,7 +1989,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   return `${base} ${suffix}`;
 }
 
-function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, dispatchWithOutcome, onActivateAndRestart, onStatus, onSecretState, hideNavigation = false, selectedNavigationKey, onNavigationSelectionChange }: {
+function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, dispatchWithOutcome, onActivateAndRestart, onStatus, onSecretState, hideNavigation = false, selectedNavigationKey, onNavigationSelectionChange, removeRequest }: {
   snapshot?: CoreSnapshot;
   native: NativeLeafAdapter;
   busy: boolean;
@@ -2017,6 +2002,7 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
   hideNavigation?: boolean;
   selectedNavigationKey?: string;
   onNavigationSelectionChange?: (key: string) => void;
+  removeRequest?: number;
 }): React.JSX.Element {
   const providers = serviceProviderRecords(snapshot);
   const [localSelectedProviderID, setLocalSelectedProviderID] = useState<string>();
@@ -2044,6 +2030,7 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
   const modelName = model ? stringValue(model.display_name, stringValue(model.name, stringValue(model.upstream_model, translate("common.notAvailable")))) : translate("common.notAvailable");
   const providerID = selected ? editorIdentifier(selected) : "";
   const shownChallenge = useRef<Record<string, string>>({});
+  const handledRemoveRequest = useRef(removeRequest ?? 0);
 
   useEffect(() => {
     if (hideNavigation) return;
@@ -2123,6 +2110,12 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
     if (hideNavigation) onNavigationSelectionChange?.("");
     onStatus(undefined);
   };
+  useEffect(() => {
+    const request = removeRequest ?? 0;
+    if (request <= handledRemoveRequest.current) return;
+    handledRemoveRequest.current = request;
+    void deleteProvider();
+  }, [removeRequest, providerID]);
  const activateProvider = async (): Promise<void> => {
    if (!providerID || selectedKind !== "openai_login") return;
     const activated = await dispatchWithOutcome("service_provider.auth_activate", { provider_id: providerID }, "providers_models");
@@ -2172,7 +2165,6 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
             {selected ? <>
               {selectedKind === "openai_login" && status === "signed_in" && !active ? <NativeButton title={translate("relay.officialProviderActivate")} compact disabled={busy} onPress={() => { void activateProvider(); }} /> : null}
               <NativeButton title={authLabel} primary compact disabled={busy} onPress={() => { if (authAction === "service_provider.auth_start") void startLogin(); else void dispatch(authAction, { provider_id: providerID }, "providers_models"); }} />
-              <NativeButton title={translate("relay.officialProviderDelete")} compact disabled={busy || status === "authorizing"} onPress={() => { void deleteProvider(); }} />
             </> : null}
           </View>
           {selectedKind === "claude_login" && selected && (status === "unsupported" || status === "error") ? <NativeSecretField autoCommit label={translate("providers.authTypeClaude")} hint={translate("relay.officialProviderTokenHint")} busy={busy} disabled={busy} domain="providers_models" field="provider_auth_token" target={providerID} onSecretState={onSecretState} /> : null}
@@ -2625,27 +2617,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       ? providerBaseUrlDrafts[entryID]
       : stringValue(entry.endpoint, stringValue(entry.api_base));
   }, [providerBaseUrlDrafts]);
-  const autoRelaySelectionKeys = useRef(new Set<string>());
-  useEffect(() => {
-    const activeKeys = new Set<string>();
-    if (!busy) {
-      for (const entry of providers) {
-        if (stringValue(entry.provider_type, "custom") === "relay") continue;
-        const baseURL = stringValue(entry.endpoint, stringValue(entry.api_base)).trim();
-        const station = relayStationForBaseUrl(baseURL, relayStations);
-        if (!station) continue;
-        const providerID = editorIdentifier(entry);
-        const selectionKey = `${providerID}\x1f${station.id}\x1f${stationOriginKey(baseURL)}`;
-        activeKeys.add(selectionKey);
-        if (autoRelaySelectionKeys.current.has(selectionKey)) continue;
-        autoRelaySelectionKeys.current.add(selectionKey);
-        void dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id });
-      }
-    }
-    for (const selectionKey of autoRelaySelectionKeys.current) {
-      if (!activeKeys.has(selectionKey)) autoRelaySelectionKeys.current.delete(selectionKey);
-    }
-  }, [busy, dispatch, providers, relayStations]);
   const providerKeyDisplayName = useCallback((entryProviderID: string, keyID: string, fallback: string): string => {
     const draft = providerKeyNameDrafts[providerKeyDraftKey(entryProviderID, keyID)];
     return draft !== undefined
@@ -3368,304 +3339,189 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   </View>;
 }
 
-function CodexWorkspace({ snapshot, ipc, busy, translate, dispatch, onSecretState, onEditorConflict, rawReloadToken, rawBaselineToken }: { snapshot?: CoreSnapshot; ipc: IpcClient; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onEditorConflict: RawEditorConflictHandler; rawReloadToken: number; rawBaselineToken: number }): React.JSX.Element {
+function CodexWorkspace({ snapshot, busy, translate, dispatch, onSecretState }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void }): React.JSX.Element {
   const state = domainState(snapshot, "codex");
   const structured = asRecord(state.structured);
-  const permissions = asRecord(structured.permissions);
-  const providers = asRecords(structured.providers);
+  const providerRows = asRecords(structured.providers).map(editableRecord);
   const deployments = asRecords(state.models);
   const deploymentModels = [...new Set(deployments.map((item) => stringValue(item.model)).filter(Boolean))];
-  const [selectedProvider, setSelectedProvider] = useState<string>();
-  const [providerFieldDrafts, setProviderFieldDrafts] = useState<Record<string, Partial<Record<"id" | "name", string>>>>({});
-  const providerFieldDraftsRef = useRef(providerFieldDrafts);
-  providerFieldDraftsRef.current = providerFieldDrafts;
-  const [modelDraft, setModelDraft] = useState<string>();
-  const providerRows = providers.map(editableRecord);
-  const setProviderFieldDraft = useCallback((providerID: string, field: "id" | "name", value: string): void => {
-    const current = providerFieldDraftsRef.current;
-    if (current[providerID]?.[field] === value) return;
-    const updated = { ...current, [providerID]: { ...current[providerID], [field]: value } };
-    providerFieldDraftsRef.current = updated;
-    setProviderFieldDrafts(updated);
-  }, []);
-  const providerDisplayID = useCallback((entry: UnknownRecord): string => {
-    const providerID = identifier(entry);
-    return providerFieldDrafts[providerID]?.id ?? providerID;
-  }, [providerFieldDrafts]);
-  const providerDisplayName = useCallback((entry: UnknownRecord): string => {
-    const providerID = identifier(entry);
-    return providerFieldDrafts[providerID]?.name ?? stringValue(entry.name);
-  }, [providerFieldDrafts]);
   const directProvider = stringValue(structured.model_provider);
-  const selectedProviderID = selectedProvider ?? directProvider;
-  const provider = providerRows.find((item) => identifier(item) === selectedProviderID)
-    ?? providerRows.find((item) => providerDisplayID(item) === selectedProviderID)
-    ?? providerRows[0];
-  const directBaseUrl = stringValue(structured.openai_base_url);
+  const provider = providerRows.find((item) => identifier(item) === directProvider);
+  const [modelDraft, setModelDraft] = useState<string>();
   const displayedModel = modelDraft ?? stringValue(structured.model);
+  const gateway = directProvider === "openai"
+    ? stringValue(structured.openai_base_url)
+    : stringValue(provider?.base_url);
+
   useEffect(() => {
-    setProviderFieldDrafts((current) => {
-      let next = current;
-      for (const [draftID, draft] of Object.entries(current)) {
-        const entry = providerRows.find((item) => identifier(item) === draftID)
-          ?? (draft.id !== undefined ? providerRows.find((item) => identifier(item) === draft.id) : undefined);
-        if (!entry) {
-          if (next === current) next = { ...current };
-          delete next[draftID];
-          continue;
-        }
-        const persistedID = identifier(entry);
-        const persistedName = stringValue(entry.name);
-        const remainingID = draft.id !== undefined && draft.id !== persistedID ? draft.id : undefined;
-        const remainingName = draft.name !== undefined && draft.name !== persistedName ? draft.name : undefined;
-        if (remainingID === undefined && remainingName === undefined) {
-          if (next === current) next = { ...current };
-          delete next[draftID];
-          continue;
-        }
-        const nextDraft = {
-          ...(remainingID !== undefined ? { id: remainingID } : {}),
-          ...(remainingName !== undefined ? { name: remainingName } : {}),
-        };
-        if (persistedID !== draftID) {
-          if (next === current) next = { ...current };
-          delete next[draftID];
-          next[persistedID] = { ...next[persistedID], ...nextDraft };
-        } else if (draft.id !== remainingID || draft.name !== remainingName) {
-          if (next === current) next = { ...current };
-          next[draftID] = nextDraft;
-        }
-      }
-      return next;
-    });
     setModelDraft((current) => current !== undefined && current === stringValue(structured.model) ? undefined : current);
-  }, [modelDraft, providerFieldDrafts, providerRows, structured.model]);
-  const providerOptions: AssistantSettingOption[] = [
-    { value: "", label: translate("common.none") },
-    ...[...new Set(["openai", directProvider, ...providerRows.map(identifier).filter(Boolean)])]
-      .filter(Boolean)
-      .map((value) => {
-        const configured = providerRows.find((item) => identifier(item) === value);
-        return { value, label: configured ? providerDisplayID(configured) : value };
-      }),
-  ];
-  const sandboxMode = stringValue(permissions.sandbox_mode);
-  const approvalPolicy = stringValue(permissions.approval_policy);
-  const [structuredWidth, setStructuredWidth] = useState(470);
-  const [workspaceWidth, setWorkspaceWidth] = useState(0);
-  const validationErrors = stringList(state.validation_errors);
-  const validationWarnings = stringList(state.warnings);
-  const validationStatus = Object.keys(state).length === 0
-    ? undefined
-    : validationErrors.length > 0
-      ? validationErrors.map((message) => localizeCodexValidationMessage(message, translate)).join("\n")
-      : validationWarnings.length > 0
-        ? validationWarnings.map((message) => localizeCodexValidationMessage(message, translate)).join("\n")
-        : undefined;
-  const validationStatusStyle = validationErrors.length > 0
-    ? styles.codexValidationError
-    : validationWarnings.length > 0
-      ? styles.codexValidationWarning
-      : undefined;
-  const selectDirectProvider = (nextProvider: string): void => {
-    if (!nextProvider) {
-      void dispatch("patch", { model_provider: null }).then(() => setSelectedProvider(undefined));
-      return;
+  }, [structured.model]);
+
+  const commitProvider = (nextProvider: string): Promise<void> => {
+    const normalized = nextProvider.trim();
+    if (!normalized) return dispatch("patch", { model_provider: null }, "codex");
+    const selected = providerRows.find((item) => identifier(item) === normalized);
+    const base_url = normalized === "openai" ? stringValue(structured.openai_base_url) : stringValue(selected?.base_url);
+    const patch: UnknownRecord = { model_provider: normalized };
+    if (normalized === "openai" || selected) {
+      patch.direct_connection = { provider: normalized, base_url };
     }
-    const configuredProvider = providerRows.find((item) => identifier(item) === nextProvider);
-    const base_url = nextProvider === "openai" ? stringValue(structured.openai_base_url) : stringValue(configuredProvider?.base_url);
-    void dispatch("patch", { model_provider: nextProvider, direct_connection: { provider: nextProvider, base_url } }).then(() => setSelectedProvider(configuredProvider ? nextProvider : undefined));
+    return dispatch("patch", patch, "codex");
   };
-  const patchProvider = (changes: UnknownRecord): Promise<void> => {
+
+  const commitGateway = (base_url: string): Promise<void> => {
+    if (directProvider === "openai") {
+      return dispatch("patch", { model_provider: "openai", direct_connection: { provider: "openai", base_url } }, "codex");
+    }
     if (!provider) return Promise.resolve();
-    const currentProviderId = identifier(provider);
-    const draft = providerFieldDraftsRef.current[currentProviderId] ?? {};
-    const nextProvider = {
-      ...provider,
-      ...(draft.id !== undefined ? { id: draft.id } : {}),
-      ...(draft.name !== undefined ? { name: draft.name } : {}),
-      ...changes,
-    };
-    const nextProviderId = identifier(nextProvider);
-    const patch: UnknownRecord = {
-      providers: providerRows.map((item) => identifier(item) === currentProviderId ? nextProvider : item),
-    };
-    if (currentProviderId === directProvider && nextProviderId !== currentProviderId) {
-      patch.model_provider = nextProviderId;
-      patch.direct_connection = { provider: nextProviderId, base_url: stringValue(asRecord(nextProvider).base_url) };
-    }
-    return dispatch("patch", patch).then(() => {
-      if (nextProviderId !== currentProviderId) setSelectedProvider(nextProviderId);
-    });
+    return dispatch("patch", { providers: providerRows.map((item) => identifier(item) === directProvider ? { ...item, base_url } : item) }, "codex");
   };
-  const addProvider = (): void => {
-    const existingIds = new Set(providerRows.map(identifier));
-    let suffix = 1;
-    while (existingIds.has(`provider-${suffix}`)) suffix += 1;
-    const id = `provider-${suffix}`;
-    void dispatch("patch", { providers: [...providerRows, { id, name: "", base_url: "", wire_api: "responses", auth_mode: "none" }] }).then(() => setSelectedProvider(id));
-  };
-  const deleteProvider = (): void => {
-    if (!provider) return;
-    const providerId = identifier(provider);
-    const patch: UnknownRecord = { providers: providerRows.filter((item) => identifier(item) !== providerId) };
-    if (providerId === directProvider) {
-      patch.model_provider = "openai";
-      patch.direct_connection = { provider: "openai", base_url: stringValue(structured.openai_base_url) };
-    }
-    void dispatch("patch", patch).then(() => setSelectedProvider(undefined));
-  };
-  const fileMissing = state.config_exists === false;
-  return <SettingsWorkspace validationStatus={validationStatus} validationStatusStyle={validationStatusStyle} structuredWidth={structuredWidth} onStructuredWidthChange={setStructuredWidth} workspaceWidth={workspaceWidth} onWorkspaceWidthChange={setWorkspaceWidth} translate={translate} missingMessage={fileMissing ? translate("settings.codexMissing") : undefined} structured={<>
-    <Section title={translate("codex.providers")}>
-      <View style={styles.form}>
-        <PickerField label={translate("codex.provider")} value={directProvider} values={providerOptions} disabled={busy} onSelect={selectDirectProvider} />
-        {directProvider === "openai" ? <TextField label={translate("codex.gateway")} value={directBaseUrl} disabled={busy} onCommit={(base_url) => dispatch("patch", { model_provider: "openai", direct_connection: { provider: "openai", base_url } })} /> : null}
-      </View>
-      <View style={styles.codexProviderEditor}>
-        <View style={styles.codexProviderToolbar}>
-          <Text style={styles.codexProviderToolbarTitle}>{`${translate("screen.configured")} ${translate("codex.providers")} (${providerRows.length})`}</Text>
-          <View style={styles.codexProviderActions}>
-            <NativeButton title={translate("common.add")} symbol="plus" toolTip={translate("common.add")} accessibilityLabel={translate("common.add")} compact primary disabled={busy} onPress={addProvider} style={styles.codexProviderActionButton} />
-            <NativeButton title={translate("common.delete")} symbol="minus" toolTip={translate("common.delete")} accessibilityLabel={translate("common.delete")} compact destructive disabled={busy || !provider} onPress={deleteProvider} style={styles.codexProviderActionButton} />
-          </View>
-      </View>
-      <View style={[styles.split, styles.codexProviderSplit]}>
-        <NativeTable columns={[{ label: translate("providers.providerId"), width: 116 }, { label: translate("providers.displayName"), width: 230 }, { label: translate("providers.authentication"), width: 84 }]} rows={providerRows.map((item) => ({ key: identifier(item), cells: [providerDisplayID(item), providerDisplayName(item), stringValue(item.auth_mode, "none")] }))} selectedKey={provider ? identifier(provider) : ""} onSelectionChange={setSelectedProvider} style={styles.codexListTable} />
-        <View style={styles.detailPane}>{provider ? <View key={`codex-provider:${identifier(provider)}`} style={styles.form}><TextField label={translate("providers.providerId")} value={providerDisplayID(provider)} onDraftChange={(value) => setProviderFieldDraft(identifier(provider), "id", value)} onCommit={(id) => patchProvider({ id })} /><TextField label={translate("providers.displayName")} value={providerDisplayName(provider)} onDraftChange={(value) => setProviderFieldDraft(identifier(provider), "name", value)} onCommit={(name) => patchProvider({ name })} /><TextField label={translate("providers.baseUrl")} value={stringValue(provider.base_url)} onCommit={(base_url) => patchProvider({ base_url })} /><PickerField label={translate("providers.protocol")} value={stringValue(provider.wire_api, "responses")} values={["responses"]} disabled={busy} onSelect={(wire_api) => patchProvider({ wire_api })} /><PickerField label={translate("providers.authentication")} value={stringValue(provider.auth_mode, "none")} values={["none", "env_key", "openai_auth", "command", "bearer"]} disabled={busy} onSelect={(auth_mode) => patchProvider({ auth_mode })} /><TextField label={translate("codex.environmentKey")} value={stringValue(provider.env_key)} onCommit={(env_key) => patchProvider({ env_key })} /><NativeCheckbox label={translate("providers.requiresOpenAIAuth")} value={booleanValue(provider.requires_openai_auth)} disabled={busy} onValueChange={(requires_openai_auth) => patchProvider({ requires_openai_auth })} /><TextField label={translate("providers.authCommand")} value={stringValue(provider.auth_command)} onCommit={(auth_command) => patchProvider({ auth_command })} /></View> : <EmptyState translate={translate} />}</View>
-      </View>
-      </View>
-    </Section>
-    <Section title={translate("codex.model")}><View style={styles.form}>
-      <PickerField label={translate("codex.activeDeployment")} value={displayedModel} values={deploymentModels.length > 0 ? deploymentModels : [{ value: "", label: translate("common.none") }]} disabled={busy || deploymentModels.length === 0} onSelect={(model) => { setModelDraft(model); const selection = deployments.find((item) => stringValue(item.model) === model); if (selection) dispatch("select_model", { selection: { model: selection.model, provider: selection.provider, deployment_id: selection.deployment_id } }); }} />
-      <TextField label={translate("common.model")} value={displayedModel} onDraftChange={setModelDraft} onCommit={(model) => dispatch("patch", { model })} />
-      <TextField label={translate("codex.reviewModel")} value={stringValue(structured.review_model)} onCommit={(review_model) => dispatch("patch", { review_model })} />
-    </View></Section>
-    <Section title={translate("codex.authentication")}><View style={styles.form}>
+
+  return <View style={assistantSettingsStyles.domainBody}>
+    <View style={assistantSettingsStyles.quickFields}>
+      <TextField label={translate("codex.provider")} value={directProvider} disabled={busy} onCommit={commitProvider} />
+      {deploymentModels.length > 0
+        ? <PickerField label={translate("common.model")} value={displayedModel} values={deploymentModels} disabled={busy} onSelect={(model) => {
+          setModelDraft(model);
+          const selection = deployments.find((item) => stringValue(item.model) === model);
+          if (selection) void dispatch("select_model", { selection: { model: selection.model, provider: selection.provider, deployment_id: selection.deployment_id } }, "codex");
+          else void dispatch("patch", { model }, "codex");
+        }} />
+        : <TextField label={translate("common.model")} value={displayedModel} disabled={busy} onDraftChange={setModelDraft} onCommit={(model) => dispatch("patch", { model }, "codex")} />}
+      <TextField label={translate("codex.gateway")} value={gateway} disabled={busy || !directProvider} onCommit={commitGateway} />
       <NativeSecretField plainText autoCommit label={translate("common.apiKey")} busy={busy} domain="codex" field="api_key" onSecretState={onSecretState} />
-    </View></Section>
-    <Section title={translate("codex.permissions")}><View style={styles.form}>
-      <SegmentedField label={translate("codex.permissionMode")} value={stringValue(permissions.mode, "unset")} values={assistantSettingOptions(["legacy", "profile", "unset"], translate)} disabled={busy} onSelect={(mode) => dispatch("patch", { permissions: { mode } })} />
-      <PickerField label={translate("codex.sandboxMode")} value={sandboxMode} values={[...new Set([sandboxMode, "read-only", "workspace-write", "danger-full-access"].filter(Boolean))]} disabled={busy || permissions.mode === "profile"} onSelect={(sandbox_mode) => dispatch("patch", { permissions: { sandbox_mode } })} />
-      <PickerField label={translate("codex.approvalPolicy")} value={approvalPolicy} values={[...new Set([approvalPolicy, "untrusted", "on-request", "never"].filter(Boolean))]} disabled={busy} onSelect={(approval_policy) => dispatch("patch", { permissions: { approval_policy } })} />
-      {hasBooleanSetting(permissions, "network_access") ? <ToggleRow label={translate("codex.network")} value={booleanValue(permissions.network_access)} disabled={busy} onChange={(network_access) => dispatch("patch", { permissions: { network_access } })} /> : null}
-      <TextField label={translate("codex.writableRoots")} value={stringList(permissions.writable_roots).join("\n")} multiline onCommit={(writable_roots) => dispatch("patch", { permissions: { writable_roots: splitLines(writable_roots) } })} />
-    </View></Section>
-    <Section title={translate("codex.features")}><FeatureToggles value={asRecord(structured.features)} disabled={busy} onChange={(features) => dispatch("patch", { features })} translate={translate} /></Section>
-  </>} raw={<><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("codex.rawToml")} domain="codex" document="config" language="toml" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("codex.rawAuth")} domain="codex" document="auth" language="json" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /></>} />;
+    </View>
+  </View>;
 }
 
-function SettingsWorkspace({ validationStatus, validationStatusStyle, structuredWidth, onStructuredWidthChange, workspaceWidth, onWorkspaceWidthChange, translate, missingMessage, structured, raw }: { validationStatus?: string; validationStatusStyle?: StyleProp<TextStyle>; structuredWidth: number; onStructuredWidthChange: (width: number) => void; workspaceWidth: number; onWorkspaceWidthChange: (width: number) => void; translate: Translate; missingMessage?: string; structured: React.ReactNode; raw: React.ReactNode }): React.JSX.Element {
-  const rawPaneMinimum = 344;
-  const minStructuredWidth = 360;
-  const [structuredViewportWidth, setStructuredViewportWidth] = useState(0);
-  const maxStructuredWidth = workspaceWidth > 0
-    ? Math.max(minStructuredWidth, Math.min(680, workspaceWidth - rawPaneMinimum))
-    : 470;
-  const paneWidth = Math.max(minStructuredWidth, Math.min(structuredWidth, maxStructuredWidth));
-  const hasStructuredHorizontalOverflow = structuredViewportWidth > 0 && structuredViewportWidth < SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH;
-  return <View style={styles.codexWorkspaceFrame} onLayout={({ nativeEvent }) => onWorkspaceWidthChange(nativeEvent.layout.width)}>{validationStatus ? <Text style={[styles.codexValidationStatus, validationStatusStyle]}>{validationStatus}</Text> : null}{missingMessage ? <Text style={styles.settingsMissingMessage}>{missingMessage}</Text> : null}<NativeSplitView paneWidth={paneWidth} minPaneWidth={minStructuredWidth} maxPaneWidth={maxStructuredWidth} onPaneWidthChange={(width) => onStructuredWidthChange(Math.max(minStructuredWidth, Math.min(width, maxStructuredWidth)))} style={styles.codexSplit}><View style={styles.codexStructuredPane}><Text style={styles.paneHeading}>{translate("settings.structured")}</Text><ScrollView style={styles.codexStructuredScroll} contentContainerStyle={[styles.codexStructured, hasStructuredHorizontalOverflow && styles.codexStructuredWithHorizontalScrollbar]} horizontal={false} alwaysBounceHorizontal={false} showsHorizontalScrollIndicator={hasStructuredHorizontalOverflow} showsVerticalScrollIndicator onLayout={({ nativeEvent }) => setStructuredViewportWidth(nativeEvent.layout.width)}><NativePersistentScrollIndicator style={styles.codexStructuredScrollIndicator} />{structured}</ScrollView></View><View style={styles.codexRawPane}><Text style={styles.paneHeading}>{translate("settings.rawLiveDraft")}</Text><View style={styles.codexRawEditors}>{raw}</View></View></NativeSplitView></View>;
+function SettingsWorkspace({ validationStatus, validationStatusStyle, translate, missingMessage, structured, files }: { validationStatus?: string; validationStatusStyle?: StyleProp<TextStyle>; translate: Translate; missingMessage?: string; structured: React.ReactNode; files: React.ReactNode }): React.JSX.Element {
+  return <View style={styles.codexWorkspaceFrame}>
+    {validationStatus ? <Text style={[styles.codexValidationStatus, validationStatusStyle]}>{validationStatus}</Text> : null}
+    {missingMessage ? <Text style={styles.settingsMissingMessage}>{missingMessage}</Text> : null}
+    <ScrollView style={styles.assistantSettingsScroll} contentContainerStyle={[styles.assistantSettingsScrollContent, assistantSettingsLayoutStyles.boundedContent]} horizontal={false} showsVerticalScrollIndicator showsHorizontalScrollIndicator={false}>
+      <View style={[styles.assistantQuickSection, assistantSettingsLayoutStyles.boundedSection]}>
+        <View style={[styles.assistantSectionHeader, assistantSettingsLayoutStyles.boundedSection]}>
+          <Text style={styles.paneHeading}>{translate("settings.structured")}</Text>
+          <Text style={styles.assistantSectionHint}>{translate("settings.basicFieldsHint")}</Text>
+        </View>
+        {structured}
+      </View>
+      <View style={[assistantFileSurfaceStyles.filesSection, assistantSettingsLayoutStyles.boundedSection]}>
+        <View style={[styles.assistantSectionHeader, assistantSettingsLayoutStyles.boundedSection]}>
+          <Text style={styles.paneHeading}>{translate("settings.files")}</Text>
+          <Text style={styles.assistantSectionHint}>{translate("settings.filesHint")}</Text>
+        </View>
+        {files}
+      </View>
+    </ScrollView>
+  </View>;
 }
 
-function FeatureToggles({ value, disabled, onChange, translate }: { value: UnknownRecord; disabled: boolean; onChange: (features: UnknownRecord) => void; translate: Translate }): React.JSX.Element {
-  // Only render feature flags that are actually present in config.toml.
-  // ``supported`` is a capability catalog, not evidence that the user saved
-  // a value; showing every absent flag as an unchecked setting was the same
-  // source-of-truth error that made the old Claude panel misleading.
-  const keys = Object.keys(value).filter((key) => typeof value[key] === "boolean");
-  return <CompactToggleGrid>{keys.length === 0 ? <EmptyState translate={translate} /> : keys.map((key) => <ToggleRow key={key} label={codexFeatureLabel(key, translate)} value={booleanValue(value[key])} disabled={disabled} onChange={(enabled) => onChange({ ...value, [key]: enabled })} />)}</CompactToggleGrid>;
-}
-
-function CompactToggleGrid({ children }: { children: React.ReactNode }): React.JSX.Element {
-  const items = React.Children.toArray(children);
-  return <View style={styles.featureGrid}>{items.map((child, index) => <View key={child && typeof child === "object" && "key" in child && child.key != null ? String(child.key) : String(index)} style={styles.featureGridItem}>{child}</View>)}</View>;
-}
-
-function ClaudeScreen({ snapshot, ipc, busy, translate, dispatch, onSecretState, onEditorConflict, deployment, onDeploymentChange, rawReloadToken, rawBaselineToken }: { snapshot?: CoreSnapshot; ipc: IpcClient; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onEditorConflict: RawEditorConflictHandler; deployment: ClaudeDeploymentDraft; onDeploymentChange: (key: keyof ClaudeDeploymentDraft, value: string) => Promise<void>; rawReloadToken: number; rawBaselineToken: number }): React.JSX.Element {
+function ClaudeScreen({ snapshot, busy, translate, dispatch, onSecretState }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void }): React.JSX.Element {
   const state = domainState(snapshot, "claude");
-  const settings = asRecord(state.settings);
   const desktop = asRecord(state.desktop);
-  const developer = asRecord(state.developer);
-  const permissions = asRecord(settings.permissions);
-  const sandbox = asRecord(settings.sandbox);
-  const filesystem = asRecord(sandbox.filesystem);
-  const [structuredWidth, setStructuredWidth] = useState(470);
-  const [workspaceWidth, setWorkspaceWidth] = useState(0);
-  const fileMissing = settings.file_exists === false;
-  const unavailable = state.available === false;
-  const validationStatus = unavailable ? translate("settings.claudeUnavailable") : undefined;
-  const updateDeployment = (key: keyof ClaudeDeploymentDraft, value: string): Promise<void> => onDeploymentChange(key, value);
   const desktopAvailable = desktop.available !== false;
-  const developerAvailable = developer.available !== false;
-  const desktopConfigured = desktop.config_exists === true;
   const desktopProvider = stringValue(desktop.provider);
-  const desktopAuthScheme = desktopConfigured ? stringValue(desktop.auth_scheme, "bearer") : "";
   const desktopModelNames = stringList(desktop.model_names);
-  const permissionMode = stringValue(permissions.defaultMode);
-  const effortLevel = stringValue(settings.effortLevel);
-  const hasSandboxBoolean = [
-    "enabled",
-    "failIfUnavailable",
-    "autoAllowBashIfSandboxed",
-    "allowUnsandboxedCommands",
-  ].some((field) => hasBooleanSetting(sandbox, field));
-  const hasCapabilityBoolean = [
-    "disableBundledSkills",
-    "disableClaudeAiConnectors",
-    "disableRemoteControl",
-    "disableAllHooks",
-  ].some((field) => hasBooleanSetting(settings, field));
-  return <SettingsWorkspace validationStatus={validationStatus} validationStatusStyle={unavailable ? styles.codexValidationError : undefined} structuredWidth={structuredWidth} onStructuredWidthChange={setStructuredWidth} workspaceWidth={workspaceWidth} onWorkspaceWidthChange={setWorkspaceWidth} translate={translate} missingMessage={fileMissing ? translate("settings.claudeMissing") : undefined} structured={<>
-    <Section title={translate("claude.desktop")}><Text style={styles.cardHint}>{translate("claude.desktopSourceHint")}</Text><View style={styles.structuredForm}>
-      <PickerField label={translate("claude.desktopProvider")} value={desktopProvider} values={[{ value: "", label: translate("common.none") }, "gateway", "anthropic", "bedrock", "vertex", "foundry"]} disabled={busy || !desktopAvailable} onSelect={(inferenceProvider) => dispatch("desktop_patch", { inferenceProvider: inferenceProvider || null })} />
-      <TextField label={translate("claude.desktopGateway")} value={stringValue(desktop.gateway_url)} disabled={busy || !desktopAvailable} onCommit={(inferenceGatewayBaseUrl) => dispatch("desktop_patch", { inferenceGatewayBaseUrl })} />
-      <PickerField label={translate("claude.desktopAuthScheme")} value={desktopAuthScheme} values={[{ value: "", label: translate("common.none") }, "bearer", "x-api-key"]} disabled={busy || !desktopAvailable} onSelect={(inferenceGatewayAuthScheme) => dispatch("desktop_patch", { inferenceGatewayAuthScheme: inferenceGatewayAuthScheme || null })} />
-      <TextField label={translate("claude.desktopModels")} value={desktopModelNames.join("\n")} hint={translate("claude.desktopModelsHint")} multiline compactMultiline disabled={busy || !desktopAvailable} onCommit={(value) => dispatch("desktop_models_patch", { model_names: splitLines(value) })} />
-      <NativeSecretField plainText autoCommit label={translate("claude.desktopApiKey")} busy={busy || !desktopAvailable} domain="claude" field="desktop_gateway_api_key" onSecretState={onSecretState} />
-      <ToggleRow label={translate("claude.desktopDeveloperMode")} value={booleanValue(developer.developer_mode_enabled)} disabled={busy || !developerAvailable} onChange={(allowDevTools) => dispatch("developer_patch", { allowDevTools })} />
-      <Text style={styles.cardHint}>{translate("claude.desktopDeveloperModeHint")}</Text>
-    </View></Section>
-    <Section title={translate("claude.deployment")}><Text style={styles.cardHint}>{translate("claude.codeSourceHint")}</Text><View style={styles.structuredForm}>
-      <TextField label={translate("claude.model")} value={deployment.model} disabled={busy} onCommit={(value) => updateDeployment("model", value)} />
-      <TextField label={translate("claude.gateway")} value={deployment.base_url} disabled={busy} onCommit={(value) => updateDeployment("base_url", value)} />
-      <NativeSecretField plainText autoCommit label={translate("claude.token")} busy={busy} domain="claude" field="deployment_token" onSecretState={onSecretState} />
-    </View></Section>
-    <Section title={translate("claude.memory")}><View style={styles.structuredForm}>
-      {hasBooleanSetting(settings, "autoMemoryEnabled") ? <ToggleRow label={translate("claude.autoMemory")} value={booleanValue(settings.autoMemoryEnabled)} disabled={busy} onChange={(autoMemoryEnabled) => dispatch("patch", { autoMemoryEnabled })} /> : <EmptyState translate={translate} />}
-    </View></Section>
-    <Section title={translate("claude.permissions")}><View style={styles.structuredForm}>
-      <PickerField label={translate("claude.permissions")} value={permissionMode} values={[{ value: "", label: translate("common.none") }, ...CLAUDE_PERMISSION_MODES.map((value) => ({ value, label: claudePermissionLabel(value, translate) }))]} disabled={busy} onSelect={(defaultMode) => dispatch("patch", { permissions: { defaultMode: defaultMode || null } })} />
-      {permissions.disableBypassPermissionsMode !== undefined ? <ToggleRow label={translate("claude.disableBypassPermissions")} value={stringValue(permissions.disableBypassPermissionsMode) === "disable"} disabled={busy} onChange={(disabled) => dispatch("patch", { permissions: { disableBypassPermissionsMode: disabled ? "disable" : null } })} /> : null}
-    </View></Section>
-    <Section title={translate("claude.sandbox")}><View style={styles.structuredForm}>
-      {hasSandboxBoolean || hasBooleanSetting(filesystem, "disabled") ? <>
-        {hasBooleanSetting(sandbox, "enabled") ? <ToggleRow label={translate("claude.sandbox")} value={booleanValue(sandbox.enabled)} disabled={busy} onChange={(enabled) => dispatch("patch", { sandbox: { enabled } })} /> : null}
-        {hasBooleanSetting(sandbox, "failIfUnavailable") ? <ToggleRow label={translate("claude.sandboxFailIfUnavailable")} value={booleanValue(sandbox.failIfUnavailable)} disabled={busy} onChange={(failIfUnavailable) => dispatch("patch", { sandbox: { failIfUnavailable } })} /> : null}
-        {hasBooleanSetting(sandbox, "autoAllowBashIfSandboxed") ? <ToggleRow label={translate("claude.sandboxAutoAllowBash")} value={booleanValue(sandbox.autoAllowBashIfSandboxed)} disabled={busy} onChange={(autoAllowBashIfSandboxed) => dispatch("patch", { sandbox: { autoAllowBashIfSandboxed } })} /> : null}
-        {hasBooleanSetting(sandbox, "allowUnsandboxedCommands") ? <ToggleRow label={translate("claude.sandboxAllowUnsandboxed")} value={booleanValue(sandbox.allowUnsandboxedCommands)} disabled={busy} onChange={(allowUnsandboxedCommands) => dispatch("patch", { sandbox: { allowUnsandboxedCommands } })} /> : null}
-        {hasBooleanSetting(filesystem, "disabled") ? <ToggleRow label={translate("claude.filesystem")} value={filesystem.disabled === false} disabled={busy} onChange={(enabled) => dispatch("patch", { sandbox: { filesystem: { disabled: !enabled } } })} /> : null}
-      </> : <EmptyState translate={translate} />}
-    </View></Section>
-    <Section title={translate("claude.modelBehavior")}><View style={styles.structuredForm}>
-      <TextField label={translate("claude.fallbackModel")} value={stringList(settings.fallbackModel).join("\n") || stringValue(settings.fallbackModel)} multiline compactMultiline onCommit={(fallbackModel) => dispatch("patch", { fallbackModel: splitLines(fallbackModel) })} />
-      <PickerField label={translate("claude.effortLevel")} value={effortLevel} values={[{ value: "", label: translate("common.none") }, "low", "medium", "high", "xhigh"]} disabled={busy} onSelect={(nextEffortLevel) => dispatch("patch", { effortLevel: nextEffortLevel || null })} />
-      {hasBooleanSetting(settings, "autoCompactEnabled") ? <ToggleRow label={translate("claude.autoCompact")} value={booleanValue(settings.autoCompactEnabled)} disabled={busy} onChange={(autoCompactEnabled) => dispatch("patch", { autoCompactEnabled })} /> : null}
-    </View></Section>
-    <Section title={translate("claude.capabilities")}>{hasCapabilityBoolean ? <CompactToggleGrid>
-      {hasBooleanSetting(settings, "disableBundledSkills") ? <ToggleRow label={translate("claude.disableBundledSkills")} value={booleanValue(settings.disableBundledSkills)} disabled={busy} onChange={(disableBundledSkills) => dispatch("patch", { disableBundledSkills })} /> : null}
-      {hasBooleanSetting(settings, "disableClaudeAiConnectors") ? <ToggleRow label={translate("claude.disableClaudeAiConnectors")} value={booleanValue(settings.disableClaudeAiConnectors)} disabled={busy} onChange={(disableClaudeAiConnectors) => dispatch("patch", { disableClaudeAiConnectors })} /> : null}
-      {hasBooleanSetting(settings, "disableRemoteControl") ? <ToggleRow label={translate("claude.disableRemoteControl")} value={booleanValue(settings.disableRemoteControl)} disabled={busy} onChange={(disableRemoteControl) => dispatch("patch", { disableRemoteControl })} /> : null}
-      {hasBooleanSetting(settings, "disableAllHooks") ? <ToggleRow label={translate("claude.disableAllHooks")} value={booleanValue(settings.disableAllHooks)} disabled={busy} onChange={(disableAllHooks) => dispatch("patch", { disableAllHooks })} /> : null}
-    </CompactToggleGrid> : <EmptyState translate={translate} />}</Section>
-  </>} raw={<><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.desktopRawJson")} domain="claude" document="desktop" language="json" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.developerRawJson")} domain="claude" document="developer" language="json" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /><RawEditor showReload={false} codexPane style={styles.codexRawEditor} label={translate("claude.codeRawJson")} domain="claude" document="settings" language="json" ipc={ipc} busy={busy} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} /></>} />;
+  const desktopModel = desktopModelNames[0] ?? "";
+  const updateDesktopModel = (value: string): Promise<void> => dispatch("desktop_models_patch", { model_names: splitLines(value) }, "claude");
+  const updateDesktopProvider = (inferenceProvider: string): Promise<void> => dispatch("desktop_patch", { inferenceProvider: inferenceProvider || null }, "claude");
+  const updateDesktopGateway = (inferenceGatewayBaseUrl: string): Promise<void> => dispatch("desktop_patch", { inferenceGatewayBaseUrl }, "claude");
+  return <View style={assistantSettingsStyles.domainBody}>
+    <View style={assistantSettingsStyles.subsection}>
+      <View style={assistantSettingsStyles.subsectionHeader}>
+        <Text style={assistantSettingsStyles.subsectionTitle}>{translate("claude.desktopSection")}</Text>
+        <Text style={assistantSettingsStyles.subsectionHint}>{translate("claude.desktopSectionHint")}</Text>
+      </View>
+      <View style={assistantSettingsStyles.quickFields}>
+        <PickerField label={translate("claude.desktopProvider")} value={desktopProvider} values={[{ value: "", label: translate("common.none") }, "gateway", "anthropic", "bedrock", "vertex", "foundry"]} disabled={busy || !desktopAvailable} onSelect={(value) => { void updateDesktopProvider(value); }} />
+        <TextField label={translate("common.model")} value={desktopModel} disabled={busy || !desktopAvailable} onCommit={(value) => { void updateDesktopModel(value); }} />
+        <TextField label={translate("claude.desktopGateway")} value={stringValue(desktop.gateway_url)} disabled={busy || !desktopAvailable} onCommit={(value) => { void updateDesktopGateway(value); }} />
+        <NativeSecretField plainText autoCommit label={translate("common.apiKey")} busy={busy || !desktopAvailable} domain="claude" field="desktop_gateway_api_key" onSecretState={onSecretState} />
+      </View>
+    </View>
+    <View style={assistantSettingsStyles.subsection}>
+      <View style={assistantSettingsStyles.subsectionHeader}>
+        <Text style={assistantSettingsStyles.subsectionTitle}>{translate("claude.codeSection")}</Text>
+        <Text style={assistantSettingsStyles.subsectionHint}>{translate("claude.codeSectionHint")}</Text>
+      </View>
+    </View>
+  </View>;
 }
 
-function claudePermissionLabel(value: string, translate: Translate): string {
-  const key = `claude.permission.${value}`;
-  return CLAUDE_PERMISSION_MODES.includes(value) ? translate(key) : translate("claude.permission.unknown", { value });
+function AssistantFileEditorDialog({ target, ipc, busy, translate, onEditorConflict, rawReloadToken, rawBaselineToken, syncRevision, onFlushPendingFields, onClose }: { target?: AssistantFileTarget; ipc: IpcClient; busy: boolean; translate: Translate; onEditorConflict: RawEditorConflictHandler; rawReloadToken: number; rawBaselineToken: number; syncRevision?: number; onFlushPendingFields: () => Promise<void>; onClose: () => void }): React.JSX.Element {
+  if (!target) return <></>;
+  const close = (): void => {
+    void onFlushPendingFields().then(onClose).catch(() => undefined);
+  };
+  return <View style={assistantFileSurfaceStyles.editorLayer} accessibilityViewIsModal onAccessibilityEscape={close}>
+    <View style={assistantFileSurfaceStyles.editorDialog}>
+      <View style={assistantFileSurfaceStyles.editorHeader}>
+        <View style={assistantFileSurfaceStyles.editorHeaderCopy}>
+          <Text style={assistantFileSurfaceStyles.editorTitle}>{target.label}</Text>
+          <Text style={assistantFileSurfaceStyles.editorHint}>{translate("settings.fileEditorHint")}</Text>
+        </View>
+      </View>
+      <RawEditor showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRaw} label={target.label} domain={target.domain} document={target.document} language={target.language} ipc={ipc} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} />
+      <View style={assistantFileSurfaceStyles.editorFooter}>
+        <ActionButton title={translate("menu.close")} disabled={busy} onPress={close} />
+      </View>
+    </View>
+  </View>;
 }
 
-const CLAUDE_PERMISSION_MODES = ["default", "manual", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions", "delegate"];
+function AssistantSettingsWorkspace({ snapshot, busy, translate, dispatch, onSecretState, onOpenFile }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onOpenFile: (target: AssistantFileTarget) => void }): React.JSX.Element {
+  const codexState = domainState(snapshot, "codex");
+  const claudeState = domainState(snapshot, "claude");
+  const codexErrors = stringList(codexState.validation_errors);
+  const codexWarnings = stringList(codexState.warnings);
+  const codexValidation = codexErrors.length > 0
+    ? codexErrors.map((message) => localizeCodexValidationMessage(message, translate)).join("\n")
+    : codexWarnings.map((message) => localizeCodexValidationMessage(message, translate)).join("\n");
+  const claudeUnavailable = claudeState.available === false ? translate("settings.claudeUnavailable") : "";
+  const validationStatus = [codexValidation, claudeUnavailable].filter(Boolean).join("\n") || undefined;
+  const validationStatusStyle = codexErrors.length > 0 || claudeUnavailable ? styles.codexValidationError : codexWarnings.length > 0 ? styles.codexValidationWarning : undefined;
+  const missingMessage = [
+    codexState.config_exists === false ? translate("settings.codexMissing") : "",
+    asRecord(claudeState.settings).file_exists === false ? translate("settings.claudeMissing") : "",
+  ].filter(Boolean).join("\n") || undefined;
+
+  const fileRow = (target: AssistantFileTarget): React.JSX.Element => <View key={`${target.domain}:${target.document}`} style={assistantFileSurfaceStyles.fileRow}>
+    <View style={assistantFileSurfaceStyles.fileMeta}>
+      <Text style={assistantFileSurfaceStyles.fileLabel}>{target.label}</Text>
+      <Text style={assistantFileSurfaceStyles.fileHint}>{target.language.toUpperCase()}</Text>
+    </View>
+    <NativeButton title={translate("settings.editFile")} accessibilityLabel={`${translate("settings.editFile")}: ${target.label}`} disabled={busy} onPress={() => onOpenFile(target)} style={assistantFileSurfaceStyles.editFileButton} />
+  </View>;
+  const fileGroup = (title: string, hint: string, targets: AssistantFileTarget[]): React.JSX.Element => <View style={assistantSettingsStyles.fileGroup}>
+    <View style={assistantSettingsStyles.fileGroupHeader}>
+      <Text style={assistantSettingsStyles.fileGroupTitle}>{title}</Text>
+      <Text style={assistantSettingsStyles.fileGroupHint}>{hint}</Text>
+    </View>
+    {targets.map(fileRow)}
+  </View>;
+  const fileTargets = {
+    codex: [
+      { domain: "codex", document: "config", language: "toml", label: translate("codex.rawToml") },
+      { domain: "codex", document: "auth", language: "json", label: translate("codex.rawAuth") },
+    ],
+    desktop: [
+      { domain: "claude", document: "desktop", language: "json", label: translate("claude.desktopRawJson") },
+      { domain: "claude", document: "developer", language: "json", label: translate("claude.developerRawJson") },
+    ],
+    code: [
+      { domain: "claude", document: "settings", language: "json", label: translate("claude.codeRawJson") },
+    ],
+  } satisfies Record<string, AssistantFileTarget[]>;
+  return <SettingsWorkspace validationStatus={validationStatus} validationStatusStyle={validationStatusStyle} translate={translate} missingMessage={missingMessage} structured={<View style={[styles.assistantQuickGrid, assistantSettingsLayoutStyles.boundedGrid]}>
+    <View style={assistantSettingsStyles.domainCard}><View style={assistantSettingsStyles.domainHeader}><Text style={assistantSettingsStyles.cardTitle}>{translate("card.codexSettings")}</Text><Text style={assistantSettingsStyles.domainHint}>{translate("settings.basicFieldsHint")}</Text></View><CodexWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} /></View>
+    <View style={assistantSettingsStyles.domainCard}><View style={assistantSettingsStyles.domainHeader}><Text style={assistantSettingsStyles.cardTitle}>{translate("card.claudeSettings")}</Text><Text style={assistantSettingsStyles.domainHint}>{translate("settings.basicFieldsHint")}</Text></View><ClaudeScreen snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} /></View>
+  </View>} files={<View style={assistantFileSurfaceStyles.fileGroups}>
+    {fileGroup(translate("card.codexSettings"), translate("settings.codexFilesHint"), fileTargets.codex)}
+    {fileGroup(translate("claude.desktopSection"), translate("settings.claudeDesktopFilesHint"), fileTargets.desktop)}
+    {fileGroup(translate("claude.codeSection"), translate("settings.claudeCodeFilesHint"), fileTargets.code)}
+  </View>} />;
+}
 
 function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
   const state = domainState(snapshot, "runtime");
@@ -3987,7 +3843,7 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   }, [setDirty]);
 
   useEffect(() => {
-    registry?.register(fieldId.current, { commit, reset, isDirty: () => dirtyRef.current });
+    registry?.register(fieldId.current, { commit, reset, isDirty: () => dirtyRef.current, flushBeforeAssistantEditor: true });
     return () => {
       // Selection changes can remove the editor before AppKit/WinUI delivers
       // its blur event. Preserve the local draft instead of silently dropping
@@ -5348,7 +5204,7 @@ function PickerField({ label, value, values, onSelect, disabled, labelWidth, lab
   return <View style={[styles.formRow, compactStyles.formRow]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedLabel} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[styles.picker, compactStyles.picker, allowShrink && styles.pickerShrink, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]} /></View>;
 }
 
-function RawEditor({ label, domain, document, language, ipc, busy, translate, showReload = true, codexPane = false, onConflict, reloadToken = 0, baselineToken = 0, style }: { label: string; domain: "codex" | "claude"; document: RawEditorDocument; language: "toml" | "json"; ipc: IpcClient; busy: boolean; translate: Translate; showReload?: boolean; codexPane?: boolean; onConflict: RawEditorConflictHandler; reloadToken?: number; baselineToken?: number; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+function RawEditor({ label, domain, document, language, ipc, translate, showLabel = true, showDiff = true, codexPane = false, onConflict, reloadToken = 0, baselineToken = 0, syncRevision, style }: { label: string; domain: "codex" | "claude"; document: RawEditorDocument; language: "toml" | "json"; ipc: IpcClient; translate: Translate; showLabel?: boolean; showDiff?: boolean; codexPane?: boolean; onConflict: RawEditorConflictHandler; reloadToken?: number; baselineToken?: number; syncRevision?: number; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   const [documentKey, setDocumentKey] = useState("");
   const [draft, setDraft] = useState("");
   const [baseline, setBaseline] = useState("");
@@ -5369,6 +5225,9 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
   const scheduleStageRef = useRef<() => void>(() => undefined);
   const mountedRef = useRef(true);
   const initializedRef = useRef(false);
+  const lastStagedRevisionRef = useRef<number | undefined>(undefined);
+  const observedSyncRevisionRef = useRef<number | undefined>(undefined);
+  const externalSyncInFlightRef = useRef(false);
   const appliedReloadNonceRef = useRef(reloadNonce);
   const appliedBaselineTokenRef = useRef(baselineToken);
 
@@ -5409,6 +5268,8 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
         try {
           const staged = await stageEditorText(editorToken, submitted);
           tokenRef.current = staged.editor_token;
+          lastStagedRevisionRef.current = staged.revision;
+          observedSyncRevisionRef.current = staged.revision;
           stagedTextRef.current = submitted;
           if (!flushStageRef.current) {
             if (draftRef.current === stagedTextRef.current) {
@@ -5545,9 +5406,9 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
       draftRef.current = descriptor.text;
       stagedTextRef.current = descriptor.text;
       setDraft(descriptor.text);
-      if (resetBaseline) {
-        baselineRef.current = descriptor.text;
-        setBaseline(descriptor.text);
+      if (resetBaseline || descriptor.baseline !== baselineRef.current) {
+        baselineRef.current = descriptor.baseline;
+        setBaseline(descriptor.baseline);
         if (initializedRef.current) setEditorRenderRevision((value) => value + 1);
       }
       if (!initializedRef.current) setDocumentKey([domain, document].join(":"));
@@ -5565,18 +5426,80 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
     return () => { active = false; };
   }, [baselineToken, document, domain, ipc, registry, reloadNonce, reloadToken, reset, translate]);
 
-  const reloadEditor = (): void => {
-    if (draftRef.current !== stagedTextRef.current || status === "saving") return;
-    setReloadNonce((value) => value + 1);
-  };
-  const reloadDisabled = busy || loading || status === "saving" || draftRef.current !== stagedTextRef.current;
+  useEffect(() => {
+    if (!initializedRef.current || syncRevision === undefined) return;
+    if (observedSyncRevisionRef.current === syncRevision) return;
+    if (stagePromise.current) {
+      observedSyncRevisionRef.current = undefined;
+      return;
+    }
+    observedSyncRevisionRef.current = syncRevision;
+    if (lastStagedRevisionRef.current === syncRevision || externalSyncInFlightRef.current) return;
+    externalSyncInFlightRef.current = true;
+    let active = true;
+    const synchronize = async (): Promise<void> => {
+      try {
+        let descriptor = await ipc.editor(domain, document);
+        if (!active) return;
+        if (descriptor.text === draftRef.current && descriptor.text === stagedTextRef.current) {
+          tokenRef.current = descriptor.editor_token;
+          if (descriptor.baseline !== baselineRef.current) {
+            baselineRef.current = descriptor.baseline;
+            setBaseline(descriptor.baseline);
+            setEditorRenderRevision((value) => value + 1);
+          }
+          return;
+        }
+        if (descriptor.text === stagedTextRef.current) {
+          // Core revisions also advance for unrelated settings. Keep a local
+          // draft intact when the raw document itself did not change, while
+          // refreshing its capability token for the next stage.
+          tokenRef.current = descriptor.editor_token;
+          if (descriptor.baseline !== baselineRef.current) {
+            baselineRef.current = descriptor.baseline;
+            setBaseline(descriptor.baseline);
+            setEditorRenderRevision((value) => value + 1);
+          }
+          return;
+        }
+        if (draftRef.current !== stagedTextRef.current) {
+          const resolution = await onConflict(domain, document);
+          if (!active) return;
+          if (resolution === "keep") {
+            descriptor = await ipc.editor(domain, document);
+            if (!active) return;
+            tokenRef.current = descriptor.editor_token;
+            if (descriptor.baseline !== baselineRef.current) {
+              baselineRef.current = descriptor.baseline;
+              setBaseline(descriptor.baseline);
+              setEditorRenderRevision((value) => value + 1);
+            }
+            return;
+          }
+          setReloadNonce((value) => value + 1);
+          return;
+        }
+        tokenRef.current = descriptor.editor_token;
+        draftRef.current = descriptor.text;
+        stagedTextRef.current = descriptor.text;
+        baselineRef.current = descriptor.baseline;
+        setDraft(descriptor.text);
+        setBaseline(descriptor.baseline);
+        setEditorRenderRevision((value) => value + 1);
+        setPending(false);
+        setError(undefined);
+      } catch (reason: unknown) {
+        if (active) setError(errorMessage(reason, translate));
+      } finally {
+        externalSyncInFlightRef.current = false;
+      }
+    };
+    void synchronize();
+    return () => { active = false; };
+  }, [document, domain, ipc, onConflict, setPending, syncRevision, translate]);
+
   return <View style={[styles.rawEditor, codexPane && styles.codexRawEditorBase, style]}>
-    <View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}>
-      <Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-        {showReload ? <ActionButton title={translate("menu.reload")} disabled={reloadDisabled} onPress={reloadEditor} /> : null}
-      </View>
-    </View>
+    {showLabel ? <View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}><Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text></View> : null}
     {documentKey
       ? <View style={styles.rawNativeEditorFrame}>
         <CodeEditorWebView
@@ -5585,7 +5508,7 @@ function RawEditor({ label, domain, document, language, ipc, busy, translate, sh
           baseline={baseline}
           language={language}
           readOnly={false}
-          showDiff
+          showDiff={showDiff}
           style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]}
           onChange={(text) => {
             if (!initializedRef.current || normalizeEditorText(text) === normalizeEditorText(draftRef.current)) return;
@@ -5695,7 +5618,7 @@ const systemColors = {
 
 const serviceProviderStyles = StyleSheet.create({
   workspace: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 },
-  unifiedHeader: { minHeight: 36, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 4, gap: 8 },
+  unifiedHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", paddingHorizontal: 4 },
   tabBar: { minHeight: 34, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator },
   tabs: { width: 280, height: 26, alignSelf: "center" },
   pane: { flex: 1, minWidth: 0, minHeight: 0, paddingHorizontal: 4, gap: 8 },
@@ -5703,7 +5626,10 @@ const serviceProviderStyles = StyleSheet.create({
   heading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   hint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   columns: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP },
-  listPane: { width: 270, minWidth: 230, maxWidth: 290, minHeight: 0 },
+  listPane: { width: 270, minWidth: 230, maxWidth: 290, minHeight: 0, gap: 4 },
+  listToolbar: { height: 22, minHeight: 22, flexShrink: 0, flexDirection: "row", alignItems: "center" },
+  listActions: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 4 },
+  listActionButton: { width: 22, minWidth: 22, height: 22 },
   table: { flex: 1, minHeight: 0 },
   detailPane: { flex: 1, minWidth: 300, minHeight: 0, paddingHorizontal: 12, paddingVertical: 4, gap: 8 },
   emptyDetail: { flex: 1, minHeight: 160, alignItems: "center", justifyContent: "center", gap: 8 },
@@ -5738,6 +5664,47 @@ const dataManagementPolishStyles = StyleSheet.create({
   webDavFormRows: { width: "100%", maxWidth: 560, gap: 7 },
   webDavSyncArea: { borderTopWidth: 0, paddingTop: 4, marginTop: 2 },
   webDavActionRow: { borderTopWidth: 0, paddingTop: 4, marginTop: 10 },
+});
+
+const assistantSettingsStyles = {
+  domainCard: { minWidth: 0, flexGrow: 1, flexBasis: 420, gap: 8, padding: 12, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.window },
+  domainHeader: { gap: 2 },
+  cardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" as const },
+  domainHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  domainBody: { gap: 8 },
+  quickFields: { gap: 6 },
+  subsection: { gap: 7, paddingTop: 8, borderTopWidth: 1, borderTopColor: systemColors.separator },
+  subsectionHeader: { gap: 2 },
+  subsectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" as const },
+  subsectionHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+  fileGroup: { gap: 5 },
+  fileGroupHeader: { gap: 2 },
+  fileGroupTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" as const },
+  fileGroupHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+};
+
+const assistantSettingsLayoutStyles = StyleSheet.create({
+  boundedContent: { width: "100%", minWidth: 0, alignSelf: "stretch" },
+  boundedSection: { minWidth: 0 },
+  boundedGrid: { width: "100%", minWidth: 0 },
+});
+
+const assistantFileSurfaceStyles = StyleSheet.create({
+  filesSection: { gap: 10, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
+  fileGroups: { gap: 14 },
+  fileRow: { minHeight: 40, flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  fileMeta: { flex: 1, minWidth: 0, gap: 2 },
+  fileLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE },
+  fileHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  editFileButton: { minWidth: 92 },
+  editorLayer: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 100, alignItems: "center", justifyContent: "center", padding: 20, backgroundColor: "rgba(0, 0, 0, 0.28)" },
+  editorDialog: { width: "94%", height: "90%", minWidth: 620, minHeight: 380, maxWidth: 1200, maxHeight: 780, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, overflow: "hidden", backgroundColor: systemColors.window, shadowColor: "#000000", shadowOpacity: 0.22, shadowRadius: 18, shadowOffset: { width: 0, height: 8 }, elevation: 8 },
+  editorHeader: { minHeight: 52, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
+  editorHeaderCopy: { flex: 1, minWidth: 0, gap: 2 },
+  editorTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  editorHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  editorRaw: { flex: 1, minHeight: 0 },
+  editorFooter: { minHeight: 50, flexShrink: 0, flexDirection: "row", justifyContent: "flex-end", alignItems: "center", paddingHorizontal: 12, paddingVertical: 9, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.window },
 });
 
 const styles = StyleSheet.create({
@@ -5814,9 +5781,9 @@ const styles = StyleSheet.create({
   routeTraceInfoText: { color: systemColors.label },
   root: { flex: 1, minWidth: 420, backgroundColor: systemColors.window },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
   footer: { height: 52, minHeight: 52, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 6 }, footerCompact: { height: 48, minHeight: 48, paddingHorizontal: 14, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.control }, footerBorderless: { borderTopWidth: 0 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
-  providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, settingsTabBar: { minHeight: 36, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsTabs: { alignSelf: "flex-start", width: 250 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
+  providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardDescription: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelScroll: { flex: 1, minHeight: 0, width: "100%" }, providerWizardModelScrollContent: { width: "100%", paddingBottom: 8 }, providerWizardModelToolbar: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardModelGroup: { gap: 6, paddingTop: 4 }, providerWizardModelGroupHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, providerWizardModelList: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, paddingHorizontal: 8, paddingVertical: 5, gap: 1 }, providerWizardModelCheckbox: { width: "100%", minHeight: 24 }, providerWizardManualModelRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardManualModelCheckbox: { flex: 1, minWidth: 0 }, providerWizardManualModelUpstream: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, providerWizardModelSummary: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500", paddingTop: 4 }, providerWizardModeControl: { width: "100%", height: 26, flexShrink: 0 }, providerWizardPicker: { width: "100%", minWidth: 0, height: 26 }, providerWizardInput: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, providerWizardSecretInput: { width: "100%", minHeight: 26 }, providerWizardHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, paddingVertical: 2 }, providerWizardValidation: { color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerWizardFooter: { minHeight: 46, paddingHorizontal: 20, paddingVertical: 8, flexDirection: "row", alignItems: "center", gap: 6, borderTopWidth: 0, backgroundColor: systemColors.window }, providerWizardFooterSpacer: { flex: 1 }, providerWizardFooterStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, providerWizardFooterActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 },
   providerAuthFields: { minWidth: 0, gap: 4, paddingTop: 2 },
@@ -5824,7 +5791,7 @@ const styles = StyleSheet.create({
   providerAuthStatusLabel: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerAuthStatusValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 154, minWidth: 154, maxWidth: 154, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 280 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 280, minWidth: 280, maxWidth: 280, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0, paddingTop: 3, paddingLeft: 0, paddingRight: 8, paddingBottom: 12, gap: 6 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, probeSummaryTrigger: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, probeSummaryTriggerPressed: { opacity: 0.65 }, probeSummary: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
-  codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, codexSplit: { flex: 1, minWidth: 0, minHeight: 0 }, codexStructuredPane: { flex: 1, minWidth: 0, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }, codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch", gap: 14, paddingLeft: 16, paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER, paddingTop: 10, paddingBottom: 16 }, codexStructuredWithHorizontalScrollbar: { paddingBottom: 32 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
+  codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, assistantSettingsScroll: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground, borderWidth: 1, borderColor: systemColors.separator }, assistantSettingsScrollContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 20, gap: 20 }, assistantQuickSection: { gap: 10 }, assistantSectionHeader: { flexDirection: "row", alignItems: "baseline", justifyContent: "space-between", gap: 12 }, assistantSectionHint: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right" }, assistantQuickGrid: { flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, assistantRawSection: { gap: 10, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, assistantRawGrid: { flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, assistantRawEditor: { flex: 0, flexGrow: 1, flexShrink: 1, flexBasis: 480, minWidth: 360, height: 286, minHeight: 240 }, codexStructuredPane: { flex: 1, minWidth: 0, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }, codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch", gap: 14, paddingLeft: 16, paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER, paddingTop: 10, paddingBottom: 16 }, codexStructuredWithHorizontalScrollbar: { paddingBottom: 32 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanControl: { width: 24, minWidth: 24, height: 24, alignSelf: "flex-start" }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 134, paddingTop: 4, minWidth: 0 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, minWidth: 0 }, runtimeMultilineField: { minWidth: 486, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minHeight: 0 }, dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, dataManagementTabs: { width: 280, height: 24, alignSelf: "center", flexShrink: 0 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: 10, paddingHorizontal: 4, paddingBottom: 14 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementImportFileLabel: { width: 72, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSyncScopeLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementDirectionLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementDirectionPicker: { width: 210, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   webDavForm: { flexGrow: 0, paddingHorizontal: 2 }, webdavFormBody: { gap: 6 }, webdavStateRow: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "flex-start" }, webdavSyncArea: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionRow: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavActionSpacer: { flex: 1 }, webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: "flex-start" }, webdavStateSpacer: { flex: 1 }, webdavStateStatus: { maxWidth: 180, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right", lineHeight: 15 }, webdavFormRows: { width: "60%", gap: 5 }, webdavPasswordInput: { width: "100%", minHeight: 26 },

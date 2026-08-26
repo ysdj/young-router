@@ -3852,7 +3852,8 @@ def _mark_protocol_fallback_failure(
         setattr(exception, _PROTOCOL_FALLBACK_FAILURE_RECORDED_ATTR, True)
     except Exception:
         pass
-    if isinstance(request_kwargs, dict):
+    recovery_policy = _recovery_policy_for_exception(exception)
+    if recovery_policy == _RECOVERY_POLICY_COOLDOWN and isinstance(request_kwargs, dict):
         marker = {
             "deployment_id": (
                 _responses_execution_module._failed_deployment_id(exception)
@@ -3871,9 +3872,10 @@ def _mark_protocol_fallback_failure(
         updated_metadata = metadata.copy()
         updated_metadata[_PROTOCOL_FALLBACK_FAILURE_RECORDED_KEY] = marker
         request_kwargs["litellm_metadata"] = updated_metadata
-    # A deterministic 4xx normally stays out of cooldown accounting. Once
-    # both protocols have failed, the pair is one failed route attempt. Count
-    # it once without turning the deterministic error into a recovery poll.
+    # Count the completed protocol pair once only when its configured policy
+    # permits cooldown accounting. A deterministic request error records
+    # neither a deployment failure nor a marker that could suppress a later,
+    # genuinely transient wrapper failure.
     _record_deployment_failure_for_cooldown(
         exception,
         request_kwargs,
@@ -4032,13 +4034,15 @@ def _record_deployment_failure_for_cooldown(
         return
     if not _deployment_cooldown_recording_enabled_for_request(request_kwargs):
         return
-    if (
-        not force
-        and not _should_count_deployment_failure_for_cooldown(
-            exception,
-            request_kwargs,
-        )
-    ):
+    if _is_sanitized_upstream_route_failure_error(exception):
+        return
+    # `force` only bypasses the once-per-fallback de-duplication gate. It
+    # must never turn a deterministic request/construction error into a
+    # cooldown failure. An explicit request-error recovery policy may opt
+    # into cooldown accounting, so evaluate the policy before honoring the
+    # protocol-fallback force path.
+    recovery_policy = _recovery_policy_for_exception(exception)
+    if recovery_policy != _RECOVERY_POLICY_COOLDOWN:
         return
     if getattr(exception, _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR, False):
         return
@@ -4370,6 +4374,13 @@ def _raise_retryable_stream_disconnect(
     original_exception: Exception,
     fallback_exception: Optional[Exception],
 ) -> None:
+    """Propagate an exhausted route as an ordinary upstream error.
+
+    ``asyncio.CancelledError`` is reserved for an actual cancelled task.  A
+    route pool that has been exhausted is a server-side failure; exposing it
+    as cancellation makes streaming clients such as Cherry Studio report an
+    unexplained interruption and discard the useful error details.
+    """
     trigger_exception = fallback_exception or original_exception
     _trace_module._route_trace(
         "retryable_stream_disconnect",
@@ -4379,9 +4390,7 @@ def _raise_retryable_stream_disconnect(
         original_exception=_trace_exception(original_exception),
         exception=_trace_exception(trigger_exception),
     )
-    raise asyncio.CancelledError(
-        "retryable upstream route exhaustion before any stream chunk"
-    ) from trigger_exception
+    raise trigger_exception
 
 
 def _should_sanitize_final_upstream_route_error(exception: Exception) -> bool:

@@ -37,37 +37,6 @@ from .base import (
 )
 
 
-def _configured_model_fallbacks(
-    fallbacks: Optional[List],
-    model_group: Optional[str],
-) -> Optional[List[str]]:
-    """Return an explicitly configured LiteLLM model-group fallback chain.
-
-    Route recovery is appropriate when the selected model has no alternate
-    deployment.  It must not hide an explicit cross-model fallback configured
-    by the user, however: that fallback is the bounded path that can complete
-    the request while the original route is unavailable.
-    """
-    if not isinstance(fallbacks, list) or not isinstance(model_group, str):
-        return None
-    for item in fallbacks:
-        if not isinstance(item, dict):
-            continue
-        candidates = item.get(model_group)
-        if candidates is None:
-            candidates = item.get("*")
-        if not isinstance(candidates, list):
-            continue
-        normalized = [
-            candidate.strip()
-            for candidate in candidates
-            if isinstance(candidate, str) and candidate.strip()
-        ]
-        if normalized:
-            return normalized
-    return None
-
-
 _ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR = (
     "_litellm_menu_anthropic_unversioned_endpoint_patch"
 )
@@ -900,42 +869,6 @@ def _install_order_peer_failover_patch() -> None:
                 )
                 return await run_async_fallback(*args, **peer_kwargs)
 
-        configured_fallbacks = _configured_model_fallbacks(
-            fallbacks if fallbacks is not None else getattr(self, "fallbacks", None),
-            _responses_execution_module._request_model_group(kwargs) or model_group,
-        )
-        if configured_fallbacks is not None and disable_fallbacks is not True:
-            # LiteLLM's configured model-group fallback is an explicit
-            # cross-model route.  Run it before the Menu's long-lived
-            # deployment cooldown stream; otherwise a failed sole deployment
-            # would mask a healthy configured fallback indefinitely.
-            _trace_module._route_trace(
-                "configured_model_fallback_start",
-                request_id=_routing_module._trace_request_id(kwargs),
-                session=_routing_module._trace_session_context(kwargs),
-                model_group=_responses_execution_module._request_model_group(kwargs)
-                or model_group,
-                fallback_model_groups=configured_fallbacks,
-                exception=_routing_module._trace_exception(e),
-            )
-            original_args = (
-                self,
-                e,
-                disable_fallbacks,
-                fallbacks,
-                context_window_fallbacks,
-                content_policy_fallbacks,
-                model_group,
-                args,
-                kwargs,
-            )
-            if include_fallback_errors:
-                return await original_common_utils(
-                    *original_args,
-                    include_fallback_errors=True,
-                )
-            return await original_common_utils(*original_args)
-
         if _routing_module._is_request_scoped_priority_deployment_failover_error(
             e,
             kwargs,
@@ -1004,7 +937,7 @@ def _install_order_peer_failover_patch() -> None:
             raise e
 
         _trace_module._route_trace(
-            "litellm_fallback_common_utils",
+            "litellm_model_group_fallback_suppressed",
             request_id=_routing_module._trace_request_id(kwargs),
             session=_routing_module._trace_session_context(kwargs),
             model_group=_responses_execution_module._request_model_group(kwargs) or model_group,
@@ -1013,13 +946,17 @@ def _install_order_peer_failover_patch() -> None:
             request=_trace_module._trace_request_summary(kwargs),
             exception=_routing_module._trace_exception(e),
         )
+        # Model identity is part of the request contract.  The Menu handles
+        # same-model peer/order failover above; never hand LiteLLM a configured
+        # model-group, client, context-window, or content-policy fallback that
+        # could silently change the selected model.
         original_args = (
             self,
             e,
             disable_fallbacks,
-            fallbacks,
-            context_window_fallbacks,
-            content_policy_fallbacks,
+            [],
+            [],
+            [],
             model_group,
             args,
             kwargs,
@@ -1269,13 +1206,6 @@ def _install_generic_deployment_failover_patch() -> None:
                     continue
                 if (
                     not external_web_search_internal
-                    and _configured_model_fallbacks(
-                        kwargs.get("fallbacks")
-                        if kwargs.get("fallbacks") is not None
-                        else getattr(self, "fallbacks", None),
-                        model,
-                    )
-                    is None
                     and _routing_module._should_return_route_recovery_stream(exc, decision_kwargs, self)
                 ):
                     if _routing_module._should_block_external_web_search_original_recovery(decision_kwargs):

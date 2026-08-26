@@ -1,11 +1,113 @@
 from __future__ import annotations
 
 import copy
+import time
 
 from hook_test_utils import *
 
 
 class HookPatchTests(HookTestCase):
+    def test_cooled_sole_deployment_remains_same_model_with_configured_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/failed-model"},
+            "model_info": {"id": "failed-route"},
+        }
+
+        class Router:
+            fallbacks = [{"default-chat": ["backup-chat"]}]
+
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+        hooks._DEPLOYMENT_COOLDOWNS["id:failed-route"] = {
+            "failures": 2,
+            "cooldown_until": time.time() + 60,
+        }
+
+        self.assertIs(
+            hooks._request_local_cooling_only_candidate_deployment(
+                Router(),
+                "default-chat",
+                {},
+                target_order=None,
+            ),
+            deployment,
+        )
+        self.assertIs(
+            hooks._request_local_cooling_only_candidate_deployment(
+                Router(),
+                "default-chat",
+                {"disable_fallbacks": True},
+                target_order=None,
+            ),
+            deployment,
+        )
+
+    async def test_public_model_fallback_is_suppressed_to_preserve_model_identity(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        router_utils_module = types.ModuleType("litellm.router_utils")
+        fallback_handlers_module = types.ModuleType(
+            "litellm.router_utils.fallback_event_handlers"
+        )
+
+        async def run_async_fallback(*args, **kwargs):
+            raise AssertionError("cross-model fallback must not be attempted")
+
+        fallback_handlers_module.run_async_fallback = run_async_fallback
+        seen = {}
+
+        class Router:
+            fallbacks = [{"default-chat": ["backup-chat"]}]
+
+            async def async_function_with_fallbacks_common_utils(
+                self,
+                e,
+                disable_fallbacks,
+                fallbacks,
+                context_window_fallbacks,
+                content_policy_fallbacks,
+                model_group,
+                args,
+                kwargs,
+                include_fallback_errors=False,
+            ):
+                seen.update(
+                    {
+                        "fallbacks": fallbacks,
+                        "context_window_fallbacks": context_window_fallbacks,
+                        "content_policy_fallbacks": content_policy_fallbacks,
+                    }
+                )
+                raise e
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        sys.modules["litellm.router_utils"] = router_utils_module
+        sys.modules["litellm.router_utils.fallback_event_handlers"] = fallback_handlers_module
+        hooks._install_order_peer_failover_patch()
+
+        error = RuntimeError("synthetic model route failure")
+        with self.assertRaises(RuntimeError) as raised:
+            await Router().async_function_with_fallbacks_common_utils(
+                error,
+                False,
+                Router.fallbacks,
+                [{"default-chat": ["larger-context"]}],
+                [{"default-chat": ["policy-backup"]}],
+                "default-chat",
+                (),
+                {"model": "default-chat"},
+            )
+        self.assertIs(raised.exception, error)
+
+        self.assertEqual(seen, {
+            "fallbacks": [],
+            "context_window_fallbacks": [],
+            "content_policy_fallbacks": [],
+        })
+
     def test_custom_response_headers_omit_values_starlette_cannot_encode(self) -> None:
         hooks, _ = load_hook_module()
         module_name = "litellm.proxy.common_request_processing"

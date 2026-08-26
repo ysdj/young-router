@@ -55,7 +55,7 @@ class ProvidersModelsDomain:
     name = "providers_models"
     _MODEL_LIST_PROTOCOL = "openai-models-v1"
     _MODEL_LIST_TIMEOUT_SECONDS = 5.0
-    _MAX_MODEL_LIST_BYTES = 512 * 1024
+    _MAX_MODEL_LIST_BYTES = 2 * 1024 * 1024
     _MAX_MODEL_CANDIDATES = 256
     _MODEL_PROBE_TIMEOUT_SECONDS = 6.0
     _MAX_MODEL_PROBE_BYTES = 256 * 1024
@@ -465,6 +465,44 @@ class ProvidersModelsDomain:
 
     def draft_state(self) -> object:
         return copy.deepcopy(self._draft)
+
+    def transaction_checkpoint(self) -> dict[str, Any]:
+        """Capture mutable provider state without copying the auth manager.
+
+        ``ProviderAuthManager`` owns locks and worker threads, so it is not a
+        transaction value.  The provider domain only needs its staged source
+        data and editor/probe bookkeeping to restore an Apply that fails.
+        """
+
+        has_last_operation = hasattr(self, "_last_operation")
+        return {
+            "raw": copy.deepcopy(self._raw),
+            "draft": copy.deepcopy(self._draft),
+            "probe_overlay": copy.deepcopy(self._probe_overlay),
+            "disk_revision": copy.deepcopy(self._disk_revision),
+            "exists": self._exists,
+            "provider_editor_ids": copy.deepcopy(self._provider_editor_ids),
+            "model_editor_ids": copy.deepcopy(self._model_editor_ids),
+            "revision": self.revision,
+            "has_last_operation": has_last_operation,
+            "last_operation": copy.deepcopy(getattr(self, "_last_operation", None)),
+        }
+
+    def restore_transaction(self, checkpoint: Mapping[str, Any]) -> None:
+        """Restore the mutable state captured by :meth:`transaction_checkpoint`."""
+
+        self._raw = copy.deepcopy(checkpoint["raw"])
+        self._draft = copy.deepcopy(checkpoint["draft"])
+        self._probe_overlay = copy.deepcopy(checkpoint["probe_overlay"])
+        self._disk_revision = copy.deepcopy(checkpoint["disk_revision"])
+        self._exists = bool(checkpoint["exists"])
+        self._provider_editor_ids = copy.deepcopy(checkpoint["provider_editor_ids"])
+        self._model_editor_ids = copy.deepcopy(checkpoint["model_editor_ids"])
+        self.revision = int(checkpoint["revision"])
+        if checkpoint.get("has_last_operation"):
+            self._last_operation = copy.deepcopy(checkpoint.get("last_operation"))
+        else:
+            self.__dict__.pop("_last_operation", None)
 
     def _replace_draft(self, providers: object, document: object | None = None) -> None:
         from config_editor_core.load import load_config_document, normalize_config_document
@@ -2183,7 +2221,7 @@ class ProvidersModelsDomain:
             "configured": bool(result.get("configured")) if isinstance(result, Mapping) else False,
         }
         if isinstance(result, Mapping):
-            for key in ("verification_uri", "user_code"):
+            for key in ("verification_uri", "user_code", "redirect_uri"):
                 value = result.get(key)
                 if isinstance(value, str) and value:
                     summary[key] = value
@@ -2232,7 +2270,7 @@ class ProvidersModelsDomain:
         result: Mapping[str, Any] = {}
         while time.monotonic() < deadline:
             result = manager.status(auth["kind"], auth["credential_ref"])
-            if result.get("user_code") or result.get("status") != "authorizing":
+            if result.get("user_code") or result.get("verification_uri") or result.get("status") != "authorizing":
                 break
             time.sleep(0.05)
         return {

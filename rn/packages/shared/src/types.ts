@@ -292,7 +292,7 @@ export interface IpcResults {
   snapshot: { snapshot: CoreSnapshot };
   disk_state: { revision: number; disk: Partial<Record<ConfigDomain, DiskState>> };
   logs: { changed: boolean; revision: number; log: LogView | null };
-  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; editor_token: string; revision: number; text: string };
+  editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; editor_token: string; revision: number; text: string; baseline: string };
   dispatch: { revision: number };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
@@ -511,7 +511,8 @@ export interface NativeLeafAdapter {
     /** Stable per-account identity used to isolate concurrent native auth windows. */
     fingerprint?: string;
     verificationURL: string;
-    userCode: string;
+    userCode?: string;
+    callbackURL?: string;
     title: string;
     closeLabel: string;
   }): Promise<void>;

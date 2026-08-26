@@ -319,6 +319,7 @@ def _normalize_sse_response_completed_block(
     if not isinstance(payload, dict):
         return block + delimiter
     original_payload = copy.deepcopy(payload)
+    _normalize_response_function_call_arguments(payload)
     if payload.get("type") == "response.completed":
         _normalize_response_completed_event_usage(
             payload,
@@ -350,6 +351,7 @@ def _normalize_sse_response_completed_text(
         or (
             "response.completed" not in text
             and "image_generation_call" not in text
+            and "response.output_item.added" not in text
         )
     ):
         return text
@@ -416,6 +418,7 @@ def _responses_stream_chunk_for_delivery(
 ) -> Any:
     input_token_upper_bound = _codex_request_input_token_upper_bound(request_data)
     if isinstance(chunk, _JSONStreamEvent):
+        _normalize_response_function_call_arguments(chunk)
         _image_generation_module._normalize_image_generation_result_status(chunk)
         _normalize_response_completed_event_usage(
             chunk,
@@ -433,6 +436,7 @@ def _responses_stream_chunk_for_delivery(
         return chunk
     json_chunk = _jsonable(chunk)
     if isinstance(json_chunk, dict):
+        _normalize_response_function_call_arguments(json_chunk)
         _image_generation_module._normalize_image_generation_result_status(json_chunk)
         _normalize_response_completed_event_usage(
             json_chunk,
@@ -440,6 +444,77 @@ def _responses_stream_chunk_for_delivery(
         )
         return _json_stream_event(json_chunk)
     return chunk
+
+
+def _normalize_response_function_call_added_arguments(payload: Any) -> None:
+    if not isinstance(payload, dict) or payload.get("type") != "response.output_item.added":
+        return
+    item = payload.get("item")
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return
+    if item.get("arguments") == "":
+        return
+    normalized_item = item.copy()
+    normalized_item["arguments"] = ""
+    payload["item"] = normalized_item
+
+
+def _normalize_response_function_call_arguments(payload: Any) -> None:
+    """Repair malformed function-call arguments on every Responses event."""
+
+    if not isinstance(payload, dict):
+        return
+    _normalize_response_function_call_added_arguments(payload)
+
+    event_type = payload.get("type")
+    if event_type == "response.output_item.done":
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            repaired = _responses_request_module._codex_repaired_function_arguments(
+                item.get("arguments")
+            )
+            if repaired is not None:
+                normalized_item = item.copy()
+                normalized_item["arguments"] = repaired
+                payload["item"] = normalized_item
+        return
+
+    if event_type == "response.function_call_arguments.done":
+        repaired = _responses_request_module._codex_repaired_function_arguments(
+            payload.get("arguments")
+        )
+        if repaired is not None:
+            payload["arguments"] = repaired
+        return
+
+    if event_type != "response.completed":
+        return
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return
+    output = response.get("output")
+    if not isinstance(output, list):
+        return
+    normalized_output = []
+    changed = False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            normalized_output.append(item)
+            continue
+        repaired = _responses_request_module._codex_repaired_function_arguments(
+            item.get("arguments")
+        )
+        if repaired is None:
+            normalized_output.append(item)
+            continue
+        normalized_item = item.copy()
+        normalized_item["arguments"] = repaired
+        normalized_output.append(normalized_item)
+        changed = True
+    if changed:
+        normalized_response = response.copy()
+        normalized_response["output"] = normalized_output
+        payload["response"] = normalized_response
 
 
 def _stream_chunk_error_payload(chunk: Any) -> Any:
@@ -599,7 +674,7 @@ def _stream_chunk_dump(chunk: Any) -> dict[str, Any]:
 
 
 def _sse_stream_chunk_payload(chunk: Any) -> Optional[dict[str, Any]]:
-    """Decode an SSE frame only for local classification, never delivery."""
+    """Decode a structured wire chunk for local classification, never delivery."""
 
     if isinstance(chunk, bytes):
         try:
@@ -618,14 +693,21 @@ def _sse_stream_chunk_payload(chunk: Any) -> Optional[dict[str, Any]]:
             event_type = value or None
         elif line.startswith("data:"):
             data_lines.append(line.split(":", 1)[1].strip())
-    if not data_lines:
+    payload_text = "\n".join(data_lines) if data_lines else text.strip()
+    if not data_lines and not payload_text.startswith("{"):
         return None
     try:
-        payload = json.loads("\n".join(data_lines))
+        payload = json.loads(payload_text)
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
         return None
+    if not data_lines:
+        chunk_type = payload.get("type")
+        if not isinstance(chunk_type, str) or not (
+            chunk_type == "error" or chunk_type.startswith("response.")
+        ):
+            return None
     if event_type and not isinstance(payload.get("type"), str):
         payload = payload.copy()
         payload["type"] = event_type
@@ -1218,6 +1300,32 @@ def _synthesized_failed_response_event(
     return _json_stream_event(event)
 
 
+def _synthesized_native_stream_error_chunk(
+    request_data: dict,
+    exception: Exception,
+) -> Any:
+    """Return a terminal error in the client's native streaming format."""
+
+    message = "The upstream model route failed before a final assistant response was available."
+    if _request_is_anthropic_messages_stream(request_data):
+        payload = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message,
+            },
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return f"event: error\ndata: {encoded}\n\n".encode("utf-8")
+    return {
+        "error": {
+            "type": "server_error",
+            "code": "upstream_route_failure",
+            "message": message,
+        }
+    }
+
+
 def _external_web_search_missing_answer_failed_event(
     request_data: dict,
     exception: Exception,
@@ -1365,10 +1473,12 @@ def _stream_chunk_has_visible_text_output(chunk: Any) -> bool:
 
 
 def _stream_chunk_has_visible_output(chunk: Any) -> bool:
+    dumped = _stream_chunk_dump(chunk)
+    visible_chunk = dumped if dumped else chunk
     return bool(
-        _stream_chunk_has_visible_text_output(chunk)
-        or _image_generation_module._response_has_image_generation_activity(chunk)
-        or _response_has_tool_call_activity(chunk)
+        _stream_chunk_has_visible_text_output(visible_chunk)
+        or _image_generation_module._response_has_image_generation_activity(visible_chunk)
+        or _response_has_tool_call_activity(visible_chunk)
     )
 
 
@@ -2251,10 +2361,6 @@ def _apply_streaming_error_fallback_constraints(
         request_data["_excluded_deployment_ids"] = serialized_excluded_ids
         payload["_excluded_deployment_ids"] = serialized_excluded_ids
         _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids)
-        try:
-            exception.excluded_deployment_ids = serialized_excluded_ids  # type: ignore[attr-defined]
-        except Exception:
-            pass
         return excluded_ids
 
     forced_target_order = _routing_module._coerce_order(
@@ -4250,15 +4356,13 @@ async def _stream_route_recovery_poll(
                 yield keepalive
 
         if uses_native_event_stream:
-            if _routing_module._should_sanitize_final_upstream_route_error(
-                last_exception
+            if (
+                _routing_module._is_context_size_error(last_exception)
+                or _routing_module._is_terminal_prompt_or_policy_error(last_exception)
             ):
-                _routing_module._raise_sanitized_upstream_route_failure(
-                    _responses_execution_module._request_model_group(request_data),
-                    last_exception,
-                    request_data,
-                )
-            raise last_exception
+                raise last_exception
+            yield _synthesized_native_stream_error_chunk(request_data, last_exception)
+            return
         yield _synthesized_failed_response_event(request_data, last_exception)
     finally:
         _route_recovery_state_remove(recovery_state_key)
@@ -4577,6 +4681,13 @@ def _apply_stream_function_arguments(
         return item
     arguments = arguments_by_item_id.get(item_id)
     if not isinstance(arguments, str):
+        arguments = item.get("arguments")
+    repaired_arguments = _responses_request_module._codex_repaired_function_arguments(
+        arguments
+    )
+    if repaired_arguments is not None:
+        arguments = repaired_arguments
+    if not isinstance(arguments, str):
         return item
     if item.get("arguments") == arguments:
         return item
@@ -4652,22 +4763,48 @@ class _ResponsesStreamCompletionState:
         if not isinstance(json_item, dict):
             return
 
+        index = self.output_index_for(dumped)
+        if chunk_type == "response.output_item.done":
+            pending_item = self.pending_by_index.get(index)
+            if isinstance(pending_item, dict):
+                merged_item = copy.deepcopy(pending_item)
+                merged_item.update(json_item)
+                json_item = merged_item
+
         item_id = _stream_output_item_key(json_item)
         if item_id and (
             json_item.get("type") == "function_call"
             or _responses_web_search_bridge_module._is_web_search_function_call_item(json_item)
         ):
+            argument_parts = self.argument_parts_by_item_id.get(item_id)
             existing_args = json_item.get("arguments")
             if existing_args is None:
                 existing_args = json_item.get("input")
-            if isinstance(existing_args, str) and existing_args:
-                self.arguments_by_item_id[item_id] = existing_args
+            if argument_parts:
+                self.arguments_by_item_id[item_id] = "".join(argument_parts)
+            elif (
+                item_id not in self.finished_argument_item_ids
+                and isinstance(existing_args, str)
+                and existing_args
+            ):
+                repaired_args = (
+                    _responses_request_module._codex_repaired_function_arguments(
+                        existing_args
+                    )
+                )
+                self.arguments_by_item_id[item_id] = (
+                    existing_args if repaired_args is None else repaired_args
+                )
 
-        index = self.output_index_for(dumped)
         if chunk_type == "response.output_item.done":
-            self.output_by_index[index] = json_item
+            self.output_by_index[index] = _apply_stream_function_arguments(
+                json_item,
+                self.arguments_by_item_id,
+            )
             self.pending_by_index.pop(index, None)
         elif json_item.get("type") == "function_call" or _responses_web_search_bridge_module._is_web_search_function_call_item(json_item):
+            if json_item.get("type") == "function_call":
+                json_item.setdefault("arguments", "")
             self.pending_by_index[index] = json_item
 
     def _remember_function_arguments(self, dumped: dict[str, Any], chunk_type: str) -> None:
@@ -4680,8 +4817,17 @@ class _ResponsesStreamCompletionState:
                 self.argument_parts_by_item_id.setdefault(item_id, []).append(delta)
             return
         arguments = dumped.get("arguments")
+        if not isinstance(arguments, str):
+            parts = self.argument_parts_by_item_id.get(item_id)
+            if isinstance(parts, list):
+                arguments = "".join(parts)
         if isinstance(arguments, str):
-            self.arguments_by_item_id[item_id] = arguments
+            repaired_args = (
+                _responses_request_module._codex_repaired_function_arguments(arguments)
+            )
+            self.arguments_by_item_id[item_id] = (
+                arguments if repaired_args is None else repaired_args
+            )
             self.finished_argument_item_ids.add(item_id)
 
     def _append_synthetic_text(self, text: str) -> None:
@@ -4707,6 +4853,14 @@ class _ResponsesStreamCompletionState:
                     else item
                     for item in output
                 ]
+            if not completed_response.get("output") and self.output_by_index:
+                completed_response["output"] = [
+                    _apply_stream_function_arguments(item, arguments_by_item_id)
+                    for _index, item in sorted(
+                        self.output_by_index.items(),
+                        key=lambda entry: entry[0],
+                    )
+                ]
             return _completed_response_payload(completed_response, request_data)
 
         response = (
@@ -4727,6 +4881,65 @@ class _ResponsesStreamCompletionState:
             if text.strip():
                 response["output_text"] = text
         return _completed_response_payload(response, request_data)
+
+    def chunk_for_delivery(
+        self,
+        chunk: Any,
+        request_data: Optional[dict],
+    ) -> Any:
+        sse_payload = _sse_stream_chunk_payload(chunk)
+        dumped = (
+            copy.deepcopy(sse_payload)
+            if isinstance(sse_payload, dict)
+            else _jsonable(chunk)
+        )
+        if not isinstance(dumped, dict):
+            return chunk
+        chunk_type = _stream_chunk_type(dumped)
+
+        if chunk_type in {"response.output_item.added", "response.output_item.done"}:
+            item = dumped.get("item")
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                return chunk
+            output_index = self.output_index_for(dumped)
+            if chunk_type == "response.output_item.added":
+                normalized_item = self.pending_by_index.get(output_index, item)
+                normalized_item = copy.deepcopy(normalized_item)
+                # Responses clients append argument deltas to this field. Some
+                # chat bridges put an empty-object placeholder here, which
+                # would otherwise produce an invalid ``{}{...}`` payload.
+                normalized_item["arguments"] = ""
+            else:
+                normalized_item = self.output_by_index.get(output_index, item)
+                normalized_item = _apply_stream_function_arguments(
+                    copy.deepcopy(normalized_item),
+                    self.arguments_by_item_id,
+                )
+            dumped["item"] = normalized_item
+            return _JSONStreamEvent(dumped)
+
+        if chunk_type == "response.function_call_arguments.done":
+            item_id = _stream_function_arguments_key(dumped)
+            arguments = self.arguments_by_item_id.get(item_id or "")
+            if isinstance(arguments, str):
+                dumped["arguments"] = arguments
+                return _JSONStreamEvent(dumped)
+            return chunk
+
+        if _responses_stream_chunk_is_completed(dumped):
+            response = dumped.get("response")
+            response_output = response.get("output") if isinstance(response, dict) else None
+            known_output = list(self.output_by_index.values())
+            if isinstance(response_output, list):
+                known_output.extend(
+                    item for item in response_output if isinstance(item, dict)
+                )
+            if not any(item.get("type") == "function_call" for item in known_output):
+                return chunk
+            dumped["response"] = self.completed_payload(request_data)
+            return _JSONStreamEvent(dumped)
+
+        return chunk
 
 
 def _codex_compaction_done_item_completed_compat(
@@ -5994,7 +6207,10 @@ async def _yield_guarded_original_stream(
             if should_suppress_internal_bridge_chunk(chunk):
                 await _close_async_iterator_safely(response)
                 return
-            yield _responses_stream_chunk_for_delivery(chunk)
+            yield _responses_stream_chunk_for_delivery(
+                completion_state.chunk_for_delivery(chunk, request_data),
+                request_data,
+            )
             await _close_async_iterator_safely(response)
             return
         elif _responses_stream_chunk_is_incomplete_terminal(chunk):
@@ -6049,7 +6265,10 @@ async def _yield_guarded_original_stream(
             )
         if should_suppress_internal_bridge_chunk(chunk):
             continue
-        yield _responses_stream_chunk_for_delivery(chunk)
+        yield _responses_stream_chunk_for_delivery(
+            completion_state.chunk_for_delivery(chunk, request_data),
+            request_data,
+        )
 
     try:
         async for chunk in _stream_with_idle_timeout(
@@ -6135,7 +6354,10 @@ async def _yield_guarded_original_stream(
                 if should_suppress_internal_bridge_chunk(chunk):
                     await _close_async_iterator_safely(response)
                     return
-                yield _responses_stream_chunk_for_delivery(chunk)
+                yield _responses_stream_chunk_for_delivery(
+                    completion_state.chunk_for_delivery(chunk, request_data),
+                    request_data,
+                )
                 await _close_async_iterator_safely(response)
                 return
             elif _responses_stream_chunk_is_incomplete_terminal(chunk):
@@ -6190,7 +6412,10 @@ async def _yield_guarded_original_stream(
                 )
             if should_suppress_internal_bridge_chunk(chunk):
                 continue
-            yield _responses_stream_chunk_for_delivery(chunk)
+            yield _responses_stream_chunk_for_delivery(
+                completion_state.chunk_for_delivery(chunk, request_data),
+                request_data,
+            )
     except Exception as exc:
         if saw_image_generation_activity:
             completed = completed_image_generation_terminal_event(

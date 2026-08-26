@@ -56,9 +56,11 @@ type AceEditor = {
   selection?: AceSelection;
   setValue: (value: string, cursorPosition?: number) => void;
   getValue: () => string;
+  getCopyText: () => string;
   setTheme: (theme: string) => void;
   setReadOnly: (readOnly: boolean) => void;
   setOption: (name: string, value: unknown) => void;
+  execCommand: (command: string, args?: unknown) => void;
   focus: () => void;
   resize: (force?: boolean) => void;
   on: (event: string, listener: () => void) => void;
@@ -108,6 +110,47 @@ let scrollbarObserver: ResizeObserver | undefined;
 let scrollbarDrag: { pointerId: number; grabOffset: number } | undefined;
 let latestDiff: EditorDiff = { added: 0, changed: 0, deleted: 0 };
 let applyingHostUpdate = false;
+
+function handleEditorShortcut(event: KeyboardEvent): void {
+  const editor = aceEditor;
+  if (!editor || event.defaultPrevented || (!event.metaKey && !event.ctrlKey) || event.altKey) return;
+  const key = event.key.toLowerCase();
+  if (key === "a") {
+    event.preventDefault();
+    event.stopPropagation();
+    editor.focus();
+    editor.execCommand("selectall");
+    return;
+  }
+  if (key === "z" || key === "y") {
+    event.preventDefault();
+    event.stopPropagation();
+    editor.focus();
+    editor.execCommand(key === "z" && event.shiftKey ? "redo" : key === "y" ? "redo" : "undo");
+    return;
+  }
+  if (key === "c" || key === "x") {
+    const text = editor.getCopyText();
+    if (!text || !navigator.clipboard?.writeText) return;
+    event.preventDefault();
+    event.stopPropagation();
+    editor.focus();
+    void navigator.clipboard.writeText(text).then(() => {
+      if (key === "x" && aceEditor === editor) editor.execCommand("cut");
+    }).catch(() => undefined);
+    return;
+  }
+  if (key === "v" && navigator.clipboard?.readText) {
+    event.preventDefault();
+    event.stopPropagation();
+    editor.focus();
+    void navigator.clipboard.readText().then((text) => {
+      if (aceEditor === editor) editor.execCommand("paste", text);
+    }).catch(() => undefined);
+  }
+}
+
+document.addEventListener("keydown", handleEditorShortcut, true);
 
 const DIFF_PREVIEW_LINE_LIMIT = 4;
 const DIFF_SIDEBAR_ENTRY_LIMIT = 24;

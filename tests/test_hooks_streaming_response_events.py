@@ -1028,7 +1028,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             raise ProviderConcurrencyError("Concurrency limit exceeded, try again later")
 
         async def fallback_stream():
-            yield {"type": "image_generation_call", "result": "base64-image"}
+            yield {"type": "image_generation_call", "result": VALID_IMAGE_RESULT}
 
         class FakeRouter:
             def _get_all_deployments(self, model_name, team_id=None):
@@ -1058,7 +1058,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(chunks, [{"type": "image_generation_call", "result": "base64-image"}])
+        self.assertEqual(chunks, [{"type": "image_generation_call", "result": VALID_IMAGE_RESULT}])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model"], "default-chat")
         self.assertEqual(calls[0]["tool_choice"], "auto")
@@ -1079,7 +1079,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             }
 
         async def fallback_stream():
-            yield {"type": "image_generation_call", "result": "base64-image"}
+            yield {"type": "image_generation_call", "result": VALID_IMAGE_RESULT}
 
         class FakeRouter:
             def _get_all_deployments(self, model_name, team_id=None):
@@ -1109,7 +1109,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(chunks, [{"type": "image_generation_call", "result": "base64-image"}])
+        self.assertEqual(chunks, [{"type": "image_generation_call", "result": VALID_IMAGE_RESULT}])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model"], "default-chat")
         self.assertNotIn("_excluded_deployment_ids", calls[0])

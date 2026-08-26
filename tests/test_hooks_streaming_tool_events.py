@@ -1145,6 +1145,234 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertEqual(events[-1]["response"]["output"][0]["type"], "custom_tool_call")
         self.assertEqual(events[-1]["response"]["output"][0]["id"], "ctc_patch")
 
+    async def test_guarded_responses_stream_restores_function_call_from_bare_json_chunks(self) -> None:
+        hooks, _ = load_hook_module()
+
+        def wire(payload):
+            return json.dumps(payload)
+
+        async def upstream_stream():
+            yield wire({
+                "type": "response.created",
+                "response": {"id": "resp_exec", "status": "in_progress", "output": []},
+            })
+            yield wire({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "item_exec",
+                    "call_id": "fc_exec",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                    "status": "in_progress",
+                },
+            })
+            yield wire({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "item_exec",
+                "output_index": 1,
+                "delta": '{"cmd":"printf ',
+            })
+            yield wire({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "item_exec",
+                "output_index": 1,
+                "delta": 'bridge-ok"}',
+            })
+            yield wire({
+                "type": "response.function_call_arguments.done",
+                "item_id": "item_exec",
+                "output_index": 1,
+                "call_id": "fc_exec",
+                "name": "exec_command",
+            })
+            yield wire({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "item_exec",
+                    "status": "completed",
+                },
+            })
+            yield wire({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_exec",
+                    "status": "completed",
+                    "output": [],
+                },
+            })
+
+        request_data = {
+            "model": "default-chat",
+            "input": "run a command",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+
+        def decoded_stream_chunk(chunk):
+            decoded = jsonable_stream_chunk(chunk)
+            return json.loads(decoded) if isinstance(decoded, str) else decoded
+
+        events = [
+            decoded_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [],
+                upstream_stream(),
+                request_data,
+            )
+        ]
+
+        added = next(event for event in events if event["type"] == "response.output_item.added")
+        arguments_done = next(
+            event
+            for event in events
+            if event["type"] == "response.function_call_arguments.done"
+        )
+        item_done = next(event for event in events if event["type"] == "response.output_item.done")
+        completed = events[-1]["response"]
+
+        self.assertEqual(added["item"]["arguments"], "")
+        self.assertEqual(arguments_done["arguments"], '{"cmd":"printf bridge-ok"}')
+        self.assertEqual(item_done["item"]["call_id"], "fc_exec")
+        self.assertEqual(item_done["item"]["name"], "exec_command")
+        self.assertEqual(item_done["item"]["arguments"], '{"cmd":"printf bridge-ok"}')
+        self.assertEqual(completed["output"], [item_done["item"]])
+
+    async def test_guarded_responses_stream_repairs_placeholder_in_done_item_without_deltas(self) -> None:
+        hooks, _ = load_hook_module()
+
+        def wire(payload):
+            return json.dumps(payload)
+
+        async def upstream_stream():
+            yield wire({
+                "type": "response.created",
+                "response": {"id": "resp_exec", "status": "in_progress", "output": []},
+            })
+            yield wire({
+                "type": "response.output_item.added",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "item_exec",
+                    "call_id": "fc_exec",
+                    "name": "exec_command",
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            })
+            yield wire({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "item_exec",
+                    "call_id": "fc_exec",
+                    "name": "exec_command",
+                    "arguments": '{}{"cmd":"printf bridge-ok"}',
+                    "status": "completed",
+                },
+            })
+            yield wire({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_exec",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "item_exec",
+                            "call_id": "fc_exec",
+                            "name": "exec_command",
+                            "arguments": '{}{"cmd":"printf bridge-ok"}',
+                            "status": "completed",
+                        }
+                    ],
+                },
+            })
+
+        request_data = {
+            "model": "default-chat",
+            "input": "run a command",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+
+        def decoded_stream_chunk(chunk):
+            decoded = jsonable_stream_chunk(chunk)
+            return json.loads(decoded) if isinstance(decoded, str) else decoded
+
+        events = [
+            decoded_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [],
+                upstream_stream(),
+                request_data,
+            )
+        ]
+
+        item_done = next(event for event in events if event["type"] == "response.output_item.done")
+        completed = events[-1]["response"]
+        expected = '{"cmd":"printf bridge-ok"}'
+        self.assertEqual(item_done["item"]["arguments"], expected)
+        self.assertEqual(completed["output"][0]["arguments"], expected)
+
+    def test_responses_delivery_repairs_placeholder_in_done_and_completed_events(self) -> None:
+        hooks, _ = load_hook_module()
+        expected = '{"cmd":"printf bridge-ok"}'
+        done = hooks._responses_stream_chunk_for_delivery(
+            {
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "function_call",
+                    "id": "item_exec",
+                    "call_id": "fc_exec",
+                    "name": "exec_command",
+                    "arguments": '{}{"cmd":"printf bridge-ok"}',
+                    "status": "completed",
+                },
+            },
+            {"call_type": "aresponses", "stream": True, "input": "run"},
+        )
+        completed = hooks._responses_stream_chunk_for_delivery(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_exec",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "item_exec",
+                            "call_id": "fc_exec",
+                            "name": "exec_command",
+                            "arguments": '{}{"cmd":"printf bridge-ok"}',
+                            "status": "completed",
+                        }
+                    ],
+                },
+            },
+            {"call_type": "aresponses", "stream": True, "input": "run"},
+        )
+        self.assertEqual(done["item"]["arguments"], expected)
+        self.assertEqual(completed["response"]["output"][0]["arguments"], expected)
+
     async def test_guarded_responses_stream_completes_finished_custom_tool_before_terminal_event(self) -> None:
         hooks, _ = load_hook_module()
 
@@ -1349,7 +1577,7 @@ class HookStreamingToolEventTests(HookTestCase):
                     "id": "ig_image",
                     "type": "image_generation_call",
                     "status": "generating",
-                    "result": "base64-image",
+                    "result": VALID_IMAGE_RESULT,
                 },
             }
 
@@ -1372,7 +1600,7 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertEqual(events[-1]["response"]["status"], "completed")
         self.assertEqual(events[-1]["response"]["output"][0]["type"], "image_generation_call")
         self.assertEqual(events[-1]["response"]["output"][0]["status"], "completed")
-        self.assertEqual(events[-1]["response"]["output"][0]["result"], "base64-image")
+        self.assertEqual(events[-1]["response"]["output"][0]["result"], VALID_IMAGE_RESULT)
         done_events = [event for event in events if event.get("type") == "response.output_item.done"]
         self.assertEqual(done_events[-1]["item"]["status"], "completed")
 
@@ -1396,7 +1624,7 @@ class HookStreamingToolEventTests(HookTestCase):
                     "id": "ig_image_error",
                     "type": "image_generation_call",
                     "status": "generating",
-                    "result": "base64-image",
+                    "result": VALID_IMAGE_RESULT,
                 },
             }
             raise TimeoutError("stream ended after completed image output")
@@ -1432,7 +1660,7 @@ class HookStreamingToolEventTests(HookTestCase):
                         "id": "ig_image_sse",
                         "type": "image_generation_call",
                         "status": "generating",
-                        "result": "base64-image",
+                        "result": VALID_IMAGE_RESULT,
                     },
                 }
             )
@@ -1611,7 +1839,7 @@ class HookStreamingToolEventTests(HookTestCase):
                     "output": [
                         {
                             "type": "image_generation_call",
-                            "result": "base64-image",
+                            "result": VALID_IMAGE_RESULT,
                         }
                     ]
                 }
@@ -1648,7 +1876,7 @@ class HookStreamingToolEventTests(HookTestCase):
                     "output": [
                         {
                             "type": "image_generation_call",
-                            "result": "base64-image",
+                            "result": VALID_IMAGE_RESULT,
                         }
                     ]
                 }
@@ -1700,7 +1928,7 @@ class HookStreamingToolEventTests(HookTestCase):
         class FakeRouter:
             async def aresponses(self, **payload):
                 calls.append(payload)
-                return {"output": [{"type": "image_generation_call", "result": "base64-image"}]}
+                return {"output": [{"type": "image_generation_call", "result": VALID_IMAGE_RESULT}]}
 
         proxy_server.llm_router = FakeRouter()
         hook = hooks.LiteLLMMenuHook()
@@ -1734,7 +1962,7 @@ class HookStreamingToolEventTests(HookTestCase):
             yield {"type": "response.output_text.delta", "delta": "blocker=IMAGEGEN_TOOL_UNAVAILABLE"}
 
         async def fallback_stream():
-            yield {"type": "image_generation_call", "result": "base64-image"}
+            yield {"type": "image_generation_call", "result": VALID_IMAGE_RESULT}
 
         class FakeRouter:
             async def aresponses(self, **payload):
@@ -1760,7 +1988,7 @@ class HookStreamingToolEventTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(chunks, [{"type": "image_generation_call", "result": "base64-image"}])
+        self.assertEqual(chunks, [{"type": "image_generation_call", "result": VALID_IMAGE_RESULT}])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model"], "default-chat")
         self.assertEqual(calls[0]["tool_choice"], {"type": "image_generation"})
