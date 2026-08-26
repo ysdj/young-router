@@ -794,7 +794,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.officialProviderActive": "当前运行账号",
   "relay.officialProviderRestartHint": "OpenAI 同时只使用一个 ChatGPT 会话。切换账号后请应用并重启 LiteLLM。",
   "relay.officialProviderWebViewHint": "将打开原生登录窗口。凭据只留在服务商页面，LiteLLM Menu 只接收登录状态。",
-  "relay.officialProviderCliHint": "Claude 使用官方 setup-token 流程；若本机没有 CLI，可在安全原生输入框中粘贴 token。",
+  "relay.officialProviderCliHint": "将打开 Claude 官方网页完成登录；无需安装 Claude CLI，授权完成后会自动保存登录凭据。",
   "relay.officialProviderTokenHint": "Token 保存在原生安全存储中，不会进入 UI 快照。",
   "relay.officialProviderModels": "默认托管模型",
   "relay.type.newapi": "NewAPI",

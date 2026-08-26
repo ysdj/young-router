@@ -1854,6 +1854,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.authTypeClaude": "Sign in with Claude"', self.en)
         self.assertIn('"providers.authStatusUnsupported": "暂不支持登录"', self.zh)
         self.assertIn('"providers.authStatusUnsupported": "Sign-in is unavailable"', self.en)
+        self.assertIn("无需安装 Claude CLI", self.zh)
+        self.assertIn("Claude CLI is not required", self.en)
+        self.assert_ui_has("const callbackURL = stringValue(summary.redirect_uri);")
+        self.assert_ui_has("...(callbackURL ? { callbackURL } : {})")
+        self.assert_ui_has('selected && status === "error" ? <NativeSecretField')
 
         # Provider & Models deliberately has no login picker; its wizard is
         # API-key-only and the official account flow is in Service Provider

@@ -933,6 +933,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("showProviderAuth?(options:", types)
         self.assertIn("fingerprint?: string;", types)
+        self.assertIn("callbackURL?: string;", types)
         self.assertIn("showProviderAuth?(options:", bridge)
         self.assertIn("showProviderAuth?:", platform)
         self.assertIn("showProviderAuth: bridge.showProviderAuth", bridge)
@@ -945,8 +946,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         )[0]
         self.assertIn("configuration.websiteDataStore = .nonPersistent()", controller)
         self.assertIn("WKWebView(frame: .zero, configuration: configuration)", controller)
-        self.assertIn("NativeProviderAuthPolicy.allows(provider: provider, url: targetURL)", controller)
-        self.assertIn("NativeProviderAuthPolicy.allows(provider: provider, url: responseURL)", controller)
+        self.assertIn(
+            "NativeProviderAuthPolicy.allows(provider: provider, url: targetURL, callbackURL: callbackURL)",
+            controller,
+        )
+        self.assertIn(
+            "NativeProviderAuthPolicy.allows(provider: provider, url: responseURL, callbackURL: callbackURL)",
+            controller,
+        )
         self.assertNotIn("WKScriptMessageHandler", controller)
         self.assertNotIn("evaluateJavaScript", controller)
         self.assertIn("@objc(showProviderAuth:resolver:rejecter:)", module)
@@ -955,6 +962,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "private final class NativeProviderAuthController", 1
         )[0]
         self.assertIn('url.scheme?.lowercased() == "https"', policy)
+        self.assertIn('url.scheme?.lowercased() == "http"', policy)
+        self.assertIn('host == "localhost" || host == "127.0.0.1"', policy)
+        self.assertIn('url.path == "/callback"', policy)
         self.assertIn('host == "auth.openai.com"', policy)
         self.assertIn('path == "/oauth/authorize"', policy)
 

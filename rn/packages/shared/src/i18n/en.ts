@@ -794,7 +794,7 @@ export const en: Record<TranslationKey, string> = {
   "relay.officialProviderActive": "Current runtime account",
   "relay.officialProviderRestartHint": "OpenAI uses one active ChatGPT session at a time. Apply and restart LiteLLM after switching accounts.",
   "relay.officialProviderWebViewHint": "A native sign-in window opens. Credentials stay inside the provider page; LiteLLM Menu only receives the login status.",
-  "relay.officialProviderCliHint": "Claude uses the official setup-token flow. If the CLI is unavailable, paste the token into the secure native field.",
+  "relay.officialProviderCliHint": "The official Claude sign-in page opens. Claude CLI is not required; credentials are saved automatically after authorization.",
   "relay.officialProviderTokenHint": "The token is stored in the native secure vault and never enters the UI snapshot.",
   "relay.officialProviderModels": "Managed default model",
   "relay.type.newapi": "New API",
