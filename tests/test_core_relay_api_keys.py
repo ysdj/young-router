@@ -200,6 +200,12 @@ class RelayApiKeyDomainTests(unittest.TestCase):
                                 "group_id": 99,
                                 "group": {"name": "Removed"},
                             },
+                            {
+                                "id": "key-ungrouped",
+                                "name": "old-ungrouped",
+                                "status": "active",
+                                "key": "replace-ungrouped",
+                            },
                         ]
                     }
                 },
@@ -238,7 +244,7 @@ class RelayApiKeyDomainTests(unittest.TestCase):
 
             prepared = domain.prepare_apply()
             self.assertEqual(
-                ["sub2api-key-duplicate", "sub2api-key-stale"],
+                ["sub2api-key-duplicate", "sub2api-key-stale", "sub2api-key-ungrouped"],
                 sorted(operation["resource_id"] for operation in prepared["destructive"]),
             )
             self.assertNotIn("api_key_create", [operation["kind"] for operation in prepared["operations"]])
@@ -266,7 +272,7 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             )
             prepared_again = domain.prepare_apply()
             self.assertEqual(
-                ["sub2api-key-duplicate", "sub2api-key-stale"],
+                ["sub2api-key-duplicate", "sub2api-key-stale", "sub2api-key-ungrouped"],
                 sorted(operation["resource_id"] for operation in prepared_again["destructive"]),
             )
 
@@ -275,6 +281,10 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             domain.execute_pending_operations(prepared_again, phase="destructive")
             self.assertIn(
                 ("DELETE", "/api/v1/keys/key-stale", "https://relay.example.test", {"Cookie": "session=fixture"}, None),
+                client.calls,
+            )
+            self.assertIn(
+                ("DELETE", "/api/v1/keys/key-ungrouped", "https://relay.example.test", {"Cookie": "session=fixture"}, None),
                 client.calls,
             )
 

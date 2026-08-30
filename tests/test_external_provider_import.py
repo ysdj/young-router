@@ -147,6 +147,71 @@ class ExternalProviderImportTests(unittest.TestCase):
         self.assertEqual("openai/chat", model["upstream_url_surface"])
         self.assertNotIn("supported_upstream_url_surfaces", model)
 
+    def test_imports_explicit_web_search_capabilities_without_inference(self) -> None:
+        directory = self.temporary_directory()
+        source = directory / "web-search-capabilities.yaml"
+        source.write_text(
+            textwrap.dedent(
+                """
+                model_list:
+                  - model_name: openrouter-search
+                    litellm_params:
+                      model: openai/openrouter-search
+                      api_base: https://openrouter.example.test/v1
+                      api_key: sk-openrouter-search
+                    model_info:
+                      provider: openrouter
+                      supports_web_search: "true"
+                  - model_name: explicit-no-search
+                    litellm_params:
+                      model: openai/explicit-no-search
+                      api_base: https://openrouter.example.test/v1
+                      api_key: sk-openrouter-search
+                    model_info:
+                      provider: openrouter
+                      supports_responses_web_search: false
+                  - model_name: unknown-search
+                    litellm_params:
+                      model: openai/unknown-search
+                      api_base: https://openrouter.example.test/v1
+                      api_key: sk-openrouter-search
+                    model_info:
+                      provider: openrouter
+                      capabilities:
+                        has_web_search_tool: false
+                  - model_name: generic-tools-only
+                    litellm_params:
+                      model: openai/generic-tools-only
+                      api_base: https://openrouter.example.test/v1
+                      api_key: sk-openrouter-search
+                    model_info:
+                      provider: openrouter
+                      supported_parameters: [tools]
+                      pricing:
+                        web_search: "0.005"
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+        result = self.run_importer("--input", str(source))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        models = json.loads(result.stdout)["providers"][0]["models"]
+        self.assertEqual(
+            {"supports_web_search": True},
+            models[0]["model_info_extra"],
+        )
+        self.assertEqual(
+            {"supports_responses_web_search": False},
+            models[1]["model_info_extra"],
+        )
+        self.assertEqual(
+            {"supports_web_search": False},
+            models[2]["model_info_extra"],
+        )
+        self.assertEqual({}, models[3]["model_info_extra"])
+
     def test_rejects_yaml_alias_bomb_without_echoing_source_values(self) -> None:
         directory = self.temporary_directory()
         source = directory / "alias-bomb.yaml"

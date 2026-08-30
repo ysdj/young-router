@@ -1187,6 +1187,270 @@ def _codex_declared_tools(request_kwargs: Optional[dict]) -> list[dict]:
     return declared
 
 
+_CODEX_OPENROUTER_NATIVE_WEB_SEARCH_METADATA_KEY = (
+    "openrouter_native_web_search_injected"
+)
+
+
+def _request_is_openrouter_route(request_kwargs: Optional[dict]) -> bool:
+    """Return whether the selected upstream is OpenRouter.
+
+    Provider metadata is authoritative after deployment selection. The host
+    and explicit custom-provider fields cover generic callbacks that LiteLLM
+    rebuilds without the original model_info object.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    litellm_params = request_kwargs.get("litellm_params")
+    if not isinstance(litellm_params, dict):
+        litellm_params = {}
+
+    def is_openrouter_name(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        normalized = value.strip().lower().rstrip("/")
+        return normalized in {"openrouter", "openrouter.ai"}
+
+    for value in (
+        model_info.get("provider"),
+        request_kwargs.get("custom_llm_provider"),
+        litellm_params.get("custom_llm_provider"),
+    ):
+        if is_openrouter_name(value):
+            return True
+
+    host = _api_base_host(_request_api_base(request_kwargs))
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
+def _codex_tool_is_web_search_declaration(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    if tool.get("type") in (
+        {"web_search", "web_search_preview"} | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES
+    ):
+        return True
+    return _codex_tool_definition_name(tool) in {"web_search", "fetch_content"}
+
+
+def _codex_tool_is_provider_native_web_search(tool: Any) -> bool:
+    return (
+        isinstance(tool, dict)
+        and tool.get("type") in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES
+    )
+
+
+def _codex_tool_is_hosted_web_search(tool: Any) -> bool:
+    return (
+        isinstance(tool, dict)
+        and tool.get("type") in {"web_search", "web_search_preview"}
+    )
+
+
+def _codex_openrouter_native_search_request(
+    request_kwargs: dict,
+    _declared_tools: List[dict],
+) -> tuple[dict, bool]:
+    """Convert Codex hosted search declarations to OpenRouter's native type."""
+
+    modified = request_kwargs.copy()
+    top_level_tools = request_kwargs.get("tools")
+    if not isinstance(top_level_tools, list):
+        existing_extra_body = request_kwargs.get("extra_body")
+        if isinstance(existing_extra_body, dict) and isinstance(
+            existing_extra_body.get("tools"), list
+        ):
+            top_level_tools = existing_extra_body["tools"]
+    updated_tools = (
+        copy.deepcopy(top_level_tools)
+        if isinstance(top_level_tools, list)
+        else []
+    )
+    hosted_replaced = False
+    for index, tool in enumerate(updated_tools):
+        if _codex_tool_is_hosted_web_search(tool):
+            updated_tools[index] = {"type": "openrouter:web_search"}
+            hosted_replaced = True
+
+    input_value = request_kwargs.get("input")
+    updated_input = copy.deepcopy(input_value) if isinstance(input_value, list) else None
+    if isinstance(updated_input, list):
+        normalized_input: list[Any] = []
+        leading_additional_tools = True
+        for item in updated_input:
+            if (
+                leading_additional_tools
+                and isinstance(item, dict)
+                and item.get("type") == "additional_tools"
+            ):
+                item_tools = item.get("tools")
+                if not isinstance(item_tools, list):
+                    normalized_input.append(item)
+                    continue
+                remaining_tools: list[Any] = []
+                promoted_native = False
+                for tool in item_tools:
+                    if _codex_tool_is_hosted_web_search(tool):
+                        hosted_replaced = True
+                        promoted_native = True
+                        continue
+                    if _codex_tool_is_provider_native_web_search(tool):
+                        promoted_native = True
+                        continue
+                    remaining_tools.append(tool)
+                if promoted_native:
+                    if remaining_tools:
+                        item["tools"] = remaining_tools
+                        normalized_input.append(item)
+                    # Promote the declaration to the top-level tools array.
+                    # Leaving it in ``additional_tools`` would either send an
+                    # invalid OpenRouter shape or duplicate it when Codex
+                    # client tools are lifted later in the request pipeline.
+                    continue
+                normalized_input.append(item)
+                continue
+            leading_additional_tools = False
+            normalized_input.append(item)
+        if normalized_input != input_value:
+            modified["input"] = normalized_input
+
+    # This helper is called only when native OpenRouter search is the selected
+    # path, so make the exact provider declaration top-level even when the
+    # caller originally placed it inside a Codex ``additional_tools`` item.
+    if not any(
+        _codex_tool_is_provider_native_web_search(tool)
+        for tool in updated_tools
+    ):
+        updated_tools.append({"type": "openrouter:web_search"})
+    modified["tools"] = updated_tools
+    return modified, hosted_replaced
+
+
+def _codex_openrouter_search_capability_probe_request(
+    request_kwargs: dict,
+    declared_tools: Optional[List[dict]] = None,
+) -> dict:
+    """Return a probe-shaped copy for route-local native-search state.
+
+    The negative capability cache is keyed by the tool family that failed. A
+    later plain Codex turn has no search declaration yet, so use the same
+    provider-native declaration that this hook would send when consulting the
+    cache. This does not expose the local bridge or mutate the caller request.
+    """
+
+    declared_tools = (
+        _codex_declared_tools(request_kwargs)
+        if declared_tools is None
+        else declared_tools
+    )
+    if any(_codex_tool_is_provider_native_web_search(tool) for tool in declared_tools):
+        return request_kwargs
+    if any(
+        _codex_tool_definition_name(tool) in {"web_search", "fetch_content"}
+        for tool in declared_tools
+    ):
+        return request_kwargs
+    probe, _hosted_replaced = _codex_openrouter_native_search_request(
+        request_kwargs,
+        declared_tools,
+    )
+    return probe
+
+
+def _with_codex_openrouter_native_web_search_tool(
+    request_kwargs: dict,
+) -> Optional[dict]:
+    """Expose OpenRouter server-side search on Codex OpenRouter turns.
+
+    A route with an explicit negative capability, or one remembered as
+    rejected by the short probe cache, is left to the pi-web-access adapter.
+    Unknown capability deliberately receives a native probe first.
+    """
+
+    if (
+        not _request_has_responses_shape(request_kwargs)
+        or _request_is_codex_compaction(request_kwargs)
+        or not _request_has_codex_client_evidence(request_kwargs)
+        or not _request_is_openrouter_route(request_kwargs)
+    ):
+        return None
+
+    from . import responses_surfaces as _responses_surfaces_module
+
+    declared_tools = _codex_declared_tools(request_kwargs)
+    capability_request = _codex_openrouter_search_capability_probe_request(
+        request_kwargs, declared_tools
+    )
+    support = _responses_surfaces_module._request_native_responses_web_search_support_decision(
+        capability_request
+    )
+    if support is False:
+        return None
+
+    if any(
+        _codex_tool_definition_name(tool) in {"web_search", "fetch_content"}
+        for tool in declared_tools
+    ):
+        return None
+    top_level_tools = request_kwargs.get("tools")
+    has_top_level_native = isinstance(top_level_tools, list) and any(
+        _codex_tool_is_provider_native_web_search(tool)
+        for tool in top_level_tools
+    )
+    nested_tools = _codex_declared_tools({"input": request_kwargs.get("input")})
+    has_nested_search_declaration = any(
+        _codex_tool_is_web_search_declaration(tool)
+        for tool in nested_tools
+    )
+    has_hosted_search_declaration = any(
+        _codex_tool_is_hosted_web_search(tool) for tool in declared_tools
+    )
+    if (
+        has_top_level_native
+        and not has_nested_search_declaration
+        and not has_hosted_search_declaration
+    ):
+        return None
+
+    modified_kwargs, hosted_replaced = _codex_openrouter_native_search_request(
+        request_kwargs,
+        declared_tools,
+    )
+    existing_extra_body = request_kwargs.get("extra_body")
+    if isinstance(existing_extra_body, dict) and "tools" in existing_extra_body:
+        extra_body = existing_extra_body.copy()
+        extra_body["tools"] = copy.deepcopy(modified_kwargs["tools"])
+        modified_kwargs["extra_body"] = extra_body
+    hosted_options_dropped = False
+    if hosted_replaced:
+        if modified_kwargs.pop("web_search_options", None) is not None:
+            hosted_options_dropped = True
+        tool_choice = modified_kwargs.get("tool_choice")
+        if (
+            isinstance(tool_choice, dict)
+            and _codex_tool_is_hosted_web_search(tool_choice)
+        ) or (
+            isinstance(tool_choice, str)
+            and tool_choice in {"web_search", "web_search_preview"}
+        ):
+            modified_kwargs["tool_choice"] = {"type": "openrouter:web_search"}
+    metadata = (
+        _request_context_module._request_metadata_dict(
+            request_kwargs,
+            "litellm_metadata",
+        )
+        or {}
+    )
+    updated_metadata = metadata.copy()
+    if hosted_replaced and hosted_options_dropped:
+        updated_metadata["openrouter_hosted_web_search_options_dropped"] = True
+    updated_metadata[_CODEX_OPENROUTER_NATIVE_WEB_SEARCH_METADATA_KEY] = True
+    modified_kwargs["litellm_metadata"] = updated_metadata
+    return modified_kwargs
+
+
 def _with_codex_external_web_search_bridge_tool(
     request_kwargs: dict,
 ) -> Optional[dict]:
@@ -1205,27 +1469,40 @@ def _with_codex_external_web_search_bridge_tool(
     if not _request_has_codex_client_evidence(request_kwargs):
         return None
 
+    openrouter_route = _request_is_openrouter_route(request_kwargs)
     # Keep the direct worker contract attached to turns that already carry a
-    # client tool registry (or a Hosted search declaration). A plain Codex
-    # text turn should not gain two extra tools merely because its transport
-    # contains Codex headers.
+    # client tool registry. Once an OpenRouter route has a remembered or
+    # explicit native-search rejection, it also needs the local pair even when
+    # the original request had no other callable tools.
     declared_tools = _codex_declared_tools(request_kwargs)
-    if not declared_tools:
+    if not declared_tools and not openrouter_route:
         return None
 
     from . import responses_surfaces as _responses_surfaces_module
 
     # Native search must get the first opportunity. An unknown capability on
-    # a Responses route is deliberately treated the same way: adding local
-    # functions before the upstream attempt lets the model choose the bridge
-    # and prevents a native web-search event from ever being produced. The
-    # local pair is therefore an explicit unsupported-capability fallback.
+    # a Responses route is deliberately left untouched; the local pair is
+    # reserved for an explicit unsupported capability or a cached deterministic
+    # rejection so the upstream still gets to produce native search events.
+    capability_request = (
+        _codex_openrouter_search_capability_probe_request(
+            request_kwargs, declared_tools
+        )
+        if openrouter_route
+        else request_kwargs
+    )
+    native_search_rejected = (
+        _responses_surfaces_module._request_native_responses_web_search_support_decision(
+            capability_request
+        )
+        is False
+    )
     if (
         _responses_surfaces_module._request_supports_native_responses_web_search(
-            request_kwargs
+            capability_request
         )
         or _responses_surfaces_module._request_should_try_unknown_native_responses_web_search(
-            request_kwargs
+            capability_request
         )
     ):
         return None
@@ -1235,8 +1512,21 @@ def _with_codex_external_web_search_bridge_tool(
     # hosted web search. If the selected route explicitly cannot accept
     # Responses function tools, do not advertise functions that it cannot
     # receive.
-    if not _responses_surfaces_module._request_supports_responses_function_tools(
-        request_kwargs
+    supports_function_tools = (
+        _responses_surfaces_module._request_supports_responses_function_tools(
+            request_kwargs
+        )
+    )
+    explicit_function_tool_rejection = (
+        _request_context_module._request_model_info(request_kwargs).get(
+            "supports_responses_function_tools"
+        )
+        is False
+    )
+    if not supports_function_tools and not (
+        openrouter_route
+        and native_search_rejected
+        and not explicit_function_tool_rejection
     ):
         return None
 
@@ -1244,15 +1534,7 @@ def _with_codex_external_web_search_bridge_tool(
     for tool in declared_tools:
         if not isinstance(tool, dict):
             continue
-        if tool.get("type") in (
-            {"web_search", "web_search_preview"}
-            | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES
-        ):
-            return None
-        if _codex_tool_definition_name(tool) in {
-            "web_search",
-            "fetch_content",
-        }:
+        if _codex_tool_is_web_search_declaration(tool):
             return None
 
     # Keep the canonical pi-web-access schemas in the Responses tool module;

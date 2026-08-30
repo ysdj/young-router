@@ -1069,6 +1069,280 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
         )
         self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
 
+    def test_native_web_search_rejection_is_remembered_until_expiry(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._WEB_SEARCH_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "600")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            state_path = Path(temporary_directory) / "deployment-cooldowns.json"
+            self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(state_path))
+            request = {
+                "call_type": "aresponses",
+                "model": "provider-search-model",
+                "input": "Search the web.",
+                "tools": [{"type": "web_search"}],
+                "model_info": {
+                    "id": "provider-search-deployment",
+                    "provider": "provider_search",
+                    "route_key": "provider_search / openai/model / key=default",
+                    "upstream_url_surface": "openai/responses",
+                    "supports_responses_function_tools": True,
+                    "supports_responses_web_search": True,
+                },
+            }
+
+            class UnsupportedSearch(Exception):
+                status_code = 422
+
+            error = UnsupportedSearch(
+                "invalid_request_error: unsupported web_search tool"
+            )
+            bridge = hooks._with_responses_external_web_search_bridge_after_native_error(
+                error,
+                request,
+            )
+            self.assertIsNotNone(bridge)
+            self.assertEqual(
+                [tool.get("name") for tool in bridge["tools"]],
+                ["web_search", "fetch_content"],
+            )
+            self.assertEqual(len(hooks._WEB_SEARCH_TOOL_UNSUPPORTED), 1)
+            state = next(iter(hooks._WEB_SEARCH_TOOL_UNSUPPORTED.values()))
+            self.assertEqual(state["status"], "unsupported")
+            self.assertAlmostEqual(
+                state["expires_at"] - state["detected_at"],
+                600.0,
+                delta=2.0,
+            )
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIn("web_search_tool_unsupported", payload)
+
+            hooks._WEB_SEARCH_TOOL_UNSUPPORTED.clear()
+            cached_request = request.copy()
+            cached_request["model_info"] = request["model_info"].copy()
+            self.assertEqual(
+                hooks._request_native_responses_web_search_support_decision(
+                    cached_request
+                ),
+                False,
+            )
+            cached_bridge = hooks._with_responses_external_web_search_bridge(
+                cached_request
+            )
+            self.assertIsNotNone(cached_bridge)
+            self.assertTrue(
+                cached_request["litellm_metadata"][
+                    hooks._WEB_SEARCH_TOOL_UNSUPPORTED_CACHE_HIT_KEY
+                ]
+            )
+
+            # Exercise expiry against the in-memory copy without reloading the
+            # still-fresh shared file in the next read.
+            self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, None)
+            for cached_state in hooks._WEB_SEARCH_TOOL_UNSUPPORTED.values():
+                cached_state["expires_at"] = time.time() - 1
+            expired_request = request.copy()
+            expired_request["model_info"] = request["model_info"].copy()
+            self.assertTrue(
+                hooks._request_native_responses_web_search_support_decision(
+                    expired_request
+                )
+            )
+            self.assertIsNone(
+                hooks._with_responses_external_web_search_bridge(expired_request)
+            )
+
+    def test_openrouter_native_web_search_rejection_uses_cached_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._WEB_SEARCH_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "600")
+        request = {
+            "call_type": "aresponses",
+            "model": "openrouter/grok",
+            "input": "Search the web.",
+            "tools": [{"type": "openrouter:web_search"}],
+            "model_info": {
+                "id": "openrouter-grok-deployment",
+                "provider": "openrouter",
+                "route_key": "openrouter / grok / key=default",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_function_tools": True,
+            },
+        }
+
+        class UnsupportedSearch(Exception):
+            status_code = 400
+
+        error = UnsupportedSearch(
+            "invalid_request_error: openrouter:web_search is not supported"
+        )
+        bridge = hooks._with_responses_external_web_search_bridge_after_native_error(
+            error,
+            request,
+        )
+        self.assertIsNotNone(bridge)
+        self.assertEqual(
+            [tool.get("name") for tool in bridge["tools"]],
+            ["web_search", "fetch_content"],
+        )
+        next_request = request.copy()
+        next_request["model_info"] = request["model_info"].copy()
+        cached_bridge = hooks._with_responses_external_web_search_bridge(next_request)
+        self.assertIsNotNone(cached_bridge)
+
+    def test_openrouter_provider_native_web_search_unknown_stays_native(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "model": "openrouter/grok",
+            "input": "Search the web if needed.",
+            "tools": [{"type": "openrouter:web_search"}],
+            "model_info": {
+                "id": "openrouter-grok-unknown-search",
+                "provider": "openrouter",
+                "route_key": "openrouter / grok / key=default",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_function_tools": True,
+            },
+        }
+
+        self.assertFalse(hooks._request_should_bridge_responses_web_search(request))
+        self.assertIsNone(hooks._responses_external_web_search_bridge_kwargs(request))
+
+    def test_explicit_false_provider_native_web_search_uses_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "model": "openrouter/grok",
+            "input": "Search the web.",
+            "tools": [{"type": "openrouter:web_search"}],
+            "model_info": {
+                "id": "openrouter-grok-explicit-no-search",
+                "provider": "openrouter",
+                "upstream_url_surface": "openai/responses",
+                "supports_web_search": False,
+                "supports_responses_function_tools": True,
+            },
+        }
+
+        bridge = hooks._responses_external_web_search_bridge_kwargs(request)
+
+        self.assertIsNotNone(bridge)
+        assert bridge is not None
+        self.assertEqual(
+            [tool.get("name") for tool in bridge["tools"]],
+            ["web_search", "fetch_content"],
+        )
+
+    def test_openrouter_native_web_search_chat_rejection_uses_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "model": "openrouter/grok",
+            "input": "Search the web.",
+            "use_chat_completions_api": True,
+            "tools": [{"type": "openrouter:web_search"}],
+            "model_info": {
+                "id": "openrouter-grok-chat-rejection",
+                "provider": "openrouter",
+                "route_key": "openrouter / grok / key=default",
+                "upstream_url_surface": "openai/chat",
+            },
+        }
+
+        class UnsupportedSearch(Exception):
+            status_code = 400
+
+        bridge = hooks._with_responses_external_web_search_bridge_after_native_error(
+            UnsupportedSearch("invalid_request_error: openrouter:web_search is not supported"),
+            request,
+        )
+
+        self.assertIsNotNone(bridge)
+        assert bridge is not None
+        self.assertEqual(
+            [tool.get("name") for tool in bridge["tools"]],
+            ["web_search", "fetch_content"],
+        )
+
+    def test_web_search_transient_failure_does_not_create_probe_memory(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._WEB_SEARCH_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "600")
+        request = {
+            "call_type": "aresponses",
+            "model": "provider-search-model",
+            "input": "Search the web.",
+            "tools": [{"type": "web_search"}],
+            "model_info": {
+                "id": "provider-search-transient",
+                "provider": "provider_search",
+                "route_key": "provider_search / openai/model / key=default",
+                "upstream_url_surface": "openai/responses",
+            },
+        }
+
+        class TemporaryFailure(Exception):
+            status_code = 503
+
+        self.assertFalse(
+            hooks._record_web_search_tool_unsupported(
+                TemporaryFailure("Exa: fetch failed"),
+                request,
+            )
+        )
+        self.assertEqual(hooks._WEB_SEARCH_TOOL_UNSUPPORTED, {})
+
+    def test_web_search_quota_or_backend_failure_does_not_create_probe_memory(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._WEB_SEARCH_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "600")
+        request = {
+            "call_type": "aresponses",
+            "model": "provider-search-model",
+            "input": "Search the web.",
+            "tools": [{"type": "web_search"}],
+            "model_info": {
+                "id": "provider-search-quota",
+                "provider": "provider_search",
+                "upstream_url_surface": "openai/responses",
+            },
+        }
+
+        class WrappedBadRequest(Exception):
+            status_code = 400
+
+        for message in (
+            "invalid_request_error: quota exceeded while using web_search",
+            "invalid_request_error: provider search fetch failed",
+        ):
+            self.assertFalse(
+                hooks._record_web_search_tool_unsupported(
+                    WrappedBadRequest(message),
+                    request,
+                )
+            )
+        self.assertEqual(hooks._WEB_SEARCH_TOOL_UNSUPPORTED, {})
+
+    def test_web_search_probe_memory_detects_input_lifted_tool_declaration(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "call_type": "aresponses",
+            "model": "openrouter/grok",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "tools": [{"type": "openrouter:web_search"}],
+                }
+            ],
+            "model_info": {
+                "id": "openrouter-input-search",
+                "provider": "openrouter",
+                "upstream_url_surface": "openai/responses",
+            },
+        }
+        self.assertEqual(
+            "provider_native",
+            hooks._web_search_tool_unsupported_family(request),
+        )
+        self.assertTrue(hooks._web_search_tool_unsupported_request_has_search(request))
+
     async def test_generic_response_wrapper_keeps_unknown_generic_chat_route_native_until_error(self) -> None:
         hooks, _ = load_hook_module()
         calls = []

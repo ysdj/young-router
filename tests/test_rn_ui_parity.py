@@ -138,6 +138,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "Promise.all([...pendingFields.current.values()].map((field) => field.commit()))",
             flush,
         )
+        self.assertIn("await dispatchQueue.current;", flush)
+        self.assertNotIn("lastDispatchError", self.ui)
 
     def test_shared_assistant_apply_is_not_blocked_by_the_undefined_default_domain(self) -> None:
         apply_body = self.ui.split('const apply = (): Promise<void> => {', 1)[1].split(
@@ -151,7 +153,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_route_close_and_apply_share_one_dirty_projection(self) -> None:
         for marker in (
             'const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
-            'const actionSnapshot = latestSnapshot.current && latestSnapshot.current.revision > (snapshot?.revision ?? -1)',
+            'const actionSnapshot = latestSnapshot.current && latestSnapshot.current.revision >= (snapshot?.revision ?? -1)',
             'const routeHasStagedChanges = useCallback((currentSnapshot: CoreSnapshot | undefined): boolean => (',
             'return (["relay_accounts", "providers_models"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
             '|| hasPendingFieldEdits()',
@@ -162,6 +164,30 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(2, self.ui.count('disabled={busy || !routeHasStagedChanges(actionSnapshot)}'))
         self.assertNotIn('disabled={busy || stagedDomainsForRoute(snapshot).length === 0}', self.ui)
         self.assertNotIn('snapshot?.drafts.codex?.dirty || snapshot?.drafts.claude?.dirty || hasClaudeDeploymentChanges(snapshot) || hasPendingFieldEdits()', self.ui)
+
+    def test_close_reads_authoritative_snapshot_before_confirming(self) -> None:
+        close_body = self.ui.split('const requestClose = async (): Promise<void> => {', 1)[1].split(
+            '  useEffect(() => {',
+            1,
+        )[0]
+        self.assertIn('const authoritative = await ipc.snapshot();', close_body)
+        self.assertIn('authoritative.revision >= current.revision', close_body)
+        self.assertIn('latestSnapshot.current = authoritative;', close_body)
+        self.assertIn('const needsDiscardConfirmation = routeHasStagedChanges(current);', close_body)
+        self.assertIn('if (!needsDiscardConfirmation) {', close_body)
+        self.assertIn('closeRoute();', close_body)
+
+    def test_apply_rebases_one_live_projection_revision_conflict(self) -> None:
+        apply_body = self.ui.split('const apply = (): Promise<void> => {', 1)[1].split(
+            'const activateProviderAndRestart',
+            1,
+        )[0]
+        self.assertIn('const applyOnce = (nextRevision: number): Promise<IpcResults["apply"]>', apply_body)
+        self.assertIn('if (!isRevisionConflict(reason)) throw reason;', apply_body)
+        self.assertIn('const current = await ipc.snapshot();', apply_body)
+        self.assertIn('const sameDomains = currentDomains.length === domains.length', apply_body)
+        self.assertIn('const sameDiskState = domains.every((name) => (', apply_body)
+        self.assertIn('result = await applyOnce(current.revision);', apply_body)
 
     def test_compatibility_claude_route_reuses_the_combined_native_window(self) -> None:
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
@@ -1321,7 +1347,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(61, len(keys))
+        self.assertEqual(62, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
@@ -1769,6 +1795,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_fetch_models_reports_empty_or_unavailable_results_and_does_not_open_stale_chooser(self) -> None:
         for marker in (
             'const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined>',
+            'const actionSummary = staged.action_summary;',
+            'operation_summary: actionSummary,',
             'const handleFetchedModels = (summary: UnknownRecord): void => {',
             'const providerIdentity = identifier(provider);',
             'summaryProviderId !== providerId && summaryProviderId !== providerIdentity',
@@ -1854,8 +1882,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.authTypeClaude": "Sign in with Claude"', self.en)
         self.assertIn('"providers.authStatusUnsupported": "暂不支持登录"', self.zh)
         self.assertIn('"providers.authStatusUnsupported": "Sign-in is unavailable"', self.en)
-        self.assertIn("无需安装 Claude CLI", self.zh)
-        self.assertIn("Claude CLI is not required", self.en)
+        self.assertIn("将打开 Claude 官方网页完成登录", self.zh)
+        self.assertIn("official Claude sign-in page opens in your browser", self.en)
         self.assert_ui_has("const callbackURL = stringValue(summary.redirect_uri);")
         self.assert_ui_has("...(callbackURL ? { callbackURL } : {})")
         self.assert_ui_has('selected && status === "error" ? <NativeSecretField')
@@ -1890,6 +1918,56 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('removeRequest: serviceProviderRemoveRequest', route)
         self.assertNotIn("embeddedAccountActions", relay)
         self.assertIn("const handledRemoveRequest = useRef(removeRequest ?? 0);", relay)
+
+    def test_service_provider_list_shows_only_name_and_type(self) -> None:
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        route = self.ui.split(
+            '{route === "relay-accounts" ? <View style={serviceProviderStyles.workspace}>',
+            1,
+        )[1].split('{route === "relay-add"', 1)[0]
+        table = route.split("<NativeTable", 1)[1].split("/>", 1)[0]
+        rows = self.ui.split("const serviceProviderRows = useMemo", 1)[1].split(
+            "  useEffect(() => {",
+            1,
+        )[0]
+        navigation = relay.split("export function relayNavigationItems", 1)[1].split(
+            "function accountStationLabel",
+            1,
+        )[0]
+
+        self.assertIn(
+            'columns={[{ label: translate("common.name"), width: 120 }, { label: translate("providers.authType"), width: 90 }]}',
+            table,
+        )
+        self.assertNotIn('translate("common.status")', table)
+        self.assertNotIn('translate("providers.authentication")', table)
+        self.assertNotIn("statusLabels", rows)
+        self.assertNotIn("statusLabels[providerAuthStatus(provider)]", rows)
+        self.assertIn(
+            'cells: [item.kind === "account" ? "  " + item.label : item.label, item.secondary]',
+            rows,
+        )
+        self.assertNotIn("statusKey", navigation)
+        self.assertIn("secondary: relayTypeLabel(account.type, translate),", navigation)
+        self.assertIn('"providers.authType": "类型"', self.zh)
+        self.assertIn('"providers.authType": "Type"', self.en)
+
+    def test_semantic_dispatch_rebases_one_stale_cross_window_revision(self) -> None:
+        dispatch = self.ui.split(
+            "const enqueueDispatch =",
+            1,
+        )[1].split("const dispatch: Dispatch", 1)[0]
+
+        self.assertIn("if (!isRevisionConflict(reason) || !isRevisionRetryableAction(type)) throw reason;", dispatch)
+        self.assertIn("const current = await ipc.snapshot();", dispatch)
+        self.assertIn("revision.current = current.revision;", dispatch)
+        self.assertIn("latestSnapshot.current = current;", dispatch)
+        self.assertIn("onSnapshot(current);", dispatch)
+        self.assertEqual(2, dispatch.count("await ipc.dispatch(action,"))
+        self.assertNotIn("while", dispatch)
+        self.assertIn("function isRevisionRetryableAction(type: string): boolean", self.ui)
+        self.assertIn("normalized === \"service_provider_add\"", self.ui)
+        self.assertIn("normalized === \"api_key_set_auto_grouping\"", self.ui)
 
     def test_logs_keep_the_legacy_dense_toolbar_and_table_frame(self) -> None:
         for marker in (
@@ -2261,8 +2339,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "secondaryCellKeys={resourceSecondaryCellKeys}",
             "onSelectionChange={setSelectedResourceID}",
             "resourceNativeTable:",
-            'columns={[{ label: translate("common.name"), width: 116 }, { label: translate("relay.apiKeyGroup"), width: 124 }, { label: translate("relay.apiKeyMultiplier"), width: 64 }]}',
-            "resourceInspectorPane: { width: 266",
+            'columns={[{ label: translate("common.name"), width: 88 }, { label: translate("relay.apiKeyGroup"), width: 84 }, { label: translate("relay.apiKeyMultiplier"), width: 58 }]}',
+            "resourceInspectorPane: { width: 220",
             "resourceInspectorLabel: { width: 54",
         ):
             self.assertIn(marker, relay)
@@ -2362,7 +2440,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"relay.apiKeyMultiplier": "倍率"', self.zh)
         self.assertIn('"relay.apiKeyGroup": "Group"', self.en)
         self.assertIn('"relay.apiKeyMultiplier": "Rate"', self.en)
-        self.assertIn('columns={[{ label: translate("common.name"), width: 116 }, { label: translate("relay.apiKeyGroup"), width: 124 }, { label: translate("relay.apiKeyMultiplier"), width: 64 }]}', relay)
+        self.assertIn('columns={[{ label: translate("common.name"), width: 88 }, { label: translate("relay.apiKeyGroup"), width: 84 }, { label: translate("relay.apiKeyMultiplier"), width: 58 }]}', relay)
         self.assertIn('resourceGroupName(resource, selectedGroups, translate)', relay)
         self.assertIn('resourceGroupMultiplier(resource, selectedGroups, translate)', relay)
         self.assertNotIn('selectedResources.length > 0 ? <View style={[styles.bottomBar, compactStyles.bottomBar]}>', relay)
@@ -2396,7 +2474,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
 
         self.assertIn("const visibleResources = useMemo", relay)
-        self.assertIn("!selected?.autoGrouping || !resourceGroupUnavailable(resource, selectedGroups)", relay)
+        self.assertIn("function resourceAutoGroupingUnavailable(resource: RelayResource, groups: RelayGroup[]): boolean", relay)
+        self.assertIn("return !resource.groupID || resourceGroupUnavailable(resource, groups);", relay)
+        self.assertIn("!selected?.autoGrouping || !resourceAutoGroupingUnavailable(resource, selectedGroups)", relay)
+        self.assertIn("selected.autoGrouping", relay)
+        self.assertIn("? !resourceAutoGroupingUnavailable(resource, selected.groups)", relay)
+        self.assertIn("const [autoGroupingControlRevision, setAutoGroupingControlRevision] = useState(0);", relay)
+        self.assertIn("setAutoGroupingControlRevision((current) => current + 1);", relay)
+        self.assertIn("key={`auto-grouping:${selected.id}:${selected.autoGrouping}:${autoGroupingControlRevision}`}", relay)
         self.assertNotIn("autoGroupingTransitionAccountID", relay)
         self.assertNotIn("resourceListLoading", relay)
         self.assertNotIn('key: "resource-loading"', relay)
@@ -2685,6 +2770,22 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 6, paddingLeft: 0, paddingRight: 12',
         ):
             self.assertIn(marker, relay)
+
+    def test_relay_resource_columns_fit_the_initial_minimum_viewport(self) -> None:
+        """The native table must expose the multiplier column without scrolling."""
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        match = re.search(
+            r'columns=\{\[\{ label: translate\("common\.name"\), width: (\d+) \}, '
+            r'\{ label: translate\("relay\.apiKeyGroup"\), width: (\d+) \}, '
+            r'\{ label: translate\("relay\.apiKeyMultiplier"\), width: (\d+) \}\]\}',
+            relay,
+        )
+        self.assertIsNotNone(match, "relay API-key table columns")
+        widths = tuple(int(value) for value in match.groups())
+        self.assertEqual((88, 84, 58), widths)
+        # Narrowing the inspector releases 46pt, leaving about 239pt for the
+        # list at the 780pt window minimum after its vertical scroller.
+        self.assertLessEqual(sum(widths), 230)
 
     def test_webdav_form_is_integrated_into_the_unified_sync_tab(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(

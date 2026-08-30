@@ -1104,7 +1104,7 @@ class HookPatchTests(HookTestCase):
         async def original_generic_function(**kwargs):
             seen["attempts"].append(kwargs)
             if len(seen["attempts"]) == 1:
-                error = RuntimeError("model does not support image input")
+                error = RuntimeError("当前模型不支持该能力：visionno fallback model group found")
                 error.status_code = 400
                 raise error
             if "model" not in kwargs:

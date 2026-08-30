@@ -46,6 +46,13 @@ from .base import (
     _IMAGE_GENERATION_TOOL_UNSUPPORTED_LOCK,
     _IMAGE_GENERATION_TOOL_UNSUPPORTED_METADATA_KEY,
     _IMAGE_GENERATION_TOOL_UNSUPPORTED_TTL_SECONDS_ENV,
+    _WEB_SEARCH_TOOL_UNSUPPORTED,
+    _WEB_SEARCH_TOOL_CAPABILITY_UNSUPPORTED_ATTR,
+    _WEB_SEARCH_TOOL_UNSUPPORTED_CACHE_HIT_KEY,
+    _WEB_SEARCH_TOOL_UNSUPPORTED_DEFAULT_TTL_SECONDS,
+    _WEB_SEARCH_TOOL_UNSUPPORTED_LOCK,
+    _WEB_SEARCH_TOOL_UNSUPPORTED_METADATA_KEY,
+    _WEB_SEARCH_TOOL_UNSUPPORTED_TTL_SECONDS_ENV,
     _HOSTED_WEB_SEARCH_TOOL_TYPES,
     _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _PROTOCOL_FALLBACK_CLIENT_SURFACE_KEY,
@@ -474,6 +481,25 @@ def _stream_start_timeout_seconds_for_request(request_data: Optional[dict]) -> f
     if request_timeout <= 0:
         return stream_start_timeout
     return min(stream_start_timeout, request_timeout)
+
+
+def _stream_idle_timeout_seconds_for_request(request_data: Optional[dict]) -> float:
+    """Return the local gap budget for the active streaming request.
+
+    Structured Codex compaction emits a bookkeeping event before the upstream
+    produces its opaque encrypted compaction item.  That gap can legitimately
+    exceed the ordinary stream-idle cap, so use the compaction start budget for
+    the post-first-event wait as well.  An explicit zero stall timeout keeps its
+    existing meaning and disables the local idle cap.
+    """
+    stall_timeout = _stall_timeout_seconds()
+    if stall_timeout <= 0:
+        return 0.0
+    if not _responses_request_module._request_has_structured_codex_compaction(
+        request_data
+    ):
+        return stall_timeout
+    return max(stall_timeout, _stream_start_timeout_seconds_for_request(request_data))
 
 
 def _stream_route_exhaustion_retries() -> int:
@@ -1238,6 +1264,403 @@ def _record_image_generation_tool_unsupported(
         model_group=_responses_execution_module._request_model_group(request_kwargs),
         deployment_id=deployment_id,
         route_key=route_key,
+        ttl_seconds=ttl,
+        expires_at=expires_at,
+        exception=_trace_exception(exception),
+    )
+    return True
+
+
+def _web_search_tool_unsupported_ttl_seconds() -> float:
+    value = os.getenv(_WEB_SEARCH_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "").strip()
+    if not value:
+        return _WEB_SEARCH_TOOL_UNSUPPORTED_DEFAULT_TTL_SECONDS
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _WEB_SEARCH_TOOL_UNSUPPORTED_DEFAULT_TTL_SECONDS
+    return max(0.0, parsed)
+
+
+def _web_search_tool_unsupported_state_map(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    payload.setdefault("schema_version", 1)
+    states = payload.setdefault("web_search_tool_unsupported", {})
+    if not isinstance(states, dict):
+        states = {}
+        payload["web_search_tool_unsupported"] = states
+    return states
+
+
+def _clean_web_search_tool_unsupported_state(
+    state: Any,
+    *,
+    now: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(state, dict):
+        return None
+    if state.get("status") not in {None, "unsupported"}:
+        return None
+    try:
+        expires_at = float(state.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    if expires_at <= 0 or (now is not None and expires_at <= now):
+        return None
+    cleaned = dict(state)
+    cleaned["status"] = "unsupported"
+    cleaned["expires_at"] = expires_at
+    try:
+        cleaned["detected_at"] = float(cleaned.get("detected_at") or 0.0)
+    except (TypeError, ValueError):
+        cleaned["detected_at"] = 0.0
+    return cleaned
+
+
+def _sync_web_search_tool_unsupported_from_shared_locked(
+    states: dict[str, Any],
+    now: float,
+) -> None:
+    shared: dict[str, dict[str, Any]] = {}
+    for cache_key, state in list(states.items()):
+        cleaned = _clean_web_search_tool_unsupported_state(state, now=now)
+        if cleaned is None:
+            states.pop(cache_key, None)
+            continue
+        shared[cache_key] = cleaned
+        if cleaned is not state:
+            states[cache_key] = cleaned
+    with _WEB_SEARCH_TOOL_UNSUPPORTED_LOCK:
+        _WEB_SEARCH_TOOL_UNSUPPORTED.clear()
+        _WEB_SEARCH_TOOL_UNSUPPORTED.update(
+            {key: value.copy() for key, value in shared.items()}
+        )
+
+
+def _web_search_tool_unsupported_update_shared(callback: Any) -> Any:
+    path = _deployment_cooldown_file_path()
+    if not path:
+        return None
+
+    def update(payload: dict[str, Any]) -> Any:
+        now = time.time()
+        states = _web_search_tool_unsupported_state_map(payload)
+        _sync_web_search_tool_unsupported_from_shared_locked(states, now)
+        result = callback(states, now)
+        _sync_web_search_tool_unsupported_from_shared_locked(states, now)
+        return result, now
+
+    try:
+        return _state_module._locked_json_state_update(path, update)
+    except OSError:
+        return None
+
+
+def _web_search_tool_unsupported_family(request_kwargs: Optional[dict]) -> str:
+    families: set[str] = set()
+    if not isinstance(request_kwargs, dict):
+        return "unknown"
+    if "web_search_options" in request_kwargs:
+        families.add("hosted")
+    tools = request_kwargs.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_type = tool.get("type")
+            if tool_type in _HOSTED_WEB_SEARCH_TOOL_TYPES:
+                families.add("hosted")
+            elif tool_type in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
+                families.add("provider_native")
+    families.update(
+        _web_search_tool_unsupported_input_families(request_kwargs.get("input"))
+    )
+    if not families:
+        return "unknown"
+    return "+".join(
+        family for family in ("hosted", "provider_native") if family in families
+    )
+
+
+def _web_search_tool_unsupported_input_families(
+    value: Any,
+    *,
+    depth: int = 0,
+) -> set[str]:
+    """Find hosted/provider-native declarations lifted into Responses input.
+
+    Responses clients can carry ``additional_tools`` or a
+    ``tool_search_output`` item in ``input`` instead of the top-level
+    ``tools`` array. Keep the probe key aligned with the tool planner without
+    treating arbitrary user text as a capability declaration.
+    """
+    if depth > 8:
+        return set()
+    if isinstance(value, list):
+        families: set[str] = set()
+        for item in value:
+            families.update(
+                _web_search_tool_unsupported_input_families(item, depth=depth + 1)
+            )
+        return families
+    if not isinstance(value, dict):
+        return set()
+    families: set[str] = set()
+    tool_type = value.get("type")
+    if tool_type in _HOSTED_WEB_SEARCH_TOOL_TYPES:
+        families.add("hosted")
+    elif tool_type in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
+        families.add("provider_native")
+    for key in ("tools", "input", "items", "output"):
+        nested = value.get(key)
+        if isinstance(nested, (dict, list)):
+            families.update(
+                _web_search_tool_unsupported_input_families(
+                    nested, depth=depth + 1
+                )
+            )
+    return families
+
+
+def _web_search_tool_unsupported_request_has_search(
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    return (
+        _request_contains_hosted_web_search_tool(request_kwargs)
+        or bool(_web_search_tool_unsupported_input_families(request_kwargs.get("input")))
+        or "web_search_options" in request_kwargs
+    )
+
+
+def _web_search_tool_unsupported_surface(request_kwargs: Optional[dict]) -> str:
+    if not isinstance(request_kwargs, dict):
+        return _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+    surface = _request_current_upstream_surface(request_kwargs)
+    if not surface:
+        model_info = _request_context_module._request_model_info(request_kwargs)
+        surface = _normalized_request_surface(
+            model_info.get(_UPSTREAM_URL_SURFACE_KEY)
+        )
+    if not surface:
+        surface = _request_client_surface(request_kwargs)
+    return surface or _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+
+
+def _web_search_tool_unsupported_cache_key(
+    request_kwargs: Optional[dict],
+    exception: Optional[Exception] = None,
+) -> Optional[str]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    deployment_id = _deployment_id_from_request(request_kwargs)
+    route_key = _deployment_route_key_from_request(request_kwargs)
+    if exception is not None:
+        deployment_id = deployment_id or _responses_execution_module._failed_deployment_id(
+            exception
+        )
+        route_key = route_key or _responses_execution_module._failed_deployment_route_key(
+            exception
+        )
+    deployment_key = _deployment_cooldown_key(
+        deployment_id=deployment_id,
+        route_key=route_key,
+    )
+    if not deployment_key:
+        return None
+    return (
+        f"{deployment_key}|surface:{_web_search_tool_unsupported_surface(request_kwargs)}"
+        f"|family:{_web_search_tool_unsupported_family(request_kwargs)}"
+    )
+
+
+def _set_web_search_tool_unsupported_request_state(
+    request_kwargs: Optional[dict],
+    *,
+    state: dict[str, Any],
+    cache_key: str,
+    cache_hit: bool,
+) -> None:
+    if not isinstance(request_kwargs, dict):
+        return
+    if cache_hit:
+        request_kwargs[_WEB_SEARCH_TOOL_UNSUPPORTED_CACHE_HIT_KEY] = True
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    updated_metadata = metadata.copy()
+    updated_metadata[_WEB_SEARCH_TOOL_UNSUPPORTED_METADATA_KEY] = {
+        "status": "unsupported",
+        "cache_key": cache_key,
+        "detected_at": state.get("detected_at"),
+        "expires_at": state.get("expires_at"),
+    }
+    updated_metadata[_WEB_SEARCH_TOOL_UNSUPPORTED_CACHE_HIT_KEY] = bool(cache_hit)
+    request_kwargs["litellm_metadata"] = updated_metadata
+
+
+def _web_search_tool_unsupported_cached(
+    request_kwargs: Optional[dict],
+) -> Optional[dict[str, Any]]:
+    if (
+        not isinstance(request_kwargs, dict)
+        or _web_search_tool_unsupported_ttl_seconds() <= 0
+        or not _web_search_tool_unsupported_request_has_search(request_kwargs)
+    ):
+        return None
+    cache_key = _web_search_tool_unsupported_cache_key(request_kwargs)
+    if not cache_key:
+        return None
+
+    def read(states: dict[str, Any], now: float) -> Optional[dict[str, Any]]:
+        state = _clean_web_search_tool_unsupported_state(
+            states.get(cache_key),
+            now=now,
+        )
+        if state is None:
+            states.pop(cache_key, None)
+            return None
+        return state
+
+    result = _web_search_tool_unsupported_update_shared(read)
+    state = result[0] if isinstance(result, tuple) else None
+    if state is None:
+        with _WEB_SEARCH_TOOL_UNSUPPORTED_LOCK:
+            state = _clean_web_search_tool_unsupported_state(
+                _WEB_SEARCH_TOOL_UNSUPPORTED.get(cache_key),
+                now=time.time(),
+            )
+            if state is None:
+                _WEB_SEARCH_TOOL_UNSUPPORTED.pop(cache_key, None)
+    if not isinstance(state, dict):
+        return None
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    already_marked = (
+        metadata.get(_WEB_SEARCH_TOOL_UNSUPPORTED_CACHE_HIT_KEY) is True
+        and isinstance(metadata.get(_WEB_SEARCH_TOOL_UNSUPPORTED_METADATA_KEY), dict)
+        and metadata[_WEB_SEARCH_TOOL_UNSUPPORTED_METADATA_KEY].get("cache_key")
+        == cache_key
+    )
+    _set_web_search_tool_unsupported_request_state(
+        request_kwargs,
+        state=state,
+        cache_key=cache_key,
+        cache_hit=True,
+    )
+    if not already_marked:
+        _trace_module._route_trace(
+            "web_search_tool_unsupported_cache_hit",
+            request_id=_trace_request_id(request_kwargs),
+            session=_trace_session_context(request_kwargs),
+            deployment_id=_deployment_id_from_request(request_kwargs),
+            route_key=_deployment_route_key_from_request(request_kwargs),
+            cache_key=cache_key,
+            expires_at=state.get("expires_at"),
+            remaining_seconds=round(
+                max(0.0, float(state.get("expires_at") or 0.0) - time.time()),
+                3,
+            ),
+            request=_trace_module._trace_request_summary(request_kwargs),
+        )
+    return state
+
+
+def _record_web_search_tool_unsupported(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    if getattr(exception, _WEB_SEARCH_TOOL_CAPABILITY_UNSUPPORTED_ATTR, False):
+        return True
+    candidate = None
+    for request in (request_kwargs, outer_request_kwargs):
+        if not isinstance(request, dict):
+            continue
+        if not _web_search_tool_unsupported_request_has_search(request):
+            continue
+        if not _is_native_responses_web_search_unsupported_error(exception, request):
+            continue
+        if (
+            _is_responses_endpoint_not_found_error(
+                exception,
+                request,
+                outer_request_kwargs,
+            )
+            and not any(
+                marker in _exception_text(exception)
+                for marker in ("web_search", "web search")
+            )
+        ):
+            # A bare Responses 404 means the whole protocol surface is absent;
+            # protocol fallback owns that signal, not the web-search probe.
+            continue
+        candidate = request
+        break
+    if candidate is None:
+        return False
+    deployment_id = _deployment_id_from_request(candidate) or (
+        _responses_execution_module._failed_deployment_id(exception)
+    )
+    route_key = _deployment_route_key_from_request(candidate) or (
+        _responses_execution_module._failed_deployment_route_key(exception)
+    )
+    cache_key = _deployment_cooldown_key(
+        deployment_id=deployment_id,
+        route_key=route_key,
+    )
+    if cache_key:
+        cache_key = (
+            f"{cache_key}|surface:{_web_search_tool_unsupported_surface(candidate)}"
+            f"|family:{_web_search_tool_unsupported_family(candidate)}"
+        )
+    if not cache_key:
+        return False
+    try:
+        setattr(exception, _WEB_SEARCH_TOOL_CAPABILITY_UNSUPPORTED_ATTR, True)
+    except Exception:
+        pass
+    ttl = _web_search_tool_unsupported_ttl_seconds()
+    now = time.time()
+    expires_at = now + ttl
+    state = {
+        "status": "unsupported",
+        "deployment_id": deployment_id,
+        "route_key": route_key,
+        "surface": _web_search_tool_unsupported_surface(candidate),
+        "family": _web_search_tool_unsupported_family(candidate),
+        "detected_at": now,
+        "expires_at": expires_at,
+    }
+    _set_web_search_tool_unsupported_request_state(
+        candidate,
+        state=state,
+        cache_key=cache_key,
+        cache_hit=False,
+    )
+    if ttl <= 0:
+        return True
+
+    def record(states: dict[str, Any], _now: float) -> None:
+        states[cache_key] = state.copy()
+
+    result = _web_search_tool_unsupported_update_shared(record)
+    if result is None:
+        with _WEB_SEARCH_TOOL_UNSUPPORTED_LOCK:
+            _WEB_SEARCH_TOOL_UNSUPPORTED[cache_key] = state.copy()
+    _trace_module._route_trace(
+        "web_search_tool_unsupported_recorded",
+        request_id=_trace_request_id(candidate),
+        session=_trace_session_context(candidate),
+        model_group=_responses_execution_module._request_model_group(candidate),
+        deployment_id=state.get("deployment_id"),
+        route_key=state.get("route_key"),
+        surface=state.get("surface"),
+        family=state.get("family"),
+        cache_key=cache_key,
         ttl_seconds=ttl,
         expires_at=expires_at,
         exception=_trace_exception(exception),
@@ -3422,6 +3845,43 @@ def _is_native_responses_web_search_unsupported_error(
     text = _exception_text(exception)
     if not text:
         return False
+    # A provider may wrap quota, auth, transport, or backend-search failures
+    # in a 400/422 ``invalid_request_error`` that also repeats the requested
+    # web-search type.  Those are not capability evidence and must not poison
+    # the short negative probe memory.
+    if (
+        _is_upstream_deployment_failover_error(exception)
+        or _is_network_recovery_exception(exception)
+        or any(
+            marker in text
+            for marker in (
+                *_UPSTREAM_BALANCE_ERROR_MARKERS,
+                *_UPSTREAM_TEMPORARY_ERROR_MARKERS,
+                "quota",
+                "credit",
+                "billing",
+                "authentication",
+                "unauthorized",
+                "permission",
+                "forbidden",
+                "api key",
+                "timed out",
+                "timeout",
+                "temporarily",
+                "provider search",
+                "search provider",
+                "provider-search",
+                "fetch failed",
+                "search failed",
+                "search error",
+                "exa",
+                "tavily",
+                "brave search",
+                "duckduckgo",
+            )
+        )
+    ):
+        return False
     request_has_hosted_web_search = _request_contains_hosted_web_search_tool(
         request_kwargs
     )
@@ -3739,6 +4199,7 @@ def _mark_exception_for_deployment_failover(
     deployment_id = _deployment_id_from_request(request_kwargs)
     route_key = _deployment_route_key_from_request(request_kwargs)
     _record_image_generation_tool_unsupported(exception, request_kwargs)
+    _record_web_search_tool_unsupported(exception, request_kwargs)
     if deployment_id and not getattr(exception, "failed_deployment_id", None):
         try:
             exception.failed_deployment_id = deployment_id  # type: ignore[attr-defined]

@@ -60,6 +60,48 @@ class ProvidersModelsDomain:
     _MODEL_PROBE_TIMEOUT_SECONDS = 6.0
     _MAX_MODEL_PROBE_BYTES = 256 * 1024
     _API_KEY_TARGET_SEPARATOR = "\x1f"
+    _WEB_SEARCH_CAPABILITY_ALIASES = {
+        "supports_responses_web_search": "supports_responses_web_search",
+        "supports_web_search": "supports_web_search",
+        "supports_web_search_tool": "supports_web_search",
+        "has_web_search_tool": "supports_web_search",
+        "has_web_search": "supports_web_search",
+        "web_search": "supports_web_search",
+        "supportsResponsesWebSearch": "supports_responses_web_search",
+        "supportsWebSearch": "supports_web_search",
+        "supportsWebSearchTool": "supports_web_search",
+        "hasWebSearchTool": "supports_web_search",
+        "hasWebSearch": "supports_web_search",
+        "webSearch": "supports_web_search",
+    }
+    _WEB_SEARCH_CAPABILITY_CONTAINERS = (
+        "capabilities",
+        "supported_capabilities",
+        "model_info",
+        "metadata",
+        "extra",
+        "model_info_extra",
+        "features",
+        "tools",
+    )
+    _WEB_SEARCH_CAPABILITY_LISTS = (
+        "supported_tools",
+        "supported_features",
+        "supported_parameters",
+        "available_tools",
+        "features",
+        "capabilities",
+        "supported_capabilities",
+        "tools",
+    )
+    _WEB_SEARCH_CAPABILITY_MARKERS = {
+        "web_search",
+        "web_search_preview",
+        "web_search_options",
+        "server_tool_web_search",
+        "openrouter_web_search",
+        "openrouter.web_search",
+    }
 
     def __init__(self, config_path: Path | str | None = None, *, auth_manager: object | None = None):
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
@@ -671,12 +713,84 @@ class ProvidersModelsDomain:
 
     @classmethod
     def _model_candidates(cls, payload: object) -> list[str] | None:
+        catalog = cls._model_catalog(payload)
+        return catalog[0] if catalog is not None else None
+
+    @staticmethod
+    def _explicit_boolean(value: object) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "enabled"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "disabled"}:
+                return False
+        return None
+
+    @classmethod
+    def _model_web_search_capabilities(
+        cls,
+        item: Mapping[str, Any],
+    ) -> dict[str, bool]:
+        capabilities: dict[str, bool] = {}
+        marker_found = False
+        visited: set[int] = set()
+
+        def visit(container: object, depth: int = 0) -> None:
+            nonlocal marker_found
+            if not isinstance(container, Mapping) or depth > 2 or id(container) in visited:
+                return
+            visited.add(id(container))
+            for source_key, target_key in cls._WEB_SEARCH_CAPABILITY_ALIASES.items():
+                if source_key not in container:
+                    continue
+                parsed = cls._explicit_boolean(container.get(source_key))
+                if parsed is not None:
+                    # Prefer a canonical/top-level declaration over aliases
+                    # or nested copies when a gateway repeats the field.
+                    capabilities.setdefault(target_key, parsed)
+            for key in cls._WEB_SEARCH_CAPABILITY_LISTS:
+                values = container.get(key)
+                if not isinstance(values, list):
+                    continue
+                for value in values:
+                    marker = value
+                    if isinstance(value, Mapping):
+                        marker = value.get("type")
+                        if marker is None and key != "tools":
+                            marker = value.get("name", value.get("id"))
+                    if not isinstance(marker, str):
+                        continue
+                    normalized = marker.strip().lower().replace("-", "_").replace(":", "_")
+                    if normalized in cls._WEB_SEARCH_CAPABILITY_MARKERS:
+                        marker_found = True
+            if depth >= 2:
+                return
+            for key in cls._WEB_SEARCH_CAPABILITY_CONTAINERS:
+                nested = container.get(key)
+                if isinstance(nested, Mapping):
+                    visit(nested, depth + 1)
+
+        visit(item)
+        if marker_found and "supports_web_search" not in capabilities:
+            capabilities["supports_web_search"] = True
+        return capabilities
+
+    @classmethod
+    def _model_catalog(
+        cls,
+        payload: object,
+    ) -> tuple[list[str], dict[str, dict[str, bool]]] | None:
         if not isinstance(payload, Mapping):
             return None
         data = payload.get("data")
         if not isinstance(data, list):
             return None
         candidates: list[str] = []
+        capabilities: dict[str, dict[str, bool]] = {}
         seen: set[str] = set()
         for item in data:
             value = item.get("id") if isinstance(item, Mapping) else item
@@ -685,13 +799,26 @@ class ProvidersModelsDomain:
             candidate = REDACT_TEXT(value.strip())
             if not candidate or len(candidate) > 256 or any(ord(char) < 32 for char in candidate):
                 continue
+            metadata = (
+                cls._model_web_search_capabilities(item)
+                if isinstance(item, Mapping)
+                else {}
+            )
+            if metadata:
+                # Some gateways repeat an id while attaching capability
+                # metadata only to one of the records. Merge missing fields
+                # across duplicates, while keeping the first explicit value
+                # deterministic if records disagree.
+                existing_metadata = capabilities.setdefault(candidate, {})
+                for key, parsed in metadata.items():
+                    existing_metadata.setdefault(key, parsed)
             if candidate in seen:
                 continue
             seen.add(candidate)
             candidates.append(candidate)
             if len(candidates) >= cls._MAX_MODEL_CANDIDATES:
                 break
-        return candidates
+        return candidates, capabilities
 
     def _fetch_provider_models(
         self,
@@ -764,10 +891,10 @@ class ProvidersModelsDomain:
                 "model_count": 0,
             }
         try:
-            candidates = self._model_candidates(json.loads(body.decode("utf-8")))
+            catalog = self._model_catalog(json.loads(body.decode("utf-8")))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            candidates = None
-        if candidates is None:
+            catalog = None
+        if catalog is None:
             return {
                 **summary,
                 "available": False,
@@ -775,13 +902,17 @@ class ProvidersModelsDomain:
                 "models": [],
                 "model_count": 0,
             }
-        return {
+        candidates, model_capabilities = catalog
+        result = {
             **summary,
             "available": True,
             "detail": "Provider model list fetched",
             "models": candidates,
             "model_count": len(candidates),
         }
+        if model_capabilities:
+            result["model_capabilities"] = model_capabilities
+        return result
 
     def _fetch_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
         index = self._provider_index(data)
@@ -2279,6 +2410,7 @@ class ProvidersModelsDomain:
             "auth_status": str(result.get("status", "error")),
             **({"verification_uri": str(result["verification_uri"])} if result.get("verification_uri") else {}),
             **({"user_code": str(result["user_code"])} if result.get("user_code") else {}),
+            **({"redirect_uri": str(result["redirect_uri"])} if result.get("redirect_uri") else {}),
         }
 
     def _new_model(
@@ -2288,6 +2420,24 @@ class ProvidersModelsDomain:
         used_deployment_ids: set[str],
     ) -> dict[str, Any]:
         model = _copy_mapping(value, "model")
+        # Model catalogs may return explicit web-search capability flags. Keep
+        # those flags in the canonical model_info_extra bucket used by the
+        # config dumper instead of leaving them as transient top-level draft
+        # fields that would disappear on Apply.
+        web_search_capabilities = self._model_web_search_capabilities(model)
+        if web_search_capabilities:
+            model_info_extra = model.get("model_info_extra")
+            normalized_extra = (
+                copy.deepcopy(dict(model_info_extra))
+                if isinstance(model_info_extra, Mapping)
+                else {}
+            )
+            for capability_key in self._WEB_SEARCH_CAPABILITY_ALIASES:
+                normalized_extra.pop(capability_key, None)
+            normalized_extra.update(web_search_capabilities)
+            model["model_info_extra"] = normalized_extra
+            for capability_key in self._WEB_SEARCH_CAPABILITY_ALIASES:
+                model.pop(capability_key, None)
         if "name" in model and "model_name" not in model:
             model["model_name"] = model.pop("name")
         if "upstream_model" in model:
@@ -3738,6 +3888,11 @@ class ProvidersModelsDomain:
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
         name = _action_name(action)
         data = _mapping(payload or {})
+        auth_status_draft_before = (
+            copy.deepcopy(self._draft)
+            if name in {"provider_auth_status", "service_provider_auth_status"}
+            else None
+        )
         if name in {"set_raw", "setraw"}:
             self._set_raw(data)
         elif name in {"providers_import_selected", "provider_import_selected", "import_selected"}:
@@ -3794,7 +3949,8 @@ class ProvidersModelsDomain:
             self._dispatch_model(name, data)
         else:
             raise DomainError("The requested provider/model action is unavailable")
-        self.revision += 1
+        if auth_status_draft_before is None or self._draft != auth_status_draft_before:
+            self.revision += 1
         result = self.snapshot()
         if hasattr(self, "_last_operation"):
             result["operation_summary"] = copy.deepcopy(self._last_operation)

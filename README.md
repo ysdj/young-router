@@ -98,18 +98,29 @@ When hosted search is unavailable, the fallback replaces the hosted
 declaration with those direct functions; it never sends both forms or
 advertises the removed private bridge name.
 
-OpenRouter is a separate native-server-tool route: when the caller/model
-already declares `type: "openrouter:web_search"`, the adapter passes that
-declaration through unchanged. It does not select a tool, add an instruction,
-or force OpenRouter search for models such as Grok. Raw provider-native search
-events are normalized for delivery, and are mutually exclusive with the
-pi-web-access fallback; only an explicit unsupported error before native search
-activity may enter that fallback.
-On an OpenRouter Codex turn with no explicit search declaration, the adapter
-also leaves the local pi pair out so the model/provider can apply its own
-search capability and request semantics without an injected competing tool; an
-explicit capability flag of `supports_*_web_search: false` is the opt-in for the
-local fallback.
+OpenRouter is a separate native-server-tool route. On an OpenRouter Codex turn
+without an existing search declaration, the adapter adds
+`{"type": "openrouter:web_search"}` so OpenRouter can make the normal
+model-driven server-tool decision; it does not force a search or add a prompt
+instruction. An existing OpenRouter provider-native declaration is passed
+through unchanged; an OpenAI hosted declaration on an OpenRouter route is
+converted to the provider-native type (with hosted-only options removed). Other
+providers keep their original declaration. Raw provider-native search events are
+normalized for delivery, and are mutually exclusive with the pi-web-access
+fallback; only an explicit unsupported error before native search activity may
+enter that fallback.
+There is no authoritative metadata-only test for this server tool: provider
+catalogues commonly advertise generic `tools` support, not
+`openrouter:web_search` acceptance. Therefore an unknown route is probed by
+the native declaration itself. An explicit capability flag of
+`supports_*_web_search: false`, or a deterministic native rejection, selects
+the local fallback.
+After that explicit native rejection, the route's negative capability is
+remembered per deployment, upstream surface, and search-tool family for
+LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS seconds (default 600).
+Matching requests use pi-web-access directly during the TTL; expiry probes the
+native declaration again. Transport, Exa, quota, policy, and other transient
+failures never populate this memory, and 0 disables it.
 
 ### Computer Facade
 
@@ -256,6 +267,11 @@ Each model deployment has its own **Probe** action. For text models it checks Re
 - **Paste Link** accepts a New API or CC Switch `ccswitch://v1/import` provider link through a masked field and standard input so its embedded key is not placed in process arguments.
 
 Imported providers and models are not written until **Apply Config**.
+Explicit `supports_responses_web_search` / `supports_web_search` values (and
+common aliases such as `has_web_search_tool`) found in imported model
+metadata are normalized and preserved; absent metadata stays unknown so the
+first real native-search request performs the runtime probe instead of
+guessing from provider pricing or a generic `tools` flag.
 
 ### Runtime Settings
 
@@ -268,6 +284,7 @@ Adjustable through the menu without editing config files:
 | Codex parent completion barrier | `LITELLM_MENU_CODEX_DESCENDANT_CLEANUP` | 1 (on) |
 | Deployment cooldown failures | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
 | Deployment cooldown seconds | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
+| Web search unsupported memory | `LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` | 600 |
 | Web search max results | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 5 |
 | Web fetch timeout | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
 | dsh-vision-router quick controls | `LITELLM_MENU_DSH_VISION_ROUTER_ENABLED`, `..._BACKEND`, `..._FREE_FALLBACK`, `..._TIMEOUT_SECONDS`, `..._MAX_TOKENS`, `..._LOCAL_OLLAMA_ENABLED`, `..._LOCAL_LM_STUDIO_ENABLED` | inherit / empty (keep advanced JSON) |
@@ -408,12 +425,20 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 `type: "function"`，名称为 `web_search`，并配套 `fetch_content`。托管搜索不可用时，
 `fallback` 会把托管声明替换为这两个直接函数，不会同时发送两种形状，也不会暴露已删除的私有桥接名称。
 
-OpenRouter 的原生服务端搜索是第三种线路：调用方或模型已经声明
-`type: "openrouter:web_search"` 时，适配器原样透传，不替模型选择工具、不添加指令，
-也不强迫 Grok 等模型搜索。上游原生 search 事件只做交付层标准化，并与 pi-web-access 回退互斥；
-只有在原生搜索活动出现之前收到明确“不支持”错误时才允许进入回退。
-OpenRouter Codex 请求如果没有显式 search 声明，适配器也不会补入本地 pi 工具对，交由模型/供应商按自身能力和请求语义处理，避免注入竞争工具；只有显式设置
-`supports_*_web_search: false` 才启用本地回退工具。
+OpenRouter 的原生服务端搜索是第三种线路：OpenRouter Codex 请求如果没有既有 search 声明，
+适配器会补入 `{"type": "openrouter:web_search"}`，让 OpenRouter 按正常的模型决策执行服务端工具；
+这不会强迫 Grok 等模型搜索，也不会添加提示词。OpenRouter 已有的供应商原生声明会原样透传；
+如果 OpenRouter 路由收到 OpenAI 托管声明，
+适配器会转换为供应商原生类型并移除只属于托管搜索的选项；其他供应商仍保持原声明。
+上游原生 search 事件只做交付层标准化，并与 pi-web-access 回退互斥；只有在原生搜索活动出现之前收到
+明确“不支持”错误时才允许进入回退。
+没有可靠的“只看目录、不发声明”预检：供应商目录通常只说明通用 `tools`，不说明是否接受
+`openrouter:web_search`。因此未知路由用原生声明本身完成探测；显式
+`supports_*_web_search: false` 或确定性的原生拒绝才启用本地回退工具。
+原生搜索明确返回不支持后，会按部署、上游线路和搜索工具族记忆负能力，保留
+`LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` 秒（默认 600 秒）；记忆期间直接使用
+本机 pi-web-access，过期后重新探测原生搜索。传输、Exa、配额、策略及其他瞬时失败不会写入
+该记忆，设为 0 可关闭跨请求记忆。
 
 ### Computer Facade
 
@@ -560,6 +585,10 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 - **Paste Link** 通过掩码输入框和标准输入接收 New API 或 CC Switch 的 `ccswitch://v1/import` provider 链接，内嵌 API key 不会进入进程参数。
 
 导入的 provider 和模型只有点击 **Apply Config** 后才会写入。
+导入模型元数据中明确给出的 `supports_responses_web_search` /
+`supports_web_search`（以及 `has_web_search_tool` 等常见别名）会被规范化并保留；
+没有这类元数据时保持未知，由首次真实原生搜索请求执行运行时探测，不会根据供应商
+计费字段或笼统的 `tools` 标志猜测。
 
 ### 运行时设置
 
@@ -572,6 +601,7 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 | Codex 父线程完成屏障 | `LITELLM_MENU_CODEX_DESCENDANT_CLEANUP` | 1（开启） |
 | 部署冷却失败次数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
 | 部署冷却秒数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
+| 网页搜索不支持记忆 | `LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` | 600 |
 | 网页搜索最大结果数 | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 5 |
 | 网页获取超时 | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
 | dsh-vision-router 快捷设置 | `LITELLM_MENU_DSH_VISION_ROUTER_ENABLED`、`..._BACKEND`、`..._FREE_FALLBACK`、`..._TIMEOUT_SECONDS`、`..._MAX_TOKENS`、`..._LOCAL_OLLAMA_ENABLED`、`..._LOCAL_LM_STUDIO_ENABLED` | 跟随高级 JSON / 留空 |

@@ -403,8 +403,18 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 {
                     "provider_id": provider_id,
                     "models": [
-                        {"name": "fetched-one", "upstream_model": "fetched-one", "api_key_name": "default"},
-                        {"name": "fetched-two", "upstream_model": "fetched-two", "api_key_name": "default"},
+                        {
+                            "name": "fetched-one",
+                            "upstream_model": "fetched-one",
+                            "api_key_name": "default",
+                            "supports_web_search": True,
+                        },
+                        {
+                            "name": "fetched-two",
+                            "upstream_model": "fetched-two",
+                            "api_key_name": "default",
+                            "supports_responses_web_search": False,
+                        },
                     ],
                 },
             )
@@ -414,6 +424,27 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual(3, len(added))
             self.assertEqual([0, 0, 0], [model["order"] for model in added])
             self.assertEqual(3, len({model["editor_id"] for model in added}))
+            private_models = domain.export(include_sensitive=True)["providers"][0]["models"]
+            by_name = {model["model_name"]: model for model in private_models}
+            self.assertEqual({"supports_web_search": True}, by_name["fetched-one"]["model_info_extra"])
+            self.assertEqual(
+                {"supports_responses_web_search": False},
+                by_name["fetched-two"]["model_info_extra"],
+            )
+            domain.apply()
+            reloaded = ProvidersModelsDomain(path).export(include_sensitive=True)
+            reloaded_models = {
+                model["model_name"]: model
+                for model in reloaded["providers"][0]["models"]
+            }
+            self.assertEqual(
+                {"supports_web_search": True},
+                reloaded_models["fetched-one"]["model_info_extra"],
+            )
+            self.assertEqual(
+                {"supports_responses_web_search": False},
+                reloaded_models["fetched-two"]["model_info_extra"],
+            )
 
     def test_new_model_uses_public_name_as_upstream_when_route_is_blank(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -874,7 +905,14 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             def do_GET(self) -> None:
                 requests.append((self.path, self.headers.get("Authorization", "")))
                 body = json.dumps(
-                    {"object": "list", "data": [{"id": "model-b"}, {"id": "model-a"}, {"id": "model-a"}]}
+                    {
+                        "object": "list",
+                        "data": [
+                            {"id": "model-b", "supported_tools": ["web_search"]},
+                            {"id": "model-a", "supports_responses_web_search": False},
+                            {"id": "model-a"},
+                        ],
+                    }
                 ).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -904,6 +942,14 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertTrue(fetched["available"])
             self.assertEqual(["model-b", "model-a"], fetched["models"])
             self.assertEqual(["openai-models-v1"], fetched["protocols"])
+            self.assertEqual(
+                {"supports_web_search": True},
+                fetched["model_capabilities"]["model-b"],
+            )
+            self.assertEqual(
+                {"supports_responses_web_search": False},
+                fetched["model_capabilities"]["model-a"],
+            )
             self.assertTrue(probed["ok"])
             self.assertEqual(["model-b", "model-a"], probed["models"])
             self.assertEqual(

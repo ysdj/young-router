@@ -1444,6 +1444,7 @@ def _wrap_generic_function_for_deployment_failover(
         # native-capable route can receive the local search pair.
         _routing_module._apply_current_selected_deployment_to_request(kwargs)
         for update_request in (
+            _responses_request_module._with_codex_openrouter_native_web_search_tool,
             _responses_request_module._with_codex_external_web_search_bridge_tool,
             _responses_request_module._with_codex_tool_registry_instruction,
             _responses_request_module._with_codex_descendant_cleanup_instruction,

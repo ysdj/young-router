@@ -239,7 +239,7 @@ class CoreProtocolTests(unittest.TestCase):
             "disk_state": {"revision": 0, "disk": {}},
             "logs": {"changed": True, "revision": 1, "log": {"tab": "requests", "available": False, "paused": False, "line_count": 0, "records": [], "filter": "", "limit": 10000}},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0, "text": "model = \"example\"\n", "baseline": "model = \"example\"\n"},
-            "dispatch": {"revision": 0},
+            "dispatch": {"revision": 0, "action_summary": {"operation": "fetch_models"}},
             "subscribe": {"subscription_id": "subscription"},
             "validate": {"validate": {}},
             "apply": {
@@ -262,7 +262,7 @@ class CoreProtocolTests(unittest.TestCase):
             "disk_state": {"revision": -1, "disk": {}},
             "logs": {"changed": "yes", "revision": 1, "log": None},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0},
-            "dispatch": {"revision": -1},
+            "dispatch": {"revision": -1, "action_summary": "fetch_models"},
             "subscribe": {"subscription_id": 1},
             "validate": {"validate": []},
             "apply": {
@@ -301,6 +301,8 @@ class CoreProtocolTests(unittest.TestCase):
                     "issues": [{"code": "relay_apply", "message": "Retry required", "api_key": "must-not-leak"}],
                 },
             )
+        with self.assertRaisesRegex(ProtocolError, r"^reload result does not match"):
+            validate_method_result("reload", {"revision": 0, "action_summary": {"operation": "fetch_models"}})
 
     def test_snapshot_params_cannot_contain_extra_fields(self) -> None:
         with self.assertRaises(ProtocolError) as raised:
@@ -1402,6 +1404,70 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                     server.stop()
 
 class CoreIPCTests(unittest.TestCase):
+    def test_dispatch_returns_the_fetch_summary_through_authenticated_ipc(self) -> None:
+        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+
+        class ModelListResponse:
+            status = 200
+
+            def read(self, _limit: int) -> bytes:
+                return b'{"data":[{"id":"model-a"}]}'
+
+            def __enter__(self) -> "ModelListResponse":
+                return self
+
+            def __exit__(self, _type: object, _value: object, _traceback: object) -> bool:
+                return False
+
+        class ModelListOpener:
+            def open(self, _request: object, *, timeout: float) -> ModelListResponse:
+                self.timeout = timeout
+                return ModelListResponse()
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "providers:\n"
+                "  openrouter:\n"
+                "    api_base: https://openrouter.ai/api/v1\n"
+                "    api_keys:\n"
+                "      - name: r\n"
+                "        value: synthetic-openrouter-key\n"
+                "model_list: []\n",
+                encoding="utf-8",
+            )
+            providers = ProvidersModelsDomain(config)
+            core = CoreStore(domains=[providers])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            snapshot = client.call("snapshot")["snapshot"]
+            provider_id = snapshot["domains"]["providers_models"]["providers"][0]["id"]
+            opener = ModelListOpener()
+            with mock.patch(
+                "litellm_menu.core.domains.providers_models.isolated_http_opener",
+                return_value=opener,
+            ):
+                staged = client.call(
+                    "dispatch",
+                    {
+                        "action": {
+                            "domain": "providers_models",
+                            "type": "providers.fetch_models",
+                            "payload": {"provider_id": provider_id, "api_key_name": "r"},
+                        },
+                        "revision": core.revision,
+                    },
+                )
+
+            self.assertEqual(5.0, opener.timeout)
+            self.assertEqual("fetch_models", staged["action_summary"]["operation"])
+            self.assertEqual(["model-a"], staged["action_summary"]["models"])
+            self.assertNotIn("synthetic-openrouter-key", json.dumps(staged))
+
     def test_import_preview_is_non_mutating_and_plan_is_one_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             package_path = Path(directory) / "configuration.json"

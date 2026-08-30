@@ -216,6 +216,204 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._with_codex_external_web_search_bridge_tool(original)
         )
 
+    def test_codex_openrouter_route_injects_native_search_before_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "provider": "openrouter",
+            "upstream_url_surface": "openai/responses",
+            "supports_responses_function_tools": True,
+        }
+
+        modified = hooks._with_codex_openrouter_native_web_search_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tools"], [{"type": "openrouter:web_search"}])
+        self.assertEqual(original["tools"], [])
+        self.assertTrue(
+            modified["litellm_metadata"][
+                hooks._CODEX_OPENROUTER_NATIVE_WEB_SEARCH_METADATA_KEY
+            ]
+        )
+        self.assertIsNone(hooks._with_codex_external_web_search_bridge_tool(modified))
+        self.assertIsNone(hooks._with_codex_openrouter_native_web_search_tool(modified))
+
+    def test_codex_openrouter_hosted_search_is_converted_to_native_declaration(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["tools"] = [
+            {"type": "web_search", "search_context_size": "high"},
+        ]
+        original["web_search_options"] = {"search_context_size": "high"}
+        original["tool_choice"] = {"type": "web_search"}
+        original["model_info"] = {
+            "provider": "openrouter",
+            "upstream_url_surface": "openai/responses",
+            "supports_responses_function_tools": True,
+        }
+
+        modified = hooks._with_codex_openrouter_native_web_search_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tools"], [{"type": "openrouter:web_search"}])
+        self.assertEqual(modified["tool_choice"], {"type": "openrouter:web_search"})
+        self.assertNotIn("web_search_options", modified)
+        self.assertEqual(
+            original["tools"],
+            [{"type": "web_search", "search_context_size": "high"}],
+        )
+        self.assertIn("web_search_options", original)
+
+    def test_codex_openrouter_nested_native_search_is_promoted_without_duplicate(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["input"][0]["tools"].append(
+            {"type": "openrouter:web_search"}
+        )
+        original["model_info"] = {
+            "provider": "openrouter",
+            "upstream_url_surface": "openai/responses",
+            "supports_responses_function_tools": True,
+        }
+
+        modified = hooks._with_codex_openrouter_native_web_search_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tools"], [{"type": "openrouter:web_search"}])
+        self.assertEqual(
+            [tool.get("type") for tool in modified["input"][0]["tools"]],
+            ["namespace"],
+        )
+        self.assertEqual(
+            original["input"][0]["tools"][-1],
+            {"type": "openrouter:web_search"},
+        )
+
+    async def test_codex_openrouter_pre_call_exposes_native_search_with_client_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "provider": "openrouter",
+            "upstream_url_surface": "openai/responses",
+            "supports_responses_function_tools": True,
+        }
+
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertIn(
+            {"type": "openrouter:web_search"},
+            modified["tools"],
+        )
+        self.assertFalse(
+            any(
+                tool.get("name") in {"web_search", "fetch_content"}
+                for tool in modified["tools"]
+                if isinstance(tool, dict)
+            )
+        )
+
+    async def test_codex_openrouter_pre_call_injects_native_search_on_plain_turn(self) -> None:
+        hooks, _ = load_hook_module()
+        original = {
+            "call_type": "aresponses",
+            "model": "openrouter-model",
+            "stream": True,
+            "model_info": {
+                "provider": "openrouter",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_function_tools": True,
+            },
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [{"role": "user", "content": "Current information?"}],
+            "tools": [],
+        }
+
+        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+            original,
+            call_type="aresponses",
+        )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tools"], [{"type": "openrouter:web_search"}])
+
+    def test_codex_openrouter_cached_rejection_uses_local_bridge_without_native_tool(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "id": "openrouter-cached-search",
+            "provider": "openrouter",
+            "route_key": "openrouter / model / key=default",
+            "upstream_url_surface": "openai/responses",
+            "supports_responses_function_tools": True,
+        }
+        probe = original.copy()
+        probe["tools"] = [{"type": "openrouter:web_search"}]
+
+        class UnsupportedSearch(Exception):
+            status_code = 400
+
+        hooks._record_web_search_tool_unsupported(
+            UnsupportedSearch(
+                "invalid_request_error: openrouter:web_search is not supported"
+            ),
+            probe,
+        )
+
+        self.assertIsNone(
+            hooks._with_codex_openrouter_native_web_search_tool(original)
+        )
+        fallback = hooks._with_codex_external_web_search_bridge_tool(original)
+        self.assertIsNotNone(fallback)
+        assert fallback is not None
+        self.assertEqual(
+            [tool.get("name") for tool in fallback["tools"]],
+            ["web_search", "fetch_content"],
+        )
+
+    def test_codex_openrouter_chat_surface_cached_rejection_uses_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "id": "openrouter-cached-search-chat",
+            "provider": "openrouter",
+            "route_key": "openrouter / chat-model / key=default",
+            "upstream_url_surface": "openai/chat",
+        }
+        probe = original.copy()
+        probe["tools"] = [{"type": "openrouter:web_search"}]
+
+        class UnsupportedSearch(Exception):
+            status_code = 400
+
+        hooks._record_web_search_tool_unsupported(
+            UnsupportedSearch(
+                "invalid_request_error: openrouter:web_search is not supported"
+            ),
+            probe,
+        )
+
+        self.assertIsNone(
+            hooks._with_codex_openrouter_native_web_search_tool(original)
+        )
+        fallback = hooks._with_codex_external_web_search_bridge_tool(original)
+        self.assertIsNotNone(fallback)
+        assert fallback is not None
+        self.assertEqual(
+            [tool.get("name") for tool in fallback["tools"]],
+            ["web_search", "fetch_content"],
+        )
+
     def test_codex_openrouter_explicit_search_unsupported_keeps_pi_fallback(self) -> None:
         hooks, _ = load_hook_module()
         original = self._codex_collaboration_request()

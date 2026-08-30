@@ -794,7 +794,7 @@ export type TranslationKey =
   | "relay.officialProviderActive"
   | "relay.officialProviderRestartHint"
   | "relay.officialProviderWebViewHint"
-  | "relay.officialProviderCliHint"
+  | "relay.officialProviderBrowserHint"
   | "relay.officialProviderTokenHint"
   | "relay.officialProviderModels"
   | "relay.workspace"

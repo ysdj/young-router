@@ -16,6 +16,7 @@ from .base import (
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _PI_WEB_ACCESS_TOOL_NAMES,
+    _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_SUPPRESS_POST_CALL_KEY,
@@ -54,7 +55,11 @@ def _tools_include_web_search(tools: Any) -> bool:
         return False
     return any(
         isinstance(tool, dict)
-        and tool.get("type") in {"web_search", "web_search_preview"}
+        and tool.get("type")
+        in (
+            {"web_search", "web_search_preview"}
+            | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES
+        )
         for tool in tools
     )
 

@@ -465,6 +465,26 @@ function isEditorCapabilityConflict(reason: unknown): boolean {
   return code === "invalid_editor" || code === "revision_conflict";
 }
 
+function isRevisionConflict(reason: unknown): boolean {
+  return stringValue(asRecord(reason).code) === "revision_conflict";
+}
+
+function isRevisionRetryableAction(type: string): boolean {
+  const normalized = type.replace(/[.-]/g, "_").toLowerCase();
+  return normalized === "service_provider_add"
+    || normalized.startsWith("service_provider_auth_")
+    || normalized.startsWith("provider_auth_")
+    || normalized === "account_add"
+    || normalized === "account_detect_type"
+    || normalized === "resources_refresh"
+    || normalized === "provider_fetch_models"
+    || normalized === "providers_fetch_models"
+    || normalized === "fetch_models"
+    || normalized === "provider_fetch_relay_resource_models"
+    || normalized === "api_key_set_auto_grouping"
+    || normalized === "api_key_auto_group_align";
+}
+
 function domainState(snapshot: CoreSnapshot | undefined, domain: ConfigDomain): UnknownRecord {
   const record = asRecord(snapshot?.domains[domain]);
   const state = asRecord(record.state);
@@ -961,7 +981,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const dispatchQueue = useRef<Promise<void>>(Promise.resolve());
   const probedSurfaceApplyQueue = useRef<Promise<void>>(Promise.resolve());
   const importPlanToken = useRef<string | undefined>(undefined);
-  const lastDispatchError = useRef<unknown>(undefined);
   const pendingFields = useRef(new Map<symbol, PendingField>());
   const [, forcePendingFieldDirtyRender] = useState(0);
   const pendingFieldDirtyIdsRef = useRef<ReadonlySet<symbol>>(new Set());
@@ -1010,26 +1029,18 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   }, [snapshot]);
 
   const serviceProviderRows = useMemo(() => {
-    const statusLabels: Record<ProviderAuthStatus, string> = {
-      signed_out: translate("providers.authStatusSignedOut"),
-      authorizing: translate("providers.authStatusAuthorizing"),
-      signed_in: translate("providers.authStatusSignedIn"),
-      expired: translate("providers.authStatusExpired"),
-      error: translate("providers.authStatusError"),
-      unsupported: translate("providers.authStatusUnsupported"),
-    };
     const officialRows = serviceProviderRecords(snapshot).map((provider) => {
       const kind = providerAuthKind(provider) === "claude_login" ? "claude_login" : "openai_login";
       return {
         key: "provider:" + editorIdentifier(provider),
-        cells: [stringValue(provider.display_name, stringValue(provider.name, serviceProviderKindLabel(kind, translate))), serviceProviderKindLabel(kind, translate), statusLabels[providerAuthStatus(provider)]],
+        cells: [stringValue(provider.display_name, stringValue(provider.name, serviceProviderKindLabel(kind, translate))), serviceProviderKindLabel(kind, translate)],
       };
     });
     const relayRows = relayNavigationItems(snapshot, translate).map((item) => ({
       key: item.key,
       // Keep the station → account hierarchy visible in the compact unified
       // list. NativeTable preserves the leading spaces in the first cell.
-      cells: [item.kind === "account" ? "  " + item.label : item.label, item.secondary, item.kind === "account" ? item.secondary.split(" · ").slice(-1)[0] : translate("relay.station")],
+      cells: [item.kind === "account" ? "  " + item.label : item.label, item.secondary],
     }));
     return [...officialRows, ...relayRows];
   }, [snapshot, translate]);
@@ -1122,17 +1133,30 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       setWebDavOperationBusy(false);
     }
   };
-  const enqueueDispatch = (type: string, payload: UnknownRecord = {}, targetDomain = domain): Promise<{ revision: number }> => {
-    if (!targetDomain) return Promise.reject(new Error("A settings domain is required"));
+  const enqueueDispatch = (type: string, payload: UnknownRecord = {}, targetDomain = domain): Promise<IpcResults["dispatch"]> => {
+    const actionDomain = targetDomain;
+    if (!actionDomain) return Promise.reject(new Error("A settings domain is required"));
     const queued = dispatchQueue.current.catch(() => undefined).then(async () => {
-      lastDispatchError.current = undefined;
       if (revision.current === undefined) await refresh();
-      const staged = await ipc.dispatch({ domain: targetDomain, type, payload }, revision.current);
+      const action = { domain: actionDomain, type, payload };
+      let staged: IpcResults["dispatch"];
+      try {
+        staged = await ipc.dispatch(action, revision.current);
+      } catch (reason: unknown) {
+        if (!isRevisionConflict(reason) || !isRevisionRetryableAction(type)) throw reason;
+        // Every route window observes the same Core revision. Another window
+        // or an official-account status refresh can advance it between this
+        // surface's last snapshot and a semantic action such as Add account.
+        // Rebase that action on the authoritative snapshot once; a second
+        // conflict remains visible instead of hiding a real concurrent edit.
+        const current = await ipc.snapshot();
+        revision.current = current.revision;
+        latestSnapshot.current = current;
+        onSnapshot(current);
+        staged = await ipc.dispatch(action, current.revision);
+      }
       revision.current = staged.revision;
       return staged;
-    }).catch((reason: unknown) => {
-      lastDispatchError.current = reason;
-      throw reason;
     });
     dispatchQueue.current = queued.then(() => undefined, () => undefined);
     return queued;
@@ -1149,6 +1173,10 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   // new Core state immediately instead of waiting for the disk watcher.
   }, null, true);
   const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined> => {
+    // Keep a stable, narrowed domain for the asynchronous outcome projection.
+    // `targetDomain` is optional on the public helper because most callers use
+    // the route's domain, but action summaries are keyed by a concrete domain.
+    const actionDomain = targetDomain;
     let succeeded = false;
     let outcome: CoreSnapshot | undefined;
     await run(async () => {
@@ -1158,6 +1186,22 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       // latestSnapshot.current after run() returns is racy with the
       // authorisation status poll, which can overwrite its operation summary.
       outcome = await refresh();
+      const actionSummary = staged.action_summary;
+      if (actionSummary && actionDomain) {
+        const currentDomainSummary = asRecord(outcome.action_summaries?.[actionDomain]);
+        outcome = {
+          ...outcome,
+          action_summaries: {
+            ...outcome.action_summaries,
+            [actionDomain]: {
+              ...currentDomainSummary,
+              operation_summary: actionSummary,
+            },
+          },
+        };
+        latestSnapshot.current = outcome;
+        onSnapshot(outcome);
+      }
       return staged;
     }, null, keepControlsEnabled, false);
     return succeeded ? outcome : undefined;
@@ -1220,8 +1264,11 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     for (const field of [...pendingFields.current.values()]) {
       await field.commit();
     }
+    // Every field commit awaits its own enqueueDispatch promise, so its error
+    // already belongs to this Apply and propagates above. The shared queue is
+    // deliberately made non-rejecting for serialization; do not replay an
+    // error from an unrelated, already-handled background action here.
     await dispatchQueue.current;
-    if (lastDispatchError.current !== undefined) throw lastDispatchError.current;
   };
   const flushAssistantEditorFields = async (): Promise<void> => {
     const fields = [...pendingFields.current.values()].filter((field) => (
@@ -1232,7 +1279,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       await field.commit();
     }
     await dispatchQueue.current;
-    if (lastDispatchError.current !== undefined) throw lastDispatchError.current;
   };
   const openAssistantFile = (target: AssistantFileTarget): void => {
     // Native button actions can run before the focused AppKit field emits its
@@ -1247,9 +1293,11 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   // Actions can finish with a fresh Core snapshot before the parent route has
   // rendered it into `snapshot`. Keep the footer and close decision on the
   // same newest projection so Apply cannot look enabled while Close sees a
-  // clean draft (or vice versa). Equal revisions prefer the prop: it is the
-  // rendered source of truth and may contain a newer same-revision projection.
-  const actionSnapshot = latestSnapshot.current && latestSnapshot.current.revision > (snapshot?.revision ?? -1)
+  // clean draft (or vice versa). The ref is populated directly by IPC reads,
+  // so equal revisions must prefer it too: the parent prop can still be one
+  // render behind after a same-revision projection (for example an action
+  // summary update).
+  const actionSnapshot = latestSnapshot.current && latestSnapshot.current.revision >= (snapshot?.revision ?? -1)
     ? latestSnapshot.current
     : snapshot;
   const routeHasStagedChanges = useCallback((currentSnapshot: CoreSnapshot | undefined): boolean => (
@@ -1410,11 +1458,36 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
         if (!accepted) return { cancelled: true };
       }
       const confirmations = [...risks, ...diskConflicts.map((name) => `overwrite_external_${name}`)];
-      const result = settingsRoute || route === "relay-accounts"
-        ? await ipc.applyDomains([...domains], refreshed.revision, confirmations.length > 0 ? confirmations : undefined)
-        : domain === undefined
-          ? await ipc.applyDomains([...domains], refreshed.revision, confirmations.length > 0 ? confirmations : undefined)
-          : await ipc.apply(domain, refreshed.revision, confirmations.length > 0 ? confirmations : undefined);
+      const applyOnce = (nextRevision: number): Promise<IpcResults["apply"]> => (
+        settingsRoute || route === "relay-accounts" || domain === undefined
+          ? ipc.applyDomains([...domains], nextRevision, confirmations.length > 0 ? confirmations : undefined)
+          : ipc.apply(domain, nextRevision, confirmations.length > 0 ? confirmations : undefined)
+      );
+      let result: IpcResults["apply"];
+      try {
+        result = await applyOnce(refreshed.revision);
+      } catch (reason: unknown) {
+        if (!isRevisionConflict(reason)) throw reason;
+        // Relay login/resource discovery and official-account auth status are
+        // intentionally live projections. They can advance Core's shared
+        // revision between this snapshot and Apply without changing the
+        // staged settings the user is applying. Rebase once on the
+        // authoritative snapshot; a second conflict remains visible instead
+        // of silently overwriting a concurrent edit.
+        const current = await ipc.snapshot();
+        const currentDomains = stagedDomainsForRoute(current);
+        const sameDomains = currentDomains.length === domains.length
+          && domains.every((name) => currentDomains.includes(name));
+        const sameDiskState = domains.every((name) => (
+          current.disk[name]?.changed === refreshed.disk[name]?.changed
+          && current.disk[name]?.generation === refreshed.disk[name]?.generation
+        ));
+        if (!sameDomains || !sameDiskState) throw reason;
+        revision.current = current.revision;
+        latestSnapshot.current = current;
+        onSnapshot(current);
+        result = await applyOnce(current.revision);
+      }
       if (domains.includes("codex") || domains.includes("claude")) {
         setSettingsRawBaselineToken((current) => current + 1);
       }
@@ -1647,7 +1720,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       onClose();
     }
   };
-  const requestClose = (): void => {
+  const requestClose = async (): Promise<void> => {
     // The provider wizard is a native modal child window. Its Cancel button
     // and title-bar close both dismiss that child directly; partial staged
     // provider edits remain in Core just as they did when the wizard was an
@@ -1661,46 +1734,61 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       native.window.open(windowRoute);
       native.window.focus(windowRoute);
     };
-    const current = actionSnapshot;
-    const dirtyDomains = stagedDomainsForRoute(current);
-    const needsDiscardConfirmation = routeHasStagedChanges(current);
-    if (!needsDiscardConfirmation) {
-      closeRoute();
-      return;
-    }
-    void (async () => {
+    try {
+      // A title-bar action can arrive before the subscription has rendered
+      // the latest Core projection into this route. Read the authoritative
+      // snapshot before deciding whether a discard confirmation is needed;
+      // this also handles same-revision projections without treating a
+      // stale prop as an edited form. If Core is temporarily unavailable,
+      // retain the last local projection as the safe fallback.
+      let current = actionSnapshot;
       try {
-        const confirmed = await native.showConfirmation({
-          title: translate("menu.close"),
-          message: translate("common.discarded"),
-          confirmLabel: translate("menu.close"),
-        });
-        if (!confirmed) {
-          restoreWindow();
-          return;
-        }
-        discardPendingFields();
-        closeRoute();
-        for (const name of dirtyDomains) {
-          try {
-            if (name === "relay_accounts") {
-              const reloaded = await ipc.reload(name, revision.current);
-              revision.current = reloaded.revision;
-            } else if (name === "language") {
-              const reloaded = await ipc.reload(name, revision.current);
-              revision.current = reloaded.revision;
-            } else {
-              await enqueueDispatch("cancel", {}, name);
-            }
-          } catch {
-            // The user already chose to discard and the window is gone. Core
-            // will reconcile the draft on the next open instead of blocking UI.
-          }
+        const authoritative = await ipc.snapshot();
+        if (!current || authoritative.revision >= current.revision) {
+          current = authoritative;
+          revision.current = authoritative.revision;
+          latestSnapshot.current = authoritative;
+          onSnapshot(authoritative);
         }
       } catch {
-        restoreWindow();
+        // Fall back to the newest local projection below.
       }
-    })();
+      const dirtyDomains = stagedDomainsForRoute(current);
+      const needsDiscardConfirmation = routeHasStagedChanges(current);
+      if (!needsDiscardConfirmation) {
+        closeRoute();
+        return;
+      }
+      const confirmed = await native.showConfirmation({
+        title: translate("menu.close"),
+        message: translate("common.discarded"),
+        confirmLabel: translate("menu.close"),
+      });
+      if (!confirmed) {
+        restoreWindow();
+        return;
+      }
+      discardPendingFields();
+      closeRoute();
+      for (const name of dirtyDomains) {
+        try {
+          if (name === "relay_accounts") {
+            const reloaded = await ipc.reload(name, revision.current);
+            revision.current = reloaded.revision;
+          } else if (name === "language") {
+            const reloaded = await ipc.reload(name, revision.current);
+            revision.current = reloaded.revision;
+          } else {
+            await enqueueDispatch("cancel", {}, name);
+          }
+        } catch {
+          // The user already chose to discard and the window is gone. Core
+          // will reconcile the draft on the next open instead of blocking UI.
+        }
+      }
+    } catch {
+      restoreWindow();
+    }
   };
   useEffect(() => {
     if (nativeAction?.id !== `request-close-${route}` && nativeAction?.id !== `request-close-${canonicalWindowRoute(route)}`) return;
@@ -1834,7 +1922,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
             </View>
           </View>
           <NativeTable
-            columns={[{ label: translate("common.name"), width: 118 }, { label: translate("providers.authentication"), width: 72 }, { label: translate("common.status"), width: 78 }]}
+            columns={[{ label: translate("common.name"), width: 120 }, { label: translate("providers.authType"), width: 90 }]}
             rows={serviceProviderRows}
             selectedKey={serviceProviderSelection ?? ""}
             compact
@@ -2145,7 +2233,7 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
     const label = stringValue(provider.display_name, stringValue(provider.name, serviceProviderKindLabel(loginKind, translate)));
     return {
       key: editorIdentifier(provider),
-      cells: [label, serviceProviderKindLabel(loginKind, translate), statusLabels[providerAuthStatus(provider)]],
+      cells: [label, serviceProviderKindLabel(loginKind, translate)],
     };
   });
 
@@ -2153,13 +2241,13 @@ function ServiceProviderManager({ snapshot, native, busy, translate, dispatch, d
       <View style={serviceProviderStyles.intro}><Text style={serviceProviderStyles.heading}>{translate("relay.officialAccounts")}</Text><Text style={serviceProviderStyles.hint}>{translate("relay.officialAccountsHint")}</Text></View>
       <View style={serviceProviderStyles.columns}>
         {!hideNavigation ? <View style={serviceProviderStyles.listPane}>
-          <NativeTable columns={[{ label: translate("providers.provider"), width: 150 }, { label: translate("providers.authentication"), width: 92 }, { label: translate("relay.officialProviderStatus"), width: 118 }]} rows={rows} selectedKey={providerID} compact onSelectionChange={(key) => setLocalSelectedProviderID(key)} style={serviceProviderStyles.table} />
+          <NativeTable columns={[{ label: translate("providers.provider"), width: 166 }, { label: translate("providers.authType"), width: 90 }]} rows={rows} selectedKey={providerID} compact onSelectionChange={(key) => setLocalSelectedProviderID(key)} style={serviceProviderStyles.table} />
         </View> : null}
         <View style={serviceProviderStyles.detailPane}>
           <View style={serviceProviderStyles.detailHeader}><Text style={serviceProviderStyles.detailTitle}>{displayName}</Text><Text style={serviceProviderStyles.status}>{statusLabels[status]}</Text></View>
           <View style={serviceProviderStyles.rule} />
           <Text style={serviceProviderStyles.detailLine}>{translate("relay.officialProviderModels")}: {modelName}</Text>
-          <Text style={serviceProviderStyles.hint}>{selectedKind === "openai_login" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderCliHint")}</Text>
+          <Text style={serviceProviderStyles.hint}>{selectedKind === "openai_login" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text>
           {selectedKind === "openai_login" && active ? <Text style={serviceProviderStyles.activeHint}>{translate("relay.officialProviderActive")}</Text> : null}
           {selectedKind === "openai_login" && selected && status === "signed_in" && !active ? <Text style={serviceProviderStyles.hint}>{translate("relay.officialProviderRestartHint")}</Text> : null}
           <View style={serviceProviderStyles.actions}>
@@ -2187,6 +2275,7 @@ function ProviderSetupWizard({ providers, relaySources, relayStations, busy, tra
   const [modelName, setModelName] = useState("");
   const [upstreamModel, setUpstreamModel] = useState("");
   const [fetchedModelCandidates, setFetchedModelCandidates] = useState<string[]>([]);
+  const [fetchedModelCapabilities, setFetchedModelCapabilities] = useState<Record<string, UnknownRecord>>({});
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [manualModels, setManualModels] = useState<Array<{ id: string; name: string; upstream_model: string }>>([]);
   const [selectedManualModelIDs, setSelectedManualModelIDs] = useState<string[]>([]);
@@ -2237,6 +2326,7 @@ function ProviderSetupWizard({ providers, relaySources, relayStations, busy, tra
     setModelName("");
     setUpstreamModel("");
     setFetchedModelCandidates([]);
+    setFetchedModelCapabilities({});
     setSelectedModels([]);
     setManualModels([]);
     setSelectedManualModelIDs([]);
@@ -2301,6 +2391,7 @@ function ProviderSetupWizard({ providers, relaySources, relayStations, busy, tra
     if (!providerID || !keyName) return;
     const request = ++modelFetchRequest.current;
     setModelFetchState("loading");
+    setFetchedModelCapabilities({});
     const relaySource = keyChoice?.kind === "relay" ? keyChoice.source : undefined;
     const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";
     const payload = relaySource ? {
@@ -2333,6 +2424,12 @@ function ProviderSetupWizard({ providers, relaySources, relayStations, busy, tra
         return;
       }
       setFetchedModelCandidates(candidates);
+      const capabilityRecords: Record<string, UnknownRecord> = {};
+      for (const [modelID, value] of Object.entries(asRecord(summary.model_capabilities))) {
+        const capabilities = webSearchCapabilityChanges(value);
+        if (Object.keys(capabilities).length > 0) capabilityRecords[modelID] = capabilities;
+      }
+      setFetchedModelCapabilities(capabilityRecords);
       const available = new Set([...(selectedKeyChoice?.source?.models ?? []), ...candidates]);
       setSelectedModels((current) => current.filter((model) => available.has(model)));
       setModelFetchState("ready");
@@ -2440,7 +2537,7 @@ function ProviderSetupWizard({ providers, relaySources, relayStations, busy, tra
     const requestedModels = [
       ...modelCandidates
         .filter((name) => selectedModels.includes(name))
-        .map((name) => ({ name, upstream_model: name })),
+        .map((name) => ({ name, upstream_model: name, ...webSearchCapabilityChanges(fetchedModelCapabilities[name]) })),
       ...manualModels
         .filter((model) => selectedManualModelIDs.includes(model.id))
         .map(({ name, upstream_model }) => ({ name, upstream_model })),
@@ -2727,6 +2824,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
     onStatus(undefined);
     const candidateSet = new Set(candidates);
+    const modelCapabilities = asRecord(summary.model_capabilities);
     const providerName = provider ? providerDisplayName(provider) : providerId;
     const apiKeyName = stringValue(summary.api_key_name);
     if (!apiKeyName) {
@@ -2739,7 +2837,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       if (selectedModels.length === 0) return;
       void dispatch("model.add_many", {
         provider_id: providerId,
-        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 })),
+        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, enabled: true, order: 0 })).map((model) => ({
+          ...model,
+          ...webSearchCapabilityChanges(modelCapabilities[model.upstream_model]),
+        })),
       });
     }).catch(() => undefined);
   };
@@ -5585,6 +5686,14 @@ function IssueList({ issues, translate }: { issues: ValidationSummary["issues"];
 }
 
 function stringList(value: unknown): string[] { return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; }
+function webSearchCapabilityChanges(value: unknown): UnknownRecord {
+  const source = asRecord(value);
+  const changes: UnknownRecord = {};
+  for (const key of ["supports_responses_web_search", "supports_web_search"] as const) {
+    if (typeof source[key] === "boolean") changes[key] = source[key];
+  }
+  return changes;
+}
 function hasBooleanSetting(value: UnknownRecord, key: string): boolean { return typeof value[key] === "boolean"; }
 function apiKeyDisplayName(value: unknown, translate: Translate): string {
   const name = stringValue(value);
@@ -5627,7 +5736,7 @@ const serviceProviderStyles = StyleSheet.create({
   heading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   hint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   columns: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP },
-  listPane: { width: 270, minWidth: 230, maxWidth: 290, minHeight: 0, gap: 4 },
+  listPane: { width: 230, minWidth: 210, maxWidth: 250, minHeight: 0, gap: 4 },
   listToolbar: { height: 22, minHeight: 22, flexShrink: 0, flexDirection: "row", alignItems: "center" },
   listActions: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 4 },
   listActionButton: { width: 22, minWidth: 22, height: 22 },

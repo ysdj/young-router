@@ -24,7 +24,7 @@
     "disk_state": {"params": {"$ref": "#/$defs/diskStateParams"}, "result": {"$ref": "#/$defs/diskStateResult"}},
     "logs": {"params": {"$ref": "#/$defs/logsParams"}, "result": {"$ref": "#/$defs/logsResult"}},
     "editor": {"params": {"$ref": "#/$defs/editorParams"}, "result": {"$ref": "#/$defs/editorResult"}},
-    "dispatch": {"params": {"$ref": "#/$defs/dispatchParams"}, "result": {"$ref": "#/$defs/revisionResult"}},
+    "dispatch": {"params": {"$ref": "#/$defs/dispatchParams"}, "result": {"$ref": "#/$defs/dispatchResult"}},
     "subscribe": {"params": {"$ref": "#/$defs/subscribeParams"}, "result": {"$ref": "#/$defs/subscribeResult"}},
     "validate": {"params": {"$ref": "#/$defs/domainRevisionParams"}, "result": {"$ref": "#/$defs/validateResult"}},
     "apply": {"params": {"$ref": "#/$defs/applyParams"}, "result": {"$ref": "#/$defs/applyResult"}},
@@ -120,6 +120,7 @@
     "logsResult": {"type": "object", "additionalProperties": false, "required": ["changed", "revision", "log"], "properties": {"changed": {"type": "boolean"}, "revision": {"$ref": "#/$defs/revision"}, "log": {"oneOf": [{"$ref": "#/$defs/logView"}, {"type": "null"}]}}},
     "editorResult": {"type": "object", "additionalProperties": false, "required": ["domain", "document", "editor_token", "revision", "text", "baseline"], "properties": {"domain": {"enum": ["codex", "claude"]}, "document": {"enum": ["config", "auth", "settings", "desktop", "developer"]}, "editor_token": {"type": "string", "minLength": 1, "maxLength": 256}, "revision": {"$ref": "#/$defs/revision"}, "text": {"type": "string", "maxLength": 2097152}, "baseline": {"type": "string", "maxLength": 2097152}}},
     "revisionResult": {"type": "object", "additionalProperties": false, "required": ["revision"], "properties": {"revision": {"$ref": "#/$defs/revision"}}},
+    "dispatchResult": {"type": "object", "additionalProperties": false, "required": ["revision"], "properties": {"revision": {"$ref": "#/$defs/revision"}, "action_summary": {"type": "object", "x-typescript-type": "Record<string, unknown>"}}},
     "subscribeResult": {"type": "object", "additionalProperties": false, "required": ["subscription_id"], "properties": {"subscription_id": {"type": "string"}}},
     "validateResult": {"type": "object", "additionalProperties": false, "required": ["validate"], "properties": {"validate": {"$ref": "#/$defs/validationSummary"}}},
     "applyIssue": {

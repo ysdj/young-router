@@ -353,6 +353,82 @@ class HookStreamingCompactionTests(HookTestCase):
             "encrypted-recovered-summary",
         )
 
+    async def test_structured_compaction_does_not_hop_after_timeout_fallback(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+        deployments = [
+            {
+                "litellm_params": {"model": "openai/default-chat", "order": 1},
+                "model_info": {"id": "compaction-peer-one", "order": 1},
+            },
+            {
+                "litellm_params": {"model": "openai/default-chat", "order": 1},
+                "model_info": {"id": "compaction-peer-two", "order": 1},
+            },
+        ]
+
+        async def original_stream():
+            yield {"type": "response.created", "response": {"id": "resp-original"}}
+            error = RuntimeError("upstream returned HTTP 502")
+            error.status_code = 502
+            raise error
+
+        async def incomplete_fallback_stream():
+            yield {"type": "response.created", "response": {"id": "resp-fallback"}}
+            error = TimeoutError("upstream stream idle timeout")
+            error.status_code = 504
+            error.body = {"reason": "stream_idle_timeout"}
+            raise error
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments
+
+            async def aresponses(self, **payload):
+                calls.append(copy.deepcopy(payload))
+                excluded_ids = set(payload.get("_excluded_deployment_ids") or [])
+                selected = next(
+                    deployment
+                    for deployment in deployments
+                    if deployment["model_info"]["id"] not in excluded_ids
+                )
+                hooks._remember_selected_deployment(selected)
+                return incomplete_fallback_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "model_info": {
+                "id": "compaction-primary",
+                "order": 1,
+                "route_key": "compat_provider / openai/default-chat / key=primary",
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([chunk["type"] for chunk in chunks], ["response.failed"])
+        self.assertEqual(
+            chunks[-1]["response"]["error"]["code"],
+            "upstream_compaction_failure",
+        )
+
     async def test_structured_compaction_done_item_clean_eof_synthesizes_terminal_event(self) -> None:
         hooks, proxy_server = load_hook_module()
 

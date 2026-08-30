@@ -634,6 +634,37 @@ def _streaming_completion_should_skip_empty_message_events(response: Any) -> boo
     )
 
 
+def _chat_completion_chunk_has_output_payload(chunk: Any) -> bool:
+    """Return whether a Chat chunk can start a visible/structured output item.
+
+    Chat providers commonly send an initial chunk containing only the
+    assistant role.  The stock Chat-to-Responses iterator used to turn that
+    marker into an empty message item, which downstream clients render as a
+    blank activity row before the actual tool call or answer arrives.
+    """
+    choices = _responses_web_search_bridge_module._response_item_get(chunk, "choices")
+    if not isinstance(choices, (list, tuple)) or not choices:
+        return False
+    delta = _responses_web_search_bridge_module._response_item_get(choices[0], "delta")
+    if delta is None:
+        return False
+    for key in (
+        "content",
+        "reasoning_content",
+        "thinking_blocks",
+        "tool_calls",
+        "function_call",
+        "annotations",
+    ):
+        value = _responses_web_search_bridge_module._response_item_get(delta, key)
+        if isinstance(value, str):
+            if value:
+                return True
+        elif value not in (None, "", [], {}):
+            return True
+    return False
+
+
 def _normalize_tool_search_output_item_event(
     event: Any,
     namespace_by_name: Optional[dict[str, str]] = None,

@@ -159,6 +159,10 @@ function resourceGroupUnavailable(resource: RelayResource, groups: RelayGroup[])
   return Boolean(resource.groupID) && !resourceGroup(resource, groups);
 }
 
+function resourceAutoGroupingUnavailable(resource: RelayResource, groups: RelayGroup[]): boolean {
+  return !resource.groupID || resourceGroupUnavailable(resource, groups);
+}
+
 function runtimeSettingNumber(snapshot: CoreSnapshot | undefined, key: string, fallback: number): number {
   const domain = record(snapshot?.domains.runtime);
   const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
@@ -416,13 +420,6 @@ export function relayNavigationItems(snapshot: CoreSnapshot | undefined, transla
     for (const accountID of station.accountIDs) {
       const account = accounts.find((candidate) => candidate.id === accountID);
       if (!account) continue;
-      const statusKey = account.loginStatus === "signed_in"
-        ? "relay.status.signed_in"
-        : account.loginStatus === "signed_out"
-          ? "relay.status.signed_out"
-          : account.loginStatus === "expired"
-            ? "relay.status.expired"
-            : "relay.status.unknown";
       rows.push({
         key: "relay:account:" + account.id,
         kind: "account",
@@ -430,7 +427,7 @@ export function relayNavigationItems(snapshot: CoreSnapshot | undefined, transla
         accountID: account.id,
         stationID: station.id,
         label: accountDisplayName(account, translate),
-        secondary: relayTypeLabel(account.type, translate) + " · " + translate(statusKey),
+        secondary: relayTypeLabel(account.type, translate),
       });
     }
     return rows;
@@ -743,6 +740,7 @@ export function RelayAccountManager({
   const [manualType, setManualType] = useState<RelayType>();
   const [apiKeyCreateOpen, setApiKeyCreateOpen] = useState(false);
   const [selectedResourceID, setSelectedResourceID] = useState<string>();
+  const [autoGroupingControlRevision, setAutoGroupingControlRevision] = useState(0);
   const [rememberPasswordDrafts, setRememberPasswordDrafts] = useState<Record<string, boolean>>({});
   const [apiKeyNameDrafts, setApiKeyNameDrafts] = useState<Record<string, string>>({});
   const apiKeyNameDraftsRef = useRef(apiKeyNameDrafts);
@@ -768,6 +766,11 @@ export function RelayAccountManager({
   const accountsRef = useRef(accounts);
   accountsRef.current = accounts;
   const typeDetectionRequest = useRef(0);
+  // A setup login can outlive the React step that started it (for example
+  // when the user presses Back while the native browser is still waiting).
+  // Invalidate the attempt before restoring the form so a late native result
+  // cannot close the wizard or overwrite the restored step.
+  const setupLoginRequest = useRef(0);
   const openedAccountIDs = useRef(new Set<string>());
   // Session/resource discovery runs in the background. It must not tint the
   // workspace or disable ordinary controls; only an actual local mutation
@@ -802,7 +805,7 @@ export function RelayAccountManager({
     ? apiKeyNameDrafts[resource.id]
     : resource.apiName || resource.name;
   const visibleResources = useMemo(() => (selected?.resources ?? []).filter((resource) => (
-    !selected?.autoGrouping || !resourceGroupUnavailable(resource, selectedGroups)
+    !selected?.autoGrouping || !resourceAutoGroupingUnavailable(resource, selectedGroups)
   )), [selected?.autoGrouping, selected?.resources, selectedGroups]);
   const resourceTableRows = useMemo(() => visibleResources.map((resource) => ({
     key: resource.id,
@@ -989,9 +992,21 @@ export function RelayAccountManager({
       apiKeyNameDraftsRef.current = next;
       return next;
     });
-    const firstSelectable = selected.resources.find((resource) => !resourceGroupUnavailable(resource, selected.groups)) ?? selected.resources[0];
-    setSelectedResourceID((current) => selected.resources.some((resource) => resource.id === current) ? current : firstSelectable?.id);
-  }, [selected?.id, selected?.resources, selected?.groups]);
+    const firstSelectable = selected.resources.find((resource) => (
+      selected.autoGrouping
+        ? !resourceAutoGroupingUnavailable(resource, selected.groups)
+        : !resourceGroupUnavailable(resource, selected.groups)
+    ));
+    setSelectedResourceID((current) => {
+      const currentResource = selected.resources.find((resource) => resource.id === current);
+      const currentSelectable = currentResource && (
+        selected.autoGrouping
+          ? !resourceAutoGroupingUnavailable(currentResource, selected.groups)
+          : !resourceGroupUnavailable(currentResource, selected.groups)
+      );
+      return currentSelectable ? current : firstSelectable?.id;
+    });
+  }, [selected?.autoGrouping, selected?.id, selected?.resources, selected?.groups]);
   useEffect(() => {
     setRememberPasswordDrafts((current) => {
       let next = current;
@@ -1023,6 +1038,7 @@ export function RelayAccountManager({
   const resetForm = (): void => {
     typeDetectionRequest.current += 1;
     setAdding(setupOnly);
+    setupLoginRequest.current += 1;
     setAddStep("origin");
     setAddStationID("__custom__");
     setOrigin("");
@@ -1100,6 +1116,7 @@ export function RelayAccountManager({
   const beginLogin = async (): Promise<void> => {
     const candidate = normalizeRelayOrigin(origin);
     if (!candidate) return;
+    const request = ++setupLoginRequest.current;
     setFormBusy(true);
     setFeedback(undefined);
     let account: AddedRelayAccount | undefined;
@@ -1133,26 +1150,33 @@ export function RelayAccountManager({
       } else {
         setAdding(false);
       }
-      const loggedIn = await loginAccount(account, setupOnly, false);
-      if (setupOnly && loggedIn) {
+      const loggedIn = await loginAccount(account, setupOnly, false, request);
+      // Back may have restored the first step while the native login promise
+      // was still pending. Treat that result as stale and clean up the staged
+      // account without navigating away from the restored form.
+      const cancelled = setupOnly && request !== setupLoginRequest.current;
+      if (cancelled || !loggedIn) {
+        await deleteAccount(account);
+      } else if (setupOnly) {
         onClose?.();
         native.window.focus("relay-accounts");
-      } else if (!loggedIn) {
-        // A cancelled or failed setup must not leave an empty account row.
-        await deleteAccount(account);
       }
     } catch {
       if (account) await deleteAccount(account);
-      setFeedback(translate("relay.operationFailed"));
+      if (!setupOnly || request === setupLoginRequest.current) setFeedback(translate("relay.operationFailed"));
     } finally {
       setFormBusy(false);
     }
   };
   const returnToStationStep = (): void => {
     if (!setupOnly || !adding || addStep !== "sign-in") return;
-    native.cancelRelayLogin();
+    // Update the React step before asking the native host to tear down its
+    // browser. Native cancellation can synchronously resolve the login
+    // promise, so doing it first lets a late callback race this state change.
+    setupLoginRequest.current += 1;
     setAddStep("origin");
     setFeedback(undefined);
+    native.cancelRelayLogin();
   };
   const pendingCleanups = pendingCredentialCleanups;
   const retryCredentialCleanup = async (cleanup: PendingCredentialCleanup): Promise<void> => {
@@ -1242,10 +1266,11 @@ export function RelayAccountManager({
     setCleanupBusy(false);
     setLocalRemoval(undefined);
   };
-  const loginAccount = async (account: AddedRelayAccount, embedded = false, silent = false): Promise<boolean> => {
+  const loginAccount = async (account: AddedRelayAccount, embedded = false, silent = false, setupRequest?: number): Promise<boolean> => {
+    const setupRequestActive = (): boolean => !setupOnly || setupRequest === undefined || setupRequest === setupLoginRequest.current;
     setLoginBusy(true);
     updateAccountLoading(account.id, "session", true);
-    if (!silent) setFeedback(translate("relay.loginWorking"));
+    if (!silent && setupRequestActive()) setFeedback(translate("relay.loginWorking"));
     let result: Awaited<ReturnType<NativeLeafAdapter["relayLogin"]>>;
     try {
       result = await native.relayLogin({
@@ -1261,7 +1286,7 @@ export function RelayAccountManager({
     } catch {
       markLoginFailure(account.id, true);
       markLocalSignedIn(account.id, false);
-      if (!silent) setFeedback(translate("relay.operationFailed"));
+      if (!silent && setupRequestActive()) setFeedback(translate("relay.operationFailed"));
       updateAccountLoading(account.id, "session", false);
       setLoginBusy(false);
       return false;
@@ -1269,7 +1294,7 @@ export function RelayAccountManager({
     if (!result) {
       markLoginFailure(account.id, true);
       markLocalSignedIn(account.id, false);
-      if (!silent) setFeedback(translate("relay.loginNotCompleted"));
+      if (!silent && setupRequestActive()) setFeedback(translate("relay.loginNotCompleted"));
       updateAccountLoading(account.id, "session", false);
       setLoginBusy(false);
       return false;
@@ -1388,6 +1413,11 @@ export function RelayAccountManager({
       if (result.draftStaged) publishGlobalFeedback(translate("relay.apiKeyAutoGroupingStaged"));
       else clearGlobalStatus();
     } catch {
+      // AppKit keeps the user's native click state while an async action is
+      // pending. If Core rejects the draft transition, remount this one
+      // control so it returns to the authoritative snapshot value instead of
+      // displaying a checked box beside the still-manual resource list.
+      setAutoGroupingControlRevision((current) => current + 1);
       publishGlobalFeedback(translate("relay.operationFailed"));
     } finally {
       setFormBusy(false);
@@ -1664,7 +1694,7 @@ export function RelayAccountManager({
           <View style={[styles.bottomBar, compactStyles.bottomBar, setupOnly && styles.setupBottomBar]}>
             <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.bottomStatus}>{feedback ?? translate("relay.loginWorking")}</Text>
             {setupOnly ? <View style={[styles.bottomActions, styles.setupBottomActions]}>
-              <NativeButton title={translate("relay.back")} disabled={setupControlsBusy && !loginBusy} onPress={returnToStationStep} />
+              <NativeButton title={translate("relay.back")} onPress={returnToStationStep} />
               {onClose ? <NativeButton title={translate("menu.close")} onPress={onClose} /> : null}
             </View> : null}
           </View>
@@ -1754,6 +1784,7 @@ export function RelayAccountManager({
                         <View style={styles.resourceToolbarHeading}>
                           <Text style={styles.resourceToolbarTitle}>{translate("relay.apiKeysTitle")}</Text>
                           <NativeCheckbox
+                            key={`auto-grouping:${selected.id}:${selected.autoGrouping}:${autoGroupingControlRevision}`}
                             label={translate("relay.apiKeyAutoGrouping")}
                             value={selected.autoGrouping}
                             disabled={controlsBusy || !apiKeyActions?.setAutoGrouping}
@@ -1767,7 +1798,15 @@ export function RelayAccountManager({
                         </View>
                       </View>
                       <NativeTable
-                        columns={[{ label: translate("common.name"), width: 116 }, { label: translate("relay.apiKeyGroup"), width: 124 }, { label: translate("relay.apiKeyMultiplier"), width: 64 }]}
+                        // Keep the three headers in the initial viewport at
+                        // the relay route's minimum window width.  The native
+                        // table has a vertical scroller which consumes part
+                        // of the list pane; when the requested widths exceed
+                        // that viewport it shrinks from the trailing column,
+                        // making 倍率 disappear entirely.  These compact
+                        // widths leave room for the scroller while retaining
+                        // enough text space for the multiplier values.
+                        columns={[{ label: translate("common.name"), width: 88 }, { label: translate("relay.apiKeyGroup"), width: 84 }, { label: translate("relay.apiKeyMultiplier"), width: 58 }]}
                         rows={resourceTableRows}
                         selectedKey={selectedResource?.id ?? ""}
                         disabledRowKeys={resourceUnavailableRowKeys}
@@ -1835,7 +1874,7 @@ const compactStyles = StyleSheet.create({
   stationSettingsForm: { gap: 4 },
   stationSettingsRow: { minHeight: 26, gap: 6 },
   resourcesSection: { gap: 8, paddingTop: 4 },
-  resourceToolbar: { minHeight: 32, gap: 8 },
+  resourceToolbar: { minHeight: 32, paddingLeft: 0, paddingRight: 12, gap: 8 },
   bottomBar: { minHeight: 38, paddingHorizontal: 12, paddingVertical: 6, gap: 6 },
 });
 
@@ -1969,7 +2008,10 @@ const styles = StyleSheet.create({
   decisionLabel: { color: colors.secondary, fontSize: UI_FONT_SIZE },
   decisionControl: { width: "100%", height: 26 },
   decisionSpacer: { flex: 1, minWidth: 0 },
-  resourceInspectorPane: { width: 266, minWidth: 244, maxWidth: 266, flexGrow: 0, flexShrink: 0, minHeight: 0 },
+  // Keep the details pane compact so the API-key table remains the primary
+  // workspace.  The released width is absorbed by the table's flexing list
+  // pane, making the three-column API-key list easier to scan.
+  resourceInspectorPane: { width: 220, minWidth: 200, maxWidth: 220, flexGrow: 0, flexShrink: 0, minHeight: 0 },
   resourceInspectorScroll: { flex: 1, minWidth: 0, backgroundColor: colors.window },
   resourceInspectorScrollIndicator: { position: "absolute", width: 0, height: 0 },
   resourceInspectorContent: { flexGrow: 1, minWidth: 0, paddingTop: 6, paddingLeft: 0, paddingRight: 12, paddingBottom: 12, gap: 8 },

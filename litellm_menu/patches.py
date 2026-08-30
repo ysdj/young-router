@@ -43,6 +43,9 @@ _ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR = (
 _LATIN1_RESPONSE_HEADERS_PATCH_ATTR = (
     "_litellm_menu_latin1_response_headers_patch"
 )
+_RESPONSES_COMPLETION_STREAM_OUTPUT_ITEM_PATCH_ATTR = (
+    "_litellm_menu_responses_completion_stream_output_item_patch"
+)
 
 
 def _install_latin1_response_headers_patch() -> None:
@@ -1367,6 +1370,41 @@ def _install_responses_completion_stream_patch() -> None:
     setattr(patched_init, _RESPONSES_COMPLETION_STREAM_PATCH_ATTR, True)
     setattr(patched_init, "_original_init", original_init)
     LiteLLMCompletionStreamingIterator.__init__ = patched_init
+
+    original_ensure_output_item_for_chunk = getattr(
+        LiteLLMCompletionStreamingIterator,
+        "_ensure_output_item_for_chunk",
+        None,
+    )
+    if callable(original_ensure_output_item_for_chunk) and not getattr(
+        original_ensure_output_item_for_chunk,
+        _RESPONSES_COMPLETION_STREAM_OUTPUT_ITEM_PATCH_ATTR,
+        False,
+    ):
+
+        def patched_ensure_output_item_for_chunk(self: Any, chunk: Any) -> Any:
+            # Do not let a role-only Chat chunk create an empty Responses
+            # message.  Wait for text, reasoning, annotations, or a tool
+            # payload; tool IDs and ordering remain owned by LiteLLM.
+            if not _responses_output_module._chat_completion_chunk_has_output_payload(
+                chunk
+            ):
+                return None
+            return original_ensure_output_item_for_chunk(self, chunk)
+
+        setattr(
+            patched_ensure_output_item_for_chunk,
+            _RESPONSES_COMPLETION_STREAM_OUTPUT_ITEM_PATCH_ATTR,
+            True,
+        )
+        setattr(
+            patched_ensure_output_item_for_chunk,
+            "_original_ensure_output_item_for_chunk",
+            original_ensure_output_item_for_chunk,
+        )
+        LiteLLMCompletionStreamingIterator._ensure_output_item_for_chunk = (
+            patched_ensure_output_item_for_chunk
+        )
 
     original_return_default_done_events = getattr(
         LiteLLMCompletionStreamingIterator,

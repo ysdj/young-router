@@ -58,6 +58,73 @@ class HookStreamingTimeoutTests(HookTestCase):
             "stream_idle_timeout",
         )
 
+    async def test_structured_compaction_uses_compaction_budget_after_first_event(self) -> None:
+        hooks, _ = load_hook_module()
+        routing_module = importlib.import_module("litellm_menu.routing")
+        previous_compaction_timeout = (
+            routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
+        )
+        routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS = 0.05
+        self.addCleanup(
+            setattr,
+            routing_module,
+            "_CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS",
+            previous_compaction_timeout,
+        )
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "1")
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"role": "user", "content": "continue"},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"request_kind\":\"compaction\"}",
+            },
+        }
+
+        self.assertEqual(
+            hooks._stream_idle_timeout_seconds_for_request(request_data),
+            0.05,
+        )
+
+        async def upstream():
+            compaction_item = {
+                "id": "cmp-compact",
+                "type": "compaction",
+                "encrypted_content": "opaque-encrypted-summary",
+            }
+            yield {"type": "response.created", "response": {"id": "resp-compact"}}
+            await asyncio.sleep(0.02)
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {"id": "resp-compact", "output": [compaction_item]},
+            }
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_with_idle_timeout(
+                upstream(),
+                request_data,
+            )
+        ]
+
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            [
+                "response.created",
+                "response.output_item.done",
+                "response.completed",
+            ],
+        )
+
     async def test_structured_compaction_waits_longer_for_first_stream_chunk(self) -> None:
         hooks, _ = load_hook_module()
         routing_module = importlib.import_module("litellm_menu.routing")
@@ -176,22 +243,37 @@ class HookStreamingTimeoutTests(HookTestCase):
         )
 
         self.assertEqual(
-            [chunk["type"] for chunk in chunks],
-            [
-                "response.metadata",
-                "response.output_text.delta",
-                "response.completed",
-            ],
+            [hooks._stream_chunk_type(chunk) for chunk in chunks[1:]],
+            ["response.output_text.delta", "response.completed"],
         )
         self.assertEqual(
-            chunks[0]["metadata"],
-            {
-                "litellm_menu_keepalive": "initial_wait",
-                "phase": "awaiting_upstream_first_event",
-            },
+            chunks[0],
+            ": litellm_menu initial_wait phase=awaiting_upstream_first_event\n\n",
         )
         self.assertFalse(upstream_cancelled)
         self.assertTrue(upstream_closed)
+
+    async def test_whitespace_delta_does_not_extend_stream_idle_deadline(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+
+        async def upstream():
+            yield {"type": "response.created", "response": {"id": "resp"}}
+            await asyncio.sleep(0.005)
+            yield {"type": "response.output_text.delta", "delta": "\n\n"}
+            await asyncio.sleep(0.02)
+            yield {"type": "response.output_text.delta", "delta": "late"}
+
+        with self.assertRaises(TimeoutError) as captured:
+            async for _chunk in hooks._stream_with_idle_timeout(
+                upstream(),
+                {"model": "default-chat"},
+            ):
+                pass
+        self.assertEqual(
+            getattr(captured.exception, "body", {}).get("reason"),
+            "stream_idle_timeout",
+        )
 
     async def test_codex_responses_initial_keepalive_preserves_first_event_deadline(self) -> None:
         hooks, _ = load_hook_module()

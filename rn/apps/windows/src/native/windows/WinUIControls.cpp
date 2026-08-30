@@ -626,6 +626,43 @@ struct TableComponentView final
     ApplyProps();
   }
 
+  // Fabric may retain an unmounted component in its recycle pool. Release the
+  // row/cell vectors and reset the controlled native selection before the
+  // backing XAML island is destroyed; otherwise a large log table can stay
+  // reachable through the recycled view.
+  void PrepareForRecycle(
+      winrt::Microsoft::ReactNative::ComponentView const& view) noexcept {
+    syncing_ = true;
+    if (list_) {
+      list_.SelectedIndex(-1);
+      list_.Items().Clear();
+    }
+    if (header_) header_.Children().Clear();
+    if (table_) {
+      table_.ColumnDefinitions().Clear();
+      table_.RowDefinitions().Clear();
+      table_.Children().Clear();
+    }
+    column_labels_.clear();
+    column_widths_.clear();
+    row_keys_.clear();
+    cells_.clear();
+    selected_key_.clear();
+    disabled_row_keys_.clear();
+    secondary_cell_keys_.clear();
+    spanning_row_keys_.clear();
+    has_applied_ = false;
+    syncing_ = false;
+
+    auto old_props = Props();
+    winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableProps> empty_props;
+    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITable<TableComponentView>::UpdateProps(
+        view, empty_props, old_props);
+    std::shared_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter> empty_emitter;
+    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITable<TableComponentView>::UpdateEventEmitter(
+        empty_emitter);
+  }
+
  private:
   void AddColumns(Grid const& grid, std::vector<float> const& widths, size_t count) noexcept {
     grid.ColumnDefinitions().Clear();
@@ -2034,6 +2071,26 @@ void RegisterCodeWebView(
       });
 }
 
+void RegisterTable(
+    winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
+  winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUITableNativeComponent<TableComponentView>(
+      package_builder,
+      [](winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const& builder) {
+        builder.SetContentIslandComponentViewInitializer(
+            [](ContentIslandComponentView const& island_view) noexcept {
+              LiteLLMMenu::ConfigureImmediateXamlPresentation();
+              auto user_data = winrt::make_self<TableComponentView>();
+              user_data->InitializeContentIsland(island_view);
+              auto weak = user_data->get_weak();
+              island_view.Destroying(
+                  [weak](auto const&, winrt::Microsoft::ReactNative::ComponentView const& view) noexcept {
+                    if (auto current = weak.get()) current->PrepareForRecycle(view);
+                  });
+              island_view.UserData(*user_data);
+            });
+      });
+}
+
 }  // namespace
 
 namespace LiteLLMMenu {
@@ -2068,9 +2125,7 @@ void RegisterWinUIControls(
   RegisterComponent<CheckboxComponentView>(
       package_builder,
       winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUICheckboxNativeComponent<CheckboxComponentView>);
-  RegisterComponent<TableComponentView>(
-      package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUITableNativeComponent<TableComponentView>);
+  RegisterTable(package_builder);
   RegisterComponent<TextEditorComponentView>(
       package_builder,
       winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUITextEditorNativeComponent<TextEditorComponentView>);
