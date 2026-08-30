@@ -37,6 +37,52 @@ MAX_LABEL_CHARS = 512
 MAX_SECRET_CHARS = 8_192
 SUPPORTED_EXTENSIONS = {".json", ".sql", ".toml", ".yaml", ".yml"}
 SUPPORTED_SURFACES = {"openai/responses", "openai/chat", "anthropic"}
+WEB_SEARCH_CAPABILITY_KEYS = (
+    "supports_responses_web_search",
+    "supports_web_search",
+)
+WEB_SEARCH_CAPABILITY_ALIASES = {
+    "supports_responses_web_search": "supports_responses_web_search",
+    "supports_web_search": "supports_web_search",
+    "supports_web_search_tool": "supports_web_search",
+    "has_web_search_tool": "supports_web_search",
+    "has_web_search": "supports_web_search",
+    "web_search": "supports_web_search",
+    "supportsResponsesWebSearch": "supports_responses_web_search",
+    "supportsWebSearch": "supports_web_search",
+    "supportsWebSearchTool": "supports_web_search",
+    "hasWebSearchTool": "supports_web_search",
+    "hasWebSearch": "supports_web_search",
+    "webSearch": "supports_web_search",
+}
+WEB_SEARCH_CAPABILITY_CONTAINERS = (
+    "capabilities",
+    "supported_capabilities",
+    "model_info",
+    "metadata",
+    "extra",
+    "model_info_extra",
+    "features",
+    "tools",
+)
+WEB_SEARCH_CAPABILITY_LISTS = (
+    "supported_tools",
+    "supported_features",
+    "supported_parameters",
+    "available_tools",
+    "features",
+    "capabilities",
+    "supported_capabilities",
+    "tools",
+)
+WEB_SEARCH_CAPABILITY_MARKERS = {
+    "web_search",
+    "web_search_preview",
+    "web_search_options",
+    "server_tool_web_search",
+    "openrouter_web_search",
+    "openrouter.web_search",
+}
 CC_SWITCH_SQL_HEADER = "-- CC Switch SQLite 导出"
 BASE_URL_KEYS = (
     "api_base",
@@ -109,6 +155,68 @@ def _bool(value: Any, default: bool = True) -> bool:
         if normalized in {"0", "false", "no", "off", "disabled"}:
             return False
     return default
+
+
+def _explicit_bool(value: Any) -> bool | None:
+    """Normalize an explicitly supplied boolean without inventing a default."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return None
+
+
+def _web_search_capability_extra(source: dict[str, Any]) -> dict[str, bool]:
+    extra: dict[str, bool] = {}
+    marker_found = False
+    visited: set[int] = set()
+
+    def visit(container: Any, depth: int = 0) -> None:
+        nonlocal marker_found
+        if not isinstance(container, dict) or depth > 2 or id(container) in visited:
+            return
+        visited.add(id(container))
+        for source_key, target_key in WEB_SEARCH_CAPABILITY_ALIASES.items():
+            if source_key not in container:
+                continue
+            parsed = _explicit_bool(container.get(source_key))
+            if parsed is not None:
+                # Prefer an explicitly canonical value over an alias or a
+                # nested metadata copy when a source repeats the field.
+                extra.setdefault(target_key, parsed)
+        for key in WEB_SEARCH_CAPABILITY_LISTS:
+            values = container.get(key)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                marker = value
+                if isinstance(value, dict):
+                    marker = value.get("type")
+                    if marker is None and key != "tools":
+                        marker = value.get("name", value.get("id"))
+                if not isinstance(marker, str):
+                    continue
+                normalized = marker.strip().lower().replace("-", "_").replace(":", "_")
+                if normalized in WEB_SEARCH_CAPABILITY_MARKERS:
+                    marker_found = True
+        if depth >= 2:
+            return
+        for key in WEB_SEARCH_CAPABILITY_CONTAINERS:
+            nested = container.get(key)
+            if isinstance(nested, dict):
+                visit(nested, depth + 1)
+
+    visit(source)
+    if marker_found and "supports_web_search" not in extra:
+        extra["supports_web_search"] = True
+    return extra
 
 
 def _first_text(source: dict[str, Any], keys: Iterable[str]) -> str:
@@ -492,6 +600,7 @@ def _add_editor_model(
     ssl_present = "ssl_verify" in source
     ssl_value = source.get("ssl_verify")
     provider.quota.add_model()
+    model_info_extra = _web_search_capability_extra(source)
     provider.models.append(
         {
             "enabled": effective_enabled,
@@ -513,7 +622,7 @@ def _add_editor_model(
             "upstream_url_surface": surface,
             "entry_extra": {},
             "litellm_extra": {},
-            "model_info_extra": {},
+            "model_info_extra": model_info_extra,
         }
     )
 
@@ -583,9 +692,13 @@ def _import_litellm(data: dict[str, Any]) -> _Drafts | None:
             "order": params.get("order", 1),
             "ssl_verify": params.get("ssl_verify"),
             "upstream_url_surface": info.get("upstream_url_surface"),
+            "model_info": info,
             "x-litellm-menu-model-enabled": info.get("x-litellm-menu-model-enabled", True),
             "supports_responses_image_generation_tool": info.get("supports_responses_image_generation_tool"),
         }
+        for capability_key in WEB_SEARCH_CAPABILITY_KEYS:
+            if capability_key in info:
+                model_source[capability_key] = info.get(capability_key)
         if "ssl_verify" not in params:
             model_source.pop("ssl_verify")
         if "supports_responses_image_generation_tool" not in info:

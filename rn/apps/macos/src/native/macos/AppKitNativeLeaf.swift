@@ -593,11 +593,10 @@ private enum NativeRelayOriginPolicy {
         controller.present()
     }
 
-    /// Present an official provider device-code flow in an isolated native
-    /// WebView. The caller continues polling Core for the auth result; closing
-    /// this panel only dismisses the browser and does not cancel that poll.
-    /// URLs are validated again in the controller's navigation delegate so a
-    /// redirect cannot turn this capability into an arbitrary browser.
+    /// Present an official provider login. Claude OAuth uses the system
+    /// browser so its first-party Cloudflare challenge and an existing browser
+    /// session work normally; device-code providers remain in an isolated
+    /// WebView. Core owns the callback and credential exchange in either case.
     func showProviderAuth(
         provider: String,
         fingerprint: String?,
@@ -629,6 +628,11 @@ private enum NativeRelayOriginPolicy {
               (userCode != nil || callbackURL != nil),
               !title.isEmpty,
               !closeTitle.isEmpty else {
+            completion()
+            return
+        }
+        if provider == "claude" {
+            NSWorkspace.shared.open(url)
             completion()
             return
         }

@@ -4,6 +4,41 @@ from hook_test_utils import *
 
 
 class HookStreamingToolEventTests(HookTestCase):
+    def test_chat_bridge_does_not_start_message_for_role_only_chunk(self) -> None:
+        hooks, _ = load_hook_module()
+        responses_module = types.ModuleType("litellm.responses")
+        bridge_module = types.ModuleType("litellm.responses.litellm_completion_transformation")
+        streaming_module = types.ModuleType(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator"
+        )
+
+        class LiteLLMCompletionStreamingIterator:
+            def _ensure_output_item_for_chunk(self, chunk):
+                self.called = getattr(self, "called", 0) + 1
+                self.sent_output_item_added_event = True
+
+        streaming_module.LiteLLMCompletionStreamingIterator = LiteLLMCompletionStreamingIterator
+        sys.modules["litellm.responses"] = responses_module
+        sys.modules["litellm.responses.litellm_completion_transformation"] = bridge_module
+        sys.modules[
+            "litellm.responses.litellm_completion_transformation.streaming_iterator"
+        ] = streaming_module
+
+        hooks._install_responses_completion_stream_patch()
+        iterator = LiteLLMCompletionStreamingIterator()
+
+        iterator._ensure_output_item_for_chunk(
+            {"choices": [{"delta": {"role": "assistant"}}]}
+        )
+        self.assertEqual(getattr(iterator, "called", 0), 0)
+        self.assertFalse(getattr(iterator, "sent_output_item_added_event", False))
+
+        iterator._ensure_output_item_for_chunk(
+            {"choices": [{"delta": {"tool_calls": [{"id": "call_1"}]}}]}
+        )
+        self.assertEqual(iterator.called, 1)
+        self.assertTrue(iterator.sent_output_item_added_event)
+
     def test_responses_completion_stream_patch_adds_completed_response(self) -> None:
         hooks, _ = load_hook_module()
         responses_module = types.ModuleType("litellm.responses")

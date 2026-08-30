@@ -150,16 +150,9 @@ class HookRouteRecoveryTests(HookTestCase):
             )
             self.assertEqual(
                 keepalive,
-                {
-                    "type": "response.metadata",
-                    "metadata": {
-                        "litellm_menu_keepalive": "route_recovery",
-                        "phase": "attempt",
-                        "attempt": 1,
-                    },
-                },
+                ": litellm_menu route_recovery phase=attempt attempt=1\n\n",
             )
-            self.assertNotIn("response", keepalive)
+            self.assertIsInstance(keepalive, str)
             touched = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertNotEqual(
                 touched["recoveries"][key]["heartbeat_at"],
@@ -1192,15 +1185,8 @@ class HookRouteRecoveryTests(HookTestCase):
         ]
         self.assertGreaterEqual(len(attempts), 2)
         self.assertGreaterEqual(len(keepalives), 1)
-        self.assertTrue(all(chunk.get("type") == "response.metadata" for chunk in keepalives))
-        self.assertTrue(
-            all(
-                chunk.get("metadata", {})
-                .get("litellm_menu_keepalive")
-                == "route_recovery"
-                for chunk in keepalives
-            )
-        )
+        self.assertTrue(all(isinstance(chunk, str) for chunk in keepalives))
+        self.assertTrue(all(chunk.startswith(": litellm_menu route_recovery ") for chunk in keepalives))
         assert_upstream_route_failed_terminal(self, chunks)
 
     async def test_route_recovery_poll_empty_retries_until_max_duration(self) -> None:

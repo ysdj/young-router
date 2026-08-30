@@ -1807,7 +1807,9 @@ async def _stream_with_idle_timeout(
     saw_visible_output: bool = False,
     initial_chunk_count: int = 0,
 ) -> AsyncIterator[Any]:
-    idle_timeout_seconds = _routing_module._stall_timeout_seconds()
+    idle_timeout_seconds = _routing_module._stream_idle_timeout_seconds_for_request(
+        request_data
+    )
     start_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(
         request_data
     )
@@ -1815,13 +1817,22 @@ async def _stream_with_idle_timeout(
     chunk_count = max(0, initial_chunk_count)
     saw_chunk = chunk_count > 0
     visible_output_seen = saw_visible_output
+    idle_deadline = (
+        time.monotonic() + idle_timeout_seconds
+        if saw_chunk and idle_timeout_seconds > 0
+        else None
+    )
     while True:
-        timeout_seconds = (
-            idle_timeout_seconds if saw_chunk else start_timeout_seconds
-        )
-        effective_timeout: Optional[float] = (
-            timeout_seconds if timeout_seconds > 0 else None
-        )
+        if saw_chunk:
+            timeout_seconds = idle_timeout_seconds
+            effective_timeout: Optional[float] = (
+                max(0.0, idle_deadline - time.monotonic())
+                if idle_deadline is not None
+                else None
+            )
+        else:
+            timeout_seconds = start_timeout_seconds
+            effective_timeout = timeout_seconds if timeout_seconds > 0 else None
         try:
             if effective_timeout is not None:
                 chunk = await asyncio.wait_for(iterator.__anext__(), timeout=effective_timeout)
@@ -1842,15 +1853,30 @@ async def _stream_with_idle_timeout(
                 idle_seconds=timeout_seconds,
                 saw_chunk=saw_chunk,
             ) from None
+        was_saw_chunk = saw_chunk
         saw_chunk = True
         chunk_count += 1
+        if not was_saw_chunk:
+            idle_deadline = (
+                time.monotonic() + idle_timeout_seconds
+                if idle_timeout_seconds > 0
+                else None
+            )
+        elif _stream_chunk_has_meaningful_delta(chunk):
+            idle_deadline = (
+                time.monotonic() + idle_timeout_seconds
+                if idle_timeout_seconds > 0
+                else None
+            )
         if (
             _routing_module._FIRST_STREAM_OUTPUT_TIME_KEY not in request_data
             and _stream_chunk_has_meaningful_delta(chunk)
         ):
+            observed_at = datetime.now(timezone.utc)
+            request_data[_routing_module._FIRST_STREAM_OUTPUT_TIME_KEY] = observed_at
             _routing_module._record_first_stream_output_time(
                 request_data,
-                datetime.now(timezone.utc),
+                observed_at,
             )
         if not visible_output_seen:
             visible_output_seen = _stream_chunk_has_visible_output(chunk) or (
@@ -1874,26 +1900,18 @@ def _should_emit_codex_responses_initial_sse_keepalive(
     )
 
 
-def _codex_responses_initial_sse_keepalive() -> _JSONStreamEvent:
-    return _JSONStreamEvent(
-        {
-            "type": "response.metadata",
-            "metadata": {
-                "litellm_menu_keepalive": "initial_wait",
-                "phase": "awaiting_upstream_first_event",
-            },
-        }
+def _codex_responses_initial_sse_keepalive() -> str:
+    return _sse_comment_event(
+        "litellm_menu initial_wait phase=awaiting_upstream_first_event"
     )
 
 
 def _is_codex_responses_initial_sse_keepalive(chunk: Any) -> bool:
-    dumped = _stream_chunk_dump(chunk)
-    metadata = dumped.get("metadata")
-    return bool(
-        dumped.get("type") == "response.metadata"
-        and isinstance(metadata, dict)
-        and metadata.get("litellm_menu_keepalive") == "initial_wait"
-    )
+    if isinstance(chunk, bytes):
+        chunk = chunk.decode("utf-8", errors="replace")
+    if isinstance(chunk, str):
+        return chunk.startswith(": litellm_menu initial_wait ")
+    return False
 
 
 async def _yield_codex_responses_initial_keepalive_stream(
@@ -2014,9 +2032,11 @@ async def _yield_codex_responses_initial_keepalive_stream(
             _routing_module._FIRST_STREAM_OUTPUT_TIME_KEY not in request_data
             and _stream_chunk_has_meaningful_delta(first_chunk)
         ):
+            observed_at = datetime.now(timezone.utc)
+            request_data[_routing_module._FIRST_STREAM_OUTPUT_TIME_KEY] = observed_at
             _routing_module._record_first_stream_output_time(
                 request_data,
-                datetime.now(timezone.utc),
+                observed_at,
             )
         yield first_chunk
         async for chunk in _stream_with_idle_timeout(
@@ -2035,8 +2055,8 @@ def _stream_chunk_has_meaningful_delta(chunk: Any) -> bool:
     chunk_type = _stream_chunk_type(dumped)
     if isinstance(chunk_type, str) and chunk_type.endswith(".delta"):
         delta = dumped.get("delta") if isinstance(dumped, dict) else None
-        if isinstance(delta, str) and delta:
-            return True
+        if isinstance(delta, str):
+            return bool(delta.strip())
         if delta not in (None, "", [], {}):
             return True
     return _stream_chunk_has_visible_output(chunk)
@@ -2865,6 +2885,11 @@ async def _stream_streaming_error_fallback(
     attempt = 0
     allow_repeated_attempt = False
     is_responses_stream = _request_is_responses_stream(request_data)
+    is_structured_compaction = (
+        _responses_request_module._request_has_structured_codex_compaction(
+            request_data
+        )
+    )
     while True:
         buffered_chunks: List[Any] = []
         started_delivery = False
@@ -2912,6 +2937,32 @@ async def _stream_streaming_error_fallback(
                     request_data,
                 )
             ):
+                raise
+            structured_compaction_wait_failed = (
+                is_structured_compaction
+                and _routing_module._is_local_stream_timeout_error(exc)
+            )
+            if structured_compaction_wait_failed:
+                # A structured compaction replays the complete signed history.
+                # Once its replacement route has consumed a timed-out stream
+                # attempt, another ordered replay only adds another full
+                # stream wait and cannot make that failed attempt valid.
+                # Keep the existing timeout values; bound only the route hop.
+                _routing_module._mark_same_deployment_retry_exhausted(exc)
+                _routing_module._sync_failed_deployment_exclusions(
+                    request_data,
+                    exc,
+                )
+                _trace_module._route_trace(
+                    "codex_compaction_streaming_fallback_stopped",
+                    request_id=_routing_module._trace_request_id(request_data),
+                    session=_routing_module._trace_session_context(request_data),
+                    model_group=_responses_execution_module._request_model_group(
+                        request_data
+                    ),
+                    reason="stream_wait_timeout",
+                    exception=_routing_module._trace_exception(exc),
+                )
                 raise
             excluded_after = (
                 _responses_request_module._request_excluded_deployment_ids(
@@ -3776,15 +3827,8 @@ def _route_recovery_sse_keepalive(
         return (
             f": litellm_menu route_recovery phase={phase} attempt={attempt}\n\n"
         ).encode("utf-8")
-    return _JSONStreamEvent(
-        {
-            "type": "response.metadata",
-            "metadata": {
-                "litellm_menu_keepalive": "route_recovery",
-                "phase": phase,
-                "attempt": attempt,
-            },
-        }
+    return _sse_comment_event(
+        f"litellm_menu route_recovery phase={phase} attempt={attempt}"
     )
 
 
@@ -3793,14 +3837,7 @@ def _is_route_recovery_sse_keepalive(chunk: Any) -> bool:
         return chunk.startswith(b": litellm_menu route_recovery ")
     if isinstance(chunk, str):
         return chunk.startswith(": litellm_menu route_recovery ")
-    dumped = _stream_chunk_dump(chunk)
-    if dumped.get("type") != "response.metadata":
-        return False
-    metadata = dumped.get("metadata")
-    return (
-        isinstance(metadata, dict)
-        and metadata.get("litellm_menu_keepalive") == "route_recovery"
-    )
+    return False
 
 
 async def _sleep_route_recovery_poll_interval(

@@ -2219,6 +2219,7 @@ class CoreStore:
         with self._lock:
             self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
             previous_revision = self._revision
+            action_summary: dict[str, Any] | None = None
             if domain_value is None and action_type.startswith("service."):
                 result = self._dispatch_service(action_type, _as_mapping(data.get("payload")))
             else:
@@ -2227,6 +2228,15 @@ class CoreStore:
                 if adapter is None:
                     raise DomainNotFound(name)
                 before = copy.deepcopy(self._baselines.get(name))
+                action_draft_before = (
+                    self._adapter_draft_state(name)
+                    if name == "providers_models"
+                    and normalized_action in {
+                        "provider_auth_status",
+                        "service_provider_auth_status",
+                    }
+                    else None
+                )
                 payload = data.get("payload")
                 if name == "providers_models" and action_type.replace("-", "_").replace(".", "_") in {
                     "providers_import_selected",
@@ -2404,33 +2414,67 @@ class CoreStore:
                     safe_result = _safe_public(result)
                     if isinstance(safe_result, Mapping):
                         self._last_actions[name] = dict(safe_result)
+                        summary = safe_result.get("operation_summary")
+                        expected_operation = {
+                            "fetch_models": "fetch_models",
+                            "providers_fetch_models": "fetch_models",
+                            "provider_fetch_models": "fetch_models",
+                            "provider_fetch_relay_resource_models": "fetch_models",
+                            "service_provider_add": "service_provider_add",
+                            "service_add_provider": "service_provider_add",
+                            "provider_auth_start": "provider_auth_start",
+                            "provider_auth_cancel": "provider_auth_cancel",
+                            "provider_auth_logout": "provider_auth_logout",
+                            "provider_auth_status": "provider_auth_status",
+                            "service_provider_auth_start": "service_provider_auth_start",
+                            "service_provider_auth_cancel": "service_provider_auth_cancel",
+                            "service_provider_auth_logout": "service_provider_auth_logout",
+                            "service_provider_auth_status": "service_provider_auth_status",
+                        }.get(normalized_action)
+                        if (
+                            name == "providers_models"
+                            and expected_operation is not None
+                            and isinstance(summary, Mapping)
+                            and summary.get("operation") == expected_operation
+                        ):
+                            # Return the summary produced by this dispatch as
+                            # an action-scoped value.  The snapshot keeps the
+                            # latest summary for rendering, but another
+                            # window's status poll can replace that slot before
+                            # the caller refreshes it.
+                            action_summary = dict(summary)
                 dirty = after != before
-                self._revision += 1
-                self._mark_domain(
-                    name,
-                    dirty=dirty,
-                    base_revision=(
-                        self._drafts.get(name, {}).get("base_revision", self._revision)
-                        if dirty
-                        else self._revision
-                    ),
-                )
-                if providers is not None and provider_before is not None:
-                    provider_after = self._adapter_draft_state("providers_models")
-                    provider_dirty = provider_after != self._baselines.get("providers_models")
+                action_mutated = action_draft_before is None or after != action_draft_before
+                if action_mutated:
+                    self._revision += 1
                     self._mark_domain(
-                        "providers_models",
-                        dirty=provider_dirty,
+                        name,
+                        dirty=dirty,
                         base_revision=(
-                            self._drafts.get("providers_models", {}).get("base_revision", self._revision)
-                            if provider_dirty
+                            self._drafts.get(name, {}).get("base_revision", self._revision)
+                            if dirty
                             else self._revision
                         ),
                     )
-                self._persist_metadata()
+                    if providers is not None and provider_before is not None:
+                        provider_after = self._adapter_draft_state("providers_models")
+                        provider_dirty = provider_after != self._baselines.get("providers_models")
+                        self._mark_domain(
+                            "providers_models",
+                            dirty=provider_dirty,
+                            base_revision=(
+                                self._drafts.get("providers_models", {}).get("base_revision", self._revision)
+                                if provider_dirty
+                                else self._revision
+                            ),
+                        )
+                    self._persist_metadata()
             if self._revision != previous_revision:
                 self._emit()
-            return {"revision": self._revision}
+            response: dict[str, Any] = {"revision": self._revision}
+            if action_summary is not None:
+                response["action_summary"] = action_summary
+            return response
 
     def reject_plaintext_secret_action(self, action: Mapping[str, Any]) -> None:
         """Reject secret-bearing actions received through ordinary IPC."""

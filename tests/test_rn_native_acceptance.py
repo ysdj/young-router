@@ -736,7 +736,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('emitAction("request-close-\\(route)")', leaf)
         self.assertIn("requestClose(route: window.flatMap(routeForWindow), hiding: window)", leaf)
         self.assertIn("request-close-", ui)
-        self.assertIn("if (!needsDiscardConfirmation) {\n      closeRoute();\n      return;", ui)
+        clean_close = ui.split("if (!needsDiscardConfirmation) {", 1)[1].split("}", 1)[0]
+        self.assertIn("closeRoute();", clean_close)
+        self.assertIn("return;", clean_close)
         self.assertIn("onPress={requestClose}", ui)
 
     def test_macos_content_size_bridge_resizes_the_existing_react_window(self) -> None:
@@ -967,6 +969,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('url.path == "/callback"', policy)
         self.assertIn('host == "auth.openai.com"', policy)
         self.assertIn('path == "/oauth/authorize"', policy)
+        self.assertIn('host == "challenges.cloudflare.com"', policy)
+        self.assertIn('path.hasPrefix("/cdn-cgi/") || path.hasPrefix("/turnstile/")', policy)
+        self.assertIn('if provider == "claude" {', mac)
+        self.assertIn('NSWorkspace.shared.open(url)', mac)
+        self.assertLess(mac.index('if provider == "claude" {'), mac.index('let authFingerprint: String'))
 
     def test_localization_crosses_the_native_leaf_contract(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")

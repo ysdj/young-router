@@ -253,6 +253,26 @@ class HookDshVisionRouterTests(HookTestCase):
 
         self.assertTrue(hooks.should_attempt_dsh_vision_router(error, request))
 
+    async def test_should_attempt_dsh_vision_router_for_localized_vision_capability_error(self) -> None:
+        hooks, _ = load_hook_module()
+        error = RuntimeError("当前模型不支持该能力：visionno fallback model group found")
+        error.status_code = 400
+        request = {
+            "model": "text-only",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "read this",
+                }, {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,abc"},
+                }],
+            }],
+        }
+
+        self.assertTrue(hooks.should_attempt_dsh_vision_router(error, request))
+
     async def test_should_attempt_dsh_vision_router_for_openrouter_no_image_endpoint_error(self) -> None:
         hooks, _ = load_hook_module()
         error = RuntimeError('{"error":{"message":"no endpoints found that support image input","code":404}}')

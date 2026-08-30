@@ -3565,7 +3565,9 @@ class RelayAccountsDomain:
         already has multiple keys, the first key in the relay's stable list is
         retained and every later key is staged for deletion. Keys that still
         reference a group removed from the current group list are also staged
-        for deletion; ungrouped keys are left untouched.
+        for deletion. Keys without a current group are not useful to the
+        automatic one-key-per-group layout either, so they are staged for
+        deletion at the same time.
         """
 
         index = self._index(account_id)
@@ -3602,7 +3604,7 @@ class RelayAccountsDomain:
         for resource in resources:
             resource_id = str(resource.get("id", ""))
             resource_group_id = str(resource.get("group_id", ""))
-            if not resource_id or not resource_group_id or resource_group_id in valid_group_ids:
+            if not resource_id or resource_group_id in valid_group_ids:
                 continue
             if any(
                 operation.get("kind") == "api_key_delete"

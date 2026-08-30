@@ -293,7 +293,7 @@ export interface IpcResults {
   disk_state: { revision: number; disk: Partial<Record<ConfigDomain, DiskState>> };
   logs: { changed: boolean; revision: number; log: LogView | null };
   editor: { domain: "codex" | "claude"; document: "config" | "auth" | "settings" | "desktop" | "developer"; editor_token: string; revision: number; text: string; baseline: string };
-  dispatch: { revision: number };
+  dispatch: { revision: number; action_summary?: Record<string, unknown> };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
   apply: {
@@ -369,7 +369,7 @@ export interface IpcClient {
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
   editor(domain: "codex" | "claude", document: "config" | "auth" | "settings" | "desktop" | "developer"): Promise<IpcResults["editor"]>;
   stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;
-  dispatch(action: DispatchAction, revision?: number): Promise<{ revision: number }>;
+  dispatch(action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]>;
   subscribe(listener: (event: IpcEvent) => void, topics?: string[]): () => void;
   validate(domain: ConfigDomain, revision?: number): Promise<ValidationSummary>;
   apply(domain: ConfigDomain, revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
@@ -502,9 +502,9 @@ export interface NativeLeafAdapter {
   showConfirmation(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
   showReadOnlyText(options: { title: string; text: string; closeLabel: string; language: "json" | "toml" | "text"; html: string }): Promise<void>;
   /**
-   * Show an official provider device-code login in a native, isolated WebView.
-   * The native host displays the one-time code but never returns page fields,
-   * cookies, tokens, or other credential material to the shared UI.
+   * Show an official provider login through the platform-owned auth surface.
+   * The native host never returns page fields, cookies, tokens, or other
+   * credential material to the shared UI.
    */
   showProviderAuth?(options: {
     provider: "openai" | "claude";

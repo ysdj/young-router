@@ -320,7 +320,18 @@ def _looks_like_vision_unsupported_error(exception: Exception) -> bool:
     if status_code is not None and status_code not in {400, 404, 422}:
         return False
     text = _exception_text(exception)
-    return any(marker in text for marker in _VISION_UNSUPPORTED_MARKERS)
+    if any(marker in text for marker in _VISION_UNSUPPORTED_MARKERS):
+        return True
+
+    # Providers do not use one stable English sentence for capability errors.
+    # Match the capability and unsupported wording independently so localized
+    # responses still enter the general image bridge without a provider branch.
+    unsupported = re.search(
+        r"(?:does not|doesn't|do not|cannot|can't|unable to|unsupported|not supported|不支持|无法使用|不具备)",
+        text,
+    )
+    vision = re.search(r"(?:\bvision\w*|image|图像|图片|视觉)", text)
+    return bool(unsupported and vision and abs(unsupported.start() - vision.start()) <= 64)
 
 
 def should_attempt_dsh_vision_router(exception: Exception, request_kwargs: Optional[dict]) -> bool:

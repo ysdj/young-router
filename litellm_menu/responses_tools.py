@@ -808,6 +808,7 @@ def _responses_chat_bridge_sanitize_tools(
     *,
     input_value: Any = None,
     bridge_web_search: bool = True,
+    bridge_provider_native_web_search: bool = False,
 ) -> tuple[Optional[list[dict]], Optional[dict], dict[str, Any]]:
     if not isinstance(tools, list):
         return None, None, {"changed": False}
@@ -862,6 +863,19 @@ def _responses_chat_bridge_sanitize_tools(
             tool
         )
         if provider_native_web_search is not None:
+            if bridge_provider_native_web_search:
+                added_local_web_tools = False
+                for direct_tool in _pi_web_access_tool_definitions():
+                    converted_direct_tool = _responses_bridge_function_tool(direct_tool)
+                    if converted_direct_tool is not None and _append_unique_chat_tool(
+                        sanitized,
+                        converted_direct_tool,
+                        seen_tool_names,
+                    ):
+                        added_local_web_tools = True
+                if added_local_web_tools:
+                    bridged_web_search_tools += 1
+                continue
             # Provider-native server tools do not have a Chat function name.
             # Route them by their declared type and keep the complete
             # declaration intact; neither a Hosted declaration nor a client

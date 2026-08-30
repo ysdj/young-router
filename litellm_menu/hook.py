@@ -93,6 +93,7 @@ class LiteLLMMenuHook(CustomLogger):
             _image_inputs_module._with_bounded_image_inputs,
             _responses_request_module._with_internal_litellm_metadata,
             _responses_request_module._with_mcp_auto_approval,
+            _responses_request_module._with_codex_openrouter_native_web_search_tool,
             _responses_request_module._with_codex_external_web_search_bridge_tool,
             _responses_request_module._with_codex_tool_registry_instruction,
             _responses_request_module._with_codex_descendant_cleanup_instruction,

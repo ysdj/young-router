@@ -61,6 +61,8 @@ def _sync_bridge_extra_body_tools(request_kwargs: dict, tools: list[dict]) -> No
 def _with_responses_chat_bridge_compatible_tools(
     retry_kwargs: dict,
     retry_metadata: dict,
+    *,
+    bridge_provider_native_web_search: bool = False,
 ) -> None:
     if _routing_module._protocol_fallback_relax_tool_choice(retry_kwargs):
         retry_metadata[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
@@ -88,6 +90,7 @@ def _with_responses_chat_bridge_compatible_tools(
         tools,
         input_value=retry_kwargs.get("input"),
         bridge_web_search=bridge_web_search,
+        bridge_provider_native_web_search=bridge_provider_native_web_search,
     )
     if stats.get("changed"):
         retry_metadata["responses_chat_bridge_tool_sanitized"] = stats
@@ -480,21 +483,49 @@ def _request_native_responses_web_search_support_decision(
     if not isinstance(request_kwargs, dict):
         return None
     model_info = _request_context_module._request_model_info(request_kwargs)
-    if model_info.get(_SUPPORTS_RESPONSES_WEB_SEARCH_KEY) is True:
-        return True
-    if model_info.get(_SUPPORTS_WEB_SEARCH_KEY) is True:
-        return True
     if model_info.get(_SUPPORTS_RESPONSES_WEB_SEARCH_KEY) is False:
         return False
     if model_info.get(_SUPPORTS_WEB_SEARCH_KEY) is False:
         return False
+    # A deterministic native rejection is a route-local negative capability
+    # signal. Keep the normal unknown/true native-first contract, but avoid
+    # paying the same rejected tool call on every request until the short
+    # probe memory expires.
+    if _routing_module._web_search_tool_unsupported_cached(request_kwargs):
+        return False
+    if model_info.get(_SUPPORTS_RESPONSES_WEB_SEARCH_KEY) is True:
+        return True
+    if model_info.get(_SUPPORTS_WEB_SEARCH_KEY) is True:
+        return True
     if _request_is_direct_openai_route(request_kwargs):
         return True
     return None
 
 
+def _request_native_responses_web_search_support_decision_for_requests(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> Optional[bool]:
+    """Preserve unknown native capability separately from a definite false.
+
+    The boolean support helper intentionally represents unknown providers as
+    false for yes/no dispatch callers. The pre-dispatch provider-native path
+    must not treat that representation as a rejection: only an explicit false
+    flag or a cached deterministic rejection authorizes the local bridge.
+    """
+    if _routing_module._request_current_upstream_surface(request_kwargs):
+        return _request_native_responses_web_search_support_decision(request_kwargs)
+    for request in (request_kwargs, outer_request_kwargs):
+        decision = _request_native_responses_web_search_support_decision(request)
+        if decision is not None:
+            return decision
+    return None
+
+
 def _request_web_search_support_is_unknown(request_kwargs: Optional[dict]) -> bool:
     if not isinstance(request_kwargs, dict):
+        return False
+    if _routing_module._web_search_tool_unsupported_cached(request_kwargs):
         return False
     model_info = _request_context_module._request_model_info(request_kwargs)
     return (
@@ -529,8 +560,24 @@ def _request_should_bridge_responses_web_search(
         request_kwargs,
         outer_request_kwargs,
     )
+    cached_unsupported = any(
+        _routing_module._web_search_tool_unsupported_cached(request)
+        is not None
+        for request in (request_kwargs, outer_request_kwargs)
+    )
     if not plan.hosted_web_search:
-        return False
+        # Provider-native declarations (for example OpenRouter's
+        # openrouter:web_search) remain pass-through while capability is
+        # unknown. Once the route has explicitly rejected that declaration,
+        # the same local function bridge is safe to use preemptively until
+        # the probe memory expires.
+        native_support_decision = (
+            _request_native_responses_web_search_support_decision_for_requests(
+                request_kwargs,
+                outer_request_kwargs,
+            )
+        )
+        return cached_unsupported or native_support_decision is False
     if _request_supports_native_responses_web_search(
         request_kwargs,
         outer_request_kwargs,
@@ -800,7 +847,22 @@ def _responses_external_web_search_bridge_kwargs(
     ):
         return None
     plan = plan or _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
-    if not plan.hosted_web_search:
+    cached_unsupported = any(
+        _routing_module._web_search_tool_unsupported_cached(request)
+        is not None
+        for request in (request_kwargs, outer_for_tool_plan)
+    )
+    native_support_decision = (
+        _request_native_responses_web_search_support_decision_for_requests(
+            request_kwargs,
+            outer_for_tool_plan,
+        )
+    )
+    if (
+        not plan.hosted_web_search
+        and not cached_unsupported
+        and native_support_decision is not False
+    ):
         return None
     if plan.hosted_computer:
         return None
@@ -905,6 +967,11 @@ def _with_responses_external_web_search_bridge_after_native_error(
         request_kwargs,
     ):
         return None
+    _routing_module._record_web_search_tool_unsupported(
+        exception,
+        request_kwargs,
+        outer_request_kwargs,
+    )
     if _tools_module._request_should_intercept_external_web_search(request_kwargs):
         return None
     # A bare Responses 404 means the selected gateway has no Responses
@@ -989,7 +1056,22 @@ def _responses_external_web_search_bridge_possible(
     plan = plan or _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_for_tool_plan)
     if plan.hosted_computer:
         return False
-    if not plan.hosted_web_search:
+    cached_unsupported = any(
+        _routing_module._web_search_tool_unsupported_cached(request)
+        is not None
+        for request in (request_kwargs, outer_for_tool_plan)
+    )
+    native_support_decision = (
+        _request_native_responses_web_search_support_decision_for_requests(
+            request_kwargs,
+            outer_for_tool_plan,
+        )
+    )
+    if (
+        not plan.hosted_web_search
+        and not cached_unsupported
+        and native_support_decision is not False
+    ):
         return False
     bridged_tools, _stats = _responses_tools_module._responses_external_web_search_bridge_tools(
         request_kwargs.get("tools")
@@ -1022,9 +1104,9 @@ def _responses_chat_bridge_preemptive_reason(
     )
     # A provider-native declaration is already valid on its own. Do not
     # mistake an OpenRouter Chat surface for a Hosted-search incompatibility
-    # and replace it with pi-web-access. If other client tools require a
-    # bridge, the sanitizer preserves this declaration while adapting only
-    # those client tools.
+    # and replace it with pi-web-access while capability is unknown. If the
+    # route has explicitly rejected that declaration, the error-path caller
+    # opts into the local pair below.
     has_provider_native_search = any(
         isinstance(tool, dict)
         and tool.get("type") in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES
@@ -1033,6 +1115,28 @@ def _responses_chat_bridge_preemptive_reason(
     if has_provider_native_search and not (
         plan.client_namespaces or plan.client_functions
     ):
+        native_support_decision = (
+            _request_native_responses_web_search_support_decision_for_requests(
+                request_kwargs,
+                outer_for_tool_reason,
+            )
+        )
+        if (
+            include_hosted_web_search_unsupported
+            and native_support_decision is False
+        ):
+            current_surface = _routing_module._request_current_upstream_surface(
+                request_kwargs
+            )
+            if (
+                current_surface in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES
+                or _request_has_chat_bridge_mode(
+                    request_kwargs,
+                    outer_for_tool_reason,
+                    allow_selected_marker=allow_selected_marker,
+                )
+            ):
+                return "provider_native_web_search_unsupported"
         return None
     if _current_route_responses_endpoint_unsupported(
         request_kwargs,
@@ -1126,7 +1230,13 @@ def _responses_chat_bridge_preemptive_kwargs(
         outer_request_kwargs,
     ):
         return None
-    _with_responses_chat_bridge_compatible_tools(bridge_kwargs, bridge_metadata)
+    _with_responses_chat_bridge_compatible_tools(
+        bridge_kwargs,
+        bridge_metadata,
+        bridge_provider_native_web_search=(
+            reason == "provider_native_web_search_unsupported"
+        ),
+    )
     bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
         bridge_kwargs.get("input")
     )

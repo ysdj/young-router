@@ -3,12 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from litellm_menu.core.domains import DomainError
 from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
 from litellm_menu.core.persistence import atomic_write_json
 from litellm_menu.core.provider_auth import ProviderAuthManager
+from litellm_menu.core.service import CoreStore
 
 
 class ServiceProviderBoundaryTests(unittest.TestCase):
@@ -112,6 +113,109 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertNotEqual(first_ref, second_ref)
         finally:
             directory.cleanup()
+
+    def test_auth_status_poll_does_not_advance_core_revision_when_draft_is_unchanged(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            domain.dispatch("service_provider.add", {"kind": "claude_login"})
+            provider = domain.snapshot()["providers"][0]
+            provider_id = provider["id"]
+            core = CoreStore(domains=[domain])
+            before = core.revision
+            domain_before = domain.revision
+            first = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "service_provider.auth_status",
+                    "payload": {"provider_id": provider_id},
+                },
+                expected_revision=before,
+            )
+            second = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "service_provider.auth_status",
+                    "payload": {"provider_id": provider_id},
+                },
+                expected_revision=first["revision"],
+            )
+            self.assertEqual(before, first["revision"])
+            self.assertEqual(before, second["revision"])
+            self.assertEqual(domain_before, domain.revision)
+
+    def test_auth_status_poll_advances_revision_when_it_changes_runtime_routing(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        root = Path(directory.name)
+        config = root / "config.yaml"
+        config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+        manager = Mock()
+        manager.status.return_value = {"status": "signed_out", "configured": False}
+        domain = ProvidersModelsDomain(config, auth_manager=manager)
+        with directory:
+            domain.dispatch("service_provider.add", {"kind": "openai_login"})
+            provider_id = domain.snapshot()["providers"][0]["id"]
+            self.assertTrue(domain.draft_state()["providers"][0]["enabled"])
+            core = CoreStore(domains=[domain])
+            before = core.revision
+            result = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "service_provider.auth_status",
+                    "payload": {"provider_id": provider_id},
+                },
+                expected_revision=before,
+            )
+            self.assertGreater(result["revision"], before)
+            self.assertFalse(domain.draft_state()["providers"][0]["enabled"])
+
+    def test_dispatch_returns_only_the_current_model_fetch_summary(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            added = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "OpenRouter",
+                        "api_base": "https://openrouter.ai/api/v1",
+                        "create_default_api_key": True,
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            summary = {
+                "operation": "fetch_models",
+                "provider_id": provider_id,
+                "protocols": ["openai-models-v1"],
+                "api_key_name": "default",
+                "available": True,
+                "detail": "Provider model list fetched",
+                "models": ["model-a"],
+                "model_count": 1,
+            }
+            core = CoreStore(domains=[domain])
+            with patch.object(domain, "_fetch_provider_models", return_value=summary):
+                fetched = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "providers.fetch_models",
+                        "payload": {"provider_id": provider_id},
+                    },
+                    expected_revision=core.revision,
+                )
+            self.assertEqual(summary, fetched["action_summary"])
+
+            edited = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.add",
+                    "payload": {
+                        "provider_id": provider_id,
+                        "model": {"name": "model-b", "upstream_model": "model-b"},
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            self.assertNotIn("action_summary", edited)
 
     def test_openai_activation_switches_active_slot_and_delete_isolated(self) -> None:
         directory, domain = self._domain()
