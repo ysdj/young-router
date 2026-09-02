@@ -123,6 +123,81 @@ class CodexConfigTests(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual([], models)
 
+    def test_litellm_model_selection_enables_native_checkpoint_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_config = Path(directory) / "config.yaml"
+            self.write_runtime_config(runtime_config)
+            with mock.patch.object(
+                codex_config,
+                "local_base_url",
+                return_value="http://127.0.0.1:4999/v1",
+            ):
+                config_text, auth_text, _config, _auth = (
+                    codex_config.apply_structured_patch(
+                        'model = "previous"\n[features]\ngoals = true\n',
+                        "{}\n",
+                        {
+                            "litellm_model": {
+                                "model": "active-chat",
+                                "provider": "active",
+                                "deployment_id": "a1b2c3d4",
+                            }
+                        },
+                        runtime_config,
+                    )
+                )
+
+        parsed = tomllib.loads(config_text)
+        self.assertEqual("openai", parsed["model_provider"])
+        self.assertEqual("active-chat", parsed["model"])
+        self.assertTrue(parsed["features"]["goals"])
+        self.assertTrue(parsed["features"]["token_budget"])
+        self.assertEqual("sk-test-local", json.loads(auth_text)["OPENAI_API_KEY"])
+
+    def test_litellm_model_selection_preserves_custom_provider_for_standalone_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_config = Path(directory) / "config.yaml"
+            self.write_runtime_config(runtime_config)
+            config_text = textwrap.dedent(
+                """
+                model = "previous"
+                model_provider = "newapi"
+                openai_base_url = "https://stale-openai.example.test/v1"
+
+                [model_providers.newapi]
+                base_url = "https://remote.example.test/v1"
+                base_url1 = "https://fallback.example.test/v1"
+                wire_api = "responses"
+                requires_openai_auth = true
+                """
+            ).lstrip()
+
+            with mock.patch.object(
+                codex_config,
+                "local_base_url",
+                return_value="http://127.0.0.1:4999/v1",
+            ):
+                config_text, auth_text, _config, _auth = codex_config.apply_structured_patch(
+                    config_text,
+                    "{}\n",
+                    {
+                        "litellm_model": {
+                            "model": "active-chat",
+                            "provider": "active",
+                            "deployment_id": "a1b2c3d4",
+                        }
+                    },
+                    runtime_config,
+                )
+
+        parsed = tomllib.loads(config_text)
+        self.assertEqual("newapi", parsed["model_provider"])
+        self.assertEqual("active-chat", parsed["model"])
+        self.assertEqual("https://stale-openai.example.test/v1", parsed["openai_base_url"])
+        self.assertEqual("http://127.0.0.1:4999/v1", parsed["model_providers"]["newapi"]["base_url"])
+        self.assertEqual("https://fallback.example.test/v1", parsed["model_providers"]["newapi"]["base_url1"])
+        self.assertEqual("sk-test-local", json.loads(auth_text)["OPENAI_API_KEY"])
+
     def run_command(
         self,
         runtime_config: Path,

@@ -112,7 +112,43 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertIn("could not be decrypted or decoded", str(exc))
         self.assertFalse(hooks._is_route_recovery_poll_error(exc))
 
-    def test_recovery_state_records_diagnostic_and_keepalive_only_touches_local_state(self) -> None:
+    def test_responses_route_recovery_keepalives_are_json_events(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "call_type": "aresponses",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        for phase in ("network", "poll", "interval", "cooldown"):
+            with self.subTest(phase=phase):
+                keepalive = hooks._route_recovery_sse_keepalive(
+                    1,
+                    request_data=request_data,
+                    phase=phase,
+                )
+                self.assertIsInstance(keepalive, dict)
+                self.assertEqual(keepalive["type"], "response.metadata")
+                self.assertEqual(keepalive["metadata"]["phase"], phase)
+                self.assertEqual(json.loads(json.dumps(keepalive)), keepalive)
+                self.assertTrue(hooks._is_route_recovery_sse_keepalive(keepalive))
+
+    def test_non_responses_route_recovery_keepalive_remains_native_sse_comment(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        keepalive = hooks._route_recovery_sse_keepalive(
+            1,
+            request_data={
+                "messages": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+            },
+            phase="network",
+        )
+
+        self.assertEqual(
+            keepalive,
+            b": litellm_menu route_recovery phase=network attempt=1\n\n",
+        )
+
         hooks, _proxy_server = load_hook_module()
         streaming_module = sys.modules["litellm_menu.streaming"]
         state_module = sys.modules["litellm_menu.state"]
@@ -1185,8 +1221,15 @@ class HookRouteRecoveryTests(HookTestCase):
         ]
         self.assertGreaterEqual(len(attempts), 2)
         self.assertGreaterEqual(len(keepalives), 1)
-        self.assertTrue(all(isinstance(chunk, str) for chunk in keepalives))
-        self.assertTrue(all(chunk.startswith(": litellm_menu route_recovery ") for chunk in keepalives))
+        self.assertTrue(all(isinstance(chunk, dict) for chunk in keepalives))
+        self.assertTrue(
+            all(
+                isinstance(chunk, dict)
+                and chunk.get("type") == "response.metadata"
+                and isinstance(chunk.get("metadata"), dict)
+                for chunk in keepalives
+            )
+        )
         assert_upstream_route_failed_terminal(self, chunks)
 
     async def test_route_recovery_poll_empty_retries_until_max_duration(self) -> None:

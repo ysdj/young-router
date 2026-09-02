@@ -248,7 +248,7 @@ class HookStreamingTimeoutTests(HookTestCase):
         )
         self.assertEqual(
             chunks[0],
-            ": litellm_menu initial_wait phase=awaiting_upstream_first_event\n\n",
+            {"type": "response.metadata", "metadata": {"phase": "initial_wait"}},
         )
         self.assertFalse(upstream_cancelled)
         self.assertTrue(upstream_closed)

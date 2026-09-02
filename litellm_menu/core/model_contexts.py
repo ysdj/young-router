@@ -168,6 +168,7 @@ _BUNDLED_RECORDS: dict[str, dict[str, Any]] = {
     "claude-fable-5": _record(1_000_000),
     "claude-sonnet-5": _record(1_000_000),
     "claude-opus-5": _record(1_000_000),
+    "glm-5.3": _record(1_000_000),
     "kimi-k3": _record(262_144, 1_048_576, priority=25),
     "k3-256k": _record(262_144, priority=25),
     "gpt-image-2": _record(65_536),
@@ -319,7 +320,7 @@ def _candidate_ids(value: str) -> list[str]:
     if raw.startswith("models/"):
         raw = raw[7:]
     candidates: list[str] = [raw]
-    if "." in raw:
+    if "." in raw and "/" not in raw:
         candidates.append(raw.split(".", 1)[1])
     parts = raw.split("/")
     for index in range(1, len(parts)):
@@ -339,14 +340,25 @@ def _candidate_ids(value: str) -> list[str]:
     return unique
 
 
+def _context_window_policy(record: Mapping[str, Any]) -> tuple[int, int, int]:
+    context = int(record["context_window"])
+    maximum = int(record.get("max_context_window") or context)
+    percent = int(
+        record.get(
+            "effective_context_window_percent",
+            DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+        )
+    )
+    return context, maximum, percent
+
+
 def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str, Any] | None:
     direct_matches: list[tuple[int, int, dict[str, Any]]] = []
     for index, candidate in enumerate(_candidate_ids(model_id)):
         direct = records.get(candidate)
         if isinstance(direct, Mapping):
             direct_matches.append((_positive_int(direct.get("priority")) or 0, -index, dict(direct)))
-    if direct_matches:
-        return max(direct_matches, key=lambda item: (item[0], item[1]))[2]
+    direct_match = max(direct_matches, key=lambda item: (item[0], item[1])) if direct_matches else None
     suffix_matches: list[tuple[int, dict[str, Any]]] = []
     candidates = set(_candidate_ids(model_id))
     for key, value in records.items():
@@ -357,10 +369,25 @@ def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str
             suffix_matches.append((_positive_int(value.get("priority")) or 0, dict(value)))
     if suffix_matches:
         top_priority = max(item[0] for item in suffix_matches)
+        if direct_match is not None:
+            direct_source = direct_match[2].get("source")
+            # An exact Codex catalog entry is already a provider-neutral
+            # policy decision.  Only let provider-qualified profiles replace
+            # the low-confidence bundled alias that caused the lookup to
+            # miss an upstream profile in the first place.
+            if direct_source != "bundled" or direct_match[0] >= top_priority:
+                return direct_match[2]
         top_records = [item[1] for item in suffix_matches if item[0] == top_priority]
-        if len(top_records) == 1 or all(record == top_records[0] for record in top_records[1:]):
-            return top_records[0]
-    return None
+        # Provider-qualified copies of the same public model often share a
+        # family while advertising slightly different windows. Falling through
+        # to the unknown default hides a known 1M-class model as 258k.
+        context, maximum, percent = min(_context_window_policy(record) for record in top_records)
+        selected = dict(top_records[0])
+        selected["context_window"] = context
+        selected["max_context_window"] = maximum
+        selected["effective_context_window_percent"] = percent
+        return selected
+    return direct_match[2] if direct_match is not None else None
 
 
 def _default_reasoning_level(
@@ -619,18 +646,16 @@ class ModelContextRegistry:
     def record_for(self, public_name: str) -> ContextRecord:
         self._load_cache()
         route_ids = self._load_route_model_ids(public_name)
-        model_ids = route_ids or [public_name]
         unknown, _ = self._runtime_values()
         records: list[dict[str, Any]] = []
-        for model_id in model_ids:
-            record = _lookup(self._records, model_id)
-            if record is None:
-                alias = _BUNDLED_ALIASES.get(model_id.casefold())
-                if alias:
-                    record = _lookup(self._records, alias)
-            if record is None:
-                record = _litellm_record([model_id])
-            records.append(record or _record(unknown, source="runtime-default", priority=0))
+        for model_id in route_ids:
+            record = self._resolve_context_record(model_id)
+            if record is not None:
+                records.append(record)
+        if not records:
+            record = self._resolve_context_record(public_name)
+            if record is not None:
+                records.append(record)
         if records:
             return ContextRecord(
                 context_window=min(int(record["context_window"]) for record in records),
@@ -642,6 +667,19 @@ class ModelContextRegistry:
             max_context_window=unknown,
             effective_context_window_percent=DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
         )
+
+    def _resolve_context_record(self, model_id: str) -> dict[str, Any] | None:
+        record = _lookup(self._records, model_id)
+        if record is None:
+            for candidate in [model_id.casefold(), *_candidate_ids(model_id)]:
+                alias = _BUNDLED_ALIASES.get(candidate)
+                if alias:
+                    record = _lookup(self._records, alias)
+                    if record is not None:
+                        break
+        if record is None:
+            record = _litellm_record([model_id])
+        return record
 
     def reasoning_for_model_id(self, model_id: str) -> ReasoningCapability | None:
         """Return Pi/Codex reasoning policy for one concrete deployment model."""

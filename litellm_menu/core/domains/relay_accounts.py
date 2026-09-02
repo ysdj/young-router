@@ -2932,6 +2932,41 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay login is unavailable")
         return headers
 
+    def _read_key_headers(self, account: Mapping[str, Any]) -> dict[str, str]:
+        """Resolve dashboard headers for one key read.
+
+        The in-memory session is preferred.  After a Core restart it may be
+        empty even though the user explicitly saved the session; fall back to
+        those persisted secrets, matching the behavior of the relay resource
+        refresh path once the session has been restored.
+        """
+
+        try:
+            return self._headers(account)
+        except RelayAccountsError:
+            pass
+        if not account.get("remember_password"):
+            raise RelayAccountsError("Relay login is unavailable") from None
+        session = account.get("session")
+        if not isinstance(session, Mapping):
+            raise RelayAccountsError("Relay login is unavailable") from None
+        cookie = session.get("cookie")
+        token = session.get("access_token")
+        headers: dict[str, str] = {}
+        if isinstance(cookie, str) and cookie:
+            headers["Cookie"] = cookie
+        if isinstance(token, str) and token:
+            headers["Authorization"] = f"Bearer {token}"
+        if not headers:
+            raise RelayAccountsError("Relay login is unavailable") from None
+        account_id = str(account.get("id", ""))
+        self._session_secrets[account_id] = {
+            key: value
+            for key, value in (("cookie", cookie), ("access_token", token), ("refresh_token", session.get("refresh_token")))
+            if isinstance(value, str) and value
+        }
+        return headers
+
     @staticmethod
     def _resource_cache_key(account_id: object, resource_id: object) -> str:
         return f"{_account_id(account_id)}:{_resource_id(resource_id)}"
@@ -3827,7 +3862,7 @@ class RelayAccountsDomain:
         if isinstance(cached, str) and cached:
             return cached
         if account["type"] == "sub2api":
-            keys = _json_data(self._http.json(account["origin"], "/api/v1/keys?page=1&page_size=100", headers=self._headers(account)))
+            keys = _json_data(self._http.json(account["origin"], "/api/v1/keys?page=1&page_size=100", headers=self._read_key_headers(account)))
             if isinstance(keys, Mapping):
                 keys = keys.get("items", [])
             if not isinstance(keys, Sequence) or isinstance(keys, (str, bytes, bytearray)):
@@ -3854,7 +3889,7 @@ class RelayAccountsDomain:
             token_id = int(token_id_text)
         except ValueError:
             raise RelayAccountsError("The selected relay API resource is unavailable")
-        payload = _json_data(self._http.post(account["origin"], f"/api/token/{token_id}/key", headers=self._headers(account)))
+        payload = _json_data(self._http.post(account["origin"], f"/api/token/{token_id}/key", headers=self._read_key_headers(account)))
         key = payload.get("key") if isinstance(payload, Mapping) else None
         if not isinstance(key, str) or not key.strip():
             raise RelayAccountsError("Relay API key is unavailable")

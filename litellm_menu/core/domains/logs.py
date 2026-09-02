@@ -906,6 +906,57 @@ def _safe_request_record(
     return result
 
 
+_REQUEST_PENDING_STATUSES = frozenset({"pending", "sending"})
+
+
+def _request_projection_key(record: Mapping[str, Any]) -> str:
+    return _string_record_value(record.get("request_id"))
+
+
+def _request_record_status(record: Mapping[str, Any]) -> str:
+    return _string_record_value(record.get("status")).casefold()
+
+
+def _should_replace_request_record(
+    existing: Mapping[str, Any],
+    incoming: Mapping[str, Any],
+) -> bool:
+    incoming_status = _request_record_status(incoming)
+    if incoming_status in _REQUEST_PENDING_STATUSES:
+        # A new deployment attempt can follow an earlier failed attempt while
+        # retaining the same request id. Surface that retry as active again.
+        return True
+    existing_status = _request_record_status(existing)
+    if incoming_status == "stream" and existing_status not in {
+        *_REQUEST_PENDING_STATUSES,
+        "stream",
+    }:
+        # Ignore an out-of-order non-terminal stream callback after a terminal
+        # callback. A subsequent pending record still starts a visible retry.
+        return False
+    return True
+
+
+def _collapse_request_records(records: list[object]) -> list[object]:
+    """Keep one row per request while allowing progress to reach a terminal state."""
+    projected: dict[str, tuple[int, dict[str, Any]]] = {}
+    standalone: list[tuple[int, dict[str, Any]]] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            continue
+        value = dict(record)
+        request_id = _request_projection_key(value)
+        if not request_id:
+            standalone.append((index, value))
+            continue
+        existing = projected.get(request_id)
+        if existing is not None and not _should_replace_request_record(existing[1], value):
+            continue
+        projected[request_id] = (existing[0] if existing else index, value)
+    result = list(projected.values()) + standalone
+    return [record for _index, record in sorted(result, key=lambda x: x[0])]
+
+
 def _is_service_noise(line: str) -> bool:
     message = SERVICE_TIMESTAMP_PREFIX.sub("", line).strip()
     if not message:
@@ -1581,6 +1632,8 @@ class LogsDomain:
                     records.append(record)
             elif tab not in {"requests", "route-trace"}:
                 records.append(REDACT_TEXT(ANSI_CONTROL_SEQUENCE.sub("", line))[:512])
+        if tab == "requests":
+            records = _collapse_request_records(records)
         needle = self._filters.get(tab, "").casefold()
         if needle:
             records = [

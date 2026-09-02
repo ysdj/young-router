@@ -655,6 +655,31 @@ model_list:
 
             self.assertEqual(["older", "newer"], [record["request_id"] for record in projected])
 
+    def test_request_records_project_each_live_lifecycle_to_one_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {"ts": "2026-08-01T04:10:10Z", "request_id": "completed", "status": "pending"},
+                {"ts": "2026-08-01T04:10:11Z", "request_id": "completed", "status": "stream"},
+                {"ts": "2026-08-01T04:10:12Z", "request_id": "completed", "status": "success"},
+                {"ts": "2026-08-01T04:10:13Z", "request_id": "completed", "status": "stream"},
+                {"ts": "2026-08-01T04:10:20Z", "request_id": "retried", "status": "failure"},
+                {"ts": "2026-08-01T04:10:21Z", "request_id": "retried", "status": "pending"},
+                {"ts": "2026-08-01T04:10:22Z", "request_id": "retried", "status": "stream"},
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+
+            self.assertEqual(2, len(projected))
+            self.assertEqual(
+                {"completed": "success", "retried": "stream"},
+                {record["request_id"]: record["status"] for record in projected},
+            )
+
     def test_request_records_normalize_epoch_seconds_and_milliseconds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

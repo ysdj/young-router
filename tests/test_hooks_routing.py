@@ -1642,6 +1642,85 @@ class HookRoutingTests(HookTestCase):
             "anthropic",
         )
 
+    def test_structured_compaction_forces_responses_surface_even_for_fixed_route(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "anthropic/vendor-model", "order": 1},
+            "model_info": {
+                "id": "fixed-anthropic-route",
+                "upstream_url_surface": "anthropic",
+                "upstream_protocol_mode": "fixed",
+            },
+        }
+        request = {
+            "call_type": "aresponses",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "_litellm_menu_upstream_url_surface": "anthropic",
+            "_litellm_menu_upstream_url_surface_deployment_id": "fixed-anthropic-route",
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(request, deployment),
+            "openai/responses",
+        )
+
+    def test_structured_compaction_skips_non_responses_same_route_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        primary = {
+            "litellm_params": {"model": "anthropic/vendor-model", "order": 1},
+            "model_info": {
+                "id": "anthropic-route",
+                "upstream_url_surface": "anthropic",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        peer = {
+            "litellm_params": {"model": "openai/vendor-model", "order": 1},
+            "model_info": {
+                "id": "responses-peer",
+                "upstream_url_surface": "openai/responses",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [primary, peer]
+
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "stream": True,
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "_target_order": 1,
+            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_litellm_menu_attempted_upstream_url_surfaces": ["openai/responses"],
+            "_litellm_menu_upstream_url_surface_deployment_id": "anthropic-route",
+            "model_info": primary["model_info"],
+            "litellm_params": primary["litellm_params"],
+        }
+        error = RuntimeError("Responses endpoint not found")
+        error.status_code = 404
+        hooks._mark_exception_for_upstream_surface_failover(error, request)
+
+        entry = hooks._ordered_deployment_fallback_entry(Router(), error, request)
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["_target_order"], 1)
+        self.assertEqual(entry["_excluded_deployment_ids"], ["anthropic-route"])
+        self.assertEqual(
+            entry[hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY],
+            ["responses-peer"],
+        )
+        self.assertNotIn("_litellm_menu_upstream_url_surface", entry)
+
     def test_protocol_fallback_stays_on_the_same_deployment(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -2874,6 +2953,260 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(hooks._next_configured_order([-1.5, 0, 0.25], -1.5), 0)
         self.assertEqual(hooks._next_configured_order([-1.5, 0, 0.25], 0), 0.25)
+
+    @staticmethod
+    def _third_party_structured_compaction_request() -> dict:
+        return {
+            "call_type": "aresponses",
+            "model": "kimi-k3",
+            "stream": True,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "SIGNED-HISTORY-MUST-NOT-REACH-THE-PROBE",
+                },
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "tools": [],
+            "client_metadata": {
+                "session_id": "thread-compaction-test",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "model_info": {
+                "id": "third-party-kimi-route",
+                "provider": "third-party",
+                "order": 1,
+            },
+            "litellm_params": {
+                "model": "openai/kimi-k3",
+                "api_base": "https://gateway.example.test/v1",
+                "order": 1,
+            },
+        }
+
+    async def test_compaction_capability_probe_is_history_free_and_cached_on_success(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        calls = []
+        hooks._CODEX_COMPACTION_CAPABILITIES.clear()
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+
+        async def supported_stream():
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "opaque-probe-result",
+                        }
+                    ],
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return supported_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        await hook.async_pre_call_deployment_hook(
+            self._third_party_structured_compaction_request(), "aresponses"
+        )
+        await hook.async_pre_call_deployment_hook(
+            self._third_party_structured_compaction_request(), "aresponses"
+        )
+
+        self.assertEqual(1, len(calls))
+        probe = calls[0]
+        self.assertEqual(
+            probe["input"],
+            [
+                {
+                    "type": "compaction_trigger",
+                    "id": "litellm-menu-compaction-capability-probe",
+                }
+            ],
+        )
+        self.assertNotIn("SIGNED-HISTORY-MUST-NOT-REACH-THE-PROBE", str(probe))
+        self.assertEqual([], probe["tools"])
+        self.assertTrue(
+            probe["litellm_metadata"][
+                hooks._CODEX_COMPACTION_CAPABILITY_PROBE_METADATA_KEY
+            ]
+        )
+        self.assertEqual(
+            "supported",
+            hooks._cached_codex_compaction_capability_status(
+                self._third_party_structured_compaction_request()
+            ),
+        )
+
+    async def test_unsupported_compaction_uses_cached_summary_fallback_signal(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        calls = []
+        hooks._CODEX_COMPACTION_CAPABILITIES.clear()
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+
+        async def ordinary_response_stream():
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "not compaction"}
+                            ],
+                        }
+                    ],
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return ordinary_response_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        for _ in range(2):
+            with self.assertRaises(
+                hooks.CodexCompactionCapabilityUnsupportedError
+            ) as raised:
+                await hook.async_pre_call_deployment_hook(
+                    self._third_party_structured_compaction_request(), "aresponses"
+                )
+            self.assertEqual(422, raised.exception.status_code)
+            self.assertEqual(
+                "upstream_compaction_unsupported", raised.exception.body["error"]["code"]
+            )
+            self.assertIn("summary fallback", str(raised.exception))
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(
+            "unsupported",
+            hooks._cached_codex_compaction_capability_status(
+                self._third_party_structured_compaction_request()
+            ),
+        )
+
+    async def test_compaction_capability_probe_does_not_cache_transient_failures(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hooks._CODEX_COMPACTION_CAPABILITIES.clear()
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise TimeoutError("probe timed out")
+
+        proxy_server.llm_router = FakeRouter()
+        status = await hooks._ensure_codex_compaction_capability(
+            self._third_party_structured_compaction_request()
+        )
+
+        self.assertEqual("unknown", status)
+        self.assertIsNone(
+            hooks._cached_codex_compaction_capability_status(
+                self._third_party_structured_compaction_request()
+            )
+        )
+
+    async def test_compaction_capability_probe_does_not_cache_auth_failures(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hooks._CODEX_COMPACTION_CAPABILITIES.clear()
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                error = RuntimeError("API key is invalid")
+                error.status_code = 401
+                raise error
+
+        proxy_server.llm_router = FakeRouter()
+        status = await hooks._ensure_codex_compaction_capability(
+            self._third_party_structured_compaction_request()
+        )
+
+        self.assertEqual("unknown", status)
+        self.assertIsNone(
+            hooks._cached_codex_compaction_capability_status(
+                self._third_party_structured_compaction_request()
+            )
+        )
+
+    async def test_compaction_capability_probe_is_shared_within_a_worker(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hooks._CODEX_COMPACTION_CAPABILITIES.clear()
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+        calls = []
+
+        async def supported_stream():
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "compaction",
+                            "encrypted_content": "opaque-probe-result",
+                        }
+                    ],
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                await asyncio.sleep(0.02)
+                return supported_stream()
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "deployment-cooldowns.json"
+            self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(state_path))
+            proxy_server.llm_router = FakeRouter()
+            statuses = await asyncio.gather(
+                *(
+                    hooks._ensure_codex_compaction_capability(
+                        self._third_party_structured_compaction_request()
+                    )
+                    for _ in range(8)
+                )
+            )
+
+            self.assertEqual(["supported"] * 8, statuses)
+            self.assertEqual(1, len(calls))
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                "supported",
+                next(iter(saved["codex_compaction_capabilities"].values()))["status"],
+            )
+
+    async def test_official_openai_compaction_skips_capability_probe(self) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        class UnexpectedRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("official OpenAI should not be capability-probed")
+
+        proxy_server.llm_router = UnexpectedRouter()
+        request = self._third_party_structured_compaction_request()
+        request["litellm_params"]["api_base"] = "https://api.openai.com/v1"
+
+        self.assertEqual(
+            "skipped", await hooks._ensure_codex_compaction_capability(request)
+        )
+
+    def test_compaction_capability_memory_defaults_to_thirty_minutes(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, None)
+        self.assertEqual(1800.0, hooks._codex_compaction_capability_ttl_seconds())
+        self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "0")
+        self.assertEqual(0.0, hooks._codex_compaction_capability_ttl_seconds())
 
 if __name__ == "__main__":
     unittest.main()

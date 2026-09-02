@@ -281,6 +281,88 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(300_000, model["context_window"])
         self.assertEqual(300_000, model["max_context_window"])
 
+    def test_glm53_uses_million_token_window_instead_of_unknown_default(self) -> None:
+        with mock.patch("litellm.model_cost", {}):
+            model = catalog_payload(["glm-5.3"])["models"][0]
+
+        self.assertEqual(1_000_000, model["context_window"])
+        self.assertEqual(1_000_000, model["max_context_window"])
+        self.assertEqual(95, model["effective_context_window_percent"])
+        self.assertEqual(950_000, model["context_window"] * model["effective_context_window_percent"] // 100)
+
+    def test_suffix_lookup_keeps_safest_window_when_provider_copies_differ(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "records": {
+                            "vendor-a/shared-agent": {
+                                "context_window": 1_000_000,
+                                "max_context_window": 1_000_000,
+                                "effective_context_window_percent": 95,
+                                "source": MODEL_CONTEXT_SOURCES[0],
+                                "priority": 40,
+                            },
+                            "vendor-b/x-ai/shared-agent": {
+                                "context_window": 1_048_576,
+                                "max_context_window": 1_048_576,
+                                "effective_context_window_percent": 95,
+                                "source": MODEL_CONTEXT_SOURCES[0],
+                                "priority": 40,
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            with mock.patch("litellm.model_cost", {}):
+                model = catalog_payload(["shared-agent"], registry=registry)["models"][0]
+
+        self.assertEqual(1_000_000, model["context_window"])
+        self.assertEqual(1_000_000, model["max_context_window"])
+        self.assertEqual(95, model["effective_context_window_percent"])
+
+    def test_pi_profile_overrides_lower_priority_bundled_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: kimi-k3\n"
+                "    litellm_params:\n"
+                "      model: anthropic/kimi-k3\n",
+                encoding="utf-8",
+            )
+            cache = root / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "records": {
+                            "moonshotai/kimi-k3": {
+                                "context_window": 1_048_576,
+                                "max_context_window": 1_048_576,
+                                "source": MODEL_CONTEXT_SOURCES[0],
+                                "priority": 40,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime,
+                cache_path=cache,
+                refresh_enabled=False,
+            )
+            with mock.patch("litellm.model_cost", {}):
+                model = catalog_payload(["kimi-k3"], registry=registry)["models"][0]
+
+        self.assertEqual(1_048_576, model["context_window"])
+        self.assertEqual(1_048_576, model["max_context_window"])
+        self.assertEqual(95, model["effective_context_window_percent"])
+
     def test_catalog_resolves_public_alias_from_runtime_route(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory) / "config.yaml"
@@ -313,8 +395,28 @@ class ModelCatalogTests(unittest.TestCase):
             registry = ModelContextRegistry(runtime_config_path=runtime, refresh_enabled=False)
             model = catalog_payload(["mixed-agent"], registry=registry)["models"][0]
 
-        self.assertEqual(272_000, model["context_window"])
-        self.assertEqual(272_000, model["max_context_window"])
+        self.assertEqual(1_000_000, model["context_window"])
+        self.assertEqual(1_000_000, model["max_context_window"])
+
+    def test_unresolved_openai_compatible_alias_does_not_poison_known_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: public-gemini\n"
+                "    litellm_params:\n"
+                "      model: openai/gateway-gemini-3.1-pro-preview\n"
+                "  - model_name: public-gemini\n"
+                "    litellm_params:\n"
+                "      model: openai/gemini-3.1-pro-preview\n",
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(runtime_config_path=runtime, refresh_enabled=False)
+            with mock.patch("litellm.model_cost", {}):
+                model = catalog_payload(["public-gemini"], registry=registry)["models"][0]
+
+        self.assertEqual(1_048_576, model["context_window"])
+        self.assertEqual(1_048_576, model["max_context_window"])
 
     def test_upstream_refresh_uses_pi_agent_policy_before_hard_limit_catalogs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

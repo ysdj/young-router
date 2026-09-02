@@ -216,6 +216,10 @@ def _catalog_model(
     # These are the route-specific fields owned by LiteLLM Menu. Everything
     # else remains native metadata whenever a native profile was available.
     model["priority"] = priority
+    # Keep the public catalog shape stable when a native profile is available
+    # as well as when the fallback profile is used.  A native executable may
+    # omit this optional capability field.
+    model.setdefault("supports_parallel_tool_calls", True)
     context = registry.record_for(name)
     # Codex displays the effective window and derives automatic compaction at
     # 90% when no explicit threshold is supplied.  Keeping the raw window,

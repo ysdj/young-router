@@ -78,6 +78,7 @@ const zh: Record<string, RuntimeCopy> = {
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES: { label: "冷却失败阈值", help: "同一部署 / 协议对连续失败多少次后临时跳过。该部署的其他已配置协议仍可使用。设为 0 可关闭冷却。" },
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS: { label: "冷却时长", help: "失败部署 / 协议对达到阈值后被跳过的时长。仅当所有已配置协议都在冷却时，才会排除该部署。设为 0 可关闭冷却。" },
   LITELLM_MENU_PROTOCOL_FALLBACK_TTL_SECONDS: { label: "备用协议记忆", help: "某部署的备用协议成功后，在此时长内，同一种客户端协议直接复用该备用协议，不再重试原协议。设为 0 可关闭记忆。" },
+  LITELLM_MENU_CODEX_COMPACTION_CAPABILITY_TTL_SECONDS: { label: "压缩能力记忆", help: "第三方 Responses 路由是否能返回加密 Codex 压缩结果的记忆时长。首次未验证的压缩会先发送不带历史的小探测；明确不支持时停止转发签名历史，并走 LiteLLM 模型选择所启用的 Codex 本地摘要检查点。设为 0 时每次压缩都重新探测。" },
   LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS: { label: "网页搜索不支持记忆", help: "某部署明确拒绝原生 web_search 后，在此时长内使用本机 pi-web-access 桥接，再到期重新探测原生搜索。瞬时网络、配额和提供方搜索失败不会写入该记忆；设为 0 可关闭跨请求记忆。" },
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED: { label: "普通请求写入冷却", help: "普通请求失败时是否向共享部署冷却池累计失败。所有请求类型仍会读取已有冷却状态。" },
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED: { label: "压缩请求写入冷却", help: "结构化 Codex 压缩失败时是否向共享部署冷却池累计失败。默认关闭，避免仅压缩时的上游失败让普通工作路由进入冷却。" },

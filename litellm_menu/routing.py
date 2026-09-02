@@ -22,6 +22,12 @@ from .base import (
     _ATTEMPTED_UPSTREAM_URL_SURFACES_KEY,
     _CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV,
+    _CODEX_COMPACTION_CAPABILITIES,
+    _CODEX_COMPACTION_CAPABILITY_DEFAULT_TTL_SECONDS,
+    _CODEX_COMPACTION_CAPABILITY_LOCK,
+    _CODEX_COMPACTION_CAPABILITY_PROBE_METADATA_KEY,
+    _CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV,
+    _CODEX_COMPACTION_CAPABILITY_UNSUPPORTED_ATTR,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID,
     _CURRENT_UPSTREAM_URL_SURFACE_KEY,
@@ -125,6 +131,7 @@ from .base import (
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
+    _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _WEB_SEARCH_EXTERNAL_STARTED_METADATA_KEY,
     _XHIGH_REASONING_EFFORT,
     asyncio,
@@ -1000,6 +1007,580 @@ def _deployment_cooldown_update_shared(callback: Any) -> Any:
         return _state_module._locked_json_state_update(path, update)
     except OSError:
         return None
+
+
+_CODEX_COMPACTION_CAPABILITY_PROBE_TIMEOUT_SECONDS = 15.0
+# A single shared lease prevents all sixteen proxy workers from discovering an
+# expired entry at once and sending the same probe concurrently.  It outlives
+# the request timeout by a small margin so a suspended worker cannot leave the
+# route unprotected forever.
+_CODEX_COMPACTION_CAPABILITY_PROBE_LEASE_SECONDS = 20.0
+_CODEX_COMPACTION_CAPABILITY_PROBE_WAIT_SECONDS = 0.05
+_CODEX_COMPACTION_CAPABILITY_STATUSES = frozenset({"supported", "unsupported"})
+_CODEX_COMPACTION_CAPABILITY_STATE_STATUSES = (
+    _CODEX_COMPACTION_CAPABILITY_STATUSES | {"probing"}
+)
+
+
+class CodexCompactionCapabilityUnsupportedError(RuntimeError):
+    """A route cannot satisfy the encrypted remote-compaction contract."""
+
+    code = "upstream_compaction_unsupported"
+
+    def __init__(
+        self,
+        *,
+        deployment_id: Optional[str],
+        route_key: Optional[str],
+    ) -> None:
+        message = (
+            "The selected upstream route does not support encrypted Responses "
+            "compaction. Codex should use its local context-checkpoint summary fallback."
+        )
+        super().__init__(message)
+        self.status_code = 422
+        self.failed_deployment_id = deployment_id
+        self.failed_deployment_route_key = route_key
+        self.body = {
+            "error": {
+                "type": "invalid_request_error",
+                "code": self.code,
+                "message": message,
+            }
+        }
+        setattr(self, _CODEX_COMPACTION_CAPABILITY_UNSUPPORTED_ATTR, True)
+
+
+def _is_codex_compaction_capability_unsupported_error(
+    exception: Any,
+) -> bool:
+    if not isinstance(exception, Exception):
+        return False
+    if getattr(exception, _CODEX_COMPACTION_CAPABILITY_UNSUPPORTED_ATTR, False) is True:
+        return True
+    body = getattr(exception, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and error.get("code") == "upstream_compaction_unsupported":
+            return True
+    text = _exception_text(exception).lower()
+    return "upstream_compaction_unsupported" in text
+
+
+def _codex_compaction_capability_ttl_seconds() -> float:
+    value = os.getenv(_CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "").strip()
+    if not value:
+        return _CODEX_COMPACTION_CAPABILITY_DEFAULT_TTL_SECONDS
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _CODEX_COMPACTION_CAPABILITY_DEFAULT_TTL_SECONDS
+    if not math.isfinite(parsed):
+        return _CODEX_COMPACTION_CAPABILITY_DEFAULT_TTL_SECONDS
+    return max(0.0, parsed)
+
+
+def _is_codex_compaction_capability_probe(
+    request_kwargs: Optional[dict],
+) -> bool:
+    for metadata_key in ("litellm_metadata", "metadata"):
+        metadata = _request_context_module._request_metadata_dict(
+            request_kwargs, metadata_key
+        )
+        if isinstance(metadata, dict) and metadata.get(
+            _CODEX_COMPACTION_CAPABILITY_PROBE_METADATA_KEY
+        ) is True:
+            return True
+    return False
+
+
+def _request_uses_third_party_codex_compaction_route(
+    request_kwargs: Optional[dict],
+) -> bool:
+    """Whether an encrypted compaction needs a one-time upstream probe.
+
+    The official OpenAI Responses origin already defines the encrypted
+    compaction protocol. Every other explicitly configured upstream origin is
+    capability-probed instead of trusting a provider/model label.
+    """
+
+    if (
+        not _responses_request_module._request_has_structured_codex_compaction(
+            request_kwargs
+        )
+        or _is_codex_compaction_capability_probe(request_kwargs)
+    ):
+        return False
+    host = _responses_request_module._api_base_host(
+        _responses_request_module._request_api_base(request_kwargs)
+    )
+    if host:
+        return host != "api.openai.com"
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    provider = model_info.get("provider") or (request_kwargs or {}).get(
+        "custom_llm_provider"
+    )
+    return isinstance(provider, str) and provider.strip().lower() not in {
+        "",
+        "openai",
+        "chatgpt",
+    }
+
+
+def _codex_compaction_capability_cache_key(
+    request_kwargs: Optional[dict],
+) -> Optional[str]:
+    deployment_key = _deployment_cooldown_key_from_request(request_kwargs)
+    return f"{deployment_key}|surface:openai/responses" if deployment_key else None
+
+
+def _codex_compaction_capability_state_map(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    payload.setdefault("schema_version", 1)
+    states = payload.setdefault("codex_compaction_capabilities", {})
+    if not isinstance(states, dict):
+        states = {}
+        payload["codex_compaction_capabilities"] = states
+    return states
+
+
+def _clean_codex_compaction_capability_state(
+    state: Any,
+    *,
+    now: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(state, dict):
+        return None
+    status = state.get("status")
+    if status not in _CODEX_COMPACTION_CAPABILITY_STATE_STATUSES:
+        return None
+    try:
+        expires_at = float(state.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(expires_at)
+        or expires_at <= 0
+        or (now is not None and expires_at <= now)
+    ):
+        return None
+    cleaned = dict(state)
+    cleaned["status"] = status
+    cleaned["expires_at"] = expires_at
+    try:
+        detected_at = float(cleaned.get("detected_at") or 0.0)
+        cleaned["detected_at"] = detected_at if math.isfinite(detected_at) else 0.0
+    except (TypeError, ValueError):
+        cleaned["detected_at"] = 0.0
+    return cleaned
+
+
+def _sync_codex_compaction_capabilities_from_shared_locked(
+    states: dict[str, Any],
+    now: float,
+) -> None:
+    shared: dict[str, dict[str, Any]] = {}
+    for cache_key, state in list(states.items()):
+        cleaned = _clean_codex_compaction_capability_state(state, now=now)
+        if cleaned is None:
+            states.pop(cache_key, None)
+            continue
+        shared[cache_key] = cleaned
+        if cleaned is not state:
+            states[cache_key] = cleaned
+    with _CODEX_COMPACTION_CAPABILITY_LOCK:
+        _CODEX_COMPACTION_CAPABILITIES.clear()
+        _CODEX_COMPACTION_CAPABILITIES.update(
+            {key: value.copy() for key, value in shared.items()}
+        )
+
+
+def _codex_compaction_capability_update_shared(callback: Any) -> Any:
+    path = _deployment_cooldown_file_path()
+    if not path:
+        return None
+
+    def update(payload: dict[str, Any]) -> Any:
+        now = time.time()
+        states = _codex_compaction_capability_state_map(payload)
+        _sync_codex_compaction_capabilities_from_shared_locked(states, now)
+        result = callback(states, now)
+        _sync_codex_compaction_capabilities_from_shared_locked(states, now)
+        return result, now
+
+    try:
+        return _state_module._locked_json_state_update(path, update)
+    except OSError:
+        return None
+
+
+def _cached_codex_compaction_capability_status(
+    request_kwargs: Optional[dict],
+) -> Optional[str]:
+    ttl = _codex_compaction_capability_ttl_seconds()
+    cache_key = _codex_compaction_capability_cache_key(request_kwargs)
+    if ttl <= 0 or not cache_key:
+        return None
+
+    def read(states: dict[str, Any], now: float) -> Optional[str]:
+        state = _clean_codex_compaction_capability_state(
+            states.get(cache_key), now=now
+        )
+        return str(state.get("status")) if state is not None else None
+
+    result = _codex_compaction_capability_update_shared(read)
+    if isinstance(result, tuple) and result[0] in _CODEX_COMPACTION_CAPABILITY_STATUSES:
+        return result[0]
+    with _CODEX_COMPACTION_CAPABILITY_LOCK:
+        state = _clean_codex_compaction_capability_state(
+            _CODEX_COMPACTION_CAPABILITIES.get(cache_key), now=time.time()
+        )
+    return (
+        str(state.get("status"))
+        if state is not None
+        and state.get("status") in _CODEX_COMPACTION_CAPABILITY_STATUSES
+        else None
+    )
+
+
+def _codex_compaction_capability_claim_probe(
+    request_kwargs: Optional[dict],
+) -> tuple[str, Optional[str]]:
+    """Atomically claim a tiny probe, or report a final/shared in-flight state.
+
+    The JSON state file is already locked across proxy workers for deployment
+    cooldowns, so use the same critical section rather than adding a second
+    process-local asyncio lock that would duplicate probes under uvicorn
+    workers.
+    """
+
+    ttl = _codex_compaction_capability_ttl_seconds()
+    cache_key = _codex_compaction_capability_cache_key(request_kwargs)
+    if ttl <= 0 or not cache_key:
+        return "probe", None
+    deployment_id = _deployment_id_from_request(request_kwargs)
+    route_key = _deployment_route_key_from_request(request_kwargs)
+    lease_id = f"{os.getpid()}:{time.time_ns()}"
+
+    def claim(states: dict[str, Any], now: float) -> tuple[str, Optional[str]]:
+        state = _clean_codex_compaction_capability_state(
+            states.get(cache_key), now=now
+        )
+        if state is not None:
+            status = str(state.get("status"))
+            if status in _CODEX_COMPACTION_CAPABILITY_STATUSES:
+                return "cached", status
+            if status == "probing":
+                return "waiting", None
+        states[cache_key] = {
+            "status": "probing",
+            "lease_id": lease_id,
+            "deployment_id": deployment_id,
+            "route_key": route_key,
+            "detected_at": now,
+            "expires_at": now + _CODEX_COMPACTION_CAPABILITY_PROBE_LEASE_SECONDS,
+        }
+        return "probe", lease_id
+
+    result = _codex_compaction_capability_update_shared(claim)
+    if (
+        isinstance(result, tuple)
+        and isinstance(result[0], tuple)
+        and len(result[0]) == 2
+        and result[0][0] in {"cached", "waiting", "probe"}
+    ):
+        return result[0]
+
+    # The Core test harness and unusual read-only runtime roots have no shared
+    # file. Keep the same lease semantics per process in that case.
+    now = time.time()
+    with _CODEX_COMPACTION_CAPABILITY_LOCK:
+        state = _clean_codex_compaction_capability_state(
+            _CODEX_COMPACTION_CAPABILITIES.get(cache_key), now=now
+        )
+        if state is not None:
+            status = str(state.get("status"))
+            if status in _CODEX_COMPACTION_CAPABILITY_STATUSES:
+                return "cached", status
+            if status == "probing":
+                return "waiting", None
+        _CODEX_COMPACTION_CAPABILITIES[cache_key] = {
+            "status": "probing",
+            "lease_id": lease_id,
+            "deployment_id": deployment_id,
+            "route_key": route_key,
+            "detected_at": now,
+            "expires_at": now + _CODEX_COMPACTION_CAPABILITY_PROBE_LEASE_SECONDS,
+        }
+    return "probe", lease_id
+
+
+def _record_codex_compaction_capability(
+    request_kwargs: Optional[dict],
+    status: str,
+    *,
+    lease_id: Optional[str] = None,
+) -> None:
+    if status not in _CODEX_COMPACTION_CAPABILITY_STATUSES:
+        return
+    cache_key = _codex_compaction_capability_cache_key(request_kwargs)
+    ttl = _codex_compaction_capability_ttl_seconds()
+    if not cache_key or ttl <= 0:
+        return
+    deployment_id = _deployment_id_from_request(request_kwargs)
+    route_key = _deployment_route_key_from_request(request_kwargs)
+    now = time.time()
+    expires_at = now + ttl
+
+    def record(states: dict[str, Any], _now: float) -> bool:
+        active = _clean_codex_compaction_capability_state(
+            states.get(cache_key), now=_now
+        )
+        if lease_id is not None and (
+            active is None
+            or active.get("status") != "probing"
+            or active.get("lease_id") != lease_id
+        ):
+            return False
+        states[cache_key] = {
+            "status": status,
+            "deployment_id": deployment_id,
+            "route_key": route_key,
+            "detected_at": now,
+            "expires_at": expires_at,
+        }
+        return True
+
+    result = _codex_compaction_capability_update_shared(record)
+    recorded = bool(isinstance(result, tuple) and result[0] is True)
+    if result is None:
+        with _CODEX_COMPACTION_CAPABILITY_LOCK:
+            active = _clean_codex_compaction_capability_state(
+                _CODEX_COMPACTION_CAPABILITIES.get(cache_key), now=now
+            )
+            if lease_id is not None and (
+                active is None
+                or active.get("status") != "probing"
+                or active.get("lease_id") != lease_id
+            ):
+                return
+            _CODEX_COMPACTION_CAPABILITIES[cache_key] = {
+                "status": status,
+                "deployment_id": deployment_id,
+                "route_key": route_key,
+                "detected_at": now,
+                "expires_at": expires_at,
+            }
+            recorded = True
+    if not recorded:
+        return
+    _trace_module._route_trace(
+        "codex_compaction_capability_recorded",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=deployment_id,
+        route_key=route_key,
+        status=status,
+        ttl_seconds=ttl,
+        expires_at=expires_at,
+    )
+
+
+def _release_codex_compaction_capability_probe(
+    request_kwargs: Optional[dict],
+    lease_id: Optional[str],
+) -> None:
+    if not lease_id:
+        return
+    cache_key = _codex_compaction_capability_cache_key(request_kwargs)
+    if not cache_key:
+        return
+
+    def release(states: dict[str, Any], now: float) -> None:
+        active = _clean_codex_compaction_capability_state(
+            states.get(cache_key), now=now
+        )
+        if (
+            active is not None
+            and active.get("status") == "probing"
+            and active.get("lease_id") == lease_id
+        ):
+            states.pop(cache_key, None)
+
+    result = _codex_compaction_capability_update_shared(release)
+    if result is not None:
+        return
+    with _CODEX_COMPACTION_CAPABILITY_LOCK:
+        active = _clean_codex_compaction_capability_state(
+            _CODEX_COMPACTION_CAPABILITIES.get(cache_key), now=time.time()
+        )
+        if (
+            active is not None
+            and active.get("status") == "probing"
+            and active.get("lease_id") == lease_id
+        ):
+            _CODEX_COMPACTION_CAPABILITIES.pop(cache_key, None)
+
+
+def _codex_compaction_probe_payload(request_kwargs: dict) -> Optional[dict]:
+    model = _request_public_model(request_kwargs)
+    if not isinstance(model, str) or not model.strip():
+        return None
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": [
+            {
+                "type": "compaction_trigger",
+                "id": "litellm-menu-compaction-capability-probe",
+            }
+        ],
+        "stream": True,
+        "tools": [],
+        "client_metadata": {
+            "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+        },
+        "litellm_metadata": {
+            _CODEX_COMPACTION_CAPABILITY_PROBE_METADATA_KEY: True,
+        },
+    }
+    deployment_id = _deployment_id_from_request(request_kwargs)
+    if deployment_id:
+        payload[_VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY] = [deployment_id]
+    target_order = _deployment_order_from_request(request_kwargs)
+    if target_order is not None:
+        payload["_target_order"] = target_order
+    return payload
+
+
+def _codex_compaction_probe_failure_status(value: Any) -> str:
+    if isinstance(value, Exception):
+        status_code = _exception_status_code(value)
+        if status_code in {404, 405, 415, 422}:
+            return "unsupported"
+        text = _exception_text(value).lower()
+    else:
+        payload = _streaming_module._stream_chunk_dump(value)
+        response = payload.get("response") if isinstance(payload, dict) else None
+        error = response.get("error") if isinstance(response, dict) else None
+        if not isinstance(error, dict):
+            return "unknown"
+        status_code = error.get("status_code")
+        if status_code in {404, 405, 415, 422}:
+            return "unsupported"
+        text = " ".join(
+            str(error.get(key) or "") for key in ("code", "type", "message")
+        ).lower()
+    return (
+        "unsupported"
+        if any(
+            marker in text
+            for marker in (
+                "compaction",
+                "unsupported",
+                "not support",
+                "invalid input",
+                "invalid request",
+                "unknown field",
+            )
+        )
+        else "unknown"
+    )
+
+
+async def _probe_codex_compaction_capability(request_kwargs: dict) -> str:
+    payload = _codex_compaction_probe_payload(request_kwargs)
+    if payload is None:
+        return "unknown"
+    try:
+        from litellm.proxy.proxy_server import llm_router
+
+        if llm_router is None or not hasattr(llm_router, "aresponses"):
+            return "unknown"
+
+        async def consume() -> str:
+            response = await llm_router.aresponses(**payload)
+            if not hasattr(response, "__aiter__"):
+                response_payload = _streaming_module._stream_chunk_dump(response)
+                output = response_payload.get("output") if isinstance(response_payload, dict) else None
+                return (
+                    "supported"
+                    if _streaming_module._codex_compaction_output_is_valid(output)
+                    else "unsupported"
+                )
+            async for chunk in response:
+                dumped = _streaming_module._stream_chunk_dump(chunk)
+                if not isinstance(dumped, dict):
+                    continue
+                event_type = dumped.get("type")
+                if event_type == "response.failed":
+                    return _codex_compaction_probe_failure_status(chunk)
+                if event_type != "response.completed":
+                    continue
+                completed = dumped.get("response")
+                output = completed.get("output") if isinstance(completed, dict) else None
+                return (
+                    "supported"
+                    if _streaming_module._codex_compaction_output_is_valid(output)
+                    else "unsupported"
+                )
+            return "unknown"
+
+        return await asyncio.wait_for(
+            consume(), timeout=_CODEX_COMPACTION_CAPABILITY_PROBE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        return "unknown"
+    except Exception as exc:
+        return _codex_compaction_probe_failure_status(exc)
+
+
+async def _ensure_codex_compaction_capability(request_kwargs: Optional[dict]) -> str:
+    """Probe an unverified third-party route before sending signed history.
+
+    A cached unsupported result raises before the full encrypted history is
+    forwarded. A LiteLLM model selection enables Codex's native checkpoint
+    summary path; the proxy never forges or rewrites encrypted compaction
+    items.
+    """
+
+    if not _request_uses_third_party_codex_compaction_route(request_kwargs):
+        return "skipped"
+    if not isinstance(request_kwargs, dict):
+        return "skipped"
+    while True:
+        action, value = _codex_compaction_capability_claim_probe(request_kwargs)
+        if action == "cached":
+            status = value or "unknown"
+            _trace_module._route_trace(
+                "codex_compaction_capability_cache_hit",
+                request_id=_trace_request_id(request_kwargs),
+                session=_trace_session_context(request_kwargs),
+                model_group=_responses_execution_module._request_model_group(request_kwargs),
+                deployment_id=_deployment_id_from_request(request_kwargs),
+                route_key=_deployment_route_key_from_request(request_kwargs),
+                status=status,
+            )
+            break
+        if action == "waiting":
+            await asyncio.sleep(_CODEX_COMPACTION_CAPABILITY_PROBE_WAIT_SECONDS)
+            continue
+        lease_id = value
+        status = await _probe_codex_compaction_capability(request_kwargs)
+        if status in _CODEX_COMPACTION_CAPABILITY_STATUSES:
+            _record_codex_compaction_capability(
+                request_kwargs, status, lease_id=lease_id
+            )
+        else:
+            _release_codex_compaction_capability_probe(request_kwargs, lease_id)
+        break
+    if status == "unsupported":
+        raise CodexCompactionCapabilityUnsupportedError(
+            deployment_id=_deployment_id_from_request(request_kwargs),
+            route_key=_deployment_route_key_from_request(request_kwargs),
+        )
+    return status
 
 
 def _image_generation_tool_unsupported_ttl_seconds() -> float:
@@ -2307,9 +2888,15 @@ def _request_log_record(
     else:
         routing_state = "unselected"
     tools_summary = _trace_module._trace_tools_summary(request_kwargs)
+    request_started_at = _request_started_time(request_kwargs)
+    request_timestamp = (
+        _event_time(end_time)
+        or _event_time(start_time)
+        or _event_time(request_started_at)
+    )
 
     record: dict[str, Any] = {
-        "ts": _event_time(end_time)
+        "ts": request_timestamp
         or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "status": status,
         "duration_ms": _duration_ms(start_time, end_time),
@@ -2356,6 +2943,10 @@ def _request_log_record(
 
     if status in {"failure", "stuck"}:
         record["error"] = _request_log_error_summary(request_kwargs, response_obj)
+    if status == "pending":
+        started_at = _event_time(request_started_at or start_time)
+        if started_at:
+            record["started_at"] = started_at
     if status == "stuck":
         stuck: dict[str, Any] = {}
         reason = _state_module._safe_log_text(request_kwargs.get("stuck_reason"), limit=120)
@@ -2804,6 +3395,15 @@ def _request_surface_for_deployment(
     request_kwargs: Optional[dict],
     deployment: Any,
 ) -> str:
+    if _responses_request_module._request_has_structured_codex_compaction(
+        request_kwargs
+    ):
+        # Remote Codex compaction is a Responses protocol operation: the
+        # only acceptable terminal payload is an encrypted ``compaction``
+        # item. A Chat or Anthropic adapter can produce an ordinary answer,
+        # but it cannot satisfy that contract. Ignore fixed/stale fallback
+        # surface state and probe the route's Responses endpoint instead.
+        return _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
     if _deployment_protocol_mode(deployment) == _UPSTREAM_PROTOCOL_MODE_FIXED:
         return _deployment_surface(deployment)
     deployment_id = _responses_request_module._deployment_id(deployment)
@@ -2926,6 +3526,17 @@ def _next_upstream_surface_for_failed_deployment(
         return None
     fallback_surface = _deployment_surface(deployment)
     if not fallback_surface:
+        return None
+    if (
+        _responses_request_module._request_has_structured_codex_compaction(
+            request_kwargs
+        )
+        and fallback_surface != _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+    ):
+        # A structured compaction cannot be downgraded to the configured Chat
+        # or Anthropic surface. Let normal ordered failover select another
+        # deployment instead of accepting an ordinary assistant response as a
+        # false compaction success.
         return None
     attempted = _request_attempted_upstream_surfaces(request_kwargs)
     current_surface = _request_current_upstream_surface(request_kwargs)
@@ -3962,7 +4573,7 @@ def _is_request_scoped_priority_deployment_failover_error(
     request_kwargs: Optional[dict],
 ) -> bool:
     """Allow only the known compaction storage rejection to advance routes."""
-    return _is_priority_deployment_failover_error(
+    return _is_codex_compaction_capability_unsupported_error(exception) or _is_priority_deployment_failover_error(
         exception
     ) or _is_structured_codex_compaction_body_capacity_error(
         exception,
@@ -4383,6 +4994,8 @@ def _sync_failed_deployment_exclusions(
 
 
 def _is_priority_deployment_failover_error(exception: Exception) -> bool:
+    if _is_codex_compaction_capability_unsupported_error(exception):
+        return True
     if _is_context_size_error(exception):
         return False
     if _is_terminal_prompt_or_policy_error(exception):

@@ -1838,17 +1838,189 @@ def _with_codex_function_call_output_text(request_kwargs: dict) -> Optional[dict
     return modified_kwargs
 
 
-def _codex_repaired_function_arguments(value: Any) -> Optional[str]:
-    if not isinstance(value, str) or not value.startswith("{}"):
+def _codex_unwrap_function_arguments(value: str) -> str:
+    text = value.strip()
+    if not text.startswith("```") or not text.endswith("```"):
+        return text
+    lines = text.splitlines()
+    if len(lines) < 2 or lines[-1].strip() != "```":
+        return text
+    body = lines[1:-1]
+    if body and body[0].strip().lower() in {"json", "javascript", "js"}:
+        body = body[1:]
+    return "\n".join(body).strip()
+
+
+def _codex_remove_trailing_commas(value: str) -> str:
+    output: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote is not None:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"\"", "'"}:
+            quote = character
+            output.append(character)
+            index += 1
+            continue
+        if character == ",":
+            lookahead = index + 1
+            while lookahead < len(value) and value[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(value) and value[lookahead] in {"]", "}"}:
+                output.extend(value[index + 1 : lookahead])
+                index = lookahead
+                continue
+        output.append(character)
+        index += 1
+    return "".join(output)
+
+
+def _codex_quote_unquoted_function_keys(value: str) -> str:
+    output: list[str] = []
+    containers: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote is not None:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {"\"", "'"}:
+            quote = character
+            output.append(character)
+            index += 1
+            continue
+        if character == "{":
+            containers.append("object")
+            output.append(character)
+            index += 1
+            continue
+        if character == "[":
+            containers.append("array")
+            output.append(character)
+            index += 1
+            continue
+        if character in {"}", "]"}:
+            if containers:
+                containers.pop()
+            output.append(character)
+            index += 1
+            continue
+        if containers and containers[-1] == "object":
+            previous = "".join(output).rstrip()[-1:] or ""
+            if previous in {"{", ","}:
+                match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", value[index:])
+                if match is not None:
+                    end = index + len(match.group(0))
+                    lookahead = end
+                    while lookahead < len(value) and value[lookahead].isspace():
+                        lookahead += 1
+                    if lookahead < len(value) and value[lookahead] == ":":
+                        output.append(json.dumps(match.group(0), ensure_ascii=False))
+                        index = end
+                        continue
+        output.append(character)
+        index += 1
+    return "".join(output)
+
+
+def _codex_function_arguments_object(value: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(value, str):
         return None
-    suffix = value[2:].lstrip()
-    if not suffix:
+    text = _codex_unwrap_function_arguments(value)
+    if not text:
+        return {}
+
+    candidates: list[str] = []
+
+    def add_candidate(candidate: str) -> None:
+        candidate = candidate.strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    add_candidate(text)
+    without_placeholders = text
+    while without_placeholders.startswith("{}"):
+        without_placeholders = without_placeholders[2:].lstrip()
+        add_candidate(without_placeholders)
+
+    for candidate in candidates:
+        transformed = _codex_quote_unquoted_function_keys(candidate)
+        variants = (
+            candidate,
+            _codex_remove_trailing_commas(candidate),
+            transformed,
+            _codex_remove_trailing_commas(transformed),
+        )
+        import ast
+
+        for variant in variants:
+            try:
+                parsed = json.loads(variant)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+            try:
+                parsed = ast.literal_eval(variant)
+            except (SyntaxError, TypeError, ValueError, MemoryError, RecursionError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
+def _codex_normalized_function_arguments(
+    value: Any,
+    *,
+    empty_is_object: bool = False,
+) -> tuple[Optional[str], bool]:
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")), True
+    if not isinstance(value, str):
+        if empty_is_object and value is None:
+            return "{}", True
+        return None, False
+    if not value.strip():
+        return ("{}", True) if empty_is_object else (None, False)
+    parsed = _codex_function_arguments_object(value)
+    if parsed is None:
+        return None, False
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":")), True
+
+
+def _codex_repaired_function_arguments(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized, valid = _codex_normalized_function_arguments(value)
+    if not valid or normalized is None:
         return None
     try:
-        parsed = json.loads(suffix)
+        original = json.loads(value)
     except (TypeError, ValueError):
+        original = None
+    if isinstance(original, dict):
         return None
-    return suffix if isinstance(parsed, dict) else None
+    return normalized
 
 
 def _with_codex_function_call_arguments_repaired(
