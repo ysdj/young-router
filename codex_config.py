@@ -1550,15 +1550,43 @@ def apply_structured_patch(
     if selection is not None:
         selected = _selected_litellm_model(selection, runtime_config_path)
         runtime_config = load_yaml(runtime_config_path)
+        current_config = parse_toml_text(result)
+        configured_provider = current_config.get("model_provider")
+        provider_id = configured_provider.strip() if isinstance(configured_provider, str) else ""
+        if not provider_id or (
+            provider_id != "openai"
+            and _find_table_section(result, ("model_providers", provider_id)) is None
+        ):
+            provider_id = "openai"
         result = _set_top_level_values(
             result,
             {
-                "model_provider": "openai",
+                "model_provider": provider_id,
                 "model": selected["model"],
-                "openai_base_url": local_base_url(),
                 "cli_auth_credentials_store": "file",
             },
         )
+        if provider_id == "openai":
+            result = _set_top_level_values(
+                result,
+                {"openai_base_url": local_base_url()},
+            )
+        else:
+            # Keep the selected custom provider identity.  The local endpoint
+            # handles both Responses and Codex's relative /alpha/search call;
+            # the proxy chooses the configured upstream deployment afterward.
+            result = _patch_optional_string(
+                result,
+                ("model_providers", provider_id),
+                "base_url",
+                local_base_url(),
+            )
+        # Third-party Responses gateways do not universally implement remote
+        # encrypted compaction. Enable Codex's native token-budget fallback
+        # whenever the user explicitly selects a LiteLLM Menu model, so the
+        # proxy can fail fast after its capability probe and Codex can create
+        # a local checkpoint summary without fabricating encrypted history.
+        result = set_table_value(result, ("features",), "token_budget", True)
         updated_auth, auth_changed = _set_auth_api_key(updated_auth, local_api_key(runtime_config))
 
     # Provider rows must exist before an atomic provider switch/rename updates

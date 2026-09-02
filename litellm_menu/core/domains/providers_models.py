@@ -1232,6 +1232,20 @@ class ProvidersModelsDomain:
         raise DomainError("The selected provider is unavailable")
 
     @staticmethod
+    def _provider_name_exists(
+        providers: list[Any], name: object, *, exclude_index: int | None = None
+    ) -> bool:
+        normalized = str(name or "").strip().casefold()
+        if not normalized:
+            return False
+        return any(
+            index != exclude_index
+            and isinstance(candidate, Mapping)
+            and str(candidate.get("name", "")).strip().casefold() == normalized
+            for index, candidate in enumerate(providers)
+        )
+
+    @staticmethod
     def _changes(data: Mapping[str, Any], key: str) -> dict[str, Any]:
         value = data.get("changes", data.get("patch"))
         if value is None:
@@ -1848,11 +1862,8 @@ class ProvidersModelsDomain:
         providers = self._draft["providers"]
         provider_index = self._provider_index(data)
         provider = self._copy_provider_for_edit(providers[provider_index])
-        if any(
-            index != provider_index
-            and isinstance(candidate, Mapping)
-            and str(candidate.get("name", "")).strip() == station_name
-            for index, candidate in enumerate(providers)
+        if self._provider_name_exists(
+            providers, station_name, exclude_index=provider_index
         ):
             raise DomainError("A provider with this name already exists")
         provider["name"] = station_name
@@ -2169,6 +2180,8 @@ class ProvidersModelsDomain:
             if source["kind"] != "custom":
                 raise DomainError("Select a relay station to create a relay provider")
             self._set_provider_source(provider, {"kind": "custom"})
+            if self._provider_name_exists(providers, provider.get("name")):
+                raise DomainError("A provider with this name already exists")
             auth = self._configure_provider_auth(provider, requested_auth_kind)
             self._apply_auth_to_models(provider, auth["kind"])
             providers.append(provider)
@@ -2228,6 +2241,10 @@ class ProvidersModelsDomain:
                     keys = []
                 provider["api_keys"] = keys
                 provider["api_key"] = api_key
+            if "name" in changes and self._provider_name_exists(
+                providers, changes["name"], exclude_index=index
+            ):
+                raise DomainError("A provider with this name already exists")
             provider.update(changes)
             if auth_requested and requested_auth_kind != current_auth["kind"]:
                 if current_auth["kind"] != "api_key":

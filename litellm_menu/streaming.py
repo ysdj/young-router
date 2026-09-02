@@ -412,6 +412,42 @@ def _normalize_sse_response_completed_chunk(
     )
 
 
+def _function_call_arguments_valid(value: Any) -> bool:
+    normalized, valid = _responses_request_module._codex_normalized_function_arguments(
+        value,
+        empty_is_object=True,
+    )
+    return bool(valid and isinstance(normalized, str))
+
+
+def _payload_invalid_function_call_reason(payload: Any) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    event_type = payload.get("type")
+    if event_type == "response.function_call_arguments.done":
+        if not _function_call_arguments_valid(payload.get("arguments")):
+            return "function call arguments are not a valid JSON object"
+        return None
+    if event_type == "response.output_item.done":
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            if not _function_call_arguments_valid(item.get("arguments")):
+                return "function call arguments are not a valid JSON object"
+        return None
+    if _responses_stream_chunk_is_completed(payload):
+        response = payload.get("response")
+        output = response.get("output") if isinstance(response, dict) else None
+        if isinstance(output, list):
+            for item in output:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "function_call"
+                    and not _function_call_arguments_valid(item.get("arguments"))
+                ):
+                    return "function call arguments are not a valid JSON object"
+    return None
+
+
 def _responses_stream_chunk_for_delivery(
     chunk: Any,
     request_data: Optional[dict] = None,
@@ -419,6 +455,12 @@ def _responses_stream_chunk_for_delivery(
     input_token_upper_bound = _codex_request_input_token_upper_bound(request_data)
     if isinstance(chunk, _JSONStreamEvent):
         _normalize_response_function_call_arguments(chunk)
+        invalid_reason = _payload_invalid_function_call_reason(chunk)
+        if invalid_reason is not None:
+            return _synthesized_failed_response_event(
+                request_data or {},
+                RuntimeError(invalid_reason),
+            )
         _image_generation_module._normalize_image_generation_result_status(chunk)
         _normalize_response_completed_event_usage(
             chunk,
@@ -426,17 +468,42 @@ def _responses_stream_chunk_for_delivery(
         )
         return chunk
     if isinstance(chunk, (str, bytes)):
-        return _normalize_sse_response_completed_chunk(
+        normalized = _normalize_sse_response_completed_chunk(
             chunk,
             input_token_upper_bound=input_token_upper_bound,
         )
+        if _request_is_responses_stream(request_data):
+            text = (
+                normalized.decode("utf-8", errors="replace")
+                if isinstance(normalized, bytes)
+                else normalized
+            )
+            stripped = text.strip()
+            if stripped.startswith(":") and not stripped.startswith("data:"):
+                return _json_stream_event(
+                    {
+                        "type": "response.metadata",
+                        "metadata": {"phase": "comment"},
+                    }
+                )
+        return normalized
     dumped = _stream_chunk_dump(chunk)
     chunk_type = _stream_chunk_type(dumped)
-    if not chunk_type.startswith("response.") and chunk_type != "error":
+    if (
+        not chunk_type.startswith("response.")
+        and chunk_type != "error"
+        and not _request_is_responses_stream(request_data)
+    ):
         return chunk
     json_chunk = _jsonable(chunk)
     if isinstance(json_chunk, dict):
         _normalize_response_function_call_arguments(json_chunk)
+        invalid_reason = _payload_invalid_function_call_reason(json_chunk)
+        if invalid_reason is not None:
+            return _synthesized_failed_response_event(
+                request_data or {},
+                RuntimeError(invalid_reason),
+            )
         _image_generation_module._normalize_image_generation_result_status(json_chunk)
         _normalize_response_completed_event_usage(
             json_chunk,
@@ -460,31 +527,41 @@ def _normalize_response_function_call_added_arguments(payload: Any) -> None:
 
 
 def _normalize_response_function_call_arguments(payload: Any) -> None:
-    """Repair malformed function-call arguments on every Responses event."""
+    """Normalize function-call arguments before a Responses event is delivered."""
 
     if not isinstance(payload, dict):
         return
     _normalize_response_function_call_added_arguments(payload)
 
+    def normalize_item(item: Any) -> Any:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            return item
+        normalized, valid = _responses_request_module._codex_normalized_function_arguments(
+            item.get("arguments"),
+            empty_is_object=True,
+        )
+        if not valid or normalized is None:
+            return item
+        if item.get("arguments") == normalized:
+            return item
+        normalized_item = item.copy()
+        normalized_item["arguments"] = normalized
+        return normalized_item
+
     event_type = payload.get("type")
     if event_type == "response.output_item.done":
-        item = payload.get("item")
-        if isinstance(item, dict) and item.get("type") == "function_call":
-            repaired = _responses_request_module._codex_repaired_function_arguments(
-                item.get("arguments")
-            )
-            if repaired is not None:
-                normalized_item = item.copy()
-                normalized_item["arguments"] = repaired
-                payload["item"] = normalized_item
+        item = normalize_item(payload.get("item"))
+        if item is not payload.get("item"):
+            payload["item"] = item
         return
 
     if event_type == "response.function_call_arguments.done":
-        repaired = _responses_request_module._codex_repaired_function_arguments(
-            payload.get("arguments")
+        normalized, valid = _responses_request_module._codex_normalized_function_arguments(
+            payload.get("arguments"),
+            empty_is_object=True,
         )
-        if repaired is not None:
-            payload["arguments"] = repaired
+        if valid and normalized is not None:
+            payload["arguments"] = normalized
         return
 
     if event_type != "response.completed":
@@ -495,23 +572,8 @@ def _normalize_response_function_call_arguments(payload: Any) -> None:
     output = response.get("output")
     if not isinstance(output, list):
         return
-    normalized_output = []
-    changed = False
-    for item in output:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
-            normalized_output.append(item)
-            continue
-        repaired = _responses_request_module._codex_repaired_function_arguments(
-            item.get("arguments")
-        )
-        if repaired is None:
-            normalized_output.append(item)
-            continue
-        normalized_item = item.copy()
-        normalized_item["arguments"] = repaired
-        normalized_output.append(normalized_item)
-        changed = True
-    if changed:
+    normalized_output = [normalize_item(item) for item in output]
+    if normalized_output != output:
         normalized_response = response.copy()
         normalized_response["output"] = normalized_output
         payload["response"] = normalized_response
@@ -655,7 +717,10 @@ def _is_structured_codex_compaction_failure_chunk(chunk: Any) -> bool:
     response = dumped.get("response")
     response = response if isinstance(response, dict) else {}
     error = response.get("error")
-    return isinstance(error, dict) and error.get("code") == "upstream_compaction_failure"
+    return isinstance(error, dict) and error.get("code") in {
+        "upstream_compaction_failure",
+        "upstream_compaction_unsupported",
+    }
 
 
 def _stream_chunk_dump(chunk: Any) -> dict[str, Any]:
@@ -1255,16 +1320,24 @@ def _synthesized_failed_response_event(
     if is_structured_compaction:
         status_code = _routing_module._exception_status_code(exception)
         status_suffix = f" (HTTP {status_code})" if status_code is not None else ""
-        message = (
-            "The upstream model route failed the structured context compaction "
-            f"request{status_suffix}."
-        )
-        error_type = (
-            "invalid_request_error"
-            if _routing_module._is_terminal_responses_stream_failure_error(exception)
-            else "server_error"
-        )
-        error_code = "upstream_compaction_failure"
+        if _routing_module._is_codex_compaction_capability_unsupported_error(exception):
+            message = str(exception) or (
+                "The selected upstream route does not support encrypted Responses "
+                "compaction. Codex should use its local context-checkpoint summary fallback."
+            )
+            error_type = "invalid_request_error"
+            error_code = "upstream_compaction_unsupported"
+        else:
+            message = (
+                "The upstream model route failed the structured context compaction "
+                f"request{status_suffix}."
+            )
+            error_type = (
+                "invalid_request_error"
+                if _routing_module._is_terminal_responses_stream_failure_error(exception)
+                else "server_error"
+            )
+            error_code = "upstream_compaction_failure"
     elif _routing_module._is_image_generation_all_deployments_unsupported_error(
         exception
     ):
@@ -1900,13 +1973,23 @@ def _should_emit_codex_responses_initial_sse_keepalive(
     )
 
 
-def _codex_responses_initial_sse_keepalive() -> str:
-    return _sse_comment_event(
-        "litellm_menu initial_wait phase=awaiting_upstream_first_event"
+def _codex_responses_initial_sse_keepalive() -> _JSONStreamEvent:
+    # Responses clients parse every ``data:`` payload as JSON.  A bare SSE
+    # comment yielded by the hook would be re-framed by the proxy as a data
+    # payload (``data: : litellm_menu ...``), aborting the client stream
+    # before ``response.completed``.  Use a parseable Responses event instead.
+    return _JSONStreamEvent(
+        {
+            "type": "response.metadata",
+            "metadata": {"phase": "initial_wait"},
+        }
     )
 
 
 def _is_codex_responses_initial_sse_keepalive(chunk: Any) -> bool:
+    if isinstance(chunk, dict) and chunk.get("type") == "response.metadata":
+        metadata = chunk.get("metadata")
+        return isinstance(metadata, dict) and metadata.get("phase") == "initial_wait"
     if isinstance(chunk, bytes):
         chunk = chunk.decode("utf-8", errors="replace")
     if isinstance(chunk, str):
@@ -2337,6 +2420,24 @@ def _build_streaming_error_fallback_payload(
     compaction_payload = _responses_request_module._with_codex_compaction_controls(payload)
     if compaction_payload is not None:
         payload = compaction_payload
+    if (
+        method_name == "aresponses"
+        and _responses_request_module._request_is_codex_compaction(payload)
+    ):
+        # Streaming fallback payloads do not pass through the ordinary
+        # deployment pre-call hook. Reuse the same Responses surface adapter
+        # so unknown gateways receive a schema-valid compaction request while
+        # official/native-capable routes keep additional_tools intact.
+        from . import responses_surfaces as _responses_surfaces_module
+
+        native_client_tool_payload = (
+            _responses_surfaces_module._with_responses_native_client_tool_passthrough(
+                payload,
+                request_data,
+            )
+        )
+        if native_client_tool_payload is not None:
+            payload = native_client_tool_payload
     extra_body_payload = _responses_request_module._with_responses_native_extra_body(payload)
     if extra_body_payload is not None:
         payload = extra_body_payload
@@ -2526,10 +2627,13 @@ async def _streaming_error_fallback_response(
         route_recovery_poll=route_recovery_poll,
     )
     retry_surface = _routing_module._request_current_upstream_surface(payload)
-    if method_name == "aresponses" and retry_surface in {
-        "openai/chat",
-        "anthropic",
-    }:
+    if (
+        method_name == "aresponses"
+        and retry_surface in {"openai/chat", "anthropic"}
+        and not _responses_request_module._request_has_structured_codex_compaction(
+            payload
+        )
+    ):
         from . import responses_surfaces as _responses_surfaces_module
 
         retry_metadata = (
@@ -3823,6 +3927,16 @@ def _route_recovery_sse_keepalive(
         _state_module._touch_route_recovery_state(
             _route_recovery_state_key(request_data)
         )
+    if _request_is_responses_stream(request_data):
+        return _JSONStreamEvent(
+            {
+                "type": "response.metadata",
+                "metadata": {
+                    "phase": phase,
+                    "attempt": attempt,
+                },
+            }
+        )
     if _request_uses_native_event_stream(request_data):
         return (
             f": litellm_menu route_recovery phase={phase} attempt={attempt}\n\n"
@@ -3837,6 +3951,9 @@ def _is_route_recovery_sse_keepalive(chunk: Any) -> bool:
         return chunk.startswith(b": litellm_menu route_recovery ")
     if isinstance(chunk, str):
         return chunk.startswith(": litellm_menu route_recovery ")
+    if isinstance(chunk, dict) and chunk.get("type") == "response.metadata":
+        metadata = chunk.get("metadata")
+        return isinstance(metadata, dict) and isinstance(metadata.get("phase"), str)
     return False
 
 
@@ -4714,22 +4831,19 @@ def _apply_stream_function_arguments(
     if item.get("type") != "function_call":
         return item
     item_id = _stream_output_item_key(item)
-    if not item_id:
-        return item
-    arguments = arguments_by_item_id.get(item_id)
+    arguments = arguments_by_item_id.get(item_id) if item_id else None
     if not isinstance(arguments, str):
         arguments = item.get("arguments")
-    repaired_arguments = _responses_request_module._codex_repaired_function_arguments(
-        arguments
+    normalized, valid = _responses_request_module._codex_normalized_function_arguments(
+        arguments,
+        empty_is_object=True,
     )
-    if repaired_arguments is not None:
-        arguments = repaired_arguments
-    if not isinstance(arguments, str):
+    if not valid or normalized is None:
         return item
-    if item.get("arguments") == arguments:
+    if item.get("arguments") == normalized:
         return item
     next_item = copy.deepcopy(item)
-    next_item["arguments"] = arguments
+    next_item["arguments"] = normalized
     return next_item
 
 
@@ -4821,16 +4935,17 @@ class _ResponsesStreamCompletionState:
                 self.arguments_by_item_id[item_id] = "".join(argument_parts)
             elif (
                 item_id not in self.finished_argument_item_ids
-                and isinstance(existing_args, str)
-                and existing_args
+                and existing_args is not None
+                and existing_args != ""
             ):
-                repaired_args = (
-                    _responses_request_module._codex_repaired_function_arguments(
-                        existing_args
+                normalized_args, valid = (
+                    _responses_request_module._codex_normalized_function_arguments(
+                        existing_args,
+                        empty_is_object=True,
                     )
                 )
                 self.arguments_by_item_id[item_id] = (
-                    existing_args if repaired_args is None else repaired_args
+                    normalized_args if valid and normalized_args is not None else None
                 )
 
         if chunk_type == "response.output_item.done":
@@ -4859,11 +4974,14 @@ class _ResponsesStreamCompletionState:
             if isinstance(parts, list):
                 arguments = "".join(parts)
         if isinstance(arguments, str):
-            repaired_args = (
-                _responses_request_module._codex_repaired_function_arguments(arguments)
+            normalized_args, valid = (
+                _responses_request_module._codex_normalized_function_arguments(
+                    arguments,
+                    empty_is_object=True,
+                )
             )
             self.arguments_by_item_id[item_id] = (
-                arguments if repaired_args is None else repaired_args
+                normalized_args if valid and normalized_args is not None else None
             )
             self.finished_argument_item_ids.add(item_id)
 
@@ -5171,11 +5289,20 @@ async def _yield_validated_structured_codex_compaction_stream(
             sanitized_chunk,
             request_data,
         ):
-            raise _responses_incomplete_stream_exception(
+            exception = _responses_incomplete_stream_exception(
                 "structured Codex compaction completed without exactly one encrypted compaction item",
                 buffer=events,
                 request_data=request_data,
             )
+            # The upstream completed a normal Responses exchange, but not the
+            # required remote-compaction protocol. Classify this narrowly as
+            # a surface incompatibility so routing moves to another deployment
+            # rather than retrying the same route or downgrading to Chat.
+            _routing_module._mark_exception_for_upstream_surface_failover(
+                exception,
+                request_data,
+            )
+            raise exception
         return "completed"
 
     for chunk in buffer:

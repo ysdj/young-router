@@ -391,6 +391,97 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertNotIn("SECRET_AUTH_VALUE", raw)
             self.assertNotIn("Authorization", raw)
 
+    async def test_pre_call_publishes_pending_request_before_completion(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        hooks._REQUEST_STARTED_TIMES.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "litellm_call_id": "pending-call-1",
+                "messages": [{"role": "user", "content": "SECRET_PROMPT_BODY"}],
+                "api_key": "SECRET_API_KEY",
+            }
+
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, len(records))
+            pending = records[0]
+            self.assertEqual("pending", pending["status"])
+            self.assertEqual("pending-call-1", pending["request_id"])
+            self.assertEqual(pending["started_at"], pending["ts"])
+            self.assertNotIn("duration_ms", pending)
+            self.assertNotIn("SECRET_PROMPT_BODY", log_path.read_text(encoding="utf-8"))
+            self.assertNotIn("SECRET_API_KEY", log_path.read_text(encoding="utf-8"))
+
+    async def test_stream_request_log_advances_to_terminal_status(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "stream": True,
+                "litellm_call_id": "stream-call-1",
+            }
+
+            await hook.async_log_success_event(
+                kwargs,
+                {"type": "response.created", "response": {"status": "in_progress"}},
+                start,
+                start + timedelta(milliseconds=10),
+            )
+            await hook.async_log_stream_event(
+                kwargs,
+                {"type": "response.completed", "response": {"status": "completed"}},
+                start,
+                start + timedelta(milliseconds=30),
+            )
+            failed_kwargs = {**kwargs, "litellm_call_id": "stream-call-2"}
+            await hook.async_log_stream_event(
+                failed_kwargs,
+                {"type": "response.failed", "response": {"status": "failed"}},
+                start,
+                start + timedelta(milliseconds=40),
+            )
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(["stream", "success", "failure"], [record["status"] for record in records])
+
+    async def test_completed_stream_summary_logs_success(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            now = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+            kwargs = {
+                "model": "public-chat",
+                "stream": True,
+                "litellm_call_id": "completed-stream-call",
+                "async_complete_streaming_response": {"id": "response-summary"},
+            }
+
+            await hook.async_log_success_event(kwargs, {"id": "response-summary"}, now, now)
+
+            record = json.loads(log_path.read_text(encoding="utf-8"))
+            self.assertEqual("success", record["status"])
+
     def test_request_log_uses_router_public_model_after_upstream_rewrite(self) -> None:
         hooks, _ = load_hook_module()
 

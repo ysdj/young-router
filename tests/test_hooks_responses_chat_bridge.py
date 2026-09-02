@@ -433,6 +433,246 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertFalse(calls[0]["parallel_tool_calls"])
         self.assertEqual(original_input[0]["type"], "additional_tools")
 
+    async def test_unknown_route_lifts_leading_additional_tools_for_compaction(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        original_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "description": "Run a command.",
+                    }
+                ],
+            },
+            {"type": "message", "role": "user", "content": "history"},
+            {"type": "compaction_trigger", "id": "compact-now"},
+        ]
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="balanced-chat",
+            input=original_input,
+            stream=True,
+            tools=[],
+            tool_choice="auto",
+            parallel_tool_calls=False,
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            model_info={
+                "id": "third-party-responses",
+                "provider": "third-party",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"], original_input[1:])
+        self.assertEqual(calls[0]["input"][-1]["type"], "compaction_trigger")
+        self.assertEqual(calls[0]["tools"], [original_input[0]["tools"][0]])
+        self.assertEqual(calls[0]["extra_body"]["tools"], calls[0]["tools"])
+        self.assertEqual(calls[0]["tool_choice"], "auto")
+        self.assertFalse(calls[0]["parallel_tool_calls"])
+        self.assertEqual(original_input[0]["type"], "additional_tools")
+        metadata = calls[0]["litellm_metadata"]
+        self.assertEqual(
+            metadata[hooks._RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY],
+            {
+                "tool_count": 1,
+                "lifted_additional_tools_items": 1,
+                "lifted_tool_count": 1,
+            },
+        )
+        self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
+        self.assertNotIn("codex_compaction_optimized", metadata)
+
+    async def test_direct_openai_compaction_keeps_additional_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        original_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "custom", "name": "exec"}],
+            },
+            {"type": "message", "role": "user", "content": "history"},
+            {"type": "compaction_trigger", "id": "compact-now"},
+        ]
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="balanced-chat",
+            input=original_input,
+            stream=True,
+            tools=[],
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            model_info={
+                "id": "openai-direct",
+                "provider": "openai",
+                "upstream_url_surface": "openai/responses",
+            },
+            api_base="https://api.openai.com/v1",
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"], original_input)
+        self.assertEqual(calls[0]["input"][0]["type"], "additional_tools")
+        metadata = calls[0].get("litellm_metadata", {})
+        self.assertNotIn(
+            hooks._RESPONSES_NATIVE_CLIENT_TOOL_PASSTHROUGH_METADATA_KEY,
+            metadata,
+        )
+
+    async def test_openai_compatible_compaction_lifts_additional_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        original_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "custom", "name": "exec"}],
+            },
+            {"type": "message", "role": "user", "content": "history"},
+            {"type": "compaction_trigger", "id": "compact-now"},
+        ]
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="openai/public-agent",
+            input=original_input,
+            stream=True,
+            tools=[],
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            model_info={
+                "id": "compat-route",
+                "provider": "openai",
+                "upstream_url_surface": "openai/responses",
+            },
+            api_base="https://gateway.example.com/v1",
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"][0]["type"], "message")
+        self.assertEqual(calls[0]["input"][-1]["type"], "compaction_trigger")
+        self.assertEqual(calls[0]["tools"], [original_input[0]["tools"][0]])
+        self.assertEqual(original_input[0]["type"], "additional_tools")
+
+    async def test_compaction_lifts_additional_tools_before_api_base_is_bound(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        original_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "custom", "name": "exec"}],
+            },
+            {"type": "message", "role": "user", "content": "history"},
+            {"type": "compaction_trigger", "id": "compact-now"},
+        ]
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="openai/public-agent",
+            input=original_input,
+            stream=True,
+            tools=[],
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            model_info={
+                "id": "compat-unbound",
+                "provider": "openai",
+                "upstream_url_surface": "openai/responses",
+            },
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"][0]["type"], "message")
+        self.assertEqual(calls[0]["input"][-1]["type"], "compaction_trigger")
+
+    async def test_relay_with_native_client_tools_keeps_additional_tools_on_compaction(self) -> None:
+        hooks, _ = load_hook_module()
+        calls = []
+
+        async def original_generic_function(**kwargs):
+            calls.append(kwargs)
+            return {"ok": True}
+
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+        original_input = [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "custom", "name": "exec"}],
+            },
+            {"type": "message", "role": "user", "content": "history"},
+            {"type": "compaction_trigger", "id": "compact-now"},
+        ]
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="openai/public-agent",
+            input=original_input,
+            stream=True,
+            tools=[],
+            client_metadata={
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            model_info={
+                "id": "compat-native-client-tools",
+                "provider": "openai",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_client_tools": True,
+            },
+            api_base="https://gateway.example.com/v1",
+        )
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input"], original_input)
+        self.assertEqual(calls[0]["input"][0]["type"], "additional_tools")
+
     async def test_lifted_native_tools_retry_with_sanitized_function_bridge(self) -> None:
         hooks, _ = load_hook_module()
         calls = []

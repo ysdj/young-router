@@ -46,6 +46,53 @@ _LATIN1_RESPONSE_HEADERS_PATCH_ATTR = (
 _RESPONSES_COMPLETION_STREAM_OUTPUT_ITEM_PATCH_ATTR = (
     "_litellm_menu_responses_completion_stream_output_item_patch"
 )
+_RESPONSES_WEBSOCKET_HTTP_BRIDGE_PATCH_ATTR = (
+    "_litellm_menu_responses_websocket_http_bridge_patch"
+)
+
+
+def _install_responses_websocket_http_bridge_patch() -> None:
+    """Serve Responses WebSocket clients through the managed HTTP bridge.
+
+    LiteLLM's native Responses WebSocket mode dials ``wss://<api_base>``
+    directly for providers whose config reports native WebSocket support
+    (OpenAI, Azure).  Relay deployments expose the OpenAI Responses HTTP
+    endpoint on hosts that reject the WebSocket upgrade with 404, so the
+    client's WebSocket is closed before ``response.completed`` and Codex
+    enters its reconnect loop.  Reporting no native support routes the
+    connection through ``ManagedResponsesWebSocketHandler``, which streams
+    over the working HTTP endpoint instead.
+    """
+
+    try:
+        from litellm.llms.base_llm.responses.transformation import (
+            BaseResponsesAPIConfig,
+        )
+    except Exception:
+        return
+
+    def patched_supports_native_websocket(self: Any) -> bool:
+        return False
+
+    setattr(
+        patched_supports_native_websocket,
+        _RESPONSES_WEBSOCKET_HTTP_BRIDGE_PATCH_ATTR,
+        True,
+    )
+    BaseResponsesAPIConfig.supports_native_websocket = patched_supports_native_websocket
+    for module_name, class_name in (
+        ("litellm.llms.openai.responses.transformation", "OpenAIResponsesAPIConfig"),
+        ("litellm.llms.azure.responses.transformation", "AzureOpenAIResponsesAPIConfig"),
+    ):
+        try:
+            import importlib
+
+            module = importlib.import_module(module_name)
+            provider_config = getattr(module, class_name, None)
+        except Exception:
+            provider_config = None
+        if provider_config is not None:
+            provider_config.supports_native_websocket = patched_supports_native_websocket
 
 
 def _install_latin1_response_headers_patch() -> None:
@@ -1625,5 +1672,6 @@ def install_all() -> None:
     _install_order_peer_failover_patch()
     _install_generic_deployment_failover_patch()
     _install_same_deployment_retry_policy_patch()
+    _install_responses_websocket_http_bridge_patch()
     _install_responses_completion_stream_patch()
     _install_responses_tool_search_bridge_patch()

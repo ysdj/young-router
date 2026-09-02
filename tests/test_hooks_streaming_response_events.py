@@ -1198,6 +1198,122 @@ class HookStreamingResponseEventTests(HookTestCase):
                 )
             ]
 
+    def test_function_arguments_helper_normalizes_common_malformed_objects(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        cases = {
+            "{'cmd':'x'}": {"cmd": "x"},
+            "{cmd:'x'}": {"cmd": "x"},
+            "```json\n{\"cmd\":\"x\",}\n```": {"cmd": "x"},
+            '{}{"cmd":"x"}': {"cmd": "x"},
+            "{}": {},
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                normalized, valid = hooks._codex_normalized_function_arguments(
+                    raw
+                )
+                self.assertTrue(valid)
+                self.assertEqual(json.loads(normalized), expected)
+                repaired = hooks._codex_repaired_function_arguments(raw)
+                if repaired is not None:
+                    self.assertEqual(json.loads(repaired), expected)
+
+        normalized, valid = hooks._codex_normalized_function_arguments("not json at all")
+        self.assertFalse(valid)
+        self.assertIsNone(normalized)
+        self.assertIsNone(hooks._codex_repaired_function_arguments("not json at all"))
+
+    async def test_responses_delivery_replaces_unrepairable_arguments_with_failed_event(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        delivered = hooks._responses_stream_chunk_for_delivery(
+            {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "call_bad",
+                "arguments": "{broken json",
+            },
+            {
+                "call_type": "aresponses",
+                "model": "default-chat",
+                "stream": True,
+                "input": "run a command",
+            },
+        )
+
+        self.assertEqual(delivered["type"], "response.failed")
+        self.assertEqual(delivered["response"]["status"], "failed")
+        self.assertIn("code", delivered["response"]["error"])
+        self.assertIn("message", delivered["response"]["error"])
+        json.dumps(delivered)
+
+    async def test_guarded_responses_stream_fails_on_unrepairable_arguments(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        async def upstream_stream():
+            yield {"type": "response.created", "response": {"id": "resp_bad"}}
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_bad",
+                    "call_id": "call_bad",
+                    "name": "exec_command",
+                    "arguments": "",
+                },
+            }
+            yield {
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "fc_bad",
+                "call_id": "call_bad",
+                "arguments": "{broken json",
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_bad",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_bad",
+                            "call_id": "call_bad",
+                            "name": "exec_command",
+                            "arguments": "{broken json",
+                        }
+                    ],
+                },
+            }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [],
+                upstream_stream(),
+                {
+                    "model": "default-chat",
+                    "input": "run a command",
+                    "stream": True,
+                    "tools": [{"type": "function", "name": "exec_command"}],
+                },
+            )
+        ]
+
+        self.assertTrue(chunks)
+        self.assertTrue(
+            any(
+                chunk.get("type") == "response.failed"
+                and chunk.get("response", {}).get("status") == "failed"
+                for chunk in chunks
+            )
+        )
+        for chunk in chunks:
+            json.dumps(chunk)
+            for item in [chunk.get("item")]:
+                if isinstance(item, dict):
+                    json.dumps(item.get("arguments", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

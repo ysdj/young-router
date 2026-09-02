@@ -43,6 +43,7 @@ type PendingFieldRegistry = {
   setDirty: (id: symbol, dirty: boolean) => void;
 };
 type ProviderWorkspaceDraftProjection = {
+  providers: UnknownRecord[];
   providerDisplayName: (provider: UnknownRecord) => string;
   modelDisplayName: (providerID: string, model: UnknownRecord) => string;
   providerBaseURL: (provider: UnknownRecord) => string;
@@ -144,6 +145,7 @@ const compactStyles = StyleSheet.create({
 // Core and native table surfaces continuously while retaining bounded pickup.
 const SETTINGS_DISK_POLL_MS = 5_000;
 const LOG_VIEW_POLL_MS = 5_000;
+const REQUEST_LOG_POLL_MS = 1_000;
 const RECOVERY_LOG_POLL_MS = 1_000;
 const ONLINE_USAGE_POLL_MS = 15_000;
 const ROUTE_TRACE_REQUEST_ROW_HEIGHT = 70;
@@ -2446,6 +2448,12 @@ function ProviderSetupWizard({ providers, relaySources, relayStations, busy, tra
       setValidation(translate("providers.wizard.required"));
       return false;
     }
+    if (providerNameExists(providers, name)) {
+      setProviderName("");
+      setProviderBaseURL("");
+      setValidation(translate("providers.wizard.duplicateName"));
+      return false;
+    }
     const existingIDs = new Set(providers.map(editorIdentifier));
     setProcessing(true);
     try {
@@ -3068,6 +3076,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     void switchMode();
   };
   const providerDraftProjection = useMemo<ProviderWorkspaceDraftProjection>(() => ({
+    providers,
     providerDisplayName,
     modelDisplayName,
     providerBaseURL,
@@ -3080,7 +3089,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     setModelUpstreamDraft,
     setModelOrderDraft,
     setProviderKeyNameDraft,
-  }), [modelDisplayName, modelOrderText, modelUpstreamDisplay, providerBaseURL, providerDisplayName, providerKeyDisplayName]);
+  }), [modelDisplayName, modelOrderText, modelUpstreamDisplay, providerBaseURL, providerDisplayName, providerKeyDisplayName, providers]);
   return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={styles.providersLayout}>
     <View style={styles.providerLeftColumn}>
       <View style={styles.providerToolbar}>
@@ -3300,8 +3309,16 @@ function editorIdentifier(record: UnknownRecord): string {
 
 const CUSTOM_BASE_URL_SOURCE = "__custom__";
 
+function providerNameExists(providers: UnknownRecord[], name: string, excludeID = ""): boolean {
+  const normalized = name.trim().toLocaleLowerCase();
+  if (!normalized) return false;
+  return providers.some((entry) => editorIdentifier(entry) !== excludeID
+    && stringValue(entry.display_name, stringValue(entry.name)).trim().toLocaleLowerCase() === normalized);
+}
+
 function ProviderSourceFields({ provider, providerID, relayStations, busy, translate, dispatch, onBaseUrlDraftChange, onNameDraftChange }: { provider: UnknownRecord; providerID: string; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatch: Dispatch; onBaseUrlDraftChange?: (baseURL: string) => void; onNameDraftChange?: (name: string) => void }): React.JSX.Element {
   const drafts = useContext(ProviderWorkspaceDraftContext);
+  const [sourceResetToken, setSourceResetToken] = useState(0);
   const providerType = stringValue(provider.provider_type, "custom") === "relay" ? "relay" : "custom";
   const stationID = stringValue(provider.relay_station_id).trim();
   const selectedStation = relayStations.find((station) => station.id === stationID);
@@ -3331,14 +3348,20 @@ function ProviderSourceFields({ provider, providerID, relayStations, busy, trans
     if (providerType !== "custom") return;
     const station = relayStationForBaseUrl(endpoint, relayStations);
     if (station) {
+      if (providerNameExists(drafts?.providers ?? [], station.name, providerID)) {
+        onBaseUrlDraftChange?.("");
+        onNameDraftChange?.("");
+        setSourceResetToken((value) => value + 1);
+        return;
+      }
       return dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id });
     }
     return dispatch("provider.patch", { provider_id: providerID, changes: { endpoint } });
   };
   return <View style={styles.providerSourceFields}>
     <PickerField label={translate("providers.endpointSource")} labelWidth={68} value={selectedValue} values={sourceOptions} disabled={busy} onSelect={selectSource} />
-    <TextField label={translate("providers.baseUrl")} labelWidth={68} value={effectiveBaseURL} disabled={busy || providerType === "relay"} onDraftChange={onBaseUrlDraftChange} onCommit={commitBaseURL} />
-    <TextField label={translate("providers.providerName")} labelWidth={68} value={effectiveName} disabled={busy || providerType === "relay"} onDraftChange={onNameDraftChange} onCommit={(name) => providerType === "custom" ? dispatch("provider.patch", { provider_id: providerID, changes: { name } }) : undefined} />
+    <TextField key={"provider-base-url:" + sourceResetToken} label={translate("providers.baseUrl")} labelWidth={68} value={effectiveBaseURL} disabled={busy || providerType === "relay"} onDraftChange={onBaseUrlDraftChange} onCommit={commitBaseURL} />
+    <TextField key={"provider-name:" + sourceResetToken} label={translate("providers.providerName")} labelWidth={68} value={effectiveName} disabled={busy || providerType === "relay"} onDraftChange={onNameDraftChange} onCommit={(name) => providerType === "custom" ? dispatch("provider.patch", { provider_id: providerID, changes: { name } }) : undefined} />
   </View>;
 }
 
@@ -4480,7 +4503,11 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const rawStatus = compactLogValue(value.status ?? value.result);
   const status = tab === "recovery"
     ? recoveryStatusLabel(rawStatus, translate)
-    : rawStatus || (value.error ? translate("logs.failed") : "");
+    : tab === "requests" && rawStatus === "pending"
+      ? translate("logs.sending")
+      : tab === "requests" && rawStatus === "stream"
+        ? translate("logs.streaming")
+        : rawStatus || (value.error ? translate("logs.failed") : "");
   const rawEvent = compactLogValue(value.event);
   const event = tab === "route-trace" ? routeTraceEventLabel(rawEvent, translate) : rawEvent;
   const action = compactLogValue(value.action);
@@ -4532,8 +4559,9 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     }
   }
   const original = safeOriginalLogRecord(record);
+  const keyTime = tab === "requests" && requestId ? "" : time;
   return {
-    key: logRecordBaseKey(tab, time, requestKey, rawEvent, action, original),
+    key: logRecordBaseKey(tab, keyTime, requestKey, rawEvent, action, original),
     requestKey,
     routeAttempts,
     time,
@@ -4960,6 +4988,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     void poll();
     const intervalMs = selected === "recovery"
       ? RECOVERY_LOG_POLL_MS
+      : selected === "requests" ? REQUEST_LOG_POLL_MS
       : selected === "online-usage" ? ONLINE_USAGE_POLL_MS : LOG_VIEW_POLL_MS;
     const interval = setInterval(() => { void poll(); }, intervalMs);
     return () => { mounted = false; clearInterval(interval); };

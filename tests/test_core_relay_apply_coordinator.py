@@ -402,6 +402,137 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertNotIn("replace-secret", json.dumps(fetched))
             self.assertNotIn("replace-secret", json.dumps(core.snapshot()))
 
+    def test_fetch_models_reads_relay_key_after_core_restart(self) -> None:
+        """A restarted Core has no in-memory session secrets. Fetching relay
+        models must fall back to the persisted session, the same behavior as
+        the relay resource refresh path."""
+
+        class RestartHTTP(RelayCoordinatorHTTP):
+            def __init__(self) -> None:
+                super().__init__()
+                self.post_calls: list[tuple[str, str]] = []
+
+            def post(
+                self,
+                origin: str,
+                path: str,
+                *,
+                headers: dict[str, str],
+                body: dict[str, object] | None = None,
+            ) -> object:
+                self.post_calls.append((origin, path))
+                return super().post(origin, path, headers=headers, body=body)
+
+        class ModelListResponse:
+            status = 200
+
+            def __enter__(self) -> "ModelListResponse":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def getcode(self) -> int:
+                return self.status
+
+            def read(self, _: int) -> bytes:
+                return b'{"data":[{"id":"model-a"},{"id":"model-b"}]}'
+
+        class ModelListOpener:
+            def __init__(self) -> None:
+                self.requests: list[Any] = []
+
+            def open(self, request: Any, *, timeout: float) -> ModelListResponse:
+                self.requests.append(request)
+                if timeout != 5.0:
+                    raise AssertionError(f"unexpected timeout {timeout}")
+                return ModelListResponse()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RestartHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.add",
+                    "payload": {
+                        "type": "newapi",
+                        "label": "Relay",
+                        "origin": "https://relay.example.test",
+                        "remember_password": True,
+                    },
+                }
+            )
+            account_id = relay.snapshot()["accounts"][0]["id"]
+            core.accept_relay_login(
+                account_id=account_id,
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="person",
+                cookie="session=fixture",
+            )
+            core.refresh_relay_resources(account_id, revision=core.revision)
+            # Persist the account as if a completed Apply had committed the
+            # staged login. A Core restart only sees this durable state.
+            relay._persist(force=True)
+            # Simulate a Core restart: fresh domain instances share only the
+            # persisted files. The new relay domain has no in-memory session
+            # secrets and no cached resource keys.
+            restarted_relay = RelayAccountsDomain(root, http_client=http)
+            restarted_providers = ProvidersModelsDomain(root / "config.yaml")
+            restarted = CoreStore(domains=[restarted_relay, restarted_providers])
+            self.assertEqual({}, restarted_relay._session_secrets)
+            account = restarted_relay.snapshot()["accounts"][0]
+            resource_id = account["resources"][0]["id"]
+            restarted.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {
+                        "provider": {
+                            "name": "provider-a",
+                            "enabled": True,
+                            "api_base": "https://relay.example.test/v1",
+                            "models": [],
+                        }
+                    },
+                },
+                expected_revision=restarted.revision,
+            )
+            http.post_calls.clear()
+            provider_id = restarted_providers.snapshot()["providers"][0]["id"]
+            opener = ModelListOpener()
+            with patch(
+                "litellm_menu.core.domains.providers_models.isolated_http_opener",
+                return_value=opener,
+            ):
+                restarted.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.fetch_relay_resource_models",
+                        "payload": {
+                            "provider_id": provider_id,
+                            "station_id": account["station_id"],
+                            "account_id": account_id,
+                            "resource_id": resource_id,
+                        },
+                    },
+                    expected_revision=restarted.revision,
+                )
+
+            summary = restarted.snapshot()["action_summaries"]["providers_models"]["operation_summary"]
+            self.assertEqual("fetch_models", summary["operation"])
+            self.assertEqual(["model-a", "model-b"], summary["models"])
+            self.assertTrue(summary["available"])
+            self.assertEqual(1, len(opener.requests))
+            self.assertTrue(opener.requests[0].get_header("Authorization").startswith("Bearer sk-"))
+            self.assertEqual([("https://relay.example.test", "/api/token/7/key")], http.post_calls)
+            self.assertNotEqual({}, restarted_relay._session_secrets)
+
     def test_linked_import_materializes_only_during_coordinated_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

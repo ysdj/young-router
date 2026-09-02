@@ -30,6 +30,15 @@ from .base import (
 
 
 class LiteLLMMenuHook(CustomLogger):
+    def _record_recent_request_started(self, kwargs: Dict[str, Any]) -> None:
+        """Publish a bounded progress row before the upstream call begins."""
+        record = _routing_module._request_log_record("pending", kwargs)
+        # A request id is the join key used when later success/failure/stream
+        # callbacks replace this progress row.  Do not emit an unjoinable
+        # pending row that would remain as a duplicate legacy request entry.
+        if record.get("request_id"):
+            _state_module._append_recent_request(record)
+
     async def async_log_success_event(
         self,
         kwargs: dict,
@@ -37,11 +46,19 @@ class LiteLLMMenuHook(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
+        if _routing_module._is_codex_compaction_capability_probe(kwargs):
+            return
         _trace_codex_fast_tier_result(kwargs, response_obj, outcome="success")
-        if kwargs.get("stream") is not True:
+        streaming = kwargs.get("stream") is True
+        completed_stream = (
+            "async_complete_streaming_response" in kwargs
+            or _streaming_module._responses_stream_chunk_is_completed(response_obj)
+        )
+        if not streaming:
             _routing_module._record_deployment_success_for_cooldown(kwargs)
+        status = "stream" if streaming and not completed_stream else "success"
         _state_module._append_recent_request(
-            _routing_module._request_log_record("success", kwargs, response_obj, start_time, end_time)
+            _routing_module._request_log_record(status, kwargs, response_obj, start_time, end_time)
         )
 
     async def async_log_failure_event(
@@ -51,6 +68,8 @@ class LiteLLMMenuHook(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
+        if _routing_module._is_codex_compaction_capability_probe(kwargs):
+            return
         _trace_codex_fast_tier_result(kwargs, response_obj, outcome="failure")
         if _routing_module._should_suppress_recent_failure_log(kwargs, response_obj):
             return
@@ -65,14 +84,19 @@ class LiteLLMMenuHook(CustomLogger):
         start_time: Any,
         end_time: Any,
     ) -> None:
-        if _codex_fast_tier_module._response_indicates_failure(response_obj):
+        if _routing_module._is_codex_compaction_capability_probe(kwargs):
+            return
+        failed = _codex_fast_tier_module._response_indicates_failure(response_obj)
+        completed = _streaming_module._responses_stream_chunk_is_completed(response_obj)
+        if failed:
             _trace_codex_fast_tier_result(kwargs, response_obj, outcome="stream_failure")
-        elif _streaming_module._responses_stream_chunk_is_completed(response_obj):
+        elif completed:
             _trace_codex_fast_tier_result(kwargs, response_obj, outcome="stream_completed")
-        if _streaming_module._responses_stream_chunk_is_completed(response_obj):
+        if completed:
             _routing_module._record_deployment_success_for_cooldown(kwargs)
+        status = "failure" if failed else "success" if completed else "stream"
         _state_module._append_recent_request(
-            _routing_module._request_log_record("stream", kwargs, response_obj, start_time, end_time)
+            _routing_module._request_log_record(status, kwargs, response_obj, start_time, end_time)
         )
 
     async def async_pre_call_deployment_hook(
@@ -80,7 +104,12 @@ class LiteLLMMenuHook(CustomLogger):
         kwargs: Dict[str, Any],
         call_type: Any,
     ) -> Optional[dict]:
-        _routing_module._record_request_started_time(kwargs)
+        is_compaction_capability_probe = (
+            _routing_module._is_codex_compaction_capability_probe(kwargs)
+        )
+        if not is_compaction_capability_probe:
+            _routing_module._record_request_started_time(kwargs)
+            self._record_recent_request_started(kwargs)
         modified_kwargs = kwargs
         changed = False
         for update_request in (
@@ -134,6 +163,8 @@ class LiteLLMMenuHook(CustomLogger):
         if native_client_tool_kwargs is not None:
             modified_kwargs = native_client_tool_kwargs
             changed = True
+        if not is_compaction_capability_probe:
+            await _routing_module._ensure_codex_compaction_capability(modified_kwargs)
         return modified_kwargs if changed else None
     async def async_filter_deployments(
         self,

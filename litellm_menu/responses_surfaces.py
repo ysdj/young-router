@@ -419,14 +419,8 @@ def _selected_marker_chat_fallback_surface_for_request(
 
 
 def _request_is_direct_openai_route(request_kwargs: Optional[dict]) -> bool:
-    model_info = _request_context_module._request_model_info(request_kwargs)
-    provider = model_info.get("provider")
     host = _responses_request_module._api_base_host(_responses_request_module._request_api_base(request_kwargs))
-    if host:
-        return host == "api.openai.com"
-    if isinstance(provider, str) and provider.strip().lower() == "openai":
-        return True
-    return False
+    return host == "api.openai.com"
 
 
 def _request_supports_native_responses_hosted_tools(
@@ -623,6 +617,15 @@ def _request_responses_client_tool_support(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
 ) -> Optional[bool]:
+    current_host = _responses_request_module._api_base_host(
+        _responses_request_module._request_api_base(request_kwargs)
+    )
+    if current_host and current_host != "api.openai.com":
+        model_info = _request_context_module._request_model_info(request_kwargs)
+        configured_support = model_info.get(_SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY)
+        if isinstance(configured_support, bool):
+            return configured_support
+        return None
     for request in (request_kwargs, outer_request_kwargs):
         model_info = _request_context_module._request_model_info(request)
         configured_support = model_info.get(
@@ -729,8 +732,6 @@ def _with_responses_native_client_tool_passthrough(
         return None
     if request_kwargs.get("use_chat_completions_api") is True:
         return None
-    if _responses_request_module._request_is_codex_compaction(request_kwargs):
-        return None
     if not _request_uses_responses_endpoint(request_kwargs):
         return None
     if _request_has_responses_function_tool_bridge_attempt(
@@ -743,13 +744,39 @@ def _with_responses_native_client_tool_passthrough(
         request_kwargs,
         outer_request_kwargs,
     )
-    if support is False or _request_is_direct_openai_route(request_kwargs):
+    if _request_is_direct_openai_route(request_kwargs):
+        return None
+    if support is False and not _responses_request_module._request_is_codex_compaction(
+        request_kwargs
+    ):
+        return None
+    if support is None and not any(
+        isinstance(request, dict)
+        and (
+            bool(_request_context_module._request_model_info(request))
+            or bool(_responses_request_module._request_api_base(request))
+            or bool(_routing_module._request_current_upstream_surface(request))
+        )
+        for request in (request_kwargs, outer_request_kwargs)
+    ):
+        # A bare pre-call hook has not been associated with a deployment yet.
+        # Do not guess that its Responses history belongs to a compatible
+        # gateway and rewrite the client's input before routing metadata exists.
         return None
 
     input_value = request_kwargs.get("input")
     lifted_items = 0
     lifted_tools: list[dict] = []
-    if support is None and isinstance(input_value, list):
+    if (
+        support is None
+        or (
+            support is False
+            and _responses_request_module._request_is_codex_compaction(request_kwargs)
+        )
+    ) and isinstance(input_value, list):
+        # Unknown compatible gateways, and explicitly unsupported compaction
+        # routes, reject Codex additional_tools items. Relays that set
+        # supports_responses_client_tools keep the native item.
         for item in input_value:
             if not isinstance(item, dict) or item.get("type") != "additional_tools":
                 break

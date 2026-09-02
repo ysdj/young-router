@@ -1347,7 +1347,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(62, len(keys))
+        self.assertEqual(63, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
@@ -1444,9 +1444,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const latestSnapshot = useRef<CoreSnapshot | undefined>(snapshot);", self.ui)
         self.assertIn("const SETTINGS_DISK_POLL_MS = 5_000;", self.ui)
         self.assertIn("const LOG_VIEW_POLL_MS = 5_000;", self.ui)
+        self.assertIn("const REQUEST_LOG_POLL_MS = 1_000;", self.ui)
         self.assertIn("const RECOVERY_LOG_POLL_MS = 1_000;", self.ui)
         self.assertIn("const ONLINE_USAGE_POLL_MS = 15_000;", self.ui)
         self.assertIn('selected === "recovery"\n      ? RECOVERY_LOG_POLL_MS', self.ui)
+        self.assertIn('selected === "requests" ? REQUEST_LOG_POLL_MS', self.ui)
         self.assertIn('selected === "online-usage" ? ONLINE_USAGE_POLL_MS : LOG_VIEW_POLL_MS', self.ui)
         self.assertIn("const next = await ipc.diskState(monitoredDiskDomains);", self.ui)
         self.assertIn("const refreshed = await ipc.snapshot();", self.ui)
@@ -1830,6 +1832,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'const [providerSourceModel, setProviderSourceModel] = useState<string>();',
             'function ProviderSourceFields(',
+            'function providerNameExists(providers: UnknownRecord[], name: string, excludeID = ""): boolean {',
+            'const [sourceResetToken, setSourceResetToken] = useState(0);',
+            'providerNameExists(drafts?.providers ?? [], station.name, providerID)',
+            'onBaseUrlDraftChange?.("");',
+            'onNameDraftChange?.("");',
+            'key={"provider-base-url:" + sourceResetToken}',
+            'key={"provider-name:" + sourceResetToken}',
             'label={translate("providers.endpointSource")} labelWidth={68}',
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: nextStationID })',
             'disabled={busy || providerType === "relay"}',
@@ -1851,6 +1860,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('inspectorBody: { gap: 4 }')
         self.assert_ui_has('protocolSettings: { gap: 4 }')
         self.assert_ui_has('protocolHint: { marginLeft: 62')
+        self.assertIn('"providers.wizard.duplicateName": "供应商名称已存在，请输入其他名称。"', self.zh)
+        self.assertIn('"providers.wizard.duplicateName": "A provider with this name already exists. Enter a different name."', self.en)
 
     def test_service_provider_management_owns_login_and_provider_editor_is_api_key_only(self) -> None:
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
@@ -1983,6 +1994,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function logColumns(",
             '<NativeTable columns={nativeTableColumns} rows={nativeTableRows}',
             "translate(\"logs.failed\")",
+            'translate("logs.sending")',
+            'translate("logs.streaming")',
+            'const keyTime = tab === "requests" && requestId ? "" : time;',
             "const proxyPrefix = detail.match",
             'translate("logs.duration")',
             'translate("logs.tokenCount")',

@@ -753,6 +753,134 @@ class HookStreamingCompactionTests(HookTestCase):
             ],
         )
 
+    async def test_structured_compaction_false_success_marks_surface_incompatible(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_litellm_menu_upstream_url_surface_deployment_id": "third-party-route",
+            "model_info": {
+                "id": "third-party-route",
+                "order": 1,
+                "upstream_url_surface": "anthropic",
+                "upstream_protocol_mode": "fallback",
+            },
+            "litellm_params": {"model": "anthropic/vendor-model", "order": 1},
+        }
+
+        async def false_success_stream():
+            message_item = {
+                "id": "msg-false-success",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "summary"}],
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": message_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-false-success",
+                    "status": "completed",
+                    "output": [message_item],
+                },
+            }
+
+        with self.assertRaises(RuntimeError) as captured:
+            _ = [
+                chunk
+                async for chunk in hooks._yield_validated_structured_codex_compaction_stream(
+                    [],
+                    false_success_stream(),
+                    request_data,
+                )
+            ]
+
+        error = captured.exception
+        self.assertTrue(getattr(error, "upstream_surface_unsupported", False))
+        self.assertEqual(getattr(error, "failed_deployment_id", None), "third-party-route")
+        self.assertEqual(
+            getattr(error, "failed_deployment_surface", None),
+            "openai/responses",
+        )
+
+    async def test_structured_compaction_fallback_never_bridges_stale_chat_surface(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc-history",
+                    "name": "exec",
+                    "input": "already-signed tool input",
+                },
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "litellm_metadata": {
+                "_litellm_menu_upstream_url_surface": "openai/chat",
+            },
+            "model_info": {
+                "id": "chat-configured-route",
+                "order": 1,
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+            "litellm_params": {"model": "openai/vendor-model", "order": 1},
+        }
+
+        async def valid_compaction_stream():
+            compaction_item = {
+                "id": "cmp-valid",
+                "type": "compaction",
+                "encrypted_content": "encrypted-summary",
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-valid",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return valid_compaction_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        error = RuntimeError("upstream stream ended")
+        error.status_code = 503
+
+        fallback = await hooks._streaming_error_fallback_response(
+            request_data,
+            error,
+        )
+
+        self.assertIsNotNone(fallback)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["input"][0],
+            request_data["input"][0],
+        )
+        self.assertEqual(calls[0]["input"][-1]["type"], "compaction_trigger")
+        self.assertNotIn(
+            hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY,
+            calls[0]["litellm_metadata"],
+        )
+
     async def test_structured_compaction_route_recovery_buffers_message_false_success(self) -> None:
         hooks, _proxy_server = load_hook_module()
         request_data = {
@@ -1322,7 +1450,14 @@ class HookStreamingCompactionTests(HookTestCase):
         )
         for retry in streaming_calls:
             self.assertEqual(retry["service_tier"], "priority")
-            self.assertEqual(retry["input"], request_input)
+            # Unknown compatible Responses routes cannot accept Codex's
+            # native ``additional_tools`` item.  The adapter removes only
+            # that leading declaration and preserves the signed history and
+            # compaction trigger.
+            self.assertEqual(
+                retry["input"],
+                request_input[1:],
+            )
             self.assertEqual(retry["client_metadata"], client_metadata)
             self.assertEqual(retry["tools"], tools)
             self.assertEqual(retry["tool_choice"], "auto")
@@ -1475,7 +1610,12 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])
         for call in calls:
             self.assertNotIn("use_chat_completions_api", call)
-            self.assertEqual(call["input"][0]["type"], "additional_tools")
+            self.assertNotEqual(call["input"][0].get("type"), "additional_tools")
+            self.assertEqual(call["input"][-1]["type"], "compaction_trigger")
+            self.assertEqual(
+                call["tools"],
+                [{"type": "custom", "name": "exec"}],
+            )
             self.assertEqual(
                 call["tool_choice"],
                 {"type": "custom", "name": "exec"},
