@@ -9,6 +9,7 @@ and JSON on the right always round-trip.  ``sync`` never writes to CODEX_HOME;
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -137,6 +138,52 @@ def default_config_path() -> pathlib.Path:
 
 def codex_home() -> pathlib.Path:
     return pathlib.Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+
+
+LEGACY_TOKEN_BUDGET_MARKER_PREFIX = ".codex-legacy-token-budget-migrated-"
+
+
+def legacy_token_budget_marker_path(runtime_config_path: pathlib.Path) -> pathlib.Path:
+    """Return the per-CODEX_HOME marker for the legacy token-budget cleanup."""
+
+    digest = hashlib.sha256(str(codex_home().resolve()).encode("utf-8")).hexdigest()[:16]
+    return (
+        runtime_config_path.expanduser().resolve().parent
+        / (LEGACY_TOKEN_BUDGET_MARKER_PREFIX + digest)
+    )
+
+
+def _remove_legacy_forced_token_budget(
+    config_text: str, runtime_config_path: pathlib.Path
+) -> str:
+    """Strip the legacy forced ``features.token_budget`` opt-in once per home.
+
+    Older releases force-wrote ``features.token_budget = true`` on every
+    LiteLLM model selection. Codex then skipped summarizing compaction and
+    silently cleared the conversation window ("Understood. I'll follow these
+    workspace and project-scope instructions.") instead of carrying a
+    summary forward. The forced value is indistinguishable from a
+    hand-authored one after the fact, so the cleanup runs exactly once per
+    CODEX_HOME (tracked by a marker beside the runtime config); a later
+    explicit ``token_budget`` setting is preserved untouched.
+    """
+
+    try:
+        marker = legacy_token_budget_marker_path(runtime_config_path)
+        if marker.exists():
+            return config_text
+    except OSError:
+        return config_text
+    features = parse_toml_text(config_text).get("features")
+    if not (isinstance(features, dict) and features.get("token_budget") is True):
+        return config_text
+    config_text = remove_table_value(config_text, ("features",), "token_budget")
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+    return config_text
 
 
 def local_port() -> str:
@@ -1573,20 +1620,29 @@ def apply_structured_patch(
             )
         else:
             # Keep the selected custom provider identity.  The local endpoint
-            # handles both Responses and Codex's relative /alpha/search call;
-            # the proxy chooses the configured upstream deployment afterward.
+            # handles the Responses request; the proxy chooses the configured
+            # upstream deployment afterward.  Do not opt custom providers into
+            # Codex's standalone /alpha/search protocol.
+            provider_path = ("model_providers", provider_id)
             result = _patch_optional_string(
                 result,
-                ("model_providers", provider_id),
+                provider_path,
                 "base_url",
                 local_base_url(),
             )
-        # Third-party Responses gateways do not universally implement remote
-        # encrypted compaction. Enable Codex's native token-budget fallback
-        # whenever the user explicitly selects a LiteLLM Menu model, so the
-        # proxy can fail fast after its capability probe and Codex can create
-        # a local checkpoint summary without fabricating encrypted history.
-        result = set_table_value(result, ("features",), "token_budget", True)
+            # This provider is routed through LiteLLM Menu. Remove the legacy
+            # opt-in so Codex uses its own default instead of calling the
+            # unsupported standalone /alpha/search endpoint.
+            result = remove_table_value(
+                result,
+                provider_path,
+                "supports_standalone_web_search",
+            )
+        # Older releases force-wrote features.token_budget = true on every
+        # LiteLLM selection, which made Codex clear the context window
+        # instead of summarizing it. Clean that legacy value up once per
+        # CODEX_HOME; explicit later re-enabling is preserved.
+        result = _remove_legacy_forced_token_budget(result, runtime_config_path)
         updated_auth, auth_changed = _set_auth_api_key(updated_auth, local_api_key(runtime_config))
 
     # Provider rows must exist before an atomic provider switch/rename updates
