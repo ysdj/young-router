@@ -221,6 +221,16 @@ class LiteLLMMenuHook(CustomLogger):
                 responses_image_input_filtered = bool(responses_image_safe)
                 candidate_deployments = responses_image_safe or candidate_deployments
 
+            (
+                candidate_deployments,
+                session_affinity_deployment_id,
+                session_affinity_applied,
+            ) = _routing_module._with_session_deployment_affinity(
+                candidate_deployments,
+                request_kwargs,
+                model,
+            )
+
             _trace_module._route_trace(
                 "filter_deployments",
                 request_id=_routing_module._trace_request_id(request_kwargs),
@@ -246,6 +256,8 @@ class LiteLLMMenuHook(CustomLogger):
                 web_search_filtered=web_search_filtered,
                 web_search_unsupported_bridge=web_search_unsupported_bridge,
                 responses_image_input_filtered=responses_image_input_filtered,
+                session_affinity_deployment_id=session_affinity_deployment_id,
+                session_affinity_applied=session_affinity_applied,
                 request_preview=_trace_module._trace_request_preview(request_kwargs, messages=messages),
                 request=_trace_module._trace_request_summary(request_kwargs, messages=messages),
                 healthy=_routing_module._trace_deployments(original_deployments),
@@ -338,6 +350,27 @@ class LiteLLMMenuHook(CustomLogger):
         )
 
     async def async_post_call_streaming_iterator_hook(
+        self,
+        user_api_key_dict: Any,
+        response: Any,
+        request_data: dict,
+    ) -> AsyncIterator[Any]:
+        # The keepalive heartbeat wraps the complete delivery pipeline (start
+        # buffering, guarded delivery, fallback and recovery rounds), so the
+        # downstream client keeps receiving bytes while any internal wait is
+        # in progress. Keepalive chunks intentionally bypass deliver_chunk():
+        # they are already in final wire form and carry no output to adapt.
+        async for chunk in _streaming_module._yield_downstream_keepalive_stream(
+            self._post_call_streaming_iterator_pipeline(
+                user_api_key_dict,
+                response,
+                request_data,
+            ),
+            request_data,
+        ):
+            yield chunk
+
+    async def _post_call_streaming_iterator_pipeline(
         self,
         user_api_key_dict: Any,
         response: Any,

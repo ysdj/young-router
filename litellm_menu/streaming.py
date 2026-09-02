@@ -3957,6 +3957,122 @@ def _is_route_recovery_sse_keepalive(chunk: Any) -> bool:
     return False
 
 
+def _stream_keepalive_chunk(request_data: Optional[dict], sequence: int) -> Any:
+    """A no-op downstream event emitted while the delivery stream is silent.
+
+    The wire form follows ``_route_recovery_sse_keepalive``: Responses
+    clients parse every ``data:`` payload as JSON, so they receive a parseable
+    ``response.metadata`` event; native event-stream clients receive a bare
+    SSE comment; other SSE clients receive a comment string. The event carries
+    no output, so clients that ignore unknown types observe nothing.
+    """
+
+    if _request_is_responses_stream(request_data):
+        return _JSONStreamEvent(
+            {
+                "type": "response.metadata",
+                "metadata": {
+                    "phase": "keepalive",
+                    "sequence": sequence,
+                },
+            }
+        )
+    if _request_uses_native_event_stream(request_data):
+        return (f": litellm_menu keepalive sequence={sequence}\n\n").encode("utf-8")
+    return _sse_comment_event(f"litellm_menu keepalive sequence={sequence}")
+
+
+def _is_stream_keepalive_chunk(chunk: Any) -> bool:
+    if isinstance(chunk, bytes):
+        return chunk.startswith(b": litellm_menu keepalive ")
+    if isinstance(chunk, str):
+        return chunk.startswith(": litellm_menu keepalive ")
+    return (
+        isinstance(chunk, dict)
+        and chunk.get("type") == "response.metadata"
+        and isinstance(chunk.get("metadata"), dict)
+        and chunk["metadata"].get("phase") == "keepalive"
+    )
+
+
+async def _yield_downstream_keepalive_stream(
+    delivery: AsyncIterator[Any],
+    request_data: dict,
+) -> AsyncIterator[Any]:
+    """Heartbeat wrapper around the final downstream delivery stream.
+
+    While the wrapped delivery generator has nothing to yield -- the buffered
+    start phase, a silent upstream reasoning window, or route-recovery polls --
+    emit one keepalive chunk per interval so client-side byte-idle timers do
+    not fire before the proxy's own budgets do. The heartbeat adds no timeout
+    of its own: every internal wait is already bounded by its existing
+    start/idle/recovery deadline, and this wrapper only fills the silence.
+    """
+
+    interval = _routing_module._stream_keepalive_interval_seconds_for_request(
+        request_data
+    )
+    if interval <= 0:
+        async for chunk in delivery:
+            yield chunk
+        return
+
+    iterator = delivery.__aiter__()
+    pending: Optional[asyncio.Task[Any]] = asyncio.create_task(iterator.__anext__())
+    sequence = 0
+
+    async def cancel_pending_read() -> None:
+        nonlocal pending
+        task = pending
+        pending = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, StopAsyncIteration):
+            pass
+        except Exception:
+            pass
+
+    try:
+        while True:
+            task = pending
+            if task is None:
+                return
+            if task.done():
+                try:
+                    chunk = task.result()
+                except StopAsyncIteration:
+                    pending = None
+                    return
+                pending = asyncio.create_task(iterator.__anext__())
+                yield chunk
+                continue
+            try:
+                chunk = await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=interval,
+                )
+            except asyncio.TimeoutError:
+                # The pending read may complete exactly at the timeout; resolve
+                # it through the done-task branch instead of dropping a chunk.
+                if task.done():
+                    continue
+                sequence += 1
+                yield _stream_keepalive_chunk(request_data, sequence)
+                continue
+            except StopAsyncIteration:
+                pending = None
+                return
+            pending = asyncio.create_task(iterator.__anext__())
+            yield chunk
+    finally:
+        await cancel_pending_read()
+        await _close_async_iterator_safely(delivery)
+
+
 async def _sleep_route_recovery_poll_interval(
     delay_seconds: float,
     *,
