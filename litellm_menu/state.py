@@ -10,6 +10,7 @@ from .base import (
     _DEPLOYMENT_COOLDOWN_FILE_ENV,
     _RECENT_REQUESTS_LOG_ENV,
     _ROUTE_RECOVERY_STATE_FILE_ENV,
+    _SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
     datetime,
     fcntl,
     json,
@@ -55,6 +56,16 @@ def _route_recovery_state_file_path() -> Optional[str]:
     if not runtime_root:
         return None
     return os.path.join(runtime_root, ".litellm-runtime", "route-recovery-state.json")
+
+
+def _session_deployment_affinity_file_path() -> Optional[str]:
+    value = os.getenv(_SESSION_DEPLOYMENT_AFFINITY_FILE_ENV, "").strip()
+    if value:
+        return value
+    runtime_root = _runtime_root_from_this_file()
+    if not runtime_root:
+        return None
+    return os.path.join(runtime_root, ".litellm-runtime", "session-deployment-affinity.json")
 
 
 def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
