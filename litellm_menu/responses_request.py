@@ -32,10 +32,14 @@ from .base import (
     _RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_METADATA_KEY,
     _RESPONSES_FUNCTION_TOOL_BRIDGE_PREEMPTIVE_METADATA_KEY,
+    _SUPPORTS_RESPONSES_WEB_SEARCH_KEY,
+    _SUPPORTS_WEB_SEARCH_KEY,
     _RouteOrder,
     _STREAM_ERROR_FALLBACK_METADATA_KEY,
     _STREAM_FALLBACK_METADATA_KEY,
     _UPSTREAM_METADATA_FORWARD_FLAGS,
+    _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
+    _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_KEY,
     _WEB_SEARCH_EXTERNAL_BRIDGE_STREAM_KEY,
@@ -1249,6 +1253,179 @@ def _codex_tool_is_hosted_web_search(tool: Any) -> bool:
     )
 
 
+_CODEX_GPT_RESPONSES_PROVIDER_NAMES = frozenset({"openai", "chatgpt"})
+
+
+def _codex_selected_provider_name(request_kwargs: Optional[dict]) -> str:
+    if not isinstance(request_kwargs, dict):
+        return ""
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    provider = model_info.get("provider")
+    if isinstance(provider, str) and provider.strip():
+        return provider.strip().lower()
+    for value in (
+        request_kwargs.get("custom_llm_provider"),
+        (request_kwargs.get("litellm_params") or {}).get("custom_llm_provider")
+        if isinstance(request_kwargs.get("litellm_params"), dict)
+        else None,
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return ""
+
+
+def _codex_request_responses_surface(request_kwargs: Optional[dict]) -> str:
+    if not isinstance(request_kwargs, dict):
+        return ""
+    current_surface = _routing_module._request_current_upstream_surface(request_kwargs)
+    if current_surface:
+        return current_surface
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    configured_surface = model_info.get("upstream_url_surface")
+    if isinstance(configured_surface, str) and configured_surface.strip():
+        return configured_surface.strip().lower()
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return _UPSTREAM_URL_SURFACE_OPENAI_CHAT
+    return (
+        _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+        if _request_is_responses_api(request_kwargs)
+        else ""
+    )
+
+
+def _request_is_codex_gpt_responses_route(request_kwargs: Optional[dict]) -> bool:
+    """Return whether Codex may use the GPT Responses native search tool.
+
+    A generic ``openai/responses`` adapter is not enough: LiteLLM uses that
+    surface for many third-party gateways.  Provider identity or the official
+    OpenAI origin must identify a GPT-compatible route; missing capability
+    metadata on an unrelated provider is deliberately not optimistic.
+    """
+
+    if not isinstance(request_kwargs, dict) or not _request_has_responses_shape(request_kwargs):
+        return False
+    if request_kwargs.get("use_chat_completions_api") is True:
+        return False
+    surface = _codex_request_responses_surface(request_kwargs)
+    if surface and surface != _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+        return False
+
+    model_info = _request_context_module._request_model_info(request_kwargs)
+    if (
+        model_info.get(_SUPPORTS_RESPONSES_WEB_SEARCH_KEY) is False
+        or model_info.get(_SUPPORTS_WEB_SEARCH_KEY) is False
+    ):
+        return False
+
+    if _api_base_host(_request_api_base(request_kwargs)) == "api.openai.com":
+        return True
+    if _codex_selected_provider_name(request_kwargs) in _CODEX_GPT_RESPONSES_PROVIDER_NAMES:
+        return True
+
+    # Route identity is intentionally required. A standalone capability flag
+    # without an identified provider or official endpoint is not proof that a
+    # third-party gateway implements GPT hosted search.
+    return False
+
+
+def _codex_bridge_search_declarations(
+    request_kwargs: dict,
+    direct_tools: List[dict],
+) -> dict:
+    """Replace Responses/provider search declarations with local functions."""
+
+    modified_kwargs = request_kwargs.copy()
+    from . import responses_tools as _responses_tools_module
+
+    existing_extra_body = request_kwargs.get("extra_body")
+    source_tools = request_kwargs.get("tools")
+    if not isinstance(source_tools, list) and isinstance(existing_extra_body, dict):
+        source_tools = existing_extra_body.get("tools")
+    top_level_tools = copy.deepcopy(source_tools) if isinstance(source_tools, list) else []
+    bridged_tools, _stats = _responses_tools_module._responses_external_web_search_bridge_tools(
+        top_level_tools
+    )
+    if bridged_tools is not None:
+        top_level_tools = bridged_tools
+
+    # The Codex client can carry an older ordinary-function declaration with
+    # one of the bridge names. Replace it with the canonical schema rather
+    # than leaving a same-named function with incompatible parameters.
+    local_tool_names = {
+        _codex_tool_definition_name(tool)
+        for tool in direct_tools
+        if _codex_tool_definition_name(tool) is not None
+    }
+    top_level_tools = [
+        tool
+        for tool in top_level_tools
+        if _codex_tool_definition_name(tool) not in local_tool_names
+    ]
+    existing_names = {
+        name
+        for tool in top_level_tools
+        if (name := _codex_tool_definition_name(tool)) is not None
+    }
+    for direct_tool in direct_tools:
+        name = _codex_tool_definition_name(direct_tool)
+        if name and name not in existing_names:
+            top_level_tools.append(copy.deepcopy(direct_tool))
+            existing_names.add(name)
+    modified_kwargs["tools"] = top_level_tools
+
+    input_value = request_kwargs.get("input")
+    if isinstance(input_value, list):
+        updated_input: list[Any] = []
+        changed_input = False
+        leading_additional_tools = True
+        for item in input_value:
+            if (
+                leading_additional_tools
+                and isinstance(item, dict)
+                and item.get("type") == "additional_tools"
+            ):
+                item_tools = item.get("tools")
+                if isinstance(item_tools, list):
+                    remaining_tools = [
+                        copy.deepcopy(tool)
+                        for tool in item_tools
+                        if not _codex_tool_is_web_search_declaration(tool)
+                    ]
+                    if remaining_tools != item_tools:
+                        changed_input = True
+                        if remaining_tools:
+                            updated_item = copy.deepcopy(item)
+                            updated_item["tools"] = remaining_tools
+                            updated_input.append(updated_item)
+                        continue
+            else:
+                leading_additional_tools = False
+            updated_input.append(copy.deepcopy(item))
+        if changed_input:
+            modified_kwargs["input"] = updated_input
+
+    if "web_search_options" in modified_kwargs:
+        modified_kwargs.pop("web_search_options", None)
+    tool_choice = modified_kwargs.get("tool_choice")
+    if (
+        isinstance(tool_choice, dict)
+        and _codex_tool_is_web_search_declaration(tool_choice)
+    ) or (
+        isinstance(tool_choice, str)
+        and tool_choice in (
+            {"web_search", "web_search_preview"}
+            | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES
+        )
+    ):
+        modified_kwargs["tool_choice"] = "auto"
+
+    if isinstance(existing_extra_body, dict) and "tools" in existing_extra_body:
+        updated_extra_body = existing_extra_body.copy()
+        updated_extra_body["tools"] = copy.deepcopy(top_level_tools)
+        modified_kwargs["extra_body"] = updated_extra_body
+    return modified_kwargs
+
+
 def _codex_openrouter_native_search_request(
     request_kwargs: dict,
     _declared_tools: List[dict],
@@ -1454,14 +1631,8 @@ def _with_codex_openrouter_native_web_search_tool(
 def _with_codex_external_web_search_bridge_tool(
     request_kwargs: dict,
 ) -> Optional[dict]:
-    """Expose pi-web-access functions to Codex model turns.
+    """Expose local web access for Codex routes without native search."""
 
-    Codex's standalone ``/alpha/search`` endpoint is not represented in the
-    Responses model tool list.  Expose the bundled pi-web-access functions as
-    ordinary Responses tools so the model can choose them from their schemas.
-    This hook deliberately does not alter ``instructions`` or require a tool
-    call; execution remains driven by the model's normal function-call output.
-    """
     if not _request_has_responses_shape(request_kwargs):
         return None
     if _request_is_codex_compaction(request_kwargs):
@@ -1470,84 +1641,66 @@ def _with_codex_external_web_search_bridge_tool(
         return None
 
     openrouter_route = _request_is_openrouter_route(request_kwargs)
-    # Keep the direct worker contract attached to turns that already carry a
-    # client tool registry. Once an OpenRouter route has a remembered or
-    # explicit native-search rejection, it also needs the local pair even when
-    # the original request had no other callable tools.
     declared_tools = _codex_declared_tools(request_kwargs)
-    if not declared_tools and not openrouter_route:
+
+    if openrouter_route:
+        # OpenRouter has its own provider-native Responses tool. The native
+        # hook runs immediately before this one and converts plain/hosted
+        # declarations; only an explicit negative or cached rejection uses
+        # the local bridge.
+        capability_request = _codex_openrouter_search_capability_probe_request(
+            request_kwargs,
+            declared_tools,
+        )
+        from . import responses_surfaces as _responses_surfaces_module
+
+        if (
+            _responses_surfaces_module._request_native_responses_web_search_support_decision(
+                capability_request
+            )
+            is not False
+        ):
+            return None
+    elif _request_is_codex_gpt_responses_route(request_kwargs):
+        # Official GPT/ChatGPT Responses routes retain Codex's native search
+        # behavior. This check intentionally does not use a generic
+        # openai/responses surface because third-party gateways share it.
         return None
 
     from . import responses_surfaces as _responses_surfaces_module
-
-    # Native search must get the first opportunity. An unknown capability on
-    # a Responses route is deliberately left untouched; the local pair is
-    # reserved for an explicit unsupported capability or a cached deterministic
-    # rejection so the upstream still gets to produce native search events.
-    capability_request = (
-        _codex_openrouter_search_capability_probe_request(
-            request_kwargs, declared_tools
-        )
-        if openrouter_route
-        else request_kwargs
-    )
-    native_search_rejected = (
-        _responses_surfaces_module._request_native_responses_web_search_support_decision(
-            capability_request
-        )
-        is False
-    )
-    if (
-        _responses_surfaces_module._request_supports_native_responses_web_search(
-            capability_request
-        )
-        or _responses_surfaces_module._request_should_try_unknown_native_responses_web_search(
-            capability_request
-        )
-    ):
-        return None
+    from . import responses_tools as _responses_tools_module
 
     # These are ordinary client-side function tools backed by the local
-    # pi-web-access worker, not a claim that the selected upstream exposes
-    # hosted web search. If the selected route explicitly cannot accept
-    # Responses function tools, do not advertise functions that it cannot
-    # receive.
-    supports_function_tools = (
-        _responses_surfaces_module._request_supports_responses_function_tools(
-            request_kwargs
-        )
-    )
+    # pi-web-access worker. An explicit false function-tool capability still
+    # wins because that route cannot receive the bridge representation.
+    model_info = _request_context_module._request_model_info(request_kwargs)
     explicit_function_tool_rejection = (
-        _request_context_module._request_model_info(request_kwargs).get(
-            "supports_responses_function_tools"
-        )
-        is False
+        model_info.get("supports_responses_function_tools") is False
     )
-    if not supports_function_tools and not (
-        openrouter_route
-        and native_search_rejected
-        and not explicit_function_tool_rejection
-    ):
+    if explicit_function_tool_rejection:
         return None
-
-    tools = request_kwargs.get("tools")
-    for tool in declared_tools:
-        if not isinstance(tool, dict):
-            continue
-        if _codex_tool_is_web_search_declaration(tool):
+    if not _responses_surfaces_module._request_supports_responses_function_tools(
+        request_kwargs
+    ):
+        # Chat/Anthropic fallback surfaces can still receive ordinary function
+        # tools through their existing surface adapter. A route explicitly
+        # marked as unable to receive them was handled above.
+        surface = _codex_request_responses_surface(request_kwargs)
+        if surface not in {"openai/chat", "anthropic"}:
             return None
-
-    # Keep the canonical pi-web-access schemas in the Responses tool module;
-    # the local import avoids a module cycle during startup.
-    from . import responses_tools as _responses_tools_module
 
     direct_tools = _responses_tools_module._pi_web_access_tool_definitions()
     if not direct_tools:
         return None
-    updated_tools = list(tools) if isinstance(tools, list) else []
-    updated_tools.extend(direct_tools)
-    modified_kwargs = request_kwargs.copy()
-    modified_kwargs["tools"] = updated_tools
+
+    # A plain Codex turn also needs the local functions: there may be no
+    # hosted declaration because the standalone search setting is omitted.
+    modified_kwargs = _codex_bridge_search_declarations(
+        request_kwargs,
+        direct_tools,
+    )
+    if modified_kwargs == request_kwargs:
+        return None
     return modified_kwargs
 
 

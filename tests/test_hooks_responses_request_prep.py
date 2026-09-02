@@ -155,10 +155,51 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._with_codex_external_web_search_bridge_tool(modified)
         )
 
-    def test_codex_responses_unknown_search_capability_keeps_native_route(self) -> None:
+    def test_codex_responses_unknown_search_capability_bridges_local_search(self) -> None:
         hooks, _ = load_hook_module()
         original = self._codex_collaboration_request()
         original["model_info"] = {
+            "upstream_url_surface": "openai/responses",
+        }
+
+        # A generic openai/responses surface is shared by many third-party
+        # gateways, so unknown capability metadata must not keep Codex's
+        # native GPT search route: the local pi-web-access bridge takes over.
+        bridged = hooks._with_codex_external_web_search_bridge_tool(original)
+        self.assertIsNotNone(bridged)
+        bridged_tools = [
+            tool.get("name")
+            for tool in (bridged or {}).get("tools", [])
+            if isinstance(tool, dict)
+        ]
+        self.assertIn("web_search", bridged_tools)
+        self.assertIn("fetch_content", bridged_tools)
+        self.assertEqual(original["tools"], [])
+
+    def test_codex_non_gpt_route_bridges_explicit_search_capability(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model_info"] = {
+            "provider": "third-party",
+            "upstream_url_surface": "openai/responses",
+            "supports_responses_web_search": True,
+        }
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            {tool["name"] for tool in modified["tools"] if "name" in tool},
+            {"web_search", "fetch_content"},
+        )
+
+    def test_codex_gpt_responses_route_keeps_native_search(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["api_base"] = "https://api.openai.com/v1"
+        original["model_info"] = {
+            "provider": "third-party",
             "upstream_url_surface": "openai/responses",
         }
 
@@ -167,10 +208,49 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertEqual(original["tools"], [])
 
+    def test_codex_provider_switch_does_not_use_stale_custom_provider(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["custom_llm_provider"] = "openai"
+        original["model_info"] = {
+            "provider": "third-party",
+            "upstream_url_surface": "openai/responses",
+        }
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            {tool["name"] for tool in modified["tools"] if "name" in tool},
+            {"web_search", "fetch_content"},
+        )
+
+    def test_codex_plain_non_gpt_turn_receives_local_search_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["input"] = [{"role": "user", "content": "Search the web."}]
+        original["tools"] = []
+        original["model_info"] = {
+            "provider": "third-party",
+            "upstream_url_surface": "openai/responses",
+        }
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            [tool["name"] for tool in modified["tools"]],
+            ["web_search", "fetch_content"],
+        )
+
     def test_codex_responses_native_search_capability_keeps_native_route(self) -> None:
         hooks, _ = load_hook_module()
         original = self._codex_collaboration_request()
         original["model_info"] = {
+            "provider": "openai",
+            "upstream_url_surface": "openai/responses",
             "supports_responses_web_search": True,
         }
 

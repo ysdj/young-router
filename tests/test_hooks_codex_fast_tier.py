@@ -23,6 +23,10 @@ class HookCodexFastTierTests(HookTestCase):
             "call_type": "aresponses",
             "model": "default-chat",
             "input": "hello",
+            # The official OpenAI route is the realistic fast-mode target and
+            # keeps Codex's native search behavior, so the local web-search
+            # bridge never rewrites these service-tier fixtures.
+            "model_info": {"provider": "openai"},
             "extra_headers": {"User-Agent": "Codex Desktop/1.0"},
             "proxy_server_request": {
                 "url": "http://127.0.0.1:4000/v1/responses",
