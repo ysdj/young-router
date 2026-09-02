@@ -111,6 +111,13 @@ from .base import (
     _SESSION_NAME_KEY_FRAGMENTS,
     _STALL_TIMEOUT_DEFAULT_SECONDS,
     _STALL_TIMEOUT_SECONDS_ENV,
+    _SESSION_DEPLOYMENT_AFFINITY,
+    _SESSION_DEPLOYMENT_AFFINITY_ENV,
+    _SESSION_DEPLOYMENT_AFFINITY_LOCK,
+    _SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES,
+    _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS,
+    _STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS,
+    _STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV,
     _STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _STREAM_START_TIMEOUT_SECONDS_ENV,
     _STREAM_ROUTE_EXHAUSTION_DEFAULT_RETRIES,
@@ -416,6 +423,34 @@ def _stall_timeout_seconds() -> float:
         parsed = float(value)
     except ValueError:
         return _STALL_TIMEOUT_DEFAULT_SECONDS
+    return max(0.0, parsed)
+
+
+def _stream_keepalive_interval_seconds_for_request(
+    request_data: Optional[dict],
+) -> float:
+    """Downstream keepalive heartbeat interval for this streaming request.
+
+    Resolution order: request metadata override
+    (``stream_keepalive_interval_seconds``, positive values only), then the
+    ``LITELLM_MENU_STREAM_KEEPALIVE_INTERVAL_SECONDS`` environment value
+    (``0`` disables the heartbeat), then the default interval. Invalid
+    environment values fall back to the default.
+    """
+
+    override = _request_metadata_positive_float(
+        request_data,
+        "stream_keepalive_interval_seconds",
+    )
+    if override is not None:
+        return override
+    value = os.getenv(_STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV, "").strip()
+    if not value:
+        return _STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS
     return max(0.0, parsed)
 
 
@@ -1007,6 +1042,208 @@ def _deployment_cooldown_update_shared(callback: Any) -> Any:
         return _state_module._locked_json_state_update(path, update)
     except OSError:
         return None
+
+
+def _session_deployment_affinity_enabled() -> bool:
+    """Whether session deployment (prompt-cache) affinity steers routing.
+
+    Enabled by default; set ``LITELLM_MENU_SESSION_DEPLOYMENT_AFFINITY`` to
+    ``0``/``off``/``false`` to restore pure strategy-based selection.
+    """
+
+    value = os.getenv(_SESSION_DEPLOYMENT_AFFINITY_ENV, "").strip().lower()
+    return value not in ("0", "off", "false")
+
+
+def _request_session_affinity_id(request_kwargs: Optional[dict]) -> Optional[str]:
+    """First session-like identifier in the request, for cache affinity."""
+
+    request_kwargs = request_kwargs or {}
+    found: list[str] = []
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 6 or found:
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                normal = _normal_trace_key(key)
+                if (
+                    any(fragment in normal for fragment in _SESSION_ID_KEY_FRAGMENTS)
+                    and isinstance(nested, (str, int))
+                    and str(nested).strip()
+                ):
+                    found.append(str(nested).strip())
+                    return
+                if isinstance(nested, (dict, list)):
+                    visit(nested, depth + 1)
+        elif isinstance(value, list):
+            for nested in value[:20]:
+                if isinstance(nested, (dict, list)):
+                    visit(nested, depth + 1)
+
+    visit(request_kwargs)
+    return found[0] if found else None
+
+
+def _session_affinity_state_map(payload: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(key): entry
+        for key, entry in payload.items()
+        if isinstance(entry, dict) and isinstance(entry.get("deployment_id"), str)
+    }
+
+
+def _prune_session_affinity_entries(
+    entries: dict[str, dict[str, Any]],
+    now: float,
+) -> dict[str, dict[str, Any]]:
+    pruned = {
+        key: entry
+        for key, entry in entries.items()
+        if now - float(entry.get("updated_at") or 0.0) <= _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS
+    }
+    if len(pruned) <= _SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES:
+        return pruned
+    keep = sorted(
+        pruned.items(),
+        key=lambda item: float(item[1].get("updated_at") or 0.0),
+        reverse=True,
+    )[:_SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES]
+    return dict(keep)
+
+
+def _session_affinity_update_shared(callback: Any) -> Any:
+    """Run ``callback(entries, now)`` against worker-shared affinity state."""
+
+    path = _state_module._session_deployment_affinity_file_path()
+    if not path:
+        return None
+
+    def update(payload: dict[str, Any]) -> Any:
+        now = time.time()
+        entries = _prune_session_affinity_entries(
+            _session_affinity_state_map(payload),
+            now,
+        )
+        result = callback(entries, now)
+        pruned = _prune_session_affinity_entries(entries, now)
+        payload.clear()
+        payload.update(pruned)
+        return result
+
+    try:
+        return _state_module._locked_json_state_update(path, update)
+    except OSError:
+        return None
+
+
+def _session_affinity_map_key(session_id: str, model_group: str) -> str:
+    return f"session={session_id} model={model_group}"
+
+
+def _record_session_deployment_affinity(request_kwargs: Optional[dict]) -> None:
+    """Remember which deployment last served this session's model group.
+
+    Recorded on request success (streaming completion included) so the next
+    request for the same session and model group can reuse the upstream's
+    warm prompt cache instead of paying a full fresh prefill elsewhere.
+    """
+
+    if not _session_deployment_affinity_enabled():
+        return
+    session_id = _request_session_affinity_id(request_kwargs)
+    deployment_id = _deployment_id_from_request(request_kwargs)
+    model_group = _responses_execution_module._request_model_group(request_kwargs)
+    if not session_id or not deployment_id or not model_group:
+        return
+    key = _session_affinity_map_key(session_id, model_group)
+    route_key = _deployment_route_key_from_request(request_kwargs)
+
+    def record(
+        entries: dict[str, dict[str, Any]],
+        now: float,
+    ) -> tuple[str, str]:
+        entries[key] = {
+            "deployment_id": deployment_id,
+            "route_key": route_key,
+            "updated_at": now,
+        }
+        return key, deployment_id
+
+    result = _session_affinity_update_shared(record)
+    if not isinstance(result, tuple):
+        with _SESSION_DEPLOYMENT_AFFINITY_LOCK:
+            _SESSION_DEPLOYMENT_AFFINITY[key] = {
+                "deployment_id": deployment_id,
+                "route_key": route_key,
+                "updated_at": time.time(),
+            }
+            pruned = _prune_session_affinity_entries(
+                _SESSION_DEPLOYMENT_AFFINITY,
+                time.time(),
+            )
+            _SESSION_DEPLOYMENT_AFFINITY.clear()
+            _SESSION_DEPLOYMENT_AFFINITY.update(pruned)
+
+
+def _session_affinity_deployment_id(
+    request_kwargs: Optional[dict],
+    model_group: Optional[str],
+) -> Optional[str]:
+    session_id = _request_session_affinity_id(request_kwargs)
+    if not session_id or not model_group:
+        return None
+    key = _session_affinity_map_key(session_id, model_group)
+
+    def lookup(
+        entries: dict[str, dict[str, Any]],
+        now: float,
+    ) -> tuple[Optional[str]]:
+        entry = entries.get(key)
+        if not isinstance(entry, dict):
+            return (None,)
+        deployment_id = entry.get("deployment_id")
+        if isinstance(deployment_id, str) and deployment_id:
+            return (deployment_id,)
+        return (None,)
+
+    result = _session_affinity_update_shared(lookup)
+    if isinstance(result, tuple):
+        return result[0]
+    with _SESSION_DEPLOYMENT_AFFINITY_LOCK:
+        entry = _SESSION_DEPLOYMENT_AFFINITY.get(key)
+        if not isinstance(entry, dict):
+            return None
+        deployment_id = entry.get("deployment_id")
+        return deployment_id if isinstance(deployment_id, str) and deployment_id else None
+
+
+def _with_session_deployment_affinity(
+    candidates: Any,
+    request_kwargs: Optional[dict],
+    model_group: Optional[str],
+) -> tuple[Any, Optional[str], bool]:
+    """Narrow eligible candidates to the session's cache-affinity deployment.
+
+    Applied last, after order/cooldown/capability filtering, so the sticky
+    deployment is always fully eligible. When it is absent (cooldown,
+    capability exclusion, retry exclusion), selection is unchanged; a later
+    success on another deployment re-points the affinity.
+    """
+
+    if not _session_deployment_affinity_enabled():
+        return candidates, None, False
+    if not isinstance(candidates, list) or len(candidates) < 2:
+        return candidates, None, False
+    sticky = _session_affinity_deployment_id(request_kwargs, model_group)
+    if not sticky:
+        return candidates, None, False
+    for deployment in candidates:
+        if _responses_request_module._deployment_id(deployment) == sticky:
+            return [deployment], sticky, True
+    return candidates, sticky, False
 
 
 _CODEX_COMPACTION_CAPABILITY_PROBE_TIMEOUT_SECONDS = 15.0
@@ -3395,15 +3632,6 @@ def _request_surface_for_deployment(
     request_kwargs: Optional[dict],
     deployment: Any,
 ) -> str:
-    if _responses_request_module._request_has_structured_codex_compaction(
-        request_kwargs
-    ):
-        # Remote Codex compaction is a Responses protocol operation: the
-        # only acceptable terminal payload is an encrypted ``compaction``
-        # item. A Chat or Anthropic adapter can produce an ordinary answer,
-        # but it cannot satisfy that contract. Ignore fixed/stale fallback
-        # surface state and probe the route's Responses endpoint instead.
-        return _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
     if _deployment_protocol_mode(deployment) == _UPSTREAM_PROTOCOL_MODE_FIXED:
         return _deployment_surface(deployment)
     deployment_id = _responses_request_module._deployment_id(deployment)
@@ -3526,17 +3754,6 @@ def _next_upstream_surface_for_failed_deployment(
         return None
     fallback_surface = _deployment_surface(deployment)
     if not fallback_surface:
-        return None
-    if (
-        _responses_request_module._request_has_structured_codex_compaction(
-            request_kwargs
-        )
-        and fallback_surface != _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
-    ):
-        # A structured compaction cannot be downgraded to the configured Chat
-        # or Anthropic surface. Let normal ordered failover select another
-        # deployment instead of accepting an ordinary assistant response as a
-        # false compaction success.
         return None
     attempted = _request_attempted_upstream_surfaces(request_kwargs)
     current_surface = _request_current_upstream_surface(request_kwargs)
@@ -5218,6 +5435,11 @@ def _record_deployment_failure_for_cooldown(
 
 
 def _record_deployment_success_for_cooldown(request_kwargs: Optional[dict]) -> None:
+    # Successful requests also refresh the session's deployment affinity so
+    # the next request for the same session/model group reuses the upstream's
+    # warm prompt cache. Every success path (non-streaming completion, stream
+    # completion, guarded stream success) funnels through here.
+    _record_session_deployment_affinity(request_kwargs)
     cooldown_keys = _deployment_cooldown_keys_from_request(request_kwargs)
     if not cooldown_keys:
         return

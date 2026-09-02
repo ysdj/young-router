@@ -123,7 +123,7 @@ class CodexConfigTests(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual([], models)
 
-    def test_litellm_model_selection_enables_native_checkpoint_fallback(self) -> None:
+    def test_litellm_model_selection_preserves_compaction_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime_config = Path(directory) / "config.yaml"
             self.write_runtime_config(runtime_config)
@@ -151,8 +151,51 @@ class CodexConfigTests(unittest.TestCase):
         self.assertEqual("openai", parsed["model_provider"])
         self.assertEqual("active-chat", parsed["model"])
         self.assertTrue(parsed["features"]["goals"])
-        self.assertTrue(parsed["features"]["token_budget"])
+        self.assertNotIn("token_budget", parsed["features"])
         self.assertEqual("sk-test-local", json.loads(auth_text)["OPENAI_API_KEY"])
+
+    def test_litellm_model_selection_strips_legacy_forced_token_budget_once(self) -> None:
+        selection = {
+            "litellm_model": {
+                "model": "active-chat",
+                "provider": "active",
+                "deployment_id": "a1b2c3d4",
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_config = Path(directory) / "config.yaml"
+            self.write_runtime_config(runtime_config)
+            with mock.patch.object(
+                codex_config,
+                "local_base_url",
+                return_value="http://127.0.0.1:4999/v1",
+            ):
+                first, _auth_text, _config, _auth = codex_config.apply_structured_patch(
+                    'model = "previous"\n[features]\ntoken_budget = true\ngoals = true\n',
+                    "{}\n",
+                    selection,
+                    runtime_config,
+                )
+
+                marker = codex_config.legacy_token_budget_marker_path(runtime_config)
+                self.assertTrue(marker.exists())
+                parsed_first = tomllib.loads(first)
+                self.assertNotIn("token_budget", parsed_first["features"])
+                self.assertTrue(parsed_first["features"]["goals"])
+
+                # After the one-time cleanup, an explicitly re-enabled value
+                # survives later LiteLLM selections untouched.
+                re_enabled = codex_config.set_table_value(
+                    first, ("features",), "token_budget", True
+                )
+                second, _auth2, _config2, _auth3 = codex_config.apply_structured_patch(
+                    re_enabled,
+                    "{}\n",
+                    selection,
+                    runtime_config,
+                )
+
+                self.assertTrue(tomllib.loads(second)["features"]["token_budget"])
 
     def test_litellm_model_selection_preserves_custom_provider_for_standalone_search(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -169,6 +212,7 @@ class CodexConfigTests(unittest.TestCase):
                 base_url1 = "https://fallback.example.test/v1"
                 wire_api = "responses"
                 requires_openai_auth = true
+                supports_standalone_web_search = true
                 """
             ).lstrip()
 
@@ -195,6 +239,7 @@ class CodexConfigTests(unittest.TestCase):
         self.assertEqual("active-chat", parsed["model"])
         self.assertEqual("https://stale-openai.example.test/v1", parsed["openai_base_url"])
         self.assertEqual("http://127.0.0.1:4999/v1", parsed["model_providers"]["newapi"]["base_url"])
+        self.assertNotIn("supports_standalone_web_search", parsed["model_providers"]["newapi"])
         self.assertEqual("https://fallback.example.test/v1", parsed["model_providers"]["newapi"]["base_url1"])
         self.assertEqual("sk-test-local", json.loads(auth_text)["OPENAI_API_KEY"])
 

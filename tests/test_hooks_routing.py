@@ -1642,7 +1642,7 @@ class HookRoutingTests(HookTestCase):
             "anthropic",
         )
 
-    def test_structured_compaction_forces_responses_surface_even_for_fixed_route(self) -> None:
+    def test_structured_compaction_respects_fixed_route_surface(self) -> None:
         hooks, _ = load_hook_module()
         deployment = {
             "litellm_params": {"model": "anthropic/vendor-model", "order": 1},
@@ -1664,17 +1664,57 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(
             hooks._request_surface_for_deployment(request, deployment),
-            "openai/responses",
+            "anthropic",
         )
 
-    def test_structured_compaction_skips_non_responses_same_route_fallback(self) -> None:
+    def test_structured_compaction_allows_configured_same_route_fallback(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/vendor-model", "order": 1},
+            "model_info": {
+                "id": "dual-protocol-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "stream": True,
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "_target_order": 1,
+            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_litellm_menu_attempted_upstream_url_surfaces": ["openai/responses"],
+            "_litellm_menu_upstream_url_surface_deployment_id": "dual-protocol-route",
+            "model_info": deployment["model_info"],
+            "litellm_params": deployment["litellm_params"],
+        }
+        error = RuntimeError("Responses endpoint not found")
+        error.status_code = 404
+        hooks._mark_exception_for_upstream_surface_failover(error, request)
+
+        entry = hooks._next_upstream_surface_for_failed_deployment(
+            Router(), error, request
+        )
+
+        self.assertEqual(entry, ("openai/chat", "dual-protocol-route"))
+
+    def test_structured_compaction_skips_fixed_non_responses_route(self) -> None:
         hooks, _ = load_hook_module()
         primary = {
             "litellm_params": {"model": "anthropic/vendor-model", "order": 1},
             "model_info": {
                 "id": "anthropic-route",
                 "upstream_url_surface": "anthropic",
-                "upstream_protocol_mode": "fallback",
+                "upstream_protocol_mode": "fixed",
             },
         }
         peer = {
