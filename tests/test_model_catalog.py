@@ -22,6 +22,10 @@ from litellm_menu.core.model_contexts import (
 from litellm_menu.core.runtime_settings_schema import runtime_settings_metadata
 
 
+def _number_text_for_schema(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
 class ModelCatalogTests(unittest.TestCase):
     def test_model_context_refresh_default_is_six_hours(self) -> None:
         self.assertEqual(6, DEFAULT_MODEL_CONTEXT_REFRESH_HOURS)
@@ -31,6 +35,50 @@ class ModelCatalogTests(unittest.TestCase):
             if item.get("key") == "LITELLM_MENU_MODEL_CONTEXT_REFRESH_HOURS"
         )
         self.assertEqual("6", setting["default"])
+
+    def test_runtime_schema_defaults_match_proxy_defaults(self) -> None:
+        from litellm_menu import base as base_module
+
+        defaults_by_key = {
+            str(item.get("key")): str(item.get("default"))
+            for item in runtime_settings_metadata()
+        }
+        self.assertEqual(
+            str(int(base_module._WEBSOCKET_MAX_FRAME_DEFAULT_BYTES)),
+            defaults_by_key["LITELLM_MENU_WEBSOCKET_MAX_FRAME_BYTES"],
+        )
+        self.assertEqual(
+            _number_text_for_schema(
+                base_module._HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS
+            ),
+            defaults_by_key["LITELLM_MENU_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS"],
+        )
+        self.assertEqual(
+            _number_text_for_schema(
+                base_module._HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES
+            ),
+            defaults_by_key["LITELLM_MENU_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"],
+        )
+        self.assertEqual(
+            "1" if base_module._PREFIX_IMAGE_PREVIEW_ENABLED_DEFAULT else "0",
+            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_PREVIEW_ENABLED"],
+        )
+        self.assertEqual(
+            str(base_module._PREFIX_IMAGE_PREVIEW_MIN_BYTES_DEFAULT),
+            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_PREVIEW_MIN_BYTES"],
+        )
+        self.assertEqual(
+            base_module._PREFIX_IMAGE_MODE_DEFAULT,
+            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_MODE"],
+        )
+        self.assertEqual(
+            str(base_module._PREFIX_IMAGE_RECENT_COUNT_DEFAULT),
+            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_RECENT_COUNT"],
+        )
+        self.assertEqual(
+            "1" if base_module._PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT else "0",
+            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_ORIGINAL_PATH"],
+        )
 
     def test_selected_names_keep_explicit_models_in_order_and_dedupe(self) -> None:
         config = {
@@ -378,6 +426,207 @@ class ModelCatalogTests(unittest.TestCase):
 
         self.assertEqual(262_144, model["context_window"])
         self.assertEqual(1_048_576, model["max_context_window"])
+
+    def test_search_tool_advertisement_mirrors_gpt_family_default(self) -> None:
+        native_profile = {
+            "slug": "gpt-5.6-sol",
+            "base_instructions": "Native prompt",
+            "model_messages": {"instructions_template": "Native prompt"},
+            "supports_search_tool": True,
+            "web_search_tool_type": "text_and_image",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: gpt-5-test\n"
+                "    litellm_params:\n"
+                "      model: openai/gpt-5-test\n",
+                encoding="utf-8",
+            )
+            cache = root / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "records": {
+                            "gpt-5-test": {
+                                "context_window": 272_000,
+                                "max_context_window": 272_000,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime,
+                cache_path=cache,
+                refresh_enabled=False,
+            )
+            with mock.patch(
+                "litellm_menu.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                model = catalog_payload(["gpt-5-test"], registry=registry)["models"][0]
+
+        self.assertTrue(model["supports_search_tool"])
+        self.assertEqual("text_and_image", model["web_search_tool_type"])
+
+    def test_non_gpt_route_drops_inherited_search_tool_advertisement(self) -> None:
+        native_profile = {
+            "slug": "gpt-5.6-sol",
+            "base_instructions": "Native prompt",
+            "model_messages": {"instructions_template": "Native prompt"},
+            "supports_search_tool": True,
+            "web_search_tool_type": "text_and_image",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: kimi-k3\n"
+                "    litellm_params:\n"
+                "      model: anthropic/kimi-k3\n",
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(runtime_config_path=runtime, refresh_enabled=False)
+            with mock.patch(
+                "litellm_menu.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                model = catalog_payload(["kimi-k3"], registry=registry)["models"][0]
+
+        self.assertFalse(model["supports_search_tool"])
+        self.assertNotIn("web_search_tool_type", model)
+
+    def test_explicit_false_search_capability_wins_on_gpt_family_route(self) -> None:
+        native_profile = {
+            "slug": "gpt-5.6-sol",
+            "base_instructions": "Native prompt",
+            "model_messages": {"instructions_template": "Native prompt"},
+            "supports_search_tool": True,
+            "web_search_tool_type": "text_and_image",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: gpt-5-test\n"
+                "    litellm_params:\n"
+                "      model: openai/gpt-5-test\n"
+                "    model_info:\n"
+                "      supports_web_search: false\n",
+                encoding="utf-8",
+            )
+            cache = root / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "records": {
+                            "gpt-5-test": {
+                                "context_window": 272_000,
+                                "max_context_window": 272_000,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime,
+                cache_path=cache,
+                refresh_enabled=False,
+            )
+            with mock.patch(
+                "litellm_menu.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                model = catalog_payload(["gpt-5-test"], registry=registry)["models"][0]
+
+        self.assertFalse(model["supports_search_tool"])
+        self.assertNotIn("web_search_tool_type", model)
+
+    def test_official_openai_route_keeps_search_tool_advertisement(self) -> None:
+        native_profile = {
+            "slug": "gpt-5.6-sol",
+            "base_instructions": "Native prompt",
+            "model_messages": {"instructions_template": "Native prompt"},
+            "supports_search_tool": True,
+            "web_search_tool_type": "text_and_image",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: third-party-alias\n"
+                "    litellm_params:\n"
+                "      custom_llm_provider: openai\n"
+                "      model: gpt-5-test\n",
+                encoding="utf-8",
+            )
+            cache = root / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "records": {
+                            "openai/gpt-5-test": {
+                                "context_window": 272_000,
+                                "max_context_window": 272_000,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime,
+                cache_path=cache,
+                refresh_enabled=False,
+            )
+            with mock.patch(
+                "litellm_menu.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                model = catalog_payload(["third-party-alias"], registry=registry)["models"][0]
+
+        self.assertTrue(model["supports_search_tool"])
+        self.assertEqual("text_and_image", model["web_search_tool_type"])
+
+    def test_search_tool_advertisement_keeps_native_profile_without_route_config(self) -> None:
+        native_profile = {
+            "slug": "gpt-5.6-sol",
+            "base_instructions": "Native prompt",
+            "model_messages": {"instructions_template": "Native prompt"},
+            "supports_search_tool": True,
+            "web_search_tool_type": "text_and_image",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "records": {
+                            "unlisted-alias": {
+                                "context_window": 272_000,
+                                "max_context_window": 272_000,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            with mock.patch(
+                "litellm_menu.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ):
+                model = catalog_payload(["unlisted-alias"], registry=registry)["models"][0]
+
+        self.assertTrue(model["supports_search_tool"])
+        self.assertEqual("text_and_image", model["web_search_tool_type"])
 
     def test_catalog_uses_safest_window_across_routes_in_one_public_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

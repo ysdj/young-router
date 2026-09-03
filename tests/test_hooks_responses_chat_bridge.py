@@ -1661,7 +1661,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
             "tools": [{"type": "web_search"}],
             "tool_choice": "auto",
             "model_info": {
-                "provider": "tbtk",
+                "provider": "relay-provider",
                 "upstream_url_surface": "anthropic",
             },
             "_litellm_menu_upstream_url_surface": "anthropic",

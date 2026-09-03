@@ -119,6 +119,7 @@ class RuntimePaths:
     webdav_sync_state: Path
     recovery: Path
     cooldowns: Path
+    affinity: Path
 
     @classmethod
     def from_root(cls, root: Path | str | None = None) -> "RuntimePaths":
@@ -137,6 +138,7 @@ class RuntimePaths:
             webdav_sync_state=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATE", runtime / "webdav-sync-state.json")).expanduser(),
             recovery=Path(os.environ.get("LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE", runtime / "route-recovery-state.json")).expanduser(),
             cooldowns=Path(os.environ.get("LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE", runtime / "deployment-cooldowns.json")).expanduser(),
+            affinity=Path(os.environ.get("LITELLM_MENU_SESSION_DEPLOYMENT_AFFINITY_FILE", runtime / "session-deployment-affinity.json")).expanduser(),
         )
 
 
@@ -539,6 +541,7 @@ class CoreServiceController:
         env["LITELLM_NATIVE_PID_FILE"] = str(self.paths.pid)
         env["LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE"] = str(self.paths.recovery)
         env["LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE"] = str(self.paths.cooldowns)
+        env["LITELLM_MENU_SESSION_DEPLOYMENT_AFFINITY_FILE"] = str(self.paths.affinity)
         # Keep request summaries beside the managed configuration for both
         # Finder-launched and terminal-launched Core processes.  The native
         # preview path sets this explicitly too; production must not rely on
@@ -651,6 +654,31 @@ class CoreServiceController:
         except Exception:
             return False
 
+    def _health_refused(self, port: int | None = None) -> bool:
+        """Whether the health listener is gone (connections are refused).
+
+        A recorded proxy whose master process is still alive but whose
+        uvicorn workers have all exited refuses new connections while the
+        master lingers in interpreter finalization.  This distinguishes a
+        dead-but-recorded zombie from a live service that is merely slow
+        (whose health probe times out instead of refusing).
+        """
+
+        target_port = self._configured_port() if port is None else port
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{target_port}/health/liveliness",
+            headers={"Accept": "application/json", "User-Agent": "LiteLLM-Menu-Core/1"},
+            method="GET",
+        )
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=0.5):
+                return False
+        except urllib.error.URLError as exc:
+            return isinstance(exc.reason, ConnectionRefusedError)
+        except Exception:
+            return False
+
     def _stage_runtime_config(self) -> None:
         if not self.paths.config.exists():
             raise RuntimeError("Provider/model configuration is unavailable")
@@ -666,9 +694,9 @@ class CoreServiceController:
             raise RuntimeError("Provider/model configuration is invalid") from None
 
     def reset_transient_routing_state(self) -> None:
-        """Remove recovery/cooldown data at the start of a new app/proxy run."""
+        """Remove recovery/cooldown/affinity data at the start of a new app/proxy run."""
 
-        for path in (self.paths.recovery, self.paths.cooldowns):
+        for path in (self.paths.recovery, self.paths.cooldowns, self.paths.affinity):
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -738,6 +766,20 @@ class CoreServiceController:
         current = self.status(force=True)
         if current["state"] == "running":
             return current
+        # A recorded proxy whose master is still alive but whose listener is
+        # gone is a zombie: workers exited while the uvicorn supervisor
+        # lingered in interpreter finalization, so the pid file still points
+        # at a process that refuses new connections.  Tear it down here so
+        # start/restart recovers without waiting for the master to exit on
+        # its own or for a human to intervene.  A live service that is
+        # merely slow times out on the health probe instead of refusing it,
+        # and is never killed by this path.
+        zombie_pid = self._recorded_pid()
+        if zombie_pid is not None and self._health_refused():
+            self._stop_process_group(zombie_pid)
+            self._remove_owner_files()
+            self._invalidate_status_cache()
+            current = self.status(force=True)
         orphaned_pid = self._recorded_proxy_is_orphaned()
         if orphaned_pid is not None:
             self._stop_process_group(orphaned_pid)

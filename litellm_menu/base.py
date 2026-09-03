@@ -59,6 +59,82 @@ _SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES = 512
 _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS = 7 * 24 * 3600.0
 _STREAM_START_TIMEOUT_SECONDS_ENV = "LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS"
 _STREAM_START_TIMEOUT_DEFAULT_SECONDS = 120.0
+_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV = (
+    "LITELLM_MENU_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS"
+)
+_HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS = 300.0
+_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV = (
+    "LITELLM_MENU_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"
+)
+_HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES = 1024.0 * 1024.0
+_WEBSOCKET_MAX_FRAME_BYTES_ENV = "LITELLM_MENU_WEBSOCKET_MAX_FRAME_BYTES"
+_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES = 64.0 * 1024.0 * 1024.0
+_WEBSOCKET_FRAME_LIMIT_PATCH_ATTR = "_litellm_menu_websocket_frame_limit_patch"
+
+
+def _websocket_max_frame_bytes() -> int:
+    """Maximum inbound WebSocket frame size for the managed proxy.
+
+    Codex sends each Responses turn request -- including the immutable replay
+    prefix with its signed image bytes -- as one text frame.  uvicorn's default
+    16 MiB limit closes such connections with code 1009 before the request
+    reaches the pipeline, which Codex reports as ``websocket closed by server
+    before response.completed`` followed by its reconnect ladder.
+    """
+
+    import os
+
+    raw = os.getenv(_WEBSOCKET_MAX_FRAME_BYTES_ENV, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    return int(_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES)
+
+
+def _install_websocket_frame_limit_patch() -> None:
+    """Raise uvicorn's default WebSocket frame limit for Responses turns.
+
+    Only the default value is replaced: an explicit ``ws_max_size`` passed by
+    the operator still wins, and ``LITELLM_MENU_WEBSOCKET_MAX_FRAME_BYTES``
+    tunes the raised default.  Safe to call repeatedly and from interpreter
+    startup (sitecustomize) so every launch path -- ``macos_proxy`` and the
+    LiteLLM CLI -- patches ``uvicorn.Config`` before any instance is built.
+    """
+
+    import inspect
+
+    try:
+        import uvicorn
+    except Exception:
+        return
+
+    config_cls = uvicorn.Config
+    original_init = config_cls.__init__
+    if getattr(original_init, _WEBSOCKET_FRAME_LIMIT_PATCH_ATTR, False):
+        return
+
+    try:
+        default_ws_max_size = int(
+            inspect.signature(original_init).parameters["ws_max_size"].default
+        )
+    except Exception:
+        default_ws_max_size = 16 * 1024 * 1024
+
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        if kwargs.get("ws_max_size", default_ws_max_size) == default_ws_max_size:
+            kwargs["ws_max_size"] = _websocket_max_frame_bytes()
+        original_init(self, *args, **kwargs)
+
+    setattr(patched_init, _WEBSOCKET_FRAME_LIMIT_PATCH_ATTR, True)
+    setattr(patched_init, "_original_config_init", original_init)
+    setattr(patched_init, "_default_ws_max_size", default_ws_max_size)
+    config_cls.__init__ = patched_init
+
+
 _CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV = (
     "LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS"
 )
@@ -239,6 +315,17 @@ _INLINE_IMAGE_HISTORY_MIN_TARGET_BYTES = 64_000
 # resolution file remains reopenable through the path reference on demand.
 _CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES = 128_000
 _CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES = _INLINE_IMAGE_MANY_TARGET_BYTES
+_PREFIX_IMAGE_PREVIEW_ENABLED_ENV = "LITELLM_MENU_PREFIX_IMAGE_PREVIEW_ENABLED"
+_PREFIX_IMAGE_PREVIEW_ENABLED_DEFAULT = True
+_PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV = "LITELLM_MENU_PREFIX_IMAGE_PREVIEW_MIN_BYTES"
+_PREFIX_IMAGE_PREVIEW_MIN_BYTES_DEFAULT = 131_072
+_PREFIX_IMAGE_MODE_ENV = "LITELLM_MENU_PREFIX_IMAGE_MODE"
+_PREFIX_IMAGE_MODE_VALUES = ("preview", "path-recent", "off")
+_PREFIX_IMAGE_MODE_DEFAULT = "path-recent"
+_PREFIX_IMAGE_RECENT_COUNT_ENV = "LITELLM_MENU_PREFIX_IMAGE_RECENT_COUNT"
+_PREFIX_IMAGE_RECENT_COUNT_DEFAULT = 6
+_PREFIX_IMAGE_ORIGINAL_PATH_ENV = "LITELLM_MENU_PREFIX_IMAGE_ORIGINAL_PATH"
+_PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT = True
 # Keep the old name as the public upper-bound constant used by diagnostics and
 # tests.  It is intentionally the maximum, not a fixed per-image size.
 _CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES = _CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES
@@ -364,7 +451,7 @@ _DSH_VISION_ROUTER_CONFIG_ENV = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
 _EXTERNAL_WEB_SEARCH_MAX_RESULTS_DEFAULT = 5
 _EXTERNAL_WEB_SEARCH_READ_CHARS_DEFAULT = 1400
 _EXTERNAL_WEB_FETCH_TIMEOUT_DEFAULT = 12.0
-_EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT = 4
+_EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT = 8
 _EXTERNAL_WEB_SEARCH_MAX_QUERIES_DEFAULT = 16
 _EXTERNAL_WEB_SEARCH_MAX_OPEN_PAGES_DEFAULT = 8
 _EXTERNAL_WEB_SEARCH_MAX_FIND_IN_PAGE_DEFAULT = 12
@@ -597,6 +684,18 @@ _UPSTREAM_HTML_BAD_REQUEST_MARKERS = (
 _LITELLM_MODEL_GROUP_FALLBACK_EXHAUSTED_MARKERS = (
     "received model group=",
     "available model group fallbacks=none",
+)
+# Relay-capacity rejections: the relay itself is reachable but its pool of
+# upstream channels for the requested model is temporarily exhausted.  The
+# failure must be attributed to the relay, not to the model named in the
+# request.
+_UPSTREAM_RELAY_CAPACITY_MARKERS = (
+    "暂无可用渠道",
+    "no available channel",
+    "no channels available",
+    "channel exhausted",
+    "channels exhausted",
+    "all channels are busy",
 )
 _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "APIConnectionError",

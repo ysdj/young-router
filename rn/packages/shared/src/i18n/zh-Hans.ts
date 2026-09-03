@@ -154,6 +154,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.routeTrace.reasonTemporary": "上游临时不可用",
   "logs.routeTrace.reasonTerminal": "请求因提示词或策略终止",
   "logs.routeTrace.reasonStreamStartTimeout": "上游首包超时",
+  "logs.routeTrace.reasonStreamIdleTimeout": "上游流中途停转",
   "logs.routeTrace.reasonResponsesUnsupported": "上游不支持响应接口",
   "logs.routeTrace.reasonWebSearchFormat": "搜索工具调用格式错误",
   "logs.routeTrace.reasonUnknown": "上游异常",

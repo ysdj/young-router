@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 from contextvars import ContextVar
 
 from . import api_base as _api_base_module
@@ -10,6 +13,7 @@ from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
 from . import routing as _routing_module
+from . import streaming as _streaming_module
 from . import trace as _trace_module
 from . import dsh_vision_router as _dsh_vision_router_module
 
@@ -33,6 +37,7 @@ from .base import (
     _ROUTING_CONSTRAINT_PATCH_ATTR,
     _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
+    _install_websocket_frame_limit_patch,
     _normalize_response_completed_event_usage,
 )
 
@@ -1393,6 +1398,85 @@ def _install_same_deployment_retry_policy_patch() -> None:
         Router.get_num_retries_from_retry_policy = patched_retry_policy
 
 
+_MANAGED_WS_KEEPALIVE_PATCH_ATTR = "_litellm_menu_managed_ws_keepalive_patch"
+
+
+def _install_managed_responses_websocket_keepalive_patch() -> None:
+    """Heartbeat the managed Responses WebSocket bridge during silent waits.
+
+    ``ManagedResponsesWebSocketHandler`` serves providers without a native
+    WebSocket endpoint by streaming ``litellm.aresponses`` over the client
+    WebSocket.  That call bypasses the proxy streaming pipeline, so the
+    downstream keepalive heartbeat never runs on this transport: while the
+    upstream first event is delayed (a heavy replay prefix can take several
+    minutes), nothing reaches the client and Codex fires its per-provider
+    ``stream_idle_timeout_ms`` (default ~300s), reporting ``stream
+    disconnected before completion: idle timeout waiting for websocket`` and
+    replaying the whole turn.  Wrap the inner stream with the proxy heartbeat
+    so every silent interval emits one ``response.metadata`` keepalive event
+    per configured interval, exactly like the HTTP/SSE transport.
+    """
+
+    try:
+        from litellm.responses.streaming_iterator import (
+            ManagedResponsesWebSocketHandler,
+        )
+    except Exception:
+        return
+
+    original = ManagedResponsesWebSocketHandler._stream_and_forward
+    if getattr(original, _MANAGED_WS_KEEPALIVE_PATCH_ATTR, False):
+        return
+
+    async def patched_stream_and_forward(self, model, call_kwargs):
+        import litellm as litellm_module
+
+        keepalive_request_data = {"model": model, "stream": True}
+        for key in ("input", "instructions"):
+            value = call_kwargs.get(key)
+            if value is not None:
+                keepalive_request_data[key] = value
+        interval = _routing_module._stream_keepalive_interval_seconds_for_request(
+            keepalive_request_data
+        )
+        stream_response = await litellm_module.aresponses(model=model, **call_kwargs)
+        if interval <= 0:
+            delivered = stream_response
+        else:
+            delivered = _streaming_module._yield_downstream_keepalive_stream(
+                stream_response,
+                keepalive_request_data,
+            )
+        completed_event = None
+        async for chunk in delivered:
+            if chunk is None:
+                continue
+            chunk_type = getattr(chunk, "type", None) or (
+                chunk.get("type") if isinstance(chunk, dict) else None
+            )
+            serialized = self._serialize_chunk(chunk)
+            if serialized is None:
+                continue
+            if chunk_type == "response.completed" and completed_event is None:
+                try:
+                    completed_event = json.loads(serialized)
+                except Exception:
+                    pass
+            try:
+                await self.websocket.send_text(serialized)
+            except Exception:
+                return completed_event
+        return completed_event
+
+    setattr(
+        patched_stream_and_forward,
+        _MANAGED_WS_KEEPALIVE_PATCH_ATTR,
+        True,
+    )
+    setattr(patched_stream_and_forward, "_original_stream_and_forward", original)
+    ManagedResponsesWebSocketHandler._stream_and_forward = patched_stream_and_forward
+
+
 def _install_responses_completion_stream_patch() -> None:
     try:
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
@@ -1673,5 +1757,7 @@ def install_all() -> None:
     _install_generic_deployment_failover_patch()
     _install_same_deployment_retry_policy_patch()
     _install_responses_websocket_http_bridge_patch()
+    _install_websocket_frame_limit_patch()
+    _install_managed_responses_websocket_keepalive_patch()
     _install_responses_completion_stream_patch()
     _install_responses_tool_search_bridge_patch()

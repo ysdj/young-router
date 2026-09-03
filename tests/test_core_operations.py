@@ -956,6 +956,53 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertFalse(controller.paths.pid.exists())
             self.assertFalse(controller.paths.owner.exists())
 
+    def test_start_recovers_a_recorded_zombie_proxy_without_a_listener(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            controller.paths.pid.parent.mkdir(parents=True, exist_ok=True)
+            replacement = mock.Mock()
+            replacement.pid = 9999
+            replacement.poll.return_value = None
+            controller.paths.pid.write_text("4242\n", encoding="utf-8")
+            controller.paths.owner.write_text("owner\n", encoding="utf-8")
+
+            with mock.patch.object(
+                controller,
+                "status",
+                side_effect=[{"state": "unhealthy"}, {"state": "stopped"}, {"state": "running"}],
+            ), mock.patch.object(controller, "_recorded_pid", return_value=4242), mock.patch.object(
+                controller, "_health_refused", return_value=True
+            ), mock.patch.object(
+                controller, "_stop_process_group"
+            ) as stop_group, mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(
+                controller, "_runtime_env", return_value={"LITELLM_HEALTH_WAIT_SECONDS": "1"}
+            ), mock.patch.object(controller, "_configured_port", return_value=4000), mock.patch(
+                "litellm_menu.core.operations.subprocess.Popen", return_value=replacement
+            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                controller, "_health", return_value=True
+            ):
+                controller.start()
+
+            stop_group.assert_called_once_with(4242)
+            self.assertEqual("9999\n", controller.paths.pid.read_text(encoding="utf-8"))
+
+    def test_start_does_not_kill_a_busy_unhealthy_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            with mock.patch.object(
+                controller,
+                "status",
+                side_effect=[{"state": "unhealthy"}],
+            ), mock.patch.object(controller, "_recorded_pid", return_value=4242), mock.patch.object(
+                controller, "_health_refused", return_value=False
+            ), mock.patch.object(controller, "_stop_process_group") as stop_group:
+                with self.assertRaisesRegex(RuntimeError, "already active"):
+                    controller.start()
+
+            stop_group.assert_not_called()
+
     def test_start_failure_clears_partial_ownership_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)

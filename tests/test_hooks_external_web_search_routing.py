@@ -1186,7 +1186,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
 
     def test_external_web_search_continuation_trims_large_source_evidence(self) -> None:
         hooks, _ = load_hook_module()
-        large_page = "factor A evidence sentence. " * 600
+        large_page = "factor A evidence sentence. " * 1200
         raw_results = (
             "Web search results for query: sample subject factor A factor B\n"
             "Title: Transporter source\n"
@@ -1516,10 +1516,7 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
 
         self.assertEqual(synthesis_kwargs["model"], "legacy-chat")
         self.assertEqual(continuation_kwargs["model"], "legacy-chat")
-        self.assertEqual(
-            continuation_kwargs["max_output_tokens"],
-            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS,
-        )
+        self.assertNotIn("max_output_tokens", continuation_kwargs)
         self.assertTrue(continuation_kwargs["stream"])
         self.assertEqual(
             continuation_kwargs["litellm_params"]["api_base"],
@@ -1641,4 +1638,46 @@ class HookExternalWebSearchRoutingTests(HookTestCase):
         self.assertEqual(payload["model"], "legacy-chat")
         self.assertNotEqual(payload["model"], "openai/vendor-chat")
         self.assertTrue(payload["stream"])
-        self.assertNotIn("route_recovery_max_seconds", payload["litellm_metadata"])
+        self.assertEqual(
+            payload["litellm_metadata"]["route_recovery_max_seconds"],
+            hooks._EXTERNAL_WEB_SEARCH_ROUTE_RECOVERY_MAX_SECONDS,
+        )
+
+    def test_external_web_search_recovery_bounds_route_recovery_window(self) -> None:
+        hooks, _ = load_hook_module()
+        pending = {
+            "model": "openai/vendor-chat",
+            "input": "Web actions completed so far:\n- q\n\nRetrieved evidence observed so far:\nshort evidence\n\nDecide the next step now.",
+            "tools": [{"type": "function", "name": "web_search"}],
+            "litellm_metadata": {
+                "external_web_search_continuation": True,
+            },
+        }
+        hooks._external_web_search_set_pending_recovery_request(
+            {
+                "model": "openai/vendor-chat",
+                "litellm_metadata": {},
+            },
+            pending,
+        )
+        payload = hooks._external_web_search_recovery_kwargs(
+            {
+                "model": "openai/vendor-chat",
+                "litellm_metadata": {
+                    "external_web_search_continuation": True,
+                },
+            },
+            search_results="evidence",
+        )
+        self.assertEqual(
+            payload["litellm_metadata"]["route_recovery_max_seconds"],
+            hooks._EXTERNAL_WEB_SEARCH_ROUTE_RECOVERY_MAX_SECONDS,
+        )
+        self.assertEqual(
+            hooks._recovery_max_seconds_for_request(payload),
+            hooks._EXTERNAL_WEB_SEARCH_ROUTE_RECOVERY_MAX_SECONDS,
+        )
+        self.assertNotEqual(
+            hooks._recovery_max_seconds_for_request(payload),
+            hooks._recovery_max_seconds(),
+        )

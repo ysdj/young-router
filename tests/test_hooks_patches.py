@@ -450,7 +450,7 @@ class HookPatchTests(HookTestCase):
             },
             "model_info": {
                 "id": "kimi-chat-route",
-                "provider": "tbtk",
+                "provider": "relay-provider",
                 "upstream_url_surface": "anthropic",
             },
         }
@@ -3214,6 +3214,144 @@ class HookPatchTests(HookTestCase):
                 },
             )
         )
+
+    def test_uvicorn_websocket_frame_limit_patch_replaces_default_only(self) -> None:
+        hooks, _ = load_hook_module()
+        uvicorn = importlib.import_module("uvicorn")
+        installed_init = uvicorn.Config.__init__
+        original_init = getattr(
+            installed_init,
+            "_original_config_init",
+            installed_init,
+        )
+        self.addCleanup(setattr, uvicorn.Config, "__init__", installed_init)
+
+        # Reinstall over a pristine __init__ so assertions observe this call.
+        uvicorn.Config.__init__ = original_init
+        hooks._install_websocket_frame_limit_patch()
+        patched_init = uvicorn.Config.__init__
+        self.assertIsNot(patched_init, original_init)
+        self.assertTrue(
+            getattr(patched_init, hooks._WEBSOCKET_FRAME_LIMIT_PATCH_ATTR, False)
+        )
+        default_ws_max_size = getattr(patched_init, "_default_ws_max_size")
+
+        # Omitted and default-passed values are raised to the configured limit.
+        self.assertEqual(
+            uvicorn.Config(app="probe:app").ws_max_size,
+            hooks._websocket_max_frame_bytes(),
+        )
+        self.assertEqual(
+            uvicorn.Config(app="probe:app", ws_max_size=default_ws_max_size).ws_max_size,
+            hooks._websocket_max_frame_bytes(),
+        )
+        # An explicit operator value still wins.
+        self.assertEqual(uvicorn.Config(app="probe:app", ws_max_size=999).ws_max_size, 999)
+
+        # The env override tunes the raised default.
+        self.set_env(hooks._WEBSOCKET_MAX_FRAME_BYTES_ENV, "1048576")
+        self.assertEqual(hooks._websocket_max_frame_bytes(), 1048576)
+        self.assertEqual(uvicorn.Config(app="probe:app").ws_max_size, 1048576)
+        self.assertEqual(uvicorn.Config(app="probe:app", ws_max_size=999).ws_max_size, 999)
+
+        # Installing twice keeps a single wrapper.
+        hooks._install_websocket_frame_limit_patch()
+        self.assertIs(uvicorn.Config.__init__, patched_init)
+
+    def test_managed_responses_websocket_bridge_emits_keepalives_during_silent_waits(self) -> None:
+        hooks, _ = load_hook_module()
+
+        fake_responses = types.ModuleType("litellm.responses")
+        fake_streaming_iterator = types.ModuleType("litellm.responses.streaming_iterator")
+
+        class RecordingWebSocket:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            async def send_text(self, text: str) -> None:
+                self.sent.append(text)
+
+        class FakeManagedHandler:
+            def __init__(self, websocket: Any, model: str, logging_obj: Any = None) -> None:
+                self.websocket = websocket
+                self.model = model
+
+            @staticmethod
+            def _serialize_chunk(chunk: Any) -> str:
+                return json.dumps(chunk)
+
+            async def _stream_and_forward(self, model: str, call_kwargs: dict) -> Any:
+                raise AssertionError("patched forward must not reach the original")
+
+        fake_streaming_iterator.ManagedResponsesWebSocketHandler = FakeManagedHandler
+        sys.modules["litellm.responses"] = fake_responses
+        sys.modules["litellm.responses.streaming_iterator"] = fake_streaming_iterator
+        self.addCleanup(sys.modules.pop, "litellm.responses", None)
+        self.addCleanup(sys.modules.pop, "litellm.responses.streaming_iterator", None)
+
+        hooks._install_managed_responses_websocket_keepalive_patch()
+        self.assertTrue(
+            getattr(
+                FakeManagedHandler._stream_and_forward,
+                hooks._MANAGED_WS_KEEPALIVE_PATCH_ATTR,
+                False,
+            )
+        )
+        self.set_env(hooks._STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV, "0.01")
+
+        async def slow_upstream_stream():
+            await asyncio.sleep(0.06)
+            yield {"type": "response.created", "response": {"id": "resp_ws"}}
+            await asyncio.sleep(0.06)
+            yield {
+                "type": "response.completed",
+                "response": {"id": "resp_ws", "status": "completed"},
+            }
+
+        litellm_stub = sys.modules["litellm"]
+
+        async def fake_aresponses(**kwargs):
+            return slow_upstream_stream()
+
+        self.assertNotEqual(getattr(litellm_stub, "aresponses", None), fake_aresponses)
+        litellm_stub.aresponses = fake_aresponses
+        self.addCleanup(
+            lambda: delattr(litellm_stub, "aresponses")
+            if getattr(litellm_stub, "aresponses", None) is fake_aresponses
+            else None
+        )
+
+        socket = RecordingWebSocket()
+        handler = FakeManagedHandler(websocket=socket, model="default-chat")
+        completed = asyncio.run(
+            handler._stream_and_forward(
+                "default-chat",
+                {"input": [{"role": "user", "content": "hi"}]},
+            )
+        )
+
+        keepalives = [frame for frame in socket.sent if '"response.metadata"' in frame]
+        self.assertGreaterEqual(len(keepalives), 2)
+        for frame in keepalives:
+            payload = json.loads(frame)
+            self.assertEqual("response.metadata", payload["type"])
+            self.assertEqual("keepalive", payload["metadata"]["phase"])
+        self.assertTrue(any('"response.created"' in frame for frame in socket.sent))
+        self.assertTrue(any('"response.completed"' in frame for frame in socket.sent))
+        self.assertIsNotNone(completed)
+        self.assertEqual("resp_ws", completed["response"]["id"])
+
+        # A zero interval disables the heartbeat and keeps plain forwarding.
+        self.set_env(hooks._STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV, "0")
+        socket.sent.clear()
+        asyncio.run(
+            handler._stream_and_forward(
+                "default-chat",
+                {"input": [{"role": "user", "content": "hi"}]},
+            )
+        )
+        self.assertEqual([f for f in socket.sent if '"response.metadata"' in f], [])
+        self.assertEqual(len(socket.sent), 2)
 
 
 if __name__ == "__main__":

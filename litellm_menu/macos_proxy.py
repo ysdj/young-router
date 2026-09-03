@@ -99,12 +99,20 @@ def run(argv: list[str] | None = None) -> int:
     uvicorn_subprocess = importlib.import_module("uvicorn._subprocess")
     uvicorn_subprocess.spawn = multiprocessing.get_context("forkserver")
     uvicorn = importlib.import_module("uvicorn")
+    from .base import _websocket_max_frame_bytes
+
     uvicorn.run(
         PROXY_APP,
         host=args.host,
         port=args.port,
         workers=args.workers,
         loop="uvloop",
+        # Codex sends each Responses turn request -- including the immutable
+        # replay prefix with signed image bytes -- as one WebSocket text frame;
+        # uvicorn's 16 MiB default closes those with code 1009 before the
+        # request reaches the pipeline (Codex then reports "websocket closed
+        # by server before response.completed" and reconnects in a loop).
+        ws_max_size=_websocket_max_frame_bytes(),
     )
     return 0
 

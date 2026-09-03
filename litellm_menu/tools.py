@@ -159,9 +159,51 @@ def _request_should_intercept_external_web_search(request_kwargs: Optional[dict]
     )
 
 
+_EXTERNAL_WEB_SEARCH_CONTINUATION_METADATA_KEY = "external_web_search_continuation"
+# litellm's streaming post-call hook only receives a reduced request context
+# (input / tools / litellm_params): litellm_metadata is dropped there.  Hidden
+# bridge continuation turns are therefore also recognised by their distinctive
+# input header, which the bridge builds from this constant.
+_EXTERNAL_WEB_SEARCH_CONTINUATION_INPUT_MARKER = "Retrieved evidence observed so far:"
+
+
+def _request_is_external_web_search_continuation(
+    request_kwargs: Optional[dict],
+) -> bool:
+    if not isinstance(request_kwargs, dict):
+        return False
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    ) or {}
+    if metadata.get(_EXTERNAL_WEB_SEARCH_CONTINUATION_METADATA_KEY) is True:
+        return True
+    litellm_params = request_kwargs.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        for key in ("litellm_metadata", "metadata"):
+            nested = litellm_params.get(key)
+            if (
+                isinstance(nested, dict)
+                and nested.get(_EXTERNAL_WEB_SEARCH_CONTINUATION_METADATA_KEY) is True
+            ):
+                return True
+    input_value = request_kwargs.get("input")
+    return (
+        isinstance(input_value, str)
+        and _EXTERNAL_WEB_SEARCH_CONTINUATION_INPUT_MARKER in input_value
+    )
+
+
 def _request_should_consume_web_search_function_call(
     request_kwargs: Optional[dict],
 ) -> bool:
+    if _request_is_external_web_search_continuation(request_kwargs):
+        # Hidden bridge continuation turns are consumed by the bridge's own
+        # round loop, which emits a client-visible web_search_call item for
+        # every executed action -- searches AND page opens.  Re-intercepting
+        # them here would swallow page-open actions invisibly (Codex would
+        # only ever show query chips) and reset the round accounting by
+        # nesting fresh resolves.
+        return False
     if _request_should_intercept_external_web_search(request_kwargs):
         return True
     if not isinstance(request_kwargs, dict):

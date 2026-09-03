@@ -360,6 +360,28 @@ def _install_litellm_optional_database_error_patch() -> None:
     )
 
 
+def _install_uvicorn_websocket_frame_limit_patch() -> None:
+    """Raise uvicorn's inbound WebSocket frame limit before any Config exists.
+
+    Codex sends each Responses turn request as a single text frame that
+    includes the immutable replay prefix, so a long task with signed image
+    history can exceed uvicorn's default 16 MiB ``ws_max_size``.  uvicorn
+    then closes the connection with code 1009 before the request reaches
+    the pipeline and Codex reports ``websocket closed by server before
+    response.completed`` followed by its reconnect ladder.  The installer
+    lives in ``litellm_menu.base`` so both this early hook (interpreter
+    startup, covering the LiteLLM CLI launch path) and the callback-time
+    ``litellm_menu.patches.install_all`` share one implementation.
+    """
+
+    def _patch(uvicorn_module: Any) -> None:
+        from litellm_menu.base import _install_websocket_frame_limit_patch
+
+        _install_websocket_frame_limit_patch()
+
+    _patch_after_import("uvicorn", _patch)
+
+
 def _install_system_proxy_lookup_patch() -> None:
     raw_snapshot = os.environ.pop(_SYSTEM_PROXY_SNAPSHOT_ENV, "")
     if not raw_snapshot and os.environ.get("LITELLM_MENU_DISABLE_SYSTEM_PROXY_LOOKUP") != "1":
@@ -426,3 +448,4 @@ if os.environ.get("LITELLM_MENU_PROXY_PROCESS") == "1":
     _install_litellm_config_callback_import_patch()
     _install_litellm_optional_database_error_patch()
     _install_litellm_openai_image_edit_usage_patch()
+    _install_uvicorn_websocket_frame_limit_patch()

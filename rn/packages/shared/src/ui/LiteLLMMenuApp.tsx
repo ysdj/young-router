@@ -4225,6 +4225,7 @@ function routeTraceReasonLabel(value: string, translate: Translate): string {
     "upstream-temporary-text": "logs.routeTrace.reasonTemporary",
     "terminal-prompt-or-policy": "logs.routeTrace.reasonTerminal",
     "stream_start_timeout": "logs.routeTrace.reasonStreamStartTimeout",
+    "stream_idle_timeout": "logs.routeTrace.reasonStreamIdleTimeout",
     "responses_endpoint_unsupported": "logs.routeTrace.reasonResponsesUnsupported",
     "malformed_web_search_function_call": "logs.routeTrace.reasonWebSearchFormat",
   };
