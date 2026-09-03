@@ -193,6 +193,28 @@ def _apply_reasoning_capability(model: dict[str, Any], registry: ModelContextReg
         model["default_reasoning_level"] = capability.default_level
 
 
+def _apply_search_tool_capability(
+    model: dict[str, Any],
+    registry: ModelContextRegistry,
+    name: str,
+) -> None:
+    """Keep the catalog's search-tool advertisement aligned with the route.
+
+    The inherited native profile advertises hosted search for the profile it
+    was copied from.  The route may not deliver that tool: an explicit false
+    capability or an unidentified non-GPT route must not advertise it.  When
+    the route configuration is unreadable the native profile is left
+    untouched.
+    """
+
+    capability = registry.search_tool_capability_for(name)
+    if capability is None:
+        return
+    model["supports_search_tool"] = bool(capability)
+    if not capability:
+        model.pop("web_search_tool_type", None)
+
+
 def _catalog_model(
     name: str,
     priority: int,
@@ -228,6 +250,7 @@ def _catalog_model(
     model["context_window"] = context.context_window
     model["max_context_window"] = context.max_context_window
     model["effective_context_window_percent"] = context.effective_context_window_percent
+    _apply_search_tool_capability(model, registry, name)
     # An exact native profile may contain Codex-only modes such as ``ultra``
     # that activate task delegation rather than map directly to a provider
     # reasoning effort.  The route capability registry intentionally knows

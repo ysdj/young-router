@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest import mock
+
 from hook_test_utils import *
 
 
@@ -163,8 +165,9 @@ class HookResponsesRequestPrepTests(HookTestCase):
         }
 
         # A generic openai/responses surface is shared by many third-party
-        # gateways, so unknown capability metadata must not keep Codex's
-        # native GPT search route: the local pi-web-access bridge takes over.
+        # gateways, so unknown capability metadata on a non-GPT public model
+        # must not keep Codex's native GPT search route: the local
+        # pi-web-access bridge takes over.
         bridged = hooks._with_codex_external_web_search_bridge_tool(original)
         self.assertIsNotNone(bridged)
         bridged_tools = [
@@ -207,6 +210,112 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._with_codex_external_web_search_bridge_tool(original)
         )
         self.assertEqual(original["tools"], [])
+
+    def test_codex_gpt_family_model_with_unknown_capability_keeps_native_search(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model"] = "gpt-5-test"
+        original["model_info"] = {
+            "provider": "third-party",
+            "upstream_url_surface": "openai/responses",
+        }
+
+        self.assertIsNone(
+            hooks._with_codex_external_web_search_bridge_tool(original)
+        )
+        self.assertEqual(original["tools"], [])
+        self.assertTrue(
+            hooks._request_is_codex_gpt_responses_route(original)
+        )
+
+    def test_codex_gpt_family_model_with_explicit_unsupported_capability_uses_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model"] = "gpt-5-test"
+        original["model_info"] = {
+            "provider": "third-party",
+            "upstream_url_surface": "openai/responses",
+            "supports_responses_web_search": False,
+        }
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            [tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)],
+            ["web_search", "fetch_content"],
+        )
+
+    def test_codex_gpt_family_model_cached_rejection_uses_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model"] = "gpt-5-test"
+        original["model_info"] = {
+            "id": "gpt-cached-search",
+            "provider": "third-party",
+            "route_key": "third-party / model / key=default",
+            "upstream_url_surface": "openai/responses",
+        }
+        probe = original.copy()
+        probe["tools"] = [{"type": "web_search"}]
+
+        class UnsupportedSearch(Exception):
+            status_code = 400
+
+        hooks._record_web_search_tool_unsupported(
+            UnsupportedSearch(
+                "invalid_request_error: web_search is not supported"
+            ),
+            probe,
+        )
+
+        fallback = hooks._with_codex_external_web_search_bridge_tool(original)
+        self.assertIsNotNone(fallback)
+        assert fallback is not None
+        self.assertEqual(
+            [tool.get("name") for tool in fallback["tools"]],
+            ["web_search", "fetch_content"],
+        )
+
+    def test_codex_gpt_family_model_on_chat_surface_uses_local_bridge(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model"] = "gpt-5-test"
+        original["model_info"] = {
+            "provider": "third-party",
+            "upstream_url_surface": "openai/chat",
+        }
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            [tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)],
+            ["web_search", "fetch_content"],
+        )
+
+    def test_codex_gpt_image_family_is_not_a_gpt_responses_route(self) -> None:
+        hooks, _ = load_hook_module()
+        original = self._codex_collaboration_request()
+        original["model"] = "gpt-image-2"
+        original["model_info"] = {
+            "provider": "third-party",
+            "upstream_url_surface": "openai/responses",
+        }
+
+        modified = hooks._with_codex_external_web_search_bridge_tool(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertFalse(
+            hooks._request_is_codex_gpt_responses_route(original)
+        )
+        self.assertEqual(
+            [tool.get("name") for tool in modified["tools"] if isinstance(tool, dict)],
+            ["web_search", "fetch_content"],
+        )
 
     def test_codex_provider_switch_does_not_use_stale_custom_provider(self) -> None:
         hooks, _ = load_hook_module()
@@ -1500,6 +1609,533 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, mutable_parts[0]["text"])
         self.assertIn("/tmp/mutable.png", mutable_parts[0]["text"])
         self.assertEqual(mutable_parts[1], mutable_output["output"][0])
+
+    def _prefix_preview_request(self) -> dict:
+        oversized_url = "data:image/png;base64," + ("A" * 200_000)
+        call = {
+            "type": "custom_tool_call",
+            "call_id": "call-frozen",
+            "name": "exec",
+            "input": 'await tools.view_image({path:"/tmp/scan/frozen.png"});',
+        }
+        output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-frozen",
+            "id": "ctco_frozen",
+            "output": [
+                {"type": "input_text", "text": "Script completed"},
+                {"type": "input_image", "image_url": oversized_url},
+            ],
+        }
+        encrypted = {
+            "type": "reasoning",
+            "encrypted_content": "opaque-signed-history",
+        }
+        return {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [call, output, encrypted],
+        }
+
+    def test_prefix_image_previews_replace_oversized_frozen_view_image_outputs(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        original = self._prefix_preview_request()
+        frozen_output = original["input"][1]
+
+        resize_calls: list[str] = []
+
+        def fake_resize(value: str, *, target_bytes: int, max_edge: int) -> str:
+            resize_calls.append(value)
+            return "data:image/jpeg;base64,c2hydW5r"
+
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url", side_effect=fake_resize
+        ):
+            hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+            modified = hooks._with_prefix_image_previews(original)
+            self.assertIsNotNone(modified)
+            assert modified is not None
+            # Cached second pass does not re-encode.
+            modified_again = hooks._with_prefix_image_previews(original)
+
+        self.assertEqual(len(resize_calls), 1)
+        self.assertIsNotNone(modified_again)
+        assert modified_again is not None
+
+        updated = modified["input"][1]
+        self.assertEqual(updated["call_id"], "call-frozen")
+        self.assertEqual(updated["id"], "ctco_frozen")
+        reference = updated["output"][0]
+        self.assertEqual("input_text", reference["type"])
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, reference["text"])
+        self.assertIn("/tmp/scan/frozen.png", reference["text"])
+        self.assertEqual(updated["output"][1], frozen_output["output"][0])
+        self.assertEqual(
+            updated["output"][2]["image_url"], "data:image/jpeg;base64,c2hydW5r"
+        )
+        # The frozen encrypted item and the call stay byte-identical.
+        self.assertEqual(modified["input"][2], original["input"][2])
+        self.assertEqual(modified["input"][0], original["input"][0])
+        # The client's own history is never mutated.
+        self.assertEqual(original["input"][1]["output"][1]["image_url"], frozen_output["output"][1]["image_url"])
+
+    def test_prefix_image_previews_preview_unpaired_images_without_reference_text(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        oversized_url = "data:image/png;base64," + ("B" * 150_000)
+        other_url = "data:image/png;base64," + ("C" * 160_000)
+        one_path_call = {
+            "type": "custom_tool_call",
+            "call_id": "call-multi",
+            "name": "exec",
+            "input": 'await tools.view_image({path:"/tmp/only-one.png"});',
+        }
+        multi_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-multi",
+            "id": "ctco_multi",
+            "output": [
+                {"type": "input_text", "text": "Script completed"},
+                {"type": "input_image", "image_url": oversized_url},
+                {"type": "input_image", "image_url": other_url},
+            ],
+        }
+        original_call = {
+            "type": "custom_tool_call",
+            "call_id": "call-original",
+            "name": "exec",
+            "input": 'await tools.view_image({path:"/tmp/orig.png", detail: "original"});',
+        }
+        original_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-original",
+            "id": "ctco_orig",
+            "output": [
+                {"type": "input_image", "image_url": oversized_url},
+            ],
+        }
+        encrypted = {"type": "reasoning", "encrypted_content": "opaque"}
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                one_path_call,
+                multi_output,
+                original_call,
+                original_output,
+                encrypted,
+            ],
+        }
+
+        seen: list[str] = []
+
+        def fake_resize(value: str, *, target_bytes: int, max_edge: int) -> str:
+            seen.append(value)
+            return "data:image/jpeg;base64,shrunk"
+
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url", side_effect=fake_resize
+        ):
+            modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(len(seen), 2)
+        # Unpaired images are previewed without a reference part.
+        updated_multi = modified["input"][1]
+        self.assertEqual(updated_multi["id"], "ctco_multi")
+        self.assertEqual(updated_multi["call_id"], "call-multi")
+        self.assertEqual(
+            [part.get("type") for part in updated_multi["output"]],
+            ["input_text", "input_image", "input_image"],
+        )
+        self.assertEqual(
+            [part.get("image_url") for part in updated_multi["output"] if part.get("type") == "input_image"],
+            ["data:image/jpeg;base64,shrunk", "data:image/jpeg;base64,shrunk"],
+        )
+        self.assertNotIn(
+            hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER,
+            json.dumps(updated_multi["output"]),
+        )
+        # Explicit original-resolution output stays byte-identical.
+        self.assertEqual(modified["input"][3], original_output)
+        self.assertEqual(modified["input"][4], encrypted)
+
+        # Disabled by setting -> untouched.
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "0")
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url"
+        ) as resize_mock:
+            self.assertIsNone(hooks._with_prefix_image_previews(request))
+            resize_mock.assert_not_called()
+
+    def test_prefix_image_previews_handle_wire_function_call_shape(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        # 真实线格式：arguments 是 JSON 对象，脚本嵌在 input 字段、引号被转义
+        wire_call = {
+            "type": "function_call",
+            "call_id": "call-wire",
+            "name": "exec",
+            "arguments": (
+                '{"input":"const r = await tools.view_image({path:\\"/tmp/wire.png\\",'
+                ' detail:\\"high\\"}); image(r.image_url, \\"high\\");"}'
+            ),
+        }
+        wire_output = {
+            "type": "function_call_output",
+            "call_id": "call-wire",
+            "id": "fco_wire",
+            "output": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64," + ("W" * 150_000),
+                }
+            ],
+        }
+        encrypted = {"type": "reasoning", "encrypted_content": "opaque"}
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [wire_call, wire_output, encrypted],
+        }
+
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        with mock.patch.object(
+            hooks._image_inputs_module,
+            "_resize_data_url",
+            side_effect=lambda value, *, target_bytes, max_edge: "data:image/jpeg;base64,wire-preview",
+        ):
+            modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        updated = modified["input"][1]
+        self.assertEqual(updated["id"], "fco_wire")
+        self.assertEqual("input_text", updated["output"][0]["type"])
+        self.assertIn("/tmp/wire.png", updated["output"][0]["text"])
+        self.assertEqual(
+            "data:image/jpeg;base64,wire-preview",
+            updated["output"][1]["image_url"],
+        )
+        self.assertEqual(modified["input"][2], encrypted)
+        # detail:"high" 不算显式原图请求
+        self.assertFalse(
+            hooks._codex_view_image_call_requests_original(wire_call)
+        )
+
+    def test_prefix_image_path_recent_mode_keeps_recent_previews_and_paths_older(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "1")
+
+        def build() -> dict:
+            items: list[dict] = []
+            for i, path in enumerate(("/tmp/old1.png", "/tmp/old2.png", "/tmp/recent.png")):
+                items.append({
+                    "type": "function_call",
+                    "call_id": f"call-{i}",
+                    "name": "exec",
+                    "arguments": '{"input":"await tools.view_image({path:\\"%s\\"});"}' % path,
+                })
+                items.append({
+                    "type": "function_call_output",
+                    "call_id": f"call-{i}",
+                    "id": f"fco-{i}",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed"},
+                        {"type": "input_image", "image_url": "data:image/png;base64," + "X" * 150_000},
+                    ],
+                })
+            items.append({"type": "reasoning", "encrypted_content": "opaque"})
+            return {
+                "call_type": "aresponses",
+                "client_metadata": {
+                    "x-codex-turn-metadata": '{"request_kind":"turn"}',
+                },
+                "input": items,
+            }
+
+        request = build()
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        with mock.patch.object(
+            hooks._image_inputs_module,
+            "_resize_data_url",
+            side_effect=lambda value, *, target_bytes, max_edge: "data:image/jpeg;base64,preview",
+        ):
+            modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        # 老的输出 -> 纯路径：图片 part 全部移除，引用文本带路径
+        out0 = modified["input"][1]["output"]
+        self.assertEqual([p.get("type") for p in out0], ["input_text", "input_text"])
+        self.assertIn("/tmp/old1.png", out0[0]["text"])
+        self.assertIn("replaced by local-path", out0[0]["text"])
+        out1 = modified["input"][3]["output"]
+        self.assertEqual([p.get("type") for p in out1], ["input_text", "input_text"])
+        self.assertIn("/tmp/old2.png", out1[0]["text"])
+        # 最近的输出 -> 预览 + 路径引用
+        out2 = modified["input"][5]["output"]
+        self.assertIn("/tmp/recent.png", out2[0]["text"])
+        image_parts2 = [p for p in out2 if p.get("type") == "input_image"]
+        self.assertEqual(len(image_parts2), 1)
+        self.assertEqual("data:image/jpeg;base64,preview", image_parts2[0]["image_url"])
+        # 加密项逐字节不变
+        self.assertEqual(modified["input"][6], request["input"][6])
+
+        # off 模式完全不碰
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "off")
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url"
+        ) as resize_mock:
+            self.assertIsNone(hooks._with_prefix_image_previews(build()))
+            resize_mock.assert_not_called()
+
+        # preview 模式全部保留预览（近期张数无关）
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "preview")
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        with mock.patch.object(
+            hooks._image_inputs_module,
+            "_resize_data_url",
+            side_effect=lambda value, *, target_bytes, max_edge: "data:image/jpeg;base64,preview",
+        ):
+            modified2 = hooks._with_prefix_image_previews(build())
+        assert modified2 is not None
+        for idx in (1, 3, 5):
+            output = modified2["input"][idx]["output"]
+            image_parts = [p for p in output if p.get("type") == "input_image"]
+            self.assertEqual(len(image_parts), 1)
+            self.assertEqual("data:image/jpeg;base64,preview", image_parts[0]["image_url"])
+
+    def test_prefix_image_previews_pair_split_identifier_wire_shapes(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "1")
+
+        def build() -> dict:
+            items: list[dict] = []
+            for i, path in enumerate(("/tmp/old1.png", "/tmp/old2.png", "/tmp/recent.png")):
+                # Replayed wire splits the pairing identifiers: the call keeps
+                # only its item ``id`` while the output keeps only ``call_id``,
+                # and the two strings never agree with each other.
+                items.append({
+                    "type": "function_call",
+                    "id": f"fc-{i}",
+                    "name": "exec",
+                    "arguments": 'const r = await tools.view_image({path:"%s", detail:"high"});' % path,
+                })
+                items.append({
+                    "type": "function_call_output",
+                    "call_id": f"wire-call-{i}",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed"},
+                        {"type": "input_image", "image_url": "data:image/png;base64," + "X" * 150_000},
+                    ],
+                })
+            items.append({"type": "reasoning", "encrypted_content": "opaque"})
+            return {
+                "call_type": "aresponses",
+                "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+                "input": items,
+            }
+
+        request = build()
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        with mock.patch.object(
+            hooks._image_inputs_module,
+            "_resize_data_url",
+            side_effect=lambda value, *, target_bytes, max_edge: "data:image/jpeg;base64,preview",
+        ):
+            modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        # 老的输出 -> 纯路径：图片 part 全部移除，引用文本带路径
+        for idx in (1, 3):
+            output = modified["input"][idx]["output"]
+            self.assertEqual([p.get("type") for p in output], ["input_text", "input_text"])
+            self.assertIn("replaced by local-path", output[0]["text"])
+        # 最近的输出 -> 预览 + 路径引用
+        output = modified["input"][5]["output"]
+        image_parts = [p for p in output if p.get("type") == "input_image"]
+        self.assertEqual(len(image_parts), 1)
+        self.assertEqual("data:image/jpeg;base64,preview", image_parts[0]["image_url"])
+        # 加密项逐字节不变
+        self.assertEqual(modified["input"][6], request["input"][6])
+
+    def test_prefix_image_original_path_converts_aged_original_outputs_by_default(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "1")
+        # 默认开关开启：原图请求超出保留窗口后同样转成纯路径引用
+
+        def build() -> dict:
+            items: list[dict] = []
+            for i, path in enumerate(("/tmp/orig-old1.png", "/tmp/orig-old2.png", "/tmp/orig-recent.png")):
+                items.append({
+                    "type": "function_call",
+                    "call_id": f"call-orig-{i}",
+                    "name": "exec",
+                    "arguments": 'const r = await tools.view_image({path:"%s", detail:"original"});' % path,
+                })
+                items.append({
+                    "type": "function_call_output",
+                    "call_id": f"call-orig-{i}",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed"},
+                        {"type": "input_image", "image_url": "data:image/png;base64," + "O" * 150_000},
+                    ],
+                })
+            items.append({"type": "reasoning", "encrypted_content": "opaque"})
+            return {
+                "call_type": "aresponses",
+                "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+                "input": items,
+            }
+
+        request = build()
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url"
+        ) as resize_mock:
+            modified = hooks._with_prefix_image_previews(request)
+            resize_mock.assert_not_called()
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        # 超出保留窗口的原图输出 -> 纯路径引用，图片 part 移除
+        for idx in (1, 3):
+            output = modified["input"][idx]["output"]
+            self.assertEqual([p.get("type") for p in output], ["input_text", "input_text"])
+            self.assertIn("replaced by local-path", output[0]["text"])
+            self.assertIn("/tmp/orig-old1.png" if idx == 1 else "/tmp/orig-old2.png", output[0]["text"])
+        # 保留窗口内的原图输出 -> 原始字节原样内联
+        self.assertEqual(modified["input"][5], request["input"][5])
+        self.assertEqual(modified["input"][6], request["input"][6])
+
+    def test_prefix_image_original_path_switch_off_preserves_original_outputs(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_ORIGINAL_PATH_ENV, "0")
+
+        def build() -> dict:
+            items: list[dict] = []
+            for i, path in enumerate(("/tmp/orig-old1.png", "/tmp/orig-old2.png", "/tmp/orig-recent.png")):
+                items.append({
+                    "type": "function_call",
+                    "call_id": f"call-orig-{i}",
+                    "name": "exec",
+                    "arguments": 'const r = await tools.view_image({path:"%s", detail:"original"});' % path,
+                })
+                items.append({
+                    "type": "function_call_output",
+                    "call_id": f"call-orig-{i}",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed"},
+                        {"type": "input_image", "image_url": "data:image/png;base64," + "O" * 150_000},
+                    ],
+                })
+            items.append({"type": "reasoning", "encrypted_content": "opaque"})
+            return {
+                "call_type": "aresponses",
+                "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+                "input": items,
+            }
+
+        # 开关关闭：原图输出全部跳过 -> 整个请求不变
+        self.assertIsNone(hooks._with_prefix_image_previews(build()))
+
+    def test_prefix_image_previews_skip_compaction_requests(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        call = {
+            "type": "function_call",
+            "call_id": "call-compact",
+            "name": "exec",
+            "arguments": '{"input":"await tools.view_image({path:\\"/tmp/comp.png\\"});"}',
+        }
+        output = {
+            "type": "function_call_output",
+            "call_id": "call-compact",
+            "output": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64," + ("C" * 150_000),
+                }
+            ],
+        }
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "input": [
+                call,
+                output,
+                {"type": "reasoning", "encrypted_content": "opaque"},
+                {"type": "compaction_trigger"},
+            ],
+        }
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url"
+        ) as resize_mock:
+            self.assertIsNone(hooks._with_prefix_image_previews(request))
+            resize_mock.assert_not_called()
+
+    def test_prefix_image_previews_skip_requests_without_frozen_prefix(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        call = {
+            "type": "custom_tool_call",
+            "call_id": "call-fresh",
+            "name": "exec",
+            "input": 'await tools.view_image({path:"/tmp/fresh.png"});',
+        }
+        output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-fresh",
+            "output": [
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64," + ("C" * 150_000),
+                }
+            ],
+        }
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [call, output],
+        }
+        # No encrypted item: the mutable-suffix pipeline owns this request.
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url"
+        ) as resize_mock:
+            self.assertIsNone(hooks._with_prefix_image_previews(request))
+            resize_mock.assert_not_called()
 
     def test_codex_view_image_reopen_marks_repeated_path_as_original(self) -> None:
         hooks, _ = load_hook_module()

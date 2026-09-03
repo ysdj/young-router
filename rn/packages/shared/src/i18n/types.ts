@@ -155,6 +155,7 @@ export type TranslationKey =
   | "logs.routeTrace.reasonTemporary"
   | "logs.routeTrace.reasonTerminal"
   | "logs.routeTrace.reasonStreamStartTimeout"
+  | "logs.routeTrace.reasonStreamIdleTimeout"
   | "logs.routeTrace.reasonResponsesUnsupported"
   | "logs.routeTrace.reasonWebSearchFormat"
   | "logs.routeTrace.reasonUnknown"

@@ -2346,17 +2346,59 @@ def _web_search_queries_for_request(
     return queries
 
 
+def _external_web_search_rate_limit_retry_attempts() -> int:
+    return 2
+
+
+def _external_web_search_rate_limit_retry_delay_seconds() -> float:
+    return 2.0
+
+
+def _external_web_search_exception_is_rate_limited(exc: Exception) -> bool:
+    """Whether a search-backend failure is a transient rate limit.
+
+    The local pi web-access search service throttles bursts of deep-dive
+    queries (HTTP 429 / 限流).  Such failures are transient by contract and
+    must be retried with a short backoff before being surfaced to the model;
+    surfacing them immediately turns every query into a dead end and makes
+    the model re-issue fresh queries instead of opening pages.
+    """
+
+    try:
+        if int(getattr(exc, "status_code", 0)) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = str(exc).lower()
+    return "429" in text or "rate" in text or "限流" in text
+
+
 async def _external_web_search_run_query(
     query: str,
     *,
     page: int = 1,
 ) -> tuple[str, list[str]]:
     try:
-        text, structured = await asyncio.to_thread(
-            _pi_web_access_module._pi_web_access_search_sync,
-            query,
-            page=page,
-        )
+        attempts = _external_web_search_rate_limit_retry_attempts() + 1
+        text = ""
+        structured = None
+        for attempt in range(attempts):
+            try:
+                text, structured = await asyncio.to_thread(
+                    _pi_web_access_module._pi_web_access_search_sync,
+                    query,
+                    page=page,
+                )
+                break
+            except Exception as exc:
+                if (
+                    attempt >= attempts - 1
+                    or not _external_web_search_exception_is_rate_limited(exc)
+                ):
+                    raise
+                delay = _external_web_search_rate_limit_retry_delay_seconds() * (attempt + 1)
+                if delay > 0:
+                    await asyncio.sleep(delay)
         urls = _external_web_search_source_urls(structured, text)
     except Exception as exc:
         text = f"Search failed for query {query!r}: {exc}"
@@ -2566,7 +2608,7 @@ def _external_web_search_max_rounds() -> int:
         _EXTERNAL_WEB_SEARCH_MAX_ROUNDS_ENV,
         _EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT,
         1,
-        8,
+        16,
     )
 
 
@@ -2761,13 +2803,23 @@ def _external_web_search_result_cards(search_results: str) -> list[dict[str, str
 
 _EXTERNAL_WEB_SEARCH_SYNTHESIS_EVIDENCE_MAX_CHARS = 6000
 _EXTERNAL_WEB_SEARCH_SYNTHESIS_SECTION_MAX_CHARS = 1400
-_EXTERNAL_WEB_SEARCH_CONTINUATION_EVIDENCE_MAX_CHARS = 10000
-_EXTERNAL_WEB_SEARCH_CONTINUATION_SECTION_MAX_CHARS = 9000
+_EXTERNAL_WEB_SEARCH_CONTINUATION_EVIDENCE_MAX_CHARS = 32000
+_EXTERNAL_WEB_SEARCH_CONTINUATION_SECTION_MAX_CHARS = 20000
+# Dedicated stream budgets for the hidden continuation turns.  The global
+# 120s stall/start budgets are tuned for interactive turns; a reasoning model
+# digesting a large accumulated evidence block can stay silent longer between
+# upstream chunks.  Bounded to five minutes so a genuinely stuck single
+# continuation cannot stall the turn indefinitely.
+_EXTERNAL_WEB_SEARCH_CONTINUATION_STREAM_TIMEOUT_SECONDS = 300.0
+# Upper bound for the shared route-recovery poll when it is driven by a hidden
+# bridge investigation turn (see _external_web_search_bounded_recovery_kwargs).
+# Also capped at five minutes so the client sees a visible failure instead of
+# an endless keepalive-only wait.
+_EXTERNAL_WEB_SEARCH_ROUTE_RECOVERY_MAX_SECONDS = 300.0
 # The hidden bridge turns only need to emit a compact tool call or a short
 # decision. Keeping these budgets bounded prevents a Kimi thinking route from
 # spending a full answer budget on an internal routing turn.
 _EXTERNAL_WEB_SEARCH_INITIAL_OUTPUT_TOKENS = 128
-_EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS = 512
 _EXTERNAL_WEB_SEARCH_SYNTHESIS_OUTPUT_TOKENS = 1536
 _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_BY_EXCEPTION_ID: dict[int, dict[str, Any]] = {}
 _EXTERNAL_WEB_SEARCH_RECOVERY_REQUESTS_MAX = 256
@@ -3868,6 +3920,20 @@ async def _external_web_search_chat_synthesis_response(
     return response
 
 
+def _external_web_search_upstream_host(
+    request_kwargs: Optional[dict],
+) -> Optional[str]:
+    if not isinstance(request_kwargs, dict):
+        return None
+    api_base = request_kwargs.get("api_base")
+    host = (
+        _responses_request_module._api_base_host(api_base)
+        if isinstance(api_base, str)
+        else ""
+    )
+    return host or None
+
+
 async def _external_web_search_chat_tool_response(
     call_kwargs: dict[str, Any],
     request_kwargs: Optional[dict],
@@ -3896,6 +3962,7 @@ async def _external_web_search_chat_tool_response(
         return None
     _trace_module._route_trace(
         "external_web_search_bridge_chat_tool_start",
+        activity="upstream_model",
         request_id=_routing_module._trace_request_id(request_kwargs or call_kwargs),
         session=_routing_module._trace_session_context(request_kwargs or call_kwargs),
         model_group=_responses_execution_module._request_model_group(call_kwargs)
@@ -4013,6 +4080,7 @@ async def _external_web_search_chat_tool_response(
     )
     _trace_module._route_trace(
         "external_web_search_bridge_chat_tool_done",
+        activity="upstream_model",
         request_id=_routing_module._trace_request_id(request_kwargs or call_kwargs),
         session=_routing_module._trace_session_context(request_kwargs or call_kwargs),
         model_group=_responses_execution_module._request_model_group(call_kwargs)
@@ -4253,6 +4321,7 @@ async def _external_web_search_synthesize_or_fallback(
     )
     _trace_module._route_trace(
         "external_web_search_bridge_synthesis_start",
+        activity="upstream_model",
         request_id=_routing_module._trace_request_id(request_kwargs),
         session=_routing_module._trace_session_context(request_kwargs),
         model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -4270,6 +4339,7 @@ async def _external_web_search_synthesize_or_fallback(
         reason = _external_web_search_synthesis_invalid_reason(synthesized)
         _trace_module._route_trace(
             "external_web_search_bridge_synthesis_done",
+        activity="upstream_model",
             request_id=_routing_module._trace_request_id(request_kwargs),
             session=_routing_module._trace_session_context(request_kwargs),
             model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -4290,6 +4360,7 @@ async def _external_web_search_synthesize_or_fallback(
     except Exception as exc:
         _trace_module._route_trace(
             "external_web_search_bridge_synthesis_error",
+        activity="upstream_model",
             request_id=_routing_module._trace_request_id(request_kwargs),
             session=_routing_module._trace_session_context(request_kwargs),
             model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -4310,6 +4381,7 @@ def _external_web_search_continuation_kwargs(
     queries: list[str],
     completed_actions: Optional[list[dict[str, str]]] = None,
     round_number: int,
+    final_round: bool = False,
 ) -> dict[str, Any]:
     continuation_kwargs = _external_web_search_safe_request_base(request_kwargs)
     continuation_kwargs["tools"] = _external_web_search_continuation_tools(request_kwargs)
@@ -4327,13 +4399,9 @@ def _external_web_search_continuation_kwargs(
     ):
         continuation_kwargs.pop(key, None)
 
-    continuation_kwargs = _external_web_search_low_reasoning_kwargs(
-        continuation_kwargs
-    )
-    if _request_context_module._positive_int_value(
-        continuation_kwargs.get("max_output_tokens")
-    ) is None:
-        continuation_kwargs["max_output_tokens"] = _EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS
+    # The continuation is the model's own investigation turn. Its reasoning
+    # effort and output budget follow the session's request settings; the
+    # bridge must not silently downgrade either one.
 
     metadata = _request_context_module._request_metadata_dict(continuation_kwargs, "litellm_metadata") or {}
     continuation_metadata = metadata.copy()
@@ -4402,6 +4470,16 @@ def _external_web_search_continuation_kwargs(
         "Otherwise choose whether to use an available lookup function with a focused "
         "query, a source URL to read, or a URL plus pattern to find text."
     )
+    final_round_note = (
+        "This is the final investigation step: do not request further search "
+        "or page actions. Provide the final answer to the user now."
+        if final_round
+        else ""
+    )
+    if final_round_note:
+        continuation_kwargs["instructions"] = (
+            f"{continuation_kwargs['instructions']} {final_round_note}"
+        )
     continuation_kwargs["input"] = (
         _external_web_search_conversation_context_prefix(request_kwargs)
         + "Original user request:\n"
@@ -4409,13 +4487,26 @@ def _external_web_search_continuation_kwargs(
         f"{time_context_lines}"
         "Web actions completed so far:\n"
         f"{query_lines}\n\n"
-        "Retrieved evidence observed so far:\n"
+        f"{_tools_module._EXTERNAL_WEB_SEARCH_CONTINUATION_INPUT_MARKER}\n"
         f"{continuation_evidence}\n\n"
         "Decide the next step now. "
         f"{next_step_text}"
+        + (f" {final_round_note}" if final_round_note else "")
     )
     continuation_kwargs.pop("messages", None)
     continuation_kwargs["stream"] = True
+    # A reasoning upstream digesting the accumulated evidence can stay silent
+    # well beyond the global 120s stream budgets (kimi-k3 observed >120s gaps
+    # between chunks while planning its next step).  The continuation is an
+    # internal investigation turn; give it a dedicated, generous stream budget
+    # so the idle watchdog does not kill the upstream stream mid-thought and
+    # force Codex to replay the whole turn (visible as "正在重新连接").
+    continuation_kwargs["stream_idle_timeout_seconds"] = (
+        _EXTERNAL_WEB_SEARCH_CONTINUATION_STREAM_TIMEOUT_SECONDS
+    )
+    continuation_kwargs["stream_start_timeout_seconds"] = (
+        _EXTERNAL_WEB_SEARCH_CONTINUATION_STREAM_TIMEOUT_SECONDS
+    )
     return _responses_execution_module._normalize_external_web_search_router_kwargs(
         continuation_kwargs,
         request_kwargs,
@@ -4498,6 +4589,7 @@ def _external_web_search_prepare_continuation_recovery_request(
     queries: list[str],
     completed_actions: Optional[list[dict[str, str]]] = None,
     round_number: int,
+    final_round: bool = False,
 ) -> dict[str, Any]:
     continuation_kwargs = _external_web_search_continuation_kwargs(
         request_kwargs,
@@ -4505,6 +4597,7 @@ def _external_web_search_prepare_continuation_recovery_request(
         queries=queries,
         completed_actions=completed_actions,
         round_number=round_number,
+        final_round=final_round,
     )
     _external_web_search_set_pending_recovery_request(
         request_kwargs,
@@ -4586,6 +4679,7 @@ async def _external_web_search_call_original(
             attempt += 1
             _trace_module._route_trace(
                 "external_web_search_bridge_model_retry",
+        activity="upstream_model",
                 request_id=_routing_module._trace_request_id(request_kwargs or call_kwargs),
                 session=_routing_module._trace_session_context(request_kwargs or call_kwargs),
                 model_group=_responses_execution_module._request_model_group(request_kwargs or call_kwargs),
@@ -4660,6 +4754,7 @@ async def _external_web_search_continue_or_synthesize(
     source_urls: list[str],
     round_number: int,
     original_function: Optional[Any],
+    final_round: bool = False,
 ) -> Any:
     if original_function is None:
         return await _external_web_search_synthesize_or_fallback(
@@ -4676,9 +4771,11 @@ async def _external_web_search_continue_or_synthesize(
         queries=queries,
         completed_actions=completed_actions,
         round_number=round_number,
+        final_round=final_round,
     )
     _trace_module._route_trace(
         "external_web_search_bridge_continuation_start",
+        activity="upstream_model",
         request_id=_routing_module._trace_request_id(request_kwargs),
         session=_routing_module._trace_session_context(request_kwargs),
         model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -4706,6 +4803,7 @@ async def _external_web_search_continue_or_synthesize(
         if _external_web_search_is_empty_continuation_response(continued):
             _trace_module._route_trace(
                 "external_web_search_bridge_empty_continuation_synthesis",
+        activity="upstream_model",
                 request_id=_routing_module._trace_request_id(request_kwargs),
                 session=_routing_module._trace_session_context(request_kwargs),
                 model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -4723,6 +4821,7 @@ async def _external_web_search_continue_or_synthesize(
             )
         _trace_module._route_trace(
             "external_web_search_bridge_continuation_done",
+        activity="upstream_model",
             request_id=_routing_module._trace_request_id(request_kwargs),
             session=_routing_module._trace_session_context(request_kwargs),
             model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -4750,6 +4849,7 @@ async def _external_web_search_continue_or_synthesize(
         recovery_request = _external_web_search_recovery_request_from_exception(exc)
         _trace_module._route_trace(
             "external_web_search_bridge_continuation_error",
+        activity="upstream_model",
             request_id=_routing_module._trace_request_id(request_kwargs),
             session=_routing_module._trace_session_context(request_kwargs),
             model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -4833,7 +4933,6 @@ async def _resolve_web_search_function_calls(
     page_cache: dict[str, str] = {}
     page_fetch_tasks: dict[str, asyncio.Task[str]] = {}
     final_response: Any = response
-    forced_synthesis = False
 
     for round_number in range(1, max_rounds + 1):
         round_actions = _external_web_search_budgeted_actions(
@@ -4852,6 +4951,7 @@ async def _resolve_web_search_function_calls(
         )
         _trace_module._route_trace(
             "external_web_search_bridge_actions_executed",
+        activity="local_pi_web_access",
             request_id=_routing_module._trace_request_id(request_kwargs),
             session=_routing_module._trace_session_context(request_kwargs),
             model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -4872,17 +4972,9 @@ async def _resolve_web_search_function_calls(
         search_results = "\n\n".join(section for section in search_sections if section.strip())
         completed_labels = _external_web_search_action_labels(completed_actions)
 
-        if round_number >= max_rounds:
-            final_response = await _external_web_search_synthesize_or_fallback(
-                request_kwargs=request_kwargs,
-                search_results=search_results,
-                queries=completed_labels,
-                source_urls=source_urls,
-                original_function=original_function,
-            )
-            forced_synthesis = True
-            break
-
+        # The round budget guards against an endless action loop; it must not
+        # replace the model's own final answer. Ask the model itself to close
+        # the investigation on the last round and keep its answer verbatim.
         current_response = await _external_web_search_continue_or_synthesize(
             request_kwargs=request_kwargs,
             search_results=search_results,
@@ -4891,19 +4983,19 @@ async def _resolve_web_search_function_calls(
             source_urls=source_urls,
             round_number=round_number,
             original_function=original_function,
+            final_round=round_number >= max_rounds,
         )
         final_response = current_response
 
-    if not forced_synthesis:
-        search_results = "\n\n".join(section for section in search_sections if section.strip())
-        final_response = await _external_web_search_finalize_response(
-            final_response,
-            request_kwargs=request_kwargs,
-            search_results=search_results,
-            queries=_external_web_search_action_labels(completed_actions),
-            source_urls=source_urls,
-            original_function=original_function,
-        )
+    search_results = "\n\n".join(section for section in search_sections if section.strip())
+    final_response = await _external_web_search_finalize_response(
+        final_response,
+        request_kwargs=request_kwargs,
+        search_results=search_results,
+        queries=_external_web_search_action_labels(completed_actions),
+        source_urls=source_urls,
+        original_function=original_function,
+    )
 
     return _with_external_web_search_call_action_items(
         final_response,
@@ -5107,8 +5199,7 @@ def _external_web_search_recovery_kwargs(
             if isinstance(model_group, str) and model_group.strip():
                 recovery_request["model"] = model_group
             recovery_request["stream"] = True
-            recovery_kwargs = recovery_request
-            return recovery_kwargs
+            return _external_web_search_bounded_recovery_kwargs(recovery_request)
 
     recovery_request = _external_web_search_pending_recovery_request(request_kwargs)
     if recovery_request is not None:
@@ -5118,7 +5209,7 @@ def _external_web_search_recovery_kwargs(
         if isinstance(model_group, str) and model_group.strip():
             recovery_request["model"] = model_group
         recovery_request["stream"] = True
-        return recovery_request
+        return _external_web_search_bounded_recovery_kwargs(recovery_request)
 
     if _external_web_search_payload_has_embedded_evidence(request_kwargs):
         recovery_kwargs = copy.deepcopy(request_kwargs or {})
@@ -5126,7 +5217,7 @@ def _external_web_search_recovery_kwargs(
         if isinstance(model_group, str) and model_group.strip():
             recovery_kwargs["model"] = model_group
         recovery_kwargs["stream"] = True
-        return recovery_kwargs
+        return _external_web_search_bounded_recovery_kwargs(recovery_kwargs)
 
     recovery_kwargs = _external_web_search_synthesis_kwargs(
         request_kwargs,
@@ -5136,6 +5227,33 @@ def _external_web_search_recovery_kwargs(
     if isinstance(model_group, str) and model_group.strip():
         recovery_kwargs["model"] = model_group
     recovery_kwargs["stream"] = True
+    return _external_web_search_bounded_recovery_kwargs(recovery_kwargs)
+
+
+def _external_web_search_bounded_recovery_kwargs(
+    recovery_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Bound the route-recovery poll window for bridge recovery requests.
+
+    The shared recovery poll defaults to a 4-hour window and keeps the client
+    stream alive with keepalives while waiting for cooldowns.  For a hidden
+    bridge investigation turn that would mean Codex displays nothing for up
+    to hours while the upstream route (e.g. an exhausted relay channel) stays
+    down.  Cap the bridge's own recovery window so the poll surfaces a
+    visible failed-response event instead; Codex's reconnect ladder can then
+    retry the turn once the route recovers.
+    """
+
+    metadata = _request_context_module._request_metadata_dict(
+        recovery_kwargs, "litellm_metadata"
+    ) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if metadata.get("route_recovery_max_seconds") is None:
+        metadata["route_recovery_max_seconds"] = (
+            _EXTERNAL_WEB_SEARCH_ROUTE_RECOVERY_MAX_SECONDS
+        )
+        recovery_kwargs["litellm_metadata"] = metadata
     return recovery_kwargs
 
 

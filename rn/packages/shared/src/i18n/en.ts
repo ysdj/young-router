@@ -154,6 +154,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.routeTrace.reasonTemporary": "Upstream is temporarily unavailable",
   "logs.routeTrace.reasonTerminal": "Request stopped by prompt or policy",
   "logs.routeTrace.reasonStreamStartTimeout": "Upstream first chunk timed out",
+  "logs.routeTrace.reasonStreamIdleTimeout": "Upstream stream stalled between chunks",
   "logs.routeTrace.reasonResponsesUnsupported": "Upstream does not support the Responses endpoint",
   "logs.routeTrace.reasonWebSearchFormat": "Search tool call format is invalid",
   "logs.routeTrace.reasonUnknown": "Upstream error",

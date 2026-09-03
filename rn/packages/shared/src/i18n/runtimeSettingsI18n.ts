@@ -36,12 +36,17 @@ const units: Record<string, string> = {
   rows: "行",
   tokens: "标记",
   hours: "小时",
+  bytes: "字节",
+  images: "张图",
 };
 
 const zh: Record<string, RuntimeCopy> = {
   LITELLM_MENU_RELAY_AUTO_GROUP_INTERVAL_MINUTES: { label: "自动分组间隔", help: "服务商管理界面刷新并暂存自动 API 密钥分组的间隔。修改会在点击“应用”后生效。" },
   LITELLM_MENU_REQUEST_TIMEOUT_SECONDS: { label: "请求超时", help: "上游模型请求、续写合成和每次恢复探测的总超时。设为 0 可取消本地请求上限。" },
   LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS: { label: "首事件超时", help: "普通请求等待首个上游流事件的最长时间。设为 0 时回退到请求超时。" },
+  LITELLM_MENU_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS: { label: "重前缀首事件超时", help: "重放前缀序列化后超过重前缀阈值的 Responses 请求，改用此更长的首事件预算；多 MB 的签名历史会让所有路由同时推迟首个事件。设为 0 时仅使用首事件超时。" },
+  LITELLM_MENU_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES: { label: "重前缀阈值", help: "重放负载（input 加 instructions）序列化后超过该字节数时启用重前缀首事件超时。设为 0 可完全关闭加长预算。" },
+  LITELLM_MENU_WEBSOCKET_MAX_FRAME_BYTES: { label: "WebSocket 帧上限", help: "本地代理接受的单个 WebSocket 消息帧的最大字节数。Codex 会把整轮请求（含签名历史）作为单帧发送，上限过小会在进入路由前被 1009 关闭并触发重连循环。修改后需重启服务生效。" },
   LITELLM_MENU_CODEX_COMPACTION_START_TIMEOUT_SECONDS: { label: "压缩首事件超时", help: "结构化 Codex 压缩请求等待首个事件的最长时间。设为 0 时回退到请求超时。" },
   LITELLM_MENU_STALL_TIMEOUT_SECONDS: { label: "流空闲超时", help: "首个事件到达后，相邻流事件之间允许的最长间隔。设为 0 可取消本地流空闲上限。" },
   LITELLM_MENU_CODEX_DESCENDANT_CLEANUP: { label: "Codex 父线程屏障", help: "根任务结束前必须取得最新的完整后代线程快照。仍承担必要实现或测试的后代会被等待；已不影响交付的后代按最深层优先中断。关闭后仅使用 Codex 原生生命周期。" },
@@ -83,6 +88,11 @@ const zh: Record<string, RuntimeCopy> = {
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED: { label: "普通请求写入冷却", help: "普通请求失败时是否向共享部署冷却池累计失败。所有请求类型仍会读取已有冷却状态。" },
   LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED: { label: "压缩请求写入冷却", help: "结构化 Codex 压缩失败时是否向共享部署冷却池累计失败。默认关闭，避免仅压缩时的上游失败让普通工作路由进入冷却。" },
   LITELLM_MENU_IMAGE_TOOL_UNSUPPORTED_TTL_SECONDS: { label: "图像工具不支持记忆", help: "某部署明确拒绝 image_generation 工具后，在此时长内跳过它。参数错误、超时、策略拒绝和其他上游错误不会写入该记忆；设为 0 可关闭跨请求记忆。" },
+  LITELLM_MENU_PREFIX_IMAGE_PREVIEW_ENABLED: { label: "签名前缀图片预览化", help: "重放时把签名前缀中超大的 view_image 输出替换为固定的预览图加本地路径引用，不再每轮重传原始字节。模型可随时再调 view_image 查看原图；显式要求原图分辨率的调用在保留窗口内保持原字节，超出保留张数后随“原图转路径”开关转为路径引用。" },
+  LITELLM_MENU_PREFIX_IMAGE_PREVIEW_MIN_BYTES: { label: "前缀图片预览阈值", help: "签名前缀中的内联图片超过该字节数才替换为预览；更小的图片照原样转发。" },
+  LITELLM_MENU_PREFIX_IMAGE_MODE: { label: "前缀图片模式", help: "签名前缀 view_image 输出的重放方式：preview 对所有超大的输出保留缩略预览；path-recent 仅最近的图片输出保留预览，更老的替换为纯路径引用；off 完全关闭改写。模型始终可以再调 view_image 重开任意原图。" },
+  LITELLM_MENU_PREFIX_IMAGE_RECENT_COUNT: { label: "前缀图片保留张数", help: "path-recent 模式下，最近多少个图片输出保留内联图片（普通调用为预览，原图调用为原字节）；更老的输出变为纯路径引用。设为 0 时所有超大输出都退化为路径引用。" },
+  LITELLM_MENU_PREFIX_IMAGE_ORIGINAL_PATH: { label: "原图转路径", help: "path-recent 模式下，显式要求原图分辨率的 view_image 输出一旦超出保留张数也转为纯本地路径引用；保留窗口内的原图输出仍保持原始字节内联。关闭后，显式原图请求永远原样重放、不参与路径转换。" },
   LITELLM_MENU_COMPUTER_FACADE_BACKEND: { label: "后端", help: "执行器后端。明确选择后不会静默回退到其他真实后端。" },
   LITELLM_MENU_COMPUTER_FACADE_MODEL: { label: "规划模型", help: "内部 JSON 规划器可选的模型组或路由。留空时使用请求模型。" },
   LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS: { label: "最大步骤数", help: "在安全失败前，允许计算机观察 / 操作的最大轮数。" },
@@ -106,6 +116,7 @@ const zh: Record<string, RuntimeCopy> = {
 
 const options: Record<string, Record<string, string>> = {
   "*": { on: "开启", auto: "自动", local: "本地", api: "API", off: "关闭", error: "直接报错", recovery: "恢复", recovery_cooldown: "恢复并冷却", compact: "紧凑", detailed: "详细", mcp: "MCP", browser: "内置浏览器", chrome: "Chrome", playwright: "Playwright", mock: "模拟" },
+  LITELLM_MENU_PREFIX_IMAGE_MODE: { preview: "全部预览", "path-recent": "近期预览+远期路径", off: "关闭" },
 };
 const englishOptions: Record<string, string> = {
   on: "On",
@@ -113,6 +124,8 @@ const englishOptions: Record<string, string> = {
   auto: "Auto",
   local: "Local",
   api: "API",
+  preview: "Preview",
+  "path-recent": "Recent previews + older paths",
 };
 
 function isChinese(translate: Translator): boolean {

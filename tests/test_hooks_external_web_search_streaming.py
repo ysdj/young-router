@@ -3556,5 +3556,249 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         self.assertIn('"type": "response.failed"', dumped)
 
 
+    def test_hidden_continuation_requests_are_not_reintercepted(self) -> None:
+        """The stream guard must not consume bridge continuation streams.
+
+        A hidden continuation whose response contains further web_search calls
+        (including page opens) is consumed by the bridge's own round loop,
+        which emits client-visible web_search_call items for every executed
+        action.  If the guard intercepts it again, page-open actions are
+        swallowed invisibly and the round accounting nests fresh resolves.
+        """
+        hooks, _ = load_hook_module()
+        bridge_key_request = {
+            "model": "openai/vendor-chat",
+            "input": "x",
+            "tools": [{"type": "function", "name": "web_search"}],
+            "stream": True,
+            "litellm_metadata": {
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
+                "external_web_search_continuation": True,
+            },
+        }
+        self.assertFalse(
+            hooks._request_should_consume_web_search_function_call(bridge_key_request)
+        )
+        # litellm's streaming post-call hook only receives a reduced request
+        # context: litellm_metadata is dropped there.  The continuation must
+        # still be recognised via its bridge-built input marker.
+        stripped_context_request = {
+            "model": "openai/vendor-chat",
+            "input": (
+                "Web actions completed so far:\n- q\n\n"
+                + hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_INPUT_MARKER
+                + "\nevidence\n\nDecide the next step now."
+            ),
+            "tools": [
+                {"type": "function", "name": "web_search"},
+                {"type": "function", "name": "fetch_content"},
+            ],
+            "stream": True,
+            "litellm_params": {},
+        }
+        self.assertTrue(
+            hooks._request_is_external_web_search_continuation(
+                stripped_context_request
+            )
+        )
+        self.assertFalse(
+            hooks._request_should_consume_web_search_function_call(
+                stripped_context_request
+            )
+        )
+        plain_request = {
+            "model": "openai/vendor-chat",
+            "input": "x",
+            "tools": [{"type": "function", "name": "web_search"}],
+            "stream": True,
+            "litellm_metadata": {
+                hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
+            },
+        }
+        self.assertTrue(
+            hooks._request_should_consume_web_search_function_call(plain_request)
+        )
+
+    async def test_post_call_hook_leaves_hidden_continuation_response_alone(self) -> None:
+        """The litellm post-call hook must not resolve continuation responses.
+
+        The hook receives a reduced request context (no litellm_metadata).  A
+        hidden continuation response that contains further web_search calls
+        must be returned unchanged so the bridge's own round loop consumes it
+        and surfaces the page-open actions to Codex.
+        """
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        request_data = {
+            "model": "openai/vendor-chat",
+            "input": (
+                "Web actions completed so far:\n- q\n\n"
+                + hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_INPUT_MARKER
+                + "\nevidence\n\nDecide the next step now."
+            ),
+            "tools": [
+                {"type": "function", "name": "web_search"},
+                {"type": "function", "name": "fetch_content"},
+            ],
+            "stream": True,
+        }
+        response = {
+            "id": "resp_cont",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "web_search",
+                    "arguments": json.dumps(
+                        {"url": "https://example.test/source"}
+                    ),
+                    "status": "completed",
+                }
+            ],
+        }
+        result = await hook.async_post_call_success_deployment_hook(
+            request_data,
+            response,
+            None,
+        )
+        self.assertIs(result, response)
+
+    async def test_streaming_rounds_emit_visible_items_for_page_opens(self) -> None:
+        """Page opens chosen by the model mid-investigation reach the client.
+
+        The model first searches; its continuation then asks to open a listed
+        source.  The bridge executes the open and must surface it to Codex as
+        a completed web_search_call item labelled with the source URL, not
+        silently swallow it.
+        """
+        hooks, _ = load_hook_module()
+        original_run_action = hooks._external_web_search_run_action
+        executed_actions = []
+
+        async def fake_run_action(action, page_cache, page_fetch_tasks):
+            executed_actions.append(action.copy())
+            if action.get("type") == "openPage":
+                return (
+                    "Opened page text for %s\n\nrelevant paragraph about the claim." % action.get("url"),
+                    [action.get("url")],
+                    action,
+                )
+            return (
+                "Web search results for query: %s\n\nTitle: t\nURL: https://example.test/source\nSnippet: s." % action.get("query"),
+                ["https://example.test/source"],
+                action,
+            )
+
+        hooks._external_web_search_run_action = fake_run_action
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_external_web_search_run_action",
+            original_run_action,
+        )
+        continuation_calls = []
+
+        async def original_function(**kwargs):
+            continuation_calls.append(kwargs)
+            if kwargs.get("litellm_metadata", {}).get("external_web_search_continuation"):
+                if not any(
+                    a.get("type") == "openPage"
+                    for a in kwargs.get("litellm_metadata", {}).get(
+                        "external_web_search_completed_actions", []
+                    )
+                ):
+                    # First continuation: open the listed source.
+                    return {
+                        "id": "resp_open",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "name": "web_search",
+                                "arguments": json.dumps(
+                                    {"url": "https://example.test/source"}
+                                ),
+                                "status": "completed",
+                            }
+                        ],
+                    }
+                return {
+                    "id": "resp_final",
+                    "object": "response",
+                    "status": "completed",
+                    "output_text": "Final answer with the page evidence.",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Final answer with the page evidence.",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            return {
+                "id": "resp_initial",
+                "object": "response",
+                "status": "completed",
+                "output_text": "initial",
+                "output": [],
+            }
+
+        response = {
+            "id": "resp_search",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "web_search",
+                    "arguments": json.dumps({"query": "sample claim"}),
+                    "status": "completed",
+                }
+            ],
+        }
+        chunks = [
+            hooks._jsonable(chunk)
+            async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(
+                response,
+                {
+                    "model": "openai/vendor-chat",
+                    "input": "深挖调查这个说法。",
+                    "tools": [{"type": "web_search"}],
+                    "stream": True,
+                },
+                original_function=original_function,
+            )
+        ]
+        completed_items = [
+            chunk.get("item", {})
+            for chunk in chunks
+            if chunk.get("type") == "response.output_item.done"
+            and chunk.get("item", {}).get("type") == "web_search_call"
+        ]
+        self.assertEqual(len(completed_items), 2)
+        self.assertEqual(
+            completed_items[0].get("action", {}).get("query"),
+            "sample claim",
+        )
+        self.assertEqual(
+            completed_items[1].get("action", {}).get("query"),
+            "https://example.test/source",
+        )
+        self.assertEqual(
+            executed_actions,
+            [
+                {"type": "search", "query": "sample claim"},
+                {"type": "openPage", "url": "https://example.test/source"},
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

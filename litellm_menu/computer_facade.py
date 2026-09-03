@@ -1259,6 +1259,7 @@ async def _resolve_web_search_function_calls_stream_rounds(
         round_completed_items = round_result["completed_items"]
         _trace_module._route_trace(
             "external_web_search_bridge_actions_executed",
+            activity="local_pi_web_access",
             request_id=_routing_module._trace_request_id(request_kwargs),
             session=_routing_module._trace_session_context(request_kwargs),
             model_group=_responses_execution_module._request_model_group(request_kwargs),
@@ -1280,29 +1281,11 @@ async def _resolve_web_search_function_calls_stream_rounds(
         search_results = "\n\n".join(section for section in search_sections if section.strip())
         completed_labels = _responses_web_search_bridge_module._external_web_search_action_labels(completed_actions)
         try:
-            if round_number >= max_rounds:
-                synthesis_task = asyncio.create_task(
-                    _responses_web_search_bridge_module._external_web_search_synthesize_or_fallback(
-                        request_kwargs=request_kwargs,
-                        search_results=search_results,
-                        queries=completed_labels,
-                        source_urls=source_urls,
-                        original_function=original_function,
-                    )
-                )
-                try:
-                    async for keepalive in _external_web_search_keepalives_until_done(
-                        synthesis_task,
-                        request_kwargs=request_kwargs,
-                        phase="web_search_synthesis",
-                    ):
-                        yield keepalive
-                    final_response = await synthesis_task
-                finally:
-                    if not synthesis_task.done():
-                        synthesis_task.cancel()
-                forced_synthesis = True
-                break
+            # The round budget guards against an endless action loop; it must
+            # not replace the model's own final answer. On the last round the
+            # continuation directs the model itself to close the investigation
+            # and its answer is kept verbatim.
+            final_round = round_number >= max_rounds
 
             _responses_web_search_bridge_module._external_web_search_prepare_continuation_recovery_request(
                 request_kwargs=request_kwargs,
@@ -1310,6 +1293,7 @@ async def _resolve_web_search_function_calls_stream_rounds(
                 queries=completed_labels,
                 completed_actions=completed_actions,
                 round_number=round_number,
+                final_round=final_round,
             )
 
             continuation_task = asyncio.create_task(
@@ -1321,6 +1305,7 @@ async def _resolve_web_search_function_calls_stream_rounds(
                     source_urls=source_urls,
                     round_number=round_number,
                     original_function=original_function,
+                    final_round=final_round,
                 )
             )
             try:
@@ -1391,6 +1376,16 @@ async def _resolve_web_search_function_calls_stream_rounds(
                 if not finalize_task.done():
                     finalize_task.cancel()
         except Exception as exc:
+            if route_recovery_attempted:
+                # A bounded route-recovery poll already ran for this stream;
+                # polling again would only extend the client-visible silence.
+                # Surface the failure so Codex can reconnect and retry once
+                # the upstream route recovers.
+                yield _streaming_module._synthesized_failed_response_event(
+                    request_kwargs or {},
+                    exc,
+                )
+                return
             route_recovery_attempted = True
             recovery_task = asyncio.create_task(
                 _external_web_search_stream_route_recovery_or_fallback(

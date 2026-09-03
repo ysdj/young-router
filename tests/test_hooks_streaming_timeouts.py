@@ -1461,3 +1461,133 @@ class HookStreamingTimeoutTests(HookTestCase):
             )
             self.assertEqual(stuck["request_id"], "route-recovery-selected-timeout")
             self.assertEqual(stuck["stuck"]["reason"], "stream_start_timeout")
+
+    def test_heavy_replay_prefix_scales_stream_start_timeout(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.2")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "0")
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV, "0.5")
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "1024")
+
+        ordinary_request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "continue"}],
+            "stream": True,
+        }
+        heavy_request = {
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "x" * 4096},
+                    ],
+                }
+            ],
+            "stream": True,
+        }
+        chat_request = {
+            "model": "default-chat",
+            "messages": [{"role": "user", "content": "x" * 4096}],
+            "stream": True,
+        }
+
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(ordinary_request),
+            0.2,
+        )
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(heavy_request),
+            0.5,
+        )
+        # Non-Responses shapes never receive the heavy budget.
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(chat_request),
+            0.2,
+        )
+
+        # A non-positive threshold disables heavy scaling entirely.
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "0")
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(heavy_request),
+            0.2,
+        )
+
+        # The request timeout still caps the scaled budget.
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "1024")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "0.3")
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(heavy_request),
+            0.3,
+        )
+
+        # A disabled stream-start watchdog is not re-enabled by weight.
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "2")
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(heavy_request),
+            2,
+        )
+
+    def test_heavy_replay_budget_keeps_compaction_budget_and_metadata_override(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.2")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "0")
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV, "0.5")
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "1024")
+
+        compaction_request = {
+            "model": "default-chat",
+            "input": [
+                {"role": "user", "content": "continue"},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        self.set_env(
+            hooks._CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV,
+            "0.4",
+        )
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(compaction_request),
+            0.4,
+        )
+
+        override_request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "x" * 4096}],
+            "stream": True,
+            "litellm_metadata": {
+                "route_recovery_attempt_timeout_seconds": 0.7,
+            },
+        }
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(override_request),
+            0.7,
+        )
+
+    def test_request_replay_payload_bytes_is_cached_in_existing_metadata(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "x" * 2048}],
+            "litellm_metadata": {},
+        }
+        first = hooks._request_replay_payload_bytes(request)
+        self.assertIsNotNone(first)
+        self.assertGreater(first, 2048)
+        cached_key = hooks._REPLAY_PAYLOAD_BYTES_METADATA_KEY
+        self.assertEqual(request["litellm_metadata"][cached_key], first)
+
+        # A cached value short-circuits re-serialization even after the body
+        # changes, and raw request bodies are never mutated with a new key.
+        request["input"] = [{"role": "user", "content": "short"}]
+        self.assertEqual(hooks._request_replay_payload_bytes(request), first)
+        bare = {"model": "default-chat", "input": [{"role": "user", "content": "y"}]}
+        hooks._request_replay_payload_bytes(bare)
+        self.assertNotIn(cached_key, bare)
+        self.assertIsNone(hooks._request_replay_payload_bytes({"model": "default-chat"}))

@@ -1318,6 +1318,10 @@ def _synthesized_failed_response_event(
         )
     )
     if is_structured_compaction:
+        _routing_module._mark_real_compaction_failure_capability_unsupported(
+            request_data,
+            exception,
+        )
         status_code = _routing_module._exception_status_code(exception)
         status_suffix = f" (HTTP {status_code})" if status_code is not None else ""
         if _routing_module._is_codex_compaction_capability_unsupported_error(exception):
@@ -1872,6 +1876,33 @@ def _route_recovery_terminal_chunk_exception(
     return exception
 
 
+def _resolved_stream_timeout_seconds(
+    request_data: dict,
+    key: str,
+    default_resolver: Any,
+) -> float:
+    """Honor an explicit per-request timeout override when present.
+
+    Internal callers (the external web-search bridge continuations) know their
+    own upstream silence profile: a reasoning model digesting a large evidence
+    block can legitimately exceed the global stall budget.  An explicit
+    ``stream_idle_timeout_seconds`` / ``stream_start_timeout_seconds`` entry
+    wins over the global defaults; ``0.0`` keeps its existing meaning and
+    disables the cap.
+    """
+
+    if isinstance(request_data, dict):
+        raw = request_data.get(key)
+        if raw is not None:
+            try:
+                explicit = float(raw)
+            except (TypeError, ValueError):
+                explicit = None
+            if explicit is not None:
+                return explicit
+    return default_resolver(request_data)
+
+
 async def _stream_with_idle_timeout(
     response: Any,
     request_data: dict,
@@ -1880,11 +1911,15 @@ async def _stream_with_idle_timeout(
     saw_visible_output: bool = False,
     initial_chunk_count: int = 0,
 ) -> AsyncIterator[Any]:
-    idle_timeout_seconds = _routing_module._stream_idle_timeout_seconds_for_request(
-        request_data
+    idle_timeout_seconds = _resolved_stream_timeout_seconds(
+        request_data,
+        "stream_idle_timeout_seconds",
+        _routing_module._stream_idle_timeout_seconds_for_request,
     )
-    start_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(
-        request_data
+    start_timeout_seconds = _resolved_stream_timeout_seconds(
+        request_data,
+        "stream_start_timeout_seconds",
+        _routing_module._stream_start_timeout_seconds_for_request,
     )
     iterator = response.__aiter__()
     chunk_count = max(0, initial_chunk_count)
@@ -4110,17 +4145,6 @@ async def _stream_route_recovery_poll(
     exception: Exception,
 ) -> AsyncIterator[Any]:
     uses_native_event_stream = _request_uses_native_event_stream(request_data)
-    if _responses_request_module._request_is_codex_compaction(request_data):
-        _trace_module._route_trace(
-            "codex_compaction_route_recovery_blocked",
-            request_id=_routing_module._trace_request_id(request_data),
-            session=_routing_module._trace_session_context(request_data),
-            model_group=_responses_execution_module._request_model_group(request_data),
-            request=_trace_module._trace_request_summary(request_data),
-            exception=_routing_module._trace_exception(exception),
-        )
-        yield _synthesized_failed_response_event(request_data, exception)
-        return
     recovery_request = _external_web_search_recovery_payload_for_blocked_original(
         request_data,
         exception,
@@ -5662,6 +5686,7 @@ async def _yield_guarded_original_stream(
         actions = _responses_web_search_bridge_module._web_search_actions_for_request(payload, request_data)
         _trace_module._route_trace(
             "external_web_search_bridge_guarded_stream_function_call_intercept",
+            activity="upstream_model",
             request_id=_routing_module._trace_request_id(request_data),
             session=_routing_module._trace_session_context(request_data),
             model_group=_responses_execution_module._request_model_group(request_data),
@@ -7309,6 +7334,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 payload = completion_state.completed_payload(request_data)
                 _trace_module._route_trace(
                     "external_web_search_bridge_stream_function_call_intercept",
+            activity="upstream_model",
                     request_id=_routing_module._trace_request_id(request_data),
                     session=_routing_module._trace_session_context(request_data),
                     model_group=_responses_execution_module._request_model_group(request_data),

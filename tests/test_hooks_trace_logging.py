@@ -786,6 +786,104 @@ class HookTraceLoggingTests(HookTestCase):
             "provider_alpha / openai/default-chat / key=team / order=1",
         )
 
+    def test_request_log_traces_buffered_text_only_completion_with_requested_tools(self) -> None:
+        hooks, _ = load_hook_module()
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        end = start + timedelta(seconds=30)
+        kwargs = {
+            "model": "public-agent",
+            "stream": True,
+            "litellm_params": {
+                "model": "openai/public-agent",
+                "api_base": "https://relay.example/v1",
+                "metadata": {
+                    "deployment_model_name": "public-agent",
+                    "model_info": {"id": "deployment-7", "provider": "relay"},
+                },
+            },
+            "tools": [
+                {"type": "function", "function": {"name": "bash"}},
+            ],
+            # The relay buffered the whole generation and flushed it at the
+            # end: the first token arrived 29.5s into a 30s request.
+            "completion_start_time": start + timedelta(milliseconds=29500),
+        }
+        text_only_response = {
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Let me check the state."}],
+        }
+
+        with self.assertLogs("litellm_menu.route_trace", level="WARNING") as captured:
+            record = hooks._request_log_record(
+                "success", kwargs, text_only_response, start, end
+            )
+
+        self.assertEqual("success", record["status"])
+        trace = json.loads(captured.output[0].split("litellm_route_trace ", 1)[1])
+        self.assertEqual(
+            trace["event"],
+            "responses_completed_text_only_after_buffered_stream",
+        )
+        self.assertEqual(trace["model_group"], "public-agent")
+        self.assertEqual(trace["deployment_id"], "deployment-7")
+        self.assertEqual(trace["duration_ms"], 30000)
+        self.assertEqual(trace["time_to_first_token_ms"], 29500)
+        self.assertIn("output_text", trace["response_types"])
+        self.assertNotIn("function_call", trace["response_types"])
+        self.assertEqual(trace["tool_types"], ["function"])
+
+    def test_request_log_no_trace_when_completion_carries_function_call_or_early_token(self) -> None:
+        hooks, _ = load_hook_module()
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        end = start + timedelta(milliseconds=32657)
+        base_kwargs = {
+            "model": "public-agent",
+            "stream": True,
+            "litellm_params": {
+                "model": "openai/public-agent",
+                "api_base": "https://relay.example/v1",
+                "metadata": {
+                    "deployment_model_name": "public-agent",
+                    "model_info": {"id": "deployment-7", "provider": "relay"},
+                },
+            },
+            "tools": [
+                {"type": "function", "function": {"name": "bash"}},
+            ],
+        }
+        with_tool_call_response = {
+            "type": "message",
+            "content": [{"type": "output_text", "text": "running"}],
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "bash",
+                    "arguments": "{}",
+                }
+            ],
+        }
+        with self.assertNoLogs("litellm_menu.route_trace", level="WARNING"):
+            hooks._request_log_record(
+                "success",
+                {**base_kwargs, "completion_start_time": start + timedelta(milliseconds=29500)},
+                with_tool_call_response,
+                start,
+                end,
+            )
+        # First token streamed early: not the buffered-flush signature.
+        with self.assertNoLogs("litellm_menu.route_trace", level="WARNING"):
+            hooks._request_log_record(
+                "success",
+                {**base_kwargs, "completion_start_time": start + timedelta(milliseconds=500)},
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "early stream"}],
+                },
+                start,
+                end,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

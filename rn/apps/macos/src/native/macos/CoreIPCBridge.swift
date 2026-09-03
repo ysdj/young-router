@@ -743,6 +743,7 @@ import Foundation
         environment["LITELLM_AUTOSTART_STATE_FILE"] = runtime.appendingPathComponent("autostart.enabled").path
         environment["LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE"] = runtime.appendingPathComponent("route-recovery-state.json").path
         environment["LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE"] = runtime.appendingPathComponent("deployment-cooldowns.json").path
+        environment["LITELLM_MENU_SESSION_DEPLOYMENT_AFFINITY_FILE"] = runtime.appendingPathComponent("session-deployment-affinity.json").path
         environment["LITELLM_MENU_SEARCH_STATE_FILE"] = runtime.appendingPathComponent("web-search-references.json").path
         environment["LITELLM_RUNTIME_DIR"] = runtime.path
         environment["LITELLM_RECENT_REQUESTS_LOG"] = root.appendingPathComponent("recent-requests.jsonl").path

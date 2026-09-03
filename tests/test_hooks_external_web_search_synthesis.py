@@ -121,7 +121,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
         self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_MAX_RESULTS_DEFAULT, 5)
         self.assertEqual(hooks._EXTERNAL_WEB_FETCH_TIMEOUT_DEFAULT, 12.0)
-        self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT, 4)
+        self.assertEqual(hooks._EXTERNAL_WEB_SEARCH_MAX_ROUNDS_DEFAULT, 8)
         self.assertEqual(hooks._DEFAULT_MAX_RESULTS, 5)
         self.assertEqual(hooks._DEFAULT_FETCH_TIMEOUT_SECONDS, 12.0)
 
@@ -424,10 +424,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             continuation_kwargs["tools"],
             hooks._pi_web_access_tool_definitions(),
         )
-        self.assertEqual(
-            continuation_kwargs["max_output_tokens"],
-            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS,
-        )
+        self.assertNotIn("max_output_tokens", continuation_kwargs)
 
     def test_external_web_search_continuation_slims_flattened_codex_tool_search(self) -> None:
         hooks, _ = load_hook_module()
@@ -1246,13 +1243,16 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             round_number=1,
         )
 
+        self.assertNotIn("max_output_tokens", kwargs)
+        self.assertEqual(kwargs.get("reasoning"), {"effort": "xhigh"})
         self.assertEqual(
-            kwargs.get("max_output_tokens"),
-            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_OUTPUT_TOKENS,
+            kwargs.get("extra_body", {}).get("reasoning"),
+            {"effort": "xhigh"},
         )
-        self.assertEqual(kwargs.get("reasoning"), {"effort": "low"})
-        self.assertEqual(kwargs.get("extra_body", {}).get("reasoning"), {"effort": "low"})
-        self.assertEqual(kwargs.get("litellm_params", {}).get("reasoning_effort"), "low")
+        self.assertEqual(
+            kwargs.get("litellm_params", {}).get("reasoning_effort"),
+            "xhigh",
+        )
         self.assertNotIn("tool_choice", kwargs)
         self.assertIn("Decide the next step now", kwargs.get("input", ""))
         self.assertIn("https://example.test/source", kwargs.get("input", ""))
@@ -2260,7 +2260,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
         )
         self.assertEqual(len(calls), 1)
         self.assertNotIn("tool_choice", calls[0])
-        self.assertEqual(calls[0].get("reasoning"), {"effort": "low"})
+        self.assertEqual(calls[0].get("reasoning"), {"effort": "xhigh"})
         self.assertIn("Final answer after finding source text", json.dumps(resolved))
 
     async def test_external_web_search_model_chooses_next_result_page(self) -> None:
@@ -2824,6 +2824,25 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 "external_web_search_continuation"
             ):
                 self.assertIn("Search failed for query", kwargs.get("input", ""))
+                if "final investigation step" in kwargs.get("input", ""):
+                    return {
+                        "id": "resp_retry_final",
+                        "object": "response",
+                        "status": "completed",
+                        "output_text": "The retry still found no source.",
+                        "output": [
+                            {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "The retry still found no source.",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
                 return {
                     "id": "resp_retry_query",
                     "object": "response",
@@ -2870,7 +2889,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MAX_ROUNDS", "2")
+        self.set_env("LITELLM_MENU_WEB_SEARCH_MAX_ROUNDS", "2")
         result = await hooks._resolve_web_search_function_calls(
             response,
             {
@@ -2888,8 +2907,295 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 {"type": "search", "query": "retry query"},
             ],
         )
-        self.assertEqual(len(continuation_calls), 3)
+        # The round budget no longer forces a proxy-side synthesis turn. The
+        # model itself closes the investigation on the final round.
+        self.assertEqual(len(continuation_calls), 2)
+        self.assertFalse(
+            continuation_calls[-1]
+            .get("litellm_metadata", {})
+            .get("external_web_search_synthesis")
+        )
+        self.assertIn(
+            "final investigation step",
+            continuation_calls[-1].get("input", ""),
+        )
         self.assertTrue(result.get("output"))
+
+    async def test_external_web_search_continuation_gets_dedicated_stream_budgets(self) -> None:
+        hooks, _ = load_hook_module()
+        original_run_action = hooks._external_web_search_run_action
+
+        async def fake_run_action(action, page_cache, page_fetch_tasks):
+            return (
+                "Web search results for query: %s\n\nTitle: t\nURL: https://example.test/a\nSnippet: s."
+                % action.get("query"),
+                ["https://example.test/a"],
+                action,
+            )
+
+        hooks._external_web_search_run_action = fake_run_action
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_external_web_search_run_action",
+            original_run_action,
+        )
+        continuation_calls = []
+
+        async def original_function(**kwargs):
+            continuation_calls.append(kwargs)
+            return {
+                "id": "resp_cont",
+                "object": "response",
+                "status": "completed",
+                "output_text": "Answer with source https://example.test/a.",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Answer with source https://example.test/a.",
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        response = {
+            "id": "resp_search",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "web_search",
+                    "arguments": json.dumps({"query": "first query"}),
+                    "status": "completed",
+                }
+            ],
+        }
+        await hooks._resolve_web_search_function_calls(
+            response,
+            {
+                "model": "openai/vendor-chat",
+                "input": "查一下这个说法。",
+                "tools": [{"type": "web_search"}],
+            },
+            original_function=original_function,
+        )
+        self.assertEqual(len(continuation_calls), 1)
+        call = continuation_calls[0]
+        # The hidden continuation turn must not inherit the interactive
+        # 120s stream budgets: a reasoning upstream digesting the evidence
+        # legitimately stays silent far longer.
+        self.assertEqual(
+            call.get("stream_idle_timeout_seconds"),
+            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_STREAM_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            call.get("stream_start_timeout_seconds"),
+            hooks._EXTERNAL_WEB_SEARCH_CONTINUATION_STREAM_TIMEOUT_SECONDS,
+        )
+
+    async def test_external_web_search_query_retries_transient_rate_limit(self) -> None:
+        hooks, _ = load_hook_module()
+        original_search = hooks._pi_web_access_module._pi_web_access_search_sync
+        original_sleep = hooks.asyncio.sleep
+        calls = []
+        sleeps = []
+
+        def fake_search(query, page=1):
+            calls.append(query)
+            if len(calls) < 3:
+                raise RuntimeError("search provider rate limited (429)")
+            return "Results for %s. https://example.test/source" % query, {
+                "sources": ["https://example.test/source"]
+            }
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        hooks._pi_web_access_module._pi_web_access_search_sync = fake_search
+        hooks.asyncio.sleep = fake_sleep
+        self.addCleanup(
+            setattr,
+            hooks._pi_web_access_module,
+            "_pi_web_access_search_sync",
+            original_search,
+        )
+        self.addCleanup(setattr, hooks.asyncio, "sleep", original_sleep)
+
+        text, urls = await hooks._external_web_search_run_query("probe query")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [2.0, 4.0])
+        self.assertIn("Results for probe query", text)
+        self.assertEqual(urls, ["https://example.test/source"])
+
+    async def test_external_web_search_query_surfaces_non_rate_limit_failure_immediately(self) -> None:
+        hooks, _ = load_hook_module()
+        original_search = hooks._pi_web_access_module._pi_web_access_search_sync
+        calls = []
+
+        def fake_search(query, page=1):
+            calls.append(query)
+            raise ValueError("upstream search outage")
+
+        hooks._pi_web_access_module._pi_web_access_search_sync = fake_search
+        self.addCleanup(
+            setattr,
+            hooks._pi_web_access_module,
+            "_pi_web_access_search_sync",
+            original_search,
+        )
+        text, urls = await hooks._external_web_search_run_query("probe query")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(urls, [])
+        self.assertIn("upstream search outage", text)
+
+    async def test_external_web_search_trace_events_carry_activity_tag(self) -> None:
+        """Local search executions must never look like kimi-k3 successes.
+
+        The local pi-web-access execution records and the upstream model
+        calls are tagged with an explicit activity field so the logs cannot
+        misattribute one to the other.
+        """
+        hooks, _ = load_hook_module()
+        original_run_action = hooks._external_web_search_run_action
+
+        async def fake_run_action(action, page_cache, page_fetch_tasks):
+            return (
+                "Web search results for query: %s\n\nTitle: t\nURL: https://example.test/a\nSnippet: s."
+                % action.get("query"),
+                ["https://example.test/a"],
+                action,
+            )
+
+        hooks._external_web_search_run_action = fake_run_action
+        self.addCleanup(
+            setattr,
+            hooks,
+            "_external_web_search_run_action",
+            original_run_action,
+        )
+        captured = []
+        original_trace = hooks._trace_module._route_trace
+        hooks._trace_module._route_trace = lambda event, **fields: captured.append(
+            (event, fields)
+        )
+        self.addCleanup(
+            setattr,
+            hooks._trace_module,
+            "_route_trace",
+            original_trace,
+        )
+
+        async def original_function(**kwargs):
+            return {
+                "id": "resp_cont",
+                "object": "response",
+                "status": "completed",
+                "output_text": "Answer with source https://example.test/a.",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Answer with source https://example.test/a.",
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        response = {
+            "id": "resp_search",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "web_search",
+                    "arguments": json.dumps({"query": "first query"}),
+                    "status": "completed",
+                }
+            ],
+        }
+        await hooks._resolve_web_search_function_calls(
+            response,
+            {
+                "model": "openai/vendor-chat",
+                "input": "查一下这个说法。",
+                "tools": [{"type": "web_search"}],
+            },
+            original_function=original_function,
+        )
+        activities = {
+            event: fields.get("activity")
+            for event, fields in captured
+            if event in {
+                "external_web_search_bridge_actions_executed",
+                "external_web_search_bridge_continuation_start",
+                "external_web_search_bridge_continuation_done",
+            }
+        }
+        self.assertEqual(
+            activities["external_web_search_bridge_actions_executed"],
+            "local_pi_web_access",
+        )
+        self.assertEqual(
+            activities["external_web_search_bridge_continuation_start"],
+            "upstream_model",
+        )
+        self.assertEqual(
+            activities["external_web_search_bridge_continuation_done"],
+            "upstream_model",
+        )
+        self.assertEqual(
+            hooks._external_web_search_upstream_host(
+                {"api_base": "https://gateway.example.test/v1"}
+            ),
+            "gateway.example.test",
+        )
+
+    def test_external_web_search_stream_timeout_overrides_win_over_globals(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = hooks._streaming_module
+        request = {
+            "model": "openai/vendor-chat",
+            "input": "x",
+            "stream": True,
+            "stream_idle_timeout_seconds": 300.0,
+            "stream_start_timeout_seconds": 0,
+        }
+        self.assertEqual(
+            streaming._resolved_stream_timeout_seconds(
+                request,
+                "stream_idle_timeout_seconds",
+                hooks._stream_idle_timeout_seconds_for_request,
+            ),
+            300.0,
+        )
+        self.assertEqual(
+            streaming._resolved_stream_timeout_seconds(
+                request,
+                "stream_start_timeout_seconds",
+                hooks._stream_start_timeout_seconds_for_request,
+            ),
+            0.0,
+        )
+        bare = {"model": "openai/vendor-chat", "input": "x", "stream": True}
+        self.assertEqual(
+            streaming._resolved_stream_timeout_seconds(
+                bare,
+                "stream_idle_timeout_seconds",
+                hooks._stream_idle_timeout_seconds_for_request,
+            ),
+            hooks._stream_idle_timeout_seconds_for_request(bare),
+        )
 
     async def test_external_web_search_stream_failed_search_without_urls_leaves_retry_query_to_model(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -2967,7 +3273,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MAX_ROUNDS", "3")
+        self.set_env("LITELLM_MENU_WEB_SEARCH_MAX_ROUNDS", "3")
         chunks = [
             jsonable_stream_chunk(chunk)
             async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(

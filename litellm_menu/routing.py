@@ -120,6 +120,10 @@ from .base import (
     _STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV,
     _STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _STREAM_START_TIMEOUT_SECONDS_ENV,
+    _HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+    _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
+    _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES,
+    _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV,
     _STREAM_ROUTE_EXHAUSTION_DEFAULT_RETRIES,
     _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS,
     _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY,
@@ -130,6 +134,7 @@ from .base import (
     _TerminalFailedResponsesStreamResponse,
     _UPSTREAM_BALANCE_ERROR_MARKERS,
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
+    _UPSTREAM_RELAY_CAPACITY_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
@@ -161,6 +166,13 @@ _REQUEST_STARTED_TIMES: dict[str, tuple[float, datetime]] = {}
 _FIRST_STREAM_OUTPUT_TIMES_LOCK = threading.Lock()
 _FIRST_STREAM_OUTPUT_TIMES_MAX = 4096
 _FIRST_STREAM_OUTPUT_TIMES_TTL_SECONDS = 600.0
+
+# A completed Responses stream that requested client function tools but ended
+# text-only, with the first output token arriving only after this much request
+# time, matches the buffered-flush signature of a relay that finished the turn
+# early without emitting any function call.  See the trace event
+# ``responses_completed_text_only_after_buffered_stream``.
+_TEXT_ONLY_COMPLETION_MIN_DURATION_MS = 4000
 
 
 class _SelectedDeploymentMarkerStream:
@@ -473,6 +485,56 @@ def _stream_start_timeout_seconds() -> float:
     )
 
 
+def _heavy_replay_stream_start_timeout_seconds() -> float:
+    return _env_float_seconds(
+        _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
+        _HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+        minimum=0.0,
+    )
+
+
+def _heavy_replay_stream_start_threshold_bytes() -> float:
+    """Serialized replay weight at which the heavy first-event budget applies.
+
+    A non-positive value disables heavy-replay scaling entirely.
+    """
+
+    value = os.getenv(_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "").strip()
+    if not value:
+        return _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES
+    return parsed
+
+
+def _heavy_replay_stream_start_budget_for_request(
+    request_data: Optional[dict],
+) -> Optional[float]:
+    """Larger first-event budget for Responses requests replaying a heavy prefix.
+
+    A multi-megabyte encrypted replay prefix (a long Codex task history, image
+    bytes inside signed items) legitimately delays the first upstream stream
+    event well past the ordinary start budget -- on every eligible deployment
+    at once, because the delay comes from processing the same prefix.  Aborting
+    at the ordinary budget only walks the whole route list and fails on each
+    deployment for the same reason.  Scale the local start budget with the
+    serialized replay weight instead; the request-wide timeout still caps the
+    total wait.
+    """
+
+    if not _responses_request_module._request_has_responses_shape(request_data):
+        return None
+    threshold = _heavy_replay_stream_start_threshold_bytes()
+    if threshold <= 0:
+        return None
+    weight = _responses_request_module._request_replay_payload_bytes(request_data)
+    if weight is None or weight < threshold:
+        return None
+    return _heavy_replay_stream_start_timeout_seconds()
+
+
 def _codex_compaction_stream_start_timeout_seconds() -> float:
     return _env_float_seconds(
         _CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV,
@@ -518,6 +580,10 @@ def _stream_start_timeout_seconds_for_request(request_data: Optional[dict]) -> f
         if compaction_timeout <= 0:
             return request_timeout
         return min(compaction_timeout, request_timeout)
+    if stream_start_timeout > 0:
+        heavy_budget = _heavy_replay_stream_start_budget_for_request(request_data)
+        if heavy_budget is not None and heavy_budget > stream_start_timeout:
+            stream_start_timeout = heavy_budget
     if stream_start_timeout <= 0:
         return request_timeout
     if request_timeout <= 0:
@@ -797,15 +863,6 @@ def _should_block_external_web_search_original_recovery(request_kwargs: Optional
 
 
 def _recovery_max_seconds_for_request(request_data: Optional[dict]) -> float:
-    if _responses_request_module._request_has_structured_codex_compaction(
-        request_data
-    ):
-        # A compaction request carries the complete signed/encrypted thread
-        # history. Replaying it in the shared long-running recovery poll can
-        # leave Codex stuck in "compacting context" for hours after an
-        # upstream rejection. The normal bounded router fallback still runs;
-        # only the cross-route recovery window is disabled.
-        return 0.0
     override = _request_metadata_positive_float(
         request_data,
         "route_recovery_max_seconds",
@@ -1302,6 +1359,54 @@ def _is_codex_compaction_capability_unsupported_error(
             return True
     text = _exception_text(exception).lower()
     return "upstream_compaction_unsupported" in text
+
+
+def _mark_real_compaction_failure_capability_unsupported(
+    request_data: Optional[dict],
+    exception: Exception,
+) -> bool:
+    """Turn a deterministic 400 on a real third-party compaction into route evidence.
+
+    Every real third-party compaction follows a tiny capability probe.  When
+    the probe passed (the deployment was cached ``supported``) but the real
+    request is rejected with a deterministic 400 that is not a signature
+    failure, the deployment cannot complete encrypted compactions in
+    practice.  Record it unsupported for the capability TTL and stamp the
+    exception so the synthesized client error switches Codex to its local
+    checkpoint-summary path; later compactions re-probe other routes.
+    """
+
+    if not isinstance(request_data, dict) or not isinstance(exception, Exception):
+        return False
+    if not _request_uses_third_party_codex_compaction_route(request_data):
+        return False
+    if _is_codex_compaction_capability_probe(request_data):
+        return False
+    if _is_codex_compaction_capability_unsupported_error(exception):
+        return False
+    if _exception_status_code(exception) != 400:
+        return False
+    text = _exception_text(exception).lower()
+    for marker in ("thinking_signature_invalid", "invalid_signature"):
+        if marker in text:
+            return False
+    if _cached_codex_compaction_capability_status(request_data) != "supported":
+        return False
+    _record_codex_compaction_capability(request_data, "unsupported")
+    try:
+        setattr(exception, _CODEX_COMPACTION_CAPABILITY_UNSUPPORTED_ATTR, True)
+    except Exception:
+        pass
+    _trace_module._route_trace(
+        "codex_compaction_capability_real_failure_unsupported",
+        request_id=_trace_request_id(request_data),
+        session=_trace_session_context(request_data),
+        model_group=_responses_execution_module._request_model_group(request_data),
+        deployment_id=_deployment_id_from_request(request_data),
+        route_key=_deployment_route_key_from_request(request_data),
+        exception=_trace_exception(exception),
+    )
+    return True
 
 
 def _codex_compaction_capability_ttl_seconds() -> float:
@@ -3178,6 +3283,31 @@ def _request_log_record(
         "response_types": _response_type_summary(response_obj),
     }
 
+    if status == "success" and "function" in tools_summary["types"]:
+        response_types = record.get("response_types") or []
+        if "output_text" in response_types and "function_call" not in response_types:
+            duration_ms = record.get("duration_ms")
+            first_token_ms = record.get("time_to_first_token_ms")
+            if (
+                isinstance(duration_ms, int)
+                and duration_ms >= _TEXT_ONLY_COMPLETION_MIN_DURATION_MS
+                and isinstance(first_token_ms, int)
+                and first_token_ms * 5 >= duration_ms * 4
+            ):
+                _trace_module._route_trace(
+                    "responses_completed_text_only_after_buffered_stream",
+                    request_id=record.get("request_id"),
+                    session=record.get("session"),
+                    model_group=record.get("model_group"),
+                    public_model=record.get("public_model"),
+                    deployment_id=record.get("deployment_id"),
+                    route_key=record.get("route_key"),
+                    duration_ms=duration_ms,
+                    time_to_first_token_ms=first_token_ms,
+                    response_types=response_types,
+                    tool_types=record.get("tool_types"),
+                )
+
     if status in {"failure", "stuck"}:
         record["error"] = _request_log_error_summary(request_kwargs, response_obj)
     if status == "pending":
@@ -4064,6 +4194,10 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "upstream-compatible-bad-request"
     elif getattr(exception, "stream_incomplete", False) and status_code is None:
         reason = "upstream-stream-incomplete"
+    elif _is_local_stream_timeout_error(exception):
+        # The local stream watchdog assigns 504 itself; reporting it as an
+        # upstream status fabricates a gateway response that never arrived.
+        reason = _exception_body_reason(exception)
     elif _exception_indicates_network_connectivity_error(exception):
         reason = "upstream-network-connectivity"
     elif status_code in (408, 429) or (status_code is not None and status_code >= 500):
@@ -5749,6 +5883,34 @@ async def _sleep_before_final_route_retry(
         await asyncio.sleep(delay_seconds)
 
 
+def _upstream_relay_capacity_message(exception: Exception) -> Optional[str]:
+    """Extract the relay's own capacity message when it rejected the request.
+
+    Relay providers (relay-style gateways) return a well-formed HTTP 400 whose body
+    says their upstream channel pool is exhausted (e.g. "请稍后重试，暂无可用渠道，或切换模型").
+    That message is the actual cause of the failure and must be preserved in
+    logs; otherwise the record reads as if the model itself (kimi-k3) failed.
+    """
+
+    text = _exception_text(exception)
+    if not any(marker in text for marker in _UPSTREAM_RELAY_CAPACITY_MARKERS):
+        return None
+    match = re.search(r'"message"\s*:\s*"([^"]+)"', text)
+    if match:
+        message = match.group(1).strip()
+        if message:
+            return message[:300]
+    for marker in _UPSTREAM_RELAY_CAPACITY_MARKERS:
+        start = text.find(marker)
+        if start >= 0:
+            return text[max(0, start - 40):start + len(marker) + 80].strip()[:300]
+    return None
+
+
+def _is_upstream_relay_capacity_error(exception: Exception) -> bool:
+    return _upstream_relay_capacity_message(exception) is not None
+
+
 def _sanitized_upstream_route_failure_message(
     model: Optional[str],
     exception: Exception,
@@ -5756,8 +5918,11 @@ def _sanitized_upstream_route_failure_message(
 ) -> str:
     model_group = model or _responses_execution_module._request_model_group(request_kwargs) or "requested model"
     status_code = _exception_status_code(exception)
+    relay_message = _upstream_relay_capacity_message(exception)
     if _is_upstream_deployment_failover_error(exception):
         reason = "upstream auth or balance error"
+    elif _is_upstream_relay_capacity_error(exception):
+        reason = "upstream relay channel unavailable"
     elif status_code == 429:
         reason = "upstream rate limit"
     elif status_code == 408:
@@ -5779,10 +5944,16 @@ def _sanitized_upstream_route_failure_message(
         if _is_upstream_deployment_failover_error(exception)
         else "Temporary upstream route failure"
     )
-    return (
+    message = (
         f"{prefix} for {model_group} ({reason}) "
         "after LiteLLM fallback retries. Retry later or choose another model route."
     )
+    if relay_message:
+        # The relay rejected the request because its upstream channel pool is
+        # exhausted.  Keep its own wording so logs attribute the failure to
+        # the relay instead of implying the model route itself is down.
+        message = f"{message} [upstream relay reported: {relay_message}]"
+    return message
 
 
 def _sanitized_upstream_route_exception(
@@ -5868,6 +6039,7 @@ def _raise_sanitized_upstream_route_failure(
         model_group=model or _responses_execution_module._request_model_group(request_kwargs),
         excluded_deployment_ids=(request_kwargs or {}).get("_excluded_deployment_ids"),
         exception=_trace_exception(exception),
+        upstream_relay_message=_upstream_relay_capacity_message(exception),
         client_message=_sanitized_upstream_route_failure_message(
             model,
             exception,

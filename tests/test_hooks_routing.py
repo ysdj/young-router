@@ -3248,5 +3248,187 @@ class HookRoutingTests(HookTestCase):
         self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "0")
         self.assertEqual(0.0, hooks._codex_compaction_capability_ttl_seconds())
 
+    def test_local_stream_timeouts_are_not_labeled_as_upstream_status(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        start_timeout = TimeoutError(
+            "LiteLLM Menu stream start timeout after 120s without the first stream event"
+        )
+        start_timeout.status_code = 504
+        start_timeout.body = {
+            "reason": "stream_start_timeout",
+            "start_seconds": 120.0,
+            "saw_chunk": False,
+            "buffered_chunks": 0,
+        }
+        self.assertEqual(
+            hooks._trace_exception(start_timeout)["reason"],
+            "stream_start_timeout",
+        )
+
+        idle_timeout = TimeoutError(
+            "LiteLLM Menu stream idle timeout after 120s without a new chunk"
+        )
+        idle_timeout.status_code = 504
+        idle_timeout.body = {"reason": "stream_idle_timeout", "saw_chunk": True}
+        self.assertEqual(
+            hooks._trace_exception(idle_timeout)["reason"],
+            "stream_idle_timeout",
+        )
+
+        # A genuine upstream 504 without a local watchdog body keeps the
+        # upstream-status label.
+        upstream_timeout = TimeoutError("gateway timeout")
+        upstream_timeout.status_code = 504
+        self.assertEqual(
+            hooks._trace_exception(upstream_timeout)["reason"],
+            "upstream-status-504",
+        )
+
+    def _real_compaction_request(self) -> dict:
+        return {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "api_base": "https://relay.example/v1",
+            "model_info": {"id": "route-relay"},
+        }
+
+    def test_real_compaction_400_on_probed_supported_route_marks_unsupported(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "600")
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+        request = self._real_compaction_request()
+        cache_key = hooks._codex_compaction_capability_cache_key(request)
+        now = time.time()
+        with hooks._CODEX_COMPACTION_CAPABILITY_LOCK:
+            hooks._CODEX_COMPACTION_CAPABILITIES[cache_key] = {
+                "status": "supported",
+                "deployment_id": "route-relay",
+                "route_key": "k",
+                "detected_at": now,
+                "expires_at": now + 600,
+            }
+
+        exception = RuntimeError(
+            "litellm.badrequesterror: openaiexception - upstream request failed"
+        )
+        exception.status_code = 400
+        self.assertTrue(
+            hooks._mark_real_compaction_failure_capability_unsupported(
+                request,
+                exception,
+            )
+        )
+        self.assertTrue(
+            hooks._is_codex_compaction_capability_unsupported_error(exception)
+        )
+        with hooks._CODEX_COMPACTION_CAPABILITY_LOCK:
+            state = hooks._CODEX_COMPACTION_CAPABILITIES.get(cache_key)
+        self.assertIsNotNone(state)
+        self.assertEqual(state["status"], "unsupported")
+
+    def test_real_compaction_marking_guards(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "600")
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+        request = self._real_compaction_request()
+
+        # 500（服务端/瞬态）不算证据
+        server_error = RuntimeError("boom")
+        server_error.status_code = 500
+        self.assertFalse(
+            hooks._mark_real_compaction_failure_capability_unsupported(
+                request, server_error
+            )
+        )
+        # 签名类确定性错误不碰
+        signature_error = RuntimeError("thinking_signature_invalid")
+        signature_error.status_code = 400
+        self.assertFalse(
+            hooks._mark_real_compaction_failure_capability_unsupported(
+                request, signature_error
+            )
+        )
+        # 非第三方路由（官方 OpenAI 或探针请求）不标记
+        official = dict(request, api_base="https://api.openai.com/v1")
+        official_error = RuntimeError("upstream request failed")
+        official_error.status_code = 400
+        self.assertFalse(
+            hooks._mark_real_compaction_failure_capability_unsupported(
+                official, official_error
+            )
+        )
+        probe = {
+            **request,
+            "litellm_metadata": {
+                hooks._CODEX_COMPACTION_CAPABILITY_PROBE_METADATA_KEY: True,
+            },
+        }
+        probe_error = RuntimeError("upstream request failed")
+        probe_error.status_code = 400
+        self.assertFalse(
+            hooks._mark_real_compaction_failure_capability_unsupported(
+                probe, probe_error
+            )
+        )
+        # 缓存不是 supported 时不标记
+        uncached_error = RuntimeError("upstream request failed")
+        uncached_error.status_code = 400
+        self.assertFalse(
+            hooks._mark_real_compaction_failure_capability_unsupported(
+                request, uncached_error
+            )
+        )
+
+
+    def test_sanitized_failure_attributes_relay_channel_exhaustion(self) -> None:
+        """A relay-capacity 400 must blame the relay, not the requested model.
+
+        relay-style gateways reject requests with a well-formed 400 whose body
+        says their upstream channel pool is exhausted.  The sanitized message
+        must keep the relay's own wording and a relay-specific reason so logs
+        never read as if kimi-k3 itself failed.
+        """
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequest(Exception):
+            pass
+
+        relay_exc = BadRequest(
+            'litellm.badrequesterror: openaiexception - {"error":{"message":'
+            '"请稍后重试，暂无可用渠道，或切换模型 (request id: x)","type":'
+            '"capability_not_supported"}}'
+        )
+        relay_exc.status_code = 400
+        message = hooks._sanitized_upstream_route_failure_message(
+            "kimi-k3",
+            relay_exc,
+            {"model": "kimi-k3"},
+        )
+        self.assertIn("upstream relay channel unavailable", message)
+        self.assertIn("暂无可用渠道", message)
+        self.assertIn("[upstream relay reported:", message)
+        self.assertIn("kimi-k3", message)
+        self.assertTrue(hooks._is_upstream_relay_capacity_error(relay_exc))
+
+        plain_exc = BadRequest("litellm.badrequesterror: some unrelated 400")
+        plain_exc.status_code = 400
+        self.assertFalse(hooks._is_upstream_relay_capacity_error(plain_exc))
+        plain_message = hooks._sanitized_upstream_route_failure_message(
+            "kimi-k3",
+            plain_exc,
+            {"model": "kimi-k3"},
+        )
+        self.assertNotIn("upstream relay channel unavailable", plain_message)
+        self.assertNotIn("[upstream relay reported:", plain_message)
+
+
 if __name__ == "__main__":
     unittest.main()

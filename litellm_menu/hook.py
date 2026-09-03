@@ -117,6 +117,7 @@ class LiteLLMMenuHook(CustomLogger):
             _reasoning_module._with_model_reasoning_mapping,
             _responses_request_module._with_plaintext_agent_message_content_restored,
             _responses_request_module._with_codex_function_call_arguments_repaired,
+            _responses_request_module._with_prefix_image_previews,
             _responses_request_module._with_codex_view_image_output_paths,
             _responses_request_module._with_codex_function_call_output_text,
             _image_inputs_module._with_bounded_image_inputs,
@@ -135,12 +136,17 @@ class LiteLLMMenuHook(CustomLogger):
             _responses_request_module._with_browser_compatible_headers,
         ):
             image_budget_before = None
+            image_budget_event = None
             if update_request is _image_inputs_module._with_bounded_image_inputs:
                 image_budget_before = _image_inputs_module._image_input_budget(modified_kwargs)
+                image_budget_event = "image_input_budget"
+            elif update_request is _responses_request_module._with_prefix_image_previews:
+                image_budget_before = _image_inputs_module._image_input_budget(modified_kwargs)
+                image_budget_event = "prefix_image_preview"
             updated_kwargs = update_request(modified_kwargs)
             if image_budget_before is not None:
                 _trace_module._route_trace(
-                    "image_input_budget",
+                    image_budget_event,
                     request_id=_routing_module._trace_request_id(modified_kwargs),
                     session=_routing_module._trace_session_context(modified_kwargs),
                     changed=updated_kwargs is not None,

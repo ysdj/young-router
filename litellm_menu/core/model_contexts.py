@@ -11,11 +11,13 @@ records privately for the next run.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import time
 from pathlib import Path
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 import urllib.request
+from urllib.parse import urlparse
 
 from .persistence import PersistenceError, atomic_write_json, read_json
 
@@ -176,6 +178,29 @@ _BUNDLED_RECORDS: dict[str, dict[str, Any]] = {
 _BUNDLED_ALIASES = {
     "gemini-3.1-pro": "gemini-3.1-pro-preview",
 }
+
+_GPT_FAMILY_MODEL_RE = re.compile(r"^gpt-[0-9]", re.IGNORECASE)
+
+
+def gpt_family_model_name(value: object) -> bool:
+    """Return whether a model name belongs to the GPT family.
+
+    The digit after the ``gpt-`` prefix keeps this narrow: ``gpt-5.6-sol``
+    and ``gpt-4.1`` match, while image families such as ``gpt-image-2`` do
+    not. Keep this aligned with ``_codex_gpt_family_model_name`` in
+    ``litellm_menu.responses_request``, which owns the request-time rule.
+    """
+
+    if not isinstance(value, str):
+        return False
+    return bool(_GPT_FAMILY_MODEL_RE.match(value.strip()))
+
+
+def _api_base_host(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    parsed = urlparse(value.strip())
+    return (parsed.hostname or "").strip().casefold()
 
 
 def _positive_int(value: object) -> int | None:
@@ -572,7 +597,9 @@ class ModelContextRegistry:
             pass
         return max(1, unknown), max(0, refresh_hours)
 
-    def _load_route_model_ids(self, public_name: str) -> list[str]:
+    def _load_route_deployments(self, public_name: str) -> list[dict[str, Any]]:
+        """Return full deployment mappings for every route of a public model."""
+
         if self.runtime_config_path is None:
             return []
         try:
@@ -584,10 +611,61 @@ class ModelContextRegistry:
             return []
         if not isinstance(data, Mapping) or not isinstance(data.get("model_list"), list):
             return []
-        result: list[str] = []
+        result: list[dict[str, Any]] = []
         for deployment in data["model_list"]:
             if not isinstance(deployment, Mapping) or str(deployment.get("model_name", "")).strip() != public_name:
                 continue
+            if isinstance(deployment.get("litellm_params"), Mapping):
+                result.append(dict(deployment))
+        return result
+
+    def search_tool_capability_for(self, public_name: str) -> bool | None:
+        """Resolve the route's hosted web-search capability for the catalog.
+
+        Mirrors the proxy's request-time rule in
+        ``responses_request._request_is_codex_gpt_responses_route``: an
+        explicit false capability on any deployment wins; an official OpenAI
+        origin or provider keeps native search; a GPT-family public model
+        defaults to native search when the capability is unknown.  Returns
+        None when no route configuration is readable, leaving the inherited
+        native profile untouched.
+        """
+
+        deployments = self._load_route_deployments(public_name)
+        if not deployments:
+            return None
+        explicit_false = False
+        identified = False
+        for deployment in deployments:
+            params = deployment.get("litellm_params")
+            if not isinstance(params, Mapping):
+                continue
+            info = deployment.get("model_info")
+            if isinstance(info, Mapping):
+                for key in ("supports_responses_web_search", "supports_web_search"):
+                    if info.get(key) is False:
+                        explicit_false = True
+            provider = params.get("custom_llm_provider")
+            if isinstance(provider, str) and provider.strip().casefold() in {
+                "openai",
+                "chatgpt",
+            }:
+                identified = True
+            if _api_base_host(params.get("api_base")) == "api.openai.com":
+                identified = True
+        if explicit_false:
+            return False
+        if identified:
+            return True
+        if gpt_family_model_name(public_name):
+            return True
+        return False
+
+    def _load_route_model_ids(self, public_name: str) -> list[str]:
+        if self.runtime_config_path is None:
+            return []
+        result: list[str] = []
+        for deployment in self._load_route_deployments(public_name):
             params = deployment.get("litellm_params")
             if not isinstance(params, Mapping):
                 continue
@@ -745,4 +823,5 @@ __all__ = [
     "ReasoningCapability",
     "UNKNOWN_MODEL_CONTEXT_WINDOW",
     "default_context_cache_path",
+    "gpt_family_model_name",
 ]

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import threading
+from collections import OrderedDict
+
 from . import request_context as _request_context_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
@@ -17,6 +23,17 @@ from .base import (
     _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY,
     _CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER,
     _CODEX_VIEW_IMAGE_REFERENCE_MARKER,
+    _PREFIX_IMAGE_PREVIEW_ENABLED_DEFAULT,
+    _PREFIX_IMAGE_PREVIEW_ENABLED_ENV,
+    _PREFIX_IMAGE_PREVIEW_MIN_BYTES_DEFAULT,
+    _PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV,
+    _PREFIX_IMAGE_MODE_DEFAULT,
+    _PREFIX_IMAGE_MODE_ENV,
+    _PREFIX_IMAGE_MODE_VALUES,
+    _PREFIX_IMAGE_RECENT_COUNT_DEFAULT,
+    _PREFIX_IMAGE_RECENT_COUNT_ENV,
+    _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT,
+    _PREFIX_IMAGE_ORIGINAL_PATH_ENV,
     _CHAT_COMPAT_REASONING_EFFORT,
     _FALLBACK_BROWSER_USER_AGENT,
     _MAX_COMPAT_REASONING_EFFORT,
@@ -191,6 +208,59 @@ def _with_plaintext_agent_message_content_restored(
 def _request_has_responses_shape(request_kwargs: Optional[dict]) -> bool:
     request_kwargs = request_kwargs or {}
     return _request_is_responses_api(request_kwargs) or "input" in request_kwargs
+
+
+_REPLAY_PAYLOAD_BYTES_METADATA_KEY = "litellm_menu_replay_payload_bytes"
+
+
+def _request_replay_payload_bytes(request_kwargs: Optional[dict]) -> Optional[int]:
+    """Serialized byte weight of a Responses replay payload (best effort).
+
+    The weight covers the request ``input`` replay prefix plus ``instructions``.
+    Callers derive stream-start budgets from it several times per request, and
+    serializing a multi-megabyte encrypted prefix on every call would dominate
+    the request path, so the value is cached inside an existing proxy metadata
+    channel when one is present.  The raw request body is never mutated and no
+    new key is ever added to the payload that is forwarded upstream.
+    """
+
+    if not isinstance(request_kwargs, dict) or "input" not in request_kwargs:
+        return None
+    metadata: Optional[dict] = None
+    for metadata_key in ("litellm_metadata", "metadata"):
+        candidate = _request_context_module._request_metadata_dict(
+            request_kwargs,
+            metadata_key,
+        )
+        if isinstance(candidate, dict):
+            metadata = candidate
+            break
+    if metadata is not None:
+        cached = metadata.get(_REPLAY_PAYLOAD_BYTES_METADATA_KEY)
+        if isinstance(cached, int) and cached >= 0:
+            return cached
+    payload = {
+        key: request_kwargs[key]
+        for key in ("input", "instructions")
+        if request_kwargs.get(key) is not None
+    }
+    try:
+        weight = len(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        )
+    except Exception:
+        return None
+    if metadata is not None:
+        try:
+            metadata[_REPLAY_PAYLOAD_BYTES_METADATA_KEY] = weight
+        except Exception:
+            pass
+    return weight
 
 
 def _with_responses_native_extra_body(request_kwargs: dict) -> Optional[dict]:
@@ -1293,13 +1363,58 @@ def _codex_request_responses_surface(request_kwargs: Optional[dict]) -> str:
     )
 
 
+_CODEX_GPT_FAMILY_MODEL_RE = re.compile(r"^gpt-[0-9]", re.IGNORECASE)
+
+
+def _codex_gpt_family_model_name(value: Any) -> bool:
+    """Return whether a public model name belongs to the GPT family.
+
+    The digit after the ``gpt-`` prefix keeps this narrow: ``gpt-5.6-sol``
+    and ``gpt-4.1`` match, while image/audio families such as
+    ``gpt-image-2`` do not.  Keep this aligned with the catalog-side helper
+    ``gpt_family_model_name`` in ``litellm_menu.core.model_contexts``.
+    """
+
+    if not isinstance(value, str):
+        return False
+    return bool(_CODEX_GPT_FAMILY_MODEL_RE.match(value.strip()))
+
+
+def _codex_gpt_hosted_search_capability_probe_request(
+    request_kwargs: dict,
+) -> dict:
+    """Return a probe-shaped copy for route-local native-search state.
+
+    The rejection cache is keyed by the tool family that failed.  A plain
+    Codex turn may carry no hosted declaration yet, so consult the cache with
+    the hosted ``web_search`` declaration that this hook would forward.  The
+    probe does not expose the local bridge or mutate the caller request.
+    """
+
+    if any(
+        _codex_tool_is_hosted_web_search(tool)
+        for tool in _codex_declared_tools(request_kwargs)
+    ):
+        return request_kwargs
+    probe = request_kwargs.copy()
+    tools = probe.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+    probe["tools"] = [*tools, {"type": "web_search"}]
+    return probe
+
+
 def _request_is_codex_gpt_responses_route(request_kwargs: Optional[dict]) -> bool:
     """Return whether Codex may use the GPT Responses native search tool.
 
     A generic ``openai/responses`` adapter is not enough: LiteLLM uses that
-    surface for many third-party gateways.  Provider identity or the official
-    OpenAI origin must identify a GPT-compatible route; missing capability
-    metadata on an unrelated provider is deliberately not optimistic.
+    surface for many third-party gateways.  Provider identity, the official
+    OpenAI origin, or a GPT-family public model identifies a GPT-compatible
+    route.  A GPT-family model with unknown capability defaults to native
+    hosted search so the original hosted-search request stays eligible for
+    the upstream; only an explicit false capability or a deterministic
+    rejection cached for this exact request and route hands the turn to the
+    local pi-web-access bridge.
     """
 
     if not isinstance(request_kwargs, dict) or not _request_has_responses_shape(request_kwargs):
@@ -1322,9 +1437,22 @@ def _request_is_codex_gpt_responses_route(request_kwargs: Optional[dict]) -> boo
     if _codex_selected_provider_name(request_kwargs) in _CODEX_GPT_RESPONSES_PROVIDER_NAMES:
         return True
 
-    # Route identity is intentionally required. A standalone capability flag
-    # without an identified provider or official endpoint is not proof that a
-    # third-party gateway implements GPT hosted search.
+    if _codex_gpt_family_model_name(
+        _request_context_module._request_model_group(request_kwargs)
+    ):
+        from . import responses_surfaces as _responses_surfaces_module
+
+        probe = _codex_gpt_hosted_search_capability_probe_request(request_kwargs)
+        support = _responses_surfaces_module._request_native_responses_web_search_support_decision(
+            probe
+        )
+        if support is not False:
+            return True
+
+    # Route identity is intentionally required otherwise. A standalone
+    # capability flag without an identified provider, official endpoint, or
+    # GPT-family model is not proof that a third-party gateway implements
+    # GPT hosted search.
     return False
 
 
@@ -1662,7 +1790,8 @@ def _with_codex_external_web_search_bridge_tool(
         ):
             return None
     elif _request_is_codex_gpt_responses_route(request_kwargs):
-        # Official GPT/ChatGPT Responses routes retain Codex's native search
+        # Identified GPT Responses routes (official provider, OpenAI origin,
+        # or a GPT-family public model) retain Codex's native search
         # behavior. This check intentionally does not use a generic
         # openai/responses surface because third-party gateways share it.
         return None
@@ -1746,7 +1875,7 @@ def _codex_text_tool_output_parts(output: Any) -> Optional[list[str]]:
     return chunks
 
 
-_CODEX_VIEW_IMAGE_PATH_LITERAL = re.compile(r'"(?:\\.|[^"\\])*"')
+_CODEX_VIEW_IMAGE_PATH_LITERAL = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _CODEX_VIEW_IMAGE_EXTENSIONS = (
     ".png",
     ".jpg",
@@ -1760,24 +1889,92 @@ _CODEX_VIEW_IMAGE_EXTENSIONS = (
 _CODEX_VIEW_IMAGE_REFERENCE_PATH_LINE = re.compile(r"^\s*\d+\.\s+(.+?)\s*$")
 
 
-def _codex_view_image_paths_from_call(item: Any) -> list[str]:
+def _codex_view_image_call_source(item: Any) -> Optional[str]:
+    """Return the exec script text of a view-image tool call item.
+
+    Codex stores local tool calls as ``custom_tool_call`` in its rollout, but
+    replayed wire history carries them as ``function_call`` items with the
+    script under ``arguments``.  Both shapes share ``name == "exec"`` and a
+    plain-string script field.
+    """
+
     if (
         not isinstance(item, dict)
-        or item.get("type") != "custom_tool_call"
         or item.get("name") != "exec"
-        or not isinstance(item.get("input"), str)
+        or item.get("type") not in {"custom_tool_call", "function_call"}
     ):
-        return []
-    source = item["input"]
-    if "view_image" not in source:
+        return None
+    for key in ("input", "arguments"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _codex_view_image_call_source(item: Any) -> Optional[str]:
+    """Return the exec script text of a view-image tool call item.
+
+    Codex stores local tool calls as ``custom_tool_call`` in its rollout, but
+    replayed wire history carries them as ``function_call`` items with the
+    script under ``arguments``.  Both shapes share ``name == "exec"`` and a
+    plain-string script field.  A JSON-encoded string (double-encoded script)
+    is unwrapped so path literals are matched against the real script text.
+    """
+
+    if (
+        not isinstance(item, dict)
+        or item.get("name") != "exec"
+        or item.get("type") not in {"custom_tool_call", "function_call"}
+    ):
+        return None
+    for key in ("input", "arguments"):
+        value = item.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        stripped = value.strip()
+        if not stripped:
+            continue
+        # A JSON-encoded string (double-encoded script) is unwrapped once.
+        if stripped.startswith('"'):
+            try:
+                unwrapped = json.loads(stripped)
+            except (TypeError, ValueError):
+                unwrapped = None
+            if isinstance(unwrapped, str) and unwrapped:
+                return unwrapped
+        # Wire replay serializes the call as {"input": "<script>", ...}.
+        if stripped.startswith("{"):
+            try:
+                obj = json.loads(stripped)
+            except (TypeError, ValueError):
+                obj = None
+            if isinstance(obj, dict):
+                for inner_key in ("input", "command", "path", "script"):
+                    inner = obj.get(inner_key)
+                    if isinstance(inner, str) and inner:
+                        return inner
+        return value
+    return None
+
+
+def _codex_view_image_path_literal_value(literal: str) -> Optional[str]:
+    """Decode one quoted path literal (double- or single-quoted)."""
+
+    try:
+        value = json.loads(literal)
+    except (TypeError, ValueError):
+        value = literal[1:-1] if len(literal) >= 2 else None
+    return value if isinstance(value, str) else None
+
+
+def _codex_view_image_paths_from_call(item: Any) -> list[str]:
+    source = _codex_view_image_call_source(item)
+    if source is None or "view_image" not in source:
         return []
     paths: list[str] = []
     for literal in _CODEX_VIEW_IMAGE_PATH_LITERAL.findall(source):
-        try:
-            value = json.loads(literal)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(value, str):
+        value = _codex_view_image_path_literal_value(literal)
+        if not value:
             continue
         normalized = value.replace("\\\\", "\\")
         is_absolute = normalized.startswith("/") or bool(
@@ -1793,17 +1990,13 @@ def _codex_view_image_paths_from_call(item: Any) -> list[str]:
 
 
 def _codex_view_image_call_requests_original(item: Any) -> bool:
-    if (
-        not isinstance(item, dict)
-        or item.get("type") != "custom_tool_call"
-        or item.get("name") != "exec"
-        or not isinstance(item.get("input"), str)
-    ):
+    source = _codex_view_image_call_source(item)
+    if source is None:
         return False
     return bool(
         re.search(
             r"(?:detail|['\"]detail['\"])[\s:]+['\"]original['\"]",
-            item["input"],
+            source,
             flags=re.IGNORECASE,
         )
     )
@@ -1944,6 +2137,486 @@ def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
         referenced_paths.update(_codex_view_image_referenced_paths(updated_item))
 
     if not changed:
+        return None
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = updated_items
+    return modified_kwargs
+
+
+_PREFIX_IMAGE_PREVIEW_CACHE_MAX_ENTRIES = 64
+_PREFIX_IMAGE_PREVIEW_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_PREFIX_IMAGE_PREVIEW_CACHE_LOCK = threading.Lock()
+
+
+def _prefix_image_preview_enabled() -> bool:
+    value = os.getenv(_PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "").strip().lower()
+    if not value:
+        return _PREFIX_IMAGE_PREVIEW_ENABLED_DEFAULT
+    return value not in {"0", "false", "off", "no", "disabled"}
+
+
+def _prefix_image_mode() -> str:
+    value = os.getenv(_PREFIX_IMAGE_MODE_ENV, "").strip().lower()
+    if value in _PREFIX_IMAGE_MODE_VALUES:
+        return value
+    return _PREFIX_IMAGE_MODE_DEFAULT
+
+
+def _prefix_image_recent_count() -> int:
+    raw = os.getenv(_PREFIX_IMAGE_RECENT_COUNT_ENV, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return _PREFIX_IMAGE_RECENT_COUNT_DEFAULT
+
+
+def _prefix_image_original_path_enabled() -> bool:
+    """Whether original-resolution outputs join the path-recent conversion.
+
+    When enabled (default), view_image outputs explicitly requested at
+    ``detail: original`` keep their original bytes inline only while they stay
+    inside the recent window; older ones become pure local-path references like
+    every other historical output.  Disable to replay explicit
+    original-resolution requests unchanged forever.
+    """
+
+    value = os.getenv(_PREFIX_IMAGE_ORIGINAL_PATH_ENV, "").strip().lower()
+    if not value:
+        return _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT
+    return value not in {"0", "false", "off", "no", "disabled"}
+
+
+def _prefix_image_preview_min_bytes() -> int:
+    raw = os.getenv(_PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    return _PREFIX_IMAGE_PREVIEW_MIN_BYTES_DEFAULT
+
+
+def _prefix_image_preview_resized(image_url: str) -> str:
+    """Deterministically shrink one oversized replay image to its preview.
+
+    Signed-prefix history replays on every request, so the resized preview is
+    cached by the original data-URL digest; without the cache every worker
+    would re-encode megabytes of PNG on each turn.  An image that cannot be
+    decoded is cached unchanged so a malformed entry never breaks the request
+    and is never retried.
+    """
+
+    digest = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+    with _PREFIX_IMAGE_PREVIEW_CACHE_LOCK:
+        cached = _PREFIX_IMAGE_PREVIEW_CACHE.get(digest)
+        if cached is not None:
+            _PREFIX_IMAGE_PREVIEW_CACHE.move_to_end(digest)
+            return cached
+    try:
+        resized = _image_inputs_module._resize_data_url(
+            image_url,
+            target_bytes=_image_inputs_module._CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+            max_edge=_image_inputs_module._INLINE_IMAGE_MANY_MAX_EDGE,
+        )
+    except Exception:
+        resized = image_url
+    with _PREFIX_IMAGE_PREVIEW_CACHE_LOCK:
+        _PREFIX_IMAGE_PREVIEW_CACHE[digest] = resized
+        while len(_PREFIX_IMAGE_PREVIEW_CACHE) > _PREFIX_IMAGE_PREVIEW_CACHE_MAX_ENTRIES:
+            _PREFIX_IMAGE_PREVIEW_CACHE.popitem(last=False)
+    return resized
+
+
+def _trace_prefix_image_preview_gate(
+    request_kwargs: Optional[dict],
+    gate: str,
+    extra: Optional[dict] = None,
+) -> None:
+    """Record which guard stopped prefix-image previewing for one request."""
+
+    from . import responses_execution as _responses_execution_module
+
+    payload: dict[str, Any] = {
+        "gate": gate,
+    }
+    if extra:
+        payload.update(extra)
+    _trace_module._route_trace(
+        "prefix_image_preview_gate",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        **payload,
+    )
+
+
+def _item_pair_identifiers(item: Any) -> list[str]:
+    """Return every call/output pairing identifier an item carries.
+
+    The client's wire convention has varied over time: some replays carry
+    ``call_id`` on both the call and its output, some carry only ``id`` on
+    the call, and some carry both.  Collect every present identifier so the
+    pairing passes below can match either side.
+    """
+
+    if not isinstance(item, dict):
+        return []
+    identifiers: list[str] = []
+    for key in ("call_id", "id"):
+        value = item.get(key)
+        if isinstance(value, str) and value and value not in identifiers:
+            identifiers.append(value)
+    return identifiers
+
+
+def _resolve_output_call_paths(
+    input_items: list[Any],
+    output_index: int,
+    output_item: dict,
+    call_paths: dict[str, list[str]],
+    original_calls: set[str],
+    call_index_by_id: dict[str, int],
+    claimed_call_ids: set[str],
+) -> tuple[Optional[list[str]], bool]:
+    """Resolve the view-image call paired with one image-bearing output.
+
+    Identifier-based pairing comes first (either shared ``call_id`` or shared
+    ``id``).  When the replayed wire omits every shared identifier, fall back
+    to adjacency: the immediately preceding item, when it is a view-image
+    ``exec`` call that no other output has claimed through identifiers, is the
+    only plausible pairing.  The fallback never steals a call already claimed
+    by an identifier match.
+    """
+
+    for identifier in _item_pair_identifiers(output_item):
+        if identifier in call_paths:
+            claimed_call_ids.add(identifier)
+            return call_paths[identifier], identifier in original_calls
+    if output_index > 0:
+        previous = input_items[output_index - 1]
+        if isinstance(previous, dict) and previous.get("type") in {
+            "custom_tool_call",
+            "function_call",
+        }:
+            previous_identifiers = _item_pair_identifiers(previous)
+            if any(
+                identifier in call_paths and identifier not in claimed_call_ids
+                for identifier in previous_identifiers
+            ):
+                identifier = next(
+                    identifier
+                    for identifier in previous_identifiers
+                    if identifier in call_paths and identifier not in claimed_call_ids
+                )
+                claimed_call_ids.add(identifier)
+                return call_paths[identifier], identifier in original_calls
+    return None, False
+
+
+def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
+    """Serve signed-prefix ``view_image`` outputs as previews plus paths.
+
+    A ``view_image`` tool output keeps its original inline bytes in the
+    client's local history, and once a later response item carries
+    ``encrypted_content`` the frozen-prefix policy forwards those bytes
+    verbatim forever -- so every request re-uploads multi-megabyte originals
+    even though the model already reasoned over the compressed preview on the
+    output's first replay.  The upstream demonstrably accepts sibling-byte
+    variation across requests (the existing entry window already alternates
+    compressed and original bytes for the same item), so for oversized paired
+    images in the frozen prefix this pass swaps in the same deterministic
+    preview the entry window produced and prepends the matching local paths.
+    The model keeps its visual memory at preview fidelity and can re-open any
+    original at full resolution with one more ``view_image`` call; outputs the
+    call explicitly requested at original resolution are left untouched.  When
+    a one-to-one path-to-image pairing cannot be established (an exec output
+    carries more images than the call's path literals), the images are still
+    previewed but no path-reference text is added; the paths remain visible in
+    the matching call item's script text.
+
+    ``LITELLM_MENU_PREFIX_IMAGE_MODE`` selects the treatment: ``preview``
+    keeps previews for every oversized paired output, ``path-recent`` keeps
+    previews only for the most recent image outputs (count from
+    ``LITELLM_MENU_PREFIX_IMAGE_RECENT_COUNT``, default 6) and replaces older
+    ones with pure path references, and ``off`` disables the pass entirely.
+    Outputs without any reopenable path are never path-ified in any mode.
+    """
+
+    if not _prefix_image_preview_enabled():
+        _trace_prefix_image_preview_gate(request_kwargs, "disabled")
+        return None
+    mode = _prefix_image_mode()
+    if mode == "off":
+        _trace_prefix_image_preview_gate(request_kwargs, "mode-off")
+        return None
+    if _request_has_structured_codex_compaction(request_kwargs):
+        # A compaction request must replay its signed history byte-exact:
+        # the upstream compacts exactly what it receives, and a preview or
+        # path swap here would permanently bake the reduced image into the
+        # compacted history the client keeps.
+        _trace_prefix_image_preview_gate(request_kwargs, "compaction-request")
+        return None
+    if not _request_has_responses_shape(request_kwargs):
+        _trace_prefix_image_preview_gate(request_kwargs, "not-responses-shape")
+        return None
+    if not _request_has_codex_client_evidence(request_kwargs):
+        _trace_prefix_image_preview_gate(request_kwargs, "no-codex-evidence")
+        return None
+    input_items = request_kwargs.get("input")
+    if not isinstance(input_items, list):
+        _trace_prefix_image_preview_gate(request_kwargs, "no-input-list")
+        return None
+    last_encrypted_index = max(
+        (
+            index
+            for index, item in enumerate(input_items)
+            if _value_has_encrypted_content(item)
+        ),
+        default=-1,
+    )
+    if last_encrypted_index < 0:
+        _trace_prefix_image_preview_gate(request_kwargs, "no-encrypted-boundary")
+        return None
+    min_bytes = _prefix_image_preview_min_bytes()
+    call_paths: dict[str, list[str]] = {}
+    original_calls: set[str] = set()
+    call_index_by_id: dict[str, int] = {}
+    image_output_items = 0
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"custom_tool_call", "function_call"}:
+            paths = _codex_view_image_paths_from_call(item)
+            if not paths:
+                continue
+            for identifier in _item_pair_identifiers(item):
+                # Replayed wire history can carry only one of ``call_id`` /
+                # ``id`` on the call while the paired output carries the
+                # other; index every identifier so outputs match regardless
+                # of the wire convention.
+                call_paths.setdefault(identifier, paths)
+                call_index_by_id[identifier] = index
+                if _codex_view_image_call_requests_original(item):
+                    original_calls.add(identifier)
+            continue
+        if item.get("type") in {"custom_tool_call_output", "function_call_output"}:
+            output = item.get("output")
+            if isinstance(output, list) and _codex_view_image_output_parts(output):
+                image_output_items += 1
+    if not call_paths:
+        if image_output_items:
+            from collections import Counter
+
+            type_counts: "Counter[str]" = Counter()
+            view_image_types: "Counter[str]" = Counter()
+            wire_shapes: dict[str, Any] = {}
+            arguments_sample: Optional[str] = None
+            for item in input_items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if not isinstance(item_type, str):
+                    item_type = type(item).__name__
+                type_counts[item_type] += 1
+                if "view_image" in json.dumps(item, default=str):
+                    view_image_types[item_type] += 1
+                    if item_type not in wire_shapes:
+                        wire_shapes[item_type] = {
+                            key: (
+                                type(value).__name__
+                                if not isinstance(value, str)
+                                else f"str[{len(value)}]"
+                            )
+                            for key, value in item.items()
+                        }
+                    if item_type == "function_call" and arguments_sample is None:
+                        for key in ("arguments", "input"):
+                            raw = item.get(key)
+                            if isinstance(raw, str):
+                                import re as _re
+
+                                arguments_sample = _re.sub(
+                                    r"/[^\"'\\s,;)]{4,}",
+                                    "/<path>",
+                                    raw,
+                                )[:180]
+                                break
+            _trace_prefix_image_preview_gate(
+                request_kwargs,
+                "no-view-image-calls",
+                extra={
+                    "input_items": len(input_items),
+                    "item_type_counts": dict(type_counts.most_common(10)),
+                    "view_image_item_types": dict(view_image_types.most_common(6)),
+                    "wire_shapes": wire_shapes,
+                    "arguments_sample": arguments_sample,
+                },
+            )
+        return None
+
+    recent_count = _prefix_image_recent_count() if mode == "path-recent" else 0
+    candidate_indices: list[int] = []
+    candidate_paths: dict[int, list[str]] = {}
+    candidate_original: dict[int, bool] = {}
+    claimed_call_ids: set[str] = set()
+    skipped_referenced = 0
+    skipped_original = 0
+    skipped_not_oversized = 0
+    skipped_unpaired = 0
+    for index in range(last_encrypted_index + 1):
+        item = input_items[index]
+        if not (
+            isinstance(item, dict)
+            and item.get("type") in {"custom_tool_call_output", "function_call_output"}
+        ):
+            continue
+        output = item.get("output")
+        if not isinstance(output, list):
+            continue
+        if _image_inputs_module._output_has_codex_view_image_references(
+            output
+        ) or _image_inputs_module._output_has_codex_view_image_original_references(output):
+            skipped_referenced += 1
+            continue
+        image_parts = _codex_view_image_output_parts(output)
+        if not image_parts:
+            continue
+        oversized = [
+            part
+            for part in image_parts
+            if _image_inputs_module._image_data_url_size(part["image_url"]) > min_bytes
+        ]
+        if not oversized:
+            skipped_not_oversized += 1
+            continue
+        paths, is_original = _resolve_output_call_paths(
+            input_items,
+            index,
+            item,
+            call_paths,
+            original_calls,
+            call_index_by_id,
+            claimed_call_ids,
+        )
+        if not paths:
+            skipped_unpaired += 1
+            continue
+        if is_original and not _prefix_image_original_path_enabled():
+            skipped_original += 1
+            continue
+        candidate_indices.append(index)
+        candidate_paths[index] = paths
+        candidate_original[index] = is_original
+
+    # The most recent image outputs keep their preview treatment so the model
+    # retains visual continuity near the current turn; older ones fall back to
+    # pure path references (path-recent mode) and can still be re-opened at
+    # full resolution with one view_image call.
+    recent_candidates = set(candidate_indices[-recent_count:])
+    updated_items = list(input_items)
+    changed = False
+    for index in candidate_indices:
+        item = input_items[index]
+        output = item["output"]
+        paths = candidate_paths[index]
+        references = "\n".join(
+            f"{number}. {path}" for number, path in enumerate(paths, start=1)
+        )
+        if mode == "path-recent" and index not in recent_candidates:
+            reference_part = {
+                "type": "input_text",
+                "text": (
+                    f"{_CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
+                    "Historical inline images below were replaced by local-path "
+                    "references to keep the replay small. To view an original, "
+                    "call view_image on its local path:\n"
+                    f"{references}"
+                ),
+            }
+            kept_parts = [
+                part
+                for part in output
+                if not (
+                    isinstance(part, dict) and part.get("type") == "input_image"
+                )
+            ]
+            updated_item = item.copy()
+            updated_item["output"] = [reference_part, *kept_parts]
+            updated_items[index] = updated_item
+            changed = True
+            continue
+
+        if candidate_original[index]:
+            # An explicit original-resolution request inside the recent window
+            # keeps its original bytes inline; it converts to a path reference
+            # only once it ages out of the window.
+            continue
+
+        image_parts = _codex_view_image_output_parts(output)
+        paired = len(paths) == len(image_parts)
+        oversized = [
+            part
+            for part in image_parts
+            if _image_inputs_module._image_data_url_size(part["image_url"]) > min_bytes
+        ]
+        new_parts: list[dict] = []
+        resized_any = False
+        for part in output:
+            if (
+                isinstance(part, dict)
+                and part in oversized
+                and isinstance(part.get("image_url"), str)
+            ):
+                resized = _prefix_image_preview_resized(part["image_url"])
+                if resized != part["image_url"]:
+                    updated_part = dict(part)
+                    updated_part["image_url"] = resized
+                    new_parts.append(updated_part)
+                    resized_any = True
+                    continue
+            new_parts.append(part)
+        if not resized_any:
+            continue
+        updated_item = item.copy()
+        if paired:
+            reference_part = {
+                "type": "input_text",
+                "text": (
+                    f"{_CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
+                    "Inline images below are reduced previews. For full detail, call "
+                    "view_image again on the matching local path:\n"
+                    f"{references}"
+                ),
+            }
+            updated_item["output"] = [reference_part, *new_parts]
+        else:
+            # The call exposes reopenable paths but the one-to-one mapping is
+            # unknown, so shrink the bytes without claiming a correspondence;
+            # the paths stay visible in the matching call item's script text.
+            updated_item["output"] = new_parts
+        updated_items[index] = updated_item
+        changed = True
+
+    if not changed:
+        _trace_prefix_image_preview_gate(
+            request_kwargs,
+            "nothing-oversized-or-unpaired-usable",
+            extra={
+                "image_output_items": image_output_items,
+                "view_image_call_items": len(call_index_by_id),
+                "candidates": len(candidate_indices),
+                "skipped_referenced": skipped_referenced,
+                "skipped_original": skipped_original,
+                "skipped_not_oversized": skipped_not_oversized,
+                "skipped_unpaired": skipped_unpaired,
+            },
+        )
         return None
     modified_kwargs = request_kwargs.copy()
     modified_kwargs["input"] = updated_items

@@ -260,6 +260,81 @@ class HookFilterSessionAffinityTests(HookTestCase):
             self.assertEqual(len(filtered), 1)
             self.assertEqual(filtered[0]["model_info"]["id"], "dep-b")
 
+    async def test_sticky_deployment_in_cooldown_falls_back_to_peer(self) -> None:
+        """Affinity never forces a cooled deployment: the peer wins instead."""
+
+        hooks, _ = load_hook_module()
+        hook = hooks.LiteLLMMenuHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        with tempfile.TemporaryDirectory() as directory:
+            self.set_env(
+                hooks._DEPLOYMENT_COOLDOWN_FILE_ENV,
+                str(Path(directory) / "deployment-cooldowns.json"),
+            )
+            self.set_env(
+                hooks._SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
+                str(Path(directory) / "session-deployment-affinity.json"),
+            )
+            session_headers = {"headers": {"session_id": "sess-123"}}
+
+            # The session is sticky on dep-b, then dep-b starts failing.
+            hooks._record_session_deployment_affinity(
+                {
+                    "proxy_server_request": session_headers,
+                    "model_info": {"id": "dep-b"},
+                    "metadata": {"model_group": "default-chat"},
+                }
+            )
+            failure = RuntimeError("upstream peer failure")
+            failure.status_code = 503
+            hooks._mark_exception_for_deployment_failover(
+                failure,
+                {
+                    "proxy_server_request": session_headers,
+                    "model": "default-chat",
+                    "litellm_params": _deployment("dep-b")["litellm_params"],
+                    "model_info": {"id": "dep-b"},
+                },
+            )
+
+            filtered = await hook.async_filter_deployments(
+                model="default-chat",
+                healthy_deployments=[_deployment("dep-a"), _deployment("dep-b")],
+                messages=None,
+                request_kwargs={
+                    "proxy_server_request": session_headers,
+                    "model": "default-chat",
+                    "stream": True,
+                    "input": "hi",
+                },
+            )
+            self.assertEqual(len(filtered), 1)
+            self.assertEqual(filtered[0]["model_info"]["id"], "dep-a")
+
+            # Once the peer serves the session, affinity re-points to it, so
+            # the next request sticks to the new warm cache, not the dead one.
+            hooks._record_deployment_success_for_cooldown(
+                {
+                    "proxy_server_request": session_headers,
+                    "model_info": {"id": "dep-a"},
+                    "metadata": {"model_group": "default-chat"},
+                }
+            )
+            candidates, sticky, applied = hooks._with_session_deployment_affinity(
+                [_deployment("dep-a"), _deployment("dep-b")],
+                {
+                    "proxy_server_request": session_headers,
+                    "model": "default-chat",
+                    "stream": True,
+                },
+                "default-chat",
+            )
+            self.assertTrue(applied)
+            self.assertEqual(sticky, "dep-a")
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["model_info"]["id"], "dep-a")
+
     async def test_filter_deployments_without_affinity_keeps_all(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.LiteLLMMenuHook()

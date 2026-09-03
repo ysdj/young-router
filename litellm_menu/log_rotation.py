@@ -14,7 +14,22 @@ except ImportError:  # pragma: no cover - Windows uses a single Core launcher.
 LOG_MAX_BYTES_ENV = "LITELLM_MENU_LOG_MAX_BYTES"
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
 MIN_LOG_MAX_BYTES = 256 * 1024
+LOG_BACKUP_SEGMENTS_ENV = "LITELLM_MENU_LOG_BACKUP_SEGMENTS"
+DEFAULT_LOG_BACKUP_SEGMENTS = 2
+MIN_LOG_BACKUP_SEGMENTS = 1
+MAX_LOG_BACKUP_SEGMENTS = 8
 _LOCAL_LOCK = threading.RLock()
+
+
+def log_backup_segments() -> int:
+    value = os.getenv(LOG_BACKUP_SEGMENTS_ENV, "").strip()
+    if not value:
+        return DEFAULT_LOG_BACKUP_SEGMENTS
+    try:
+        parsed = int(value)
+    except ValueError:
+        return DEFAULT_LOG_BACKUP_SEGMENTS
+    return max(MIN_LOG_BACKUP_SEGMENTS, min(parsed, MAX_LOG_BACKUP_SEGMENTS))
 
 
 def log_max_bytes() -> int:
@@ -49,6 +64,29 @@ def _stream_path(stream: object) -> str | None:
     return path if os.path.isabs(path) else None
 
 
+def _shift_backup_segments(path: str, segments: int) -> None:
+    """Rotate ``.1``..``.N`` backups before writing a fresh ``.1`` tail.
+
+    A busy service can rotate several times in minutes; keeping only one
+    backup then discards the very window that recorded an incident.  Shift
+    the older segments (``.1`` -> ``.2``, ...) so a bounded number of
+    previous tails remain readable.
+    """
+
+    for index in range(segments, 0, -1):
+        current = f"{path}.{index}"
+        if index >= segments:
+            try:
+                os.unlink(current)
+            except FileNotFoundError:
+                pass
+            continue
+        try:
+            os.replace(current, f"{path}.{index + 1}")
+        except FileNotFoundError:
+            pass
+
+
 def _write_backup(descriptor: int, path: str, size: int, maximum: int) -> None:
     with open(path, "rb") as source:
         source.seek(max(0, size - maximum))
@@ -56,6 +94,7 @@ def _write_backup(descriptor: int, path: str, size: int, maximum: int) -> None:
     backup = f"{path}.1"
     temporary = f"{backup}.rotate.{os.getpid()}.tmp"
     try:
+        _shift_backup_segments(path, log_backup_segments())
         with open(temporary, "wb") as target:
             target.write(tail)
         os.chmod(temporary, 0o600)
