@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from litellm_menu.core.domains import DomainError
 from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
 from litellm_menu.core.persistence import atomic_write_json
 from litellm_menu.core.provider_auth import ProviderAuthManager
 from litellm_menu.core.service import CoreStore
@@ -134,6 +135,123 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                 )
             self.assertEqual("Flux", domain.snapshot()["providers"][0]["name"])
             self.assertEqual("Other", domain.snapshot()["providers"][1]["name"])
+
+    def _relay_core(self):
+        directory = tempfile.TemporaryDirectory()
+        root = Path(directory.name)
+        config = root / "config.yaml"
+        config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+        providers = ProvidersModelsDomain(config, auth_manager=ProviderAuthManager(root))
+        relay = RelayAccountsDomain(root)
+        core = CoreStore(domains=[relay, providers])
+        relay.dispatch(
+            "account.add",
+            {"type": "sub2api", "label": "account", "origin": "https://flux-code.cc", "station_name": "flux-code"},
+        )
+        station_id = relay.snapshot()["stations"][0]["id"]
+        return directory, providers, relay, core, station_id
+
+    def test_station_binding_preserves_a_matching_api_base_and_stays_clean(self) -> None:
+        """Binding a same-name, same-site provider must not dirty the draft.
+
+        The provider keeps its ``/v1`` spelling and the hidden source
+        metadata change stays clean, so closing the window never asks the
+        user to discard a change that altered nothing visible.
+        """
+
+        directory, providers, _relay, core, station_id = self._relay_core()
+        with directory:
+            added = providers.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "flux-code",
+                        "api_base": "https://flux-code.cc/v1",
+                        "models": [],
+                        "create_default_api_key": True,
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            result = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.select_relay_station",
+                    "payload": {"provider_id": provider_id, "station_id": station_id},
+                },
+                expected_revision=core.revision,
+            )
+            provider = providers.draft_state()["providers"][0]
+            self.assertEqual("https://flux-code.cc/v1", provider["api_base"])
+            self.assertEqual("relay", provider["provider_type"])
+            self.assertEqual(station_id, provider["relay_station_id"])
+            self.assertFalse(core.snapshot()["drafts"]["providers_models"]["dirty"])
+            self.assertEqual(core.revision, result["revision"])
+
+    def test_reselecting_the_same_station_is_a_no_op(self) -> None:
+        directory, providers, _relay, core, station_id = self._relay_core()
+        with directory:
+            added = providers.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "flux-code",
+                        "api_base": "https://flux-code.cc/v1",
+                        "models": [],
+                        "create_default_api_key": True,
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            first = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.select_relay_station",
+                    "payload": {"provider_id": provider_id, "station_id": station_id},
+                },
+                expected_revision=core.revision,
+            )
+            before = providers.draft_state()["providers"][0]
+            second = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.select_relay_station",
+                    "payload": {"provider_id": provider_id, "station_id": station_id},
+                },
+                expected_revision=first["revision"],
+            )
+            self.assertEqual(before, providers.draft_state()["providers"][0])
+            self.assertFalse(core.snapshot()["drafts"]["providers_models"]["dirty"])
+
+    def test_station_binding_keeps_a_different_site_substantive(self) -> None:
+        """A host-level site mismatch (www vs bare) rewrites the URL and stays dirty."""
+
+        directory, providers, _relay, core, station_id = self._relay_core()
+        with directory:
+            added = providers.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "flux-www",
+                        "api_base": "https://www.flux-code.cc/v1",
+                        "models": [],
+                        "create_default_api_key": True,
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.select_relay_station",
+                    "payload": {"provider_id": provider_id, "station_id": station_id},
+                },
+                expected_revision=core.revision,
+            )
+            provider = providers.draft_state()["providers"][0]
+            self.assertEqual("https://flux-code.cc", provider["api_base"])
+            self.assertEqual("flux-code", provider["name"])
+            self.assertTrue(core.snapshot()["drafts"]["providers_models"]["dirty"])
 
     def test_service_provider_defaults_name_and_model(self) -> None:
         directory, domain = self._domain()

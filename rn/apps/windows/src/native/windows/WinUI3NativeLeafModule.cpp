@@ -591,15 +591,24 @@ void WinUI3NativeLeafModule::RelayLogin(
   auto origin = field("origin");
   auto language = field("language");
   auto username = field("username");
-  auto remember_entry = options.find("rememberPassword");
-  std::optional<bool> remember_password;
-  if (remember_entry != options.end()) remember_password = remember_entry->second.TryGetBoolean();
-  static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "language", "username", "rememberPassword"};
+  auto pending_entry = options.find("pendingAccount");
+  std::optional<bool> pending_account;
+  if (pending_entry != options.end()) pending_account = pending_entry->second.TryGetBoolean();
+  // "embedded" is a macOS sheet hint; Windows always opens its own login
+  // window, so the flag is accepted and ignored here.
+  static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin"};
+  auto station_id = field("stationId");
+  auto station_name = field("stationName");
+  auto station_type = field("stationType");
+  auto station_origin = field("stationOrigin");
   auto const ui_language = language.value_or("system");
   if (options.size() > allowed.size() ||
       std::any_of(options.begin(), options.end(), [&allowed](auto const& entry) { return allowed.find(entry.first) == allowed.end(); }) ||
-      !account_id || !account_type || !label || !origin || !remember_password ||
+      !account_id || !account_type || !label || !origin ||
       (options.find("language") != options.end() && !language) ||
+      (pending_account && !pending_account.value()) ||
+      (station_type && station_type->empty()) ||
+      (station_type && *station_type != "newapi" && *station_type != "sub2api") ||
       account_id->empty() || account_id->size() > 96 || label->empty() || label->size() > 160 ||
       origin->empty() || origin->size() > 2048 ||
       (ui_language != "system" && ui_language != "en" && ui_language != "zh-Hans") ||
@@ -616,8 +625,13 @@ void WinUI3NativeLeafModule::RelayLogin(
   auto owner = HostWindow(context_);
   auto js_dispatcher = context_.JSDispatcher();
   WindowsRelayLoginOptions native_options{
-        *account_id, *account_type, *label, *origin, username, *remember_password};
+        *account_id, *account_type, *label, *origin, username};
   native_options.language = ui_language;
+  if (pending_account) native_options.pending_account = pending_account.value();
+  if (station_id) native_options.station_id = station_id;
+  if (station_name) native_options.station_name = station_name;
+  if (station_type) native_options.station_type = station_type;
+  if (station_origin) native_options.station_origin = station_origin;
     context_.UIDispatcher().Post([
         owner, native_options = std::move(native_options), promise, js_dispatcher]() mutable {
       std::optional<WindowsRelayLoginResult> result;

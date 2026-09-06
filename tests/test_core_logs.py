@@ -567,6 +567,95 @@ model_list:
             self.assertEqual("public-chat", record["public_model"])
             self.assertEqual("openai/vendor-chat-tagged", record["upstream_model"])
 
+    def test_request_log_never_projects_a_prefixed_route_model_as_the_public_name(self) -> None:
+        """Route keys with ``model=openai/...`` must not surface a bare ``openai`` name."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.yaml").write_text(
+                """model_list:
+  - model_name: public-chat
+    litellm_params:
+      model: openai/upstream-chat
+    model_info:
+      id: abc12345
+      upstream_url_surface: openai/chat
+      supported_upstream_url_surfaces: [openai/chat]
+""",
+                encoding="utf-8",
+            )
+            (root / "recent-requests.jsonl").write_text(
+                json.dumps(
+                    {
+                        "deployment_id": "abc12345",
+                        "public_model": "openai/upstream-chat",
+                        "model_group": "openai/upstream-chat",
+                        "upstream_model": "openai/upstream-chat",
+                        "route_key": "model=openai/upstream-chat / provider=provider-a / upstream=openai/upstream-chat",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("requests")["log"]["records"][0]
+
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("openai/upstream-chat", record["upstream_model"])
+
+    def test_recovery_log_prefers_the_configured_public_model_over_a_prefixed_route_key(self) -> None:
+        """A prefixed failed route key must not truncate the public model to ``openai``."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = datetime.now(timezone.utc).isoformat()
+            (root / "config.yaml").write_text(
+                """model_list:
+  - model_name: public-chat
+    litellm_params:
+      model: openai/upstream-chat
+    model_info:
+      id: abc12345
+      upstream_url_surface: openai/chat
+      supported_upstream_url_surfaces: [openai/chat]
+""",
+                encoding="utf-8",
+            )
+            state = root / ".litellm-runtime" / "route-recovery-state.json"
+            state.parent.mkdir()
+            state.write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            "route-a": {
+                                "key": "route-a",
+                                "status": "polling",
+                                "updated_at": now,
+                                "model_group": "openai/upstream-chat",
+                                "exception": {
+                                    "failed_deployment_id": "abc12345",
+                                    "failed_deployment_route_key": (
+                                        "model=openai/upstream-chat / provider=provider-a / "
+                                        "upstream=openai/upstream-chat"
+                                    ),
+                                    "reason": "upstream-status-500",
+                                },
+                            }
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("recovery")["log"]["records"][0]
+
+            self.assertEqual("public-chat", record["public_model"])
+            self.assertEqual("upstream-chat", record["upstream_model"])
+            self.assertEqual("provider-a", record["provider"])
+            self.assertNotEqual("openai", record["public_model"])
+
     def test_request_log_preserves_token_counts_and_safe_failure_cause(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -594,6 +683,30 @@ model_list:
             self.assertEqual("AuthenticationError", record["error"]["type"])
             self.assertEqual("unselected", record["routing_state"])
             self.assertNotIn("message", record["error"])
+
+    def test_request_log_projects_prompt_completion_usage_as_sent_received(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recent-requests.jsonl").write_text(
+                json.dumps(
+                    {
+                        "status": "success",
+                        "usage": {
+                            "prompt_tokens": 11,
+                            "completion_tokens": 7,
+                            "total_tokens": 18,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            record = LogsDomain(root).view("requests")["log"]["records"][0]
+
+            self.assertEqual(11, record["usage"]["input_tokens"])
+            self.assertEqual(7, record["usage"]["output_tokens"])
+            self.assertEqual(18, record["usage"]["total_tokens"])
 
     def test_service_log_omits_litellm_banner_noise(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

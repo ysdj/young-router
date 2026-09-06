@@ -51,8 +51,6 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   // deliberately live at the native window boundary: React owns the shared
   // page, while Win32 owns frame constraints and DPI conversion.
   if (route == L"providers-models") return {780, 560};
-  if (route == L"relay-accounts") return {780, 440};
-  if (route == L"relay-add") return {540, 420};
   if (route == L"provider-wizard") return {540, 420};
   if (route == L"codex-settings" || route == L"claude-settings") return {1100, 640};
   if (route == L"runtime-settings") return {800, 520};
@@ -64,9 +62,7 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
 }
 
 ContentSize RouteInitialContentSize(std::wstring_view route) {
-  if (route == L"providers-models") return {780, 560};
-  if (route == L"relay-accounts") return {820, 480};
-  if (route == L"relay-add") return {620, 460};
+  if (route == L"providers-models") return {860, 560};
   if (route == L"provider-wizard") return {620, 460};
   if (route == L"codex-settings" || route == L"claude-settings") return {1160, 700};
   if (route == L"runtime-settings") return {1080, 620};
@@ -1127,8 +1123,6 @@ std::wstring WinUI3NativeLeaf::Localized(std::string const& key, std::wstring_vi
 std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
   if (route == L"home") return Localized("appTitle", L"LiteLLM Menu");
   if (route == L"providers-models") return Localized("routeProvidersModels", L"Providers & Models");
-  if (route == L"relay-accounts") return Localized("routeRelayAccounts", L"Service Provider Management");
-  if (route == L"relay-add") return Localized("routeRelayAdd", L"Add Relay Account");
   if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
   if (route == L"codex-settings" || route == L"claude-settings") {
     return Localized("routeCodexSettings", L"Codex / Claude Settings");

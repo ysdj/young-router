@@ -63,8 +63,13 @@ export interface NativeLeafBridge {
     origin: string;
     language: LanguagePreference;
     username?: string;
-    rememberPassword: boolean;
     embedded?: boolean;
+    /** Pending login: Core creates the account shell only after sign-in succeeds. */
+    pendingAccount?: boolean;
+    stationId?: string;
+    stationName?: string;
+    stationType?: "newapi" | "sub2api";
+    stationOrigin?: string;
   }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   cancelRelayLogin?: () => void;
   restoreRelaySession(options: {

@@ -31,3 +31,21 @@ export function suggestedRelayStationName(value: string): string {
     && labels[labels.length - 2].length <= 3;
   return labels[countryCodeSuffix ? labels.length - 3 : labels.length - 2] ?? labels[0] ?? "";
 }
+
+export function suggestedProviderName(value: string): string {
+  // Suggest a provider name from a base URL only once the hostname looks
+  // complete: while the user is still typing the first label ("h", "api")
+  // there is no meaningful name yet, and pre-filling those fragments would
+  // freeze the name field at a single stray character.
+  const normalized = normalizeRelayOrigin(value);
+  if (!normalized) return "";
+  let hostname = "";
+  try {
+    hostname = new URL(normalized).hostname.toLowerCase().replace(/\.$/u, "");
+  } catch {
+    return "";
+  }
+  if (!hostname.includes(".")) return "";
+  const suggestion = suggestedRelayStationName(normalized);
+  return suggestion.length > 1 ? suggestion : "";
+}

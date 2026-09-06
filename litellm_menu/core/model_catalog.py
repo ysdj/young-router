@@ -57,15 +57,34 @@ def catalog_names_from_editor(payload: object) -> list[str]:
     """Return public model names available to the Codex model catalog.
 
     ``exposed_models`` is populated from the authenticated local LiteLLM
-    ``/v1/models`` response and is the sole source of catalog entries. The
-    active and review models are kept first *only when LiteLLM exposes them*;
-    every other exposed ID follows in endpoint order. Configured deployments,
-    protocol/mode metadata, route health, and stale selected names are never
-    used as fallbacks. An unavailable Menu therefore yields an empty catalog.
+    ``/v1/models`` response.  Only names that also appear in the configured
+    model list are eligible: worker processes can transiently carry extra
+    routes that are not part of the user's public model set (for example a
+    runtime-added ``openai/<model>`` alias present on a subset of workers),
+    and those flapping names must neither rewrite the catalog nor queue a
+    Codex restart prompt.  The configured names act as an allowlist over the
+    live exposure, never as a fallback: a configured model whose route is
+    currently unavailable drops out of the catalog, and an unavailable Menu
+    still yields an empty catalog.
+
+    The active and review models are kept first *only when LiteLLM exposes
+    them*; every other eligible ID follows in endpoint order.
     """
 
     if not isinstance(payload, Mapping):
         return []
+
+    configured: set[str] = set()
+    configured_models = payload.get("models")
+    if isinstance(configured_models, Sequence) and not isinstance(
+        configured_models, (str, bytes, bytearray)
+    ):
+        for entry in configured_models:
+            if not isinstance(entry, Mapping):
+                continue
+            name = entry.get("model")
+            if isinstance(name, str) and name.strip():
+                configured.add(name.strip())
 
     names: list[str] = []
     seen: set[str] = set()
@@ -74,7 +93,7 @@ def catalog_names_from_editor(payload: object) -> list[str]:
         if not isinstance(value, str):
             return
         name = value.strip()
-        if name and name not in seen:
+        if name and name in configured and name not in seen:
             seen.add(name)
             names.append(name)
 

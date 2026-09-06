@@ -651,6 +651,17 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
         parts.append(f"code={error_code}")
     text = " ".join(parts)
     lowered = text.lower()
+    # Synthesized route/compaction failures may use ``invalid_request_error``
+    # as their wire-level type while carrying the exact upstream status in the
+    # message. Parse that explicit status before the generic invalid-request
+    # inference, otherwise an upstream 404 is incorrectly downgraded to 400.
+    if status_code is None and error_code in {
+        "upstream_compaction_failure",
+        "upstream_route_failure",
+    }:
+        match = re.search(r"\bhttp\s+([45]\d\d)\b", lowered)
+        if match is not None:
+            status_code = int(match.group(1))
     if status_code is None and (
         "rate_limit" in lowered
         or "rate limit" in lowered
@@ -671,13 +682,6 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
         status_code = 529
     elif status_code is None and error_type == "api_error":
         status_code = 500
-    elif status_code is None and error_code in {
-        "upstream_compaction_failure",
-        "upstream_route_failure",
-    }:
-        match = re.search(r"\bhttp\s+([45]\d\d)\b", lowered)
-        if match is not None:
-            status_code = int(match.group(1))
 
     exception = RuntimeError(text)
     if status_code is not None:
@@ -1541,7 +1545,12 @@ def _response_has_tool_call_activity(response: Any) -> bool:
 
 
 def _stream_chunk_has_visible_text_output(chunk: Any) -> bool:
-    if not _responses_output_module._response_text(chunk):
+    text = _responses_output_module._response_text(chunk)
+    # A relay that finishes a turn early can emit a whitespace-only output
+    # text.  That is not usable output: treat it the same as an empty
+    # completion so the buffered-stream wrapper fails over instead of
+    # forwarding a silent, message-less turn to the client.
+    if not text or not text.strip():
         return False
     types = [item_type.lower() for item_type in _responses_output_module._response_types(chunk)]
     if not any("reasoning" in item_type for item_type in types):
@@ -2595,6 +2604,19 @@ async def _streaming_error_fallback_response(
 ) -> Optional[tuple[Any, dict]]:
     if not isinstance(request_data, dict):
         return None
+    # A streaming response can fail only when its iterator is consumed.  By
+    # the time a fallback round reaches this helper the generic router has
+    # already returned, so classify a real compaction 400 against the
+    # selected deployment before deciding whether another route is eligible.
+    if selected_deployment_box is not None:
+        _routing_module._apply_current_selected_deployment_to_request(
+            request_data,
+            selected_box=selected_deployment_box,
+        )
+    _routing_module._mark_real_compaction_failure_capability_unsupported(
+        request_data,
+        exception,
+    )
     if (
         not allow_repeated_attempt
         and _responses_request_module._request_already_attempted_streaming_error_fallback(request_data)
@@ -2821,9 +2843,20 @@ async def _stream_streaming_error_fallback_round(
                 )
             yield chunk
     except Exception as fallback_exception:
+        fallback_request = (
+            fallback_payload if "fallback_payload" in locals() else request_data
+        )
         _routing_module._apply_current_selected_deployment_to_request(
-            fallback_payload if "fallback_payload" in locals() else request_data,
+            fallback_request,
             selected_box=selected_deployment_box,
+        )
+        # The second route can also return an iterator successfully and then
+        # reject the encrypted compaction on its first/next read.  Record that
+        # route-local capability failure before priority/failover classification
+        # or the outer recovery loop sees the raw HTTP 400.
+        _routing_module._mark_real_compaction_failure_capability_unsupported(
+            fallback_request,
+            fallback_exception,
         )
         _routing_module._apply_current_selected_deployment_to_request(
             request_data,
@@ -2833,7 +2866,7 @@ async def _stream_streaming_error_fallback_round(
         if (
             _routing_module._is_request_scoped_priority_deployment_failover_error(
                 fallback_exception,
-                fallback_payload if "fallback_payload" in locals() else request_data,
+                fallback_request,
             )
             and (
                 route_recovery_poll
@@ -2851,20 +2884,20 @@ async def _stream_streaming_error_fallback_round(
         if (
             _routing_module._is_request_scoped_priority_deployment_failover_error(
                 fallback_exception,
-                fallback_payload if "fallback_payload" in locals() else request_data,
+                fallback_request,
             )
             and not _routing_module._should_retry_same_deployment_before_fallback(fallback_exception)
         ):
             failed_deployment_id = (
                 _responses_execution_module._failed_deployment_id(fallback_exception)
                 or _routing_module._deployment_id_from_request(
-                    fallback_payload if "fallback_payload" in locals() else request_data
+                    fallback_request
                 )
                 or _routing_module._deployment_id_from_request(request_data)
             )
             _routing_module._mark_exception_for_deployment_failover(
                 fallback_exception,
-                fallback_payload if "fallback_payload" in locals() else request_data,
+                fallback_request,
             )
             _routing_module._sync_failed_deployment_exclusions(
                 request_data,
@@ -6840,6 +6873,15 @@ async def _yield_streaming_error_fallback_or_raise(
     request_data: dict,
     exception: Exception,
 ) -> AsyncIterator[Any]:
+    # A provider may return an async iterator successfully and raise the
+    # upstream 400 only on a later iterator read. That bypasses LiteLLM's
+    # generic-call exception path, so record the route-local compaction
+    # capability evidence before any recovery/fallback policy is evaluated.
+    _routing_module._apply_current_selected_deployment_to_request(request_data)
+    _routing_module._mark_real_compaction_failure_capability_unsupported(
+        request_data,
+        exception,
+    )
     is_responses_stream = _request_is_responses_stream(request_data)
     network_recovery = (
         _routing_module._is_network_recovery_exception(exception)

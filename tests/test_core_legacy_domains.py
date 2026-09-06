@@ -368,6 +368,20 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertNotIn("value", json.dumps(snapshot))
             self.assertFalse(domain.validate()["valid"])
 
+            named = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "named",
+                        "models": [],
+                        "create_default_api_key": True,
+                        "initial_api_key_name": "coral",
+                    }
+                },
+            )
+            self.assertEqual(["coral"], named["providers"][1]["api_key_names"])
+            self.assertNotIn("value", json.dumps(named))
+
     def test_new_draft_ids_stay_stable_across_move_and_order_remains_numeric(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
@@ -962,6 +976,151 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_fetch_models_exposes_explicit_responses_compaction_opt_in(self) -> None:
+        """Fetched catalog capability records carry the compaction opt-in.
+
+        Only an explicit boolean in the model record counts (canonical key or
+        unified alias); absent capability stays unknown and is not included.
+        """
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = json.dumps(
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": "model-a",
+                                "capabilities": {"supports_responses_compaction": True},
+                            },
+                            {"id": "model-b", "supports_compaction": False},
+                            {"id": "model-c"},
+                            {"id": "model-d", "supports_compaction": True},
+                        ],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = PROVIDER_CONFIG.replace("https://example.test/v1", f"http://127.0.0.1:{port}/v1")
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(config).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                fetched = domain.dispatch(
+                    "providers.fetch_models", {"provider_id": "primary"}
+                )["operation_summary"]
+
+            capabilities = fetched["model_capabilities"]
+            self.assertEqual(
+                {"supports_responses_compaction": True},
+                capabilities["model-a"],
+            )
+            self.assertEqual(
+                {"supports_responses_compaction": False},
+                capabilities["model-b"],
+            )
+            # Alias resolves to the canonical field.
+            self.assertEqual(
+                {"supports_responses_compaction": True},
+                capabilities["model-d"],
+            )
+            # Absent capability is unknown, not unsupported.
+            self.assertNotIn("model-c", capabilities)
+            self.assertNotIn("replace-me-secret", json.dumps(fetched))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_new_model_canonicalizes_responses_compaction_opt_in(self) -> None:
+        """Top-level add payloads persist the canonical model_info key.
+
+        The unified alias maps to ``supports_responses_compaction`` and the
+        canonical spelling wins over an alias when both are supplied. The key
+        survives Apply and a reload round trip so Codex Settings selection can
+        read it from the runtime config's ``model_info``.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+            domain.dispatch(
+                "model.add_many",
+                {
+                    "provider_id": provider_id,
+                    "models": [
+                        {
+                            "name": "opt-in-canonical",
+                            "upstream_model": "opt-in-canonical",
+                            "api_key_name": "default",
+                            "supports_responses_compaction": True,
+                        },
+                        {
+                            "name": "opt-in-aliased",
+                            "upstream_model": "opt-in-aliased",
+                            "api_key_name": "default",
+                            "supports_compaction": True,
+                        },
+                        {
+                            "name": "opt-in-conflict",
+                            "upstream_model": "opt-in-conflict",
+                            "api_key_name": "default",
+                            "supports_responses_compaction": False,
+                            "supports_compaction": True,
+                        },
+                        {
+                            "name": "opt-out",
+                            "upstream_model": "opt-out",
+                            "api_key_name": "default",
+                            "supports_responses_compaction": False,
+                        },
+                        {
+                            "name": "unmarked",
+                            "upstream_model": "unmarked",
+                            "api_key_name": "default",
+                        },
+                    ],
+                },
+            )
+            domain.apply()
+
+            reloaded = ProvidersModelsDomain(path).export(include_sensitive=True)
+            reloaded_models = {
+                model["model_name"]: model
+                for model in reloaded["providers"][0]["models"]
+            }
+            self.assertEqual(
+                {"supports_responses_compaction": True},
+                reloaded_models["opt-in-canonical"]["model_info_extra"],
+            )
+            self.assertEqual(
+                {"supports_responses_compaction": True},
+                reloaded_models["opt-in-aliased"]["model_info_extra"],
+            )
+            self.assertEqual(
+                {"supports_responses_compaction": False},
+                reloaded_models["opt-in-conflict"]["model_info_extra"],
+            )
+            self.assertEqual(
+                {"supports_responses_compaction": False},
+                reloaded_models["opt-out"]["model_info_extra"],
+            )
+            self.assertEqual({}, reloaded_models["unmarked"]["model_info_extra"])
 
     def test_fetch_models_uses_only_the_requested_named_api_key(self) -> None:
         requests: list[str] = []
@@ -1602,7 +1761,32 @@ class CodexSettingsDomainTests(unittest.TestCase):
         ):
             root = Path(directory)
             runtime = root / "config.yaml"
-            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            runtime.write_text(
+                textwrap.dedent(
+                    """
+                    providers:
+                      primary:
+                        api_base: "https://example.test/v1"
+                        api_keys:
+                          - name: default
+                            value: "replace-me-secret"
+                    model_list:
+                      - model_name: model-a
+                        litellm_params:
+                          model: openai/model-a
+                          api_base: "https://example.test/v1"
+                          api_key: "replace-me-secret"
+                      - model_name: model-b
+                        litellm_params:
+                          model: openai/model-b
+                          api_base: "https://example.test/v1"
+                          api_key: "replace-me-secret"
+                    litellm_settings:
+                      public_model_groups: [model-a, model-b]
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
             home = root / "codex"
             home.mkdir()
             (home / "config.toml").write_text('model = "model-a"\n', encoding="utf-8")
@@ -1632,9 +1816,19 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertFalse(snapshot["restart_required"])
             self.assertIsNone(snapshot["change_reason"])
 
-    @mock.patch("codex_config._local_exposed_models", return_value=(['default-chat'], True))
-    def test_provider_apply_updates_enabled_catalog_and_requests_restart(self, _live_models) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+    def test_provider_apply_updates_enabled_catalog_and_requests_restart(self) -> None:
+        live_models = {"names": ["default-chat"]}
+
+        def exposed_models(_api_key: str) -> tuple[list[str], bool]:
+            return list(live_models["names"]), True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ), mock.patch(
+            "litellm_menu.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
             root = Path(directory)
             runtime = root / "config.yaml"
             runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
@@ -1681,19 +1875,38 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 },
                 expected_revision=upstream_applied["revision"],
             )
+            # The reloaded proxy exposes the renamed public model.
+            live_models["names"] = ["deepseek-v4-flash"]
             providers_applied = core.apply("providers_models", revision=changed["revision"])
 
+            # The first post-apply observation is not stable yet: the catalog
+            # still carries the acknowledged name.
+            codex._catalog_source_checked_at = 0.0
+            first = core.snapshot()["domains"]["codex"]["model_catalog"]
+            self.assertFalse(first["restart_required"])
             catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
-            self.assertFalse(core.snapshot()["domains"]["codex"]["model_catalog"]["restart_required"])
 
+            # A second fresh observation completes the repair and queues the
+            # restart prompt for the renamed model set.
+            codex._catalog_source_checked_at = 0.0
+            repaired = core.snapshot()["domains"]["codex"]["model_catalog"]
+            self.assertTrue(repaired["restart_required"])
+            self.assertEqual("catalog_repaired", repaired["change_reason"])
+            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
+
+            core.dispatch(
+                {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
+                expected_revision=core.revision,
+            )
             selected = core.dispatch(
                 {
                     "domain": "codex",
                     "type": "patch",
-                    "payload": {"model": "deepseek-v4-flash"},
+                    "payload": {"model": "missing-model"},
                 },
-                expected_revision=providers_applied["revision"],
+                expected_revision=core.revision,
             )
             core.apply("codex", revision=selected["revision"])
 
@@ -1704,7 +1917,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertFalse(catalog_state["restart_required"])
             self.assertIsNone(catalog_state["change_reason"])
             catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
-            self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
+            self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
 
     def test_sync_and_apply_preserve_unknown_toml_and_auth_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
