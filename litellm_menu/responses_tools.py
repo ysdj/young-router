@@ -30,6 +30,18 @@ from .base import (
 
 
 def _responses_chat_bridge_tool_schema(value: Any) -> Any:
+    """Sanitize one JSON-schema fragment for the bridged tool surface.
+
+    Drops the two constructs strict third-party tool validators reject:
+    empty ``enum`` members, and a ``type`` sibling beside ``$ref``. The
+    Moonshot-flavored schema validator used by relays in front of Kimi
+    models returns ``when using $ref, type should be defined in the
+    referenced schema instead of the parent schema`` for the latter, and
+    Codex Desktop's compacted namespace-tool schemas (``$defs.__schemaN``)
+    emit exactly that shape. Removing the redundant sibling is lossless for
+    validators that follow the referenced schema.
+    """
+
     if isinstance(value, list):
         return [_responses_chat_bridge_tool_schema(item) for item in value]
     if not isinstance(value, dict):
@@ -40,6 +52,8 @@ def _responses_chat_bridge_tool_schema(value: Any) -> Any:
         if key == "enum" and isinstance(item, list) and not item:
             continue
         sanitized[key] = _responses_chat_bridge_tool_schema(item)
+    if "$ref" in sanitized and "type" in sanitized:
+        del sanitized["type"]
     return sanitized
 
 

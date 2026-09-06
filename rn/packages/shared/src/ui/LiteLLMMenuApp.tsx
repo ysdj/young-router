@@ -18,7 +18,6 @@ import {
   providedKeyRows,
   pendingCredentialCleanups,
   StationAccountsPanel,
-  relayTypeLabel,
   stationDisplayName,
   stationOriginKey,
   stationsFromSnapshot,
@@ -1946,7 +1945,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [providerName, setProviderName] = useState("");
   const [providerBaseURL, setProviderBaseURL] = useState("");
   const [typeDetection, setTypeDetection] = useState<"checking" | RelayType | "unknown" | undefined>(undefined);
-  const [manualType, setManualType] = useState<RelayType>();
   // Keys step.
   const [keyPath, setKeyPath] = useState<"login" | "manual">("manual");
   const [loginPhase, setLoginPhase] = useState<"idle" | "sign-in">("idle");
@@ -2188,6 +2186,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return undefined;
     }
   };
+  // The relay family always comes from auto-detection: the bound station's
+  // type first, then a live probe of the provider URL. No manual select.
+  const resolveRelayType = async (): Promise<RelayType | undefined> => {
+    if (typeDetection === "newapi" || typeDetection === "sub2api") return typeDetection;
+    if (stationForProvider?.type) return stationForProvider.type;
+    return detectRelayType();
+  };
   const addManualModel = (): void => {
     const name = modelName.trim();
     const upstream = upstreamModel.trim();
@@ -2374,7 +2379,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         setLoginFeedbackMessage(undefined);
         return;
       }
-      const accountType = manualType ?? (typeDetection === "newapi" || typeDetection === "sub2api" ? typeDetection : undefined) ?? stationForProvider?.type;
+      const accountType = await resolveRelayType();
       if (!accountType) {
         setLoginBusy(false);
         setLoginFeedbackMessage(translate("relay.typeNotDetected"));
@@ -2632,8 +2637,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const selectedProviderPickerLabel = providerOptions.find((option) => option.value === providerSelection)?.label ?? providerPickerLabels[0] ?? "";
   const keyPickerLabels = keyOptions.map((option) => option.label);
   const selectedKeyPickerLabel = keyOptions.find((option) => option.value === activeKeySelection)?.label ?? keyPickerLabels[0] ?? "";
-  const typeLabels = [relayTypeLabel("newapi", translate), relayTypeLabel("sub2api", translate)];
-  const selectedRelayType = manualType ?? (typeDetection === "newapi" || typeDetection === "sub2api" ? typeDetection : undefined);
   const wizardBusy = busy || processing || loginBusy;
   return <View style={styles.providerWizardSurface} accessibilityViewIsModal>
     <View style={styles.providerWizardSetupContent}>
@@ -2679,10 +2682,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
               <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); }} style={styles.providerWizardModeControl} />
             </NativeFormRow>
             {keyPath === "login" ? <>
-              <View style={styles.providerWizardTypeRow}>
-                <NativePicker labels={typeLabels} selectedValue={selectedRelayType ? relayTypeLabel(selectedRelayType, translate) : ""} disabled={wizardBusy} onChange={({ nativeEvent }) => setManualType(nativeEvent.index === 1 ? "sub2api" : "newapi")} style={styles.providerWizardPicker} />
-                <NativeButton title={typeDetection === "checking" ? translate("relay.detectingType") : translate("relay.setupStepStation")} compact link disabled={wizardBusy || !activeProviderBaseURL.trim()} onPress={() => { void detectRelayType(); }} />
-              </View>
               {providedChoices.length > 0 ? <>
                 <Text style={styles.providerWizardHint}>{translate("providers.wizard.providedKeysHint", { count: providedChoices.length })}</Text>
                 <View style={styles.providerWizardModelList}>
@@ -3381,7 +3380,9 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     const showHeaders = providedRows.length > 0 && customKeys.length > 0;
     if (showHeaders) rows.push({ key: "group:custom", cells: [`${translate("providers.keysCustom")} · ${customKeys.length}`], spanning: true });
     for (const key of customKeys) {
-      rows.push({ key: `custom:${key.id}`, cells: [key.name] });
+      // Custom keys indent under their group header the same way relay keys
+      // indent under their account row.
+      rows.push({ key: `custom:${key.id}`, cells: [showHeaders ? `\t${key.name}` : key.name] });
     }
     // Relay keys nest under their account the way routes nest under a
     // public model: spanning account rows, indented key rows beneath.
@@ -3496,6 +3497,11 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     <IconButton label="−" title={translate("common.delete")} disabled={controlsBusy || (!selectedCustom && !selectedProvided) || (Boolean(selectedProvided) && autoGrouping)} onPress={deleteSelected} />
   </>;
   const selectedProvidedName = selectedProvided ? providedNameDrafts[selectedProvided.key] ?? selectedProvided.keyName : "";
+  // The inline keys list sizes to its content (capped), so it never clips a
+  // row behind a few pixels of internal scroll; the inspector scrolls the
+  // rest. 22 pt per compact row plus the 24 pt header and 2 pt of slack so
+  // an exact fit never presents a stray scroller.
+  const keysTableInlineHeight = Math.min(tableRows.length, 10) * 22 + 26;
   const keysTable = <NativeTable
       columns={variant === "inline"
         ? [{ label: translate("providers.keys"), width: 264 }]
@@ -3508,7 +3514,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       firstColumnHorizontalPadding={6}
       scrollTrailingColumnOverflow={false}
       onSelectionChange={(key) => { if (!key.startsWith("group:") && !key.startsWith("account:")) setSelectedKey(key); }}
-      style={variant === "inline" ? styles.keysTableInline : styles.keysTable}
+      style={variant === "inline" ? [styles.keysTableInline, { height: keysTableInlineHeight, minHeight: keysTableInlineHeight }] : styles.keysTable}
     />;
   const keysEditorView = <View style={styles.keysEditor}>
       {selectedCustom ? <>
@@ -4072,6 +4078,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       refreshAccounts={relay.refreshAccounts}
       refreshResources={relay.refreshResources}
       apiKeyActions={relay.apiKeyActions}
+      detectType={relay.detectType}
       stationDraft={stationDraft}
       onStationDraftChange={setStationDraftValue}
       onStageStationUpdate={stageStationUpdate}
@@ -6581,10 +6588,10 @@ const styles = StyleSheet.create({
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
   footer: { height: 52, minHeight: 52, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 6 }, footerCompact: { height: 48, minHeight: 48, paddingHorizontal: 14, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.control }, footerBorderless: { borderTopWidth: 0 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
   providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
-  providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardTypeRow: { width: "100%", flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },
   keysSection: { flex: 3, minHeight: 170 }, keysSectionContent: { paddingBottom: 4, gap: 4 }, keysSectionLogin: { flex: 0, minHeight: 40 }, modelPane: { flex: 1, minWidth: 0, minHeight: 130, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
-  keysPane: { flex: 1, minWidth: 0, minHeight: 0 }, keysInline: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }, keysTableInline: { flex: 0, height: 116, minHeight: 116, flexShrink: 0 },
+  keysPane: { flex: 1, minWidth: 0, minHeight: 0 }, keysInline: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }, keysTableInline: { flex: 0, flexShrink: 0 },
   keysTable: { flex: 1, minHeight: 120 },
   keysEditor: { minWidth: 0, gap: 5, paddingTop: 5, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: systemColors.separator },
   keysEditorRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
