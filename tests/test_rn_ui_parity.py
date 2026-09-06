@@ -1731,7 +1731,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value);',
             'const providerKeyOptions = [...keyStates.map((key) => ({',
             'value={selectedProviderKey?.id ?? providerKeyOptions[0]?.value ?? ""}',
-            'rows.push({ key: `custom:${key.id}`, cells: [key.name] });',
+            'rows.push({ key: `custom:${key.id}`, cells: [showHeaders ? `\\t${key.name}` : key.name] });',
             'const pendingCustomKeyName = useRef<string | undefined>(undefined);',
             'pendingCustomKeyName.current = undefined; // selection lands after the snapshot refresh' if False else 'setSelectedKey(`custom:${added.id}`);',
             'return dispatch("provider.key_delete", { provider_id: providerId, name: selectedKeyName });',
@@ -2203,6 +2203,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const stageStationUpdate = async (overrides: StationDraft = {}): Promise<void> => {", relay)
         self.assertIn('await commit("station.update", { id: station.id, name, origin, type });', relay)
         self.assertIn("translate(\"relay.stationUpdateStaged\")", relay)
+        # The relay family has no manual select: it comes from the station
+        # type or auto-detection, and grouping lives in the manager dialog.
+        self.assertNotIn('translate("relay.type")', relay)
+        self.assertIn("detectType?: (origin: string) => Promise<RelayType | undefined>;", relay)
+        self.assertIn("station.type ?? await detectType?.(station.origin)", relay)
+        self.assertIn("function StationGroupManagerDialog(", relay)
+        self.assertIn('translate("relay.groupManager")', relay)
+        self.assertIn('translate("relay.apiKeyAutoGrouping")', relay)
         self.assertNotIn("function RelayAccountManager(", relay)
         self.assertNotIn("relayNavigationItems", relay)
 
@@ -2231,6 +2239,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertNotIn(marker, ui)
         # Adding an account goes straight to the native sign-in.
         self.assertIn("await startPendingLogin();", relay)
+        # The wizard's relay family is auto-detected inside the login flow:
+        # no type picker, no station-details button, no type row style.
+        for marker in (
+            "providerWizardTypeRow",
+            "manualType",
+            "setupStepStation",
+            'translate("relay.type")',
+        ):
+            self.assertNotIn(marker, ui)
+        self.assertIn("const accountType = await resolveRelayType();", ui)
+        self.assertIn("detectType={relay.detectType}", ui)
 
     def test_relay_inline_edits_stage_without_local_save_buttons(self) -> None:
         relay = self.relay
@@ -2239,7 +2258,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("relay.apiKeyActions.update?.(selectedProvided.account.id, selectedProvided.resource.id, name)", self.ui)
         self.assertIn("onCommit={() => { void stageStationUpdate(); }}", self.ui)
         self.assertIn("await relay.commit(\"station.update\", { id: station.id, name, origin, type });", self.ui)
-        self.assertIn("void stageStationUpdate({ type: nextType });", relay)
         self.assertIn("onStageStationUpdate=", self.ui)
         self.assertIn('translate("relay.stationUpdateStaged")', relay)
         apply_body = self.ui.split("const apply = (): Promise<void> => {", 1)[1].split("const applyDataManagement", 1)[0]
@@ -2284,7 +2302,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("<Modal", relay)
         self.assertNotIn("import { Modal,", relay)
         self.assertIn("function RelayDialogLayer(", relay)
-        self.assertEqual(2, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
+        self.assertEqual(3, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
         self.assertIn(
             'relayDialogLayer: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 100 }',
             relay,

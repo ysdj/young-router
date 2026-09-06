@@ -212,6 +212,23 @@ def _apply_reasoning_capability(model: dict[str, Any], registry: ModelContextReg
         model["default_reasoning_level"] = capability.default_level
 
 
+def _apply_direct_tool_surface(model: dict[str, Any]) -> None:
+    """Reset an inherited code-mode surface to the classic direct tools.
+
+    Custom routes inherit whichever native profile carries model
+    instructions — today always a GPT profile whose ``unified_exec`` shell
+    and ``tool_mode: "code_mode_only"`` assume a model trained on the GPT
+    code-mode ``exec`` script surface. Third-party chat routes are trained
+    on ordinary per-call JSON function tools, so give inherited profiles the
+    classic surface instead: a ``shell_command`` shell and ``direct`` tool
+    mode. ``apply_patch_tool_type`` stays as inherited because the function
+    (JSON) variant no longer exists in current Codex releases.
+    """
+
+    model["shell_type"] = "shell_command"
+    model["tool_mode"] = "direct"
+
+
 def _apply_search_tool_capability(
     model: dict[str, Any],
     registry: ModelContextRegistry,
@@ -253,6 +270,7 @@ def _catalog_model(
         model["slug"] = name
         if not exact_native_match:
             model["display_name"] = name
+            _apply_direct_tool_surface(model)
 
     # These are the route-specific fields owned by LiteLLM Menu. Everything
     # else remains native metadata whenever a native profile was available.

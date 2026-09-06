@@ -668,6 +668,7 @@ NSScrollView *ParentScrollView(NSView *view);
 BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL acceptsVerticalScroll, BOOL acceptsHorizontalScroll);
 BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 
+
 @interface LiteLLMTableScrollView : NSScrollView
 @property(nonatomic) BOOL acceptsVerticalScroll;
 @property(nonatomic) BOOL acceptsHorizontalScroll;
@@ -677,7 +678,8 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 
 - (void)scrollWheel:(NSEvent *)event
 {
-  if (TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll)) {
+  BOOL canConsume = TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll);
+  if (canConsume) {
     [super scrollWheel:event];
     return;
   }

@@ -1057,8 +1057,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('sheetParent.beginSheet(panel, completionHandler: nil)', mac_leaf)
         self.assertIn('panel.sheetParent?.endSheet(panel)', mac_leaf)
         self.assertIn("embedded: true,", wizard_ui)
-        self.assertIn("const [manualType, setManualType] = useState<RelayType>();", wizard_ui)
         self.assertIn("suggestedRelayStationName(candidate)", wizard_ui)
+        # The relay family is auto-detected; no manual type state survives.
+        self.assertNotIn("manualType", wizard_ui)
+        self.assertIn("const accountType = await resolveRelayType();", wizard_ui)
         self.assertNotIn("const updateStationName = (value: string): void =>", wizard_ui)
         self.assertIn('onBlur={() => { void detectRelayType(); }}', relay_ui) if False else None
         self.assertIn("stationForProvider", wizard_ui)
@@ -1693,7 +1695,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("- (void)scrollWheel:(NSEvent *)event", controls)
         self.assertIn("BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL acceptsVerticalScroll, BOOL acceptsHorizontalScroll);", controls)
         self.assertIn("BOOL ForwardWheelToParent(NSView *view, NSEvent *event);", controls)
-        self.assertIn("if (TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll))", controls)
+        self.assertIn("BOOL canConsume = TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll);", controls)
         self.assertIn("if (ForwardWheelToParent(self, event)) return;", controls)
         self.assertIn("_scrollView.acceptsVerticalScroll = NO", controls)
         self.assertIn("@interface LiteLLMTableClipView : NSClipView", controls)
