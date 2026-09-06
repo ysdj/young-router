@@ -53,6 +53,27 @@ class CodexRestartPromptTests(unittest.TestCase):
         # below represents a distinct endpoint observation.
         domain._catalog_source_checked_at = 0.0
 
+    def _config_with_models(self, names: list[str]) -> str:
+        entries = "\n".join(
+            f"  - model_name: {name}\n"
+            "    litellm_params:\n"
+            f"      model: openai/upstream-{name}\n"
+            "      api_base: https://example.test/v1\n"
+            "      api_key: synthetic-key\n"
+            for name in names
+        )
+        groups = ", ".join(names)
+        return (
+            "providers:\n"
+            "  primary:\n"
+            "    api_base: https://example.test/v1\n"
+            "    api_keys:\n"
+            "      - name: default\n"
+            "        value: synthetic-key\n"
+            f"model_list:\n{entries}"
+            f"litellm_settings:\n  public_model_groups: [{groups}]\n"
+        )
+
     def test_acknowledged_catalog_signature_does_not_queue_same_prompt_again(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "codex_config._local_exposed_models",
@@ -88,7 +109,8 @@ class CodexRestartPromptTests(unittest.TestCase):
             "litellm_menu.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
-            core = self._core(Path(directory))
+            root = Path(directory)
+            core = self._core(root)
             enabled = core.dispatch(
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
@@ -99,6 +121,12 @@ class CodexRestartPromptTests(unittest.TestCase):
                 expected_revision=enabled["revision"],
             )
             domain = core._domains["codex"]
+            # The applied configuration adopts public-b before the repair.
+            (root / "config.yaml").write_text(
+                self._config_with_models(["public-a", "public-b"]),
+                encoding="utf-8",
+            )
+            domain._refresh_live_catalog_source(force=True)
             domain._queue_catalog_restart("catalog_repaired", names=["public-a", "public-b"], enabled=True)
             state = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertTrue(state["restart_required"])
@@ -131,7 +159,15 @@ class CodexRestartPromptTests(unittest.TestCase):
             self.assertEqual(before_event, state["change_event"])
             self.assertEqual(["public-a"], catalog_model_names(catalog_path))
 
-    def test_two_consecutive_snapshot_observations_repair_and_queue(self) -> None:
+    def test_unconfigured_endpoint_names_never_rewrite_or_queue(self) -> None:
+        """Endpoint routes outside the configured list are ignored entirely.
+
+        Workers can transiently expose runtime-added names (for example an
+        ``openai/<model>`` alias present on only a subset of workers).  Those
+        flapping names must not rewrite the catalog or queue a Codex restart
+        prompt, no matter how many consecutive observations agree on them.
+        """
+
         endpoint = {"models": ["public-a"]}
 
         def exposed_models(_api_key: str):
@@ -150,6 +186,129 @@ class CodexRestartPromptTests(unittest.TestCase):
             catalog_path = domain.model_catalog_path
             before_event = enabled["model_catalog"]["change_event"]
 
+            endpoint["models"] = ["public-a", "public-b"]
+            for _ in range(3):
+                self._force_catalog_observation(domain)
+                state = domain.snapshot()["model_catalog"]
+                self.assertFalse(state["restart_required"])
+                self.assertEqual(before_event, state["change_event"])
+                self.assertEqual(["public-a"], catalog_model_names(catalog_path))
+
+    def test_unconfigured_route_drop_repairs_catalog_without_prompt(self) -> None:
+        """Dropping a never-configured exposed route updates the catalog silently.
+
+        A catalog acknowledged while a runtime-added route was visible can
+        carry that route.  When the live view drops it, the catalog repair
+        removes it without asking Codex to restart: the change involves no
+        configured public model.
+        """
+
+        endpoint = {"models": ["public-a"]}
+
+        def exposed_models(_api_key: str):
+            return endpoint["models"], True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ), mock.patch(
+            "litellm_menu.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
+            domain = self._domain(Path(directory))
+            enabled = domain.set_model_catalog_enabled_immediately(True)
+            domain.dispatch("acknowledge_model_catalog_restart", {})
+            catalog_path = domain.model_catalog_path
+            before_event = enabled["model_catalog"]["change_event"]
+
+            # A previous run acknowledged a catalog that included a runtime
+            # route outside the configured model list.
+            from litellm_menu.core.model_catalog import write_catalog
+
+            write_catalog(catalog_path, ["public-a", "phantom-route"], registry=domain._context_registry)
+            domain._catalog_acknowledged_signature = domain._catalog_signature(
+                ["public-a", "phantom-route"], enabled=True
+            )
+
+            self._force_catalog_observation(domain)
+            domain.snapshot()
+            self._force_catalog_observation(domain)
+            state = domain.snapshot()["model_catalog"]
+
+            self.assertFalse(state["restart_required"])
+            self.assertEqual(before_event, state["change_event"])
+            self.assertEqual(["public-a"], catalog_model_names(catalog_path))
+
+    def test_configured_model_drop_still_queues_prompt(self) -> None:
+        """A configured public model leaving the live exposure still prompts."""
+
+        endpoint = {"models": ["public-a", "public-b"]}
+
+        def exposed_models(_api_key: str):
+            return endpoint["models"], True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ), mock.patch(
+            "litellm_menu.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(
+                self._config_with_models(["public-a", "public-b"]),
+                encoding="utf-8",
+            )
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "public-a"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(config, codex_home=home)
+            enabled = domain.set_model_catalog_enabled_immediately(True)
+            domain.dispatch("acknowledge_model_catalog_restart", {})
+            catalog_path = domain.model_catalog_path
+            before_event = enabled["model_catalog"]["change_event"]
+
+            endpoint["models"] = ["public-a"]
+            self._force_catalog_observation(domain)
+            domain.snapshot()
+            self._force_catalog_observation(domain)
+            state = domain.snapshot()["model_catalog"]
+
+            self.assertTrue(state["restart_required"])
+            self.assertEqual("catalog_repaired", state["change_reason"])
+            self.assertEqual(before_event + 1, state["change_event"])
+            self.assertEqual(["public-a"], catalog_model_names(catalog_path))
+
+    def test_two_consecutive_snapshot_observations_repair_and_queue(self) -> None:
+        """A configured public model entering the live exposure is adopted."""
+
+        endpoint = {"models": ["public-a"]}
+
+        def exposed_models(_api_key: str):
+            return endpoint["models"], True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ), mock.patch(
+            "litellm_menu.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
+            root = Path(directory)
+            domain = self._domain(root)
+            enabled = domain.set_model_catalog_enabled_immediately(True)
+            domain.dispatch("acknowledge_model_catalog_restart", {})
+            catalog_path = domain.model_catalog_path
+            before_event = enabled["model_catalog"]["change_event"]
+
+            # The applied configuration adopts public-b and the endpoint
+            # exposes it.
+            (root / "config.yaml").write_text(
+                self._config_with_models(["public-a", "public-b"]),
+                encoding="utf-8",
+            )
             endpoint["models"] = ["public-a", "public-b"]
             self._force_catalog_observation(domain)
             first = domain.snapshot()["model_catalog"]
@@ -186,7 +345,17 @@ class CodexRestartPromptTests(unittest.TestCase):
             "litellm_menu.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
-            domain = self._domain(Path(directory))
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(
+                self._config_with_models(stable_models),
+                encoding="utf-8",
+            )
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text('model = "public-0"\n', encoding="utf-8")
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            domain = CodexSettingsDomain(config, codex_home=home)
             enabled = domain.set_model_catalog_enabled_immediately(True)
             domain.dispatch("acknowledge_model_catalog_restart", {})
             catalog_path = domain.model_catalog_path
@@ -200,6 +369,60 @@ class CodexRestartPromptTests(unittest.TestCase):
 
             self.assertEqual(before_event, state["change_event"])
             self.assertEqual(stable_models, catalog_model_names(catalog_path))
+
+    def test_single_post_apply_refresh_observation_does_not_rewrite_or_queue(self) -> None:
+        """A provider apply that changed no exposure must not prompt Codex.
+
+        The post-reload refresh sees the same endpoint jitter as snapshots.
+        One observation of a changed view is not stable, so it must neither
+        rewrite the catalog nor queue a restart prompt.  Names the endpoint
+        exposes outside the configured model list are ignored entirely.
+        """
+
+        endpoint = {"models": ["public-a"]}
+
+        def exposed_models(_api_key: str):
+            return endpoint["models"], True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "codex_config._local_exposed_models",
+            side_effect=exposed_models,
+        ), mock.patch(
+            "litellm_menu.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
+            root = Path(directory)
+            domain = self._domain(root)
+            enabled = domain.set_model_catalog_enabled_immediately(True)
+            domain.dispatch("acknowledge_model_catalog_restart", {})
+            catalog_path = domain.model_catalog_path
+            before_event = enabled["model_catalog"]["change_event"]
+
+            endpoint["models"] = ["public-a", "public-b"]
+            self._force_catalog_observation(domain)
+            refreshed = domain.refresh_model_catalog()
+
+            self.assertFalse(refreshed)
+            self.assertFalse(domain.snapshot()["model_catalog"]["restart_required"])
+            self.assertEqual(before_event, domain.snapshot()["model_catalog"]["change_event"])
+            self.assertEqual(["public-a"], catalog_model_names(catalog_path))
+
+            # Once the applied configuration adopts the new model and two
+            # stable refresh observations agree, the repair completes and
+            # queues the prompt, so genuine exposure changes are surfaced.
+            (root / "config.yaml").write_text(
+                self._config_with_models(["public-a", "public-b"]),
+                encoding="utf-8",
+            )
+            self._force_catalog_observation(domain)
+            domain.refresh_model_catalog()
+            self._force_catalog_observation(domain)
+            domain.refresh_model_catalog()
+            second = domain.snapshot()["model_catalog"]
+            self.assertTrue(second["restart_required"])
+            self.assertEqual("catalog_repaired", second["change_reason"])
+            self.assertEqual(before_event + 1, second["change_event"])
+            self.assertEqual(["public-a", "public-b"], catalog_model_names(catalog_path))
 
     def test_acknowledged_catalog_signature_survives_core_recreation(self) -> None:
         endpoint = {"models": ["public-a"]}
@@ -228,6 +451,12 @@ class CodexRestartPromptTests(unittest.TestCase):
             self.assertFalse(unchanged["restart_required"])
             self.assertEqual(0, unchanged["change_event"])
 
+            # The applied configuration adopts public-b; two fresh
+            # observations of the changed exposure complete the repair.
+            (root / "config.yaml").write_text(
+                self._config_with_models(["public-a", "public-b"]),
+                encoding="utf-8",
+            )
             endpoint["models"] = ["public-a", "public-b"]
             self._force_catalog_observation(second)
             first_observation = second.snapshot()["model_catalog"]

@@ -12,8 +12,14 @@ struct WindowsRelayLoginOptions {
   std::string label;
   std::string origin;
   std::optional<std::string> username;
-  bool remember_password = false;
   std::string language = "system";
+  // Pending login: Core creates the account shell only after sign-in
+  // succeeds, so a cancelled login leaves no reserved slot behind.
+  bool pending_account = false;
+  std::optional<std::string> station_id;
+  std::optional<std::string> station_name;
+  std::optional<std::string> station_type;
+  std::optional<std::string> station_origin;
 };
 
 struct WindowsRelayLoginResult {

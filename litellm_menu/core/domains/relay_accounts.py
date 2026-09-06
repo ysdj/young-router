@@ -1011,6 +1011,49 @@ class RelayAccountsDomain:
     def _has_staged_changes(self) -> bool:
         return self._draft_staged or self._import_staged or bool(self._pending_operations)
 
+    def _crud_projection(self) -> dict[str, Any]:
+        """Return the persisted CRUD shape without volatile cleanup tombstones.
+
+        Pending credential cleanups never count as staged changes, so they are
+        excluded here as well. Comparing this projection against the durable
+        baseline decides whether an in-draft add that was removed again
+        cancels out to a clean draft.
+        """
+
+        payload = self._stored_payload()
+        return {
+            "stations": payload.get("stations", []),
+            "accounts": payload.get("accounts", []),
+        }
+
+    def _baseline_crud_projection(self) -> dict[str, Any]:
+        default: dict[str, Any] = {"stations": [], "accounts": []}
+        raw = self._baseline_bytes
+        if not raw:
+            return default
+        try:
+            loaded = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return default
+        if not isinstance(loaded, Mapping):
+            return default
+        return {
+            "stations": loaded.get("stations", []),
+            "accounts": loaded.get("accounts", []),
+        }
+
+    def _draft_staged_from_baseline(self) -> bool:
+        """Recompute the CRUD staged flag by diffing against durable storage.
+
+        Removing an account or station that was only added inside the current
+        unapplied draft must return the draft to clean, so closing the window
+        does not ask the user to discard changes that never effectively
+        existed. Any remaining difference (including login/session metadata)
+        conservatively keeps the draft dirty.
+        """
+
+        return self._crud_projection() != self._baseline_crud_projection()
+
     def _read_storage_bytes(self) -> bytes | None:
         try:
             return read_bytes(self.storage_path)
@@ -1768,7 +1811,7 @@ class RelayAccountsDomain:
         self._clear_resource_cache(account["id"])
         if station_id and self._station_account_count(station_id) == 0:
             self._stations = [item for item in self._stations if item["id"] != station_id]
-        self._draft_staged = True
+        self._draft_staged = self._draft_staged_from_baseline()
         return {
             "kind": "account_remove",
             "account_id": account["id"],
@@ -1790,7 +1833,7 @@ class RelayAccountsDomain:
             details = self._remove_account_local(account_id, dependency_policy=policy)
             resources.extend(details["resources"])
         self._stations = [item for item in self._stations if item["id"] != station["id"]]
-        self._draft_staged = True
+        self._draft_staged = self._draft_staged_from_baseline()
         return {
             "kind": "station_remove",
             "station_id": station["id"],
@@ -2768,6 +2811,80 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay login is unavailable")
         return self._read_key(account, self._selected_resource(account, resource_id))
 
+    def add_account_for_login(
+        self,
+        *,
+        account_id: str,
+        account_type: str,
+        label: str,
+        origin: str,
+        station_id: str | None = None,
+        station_name: str | None = None,
+        station_type: str | None = None,
+        station_origin: str | None = None,
+        remember_password: bool = False,
+    ) -> dict[str, Any]:
+        """Create the account shell for an in-flight native browser login.
+
+        The host starts the login webview before the account exists, so no
+        slot is reserved when the flow is cancelled. The host-supplied id is
+        the same pending id the native session store already keys the captured
+        credentials under, and the station binding mirrors ``account.add``.
+        """
+
+        if len(self._accounts) >= MAX_ACCOUNTS:
+            raise RelayAccountsError("Relay account limit reached")
+        if account_type not in ACCOUNT_TYPES:
+            raise RelayAccountsError("Relay account type is invalid")
+        checked_id = _account_id(account_id)
+        if any(account["id"] == checked_id for account in self._accounts):
+            raise RelayAccountsError("Relay account already exists")
+        data: dict[str, Any] = {
+            "origin": _origin(origin),
+            "label": _text(label, "Relay label", limit=160),
+        }
+        if station_id:
+            data["station_id"] = station_id
+        if station_name:
+            data["station_name"] = station_name
+        if station_type:
+            data["station_type"] = station_type
+        if station_origin:
+            data["station_origin"] = station_origin
+        station_ids_before = {station["id"] for station in self._stations}
+        station, account_origin = self._account_station(data, account_type)
+        try:
+            account = _private_account(
+                {
+                    "id": checked_id,
+                    "station_id": station["id"],
+                    "type": account_type,
+                    "label": data["label"],
+                    "origin": account_origin,
+                    "username": "",
+                    "login_status": "signed_out",
+                    "remember_password": remember_password is True,
+                    "password": "",
+                    "session": {},
+                    "balance": None,
+                    "last_updated_at": "",
+                    "resource_status": "idle",
+                    "resource_error": "none",
+                    "resources": [],
+                    "groups": [],
+                }
+            )
+        except Exception:
+            if station["id"] not in station_ids_before:
+                self._stations = [item for item in self._stations if item["id"] != station["id"]]
+            raise
+        self._accounts.append(account)
+        self._draft_staged = True
+        self._last_action = {"kind": "account_add", "account_id": checked_id, "station_id": station["id"]}
+        self._persist()
+        self.revision += 1
+        return _public_account(account)
+
     def accept_login_result(
         self,
         account_id: str,
@@ -2777,9 +2894,16 @@ class RelayAccountsDomain:
         access_token: str = "",
         refresh_token: str = "",
         password: str = "",
+        remember_password: bool | None = None,
         preserve_resources: bool = False,
     ) -> dict[str, Any]:
-        """Trusted native/browser boundary for one completed login."""
+        """Trusted native/browser boundary for one completed login.
+
+        ``remember_password`` is a tri-state: ``None`` keeps the stored
+        preference (used when no password was typed), while ``True``/``False``
+        apply the post-login choice made in the host's subordinate prompt —
+        ``False`` also clears an earlier saved password and persisted session.
+        """
 
         index = self._index(account_id)
         account = copy.deepcopy(self._accounts[index])
@@ -2799,6 +2923,8 @@ class RelayAccountsDomain:
             secrets["access_token"] = _text(access_token, "Relay access token", limit=32768)
         if refresh_token:
             secrets["refresh_token"] = _text(refresh_token, "Relay refresh token", limit=32768)
+        if remember_password is not None:
+            account["remember_password"] = remember_password is True
         account.update(
             {
                 "username": username_value,

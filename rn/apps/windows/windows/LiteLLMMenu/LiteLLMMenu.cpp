@@ -23,7 +23,7 @@ namespace {
 std::wstring AllowedRoute(std::wstring route) {
   static constexpr std::wstring_view allowed[] = {
       L"home", L"providers-models", L"codex-settings", L"claude-settings",
-      L"runtime-settings", L"relay-accounts", L"data-management", L"provider-wizard",
+      L"runtime-settings", L"data-management", L"provider-wizard",
       L"logs"};
   return std::find(std::begin(allowed), std::end(allowed), route) == std::end(allowed)
       ? std::wstring{} : route;
@@ -36,8 +36,16 @@ std::wstring AllowedLogTab(std::wstring tab) {
       ? std::wstring{} : tab;
 }
 
+std::wstring CanonicalRoute(std::wstring route) {
+  // The former Service Provider Management surfaces are integrated into the
+  // unified provider workspace; legacy routes land there.
+  if (route == L"relay-accounts") return L"providers-models";
+  if (route == L"relay-add") return L"provider-wizard";
+  return route;
+}
+
 std::wstring RouteWithAllowedTab(std::wstring route, std::wstring_view query) {
-  route = AllowedRoute(std::move(route));
+  route = CanonicalRoute(AllowedRoute(std::move(route)));
   if (route != L"logs" || query.empty()) return route;
   if (query.front() == L'?') query.remove_prefix(1);
   constexpr std::wstring_view prefix = L"tab=";

@@ -25,6 +25,7 @@ func configureImmediatePresentation(_ window: NSWindow) {
     window.animationBehavior = .none
 }
 
+
 private enum NativeRelayOriginPolicy {
     static func allows(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme), let host = url.host?.lowercased() else {
@@ -75,7 +76,7 @@ private enum NativeRelayOriginPolicy {
     private static let statusMenuOrder = [
         "status", "separator",
         "toggle-autostart", "toggle-codex-model-catalog", "separator",
-        "open-providers-models", "open-runtime-settings", "open-codex-settings", "open-relay-accounts", "separator",
+        "open-providers-models", "open-runtime-settings", "open-codex-settings", "separator",
         "webdav-status", "open-data-management", "separator",
         "open-logs", "separator",
         "show-version", "quit",
@@ -142,7 +143,7 @@ private enum NativeRelayOriginPolicy {
         "languageMenu": "Language", "languageSystem": "System", "languageEnglish": "English", "languageSimplifiedChinese": "简体中文",
         "menuQuit": "Quit LiteLLM Menu",
         "routeHome": "LiteLLM Menu", "routeProvidersModels": "Providers & Models",
-        "routeRelayAccounts": "Service Provider Management", "routeRelayAdd": "Add Relay Account", "routeProviderWizard": "Add Provider",
+        "routeProviderWizard": "Add Provider",
         "providerAuthInstruction": "Complete sign-in on the official provider page. The code below is shown only for this device-code flow.",
         "providerAuthCode": "Device code", "providerAuthCopy": "Copy", "providerAuthBlocked": "This navigation was blocked because it is outside the official provider authentication flow.",
         "routeCodexSettings": "Codex / Claude Settings", "routeClaudeSettings": "Claude Settings",
@@ -249,13 +250,6 @@ private enum NativeRelayOriginPolicy {
         // supply AppKit controls, focus behavior, and system appearance.
         let windowRoute = canonicalRoute(route)
         ensureReactHostStarted()
-        if windowRoute == "relay-add", routeWindows["relay-accounts"] == nil,
-           let parentTitle = routeWindowTitle("relay-accounts") {
-            // The add-account flow is a child of the relay workspace. Keep a
-            // real parent window available so AppKit can enforce sheet
-            // modality even when the route is opened directly.
-            open(route: "relay-accounts", title: parentTitle)
-        }
         if windowRoute == "provider-wizard", routeWindows["providers-models"] == nil,
            let parentTitle = routeWindowTitle("providers-models") {
             // The provider wizard is a child of the provider workspace. A
@@ -285,15 +279,7 @@ private enum NativeRelayOriginPolicy {
         updateActivationPolicy()
         configureImmediatePresentation(window)
         withoutAnimations {
-            if windowRoute == "relay-add", let parent = routeWindows["relay-accounts"] {
-                if window.sheetParent == nil {
-                    // A sheet keeps the relay workspace visible for context
-                    // while AppKit disables it until this child is closed.
-                    parent.beginSheet(window)
-                } else {
-                    window.makeKeyAndOrderFront(nil)
-                }
-            } else if windowRoute == "provider-wizard", let parent = routeWindows["providers-models"] {
+            if windowRoute == "provider-wizard", let parent = routeWindows["providers-models"] {
                 if window.sheetParent == nil {
                     // AppKit disables the parent until endSheet is called.
                     parent.beginSheet(window)
@@ -318,8 +304,6 @@ private enum NativeRelayOriginPolicy {
         guard let selectedRoute, let window = routeWindows[selectedRoute] else { return }
         approvedCloseRoutes.insert(selectedRoute)
         defer { approvedCloseRoutes.remove(selectedRoute) }
-        let restoreRelayAccounts = selectedRoute == "relay-add"
-            ? routeWindows["relay-accounts"] : nil
         let restoreProviderModels = selectedRoute == "provider-wizard"
             ? routeWindows["providers-models"] : nil
         withoutAnimations {
@@ -330,9 +314,6 @@ private enum NativeRelayOriginPolicy {
             window.close()
         }
         routeWindows.removeValue(forKey: selectedRoute)
-        if let restoreRelayAccounts {
-            restoreRelayAccounts.makeKeyAndOrderFront(nil)
-        }
         if let restoreProviderModels {
             restoreProviderModels.makeKeyAndOrderFront(nil)
         }
@@ -712,8 +693,12 @@ private enum NativeRelayOriginPolicy {
         origin: String,
         language: String,
         username: String?,
-        rememberPassword: Bool,
         embedded: Bool = false,
+        pendingAccount: Bool = false,
+        stationID: String? = nil,
+        stationName: String? = nil,
+        stationType: String? = nil,
+        stationOrigin: String? = nil,
         completion: @escaping (CoreIPCBridge.RelayLoginResult?) -> Void
     ) {
         guard Thread.isMainThread else {
@@ -725,8 +710,12 @@ private enum NativeRelayOriginPolicy {
                     origin: origin,
                     language: language,
                     username: username,
-                    rememberPassword: rememberPassword,
                     embedded: embedded,
+                    pendingAccount: pendingAccount,
+                    stationID: stationID,
+                    stationName: stationName,
+                    stationType: stationType,
+                    stationOrigin: stationOrigin,
                     completion: completion
                 )
             }
@@ -755,13 +744,17 @@ private enum NativeRelayOriginPolicy {
             normalized.path = path.isEmpty ? "" : "/" + path
             return normalized.url ?? originURL
         } ?? originURL
-        let embeddedWindow = embedded ? routeWindows["relay-add"].flatMap { $0.contentView == nil ? nil : $0 } : nil
+        let embeddedWindow = embedded ? routeWindows["provider-wizard"].flatMap { $0.contentView == nil ? nil : $0 } : nil
         guard !embedded || embeddedWindow != nil else {
             completion(nil)
             return
         }
+        // A login opened from the providers workspace attaches to that window
+        // as a sheet: it is a subordinate surface, and the parent stays
+        // unclickable until the flow finishes.
+        let sheetParent = embeddedWindow == nil ? routeWindows["providers-models"] : nil
         let embeddedClose: (() -> Void)? = embedded ? { [weak self] in
-            self?.close(route: "relay-add")
+            self?.close(route: "provider-wizard")
         } : nil
         let controller = NativeRelayLoginController(
             accountID: accountID,
@@ -770,9 +763,14 @@ private enum NativeRelayOriginPolicy {
             originURL: canonicalOrigin,
             language: language,
             username: username,
-            rememberPassword: rememberPassword,
             embeddedWindow: embeddedWindow,
-            embeddedClose: embeddedClose
+            embeddedClose: embeddedClose,
+            sheetParent: sheetParent,
+            pendingAccount: pendingAccount,
+            stationID: stationID,
+            stationName: stationName,
+            stationType: stationType,
+            stationOrigin: stationOrigin
         )
         activeRelayLoginController = controller
         controller.start { [weak self] result in
@@ -839,7 +837,6 @@ private enum NativeRelayOriginPolicy {
             originURL: canonicalOrigin,
             language: language,
             username: nil,
-            rememberPassword: false,
             mode: .logs
         )
         activeRelayLoginController = controller
@@ -1108,7 +1105,9 @@ private enum NativeRelayOriginPolicy {
     }
 
     private func modelChooserButton(title: String, toolTip: String) -> NSButton {
-        let button = NSButton(title: title, target: nil, action: nil)
+        // Keep Return-to-add via the default-button key equivalent, but draw
+        // the ordinary (non-accent) bezel so the "+" stays a neutral action.
+        let button = NeutralDefaultButton(title: title, target: nil, action: nil)
         button.bezelStyle = .rounded
         button.toolTip = toolTip
         button.setAccessibilityLabel(toolTip)
@@ -1141,13 +1140,6 @@ private enum NativeRelayOriginPolicy {
             item.target = self
             item.representedObject = "open-settings"
         }
-        let relayItem = applicationMenu.addItem(
-            withTitle: localized("routeRelayAccounts", fallback: "Service Provider Management"),
-            action: #selector(openRelayAccounts),
-            keyEquivalent: ""
-        )
-        relayItem.target = self
-        relayItem.representedObject = "native-open-relay-accounts"
         let dataManagementItem = applicationMenu.addItem(
             withTitle: localized("routeDataManagement", fallback: "Data Management"),
             action: #selector(openDataManagement),
@@ -1328,7 +1320,6 @@ private enum NativeRelayOriginPolicy {
     private func menuTitle(for id: String, fallback: String) -> String {
         switch id {
         case "open-providers-models": return localized("routeProvidersModels", fallback: fallback)
-        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: fallback)
         case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: fallback)
         case "open-codex-settings": return localized("routeCodexSettings", fallback: fallback)
         case "open-data-management": return localized("routeDataManagement", fallback: fallback)
@@ -1343,7 +1334,6 @@ private enum NativeRelayOriginPolicy {
         case "toggle-autostart": return localized("autoStart", fallback: "Auto Start at Login")
         case "toggle-codex-model-catalog": return "Use LiteLLM models in Codex"
         case "open-providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
-        case "open-relay-accounts": return localized("routeRelayAccounts", fallback: "Service Provider Management")
         case "open-runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
         case "open-codex-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
         case "open-data-management": return localized("routeDataManagement", fallback: "Data Management")
@@ -1432,8 +1422,6 @@ private enum NativeRelayOriginPolicy {
         for item in applicationMenu.items {
             switch item.representedObject as? String {
             case "open-settings": item.title = localized("settings", fallback: "Settings...")
-            case "native-open-relay-accounts":
-                item.title = localized("routeRelayAccounts", fallback: "Service Provider Management")
             case "native-reload": item.title = localized("reload", fallback: "Reload")
             case "native-close-window": item.title = localized("closeWindow", fallback: "Close Window")
             case "native-quit": item.title = localized("menuQuit", fallback: "Quit LiteLLM Menu")
@@ -1507,7 +1495,12 @@ private enum NativeRelayOriginPolicy {
     }
 
     private func canonicalRoute(_ route: String) -> String {
-        route == "claude-settings" ? "codex-settings" : route
+        // The former Service Provider Management surfaces are integrated into
+        // the unified provider workspace; legacy routes land there.
+        if route == "claude-settings" { return "codex-settings" }
+        if route == "relay-accounts" { return "providers-models" }
+        if route == "relay-add" { return "provider-wizard" }
+        return route
     }
 
     private func routeForWindow(_ window: NSWindow) -> String? {
@@ -1551,21 +1544,11 @@ private enum NativeRelayOriginPolicy {
     private func routeWindowLayout(for route: String) -> RouteWindowLayout {
         switch route {
         case "providers-models":
+            // The unified provider workspace carries provider, key, and model
+            // panes plus the detail column, so it starts wider than before.
             return RouteWindowLayout(
-                contentSize: NSSize(width: 780, height: 460),
-                minSize: NSSize(width: 780, height: 460),
-                maxSize: nil
-            )
-        case "relay-accounts":
-            return RouteWindowLayout(
-                contentSize: NSSize(width: 820, height: 480),
-                minSize: NSSize(width: 780, height: 440),
-                maxSize: nil
-            )
-        case "relay-add":
-            return RouteWindowLayout(
-                contentSize: NSSize(width: 620, height: 460),
-                minSize: NSSize(width: 540, height: 420),
+                contentSize: NSSize(width: 900, height: 640),
+                minSize: NSSize(width: 820, height: 560),
                 maxSize: nil
             )
         case "provider-wizard":
@@ -1631,8 +1614,6 @@ private enum NativeRelayOriginPolicy {
         switch route {
         case "home": return localized("routeHome", fallback: "LiteLLM Menu")
         case "providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
-        case "relay-accounts": return localized("routeRelayAccounts", fallback: "Service Provider Management")
-        case "relay-add": return localized("routeRelayAdd", fallback: "Add Relay Account")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
@@ -1648,8 +1629,6 @@ private enum NativeRelayOriginPolicy {
         switch route {
         case "home": return localized("routeHome", fallback: "LiteLLM Menu")
         case "providers-models": return "LiteLLM " + localized("routeProvidersModels", fallback: "Providers & Models")
-        case "relay-accounts": return localized("routeRelayAccounts", fallback: "Service Provider Management")
-        case "relay-add": return "LiteLLM " + localized("routeRelayAdd", fallback: "Add Relay Account")
         case "provider-wizard": return "LiteLLM " + localized("routeProviderWizard", fallback: "Add Provider")
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
@@ -1668,7 +1647,6 @@ private enum NativeRelayOriginPolicy {
     }
 
     @objc private func openProviders() { openNamedRoute("providers-models") }
-    @objc private func openRelayAccounts() { openNamedRoute("relay-accounts") }
     @objc private func openCodex() { openNamedRoute("codex-settings") }
     @objc private func openClaude() { openNamedRoute("claude-settings") }
     @objc private func openRuntime() { openNamedRoute("runtime-settings") }
@@ -1688,7 +1666,6 @@ private enum NativeRelayOriginPolicy {
         guard let id = sender.representedObject as? String else { return }
         switch id {
         case "open-providers-models": openProviders()
-        case "open-relay-accounts": openRelayAccounts()
         case "open-codex-settings": openCodex()
         case "open-claude-settings": openClaude()
         case "open-runtime-settings": openRuntime()
@@ -1717,6 +1694,23 @@ private enum NativeRelayOriginPolicy {
     }
 
     @objc private func quit() { requestQuit() }
+}
+
+/// A push button that keeps the Return-key default-button role without the
+/// accent-colored default fill. Assigning ``keyEquivalent`` ``"\\r"`` makes
+/// AppKit paint the button with the control accent color; temporarily
+/// clearing the equivalent while drawing restores the ordinary bezel while
+/// the window still routes Return to this cell.
+private final class NeutralDefaultButton: NSButton {
+    override func draw(_ dirtyRect: NSRect) {
+        guard keyEquivalent == "\r", window?.defaultButtonCell === cell else {
+            super.draw(dirtyRect)
+            return
+        }
+        keyEquivalent = ""
+        super.draw(dirtyRect)
+        keyEquivalent = "\r"
+    }
 }
 
 final class NativeSplitView: NSSplitView {
@@ -2810,12 +2804,17 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private let originURL: URL
     private let language: String
     private let presetUsername: String?
-    private let rememberPassword: Bool
     private let mode: NativeRelayBrowserMode
     private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
     private let panel: NSPanel?
     private weak var embeddedWindow: NSWindow?
     private let embeddedClose: (() -> Void)?
+    private weak var sheetParent: NSWindow?
+    private let pendingAccount: Bool
+    private let stationID: String?
+    private let stationName: String?
+    private let stationType: String?
+    private let stationOrigin: String?
     private var embeddedContent: NSView?
     private var embeddedCloseObserver: NSObjectProtocol?
     private let webView: WKWebView
@@ -2856,9 +2855,14 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         originURL: URL,
         language: String,
         username: String?,
-        rememberPassword: Bool,
         embeddedWindow: NSWindow? = nil,
         embeddedClose: (() -> Void)? = nil,
+        sheetParent: NSWindow? = nil,
+        pendingAccount: Bool = false,
+        stationID: String? = nil,
+        stationName: String? = nil,
+        stationType: String? = nil,
+        stationOrigin: String? = nil,
         mode: NativeRelayBrowserMode = .login
     ) {
         self.accountID = accountID
@@ -2867,10 +2871,15 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         self.originURL = originURL
         self.language = language
         self.presetUsername = username?.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.rememberPassword = rememberPassword
         self.mode = mode
         self.embeddedWindow = embeddedWindow
         self.embeddedClose = embeddedClose
+        self.sheetParent = sheetParent
+        self.pendingAccount = pendingAccount
+        self.stationID = stationID
+        self.stationName = stationName
+        self.stationType = stationType
+        self.stationOrigin = stationOrigin
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
@@ -2882,7 +2891,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 forMainFrameOnly: false
             )
         )
-        if rememberPassword && mode == .login {
+        if mode == .login {
             configuration.userContentController.addUserScript(
                 WKUserScript(
                     source: """
@@ -2920,7 +2929,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             defer: false
         ) : nil
         super.init()
-        if rememberPassword && mode == .login {
+        if mode == .login {
             configuration.userContentController.add(self, name: "litellmRelayPassword")
         }
         buildPanel()
@@ -2929,7 +2938,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     func start(completion: @escaping (CoreIPCBridge.RelayLoginResult?) -> Void) {
         self.completion = completion
         beginBrowserFlow()
-        if let panel {
+        if let panel, let sheetParent {
+            // Sheet presentation: subordinate to the provider window, whose
+            // controls stay blocked until the sheet ends.
+            NSApp.activate(ignoringOtherApps: true)
+            configureImmediatePresentation(panel)
+            withoutAnimations { sheetParent.beginSheet(panel, completionHandler: nil) }
+        } else if let panel {
             NSApp.activate(ignoringOtherApps: true)
             panel.center()
             configureImmediatePresentation(panel)
@@ -2968,7 +2983,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         if mode == .logs {
             return relayURL(path: type == "newapi" ? "usage-logs" : "usage") ?? originURL
         }
-        guard type == "sub2api" else { return originURL }
+        // Both relay families expose the sign-in form at /login; landing
+        // there skips the marketing home page and its separate 登录 link.
         return originURL.appendingPathComponent("login")
     }
 
@@ -3034,12 +3050,19 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // The React step owns the progress header and close action. The
         // embedded browser must not add a second native panel header.
         let showsEmbeddedClose = false
-        let showsPanelActions = showsReloadAction || showsEmbeddedClose
+        // A sheet has no traffic-light close button, so it carries an
+        // explicit Close action; the parent window stays blocked anyway.
+        let showsSheetClose = sheetParent != nil && mode == .login && !isEmbeddedPresentation
+        let showsPanelActions = showsReloadAction || showsEmbeddedClose || showsSheetClose
         titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
         titleLabel.lineBreakMode = .byTruncatingTail
+        let host = originURL.host ?? ""
+        // The host subtitle is redundant when the title already shows the URL.
+        let showsHostSubtitle = isEmbeddedPresentation || mode == .logs || host.isEmpty || !label.localizedCaseInsensitiveContains(host)
         accountLabel.stringValue = isEmbeddedPresentation
             ? text("Sign-in is detected automatically", "登录成功后自动检测")
             : (originURL.host ?? originURL.absoluteString)
+        accountLabel.isHidden = !showsHostSubtitle
         accountLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = isEmbeddedPresentation
             ? waitingForSignInStatus
@@ -3064,15 +3087,29 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             cancelButton.bezelStyle = .rounded
             cancelButton.keyEquivalent = "\u{1b}"
         }
-
         [titleLabel, accountLabel, statusLabel].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             header.addSubview($0)
         }
-        if showsPanelActions {
-            ([showsReloadAction ? signInButton : nil, cancelButton] as [NSButton?]).compactMap { $0 }.forEach {
+        // A sheet has no traffic-light close button, so its Close action
+        // lives in a fixed bottom-right action bar, matching the route-window
+        // convention; only the logs header keeps inline header buttons.
+        let sheetActionBar = showsSheetClose ? NSView() : nil
+        let sheetActionSeparator = showsSheetClose ? NSBox() : nil
+        sheetActionSeparator?.boxType = .separator
+        if showsReloadAction {
+            ([signInButton, cancelButton] as [NSButton?]).compactMap { $0 }.forEach {
                 $0.translatesAutoresizingMaskIntoConstraints = false
                 header.addSubview($0)
+            }
+        } else if let actionBar = sheetActionBar {
+            actionBar.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(actionBar)
+            cancelButton.translatesAutoresizingMaskIntoConstraints = false
+            actionBar.addSubview(cancelButton)
+            if let separator = sheetActionSeparator {
+                separator.translatesAutoresizingMaskIntoConstraints = false
+                actionBar.addSubview(separator)
             }
         }
         webView.translatesAutoresizingMaskIntoConstraints = false
@@ -3119,7 +3156,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         var constraints: [NSLayoutConstraint] = [
             webView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            webView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             loadingOverlay.leadingAnchor.constraint(equalTo: webView.leadingAnchor),
             loadingOverlay.trailingAnchor.constraint(equalTo: webView.trailingAnchor),
             loadingOverlay.topAnchor.constraint(equalTo: webView.topAnchor),
@@ -3127,6 +3163,28 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             loadingLabel.centerXAnchor.constraint(equalTo: loadingOverlay.centerXAnchor),
             loadingLabel.centerYAnchor.constraint(equalTo: loadingOverlay.centerYAnchor),
         ]
+        if let actionBar = sheetActionBar {
+            constraints += [
+                webView.bottomAnchor.constraint(equalTo: actionBar.topAnchor),
+                actionBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                actionBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                actionBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                actionBar.heightAnchor.constraint(equalToConstant: 44),
+                cancelButton.leadingAnchor.constraint(greaterThanOrEqualTo: actionBar.leadingAnchor, constant: 18),
+                cancelButton.trailingAnchor.constraint(equalTo: actionBar.trailingAnchor, constant: -18),
+                cancelButton.centerYAnchor.constraint(equalTo: actionBar.centerYAnchor),
+                cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
+            ]
+            if let separator = sheetActionSeparator {
+                constraints += [
+                    separator.leadingAnchor.constraint(equalTo: actionBar.leadingAnchor),
+                    separator.trailingAnchor.constraint(equalTo: actionBar.trailingAnchor),
+                    separator.topAnchor.constraint(equalTo: actionBar.topAnchor),
+                ]
+            }
+        } else {
+            constraints.append(webView.bottomAnchor.constraint(equalTo: content.bottomAnchor))
+        }
         if isEmbeddedPresentation {
             constraints.append(webView.topAnchor.constraint(equalTo: content.topAnchor))
         } else {
@@ -3345,7 +3403,9 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard rememberPassword,
+        // The capture always runs so the post-login prompt can offer to keep
+        // the typed password; whether it is persisted is decided later.
+        guard mode == .login,
               mode == .login,
               message.name == "litellmRelayPassword",
               message.frameInfo.isMainFrame,
@@ -3361,7 +3421,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     }
 
     private func captureBrowserCredentials(attempt: NativeRelayLoginAttempt, completion: @escaping () -> Void) {
-        let passwordExpression = rememberPassword
+        let passwordExpression = mode == .login
             ? "sessionStorage.getItem('__litellm_menu_relay_password') || document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || ''"
             : "''"
         let script = """
@@ -3521,6 +3581,68 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         attempt: NativeRelayLoginAttempt
     ) {
         guard isCurrentCheck(attempt) else { return }
+        let capturedPassword = self.capturedPassword
+        if let capturedPassword, !capturedPassword.isEmpty {
+            // The typed password is a decision point, not a default: ask the
+            // user whether to keep it after the sign-in was verified.
+            presentRememberPasswordPrompt { [weak self, weak attempt] rememberPassword in
+                guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
+                self.commitVerifiedLogin(
+                    username: username,
+                    cookie: cookie,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    rememberPassword: rememberPassword,
+                    capturedPassword: capturedPassword,
+                    attempt: attempt
+                )
+            }
+            return
+        }
+        // No password was typed (cookie/token sign-in). Nothing to keep, so
+        // the account's existing preference stands and no prompt appears.
+        commitVerifiedLogin(
+            username: username,
+            cookie: cookie,
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            rememberPassword: nil,
+            capturedPassword: nil,
+            attempt: attempt
+        )
+    }
+
+    /// Post-login subordinate prompt on the sign-in surface: keep the typed
+    /// password on this device, or keep only the current login state.
+    private func presentRememberPasswordPrompt(completion: @escaping (Bool) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = text("Remember the password?", "是否记住密码？")
+        alert.informativeText = text(
+            "Save the password on this device to enable automatic sign-in next time. Choose “Session only” to keep just the current sign-in state.",
+            "密码将保存到本机，下次可自动登录。选择「仅记住登录态」则只保留本次登录状态。"
+        )
+        alert.addButton(withTitle: text("Remember Password", "记住密码"))
+        alert.addButton(withTitle: text("Session Only", "仅记住登录态"))
+        guard let promptParent = embeddedWindow ?? panel else {
+            completion(false)
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        alert.beginSheetModal(for: promptParent) { response in
+            completion(response == .alertFirstButtonReturn)
+        }
+    }
+
+    private func commitVerifiedLogin(
+        username: String,
+        cookie: String?,
+        accessToken: String?,
+        refreshToken: String?,
+        rememberPassword: Bool?,
+        capturedPassword: String?,
+        attempt: NativeRelayLoginAttempt
+    ) {
+        guard isCurrentCheck(attempt) else { return }
         let accountID = self.accountID
         let accountType = self.type
         let accountLabel = self.label
@@ -3533,8 +3655,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             refreshToken: refreshToken ?? ""
         )
         let attachFailure = text("The signed-in session could not be saved.", "无法保存登录状态。")
-        let shouldRememberPassword = rememberPassword
-        let capturedPassword = self.capturedPassword
+        let pendingAccount = self.pendingAccount
+        let stationID = self.stationID
+        let stationName = self.stationName
+        let stationType = self.stationType
+        let stationOrigin = self.stationOrigin
         DispatchQueue.global(qos: .userInitiated).async { [weak self, weak attempt] in
             guard let attempt, attempt.isActive() else { return }
             guard attempt.beginCommit() else { return }
@@ -3559,7 +3684,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                     cookie: cookie,
                     accessToken: accessToken,
                     refreshToken: refreshToken,
-                    password: shouldRememberPassword ? capturedPassword : nil
+                    password: rememberPassword == true ? capturedPassword : nil,
+                    stationID: stationID,
+                    stationName: stationName,
+                    stationType: stationType,
+                    stationOrigin: stationOrigin,
+                    rememberPassword: rememberPassword,
+                    pendingAccount: pendingAccount
                 )
                 DispatchQueue.main.async { [weak self, weak attempt] in
                     guard let self, let attempt else { return }
@@ -3656,9 +3787,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     @objc private func cancel(_ sender: Any?) {
         guard !finished else { return }
+        // A React-side Back must restore the wizard immediately. Even when a
+        // credential commit is in flight, resolve this presentation now so
+        // the pending relayLogin promise cannot leave the wizard busy with a
+        // stale browser covering the restored form. The later commit result
+        // is discarded because the controller is already finished.
         if let activeCheck, activeCheck.requestCancellation() == .committing {
-            dismissWhileCommitting()
-            return
+            panelClosedDuringCommit = true
         }
         activeCheck = nil
         finished = true
@@ -3732,13 +3867,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         capturedPassword = nil
     }
 
-    private func dismissWhileCommitting() {
-        panelClosedDuringCommit = true
-        signInButton.isEnabled = false
-        cancelButton.isEnabled = false
-        dismissPresentation()
-    }
-
     private func dismissPresentation() {
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
@@ -3756,8 +3884,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         embeddedContent?.removeFromSuperview()
         embeddedContent = nil
         if let panel {
-            panel.orderOut(nil)
-            panel.close()
+            // The project forbids window animations: end/close the sheet or
+            // panel inside a zero-duration transaction so dismissal is instant.
+            withoutAnimations {
+                panel.sheetParent?.endSheet(panel)
+                panel.orderOut(nil)
+                panel.close()
+            }
         }
     }
 

@@ -71,7 +71,13 @@ class CoreIPCBridge {
       std::optional<std::string> const& cookie,
       std::optional<std::string> const& access_token,
       std::optional<std::string> const& refresh_token,
-      std::optional<std::string> const& password = std::nullopt);
+      std::optional<std::string> const& password = std::nullopt,
+      std::optional<std::string> const& station_id = std::nullopt,
+      std::optional<std::string> const& station_name = std::nullopt,
+      std::optional<std::string> const& station_type = std::nullopt,
+      std::optional<std::string> const& station_origin = std::nullopt,
+      bool remember_password = false,
+      bool pending_account = false);
   std::optional<RelaySessionRestoreResult> RestoreRelaySession(
       std::string const& account_id,
       std::string const& account_type,

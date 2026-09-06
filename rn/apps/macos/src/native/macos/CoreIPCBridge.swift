@@ -202,7 +202,13 @@ import Foundation
         cookie: String?,
         accessToken: String?,
         refreshToken: String?,
-        password: String? = nil
+        password: String? = nil,
+        stationID: String? = nil,
+        stationName: String? = nil,
+        stationType: String? = nil,
+        stationOrigin: String? = nil,
+        rememberPassword: Bool? = nil,
+        pendingAccount: Bool = false
     ) throws -> RelayLoginResult {
         var payload: [String: Any] = [
             "account_id": accountID,
@@ -215,6 +221,12 @@ import Foundation
         if let accessToken, !accessToken.isEmpty { payload["access_token"] = accessToken }
         if let refreshToken, !refreshToken.isEmpty { payload["refresh_token"] = refreshToken }
         if let password, !password.isEmpty { payload["password"] = password }
+        if let stationID, !stationID.isEmpty { payload["station_id"] = stationID }
+        if let stationName, !stationName.isEmpty { payload["station_name"] = stationName }
+        if let stationType, !stationType.isEmpty { payload["station_type"] = stationType }
+        if let stationOrigin, !stationOrigin.isEmpty { payload["station_origin"] = stationOrigin }
+        if let rememberPassword { payload["remember_password"] = rememberPassword }
+        if pendingAccount { payload["pending_account"] = true }
         guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []),
               body.count <= 96 * 1024 else { throw BridgeError.invalidResponse }
         let (data, response, _, restarted) = try performCoreRequest(

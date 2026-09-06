@@ -26,6 +26,7 @@ export interface NativeTableProps extends ViewProps {
   scrollTrailingColumnOverflow?: WithDefault<boolean, true>;
   disabledRowKeys?: ReadonlyArray<string>;
   secondaryCellKeys?: ReadonlyArray<string>;
+  alertRowKeys?: ReadonlyArray<string>;
   spanningRowKeys?: ReadonlyArray<string>;
   onSelectionChange?: DirectEventHandler<SelectionChangeEvent>;
   onRowDoublePress?: DirectEventHandler<RowDoublePressEvent>;

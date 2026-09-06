@@ -706,10 +706,11 @@ struct TableComponentView final
         props.borderless.value_or(false) ? Thickness{0, 0, 0, 0} : Thickness{1, 1, 1, 1});
     const auto disabled_row_keys = props.disabledRowKeys.value_or(std::vector<std::string>{});
     const auto secondary_cell_keys = props.secondaryCellKeys.value_or(std::vector<std::string>{});
+    const auto alert_row_keys = props.alertRowKeys.value_or(std::vector<std::string>{});
     const auto spanning_row_keys = props.spanningRowKeys.value_or(std::vector<std::string>{});
     const auto column_count = props.columnLabels.size();
     const bool columns_changed = !has_applied_ || column_labels_ != props.columnLabels || column_widths_ != props.columnWidths || compact_ != props.compact;
-    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || spanning_row_keys_ != spanning_row_keys || compact_ != props.compact;
+    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || alert_row_keys_ != alert_row_keys || spanning_row_keys_ != spanning_row_keys || compact_ != props.compact;
     const bool selection_changed = !has_applied_ || selected_key_ != props.selectedKey;
     const bool was_following_bottom = props.followBottom.value_or(false) && rows_changed
         ? (!has_applied_ || ListIsFollowingBottom(list_))
@@ -773,7 +774,12 @@ struct TableComponentView final
             cell.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
             const auto cell_key = props.rowKeys[row_index] + "\x1f" + std::to_string(column_index);
             const bool secondary = std::find(secondary_cell_keys.begin(), secondary_cell_keys.end(), cell_key) != secondary_cell_keys.end();
-            if (disabled || secondary) cell.Foreground(SecondaryTextBrush());
+            const bool alert = std::find(alert_row_keys.begin(), alert_row_keys.end(), props.rowKeys[row_index]) != alert_row_keys.end();
+            if (alert) {
+              cell.Foreground(winrt::Microsoft::UI::Xaml::Media::SolidColorBrush{winrt::Windows::UI::Color{255, 0x6F, 0x55, 0x00}});
+            } else if (disabled || secondary) {
+              cell.Foreground(SecondaryTextBrush());
+            }
             Grid::SetColumn(cell, static_cast<int32_t>(column_index));
             row.Children().Append(cell);
           }
@@ -795,6 +801,7 @@ struct TableComponentView final
     compact_ = props.compact;
     disabled_row_keys_ = disabled_row_keys;
     secondary_cell_keys_ = secondary_cell_keys;
+    alert_row_keys_ = alert_row_keys;
     spanning_row_keys_ = spanning_row_keys;
     if (props.followBottom.value_or(false) && rows_changed && was_following_bottom && !props.rowKeys.empty()) {
       list_.ScrollIntoView(list_.Items().GetAt(static_cast<uint32_t>(props.rowKeys.size() - 1)));
@@ -822,6 +829,7 @@ struct TableComponentView final
   std::optional<bool> compact_;
   std::vector<std::string> disabled_row_keys_;
   std::vector<std::string> secondary_cell_keys_;
+  std::vector<std::string> alert_row_keys_;
   std::vector<std::string> spanning_row_keys_;
 };
 

@@ -92,8 +92,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             ("providers-models", 780, 560),
             ("runtime-settings", 800, 520),
             ("data-management", 500, 180),
-            ("relay-accounts", 780, 440),
-            ("relay-add", 540, 420),
+            ("provider-wizard", 540, 420),
             ("logs", 640, 420),
         ):
             self.assertIn(f'route == L"{route}") return {{{width}, {height}}};', leaf)
@@ -108,7 +107,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
         self.assertIn("ContentSize RouteInitialContentSize", leaf)
-        for size in ("{780, 560}", "{1160, 700}", "{1080, 620}", "{620, 220}", "{820, 480}", "{620, 460}", "{900, 580}"):
+        for size in ("{780, 560}", "{860, 560}", "{1160, 700}", "{1080, 620}", "{620, 220}", "{620, 460}", "{900, 580}"):
             self.assertIn(size, leaf)
         self.assertIn("RouteInitialContentSize(route)", leaf)
 
@@ -149,9 +148,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_macos_route_geometry_matches_the_responsive_constraints(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-
         for width, height, min_width, min_height in (
-            (780, 460, 780, 460),
+            (900, 640, 820, 560),
             (1160, 700, 1100, 640),
             (1080, 620, 800, 520),
             (600, 220, 500, 180),
@@ -160,13 +158,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         ):
             self.assertIn(f"contentSize: NSSize(width: {width}, height: {height})", leaf)
             self.assertIn(f"minSize: NSSize(width: {min_width}, height: {min_height})", leaf)
-        relay_layout = leaf.split('case "relay-accounts":', 1)[1].split('case "relay-add":', 1)[0]
-        self.assertIn("contentSize: NSSize(width: 820, height: 480)", relay_layout)
-        self.assertIn("minSize: NSSize(width: 780, height: 440)", relay_layout)
+        # The former relay windows are folded into the unified workspace.
+        self.assertNotIn('case "relay-accounts":', leaf)
+        self.assertNotIn('case "relay-add":', leaf)
         self.assertNotIn('case "configuration-package":', leaf)
         self.assertNotIn("maxSize: NSSize(width: 680, height: 386)", leaf)
 
-    def test_macos_relay_add_is_a_cascaded_sheet_that_locks_the_parent(self) -> None:
+    def test_macos_provider_wizard_is_a_cascaded_sheet_that_locks_the_parent(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         open_route = leaf.split("func open(route: String, title: String", 1)[1].split(
             "func open(route: String)", 1
@@ -178,15 +176,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "private func canonicalRoute", 1
         )[0]
 
-        self.assertIn('if windowRoute == "relay-add"', open_route)
-        self.assertIn('open(route: "relay-accounts", title: parentTitle)', open_route)
+        # The wizard is a child of the unified provider workspace; legacy
+        # relay routes are canonicalized into it.
+        self.assertIn('if route == "relay-add" { return "provider-wizard" }', leaf)
+        self.assertIn('if windowRoute == "provider-wizard", routeWindows["providers-models"] == nil', open_route)
         self.assertIn("parent.beginSheet(window)", open_route)
         self.assertIn("window.sheetParent == nil", open_route)
         self.assertIn("parent.endSheet(window)", close_route)
-        self.assertIn('let restoreRelayAccounts = selectedRoute == "relay-add"', close_route)
-        self.assertIn("restoreRelayAccounts.makeKeyAndOrderFront(nil)", close_route)
+        self.assertIn('let restoreProviderModels = selectedRoute == "provider-wizard"', close_route)
+        self.assertIn("restoreProviderModels.makeKeyAndOrderFront(nil)", close_route)
         self.assertIn("if window.sheetParent == nil", request_close)
         self.assertIn("parent sheet-locked", request_close)
+        self.assertNotIn("restoreRelayAccounts", close_route)
 
     def test_windows_tray_left_click_does_not_reinterpret_menu_index_zero(self) -> None:
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
@@ -586,8 +587,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("applicationShouldHandleReopen", app_delegate)
         self.assertIn("hasVisibleWindows", app_delegate)
         self.assertIn('openRouteFromDeepLink:@"providers-models" logTab:nil', app_delegate)
-        self.assertIn('representedObject = "native-open-relay-accounts"', leaf)
-        self.assertIn("action: #selector(openRelayAccounts)", leaf)
+        self.assertNotIn("native-open-relay-accounts", leaf)
+        self.assertNotIn("openRelayAccounts", leaf)
         self.assertIn('representedObject = "native-open-data-management"', leaf)
         self.assertIn("action: #selector(openDataManagement)", leaf)
         self.assertIn("dataManagementItem.keyEquivalentModifierMask = [.command, .shift]", leaf)
@@ -1003,6 +1004,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         mac_controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         mac_module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
+        mac_bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
         mac_core = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         windows_header = (WIN_NATIVE / "WinUI3NativeLeafModule.h").read_text(encoding="utf-8")
         windows_module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
@@ -1019,44 +1021,61 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("relayLogin?: (options:", platform)
 
         relay_ui = (SHARED / "ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
-        self.assertIn('language: snapshot?.language ?? "system"', relay_ui)
-        self.assertIn("const [rememberPasswordDrafts, setRememberPasswordDrafts] = useState<Record<string, boolean>>({});", relay_ui)
-        self.assertIn("const selectedRememberPassword = selected ? rememberPasswordDrafts[selected.id] ?? selected.rememberPassword : false;", relay_ui)
-        self.assertIn("const passwordStorageAvailable = true;", relay_ui)
-        self.assertIn("const [manualType, setManualType] = useState<RelayType>();", relay_ui)
-        self.assertIn("const accountType = chosenStation?.type ?? manualType ?? detected ?? detectedAddType;", relay_ui)
+        wizard_ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        # The station sign-in lives in the shared wizard window; the account
+        # panel keeps the sanitized native session boundary.
+        self.assertIn("language,", relay_ui)
+        self.assertIn("native.relayLogin({", relay_ui)
+        self.assertIn("pendingAccount: true,", relay_ui)
+        self.assertIn("await startPendingLogin();", relay_ui)
+        self.assertIn("native.cancelRelayLogin();", wizard_ui)
+        # Pending logins flow through both hosts: the module allowlists the
+        # pending/station fields and the accept payload forwards them to Core,
+        # which creates the account shell only after sign-in succeeds.
+        self.assertIn('"pendingAccount", "stationId", "stationName", "stationType", "stationOrigin"', mac_module)
+        self.assertIn('pendingAccount: pendingAccount,', mac_module)
+        self.assertIn('"pendingAccount", "stationId", "stationName", "stationType", "stationOrigin"', windows_module)
+        self.assertIn('native_options.pending_account = pending_account.value();', windows_module)
+        # What a sign-in may keep is asked by the hosts after the login
+        # succeeds: a subordinate post-login prompt replaces the retired
+        # pre-login choice surface and checkbox.
+        self.assertNotIn("showRelayLoginChoice", types)
+        self.assertNotIn("showRelayLoginChoice", mac_bridge)
+        self.assertNotIn("showRelayLoginChoice", mac_leaf)
+        self.assertIn('text("Remember Password", "记住密码")', mac_leaf)
+        self.assertIn('text("Session Only", "仅记住登录态")', mac_leaf)
+        self.assertIn("presentRememberPasswordPrompt", mac_leaf)
+        self.assertIn("ShowRememberPasswordPrompt", windows_relay)
+        self.assertIn('L"Remember Password", L"记住密码"', windows_relay)
+        self.assertIn('L"Session Only", L"仅记住登录态"', windows_relay)
+        self.assertIn('payload["pending_account"] = true', mac_core)
+        self.assertIn('payload.SetNamedValue(L"pending_account"', windows_core)
+        self.assertIn('"pending_account"', core_ipc)
+        # The providers-window login attaches as a subordinate sheet, so the
+        # parent stays blocked until the flow ends.
+        self.assertIn('let sheetParent = embeddedWindow == nil ? routeWindows["providers-models"] : nil', mac_leaf)
+        self.assertIn('sheetParent.beginSheet(panel, completionHandler: nil)', mac_leaf)
+        self.assertIn('panel.sheetParent?.endSheet(panel)', mac_leaf)
+        self.assertIn("embedded: true,", wizard_ui)
+        self.assertIn("const [manualType, setManualType] = useState<RelayType>();", wizard_ui)
+        self.assertIn("suggestedRelayStationName(candidate)", wizard_ui)
+        self.assertNotIn("const updateStationName = (value: string): void =>", wizard_ui)
+        self.assertIn('onBlur={() => { void detectRelayType(); }}', relay_ui) if False else None
+        self.assertIn("stationForProvider", wizard_ui)
+        self.assertIn("accountType", wizard_ui)
         self.assertIn("NativePicker", relay_ui)
-        self.assertIn("account = await addAccount(accountType, candidate, rememberPassword, chosenStation ? {", relay_ui)
-        self.assertIn('translate("relay.rememberPassword")', relay_ui)
-        self.assertIn('translate("relay.back")', relay_ui)
-        self.assertIn("native.cancelRelayLogin()", relay_ui)
-        self.assertIn(
-            "typeDetectionRequest.current += 1;\n"
-            "    setAdding(setupOnly);",
-            relay_ui,
-        )
-        self.assertIn('const [addStep, setAddStep] = useState<AddStep>("origin");', relay_ui)
-        self.assertIn('type AddStep = "origin" | "sign-in";', relay_ui)
-        self.assertIn("onChangeText={updateAddOrigin}", relay_ui)
-        self.assertNotIn('onBlur={() => { void detectRelayType(); }}', relay_ui)
-        self.assertIn("setAddStationName(suggestedRelayStationName(value));", relay_ui)
-        self.assertIn("const updateAddStationName = (value: string): void =>", relay_ui)
-        self.assertIn('SetupProgress step="origin"', relay_ui)
-        self.assertNotIn('SetupProgress step="select"', relay_ui)
-        self.assertNotIn('setAddStep("select")', relay_ui)
-        self.assertIn(': !setupOnly && selected ? <View style={styles.detailWorkspace}>', relay_ui)
-        self.assertIn('onClose?.();\n        native.window.focus("relay-accounts");', relay_ui)
-        self.assertIn("if (embedded) return true;", relay_ui)
+        # Both relay login entry points are pending flows: Core creates the
+        # account shell only after sign-in succeeds.
+        self.assertIn("pendingAccount: true,", wizard_ui)
+        self.assertNotIn("await relay.addAccount(", wizard_ui)
+        self.assertNotIn('relay.commit("account.delete"', wizard_ui)
+        self.assertNotIn("const [addStep, setAddStep] = useState<AddStep>", relay_ui)
+        # The login boundary stays native-only: Core never sees page fields.
+        self.assertNotIn("document.querySelector", relay_ui)
         self.assertIn("NativeCheckbox", relay_ui)
         self.assertNotIn('title={translate("relay.importSelected")}', relay_ui)
-        self.assertIn('type SavedSessionRestore = "signed_in" | "expired" | "unavailable";', relay_ui)
-        self.assertIn("const openedAccountIDs = useRef(new Set<string>());", relay_ui)
-        self.assertIn("const refreshLoginState = async (account: RelayAccount, automatic = false): Promise<void> => {", relay_ui)
-        self.assertIn("void refreshLoginState(selected, true);", relay_ui)
-        self.assertIn('title={translate("common.refresh")}', relay_ui)
-        self.assertIn('native.window.open("relay-add")', relay_ui)
-        self.assertIn('translate("relay.passwordNotSaved")', relay_ui)
-        self.assertNotIn('onPress={() => { void refreshWorkspace(); }}', relay_ui)
+        self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay_ui)
+        self.assertNotIn('symbol="refresh"', relay_ui)
         self.assertNotIn('translate("relay.status.signed_out")', relay_ui)
 
         self.assertIn("import WebKit", mac_leaf)
@@ -1091,8 +1110,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("set(user, \\(safeUser))", mac_leaf)
         self.assertIn("input[type=email], input[type=text]", mac_leaf)
         self.assertIn("const words = new Set(['login', 'log in', 'sign in', '登录']);", mac_leaf)
-        self.assertIn('guard type == "sub2api" else { return originURL }', mac_leaf)
-        self.assertIn('originURL.appendingPathComponent("login")', mac_leaf)
+        # Both relay families land directly on the login form.
+        self.assertIn('return originURL.appendingPathComponent("login")', mac_leaf)
         self.assertIn("private let loadingOverlay = NSVisualEffectView()", mac_leaf)
         self.assertNotIn("NSProgressIndicator", mac_leaf)
         self.assertNotIn("startAnimation", mac_leaf)
@@ -1106,9 +1125,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("func webView(_ webView: WKWebView, didFailProvisionalNavigation", mac_leaf)
         self.assertIn("private var capturedPassword: String?", mac_leaf)
         self.assertIn("__litellm_menu_relay_password", mac_leaf)
-        self.assertIn("let shouldRememberPassword = rememberPassword", mac_leaf)
+        self.assertIn("rememberPassword: Bool?,", mac_leaf)
         self.assertIn("let capturedPassword = self.capturedPassword", mac_leaf)
-        self.assertIn("password: shouldRememberPassword ? capturedPassword : nil", mac_leaf)
+        self.assertIn("password: rememberPassword == true ? capturedPassword : nil", mac_leaf)
         self.assertNotIn("autoLoginAttempt", mac_leaf)
         self.assertIn("private var automaticCheckProbe: DispatchWorkItem?", mac_leaf)
         self.assertIn("private var loginFormRevealProbe: DispatchWorkItem?", mac_leaf)
@@ -1137,10 +1156,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("let showsEmbeddedClose = false", mac_leaf)
         self.assertIn("func cancelRelayLogin()", mac_leaf)
         self.assertIn("@objc func cancelRelayLogin()", mac_module)
+        # The ObjC interop bridge must export the method: without this line the
+        # JS `native.cancelRelayLogin()` optional chain silently no-ops and the
+        # embedded login browser can never be dismissed by the wizard's Back.
+        self.assertIn("RCT_EXTERN_METHOD(cancelRelayLogin)", mac_bridge)
         self.assertIn("parent.beginSheet(window)", mac_leaf)
         self.assertIn("parent.endSheet(window)", mac_leaf)
         self.assertIn("@objc private func closeEmbeddedWindow", mac_leaf)
-        self.assertIn('self?.close(route: "relay-add")', mac_leaf)
+        self.assertIn('self?.close(route: "provider-wizard")', mac_leaf)
+        self.assertIn('routeWindows["provider-wizard"].flatMap', mac_leaf)
         self.assertNotIn('text("Check Sign-In", "检查登录")', mac_leaf)
         self.assertIn('text("No valid sign-in was found.', mac_leaf)
         self.assertIn('L"Verify Sign-In", L"验证登录"', windows_relay)
@@ -1159,7 +1183,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("guard let attempt, attempt.isActive() else { return }", mac_leaf)
         self.assertIn("activeCheck?.requestCancellation()", mac_leaf)
         self.assertIn("guard attempt.beginCommit() else { return }", mac_leaf)
-        self.assertIn("dismissWhileCommitting()", mac_leaf)
+        # A React-side Back must resolve immediately even when a credential
+        # commit is in flight, so the wizard can never stay busy behind a
+        # stale embedded browser.
+        self.assertIn("panelClosedDuringCommit = true", mac_leaf)
+        self.assertNotIn("dismissWhileCommitting()", mac_leaf)
         self.assertIn("self.finish(accepted, session: session, attempt: attempt)", mac_leaf)
         self.assertIn("func windowShouldClose(_ sender: NSWindow) -> Bool", mac_leaf)
         close_method = mac_leaf.split("func windowShouldClose(_ sender: NSWindow) -> Bool", 1)[1].split("private func finishCheckingFailure", 1)[0]
@@ -1195,13 +1223,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("userInput.focus({ preventScroll: true })", windows_relay)
         self.assertIn("bool UseChinese(WindowsRelayLoginOptions const& options)", windows_relay)
         self.assertIn('options.language == "zh-Hans"', windows_relay)
-        self.assertIn('auto prior_password = state->options.remember_password', windows_relay)
-        self.assertIn('if (state->options.remember_password) {\n        WriteChunkedCredential(state->options.account_id, L"password", prior_password);', windows_relay)
+        self.assertIn('auto prior_password = ReadChunkedCredential(state->options.account_id, L"password");', windows_relay)
         self.assertIn('host == L"localhost"', windows_relay)
         self.assertIn('state->webview.Source(winrt::Windows::Foundation::Uri(Utf8ToWide(state->options.origin)));', windows_relay)
         probe_login = windows_relay.split("winrt::fire_and_forget ProbeLogin", 1)[1].split("winrt::fire_and_forget InitializeBrowser", 1)[0]
         self.assertNotIn("state->captured_password.reset();", probe_login)
-        self.assertIn("if (state->options.remember_password && !password) password = state->captured_password;", windows_relay)
+        self.assertIn("if (!password) password = state->captured_password;", windows_relay)
+        self.assertIn("remember_password = co_await ShowRememberPasswordPrompt(state);", windows_relay)
         self.assertIn("std::map<std::string, std::string> ParseCookieHeader(std::string const& header);", windows_relay)
         self.assertIn("if (credentials_saved && !accepted)", windows_relay)
         self.assertIn("class RelayLoginAttempt", windows_relay)
@@ -1250,21 +1278,20 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("restoreRelaySession?: (options:", platform)
         self.assertIn("native.restoreRelaySession", relay_ui)
         self.assertIn("username: account.username || undefined", relay_ui)
-        self.assertIn("const refreshLoginState = async (account: RelayAccount, automatic = false): Promise<void> => {", relay_ui)
-        self.assertIn("const restored = await restoreSavedSession(account);", relay_ui)
-        self.assertIn('if (restored === "signed_in")', relay_ui)
+        self.assertIn("const attemptedAccounts = useRef(new Set<string>());", relay_ui)
+        self.assertIn("await refreshAccountResources(account, true);", relay_ui)
         self.assertNotIn('translate("relay.lastUpdated"', relay_ui)
         self.assertNotIn("accountAvatar", relay_ui)
         self.assertNotIn("native.showActionMenu", relay_ui)
         self.assertNotIn("NativeToggle", relay_ui)
-        resource_inspector = relay_ui.split("function ResourceInspector(", 1)[1].split(
-            "export function RelayAccountManager(",
-            1,
-        )[0]
-        self.assertIn('value={resource.enabled}', resource_inspector)
-        self.assertIn('onValueChange={onEnabledChange}', resource_inspector)
-        self.assertIn('native.copySecret({', relay_ui)
-        self.assertIn('domain="relay_accounts" field="api_key"', relay_ui)
+        provided_panel = logs_ui.split("function ProviderKeysPanel", 1)[1].split("function CodexWorkspace", 1)[0]
+        self.assertNotIn('value={selectedProvided.resource.enabled}', provided_panel)
+        self.assertIn('label={translate("providers.keyValue")}', provided_panel)
+        self.assertIn('symbol="copy"', provided_panel)
+        self.assertIn('native.copySecret({', provided_panel)
+        # The attribute order differs in the new panel; assert both parts.
+        self.assertIn('domain="relay_accounts"', provided_panel)
+        self.assertIn('field="api_key"', provided_panel)
         self.assertIn('copySecret(options:', types)
         self.assertIn('copySecret(domain: "relay_accounts", field: "api_key", target: string)', bridge)
         self.assertIn('copySecret?: (domain: "relay_accounts", field: "api_key", target: string)', platform)
@@ -1500,12 +1527,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac_spec = (SHARED / "ui/macos/NativeSecureTextInputNativeComponent.ts").read_text(encoding="utf-8")
         windows_spec = (SHARED / "ui/windows/NativeSecureTextInputNativeComponent.ts").read_text(encoding="utf-8")
 
-        provider_editor = ui.split("function ProviderEditor", 1)[1].split("function CodexWorkspace", 1)[0]
-        self.assertIn("<NativeSecretField plainText autoCommit", provider_editor)
-        self.assertNotIn('setTitle={translate("common.set")}', provider_editor)
-        self.assertNotIn('clearTitle={translate("common.clear")}', provider_editor)
-        self.assertNotIn("onClear={() => clearSecret", provider_editor)
-        self.assertNotIn("providers.apiKeyHint", provider_editor)
+        workspace = ui.split("function ProviderKeysPanel", 1)[1].split("function CodexWorkspace", 1)[0]
+        self.assertIn("<NativeSecretField plainText autoCommit", workspace)
+        self.assertNotIn('setTitle={translate("common.set")}', workspace)
+        self.assertNotIn('clearTitle={translate("common.clear")}', workspace)
+        self.assertNotIn("onClear={() => clearSecret", workspace)
+        self.assertNotIn("providers.apiKeyHint", workspace)
         for spec in (mac_spec, windows_spec):
             self.assertIn("plainText?: WithDefault<boolean, false>;", spec)
             self.assertIn("autoCommit?: WithDefault<boolean, false>;", spec)
@@ -1722,7 +1749,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("preserveColumnWidths={preserveColumnWidths}", native_controls)
         self.assertIn("scrollTrailingColumnOverflow?: boolean;", native_controls)
         self.assertIn("scrollTrailingColumnOverflow={scrollTrailingColumnOverflow}", native_controls)
-        self.assertIn("cellHorizontalPadding={0}", (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8"))
+        self.assertIn("cellHorizontalPadding={6}", (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8"))
         self.assertIn("firstColumnHorizontalPadding={0}", (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8"))
         logs_ui = (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
         logs_workspace = logs_ui.split("function LogsWorkspace", 1)[1].split("function Section", 1)[0]

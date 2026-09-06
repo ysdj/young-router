@@ -395,12 +395,11 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "rememberPassword", "embedded"]),
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin"]),
               let accountID = options["accountId"] as? String,
               let type = options["type"] as? String,
               let label = options["label"] as? String,
-              let origin = options["origin"] as? String,
-              let rememberPassword = options["rememberPassword"] as? Bool else {
+              let origin = options["origin"] as? String else {
             reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
             return
         }
@@ -428,6 +427,26 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         } else {
             embedded = false
         }
+        let pendingAccount: Bool
+        if let value = options["pendingAccount"] {
+            guard let suppliedPending = value as? Bool else {
+                reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+                return
+            }
+            pendingAccount = suppliedPending
+        } else {
+            pendingAccount = false
+        }
+        let stationType: String?
+        if let value = options["stationType"] {
+            guard let suppliedStationType = value as? String, ["newapi", "sub2api"].contains(suppliedStationType) else {
+                reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+                return
+            }
+            stationType = suppliedStationType
+        } else {
+            stationType = nil
+        }
         // WKWebView and its native host are created on AppKit's main thread, while
         // the React promise is completed asynchronously after the browser
         // flow finishes or is cancelled.
@@ -439,8 +458,12 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 origin: origin,
                 language: language,
                 username: options["username"] as? String,
-                rememberPassword: rememberPassword,
-                embedded: embedded
+                embedded: embedded,
+                pendingAccount: pendingAccount,
+                stationID: options["stationId"] as? String,
+                stationName: options["stationName"] as? String,
+                stationType: stationType,
+                stationOrigin: options["stationOrigin"] as? String
             ) { result in
                 DispatchQueue.main.async {
                     guard let result else {

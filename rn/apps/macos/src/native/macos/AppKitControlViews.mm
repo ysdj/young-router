@@ -2012,6 +2012,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       oldViewProps.cells != newViewProps.cells ||
       oldViewProps.disabledRowKeys != newViewProps.disabledRowKeys ||
       oldViewProps.secondaryCellKeys != newViewProps.secondaryCellKeys ||
+      oldViewProps.alertRowKeys != newViewProps.alertRowKeys ||
       oldViewProps.spanningRowKeys != newViewProps.spanningRowKeys;
   const bool dataChanged = columnsChanged || compactChanged || paddingChanged || firstColumnPaddingChanged ||
       overflowBehaviorChanged || rowsChanged;
@@ -2445,7 +2446,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const bool disabled = std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), rowKey) != viewProps.disabledRowKeys.end();
   const std::string cellKey = rowKey + "\x1f" + std::to_string(columnIndex);
   const bool secondary = std::find(viewProps.secondaryCellKeys.begin(), viewProps.secondaryCellKeys.end(), cellKey) != viewProps.secondaryCellKeys.end();
-  NSColor *textColor = disabled || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor;
+  const bool alert = std::find(viewProps.alertRowKeys.begin(), viewProps.alertRowKeys.end(), rowKey) != viewProps.alertRowKeys.end();
+  NSColor *textColor = alert ? NSColor.systemBrownColor : (disabled || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor);
   label.textColor = textColor;
   label.attributedStringValue = TableCellTitle(value, textColor);
   label.toolTip = value;

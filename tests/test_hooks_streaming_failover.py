@@ -450,6 +450,85 @@ class HookStreamingFailoverTests(HookTestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("id:reasoning-eof-route", hooks._DEPLOYMENT_COOLDOWNS)
 
+    async def test_whitespace_only_completed_text_fails_over_instead_of_completing(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        hooks._DEPLOYMENT_COOLDOWNS.clear()
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, None)
+        calls = []
+
+        async def whitespace_only_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-whitespace", "status": "in_progress"},
+            }
+            yield {"type": "response.output_text.delta", "delta": "   "}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-whitespace",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "msg-whitespace",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "   ", "annotations": []}
+                            ],
+                        }
+                    ],
+                },
+            }
+
+        async def recovered_stream():
+            yield {"type": "response.output_text.delta", "delta": "recovered"}
+            yield {
+                "type": "response.completed",
+                "response": {"id": "resp-recovered", "status": "completed"},
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {
+                "id": "whitespace-eof-route",
+                "route_key": "provider / openai/default-chat / key=primary / order=1",
+                "order": 1,
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=whitespace_only_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(
+            chunks,
+            [
+                {"type": "response.output_text.delta", "delta": "recovered"},
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp-recovered", "status": "completed"},
+                },
+            ],
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("id:whitespace-eof-route", hooks._DEPLOYMENT_COOLDOWNS)
+
     async def test_route_recovery_reasoning_only_completion_returns_failure(self) -> None:
         hooks, proxy_server = load_hook_module()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.01")

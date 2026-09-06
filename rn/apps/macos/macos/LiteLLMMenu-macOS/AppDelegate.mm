@@ -122,7 +122,7 @@
       continue;
     }
     NSString *route = [[url path] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
-    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"relay-accounts", @"data-management", @"provider-wizard", @"logs"]];
+    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"logs"]];
     if (![routes containsObject:route]) {
       continue;
     }

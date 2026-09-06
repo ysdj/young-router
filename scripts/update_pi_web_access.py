@@ -60,6 +60,7 @@ NODE_VERSION_PATTERN = re.compile(r"^v22\.[0-9]+\.[0-9]+$")
 FALLBACK_PI_PEERS = (
     "@earendil-works/pi-ai",
     "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-server",
     "@earendil-works/pi-tui",
 )
 

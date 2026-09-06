@@ -30,6 +30,23 @@ DEFAULT_PORT = "4000"
 DEFAULT_KEY = "sk-local-litellm"
 LOCAL_MODEL_LIST_TIMEOUT_SECONDS = 1.0
 LOCAL_MODEL_LIST_MAX_BYTES = 512 * 1024
+LITELLM_CODEX_PROVIDER_ID = "litellm-menu"
+LITELLM_CODEX_PROVIDER_NAME = "LiteLLM Menu"
+# Codex 0.153.x decides whether compaction requests are remote/encrypted from
+# the provider display name: only the exact ``OpenAI`` (or an Azure) name uses
+# encrypted remote Responses compaction, every other name uses the local
+# checkpoint summary. A LiteLLM selection therefore only advertises the exact
+# OpenAI name when the chosen model explicitly opts in through model metadata;
+# every other selection keeps the neutral name so new tasks compact locally.
+CODEX_REMOTE_COMPACTION_PROVIDER_NAME = "OpenAI"
+# Canonical per-model metadata key that opts an upstream model into encrypted
+# remote Responses compaction when routed through a LiteLLM selection. The
+# value must come from explicit model metadata (``model_info``), never from a
+# provider name, model name, or gpt-version inference.
+SUPPORTS_RESPONSES_COMPACTION_KEY = "supports_responses_compaction"
+# One unified alias for the canonical key. It maps onto the canonical field
+# everywhere it is consumed; conflicting values prefer the canonical key.
+_SUPPORTS_RESPONSES_COMPACTION_ALIASES = ("supports_compaction",)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -737,6 +754,23 @@ def _structured_scalar(mapping: dict[str, Any], key: str) -> Any:
     return value
 
 
+def _supports_responses_compaction(model_info: dict[str, Any]) -> bool | None:
+    """Read the explicit per-model compaction opt-in from ``model_info``.
+
+    Only an explicit boolean in the model metadata counts. The provider name,
+    model name, and gpt version are never consulted.
+    """
+
+    for key in (
+        SUPPORTS_RESPONSES_COMPACTION_KEY,
+        *_SUPPORTS_RESPONSES_COMPACTION_ALIASES,
+    ):
+        value = model_info.get(key)
+        if isinstance(value, bool):
+            return value
+    return None
+
+
 def configured_models(config: dict[str, Any]) -> list[dict[str, Any]]:
     providers = _get_mapping(config.get("providers"))
     result: list[dict[str, Any]] = []
@@ -766,6 +800,7 @@ def configured_models(config: dict[str, Any]) -> list[dict[str, Any]]:
                 "upstream_url_surface": str(info.get("upstream_url_surface") or "").strip().lower(),
                 "mode": str(info.get("mode") or "").strip().lower(),
                 "model_enabled": model_enabled,
+                "supports_responses_compaction": _supports_responses_compaction(info),
             }
         )
     return result
@@ -982,7 +1017,7 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
 
 def _runtime_context(
     config_path: pathlib.Path,
-) -> tuple[list[dict[str, str]], list[str], bool, str, list[str]]:
+) -> tuple[list[dict[str, Any]], list[str], bool, str, list[str]]:
     warnings: list[str] = []
     try:
         runtime_config = load_yaml(config_path)
@@ -1505,7 +1540,7 @@ def _apply_advanced_patch(text: str, value: object) -> str:
 
 def _selected_litellm_model(
     selection: object, runtime_config_path: pathlib.Path
-) -> dict[str, str]:
+) -> dict[str, Any]:
     selected = _require_mapping(selection, "litellm_model")
     model = selected.get("model")
     provider = selected.get("provider", "")
@@ -1600,11 +1635,12 @@ def apply_structured_patch(
         current_config = parse_toml_text(result)
         configured_provider = current_config.get("model_provider")
         provider_id = configured_provider.strip() if isinstance(configured_provider, str) else ""
-        if not provider_id or (
-            provider_id != "openai"
-            and _find_table_section(result, ("model_providers", provider_id)) is None
+        if (
+            not provider_id
+            or provider_id == "openai"
+            or _find_table_section(result, ("model_providers", provider_id)) is None
         ):
-            provider_id = "openai"
+            provider_id = LITELLM_CODEX_PROVIDER_ID
         result = _set_top_level_values(
             result,
             {
@@ -1613,31 +1649,64 @@ def apply_structured_patch(
                 "cli_auth_credentials_store": "file",
             },
         )
-        if provider_id == "openai":
-            result = _set_top_level_values(
-                result,
-                {"openai_base_url": local_base_url()},
-            )
-        else:
-            # Keep the selected custom provider identity.  The local endpoint
-            # handles the Responses request; the proxy chooses the configured
-            # upstream deployment afterward.  Do not opt custom providers into
-            # Codex's standalone /alpha/search protocol.
-            provider_path = ("model_providers", provider_id)
-            result = _patch_optional_string(
-                result,
-                provider_path,
-                "base_url",
-                local_base_url(),
-            )
-            # This provider is routed through LiteLLM Menu. Remove the legacy
-            # opt-in so Codex uses its own default instead of calling the
-            # unsupported standalone /alpha/search endpoint.
-            result = remove_table_value(
-                result,
-                provider_path,
-                "supports_standalone_web_search",
-            )
+        # A LiteLLM selection always uses a custom provider row whose local
+        # endpoint is this gateway. Codex 0.153.x derives remote Responses
+        # compaction support from the provider display name, so the row name
+        # selects the compaction protocol used by NEW tasks:
+        #
+        # - Default (capability false or unknown): the neutral ``LiteLLM Menu``
+        #   name, so Codex picks its local context-checkpoint summary and the
+        #   gateway never receives encrypted signed history on an unverified
+        #   route.
+        # - Explicit per-model opt-in (``supports_responses_compaction: true``
+        #   in the model's ``model_info``): the exact ``OpenAI`` name, which
+        #   makes Codex send encrypted remote compaction through the local
+        #   gateway; the proxy still capability-probes the actual route before
+        #   forwarding signed history (official OpenAI hosts skip the probe).
+        #
+        # Keep OpenAI auth for the local API key in both cases. This decision
+        # is made when the task is created: an already-running task cached its
+        # compaction capability and cannot be switched mid-protocol, so old
+        # tasks keep their previous provider identity until they are resumed
+        # as a new task.
+        provider_path = ("model_providers", provider_id)
+        result = _patch_optional_string(
+            result,
+            provider_path,
+            "name",
+            (
+                CODEX_REMOTE_COMPACTION_PROVIDER_NAME
+                if selected.get("supports_responses_compaction") is True
+                else LITELLM_CODEX_PROVIDER_NAME
+            ),
+        )
+        result = _patch_optional_string(
+            result,
+            provider_path,
+            "base_url",
+            local_base_url(),
+        )
+        result = _patch_optional_string(
+            result,
+            provider_path,
+            "wire_api",
+            "responses",
+        )
+        result = _apply_provider_auth_mode(
+            result,
+            provider_path,
+            provider_id,
+            "openai_auth",
+            {},
+        )
+        # This provider is routed through LiteLLM Menu. Remove the legacy
+        # opt-in so Codex emits hosted Responses search through the local
+        # gateway instead of calling an unsupported standalone endpoint.
+        result = remove_table_value(
+            result,
+            provider_path,
+            "supports_standalone_web_search",
+        )
         # Older releases force-wrote features.token_budget = true on every
         # LiteLLM selection, which made Codex clear the context window
         # instead of summarizing it. Clean that legacy value up once per

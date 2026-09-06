@@ -218,6 +218,11 @@ class CoreServiceReloadTests(unittest.TestCase):
                 )
 
                 result = core.apply("providers_models", revision=staged["revision"])
+                # Endpoint-backed repairs require two fresh observations so a
+                # transient post-reload worker view cannot manufacture a
+                # restart prompt. The apply's forced refresh is the first;
+                # the next snapshot with a fresh probe completes the pair.
+                codex._catalog_source_checked_at = 0.0
                 catalog_state = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             catalog = json.loads(

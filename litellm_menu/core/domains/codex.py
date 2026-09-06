@@ -224,16 +224,24 @@ class CodexSettingsDomain:
         except DomainError:
             exposed_models: list[str] = []
             source_available = False
+            configured_models: list[dict[str, Any]] = []
         else:
             raw_exposed = payload.get("exposed_models", [])
             exposed_models = list(raw_exposed) if isinstance(raw_exposed, list) else []
             source_available = self._catalog_source_is_available(payload)
+            raw_models = payload.get("models", [])
+            configured_models = list(raw_models) if isinstance(raw_models, list) else []
         for state in (self._raw, self._draft):
             # A failed probe is not an observed empty model list.  Keep the
             # last verified names so a transient startup/reload failure cannot
             # erase the catalog and manufacture a Codex restart prompt.
             if source_available:
                 state["exposed_models"] = copy.deepcopy(exposed_models)
+                # The configured model list is the catalog allowlist.  Refresh
+                # it alongside the exposure so a provider apply that adds or
+                # removes models is visible on the next snapshot without a
+                # Core restart.
+                state["models"] = copy.deepcopy(configured_models)
             state["litellm_menu_enabled"] = source_available
         return True
 
@@ -256,6 +264,22 @@ class CodexSettingsDomain:
         self._catalog_repair_observed_signature = None
         self._catalog_repair_observation_count = 0
 
+    @staticmethod
+    def _configured_model_names(payload: Mapping[str, Any]) -> set[str]:
+        """Names of the models configured in the runtime model list."""
+
+        names: set[str] = set()
+        models = payload.get("models", [])
+        if not isinstance(models, list):
+            return names
+        for entry in models:
+            if not isinstance(entry, Mapping):
+                continue
+            name = entry.get("model")
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+        return names
+
     def _queue_catalog_restart(
         self,
         reason: str,
@@ -269,12 +293,25 @@ class CodexSettingsDomain:
         if current_names is None:
             current_names = self._catalog_model_names(self._raw) if current_enabled else []
         signature = self._catalog_signature(current_names, enabled=current_enabled)
-        # Stability is enforced only by snapshot's external observation path.
-        # Apply and provider refresh call this method with an already-known
-        # model set and therefore must remain immediate.
+        # Endpoint-backed repairs run through the shared stability gate in
+        # ``_ensure_model_catalog_current``; explicit enable/disable actions
+        # queue their restart immediately and bypass that observation gate.
         self._reset_catalog_repair_observation()
         if not force and signature == self._catalog_acknowledged_signature:
             return False
+        if not force:
+            acknowledged = self._catalog_acknowledged_signature
+            if acknowledged is not None and acknowledged[0] == signature[0]:
+                added = set(signature[1]) - set(acknowledged[1])
+                dropped = set(acknowledged[1]) - set(signature[1])
+                configured = self._configured_model_names(self._raw)
+                # Worker views can flap a runtime-added route that is not
+                # part of the configured public model set.  Repairing the
+                # catalog file to match the live exposure is fine, but only
+                # a change that involves configured names warrants a Codex
+                # restart prompt.
+                if not (added & configured) and not (dropped & configured):
+                    return False
         if self._catalog_restart_required and signature == self._catalog_pending_signature:
             return False
         self._catalog_restart_required = True
@@ -327,12 +364,19 @@ class CodexSettingsDomain:
         return True
 
     def refresh_model_catalog(self) -> bool:
-        """Refresh the enabled catalog after LiteLLM reloads its routes."""
+        """Refresh the enabled catalog after LiteLLM reloads its routes.
+
+        Worker reloads briefly alternate between adjacent ``/v1/models``
+        views.  Use the same two-observation stability gate as the snapshot
+        path so a provider apply that did not change the exposed model set
+        cannot manufacture a Codex restart prompt from a transient partial
+        view.
+        """
 
         return self._ensure_model_catalog_current(
             notify=True,
             force_source_refresh=True,
-            require_stable_repair=False,
+            require_stable_repair=True,
         )
 
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:

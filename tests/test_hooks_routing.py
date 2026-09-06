@@ -170,6 +170,40 @@ class HookRoutingTests(HookTestCase):
             "upstream-request-body-capacity",
         )
 
+    def test_unsupported_compaction_advances_to_other_candidate_routes(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        error = hooks.CodexCompactionCapabilityUnsupportedError(
+            deployment_id="route-a",
+            route_key="provider / openai/default-chat / key=a / order=1",
+        )
+        request = {
+            "model": "default-chat",
+            "input": [{"type": "compaction_trigger", "id": "compact-now"}],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+
+        # The capability rejection belongs to the probed deployment: while
+        # another candidate deployment exists the request advances to it.
+        self.assertTrue(hooks._is_priority_deployment_failover_error(error))
+        self.assertTrue(
+            hooks._is_request_scoped_priority_deployment_failover_error(error, request)
+        )
+        hooks._sync_failed_deployment_exclusions(request, error)
+        self.assertEqual(["route-a"], request.get("_excluded_deployment_ids"))
+        # A capability failure is deterministic for this deployment, so it is
+        # never sent into cooldown accounting or the long recovery polling
+        # loop. After every candidate is excluded the caller surfaces the
+        # explicit protocol error instead.
+        self.assertEqual(hooks._recovery_policy_for_exception(error), "error")
+        self.assertFalse(hooks._should_return_route_recovery_stream(error, request))
+        self.assertEqual(
+            hooks._trace_exception(error)["reason"],
+            "codex-compaction-unsupported",
+        )
+
     def test_unknown_custom_tool_type_is_not_a_deployment_failover(self) -> None:
         hooks, _proxy_server = load_hook_module()
         error = RuntimeError("OpenAIException invalid_request_error: unknown tool type: custom")
@@ -3334,6 +3368,22 @@ class HookRoutingTests(HookTestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state["status"], "unsupported")
 
+    def test_compaction_route_classification_prefers_selected_nested_api_base(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request = self._real_compaction_request()
+        # LiteLLM can retain the prior route's top-level api_base while the
+        # selected deployment is represented in nested parameters. Capability
+        # classification must follow the selected route without mutating the
+        # client-facing top-level request.
+        request["api_base"] = "https://api.openai.com/v1"
+        request["litellm_params"] = {
+            "model": "openai/vendor-model",
+            "api_base": "https://relay.example/v1",
+        }
+        self.assertTrue(
+            hooks._request_uses_third_party_codex_compaction_route(request)
+        )
+
     def test_real_compaction_marking_guards(self) -> None:
         hooks, _proxy_server = load_hook_module()
         self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "600")
@@ -3384,6 +3434,17 @@ class HookRoutingTests(HookTestCase):
         self.assertFalse(
             hooks._mark_real_compaction_failure_capability_unsupported(
                 request, uncached_error
+            )
+        )
+        # An explicit context-size rejection remains an input-size failure,
+        # even if the gateway mentions a custom tool call in the body.
+        context_error = RuntimeError(
+            "no tool output found for custom tool call; context length exceeded"
+        )
+        context_error.status_code = 400
+        self.assertFalse(
+            hooks._mark_real_compaction_failure_capability_unsupported(
+                request, context_error
             )
         )
 

@@ -22,6 +22,7 @@ export interface NativeTableProps extends ViewProps {
   borderless?: WithDefault<boolean, false>;
   disabledRowKeys?: ReadonlyArray<string>;
   secondaryCellKeys?: ReadonlyArray<string>;
+  alertRowKeys?: ReadonlyArray<string>;
   spanningRowKeys?: ReadonlyArray<string>;
   onSelectionChange?: DirectEventHandler<SelectionChangeEvent>;
   onRowDoublePress?: DirectEventHandler<RowDoublePressEvent>;

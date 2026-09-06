@@ -465,8 +465,6 @@ export interface NativeLocalization {
   routeClaudeSettings: string;
   routeRuntimeSettings: string;
   routeDataManagement: string;
-  routeRelayAccounts: string;
-  routeRelayAdd: string;
   routeProviderWizard: string;
   routeLogs: string;
   providerAuthInstruction?: string;
@@ -551,8 +549,13 @@ export interface NativeLeafAdapter {
     origin: string;
     language: LanguagePreference;
     username?: string;
-    rememberPassword: boolean;
     embedded?: boolean;
+    /** Pending login: Core creates the account shell only after sign-in succeeds. */
+    pendingAccount?: boolean;
+    stationId?: string;
+    stationName?: string;
+    stationType?: "newapi" | "sub2api";
+    stationOrigin?: string;
   }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   cancelRelayLogin(): void;
   restoreRelaySession(options: {
@@ -583,4 +586,20 @@ export interface NativeMenuAnchor {
   y: number;
   width: number;
   height: number;
+}
+
+/**
+ * Codex model selection payload sent from Codex Settings to the Core editor.
+ *
+ * ``model``/``provider``/``deployment_id`` identify the configured LiteLLM
+ * model row. ``supports_responses_compaction`` mirrors the explicit per-model
+ * metadata opt-in (``model_info.supports_responses_compaction``) so the UI
+ * selection carries the compaction capability; the Core apply still resolves
+ * the authoritative value from the runtime configuration row.
+ */
+export interface CodexModelSelection {
+  model: string;
+  provider: string;
+  deployment_id: string;
+  supports_responses_compaction?: boolean | null;
 }

@@ -1390,6 +1390,8 @@ def _mark_real_compaction_failure_capability_unsupported(
     for marker in ("thinking_signature_invalid", "invalid_signature"):
         if marker in text:
             return False
+    if _is_context_size_error(exception):
+        return False
     if _cached_codex_compaction_capability_status(request_data) != "supported":
         return False
     _record_codex_compaction_capability(request_data, "unsupported")
@@ -1453,9 +1455,20 @@ def _request_uses_third_party_codex_compaction_route(
         or _is_codex_compaction_capability_probe(request_kwargs)
     ):
         return False
-    host = _responses_request_module._api_base_host(
-        _responses_request_module._request_api_base(request_kwargs)
+    # The generic router may leave a stale top-level api_base from the
+    # previous deployment while rebuilding callback kwargs. The selected
+    # deployment's nested parameters are the authoritative route marker for
+    # capability classification; do not copy them to the client-facing
+    # top-level request, which would create a credential/route override.
+    selected_litellm_params = request_kwargs.get("litellm_params")
+    selected_api_base = (
+        selected_litellm_params.get("api_base")
+        if isinstance(selected_litellm_params, dict)
+        else None
     )
+    if not isinstance(selected_api_base, str):
+        selected_api_base = _responses_request_module._request_api_base(request_kwargs)
+    host = _responses_request_module._api_base_host(selected_api_base)
     if host:
         return host != "api.openai.com"
     model_info = _request_context_module._request_model_info(request_kwargs)
@@ -1879,12 +1892,17 @@ async def _probe_codex_compaction_capability(request_kwargs: dict) -> str:
 
 
 async def _ensure_codex_compaction_capability(request_kwargs: Optional[dict]) -> str:
-    """Probe an unverified third-party route before sending signed history.
+    """Probe an unverified route before sending signed history.
 
-    A cached unsupported result raises before the full encrypted history is
-    forwarded. A LiteLLM model selection enables Codex's native checkpoint
-    summary path; the proxy never forges or rewrites encrypted compaction
-    items.
+    The capability check belongs to the exact target route: official OpenAI
+    hosts skip the probe, every other explicitly configured origin is probed.
+    A cached or probed ``unsupported`` result raises a per-deployment
+    capability failure so the request can advance to another candidate
+    deployment; only when every candidate rejects encrypted compaction does
+    the caller surface the explicit protocol error. New Codex tasks default
+    to the local checkpoint summary (the LiteLLM selection keeps a neutral
+    provider name unless the model explicitly opted in), and the proxy never
+    forges or rewrites encrypted compaction items.
     """
 
     if not _request_uses_third_party_codex_compaction_route(request_kwargs):
@@ -4172,6 +4190,8 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
     text = _exception_text(exception)
     if _is_image_generation_all_deployments_unsupported_error(exception):
         reason = "image-generation-tool-all-deployments-unsupported"
+    elif _is_codex_compaction_capability_unsupported_error(exception):
+        reason = "codex-compaction-unsupported"
     elif _is_no_deployments_available_error(exception):
         reason = "no-available-deployment"
     elif type(exception).__name__ == "ProxyModelNotFoundError":
@@ -4923,12 +4943,20 @@ def _is_request_scoped_priority_deployment_failover_error(
     exception: Exception,
     request_kwargs: Optional[dict],
 ) -> bool:
-    """Allow only the known compaction storage rejection to advance routes."""
-    return _is_codex_compaction_capability_unsupported_error(exception) or _is_priority_deployment_failover_error(
-        exception
-    ) or _is_structured_codex_compaction_body_capacity_error(
-        exception,
-        request_kwargs,
+    """Allow known compaction capability/storage rejections to advance routes.
+
+    A compaction capability failure belongs to the probed deployment, not to
+    the signed request: when another candidate deployment exists the request
+    must advance to it. Only after every candidate has failed does the caller
+    surface the explicit ``upstream_compaction_unsupported`` protocol error.
+    """
+    return (
+        _is_codex_compaction_capability_unsupported_error(exception)
+        or _is_priority_deployment_failover_error(exception)
+        or _is_structured_codex_compaction_body_capacity_error(
+            exception,
+            request_kwargs,
+        )
     )
 
 
@@ -5346,6 +5374,10 @@ def _sync_failed_deployment_exclusions(
 
 def _is_priority_deployment_failover_error(exception: Exception) -> bool:
     if _is_codex_compaction_capability_unsupported_error(exception):
+        # The probed deployment cannot satisfy the encrypted remote-compaction
+        # contract. That is this deployment's capability failure: advance to
+        # another candidate deployment when one exists instead of treating the
+        # whole request as a terminal client error.
         return True
     if _is_context_size_error(exception):
         return False

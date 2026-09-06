@@ -92,13 +92,19 @@ class ModelCatalogTests(unittest.TestCase):
         )
         self.assertEqual([], selected_model_names({"model": "", "review_model": None}))
 
-    def test_catalog_names_include_all_litellm_exposed_models_after_selected_models(self) -> None:
+    def test_catalog_names_include_exposed_configured_models_after_selected_models(self) -> None:
         payload = {
             "structured": {
                 "model": "active-model",
                 "review_model": "review-model",
             },
-            "models": [{"model": "configured-only"}],
+            "models": [
+                {"model": "configured-only"},
+                {"model": "active-model"},
+                {"model": "other-model"},
+                {"model": "image-model"},
+                {"model": "anthropic-model"},
+            ],
             "exposed_models": [
                 "other-model",
                 "active-model",
@@ -108,6 +114,10 @@ class ModelCatalogTests(unittest.TestCase):
             ],
         }
 
+        # The configured model list is an allowlist over the live exposure:
+        # selected names keep their position, unconfigured routes are never
+        # catalog entries, and configured-but-unexposed names are not
+        # fallbacks.
         self.assertEqual(
             [
                 "active-model",
@@ -118,9 +128,9 @@ class ModelCatalogTests(unittest.TestCase):
             catalog_names_from_editor(payload),
         )
 
-    def test_catalog_names_include_every_exposed_route(self) -> None:
+    def test_catalog_names_include_every_exposed_configured_route(self) -> None:
         self.assertEqual(
-            ["active-model", "disabled-model"],
+            ["disabled-model"],
             catalog_names_from_editor(
                 {
                     "structured": {"model": "active-model"},

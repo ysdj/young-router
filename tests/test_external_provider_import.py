@@ -212,6 +212,78 @@ class ExternalProviderImportTests(unittest.TestCase):
         )
         self.assertEqual({}, models[3]["model_info_extra"])
 
+    def test_imports_explicit_responses_compaction_opt_in_without_inference(self) -> None:
+        """Imported model_info keeps the explicit compaction opt-in.
+
+        The canonical key and the unified alias map to
+        ``supports_responses_compaction``; the provider display name and gpt
+        version never imply the capability.
+        """
+
+        directory = self.temporary_directory()
+        source = directory / "compaction-capabilities.yaml"
+        source.write_text(
+            textwrap.dedent(
+                """
+                model_list:
+                  - model_name: opted-in
+                    litellm_params:
+                      model: openai/gpt-6-astra
+                      api_base: https://relay.example.test/v1
+                      api_key: sk-relay
+                    model_info:
+                      provider: relay
+                      supports_responses_compaction: true
+                  - model_name: opted-in-alias
+                    litellm_params:
+                      model: openai/gpt-6-astra
+                      api_base: https://relay.example.test/v1
+                      api_key: sk-relay
+                    model_info:
+                      provider: relay
+                      supports_compaction: "true"
+                  - model_name: opted-out
+                    litellm_params:
+                      model: openai/gpt-6-astra
+                      api_base: https://relay.example.test/v1
+                      api_key: sk-relay
+                    model_info:
+                      provider: relay
+                      supports_responses_compaction: false
+                  - model_name: openai-named-unmarked
+                    litellm_params:
+                      model: openai/gpt-6-astra
+                      api_base: https://relay.example.test/v1
+                      api_key: sk-relay
+                    model_info:
+                      provider: relay
+                    model_providers:
+                      relay:
+                        name: OpenAI
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+
+        result = self.run_importer("--input", str(source))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        models = json.loads(result.stdout)["providers"][0]["models"]
+        by_name = {model["model_name"]: model for model in models}
+        self.assertEqual(
+            {"supports_responses_compaction": True},
+            by_name["opted-in"]["model_info_extra"],
+        )
+        self.assertEqual(
+            {"supports_responses_compaction": True},
+            by_name["opted-in-alias"]["model_info_extra"],
+        )
+        self.assertEqual(
+            {"supports_responses_compaction": False},
+            by_name["opted-out"]["model_info_extra"],
+        )
+        self.assertEqual({}, by_name["openai-named-unmarked"]["model_info_extra"])
+
     def test_rejects_yaml_alias_bomb_without_echoing_source_values(self) -> None:
         directory = self.temporary_directory()
         source = directory / "alias-bomb.yaml"

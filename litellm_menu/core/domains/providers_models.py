@@ -17,6 +17,7 @@ import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 from config_editor_core.schema import (
     MENU_PROVIDER_AUTH_KEY,
@@ -49,6 +50,34 @@ from ._shared import (
     _selected_identifier,
 )
 
+
+def _relay_site_key(value: object) -> tuple[str, str, int | None] | None:
+    """Canonical relay site identity used to compare provider and station URLs.
+
+    The comparison is host-exact: ``atlas.example`` and ``www.atlas.example``
+    are different sites.  A trailing ``/v1`` API path does not change the
+    site, so a provider base URL that differs only in that suffix is treated
+    as the same site and keeps its existing spelling.
+    """
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = f"https://{raw.lstrip('/')}"
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        scheme = parsed.scheme.lower()
+        port = parsed.port
+        if (scheme == "https" and port == 443) or (scheme == "http" and port == 80):
+            port = None
+        return (scheme, parsed.hostname.rstrip(".").lower(), port)
+    except ValueError:
+        return None
+
+
 class ProvidersModelsDomain:
     """Staged providers/models editing through ``config_editor_core``."""
 
@@ -73,6 +102,13 @@ class ProvidersModelsDomain:
         "hasWebSearchTool": "supports_web_search",
         "hasWebSearch": "supports_web_search",
         "webSearch": "supports_web_search",
+    }
+    # Explicit per-model opt-in for encrypted remote Responses compaction. A
+    # unified alias maps onto the canonical field; nothing may infer this
+    # capability from a provider name, model name, or gpt version.
+    _RESPONSES_COMPACTION_CAPABILITY_ALIASES = {
+        "supports_responses_compaction": "supports_responses_compaction",
+        "supports_compaction": "supports_responses_compaction",
     }
     _WEB_SEARCH_CAPABILITY_CONTAINERS = (
         "capabilities",
@@ -113,6 +149,7 @@ class ProvidersModelsDomain:
         self._exists = False
         self._provider_editor_ids: dict[int, str] = {}
         self._model_editor_ids: dict[int, str] = {}
+        self._cosmetic_binding = False
         self.revision = 0
         self.reload()
 
@@ -731,6 +768,44 @@ class ProvidersModelsDomain:
         return None
 
     @classmethod
+    def _model_responses_compaction_capabilities(
+        cls,
+        item: Mapping[str, Any],
+    ) -> dict[str, bool]:
+        """Extract the explicit per-model compaction opt-in.
+
+        Reads only declared boolean keys (canonical first, then the unified
+        alias) from the record or its capability containers. Absence means
+        "unknown", never "supported".
+        """
+
+        capabilities: dict[str, bool] = {}
+        visited: set[int] = set()
+
+        def visit(container: object, depth: int = 0) -> None:
+            if not isinstance(container, Mapping) or depth > 2 or id(container) in visited:
+                return
+            visited.add(id(container))
+            for key in cls._RESPONSES_COMPACTION_CAPABILITY_ALIASES:
+                if key not in container:
+                    continue
+                parsed = cls._explicit_boolean(container.get(key))
+                if parsed is not None:
+                    capabilities.setdefault(
+                        cls._RESPONSES_COMPACTION_CAPABILITY_ALIASES[key],
+                        parsed,
+                    )
+            if depth >= 2:
+                return
+            for key in cls._WEB_SEARCH_CAPABILITY_CONTAINERS:
+                nested = container.get(key)
+                if isinstance(nested, Mapping):
+                    visit(nested, depth + 1)
+
+        visit(item)
+        return capabilities
+
+    @classmethod
     def _model_web_search_capabilities(
         cls,
         item: Mapping[str, Any],
@@ -800,7 +875,10 @@ class ProvidersModelsDomain:
             if not candidate or len(candidate) > 256 or any(ord(char) < 32 for char in candidate):
                 continue
             metadata = (
-                cls._model_web_search_capabilities(item)
+                {
+                    **cls._model_web_search_capabilities(item),
+                    **cls._model_responses_compaction_capabilities(item),
+                }
                 if isinstance(item, Mapping)
                 else {}
             )
@@ -1849,9 +1927,19 @@ class ProvidersModelsDomain:
         providers[provider_index] = provider
 
     def _select_provider_relay_station(self, data: Mapping[str, Any]) -> None:
-        """Atomically bind a provider's URL and name to one relay station."""
+        """Atomically bind a provider's URL and name to one relay station.
+
+        A provider whose name and base URL already target the station is
+        rebound without touching either of them: its existing ``/v1``
+        spelling is kept, re-selecting the same station is a true no-op, and
+        a binding that changes only the hidden source metadata is flagged as
+        cosmetic so Core keeps the draft clean.  A window closing after such
+        a binding must not ask the user to discard changes that never altered
+        anything visible.
+        """
 
         raw_source = data.get("source")
+        self._cosmetic_binding = False
         if not isinstance(raw_source, Mapping):
             raise DomainError("Relay station is unavailable")
         station_id = str(raw_source.get("station_id", "")).strip()
@@ -1866,8 +1954,35 @@ class ProvidersModelsDomain:
             providers, station_name, exclude_index=provider_index
         ):
             raise DomainError("A provider with this name already exists")
+        original = providers[provider_index]
+        current_source = self._provider_source_state(provider)
+        current_name = str(original.get("name", "")).strip()
+        current_base = str(
+            original.get("api_base", "") or original.get("endpoint", "")
+        ).strip()
+        current_site = _relay_site_key(current_base)
+        same_site = bool(
+            current_site is not None and current_site == _relay_site_key(station_origin)
+        )
+        if (
+            current_source.get("kind") == "relay"
+            and current_source.get("station_id") == station_id
+            and same_site
+            and current_name.casefold() == station_name.casefold()
+        ):
+            # Already bound to this station with the same name and site:
+            # nothing changes, so do not dirty the draft.
+            return
         provider["name"] = station_name
-        provider["api_base"] = station_origin
+        # Keep the provider's existing API base when it already targets the
+        # same relay site.  Station origins omit a trailing /v1 API path;
+        # overwriting the provider URL with the bare origin would silently
+        # move every linked model off the /v1 endpoint.
+        provider["api_base"] = current_base if same_site else station_origin
+        self._cosmetic_binding = (
+            str(provider["name"]) == current_name
+            and str(provider["api_base"]) == current_base
+        )
         previous_auth = self._provider_auth_state(provider)
         if previous_auth["kind"] != "api_key":
             try:
@@ -2159,9 +2274,12 @@ class ProvidersModelsDomain:
             value = data.get("provider", data.get("value", data))
             provider = _copy_mapping(value, "provider")
             create_default_api_key = provider.pop("create_default_api_key", False) is True
+            initial_api_key_name = str(provider.pop("initial_api_key_name", "")).strip()
             # UI-created providers may request a safe key slot before their
             # first native-secret edit. The intent marker is consumed here;
-            # React never constructs or transports a credential value.
+            # React never constructs or transports a credential value.  The
+            # slot name defaults to a caller-supplied word so the UI can
+            # pre-fill an editable key name that is never the bare "default".
             requested_auth_kind = str(provider.get("auth_kind", "api_key")).strip() or "api_key"
             if "auth_kind" not in provider and requested_auth_kind == "api_key":
                 try:
@@ -2173,7 +2291,7 @@ class ProvidersModelsDomain:
                     "Account login is managed in Service Provider Management"
                 )
             if create_default_api_key and requested_auth_kind == "api_key" and "api_keys" not in provider:
-                provider["api_keys"] = [{"name": "default", "value": ""}]
+                provider["api_keys"] = [{"name": initial_api_key_name or "default", "value": ""}]
             if "api_keys" in provider and requested_auth_kind == "api_key":
                 self._sync_primary_api_key(provider, self._provider_api_keys(provider))
             source = self._provider_source_state(provider)
@@ -2454,6 +2572,25 @@ class ProvidersModelsDomain:
             normalized_extra.update(web_search_capabilities)
             model["model_info_extra"] = normalized_extra
             for capability_key in self._WEB_SEARCH_CAPABILITY_ALIASES:
+                model.pop(capability_key, None)
+        # The same normalization applies to the explicit per-model remote
+        # Responses compaction opt-in, whose canonical key the Codex Settings
+        # selection reads from the runtime ``model_info`` table.
+        responses_compaction_capabilities = (
+            self._model_responses_compaction_capabilities(model)
+        )
+        if responses_compaction_capabilities:
+            model_info_extra = model.get("model_info_extra")
+            normalized_extra = (
+                copy.deepcopy(dict(model_info_extra))
+                if isinstance(model_info_extra, Mapping)
+                else {}
+            )
+            for capability_key in self._RESPONSES_COMPACTION_CAPABILITY_ALIASES:
+                normalized_extra.pop(capability_key, None)
+            normalized_extra.update(responses_compaction_capabilities)
+            model["model_info_extra"] = normalized_extra
+            for capability_key in self._RESPONSES_COMPACTION_CAPABILITY_ALIASES:
                 model.pop(capability_key, None)
         if "name" in model and "model_name" not in model:
             model["model_name"] = model.pop("name")

@@ -391,7 +391,13 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     std::optional<std::string> const& cookie,
     std::optional<std::string> const& access_token,
     std::optional<std::string> const& refresh_token,
-    std::optional<std::string> const& password) {
+    std::optional<std::string> const& password,
+    std::optional<std::string> const& station_id,
+    std::optional<std::string> const& station_name,
+    std::optional<std::string> const& station_type,
+    std::optional<std::string> const& station_origin,
+    bool remember_password,
+    bool pending_account) {
   if (account_id.empty() || account_id.size() > 96 ||
       (account_type != "newapi" && account_type != "sub2api") ||
       label.empty() || label.size() > 160 || origin.empty() || origin.size() > 2048 ||
@@ -421,6 +427,24 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     }
     if (password && !password->empty()) {
       payload.SetNamedValue(L"password", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*password)));
+    }
+    if (station_id && !station_id->empty()) {
+      payload.SetNamedValue(L"station_id", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*station_id)));
+    }
+    if (station_name && !station_name->empty()) {
+      payload.SetNamedValue(L"station_name", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*station_name)));
+    }
+    if (station_type && !station_type->empty()) {
+      payload.SetNamedValue(L"station_type", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*station_type)));
+    }
+    if (station_origin && !station_origin->empty()) {
+      payload.SetNamedValue(L"station_origin", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*station_origin)));
+    }
+    if (remember_password) {
+      payload.SetNamedValue(L"remember_password", winrt::Windows::Data::Json::JsonValue::CreateBoolean(true));
+    }
+    if (pending_account) {
+      payload.SetNamedValue(L"pending_account", winrt::Windows::Data::Json::JsonValue::CreateBoolean(true));
     }
     auto body = WideToUtf8(payload.Stringify().c_str());
     if (body.size() > 96 * 1024) return std::nullopt;
