@@ -541,6 +541,83 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertTrue(relay.secret_present("session", account["id"]))
             self.assertFalse(providers.snapshot()["providers"])
 
+    def test_core_pending_login_creates_account_without_reserving_cancelled_slot(self) -> None:
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/user/models": {"success": True, "data": []},
+                "/api/token/?p=1&size=100": {
+                    "success": True,
+                    "data": {"items": [{"id": 7, "status": 1}]},
+                },
+                "/api/token/7/key": {"success": True, "data": {"key": "replace-relay-key"}},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=fake)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, providers],
+            )
+
+            # A cancelled pending flow never reaches Core, so no slot exists.
+            self.assertEqual([], relay.snapshot()["accounts"])
+
+            result = core.accept_relay_login(
+                account_id="pending0123456789abcdef0123456789ab",
+                account_type="newapi",
+                label="https://relay.example.test",
+                origin="https://relay.example.test",
+                username="sample-user",
+                cookie="session=replace-cookie",
+                access_token="replace-dashboard-token",
+                station_name="Relay",
+                station_type="newapi",
+                remember_password=True,
+                pending_account=True,
+            )
+
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertEqual("sample-user", result["username"])
+            snapshot = core.snapshot()
+            accounts = snapshot["domains"]["relay_accounts"]["accounts"]
+            self.assertEqual(1, len(accounts))
+            account = accounts[0]
+            self.assertEqual("pending0123456789abcdef0123456789ab", account["id"])
+            self.assertEqual("signed_in", account["login_status"])
+            self.assertEqual("sample-user", account["username"])
+            self.assertTrue(account["remember_password"])
+            stations = snapshot["domains"]["relay_accounts"]["stations"]
+            self.assertEqual(1, len(stations))
+            self.assertEqual(stations[0]["id"], account["station_id"])
+            self.assertTrue(relay.secret_present("session", account["id"]))
+            persisted_json = "\n".join(path.read_text() for path in root.rglob("*.json"))
+            for secret in ("replace-cookie", "replace-dashboard-token", "replace-relay-key"):
+                self.assertNotIn(secret, persisted_json)
+
+    def test_core_login_accept_without_pending_flag_still_rejects_unknown_account(self) -> None:
+        fake = FakeRelayHTTPClient({})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=fake)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, providers],
+            )
+            with self.assertRaises(CoreError):
+                core.accept_relay_login(
+                    account_id="unknown0123456789abcdef0123456789ab",
+                    account_type="newapi",
+                    label="https://relay.example.test",
+                    origin="https://relay.example.test",
+                    username="sample-user",
+                    cookie="session=replace-cookie",
+                    pending_account=False,
+                )
+            self.assertEqual([], core.snapshot()["domains"]["relay_accounts"]["accounts"])
+
     def test_resource_refresh_is_explicit_and_revision_checked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -562,6 +639,73 @@ class RelayAccountsDomainTests(unittest.TestCase):
             with self.assertRaises(CoreError) as raised:
                 core.refresh_relay_resources(account["id"], revision=core.revision - 1)
             self.assertEqual("revision_conflict", raised.exception.code)
+
+    def test_accept_login_result_applies_the_post_login_remember_choice(self) -> None:
+        """The host prompt's tri-state decision flows into the stored flags."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root)
+            remembered = domain.dispatch(
+                "account.add",
+                {
+                    "type": "newapi",
+                    "label": "Relay One",
+                    "origin": "https://relay.example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]
+            domain.accept_login_result(
+                remembered["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                access_token="replace-access-token",
+                password="replace-password",
+            )
+
+            # "仅记住登录态": retire the saved password and persisted session.
+            session_only = domain.accept_login_result(
+                remembered["id"],
+                username="sample-user",
+                cookie="session=replaced-session-cookie",
+                remember_password=False,
+            )
+            self.assertEqual("signed_in", session_only["login_status"])
+            self.assertFalse(session_only["remember_password"])
+            self.assertFalse(session_only["password_saved"])
+
+            # "记住密码": adopt saving later, on an account that never saved.
+            sessionless = domain.dispatch(
+                "account.add",
+                {
+                    "type": "newapi",
+                    "label": "Relay Two",
+                    "origin": "https://relay.example.test",
+                },
+            )["accounts"][0]
+            domain.accept_login_result(
+                sessionless["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=True,
+            )
+            updated = domain.accept_login_result(
+                sessionless["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                password="replace-password",
+            )
+            self.assertTrue(updated["remember_password"])
+            self.assertTrue(updated["password_saved"])
+
+            # Absent decision: an existing preference stands.
+            untouched = domain.accept_login_result(
+                sessionless["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+            )
+            self.assertTrue(untouched["remember_password"])
+            self.assertTrue(untouched["password_saved"])
 
     def test_account_snapshot_redacts_remembered_credentials_while_private_file_retains_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -696,6 +840,48 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertEqual([], confirmed["pending_credential_cleanups"])
             self.assertEqual([], RelayAccountsDomain(root).snapshot()["pending_credential_cleanups"])
+
+    def test_removing_a_draft_only_account_cancels_out_to_a_clean_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(Path(directory))
+            core = CoreStore(domains=[domain])
+
+            def relay_dirty() -> bool:
+                return core.snapshot()["drafts"]["relay_accounts"]["dirty"]
+
+            self.assertFalse(relay_dirty())
+            account = core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.add",
+                    "payload": {"type": "newapi", "label": "Relay Draft", "origin": "https://relay.example.test"},
+                }
+            )
+            self.assertTrue(relay_dirty())
+            account_id = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["id"]
+            core.dispatch({"domain": "relay_accounts", "type": "account.delete", "payload": {"id": account_id}})
+            # The add was undone before Apply, so the draft must be clean again:
+            # closing the relay window must not ask to discard changes that
+            # never effectively existed.
+            self.assertFalse(relay_dirty())
+            snapshot = core.snapshot()["domains"]["relay_accounts"]
+            self.assertEqual([], snapshot["accounts"])
+            self.assertEqual([], snapshot["stations"])
+
+            # A persisted account is still a real deletion and must stage.
+            applied = core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.add",
+                    "payload": {"type": "newapi", "label": "Relay Kept", "origin": "https://relay.example.test"},
+                }
+            )
+            kept_id = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["id"]
+            core.apply("relay_accounts", revision=core.revision)
+            self.assertFalse(relay_dirty())
+            core.dispatch({"domain": "relay_accounts", "type": "account.delete", "payload": {"id": kept_id}})
+            self.assertTrue(relay_dirty())
+            self.assertEqual([], domain.snapshot()["accounts"])
 
     def test_disabling_password_remember_clears_the_private_file_on_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

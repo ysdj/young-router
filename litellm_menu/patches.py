@@ -1101,6 +1101,18 @@ def _install_generic_deployment_failover_patch() -> None:
                 )
                 return response
             except Exception as exc:
+                # LiteLLM's generic helper catches the upstream 400 after its
+                # callback has already returned.  Classify the exact
+                # structured-compaction capability failure before any retry,
+                # cooldown, peer selection, or route-recovery decision.  The
+                # selected-deployment marker may be the only source of the
+                # route's api_base/model_info after the callback rebuilt its
+                # kwargs, so restore it first.
+                _routing_module._apply_current_selected_deployment_to_request(kwargs)
+                _routing_module._mark_real_compaction_failure_capability_unsupported(
+                    kwargs,
+                    exc,
+                )
                 _routing_module._mark_no_deployments_for_order_exhaustion(exc, kwargs)
                 browser_retry_kwargs = None
                 if _routing_module._should_retry_with_browser_compatible_headers(exc, kwargs):

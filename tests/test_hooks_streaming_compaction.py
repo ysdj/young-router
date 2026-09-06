@@ -175,6 +175,7 @@ class HookStreamingCompactionTests(HookTestCase):
         for status_code, error_code in (
             (500, "upstream_compaction_failure"),
             (400, "upstream_route_failure"),
+            (404, "upstream_compaction_failure"),
         ):
             stream_event = {
                 "type": "response.failed",
@@ -389,6 +390,296 @@ class HookStreamingCompactionTests(HookTestCase):
             chunks[-1]["response"]["output"][0]["encrypted_content"],
             "encrypted-recovered-summary",
         )
+
+    async def test_unsupported_compaction_stream_advances_to_next_route(self) -> None:
+        """A capability-unsupported deployment advances the compaction request.
+
+        The first route cannot satisfy the encrypted remote-compaction
+        contract; when another candidate deployment exists the request is
+        replayed there instead of terminating the whole request. The signed
+        history never reaches the unsupported route, and the fallback payload
+        excludes it.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        async def unsupported_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-unsupported-a", "status": "in_progress", "output": []},
+            }
+            raise hooks.CodexCompactionCapabilityUnsupportedError(
+                deployment_id="compaction-route-a",
+                route_key="provider / openai/default-chat / key=a / order=1",
+            )
+
+        async def recovered_stream():
+            compaction_item = {
+                "id": "cmp-recovered",
+                "type": "compaction",
+                "encrypted_content": "encrypted-recovered-summary",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-recovered",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(copy.deepcopy(payload))
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-compaction-unsupported-fallback",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "model_info": {
+                "id": "compaction-route-a",
+                "provider": "compat_provider",
+                "route_key": "provider / openai/default-chat / key=a / order=1",
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=unsupported_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        # One native Responses fallback round targeted the next candidate; the
+        # failed route is excluded from it.
+        self.assertEqual(len(calls), 1)
+        self.assertIn(
+            "compaction-route-a",
+            calls[0].get("_excluded_deployment_ids", []),
+        )
+        self.assertNotIn("use_chat_completions_api", calls[0])
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0]["encrypted_content"],
+            "encrypted-recovered-summary",
+        )
+
+    async def test_midstream_compaction_400_is_marked_before_fallback(self) -> None:
+        """A 400 raised while consuming the iterator must fail over cleanly."""
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "600")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+        self.addCleanup(hooks._DEPLOYMENT_COOLDOWNS.clear)
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "api_base": "https://relay-a.example/v1",
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"request_kind\":\"compaction\"}",
+            },
+            "model_info": {
+                "id": "compaction-route-a",
+                "order": 1,
+                "route_key": "provider-a / openai/default-chat / key=a / order=1",
+            },
+        }
+        cache_key = hooks._codex_compaction_capability_cache_key(request_data)
+        now = time.time()
+        with hooks._CODEX_COMPACTION_CAPABILITY_LOCK:
+            hooks._CODEX_COMPACTION_CAPABILITIES[cache_key] = {
+                "status": "supported",
+                "deployment_id": "compaction-route-a",
+                "route_key": request_data["model_info"]["route_key"],
+                "detected_at": now,
+                "expires_at": now + 600,
+            }
+
+        async def failed_after_headers():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-route-a", "status": "in_progress"},
+            }
+            error = RuntimeError(
+                "OpenAIException - no tool output found for custom tool call call_exec"
+            )
+            error.status_code = 400
+            error.body = {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "no tool output found for custom tool call call_exec",
+                }
+            }
+            raise error
+
+        async def recovered_stream():
+            compaction_item = {
+                "id": "cmp-route-b",
+                "type": "compaction",
+                "encrypted_content": "encrypted-route-b",
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": compaction_item,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-route-b",
+                    "status": "completed",
+                    "output": [compaction_item],
+                },
+            }
+
+        calls = []
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(copy.deepcopy(payload))
+                return recovered_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=failed_after_headers(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("compaction-route-a", calls[0]["_excluded_deployment_ids"])
+        self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertEqual(
+            chunks[-1]["response"]["output"][0]["encrypted_content"],
+            "encrypted-route-b",
+        )
+        self.assertEqual(
+            hooks._cached_codex_compaction_capability_status(request_data),
+            "unsupported",
+        )
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_unsupported_compaction_all_routes_unsupported_returns_explicit_protocol_error(self) -> None:
+        """Every candidate unsupported yields the explicit protocol error.
+
+        After the capability-unsupported route advanced to the next candidate
+        and that candidate also rejected encrypted compaction, the pipeline
+        returns the explicit ``upstream_compaction_unsupported`` protocol
+        error. It never fabricates an encrypted compaction item, never turns
+        the signed history into a local plaintext summary, and never starts a
+        long recovery poll for a deterministic capability failure.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        calls = []
+        unsupported_errors = [
+            hooks.CodexCompactionCapabilityUnsupportedError(
+                deployment_id="compaction-route-a",
+                route_key="provider / openai/default-chat / key=a / order=1",
+            ),
+            hooks.CodexCompactionCapabilityUnsupportedError(
+                deployment_id="compaction-route-b",
+                route_key="provider / openai/default-chat / key=b / order=1",
+            ),
+        ]
+
+        async def unsupported_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-unsupported-a", "status": "in_progress", "output": []},
+            }
+            raise unsupported_errors[0]
+
+        async def second_unsupported_stream():
+            yield {
+                "type": "response.created",
+                "response": {"id": "resp-unsupported-b", "status": "in_progress", "output": []},
+            }
+            raise unsupported_errors[1]
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(copy.deepcopy(payload))
+                return second_unsupported_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "thread_id": "thread-compaction-all-unsupported",
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+            "model_info": {
+                "id": "compaction-route-a",
+                "provider": "compat_provider",
+                "route_key": "provider / openai/default-chat / key=a / order=1",
+            },
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=unsupported_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        # Exactly one fallback round: the second candidate rejected compaction
+        # too, and a deterministic capability failure never enters the long
+        # route recovery polling loop.
+        self.assertEqual(len(calls), 1)
+        self.assertIn(
+            "compaction-route-a",
+            calls[0].get("_excluded_deployment_ids", []),
+        )
+        terminal = chunks[-1]
+        self.assertEqual(terminal["type"], "response.failed")
+        self.assertEqual(
+            terminal["response"]["error"]["code"],
+            "upstream_compaction_unsupported",
+        )
+        self.assertEqual(
+            terminal["response"]["error"]["type"],
+            "invalid_request_error",
+        )
+        # The explicit protocol error never fabricates encrypted content and
+        # never claims the gateway converted the request into a local summary:
+        # it rejects the encrypted compaction on the route and points Codex at
+        # its own checkpoint-summary fallback for a new attempt.
+        self.assertNotIn("encrypted-", json.dumps(chunks))
+        self.assertEqual(terminal["response"]["output"], [])
+        self.assertNotIn("converted", terminal["response"]["error"]["message"].lower())
 
     async def test_structured_compaction_recovery_poll_hops_remaining_routes_until_exhausted(self) -> None:
         hooks, proxy_server = load_hook_module()

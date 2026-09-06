@@ -87,9 +87,19 @@ def _safe_scalar(value: object, limit: int = 160) -> object:
 
 
 def _public_model_from_route_key(value: object) -> str:
+    """Extract the full ``model=`` value up to the next route-key part.
+
+    Route keys join parts with `` / ``.  A model value such as
+    ``openai/gpt-5.6-sol`` legitimately contains slashes, so capture up to
+    the next `` / name=`` separator instead of stopping at the first ``/``
+    (which truncated prefixed models to a bare ``openai``).
+    """
+
     if not isinstance(value, str):
         return ""
-    match = re.search(r"(?:^|/)\s*model\s*=\s*([^/]+?)\s*(?=/|$)", value)
+    match = re.search(
+        r"(?:^|/)\s*model\s*=\s*(.*?)\s*(?=/\s*[A-Za-z_]+\s*=|$)", value
+    )
     return match.group(1).strip() if match else ""
 
 
@@ -509,8 +519,11 @@ def _safe_recovery_record(
     route_public_model = _public_model_from_route_key(route_key)
     route_upstream_model = _route_key_value(route_key, "upstream")
     public_model = (
-        route_public_model
-        or configured.get("public_model", "")
+        # The configured public model is authoritative for a known
+        # deployment.  Route keys can carry a prefixed litellm model
+        # (``openai/gpt-5.6-sol``) whose bare form is the public name.
+        configured.get("public_model", "")
+        or route_public_model
         or _string_record_value(raw.get("public_model"))
         or _string_record_value(raw.get("model_group"))
         or _string_record_value(request.get("public_model"))
@@ -625,7 +638,7 @@ def _safe_route_identity(
     result = {
         "deployment_id": _safe_scalar(deployment_text),
         "public_model": _safe_scalar(
-            route_public_model or _string_record_value(public_model) or configured_public_model
+            configured_public_model or route_public_model or _string_record_value(public_model)
         ),
         "upstream_model": _safe_scalar(
             _upstream_model_name(_route_key_value(route_key, "upstream") or upstream_model)
@@ -720,7 +733,12 @@ def _safe_route_trace_record(
         and deployment_id.strip()
         else None
     )
-    if configured_public_model and not route_public_model:
+    if configured_public_model and (
+        not route_public_model
+        or _matches_upstream_model(
+            route_public_model, _route_key_value(route_key, "upstream")
+        )
+    ):
         public_model = configured_public_model
     upstream_model = _upstream_model_name(
         _route_key_value(route_key, "upstream")
@@ -880,11 +898,21 @@ def _safe_request_record(
         result["public_model"] = _safe_scalar(configured_public_model)
     usage = raw.get("usage")
     if isinstance(usage, Mapping):
-        result["usage"] = {
-            key: value
-            for key in ("input_tokens", "output_tokens", "total_tokens")
-            if isinstance((value := usage.get(key)), (int, float)) and not isinstance(value, bool)
-        }
+        # Relays report either input/output or prompt/completion pairs.  Keep
+        # both spellings under one canonical pair so the UI can always show
+        # sent/received tokens.
+        projected_usage: dict[str, Any] = {}
+        for raw_key, projected_key in (
+            ("input_tokens", "input_tokens"),
+            ("prompt_tokens", "input_tokens"),
+            ("output_tokens", "output_tokens"),
+            ("completion_tokens", "output_tokens"),
+            ("total_tokens", "total_tokens"),
+        ):
+            value = usage.get(raw_key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                projected_usage[projected_key] = value
+        result["usage"] = projected_usage
     error = raw.get("error")
     if isinstance(error, Mapping):
         projected_error = {

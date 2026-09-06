@@ -754,6 +754,32 @@ std::map<std::string, std::string> ParseCookieHeader(std::string const& header) 
   return result;
 }
 
+// Subordinate post-login prompt: keep the typed password on this device, or
+// keep only the current login state. Shown once the sign-in was verified and
+// the commit has begun, so a closed window simply answers "session only".
+winrt::Windows::Foundation::IAsyncOperation<bool> ShowRememberPasswordPrompt(
+    std::shared_ptr<LoginState> const& state) {
+  controls::ContentDialog prompt;
+  prompt.Title(winrt::box_value(winrt::hstring(Text(state->options, L"Remember the password?", L"是否记住密码？"))));
+  prompt.Content(winrt::box_value(winrt::hstring(Text(state->options,
+      L"Save the password on this device to enable automatic sign-in next time. Choose “Session only” to keep just the current sign-in state.",
+      L"密码将保存到本机，下次可自动登录。选择「仅记住登录态」则只保留本次登录状态。"))));
+  prompt.PrimaryButtonText(Text(state->options, L"Remember Password", L"记住密码"));
+  prompt.SecondaryButtonText(Text(state->options, L"Session Only", L"仅记住登录态"));
+  prompt.DefaultButton(controls::ContentDialogButton::Primary);
+  try {
+    prompt.XamlRoot(state->dialog.Content().XamlRoot());
+  } catch (...) {
+    co_return false;
+  }
+  try {
+    auto result = co_await prompt.ShowAsync();
+    co_return result == controls::ContentDialogResult::Primary;
+  } catch (...) {
+    co_return false;
+  }
+}
+
 winrt::fire_and_forget ProbeLogin(
     std::shared_ptr<LoginState> state,
     std::shared_ptr<RelayLoginAttempt> attempt) {
@@ -774,9 +800,7 @@ winrt::fire_and_forget ProbeLogin(
       try { const user = JSON.parse(localStorage.getItem('user') || 'null'); userToken = typeof user?.token === 'string' ? user.token : ''; } catch {}
       const access = (localStorage.getItem('auth_token') || localStorage.getItem('access_token') || userToken).slice(0,32768);
       const refresh = (localStorage.getItem('refresh_token') || '').slice(0,32768);
-      const password = )JS" + std::wstring(state->options.remember_password
-          ? L"(document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || '').slice(0,4096)"
-          : L"''") + LR"JS(;
+      const password = (document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || '').slice(0,4096);
       return JSON.stringify({password,accessToken:access,refreshToken:refresh});
     })())JS";
     auto raw_result = co_await state->webview.ExecuteScriptAsync(script);
@@ -787,7 +811,7 @@ winrt::fire_and_forget ProbeLogin(
     auto access_token = JsonString(probe, L"accessToken");
     auto refresh_token = JsonString(probe, L"refreshToken");
     auto password = JsonString(probe, L"password");
-    if (state->options.remember_password && !password) password = state->captured_password;
+    if (!password) password = state->captured_password;
 
     auto cookies = co_await state->webview.CoreWebView2().CookieManager().GetCookiesAsync(Utf8ToWide(state->options.origin));
     if (state->canceled.load() || state->finished.load() || !attempt->IsPending()) co_return;
@@ -823,13 +847,22 @@ winrt::fire_and_forget ProbeLogin(
       state->cancel.IsEnabled(false);
       state->status.Text(Text(state->options, L"Saving sign-in...", L"正在保存登录..."));
     });
+    // Decide what the verified sign-in may keep. A freshly typed password
+    // asks in the subordinate post-login prompt; a password auto-filled from
+    // the saved store keeps remembering silently.
+    bool remember_password = false;
+    if (password && !password->empty() && password != state->restored_password) {
+      co_await winrt::resume_foreground(dispatcher);
+      if (state->canceled.load()) co_return;
+      remember_password = co_await ShowRememberPasswordPrompt(state);
+      if (state->canceled.load()) co_return;
+      co_await winrt::resume_background();
+    }
     auto prior_session = ReadChunkedCredential(state->options.account_id, L"session");
-    auto prior_password = state->options.remember_password
-        ? ReadChunkedCredential(state->options.account_id, L"password")
-        : std::nullopt;
+    auto prior_password = ReadChunkedCredential(state->options.account_id, L"password");
     bool credentials_saved = WriteChunkedCredential(state->options.account_id, L"session", session_text);
     if (credentials_saved) {
-      if (state->options.remember_password && password && !password->empty()) {
+      if (remember_password && password && !password->empty()) {
         credentials_saved = WriteChunkedCredential(state->options.account_id, L"password", EncodePassword(state->options, *password));
       } else {
         credentials_saved = ClearChunkedCredential(state->options.account_id, L"password");
@@ -837,9 +870,7 @@ winrt::fire_and_forget ProbeLogin(
     }
     if (!credentials_saved) {
       WriteChunkedCredential(state->options.account_id, L"session", prior_session);
-      if (state->options.remember_password) {
-        WriteChunkedCredential(state->options.account_id, L"password", prior_password);
-      }
+      WriteChunkedCredential(state->options.account_id, L"password", prior_password);
     }
     // AcceptRelayLogin is transactional in Core: a missing response is a
     // definitive failed import, so restore the native side to the same prior
@@ -849,14 +880,15 @@ winrt::fire_and_forget ProbeLogin(
         state->options.origin, verified->username,
         verified->cookie.empty() ? std::nullopt : std::optional<std::string>(verified->cookie),
         verified->access_token, verified->refresh_token,
-        state->options.remember_password ? password : std::nullopt) : std::nullopt;
+        remember_password ? password : std::nullopt,
+        state->options.station_id, state->options.station_name,
+        state->options.station_type, state->options.station_origin,
+        remember_password, state->options.pending_account) : std::nullopt;
     // Once Core accepted the login, preserve the matching native credentials
     // even if the user closed the dialog while that synchronous IPC call ran.
     if (credentials_saved && !accepted) {
       WriteChunkedCredential(state->options.account_id, L"session", prior_session);
-      if (state->options.remember_password) {
-        WriteChunkedCredential(state->options.account_id, L"password", prior_password);
-      }
+      WriteChunkedCredential(state->options.account_id, L"password", prior_password);
     }
     auto completed_result = accepted
         ? std::optional<WindowsRelayLoginResult>(WindowsRelayLoginResult{accepted->revision, accepted->username})
@@ -964,28 +996,28 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
     core.Settings().IsPasswordAutosaveEnabled(false);
     core.NewWindowRequested([](auto const&, web::CoreWebView2NewWindowRequestedEventArgs const& args) { args.Handled(true); });
     co_await core.AddScriptToExecuteOnDocumentCreatedAsync(kImmediateWebPresentationScript);
-    if (state->options.remember_password) {
-      core.WebMessageReceived([weak = std::weak_ptr<LoginState>(state)](auto const&, web::CoreWebView2WebMessageReceivedEventArgs const& args) {
-        auto current = weak.lock();
-        if (!current || current->canceled.load()) return;
-        try {
-          winrt::Windows::Foundation::Uri source(args.Source());
-          if (!SameOrigin(source, current->origin.uri)) return;
-          auto message = WideToUtf8(args.TryGetWebMessageAsString().c_str());
-          constexpr char prefix[] = "relay-password:";
-          if (message.rfind(prefix, 0) == 0) {
-            auto value = message.substr(sizeof(prefix) - 1);
-            if (!value.empty() && value.size() <= kMaxPasswordBytes) current->captured_password = std::move(value);
-          }
-        } catch {}
-      });
-      co_await core.AddScriptToExecuteOnDocumentCreatedAsync(LR"JS((() => {
-        const capture = (node) => { const value=node?.value; if (typeof value==='string' && value.length) chrome.webview.postMessage(`relay-password:${value.slice(0,4096)}`); };
-        document.addEventListener('input', e => { if (e.target?.matches?.('input[type=password],input[autocomplete=current-password]')) capture(e.target); }, true);
-        document.addEventListener('change', e => { if (e.target?.matches?.('input[type=password],input[autocomplete=current-password]')) capture(e.target); }, true);
-        document.addEventListener('submit', e => capture(e.target?.querySelector?.('input[type=password],input[autocomplete=current-password]')), true);
-      })())JS");
-    }
+    // The capture always runs so the post-login prompt can offer to keep the
+    // typed password; whether it is persisted is decided after sign-in.
+    core.WebMessageReceived([weak = std::weak_ptr<LoginState>(state)](auto const&, web::CoreWebView2WebMessageReceivedEventArgs const& args) {
+      auto current = weak.lock();
+      if (!current || current->canceled.load()) return;
+      try {
+        winrt::Windows::Foundation::Uri source(args.Source());
+        if (!SameOrigin(source, current->origin.uri)) return;
+        auto message = WideToUtf8(args.TryGetWebMessageAsString().c_str());
+        constexpr char prefix[] = "relay-password:";
+        if (message.rfind(prefix, 0) == 0) {
+          auto value = message.substr(sizeof(prefix) - 1);
+          if (!value.empty() && value.size() <= kMaxPasswordBytes) current->captured_password = std::move(value);
+        }
+      } catch {}
+    });
+    co_await core.AddScriptToExecuteOnDocumentCreatedAsync(LR"JS((() => {
+      const capture = (node) => { const value=node?.value; if (typeof value==='string' && value.length) chrome.webview.postMessage(`relay-password:${value.slice(0,4096)}`); };
+      document.addEventListener('input', e => { if (e.target?.matches?.('input[type=password],input[autocomplete=current-password]')) capture(e.target); }, true);
+      document.addEventListener('change', e => { if (e.target?.matches?.('input[type=password],input[autocomplete=current-password]')) capture(e.target); }, true);
+      document.addEventListener('submit', e => capture(e.target?.querySelector?.('input[type=password],input[autocomplete=current-password]')), true);
+    })())JS");
 
     if (state->restored_session) {
       auto manager = core.CookieManager();
@@ -1026,11 +1058,7 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
   state->options.origin = origin->value;
   state->origin = *origin;
   state->restored_session = ReadSession(state->options);
-  if (state->options.remember_password) {
-    state->restored_password = ReadPassword(state->options);
-  } else {
-    ClearWindowsRelayPassword(state->options.account_id);
-  }
+  state->restored_password = ReadPassword(state->options);
 
   xaml::Window dialog;
   state->dialog = dialog;
@@ -1107,12 +1135,10 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
     auto password = current->restored_password.value_or("");
     auto access = current->restored_session ? current->restored_session->access_token : "";
     auto refresh = current->restored_session ? current->restored_session->refresh_token : "";
-    bool auto_submit_saved_password = current->options.remember_password && !password.empty() &&
+    bool auto_submit_saved_password = !password.empty() &&
         !current->auto_submit_saved_password_pending && !current->did_auto_submit_saved_password;
     if (auto_submit_saved_password) current->auto_submit_saved_password_pending = true;
-    auto password_assignment = current->options.remember_password
-        ? (L"set(document.querySelector('input[type=password],input[autocomplete=current-password]'), " + JsonLiteral(password) + L");")
-        : std::wstring{};
+    auto password_assignment = (L"set(document.querySelector('input[type=password],input[autocomplete=current-password]'), " + JsonLiteral(password) + L");");
     std::wstring script = LR"JS((() => {
       const set = (node,value) => { if (!node || !value || node.value) return; const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set; setter?.call(node,value); node.dispatchEvent(new Event('input',{bubbles:true})); node.dispatchEvent(new Event('change',{bubbles:true})); };
       const userInput = document.querySelector('input[type=email],input[type=text],input:not([type]),input[name=email],input[name=username],input[autocomplete=username],input[placeholder*="用户名"],input[placeholder*="email" i]');

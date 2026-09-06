@@ -53,7 +53,6 @@ type NativeModule = {
     origin: string;
     language: LanguagePreference;
     username?: string;
-    rememberPassword: boolean;
   }) => Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   cancelRelayLogin?: () => void;
   openRelayLogs?: (options: {

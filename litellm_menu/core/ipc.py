@@ -277,7 +277,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 data = decode_message(self._read_body())
                 if route.endswith("/relay/login"):
-                    allowed = {"account_id", "type", "label", "origin", "username", "cookie", "access_token", "refresh_token", "password"}
+                    allowed = {"account_id", "type", "label", "origin", "username", "cookie", "access_token", "refresh_token", "password", "station_id", "station_name", "station_type", "station_origin", "remember_password", "pending_account"}
                     required = {"account_id", "type", "label", "origin", "username"}
                     if not required.issubset(data) or set(data).difference(allowed):
                         raise CoreError("relay_login_failed", "Relay login result is invalid")
@@ -291,6 +291,12 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                         access_token=data.get("access_token", ""),
                         refresh_token=data.get("refresh_token", ""),
                         password=data.get("password", ""),
+                        station_id=data.get("station_id"),
+                        station_name=data.get("station_name"),
+                        station_type=data.get("station_type"),
+                        station_origin=data.get("station_origin"),
+                        remember_password=data.get("remember_password"),
+                        pending_account=data.get("pending_account", False),
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
                 elif route.endswith("/relay/restore"):

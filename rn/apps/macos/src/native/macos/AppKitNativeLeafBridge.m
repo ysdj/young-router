@@ -25,6 +25,7 @@ RCT_EXTERN_METHOD(editSecret:(NSString *)domain field:(NSString *)field target:(
 RCT_EXTERN_METHOD(clearSecret:(NSString *)domain field:(NSString *)field target:(NSString *)target resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(copySecret:(NSString *)domain field:(NSString *)field target:(NSString *)target resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(relayLogin:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(cancelRelayLogin)
 RCT_EXTERN_METHOD(openRelayLogs:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(restoreRelaySession:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(clearRelayPassword:(NSString *)accountID resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)

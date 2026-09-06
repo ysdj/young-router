@@ -1284,6 +1284,243 @@ class HookPatchTests(HookTestCase):
             ["small-body-route"],
         )
 
+    async def test_generic_helper_marks_real_compaction_capability_failure_before_route_decision(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "600")
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+        router_module = types.ModuleType("litellm.router")
+        router_attempts = []
+        upstream_attempts = []
+        deployments = [
+            {
+                "litellm_params": {
+                    "model": "openai/default-chat",
+                    "api_base": "https://relay-a.example/v1",
+                    "order": 1,
+                },
+                "model_info": {
+                    "id": "compaction-route-a",
+                    "order": 1,
+                    "route_key": "provider-a / openai/default-chat / key=a / order=1",
+                },
+            },
+            {
+                "litellm_params": {
+                    "model": "openai/default-chat",
+                    "api_base": "https://relay-b.example/v1",
+                    "order": 2,
+                },
+                "model_info": {
+                    "id": "compaction-route-b",
+                    "order": 2,
+                    "route_key": "provider-b / openai/default-chat / key=b / order=2",
+                },
+            },
+        ]
+
+        request = {
+            "model": "default-chat",
+            "api_base": "https://relay-a.example/v1",
+            "model_info": deployments[0]["model_info"].copy(),
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        cache_key = hooks._codex_compaction_capability_cache_key(request)
+        now = time.time()
+        with hooks._CODEX_COMPACTION_CAPABILITY_LOCK:
+            hooks._CODEX_COMPACTION_CAPABILITIES[cache_key] = {
+                "status": "supported",
+                "deployment_id": "compaction-route-a",
+                "route_key": deployments[0]["model_info"]["route_key"],
+                "detected_at": now,
+                "expires_at": now + 600,
+            }
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                router_attempts.append(copy.deepcopy(kwargs))
+                excluded_ids = set(kwargs.get("_excluded_deployment_ids") or [])
+                target_order = kwargs.get("_target_order")
+                selected = next(
+                    deployment
+                    for deployment in deployments
+                    if deployment["model_info"]["id"] not in excluded_ids
+                    and (
+                        target_order is None
+                        or deployment["litellm_params"]["order"] == target_order
+                    )
+                )
+                # Mirror LiteLLM's real helper: the selected deployment is
+                # merged into the request before the callback runs, and the
+                # helper stamps the selected id when the callback fails.
+                kwargs["model_info"] = selected["model_info"].copy()
+                kwargs["litellm_params"] = selected["litellm_params"].copy()
+                kwargs["api_base"] = selected["litellm_params"]["api_base"]
+                try:
+                    return await original_generic_function(**kwargs)
+                except Exception as exc:
+                    exc.failed_deployment_id = selected["model_info"]["id"]
+                    exc.failed_deployment_order = selected["model_info"]["order"]
+                    exc.failed_deployment_route_key = selected["model_info"]["route_key"]
+                    raise
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            route_id = kwargs["model_info"]["id"]
+            upstream_attempts.append(route_id)
+            if route_id == "compaction-route-a":
+                error = RuntimeError(
+                    "OpenAIException - no tool output found for custom tool call call_exec"
+                )
+                error.status_code = 400
+                error.body = {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "no tool output found for custom tool call call_exec",
+                    }
+                }
+                raise error
+            return {"ok": True, "route": route_id}
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            **{key: value for key, value in request.items() if key != "model"},
+        )
+
+        self.assertEqual(response, {"ok": True, "route": "compaction-route-b"})
+        self.assertEqual(upstream_attempts, ["compaction-route-a", "compaction-route-b"])
+        self.assertEqual(len(router_attempts), 2)
+        self.assertEqual(
+            router_attempts[1]["_excluded_deployment_ids"],
+            ["compaction-route-a"],
+        )
+        self.assertEqual(
+            hooks._cached_codex_compaction_capability_status(request),
+            "unsupported",
+        )
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_generic_helper_returns_terminal_compaction_failure_without_route_recovery(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._CODEX_COMPACTION_CAPABILITY_TTL_SECONDS_ENV, "600")
+        self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
+        router_module = types.ModuleType("litellm.router")
+        deployment = {
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "api_base": "https://relay-only.example/v1",
+                "order": 1,
+            },
+            "model_info": {
+                "id": "compaction-route-only",
+                "order": 1,
+                "route_key": "provider-only / openai/default-chat / key=only / order=1",
+            },
+        }
+        request = {
+            "model": "default-chat",
+            "api_base": "https://relay-only.example/v1",
+            "model_info": deployment["model_info"].copy(),
+            "input": [
+                {"type": "message", "role": "user", "content": "history"},
+                {"type": "compaction_trigger", "id": "compact-now"},
+            ],
+            "stream": True,
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"compaction"}',
+            },
+        }
+        cache_key = hooks._codex_compaction_capability_cache_key(request)
+        now = time.time()
+        with hooks._CODEX_COMPACTION_CAPABILITY_LOCK:
+            hooks._CODEX_COMPACTION_CAPABILITIES[cache_key] = {
+                "status": "supported",
+                "deployment_id": "compaction-route-only",
+                "route_key": deployment["model_info"]["route_key"],
+                "detected_at": now,
+                "expires_at": now + 600,
+            }
+        attempts = []
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [deployment]
+
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                attempts.append(copy.deepcopy(kwargs))
+                kwargs["model_info"] = deployment["model_info"].copy()
+                kwargs["litellm_params"] = deployment["litellm_params"].copy()
+                kwargs["api_base"] = deployment["litellm_params"]["api_base"]
+                try:
+                    return await original_generic_function(**kwargs)
+                except Exception as exc:
+                    exc.failed_deployment_id = deployment["model_info"]["id"]
+                    exc.failed_deployment_order = deployment["model_info"]["order"]
+                    exc.failed_deployment_route_key = deployment["model_info"]["route_key"]
+                    raise
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            error = RuntimeError(
+                "OpenAIException - no tool output found for custom tool call call_exec"
+            )
+            error.status_code = 400
+            error.body = {
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "no tool output found for custom tool call call_exec",
+                }
+            }
+            raise error
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "default-chat",
+            original_generic_function,
+            **{key: value for key, value in request.items() if key != "model"},
+        )
+
+        self.assertTrue(hooks._is_failed_responses_stream_response(response))
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(
+            hooks._cached_codex_compaction_capability_status(request),
+            "unsupported",
+        )
+        self.assertTrue(
+            hooks._is_codex_compaction_capability_unsupported_error(response.exception)
+        )
+        self.assertFalse(hooks._is_route_recovery_poll_error(response.exception))
+        self.assertFalse(hooks._should_return_route_recovery_stream(
+            response.exception,
+            request,
+        ))
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
     def test_responses_tool_search_bridge_patch_restores_custom_tool_calls(self) -> None:
         hooks, _ = load_hook_module()
         responses_module = types.ModuleType("litellm.responses")

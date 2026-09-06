@@ -123,7 +123,7 @@ class CodexConfigTests(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual([], models)
 
-    def test_litellm_model_selection_preserves_compaction_mode(self) -> None:
+    def test_litellm_model_selection_uses_local_checkpoint_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime_config = Path(directory) / "config.yaml"
             self.write_runtime_config(runtime_config)
@@ -148,10 +148,15 @@ class CodexConfigTests(unittest.TestCase):
                 )
 
         parsed = tomllib.loads(config_text)
-        self.assertEqual("openai", parsed["model_provider"])
+        self.assertEqual(codex_config.LITELLM_CODEX_PROVIDER_ID, parsed["model_provider"])
         self.assertEqual("active-chat", parsed["model"])
         self.assertTrue(parsed["features"]["goals"])
         self.assertNotIn("token_budget", parsed["features"])
+        provider = parsed["model_providers"][codex_config.LITELLM_CODEX_PROVIDER_ID]
+        self.assertEqual(codex_config.LITELLM_CODEX_PROVIDER_NAME, provider["name"])
+        self.assertEqual("http://127.0.0.1:4999/v1", provider["base_url"])
+        self.assertEqual("responses", provider["wire_api"])
+        self.assertTrue(provider["requires_openai_auth"])
         self.assertEqual("sk-test-local", json.loads(auth_text)["OPENAI_API_KEY"])
 
     def test_litellm_model_selection_strips_legacy_forced_token_budget_once(self) -> None:
@@ -197,7 +202,7 @@ class CodexConfigTests(unittest.TestCase):
 
                 self.assertTrue(tomllib.loads(second)["features"]["token_budget"])
 
-    def test_litellm_model_selection_preserves_custom_provider_for_standalone_search(self) -> None:
+    def test_litellm_model_selection_uses_non_openai_provider_for_local_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime_config = Path(directory) / "config.yaml"
             self.write_runtime_config(runtime_config)
@@ -208,6 +213,7 @@ class CodexConfigTests(unittest.TestCase):
                 openai_base_url = "https://stale-openai.example.test/v1"
 
                 [model_providers.newapi]
+                name = "OpenAI"
                 base_url = "https://remote.example.test/v1"
                 base_url1 = "https://fallback.example.test/v1"
                 wire_api = "responses"
@@ -238,10 +244,183 @@ class CodexConfigTests(unittest.TestCase):
         self.assertEqual("newapi", parsed["model_provider"])
         self.assertEqual("active-chat", parsed["model"])
         self.assertEqual("https://stale-openai.example.test/v1", parsed["openai_base_url"])
+        self.assertEqual(codex_config.LITELLM_CODEX_PROVIDER_NAME, parsed["model_providers"]["newapi"]["name"])
         self.assertEqual("http://127.0.0.1:4999/v1", parsed["model_providers"]["newapi"]["base_url"])
         self.assertNotIn("supports_standalone_web_search", parsed["model_providers"]["newapi"])
         self.assertEqual("https://fallback.example.test/v1", parsed["model_providers"]["newapi"]["base_url1"])
         self.assertEqual("sk-test-local", json.loads(auth_text)["OPENAI_API_KEY"])
+
+    def _runtime_config_text(self, model_info_extra: str = "") -> str:
+        return textwrap.dedent(
+            f"""
+            providers:
+              active:
+                api_base: https://active.example.test/v1
+                api_keys:
+                  - name: default
+                    value: replace-me
+            model_list:
+              - model_name: active-chat
+                litellm_params:
+                  model: openai/gpt-6-astra
+                model_info:
+                  id: a1b2c3d4
+                  provider: active
+                  upstream_url_surface: openai/responses
+                  supported_upstream_url_surfaces: [openai/responses]
+                  {model_info_extra}
+            general_settings:
+              master_key: sk-test-local
+            """
+        ).lstrip()
+
+    def _apply_selection(self, runtime_config: Path) -> tuple[str, str]:
+        with mock.patch.object(
+            codex_config,
+            "local_base_url",
+            return_value="http://127.0.0.1:4999/v1",
+        ):
+            config_text, auth_text, _config, _auth = codex_config.apply_structured_patch(
+                'model = "previous"\n',
+                "{}",
+                {
+                    "litellm_model": {
+                        "model": "active-chat",
+                        "provider": "active",
+                        "deployment_id": "a1b2c3d4",
+                    }
+                },
+                runtime_config,
+            )
+        return config_text, auth_text
+
+    def test_litellm_model_selection_uses_openai_name_only_for_explicit_compaction_opt_in(self) -> None:
+        """Provider display name follows the per-model capability metadata.
+
+        ``supports_responses_compaction: true`` is the only case allowed to
+        advertise the exact ``OpenAI`` name (which makes new Codex tasks use
+        encrypted remote compaction); ``false`` and an absent field both keep
+        the neutral ``LiteLLM Menu`` name (local checkpoint summary). The
+        upstream model name (gpt-6-astra here) never triggers remote
+        compaction by itself.
+        """
+
+        for model_info_line, expected_name in (
+            ("supports_responses_compaction: true", "OpenAI"),
+            ("supports_responses_compaction: false", codex_config.LITELLM_CODEX_PROVIDER_NAME),
+            ("", codex_config.LITELLM_CODEX_PROVIDER_NAME),
+        ):
+            with self.subTest(model_info_line=model_info_line or "missing"):
+                with tempfile.TemporaryDirectory() as directory:
+                    runtime_config = Path(directory) / "config.yaml"
+                    runtime_config.write_text(
+                        self._runtime_config_text(model_info_line),
+                        encoding="utf-8",
+                    )
+                    config_text, _auth_text = self._apply_selection(runtime_config)
+
+                parsed = tomllib.loads(config_text)
+                provider = parsed["model_providers"][codex_config.LITELLM_CODEX_PROVIDER_ID]
+                self.assertEqual(expected_name, provider["name"])
+                self.assertEqual("http://127.0.0.1:4999/v1", provider["base_url"])
+                self.assertEqual("responses", provider["wire_api"])
+
+    def test_litellm_model_selection_accepts_compaction_capability_alias(self) -> None:
+        """The unified alias maps onto the canonical capability.
+
+        An explicit ``supports_compaction: true`` in model_info is the same
+        opt-in as the canonical key, so the provider row may use the exact
+        OpenAI name.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_config = Path(directory) / "config.yaml"
+            runtime_config.write_text(
+                self._runtime_config_text("supports_compaction: true"),
+                encoding="utf-8",
+            )
+            config_text, _auth_text = self._apply_selection(runtime_config)
+
+        parsed = tomllib.loads(config_text)
+        provider = parsed["model_providers"][codex_config.LITELLM_CODEX_PROVIDER_ID]
+        self.assertEqual("OpenAI", provider["name"])
+
+    def test_configured_models_exposes_explicit_compaction_support_only(self) -> None:
+        """Configured rows carry the boolean opt-in; inference never happens.
+
+        The provider display name ``OpenAI`` and the gpt-6 upstream model do
+        not imply remote compaction support on their own.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_config = Path(directory) / "config.yaml"
+            runtime_config.write_text(
+                textwrap.dedent(
+                    """
+                    providers:
+                      active:
+                        api_base: https://active.example.test/v1
+                        api_keys:
+                          - name: default
+                            value: replace-me
+                      openai:
+                        name: OpenAI
+                        api_base: https://active.example.test/v1
+                        api_keys:
+                          - name: default
+                            value: replace-me
+                    model_list:
+                      - model_name: opted-in
+                        litellm_params:
+                          model: openai/gpt-6-astra
+                        model_info:
+                          id: a1b2c3d4
+                          provider: active
+                          supports_responses_compaction: true
+                      - model_name: opted-out
+                        litellm_params:
+                          model: openai/gpt-6-astra
+                        model_info:
+                          id: a1b2c3d5
+                          provider: active
+                          supports_responses_compaction: false
+                      - model_name: aliased
+                        litellm_params:
+                          model: openai/gpt-6-astra
+                        model_info:
+                          id: a1b2c3d6
+                          provider: active
+                          supports_compaction: true
+                      - model_name: unmarked
+                        litellm_params:
+                          model: openai/gpt-6-astra
+                        model_info:
+                          id: a1b2c3d7
+                          provider: active
+                      - model_name: openai-named
+                        litellm_params:
+                          model: openai/gpt-6-astra
+                        model_info:
+                          id: a1b2c3d8
+                          provider: openai
+                    general_settings:
+                      master_key: sk-test-local
+                    """
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            models = codex_config.configured_models(codex_config.load_yaml(runtime_config))
+
+        by_name = {item["model"]: item for item in models}
+        self.assertTrue(by_name["opted-in"]["supports_responses_compaction"])
+        self.assertFalse(by_name["opted-out"]["supports_responses_compaction"])
+        # The unified alias resolves to the canonical field.
+        self.assertTrue(by_name["aliased"]["supports_responses_compaction"])
+        # Missing metadata stays None (unknown), never an inferred capability,
+        # even when the provider row is literally named OpenAI or the upstream
+        # model is a gpt-6 variant.
+        self.assertIsNone(by_name["unmarked"]["supports_responses_compaction"])
+        self.assertIsNone(by_name["openai-named"]["supports_responses_compaction"])
 
     def run_command(
         self,

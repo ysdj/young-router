@@ -151,6 +151,8 @@ type TableProps = {
   scrollTrailingColumnOverflow?: boolean;
   disabledRowKeys?: string[];
   secondaryCellKeys?: string[];
+  /** Rows whose text renders in the warning (brown) color. */
+  alertRowKeys?: string[];
   onSelectionChange?: (key: string, index: number) => void;
   onRowDoublePress?: (key: string, index: number) => void;
   style?: StyleProp<ViewStyle>;
@@ -298,7 +300,7 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
 }
 
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, framed = true, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, framed = true, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
   const stripedRows = striped && (alternatingRows || rows.length > 0);
   const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);
   const nativeProps = {
@@ -313,6 +315,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, a
     borderless: !framed,
     disabledRowKeys,
     secondaryCellKeys,
+    alertRowKeys,
     spanningRowKeys,
   };
   if (Platform.OS === "windows") {

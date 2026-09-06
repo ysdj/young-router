@@ -83,6 +83,17 @@ WEB_SEARCH_CAPABILITY_MARKERS = {
     "openrouter_web_search",
     "openrouter.web_search",
 }
+# Explicit per-model opt-in for encrypted remote Responses compaction. Only
+# declared boolean keys count; the canonical spelling wins over the alias and
+# nothing infers this capability from provider/model names.
+RESPONSES_COMPACTION_CAPABILITY_ALIASES = {
+    "supports_responses_compaction": "supports_responses_compaction",
+    "supports_compaction": "supports_responses_compaction",
+}
+COMPACTION_CAPABILITY_KEYS = (
+    "supports_responses_compaction",
+    "supports_compaction",
+)
 CC_SWITCH_SQL_HEADER = "-- CC Switch SQLite 导出"
 BASE_URL_KEYS = (
     "api_base",
@@ -183,14 +194,15 @@ def _web_search_capability_extra(source: dict[str, Any]) -> dict[str, bool]:
         if not isinstance(container, dict) or depth > 2 or id(container) in visited:
             return
         visited.add(id(container))
-        for source_key, target_key in WEB_SEARCH_CAPABILITY_ALIASES.items():
-            if source_key not in container:
-                continue
-            parsed = _explicit_bool(container.get(source_key))
-            if parsed is not None:
-                # Prefer an explicitly canonical value over an alias or a
-                # nested metadata copy when a source repeats the field.
-                extra.setdefault(target_key, parsed)
+        for alias_map in (WEB_SEARCH_CAPABILITY_ALIASES, RESPONSES_COMPACTION_CAPABILITY_ALIASES):
+            for source_key, target_key in alias_map.items():
+                if source_key not in container:
+                    continue
+                parsed = _explicit_bool(container.get(source_key))
+                if parsed is not None:
+                    # Prefer an explicitly canonical value over an alias or a
+                    # nested metadata copy when a source repeats the field.
+                    extra.setdefault(target_key, parsed)
         for key in WEB_SEARCH_CAPABILITY_LISTS:
             values = container.get(key)
             if not isinstance(values, list):
@@ -696,7 +708,7 @@ def _import_litellm(data: dict[str, Any]) -> _Drafts | None:
             "x-litellm-menu-model-enabled": info.get("x-litellm-menu-model-enabled", True),
             "supports_responses_image_generation_tool": info.get("supports_responses_image_generation_tool"),
         }
-        for capability_key in WEB_SEARCH_CAPABILITY_KEYS:
+        for capability_key in WEB_SEARCH_CAPABILITY_KEYS + COMPACTION_CAPABILITY_KEYS:
             if capability_key in info:
                 model_source[capability_key] = info.get(capability_key)
         if "ssl_verify" not in params:

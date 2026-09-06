@@ -10,15 +10,13 @@ export const ROUTES: readonly RouteDefinition[] = [
   { id: "runtime-settings", titleKey: "menu.runtime" },
   { id: "codex-settings", titleKey: "menu.codex" },
   { id: "claude-settings", titleKey: "menu.claude" },
-  { id: "relay-accounts", titleKey: "menu.relay" },
   { id: "data-management", titleKey: "menu.dataManagement" },
-  { id: "relay-add", titleKey: "relay.addAccount" },
   { id: "provider-wizard", titleKey: "providers.wizard.title" },
   { id: "logs", titleKey: "menu.logs" },
 ];
 
 export const MENU_ROUTES: readonly RouteDefinition[] = ROUTES.filter(
-  ({ id }) => id !== "claude-settings" && id !== "relay-add" && id !== "provider-wizard",
+  ({ id }) => id !== "claude-settings" && id !== "provider-wizard",
 );
 
 export function routeMenuActions(
@@ -43,5 +41,10 @@ export const LOG_TABS: readonly LogTab[] = [
 ];
 
 export function canonicalWindowRoute(route: AppRoute): AppRoute {
-  return route === "claude-settings" ? "codex-settings" : route;
+  if (route === "claude-settings") return "codex-settings";
+  // The former Service Provider Management surfaces are integrated into the
+  // unified provider workspace; legacy deep links land there.
+  if (route === "relay-accounts") return "providers-models";
+  if (route === "relay-add") return "provider-wizard";
+  return route;
 }

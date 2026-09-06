@@ -1524,9 +1524,22 @@ class CoreStore:
         access_token: object = "",
         refresh_token: object = "",
         password: object = "",
+        station_id: object = None,
+        station_name: object = None,
+        station_type: object = None,
+        station_origin: object = None,
+        remember_password: object = None,
+        pending_account: object = False,
     ) -> dict[str, Any]:
-        """Accept one native browser session and expose only public account state."""
+        """Accept one native browser session and expose only public account state.
 
+        ``remember_password`` is the host's post-login prompt decision. An
+        absent value keeps the account's stored preference; a boolean applies
+        the choice, so a previously saved password can be retired from the
+        same prompt.
+        """
+
+        remember_choice = remember_password if isinstance(remember_password, bool) else None
         known_secrets = tuple(
             value for value in (cookie, access_token, refresh_token, password) if isinstance(value, str) and value
         )
@@ -1569,7 +1582,38 @@ class CoreStore:
                     None,
                 )
                 if not isinstance(matching, Mapping):
-                    raise CoreError("relay_login_failed", "Relay account is unavailable")
+                    # Pending login: the host started the webview before any
+                    # account existed, so a successful sign-in creates the
+                    # shell now. A cancelled flow never reaches this branch
+                    # and leaves no reserved slot behind. Stale accepts for
+                    # unknown accounts without the pending flag still fail.
+                    creator = getattr(relay, "add_account_for_login", None)
+                    if (
+                        not callable(creator)
+                        or pending_account is not True
+                        or not isinstance(account_id, str)
+                        or not account_id
+                    ):
+                        raise CoreError("relay_login_failed", "Relay account is unavailable")
+                    creator(
+                        account_id=account_id,
+                        account_type=str(account_type) if isinstance(account_type, str) else "",
+                        label=str(label) if isinstance(label, str) else "",
+                        origin=str(origin) if isinstance(origin, str) else "",
+                        station_id=str(station_id) if isinstance(station_id, str) and station_id else None,
+                        station_name=str(station_name) if isinstance(station_name, str) and station_name else None,
+                        station_type=str(station_type) if isinstance(station_type, str) and station_type else None,
+                        station_origin=str(station_origin) if isinstance(station_origin, str) and station_origin else None,
+                        remember_password=remember_choice is True,
+                    )
+                    current = self._adapter_snapshot("relay_accounts")
+                    accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
+                    matching = next(
+                        (item for item in accounts if isinstance(item, Mapping) and item.get("id") == account_id),
+                        None,
+                    )
+                    if not isinstance(matching, Mapping):
+                        raise CoreError("relay_login_failed", "Relay account is unavailable")
                 if (
                     matching.get("type") != account_type
                     or matching.get("label") != label
@@ -1583,6 +1627,7 @@ class CoreStore:
                     access_token=str(access_token) if isinstance(access_token, str) else "",
                     refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
                     password=str(password) if isinstance(password, str) else "",
+                    remember_password=remember_choice,
                 )
                 # Login is the durable browser-session boundary. Resource
                 # discovery is a separate explicit action so a station API
@@ -2443,7 +2488,18 @@ class CoreStore:
                             # window's status poll can replace that slot before
                             # the caller refreshes it.
                             action_summary = dict(summary)
-                dirty = after != before
+                cosmetic_binding = bool(
+                    name == "providers_models"
+                    and normalized_action == "provider_select_relay_station"
+                    and getattr(adapter, "_cosmetic_binding", False)
+                )
+                if cosmetic_binding:
+                    # The station binding changed only the hidden source
+                    # metadata; the visible name and URL are untouched.  Keep
+                    # the draft clean so closing the window never asks to
+                    # discard a change that altered nothing visible.
+                    self._baselines[name] = copy.deepcopy(after)
+                dirty = False if cosmetic_binding else after != before
                 action_mutated = action_draft_before is None or after != action_draft_before
                 if action_mutated:
                     self._revision += 1

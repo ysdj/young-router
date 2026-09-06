@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { normalizeRelayOrigin, suggestedRelayStationName } from "../rn/packages/shared/src/ui/relayOrigin.ts";
+import { normalizeRelayOrigin, suggestedProviderName, suggestedRelayStationName } from "../rn/packages/shared/src/ui/relayOrigin.ts";
 
 assert.equal(normalizeRelayOrigin("aaa.com/"), "https://aaa.com");
 assert.equal(normalizeRelayOrigin("https://x.bbb.com/login"), "https://x.bbb.com");
@@ -10,4 +10,15 @@ assert.equal(suggestedRelayStationName("x.bbb.com"), "bbb");
 assert.equal(suggestedRelayStationName("https://api.example.co.uk/login"), "example");
 assert.equal(suggestedRelayStationName("http://localhost:4000"), "localhost");
 
-console.log("RN relay origin regression tests OK (normalization and station-name suggestion)");
+// Provider-name suggestion stays empty while the hostname is incomplete and
+// then yields the domain label before the TLD.
+assert.equal(suggestedProviderName("h"), "");
+assert.equal(suggestedProviderName("https://a"), "");
+assert.equal(suggestedProviderName("https://api"), "");
+assert.equal(suggestedProviderName("https://a.b"), "");
+assert.equal(suggestedProviderName("https://api.openai.com/v1"), "openai");
+assert.equal(suggestedProviderName("api.gamma.example/v1"), "gamma");
+assert.equal(suggestedProviderName("https://atlas.example/v1"), "atlas");
+assert.equal(suggestedProviderName("http://localhost:4000"), "");
+
+console.log("RN relay origin regression tests OK (normalization, station-name and provider-name suggestion)");
