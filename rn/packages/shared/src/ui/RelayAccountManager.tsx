@@ -487,6 +487,43 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
 
 type AccountLoading = { session: boolean; resources: boolean };
 
+/** 下级分组管理 dialog: the station's group list plus the auto-grouping switch. */
+export function StationGroupManagerDialog({ visible, account, disabled, translate, onClose, onAutoGrouping }: {
+  visible: boolean;
+  account: RelayAccount;
+  disabled: boolean;
+  translate: Translate;
+  onClose: () => void;
+  onAutoGrouping: (enabled: boolean) => void;
+}): React.JSX.Element {
+  const keysInGroup = (groupID: string): number => account.resources.filter((resource) => resource.groupID === groupID).length;
+  return <RelayDialogLayer visible={visible} onRequestClose={onClose}>
+    <View style={styles.dialogBackdrop}>
+      <View style={styles.decisionDialog} accessibilityViewIsModal>
+        <View style={styles.dialogHeader}><Text style={styles.dialogTitle}>{translate("relay.groupManager")}</Text><NativeButton title={translate("menu.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} /></View>
+        <View style={styles.decisionContent}>
+          {account.groups.length > 0 ? <View style={styles.groupManagerList}>
+            {account.groups.map((group) => <View key={group.id} style={styles.groupManagerRow}>
+              <Text numberOfLines={1} style={styles.groupManagerName}>{groupLabel(group, translate)}</Text>
+              <Text numberOfLines={1} style={styles.groupManagerMeta}>{translate("relay.groupKeysCount", { count: keysInGroup(group.id) })}</Text>
+            </View>)}
+          </View> : <Text style={styles.decisionMessage}>{translate("relay.groupsEmpty")}</Text>}
+          <View style={styles.groupManagerAutoRow}>
+            <NativeCheckbox
+              key={`auto-grouping:${account.id}`}
+              label={translate("relay.apiKeyAutoGrouping")}
+              value={account.autoGrouping}
+              disabled={disabled}
+              onValueChange={onAutoGrouping}
+            />
+          </View>
+        </View>
+        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("menu.close")} compact disabled={disabled} onPress={onClose} /></View></View>
+      </View>
+    </View>
+  </RelayDialogLayer>;
+}
+
 /**
  * 账号管理 for one relay station: list, add (native webview login), re-login,
  * rename, remember-password, refresh, and remove accounts, plus the station
@@ -502,6 +539,7 @@ export function StationAccountsPanel({
   refreshAccounts,
   refreshResources,
   apiKeyActions,
+  detectType,
   language,
   cleanups,
   stationDraft: stationDraftProp,
@@ -521,6 +559,8 @@ export function StationAccountsPanel({
   refreshAccounts: () => Promise<CoreSnapshot | void>;
   refreshResources: (accountID: string) => Promise<"ready" | "unavailable">;
   apiKeyActions?: RelayApiKeyActions;
+  /** Relay-family auto-detection; the station type has no manual select. */
+  detectType?: (origin: string) => Promise<RelayType | undefined>;
   onStatus?: (status?: string) => void;
   stationDraft?: StationDraft;
   onStationDraftChange?: (draft: StationDraft) => void;
@@ -540,6 +580,7 @@ export function StationAccountsPanel({
   const [formBusy, setFormBusy] = useState(false);
   const [removal, setRemoval] = useState<{ account: RelayAccount }>();
   const [removalPolicy, setRemovalPolicy] = useState<LocalDependencyPolicy>("detach");
+  const [groupManagerOpen, setGroupManagerOpen] = useState(false);
   // What a sign-in may save is asked by the native login flow after the
   // webview login succeeds; adding an account goes straight to sign-in.
   const beginAddLogin = async (): Promise<void> => {
@@ -728,12 +769,18 @@ export function StationAccountsPanel({
   // first (modal sheet on the provider window); Core creates the account
   // shell only when sign-in actually succeeds (pending_account), so a
   // cancelled login leaves nothing behind. Whether the password is kept is
-  // decided by the post-login prompt inside the native flow.
+  // decided by the post-login prompt inside the native flow. The relay
+  // family comes from the station's type, or auto-detection — never a select.
   const startPendingLogin = async (): Promise<void> => {
     setFormBusy(true);
     setFeedback(undefined);
     const pendingID = `login-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const stationType = station.type ?? "newapi";
+    const stationType = station.type ?? await detectType?.(station.origin);
+    if (!stationType) {
+      setFormBusy(false);
+      setFeedback(translate("relay.typeNotDetected"));
+      return;
+    }
     try {
       const result = await native.relayLogin({
         accountId: pendingID,
@@ -849,20 +896,6 @@ export function StationAccountsPanel({
         <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} disabled={controlsBusy || !selected} onPress={() => { if (selected) { setRemovalPolicy("detach"); setRemoval({ account: selected }); } }} style={styles.panelActionButton} />
       </View>
     </View>
-    <View style={styles.fieldRow}>
-      <Text numberOfLines={1} style={[styles.fieldLabel, { width: undefined }]}>{translate("relay.type")}</Text>
-      <NativePicker
-        labels={[relayTypeLabel("newapi", translate), relayTypeLabel("sub2api", translate)]}
-        selectedValue={relayTypeLabel(stationDraft.type ?? station.type ?? "newapi", translate)}
-        disabled={controlsBusy || stationAccounts.length === 0}
-        onChange={({ nativeEvent }) => {
-          const nextType = nativeEvent.index === 1 ? "sub2api" : "newapi";
-          setStationDraftValue({ type: nextType });
-          void stageStationUpdate({ type: nextType });
-        }}
-        style={styles.relayTypeInline}
-      />
-    </View>
     {accountRows.length > 0 ? <NativeTable
       columns={[{ label: translate("relay.accounts"), width: 96 }, { label: translate("providers.authStatus"), width: 74 }, { label: translate("relay.balance"), width: 58 }]}
       rows={accountRows}
@@ -881,29 +914,30 @@ export function StationAccountsPanel({
         {!selectedSignedIn ? <NativeButton title={translate("relay.goLogin")} compact disabled={controlsBusy || isAccountLoading(selected.id)} onPress={() => { void loginSelected(); }} /> : null}
       </View>
       <View style={styles.accountActionsRow}>
-        <NativeCheckbox
-          key={`auto-grouping:${selected.id}`}
-          label={translate("relay.apiKeyAutoGrouping")}
-          value={selected.autoGrouping}
-          disabled={controlsBusy || !apiKeyActions?.setAutoGrouping}
-          onValueChange={(enabled) => {
-            void (async () => {
-              setFormBusy(true);
-              try {
-                await apiKeyActions?.setAutoGrouping?.(selected.id, enabled);
-                await refreshAccounts();
-                onStatus?.(translate("relay.apiKeyAutoGroupingStaged"));
-              } catch {
-                onStatus?.(translate("relay.operationFailed"));
-              } finally {
-                setFormBusy(false);
-              }
-            })();
-          }}
-          style={styles.autoGroupingInline}
-        />
+        <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy} onPress={() => setGroupManagerOpen(true)} />
       </View>
     </View> : null}
+    {selected ? <StationGroupManagerDialog
+      visible={groupManagerOpen}
+      account={selected}
+      disabled={controlsBusy}
+      translate={translate}
+      onClose={() => setGroupManagerOpen(false)}
+      onAutoGrouping={(enabled) => {
+        void (async () => {
+          setFormBusy(true);
+          try {
+            await apiKeyActions?.setAutoGrouping?.(selected.id, enabled);
+            await refreshAccounts();
+            onStatus?.(translate("relay.apiKeyAutoGroupingStaged"));
+          } catch {
+            onStatus?.(translate("relay.operationFailed"));
+          } finally {
+            setFormBusy(false);
+          }
+        })();
+      }}
+    /> : null}
     <DependencyPolicyDialog
       visible={Boolean(removal)}
       title={translate("relay.removeLocalTitle")}
@@ -1006,8 +1040,11 @@ const styles = StyleSheet.create({
   accountsEmptyText: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, textAlign: "center" },
   accountEditor: { minWidth: 0, gap: 5 },
   accountNameValue: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE },
-  relayTypeInline: { width: 96, height: 26, flexShrink: 0 },
-  autoGroupingInline: { flexShrink: 0, flexGrow: 0 },
+  groupManagerList: { minWidth: 0, gap: 4, maxHeight: 220 },
+  groupManagerRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 },
+  groupManagerName: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE },
+  groupManagerMeta: { flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
+  groupManagerAutoRow: { minHeight: 26, paddingTop: 6, borderTopWidth: 1, borderTopColor: colors.separator },
   accountActionsRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
   fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
   fieldLabel: { width: 64, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },

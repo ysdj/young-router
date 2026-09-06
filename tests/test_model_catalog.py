@@ -300,6 +300,51 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual("v4", model["multi_agent_version"])
         self.assertEqual(["kept"], model["future_native_field"])
 
+    def test_inherited_code_mode_profile_gets_the_direct_tool_surface(self) -> None:
+        native_profile = {
+            "slug": "gpt-6-astra",
+            "display_name": "GPT-6-Astra",
+            "base_instructions": "Native prompt",
+            "model_messages": {"instructions_template": "Native prompt"},
+            "shell_type": "unified_exec",
+            "tool_mode": "code_mode_only",
+            "apply_patch_tool_type": "freeform",
+            "experimental_supported_tools": ["send_user_message_async", "clock"],
+        }
+
+        with mock.patch(
+            "litellm_menu.core.model_catalog.load_native_catalog",
+            return_value=[native_profile],
+        ):
+            model = catalog_payload(["kimi-k3"])["models"][0]
+
+        self.assertEqual("shell_command", model["shell_type"])
+        self.assertEqual("direct", model["tool_mode"])
+        self.assertEqual("freeform", model["apply_patch_tool_type"])
+        self.assertEqual(
+            ["send_user_message_async", "clock"],
+            model["experimental_supported_tools"],
+        )
+
+    def test_exact_native_profile_keeps_its_own_tool_surface(self) -> None:
+        native_profile = {
+            "slug": "kimi-k3",
+            "display_name": "Kimi K3",
+            "base_instructions": "Native prompt",
+            "model_messages": {"instructions_template": "Native prompt"},
+            "shell_type": "unified_exec",
+            "tool_mode": "code_mode_only",
+        }
+
+        with mock.patch(
+            "litellm_menu.core.model_catalog.load_native_catalog",
+            return_value=[native_profile],
+        ):
+            model = catalog_payload(["kimi-k3"])["models"][0]
+
+        self.assertEqual("unified_exec", model["shell_type"])
+        self.assertEqual("code_mode_only", model["tool_mode"])
+
     def test_catalog_carries_known_context_window_to_codex(self) -> None:
         with mock.patch(
             "litellm.model_cost",

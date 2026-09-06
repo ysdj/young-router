@@ -75,6 +75,40 @@ class HookResponsesToolBridgeTests(HookTestCase):
         )
 
 
+    def test_function_tool_bridge_drops_type_sibling_beside_ref(self) -> None:
+        hooks, _ = load_hook_module()
+
+        converted = hooks._responses_bridge_function_tool(
+            {
+                "type": "function",
+                "name": "capture_screen_context",
+                "parameters": {
+                    "type": "object",
+                    "$defs": {
+                        "__schema20": {
+                            "type": "object",
+                            "properties": {"window_title": {"type": "string"}},
+                        }
+                    },
+                    "properties": {
+                        "frontmost": {"$ref": "#/$defs/__schema20", "type": "object"},
+                        "path": {"type": "string"},
+                    },
+                    "required": ["path"],
+                },
+            }
+        )
+
+        self.assertIsNotNone(converted)
+        assert converted is not None
+        parameters = converted["parameters"]
+        self.assertEqual(
+            {"$ref": "#/$defs/__schema20"},
+            parameters["properties"]["frontmost"],
+        )
+        self.assertEqual("string", parameters["properties"]["path"]["type"])
+        self.assertIn("__schema20", parameters["$defs"])
+
     def test_function_tool_bridge_normalizes_missing_parameter_object_members(self) -> None:
         hooks, _ = load_hook_module()
 
