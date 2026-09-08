@@ -678,8 +678,7 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 
 - (void)scrollWheel:(NSEvent *)event
 {
-  BOOL canConsume = TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll);
-  if (canConsume) {
+  if (TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll)) {
     [super scrollWheel:event];
     return;
   }
@@ -699,6 +698,24 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 @end
 
 @implementation LiteLLMTableClipView
+
+// The table header floats above this clip view, so AppKit's document top
+// (origin zero) would park the first row behind that header.  Keep the resting
+// position one header height higher, the same place AppKit uses before the
+// first scroll, so the first row stays readable whenever the list returns to
+// the top.
+- (NSRect)constrainBoundsRect:(NSRect)proposedBounds
+{
+  NSRect constrained = [super constrainBoundsRect:proposedBounds];
+  NSTableView *tableView = (NSTableView *)self.documentView;
+  if (![tableView isKindOfClass:NSTableView.class] || tableView.headerView == nil) {
+    return constrained;
+  }
+  if (NSMinY(proposedBounds) <= 0.5) {
+    constrained.origin.y = -NSHeight(tableView.headerView.frame);
+  }
+  return constrained;
+}
 
 - (void)scrollWheel:(NSEvent *)event
 {
@@ -2098,7 +2115,14 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:selectedIndex] byExtendingSelection:NO];
     }
     if (selectionChanged && _scrollView.hasVerticalScroller) {
-      [_tableView scrollRowToVisible:selectedIndex];
+      // Only reveal a selected row that is actually out of sight.  Scrolling
+      // a row that is already visible parks it under the floating header and
+      // hides every row above it, so the list no longer reads from the top.
+      const NSRect visibleRect = _scrollView.documentVisibleRect;
+      const NSRect selectedRect = [_tableView rectOfRow:selectedIndex];
+      if (!NSIsEmptyRect(visibleRect) && !NSContainsRect(visibleRect, selectedRect)) {
+        [_tableView scrollRowToVisible:selectedIndex];
+      }
     }
   } else if (_tableView.selectedRow >= 0) {
     [_tableView deselectAll:nil];
@@ -2305,6 +2329,20 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       MAX(dataViewportHeight, rowsHeight));
   if (!NSEqualSizes(_tableView.frame.size, documentSize)) {
     _tableView.frame = NSMakeRect(0, 0, documentSize.width, documentSize.height);
+  }
+  // A fresh table starts at origin zero, which parks its first row behind the
+  // floating header.  Normalise any resting position inside that header strip
+  // to one header height higher, the same place AppKit uses for tables that
+  // never scrolled, so the first row is readable without a nudge.
+  if (_tableView.headerView != nil) {
+    const CGFloat restingOrigin = -NSHeight(_tableView.headerView.frame);
+    const CGFloat originY = NSMinY(_clipView.bounds);
+    if (originY >= 0 && originY < -restingOrigin) {
+      NSRect clipBounds = _clipView.bounds;
+      clipBounds.origin.y = restingOrigin;
+      _clipView.bounds = clipBounds;
+      [_scrollView reflectScrolledClipView:_clipView];
+    }
   }
 }
 

@@ -42,6 +42,49 @@ POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height);
 // window, including future route and modal windows.
 void DisableWindowTransitions(HWND window) noexcept;
 
+// One relay API key as the group manager sheet sees it.
+struct GroupManagerKey {
+  std::wstring id;
+  std::wstring name;
+  std::wstring group_id;
+  std::wstring group_label;
+  std::wstring multiplier;
+};
+
+// Localized labels for the native group manager sheet.
+struct GroupManagerLabels {
+  std::wstring list_label;
+  std::wstring add_label;
+  std::wstring remove_label;
+  std::wstring name_label;
+  std::wstring group_label;
+  std::wstring enabled_label;
+  std::wstring new_key_name;
+  std::wstring draft_label;
+  std::wstring deleted_label;
+  std::wstring auto_grouping_label;
+  std::wstring close_label;
+  std::wstring apply_label;
+  std::wstring hint;
+};
+
+// One staged edit of an existing key.
+struct GroupManagerUpdate {
+  std::wstring key_id;
+  std::wstring name;
+  std::wstring group_id;
+  bool enabled = true;
+};
+
+// What the sheet returns: the auto-grouping switch plus the key edits the user
+// staged in the master-detail editor.
+struct GroupManagerResult {
+  bool auto_grouping = false;
+  std::vector<std::pair<std::wstring, std::wstring>> creates;  // name, group id
+  std::vector<GroupManagerUpdate> updates;
+  std::vector<std::wstring> deletes;                           // key ids
+};
+
 class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
  public:
   static std::shared_ptr<WinUI3NativeLeaf> Shared();
@@ -81,6 +124,13 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       std::wstring_view title,
       bool allow_clear,
       bool present);
+  std::optional<GroupManagerResult> ShowGroupManager(
+      std::wstring title,
+      std::wstring account_label,
+      std::vector<std::pair<std::wstring, std::wstring>> groups,
+      std::vector<GroupManagerKey> keys,
+      GroupManagerLabels labels,
+      bool auto_grouping);
   bool SetLaunchAtLogin(bool enabled);
   void ShowVersion() const;
   void Quit();

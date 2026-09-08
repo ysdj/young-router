@@ -25,6 +25,7 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(ChooseModelsToAdd, L"chooseModelsToAdd");
   REACT_METHOD(SetLocalization, L"setLocalization");
   REACT_METHOD(EditSecret, L"editSecret");
+  REACT_METHOD(ShowGroupManager, L"showGroupManager");
   REACT_METHOD(ClearSecret, L"clearSecret");
   REACT_METHOD(CopySecret, L"copySecret");
   REACT_METHOD(RelayLogin, L"relayLogin");
@@ -82,6 +83,9 @@ struct WinUI3NativeLeafModule {
       std::optional<std::string> const& target,
       std::wstring const& title,
       bool allow_clear,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
+  void ShowGroupManager(
+      winrt::Microsoft::ReactNative::JSValueObject const& options,
       winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept;
   void ClearSecret(
       std::string const& domain,
