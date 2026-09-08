@@ -4,7 +4,7 @@ import { createIpcClient } from "./ipc";
 import { createNativeIpcTransport, createNativeLeafBridgeAdapter, type NativeIpcBridge, type NativeLeafBridge } from "./platform/nativeBridge";
 import { routeMenuActions } from "./routes";
 import { registerLiteLLMMenu } from "./bootstrap";
-import type { LanguagePreference, NativeLocalization, NativeMenuAction, NativeMenuAnchor, ServiceStatus } from "./types";
+import type { LanguagePreference, NativeLocalization, NativeMenuAction, NativeMenuAnchor, RelayGroupManagerGroup, RelayGroupManagerKey, RelayGroupManagerLabels, RelayGroupManagerResult, ServiceStatus } from "./types";
 
 type NativeModule = {
   send?: (request: string) => Promise<string>;
@@ -33,6 +33,14 @@ type NativeModule = {
   }) => Promise<void>;
   showCodexRestartConfirmation?: (title: string, message: string, restartLabel: string, laterLabel: string) => Promise<"restart" | "later" | undefined>;
   chooseModelsToAdd?: (models: string[], providerName: string, keyName: string) => Promise<string[] | undefined>;
+  showGroupManager?: (options: {
+    title: string;
+    accountLabel: string;
+    groups: RelayGroupManagerGroup[];
+    keys: RelayGroupManagerKey[];
+    labels: RelayGroupManagerLabels;
+    autoGrouping: boolean;
+  }) => Promise<RelayGroupManagerResult | undefined>;
   editSecret?: (
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav",
     field: string,
@@ -140,6 +148,7 @@ const nativeBridge: NativeLeafBridge = {
     : undefined,
   showCodexRestartConfirmation: async (title, message, restartLabel, laterLabel) => leaf.showCodexRestartConfirmation?.(title, message, restartLabel, laterLabel),
   chooseModelsToAdd: async (models, providerName, keyName) => leaf.chooseModelsToAdd?.(models, providerName, keyName),
+  showGroupManager: async (options) => leaf.showGroupManager?.(options),
   editSecret: async (domain, field, target, title, allowClear) => leaf.editSecret?.(domain, field, target, title, allowClear),
   clearSecret: async (domain, field, target) => leaf.clearSecret?.(domain, field, target),
   copySecret: async (domain, field, target) => leaf.copySecret?.(domain, field, target) ?? false,
