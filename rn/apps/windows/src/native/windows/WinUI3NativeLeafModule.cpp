@@ -499,6 +499,189 @@ void WinUI3NativeLeafModule::EditSecret(
   }
 }
 
+void WinUI3NativeLeafModule::ShowGroupManager(
+    winrt::Microsoft::ReactNative::JSValueObject const& options,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<winrt::Microsoft::ReactNative::JSValueObject>> const& promise) noexcept {
+  auto string_field = [&options](char const* name) -> std::optional<std::string> {
+    auto found = options.find(name);
+    if (found == options.end()) return std::nullopt;
+    auto value = found->second.TryGetString();
+    return value ? std::optional<std::string>(*value) : std::nullopt;
+  };
+  auto title = string_field("title");
+  auto account_label = string_field("accountLabel");
+  auto grouping_entry = options.find("autoGrouping");
+  std::optional<bool> auto_grouping;
+  if (grouping_entry != options.end()) {
+    if (auto const* checked = grouping_entry->second.TryGetBoolean()) auto_grouping = *checked;
+  }
+  bool valid = true;
+  std::vector<std::pair<std::wstring, std::wstring>> groups;
+  auto groups_entry = options.find("groups");
+  if (groups_entry == options.end()) {
+    valid = false;
+  } else {
+    auto const* array = groups_entry->second.TryGetArray();
+    if (array == nullptr || array->size() > 512) {
+      valid = false;
+    } else {
+      for (auto const& item : *array) {
+        auto const* object = item.TryGetObject();
+        if (!object) {
+          valid = false;
+          break;
+        }
+        std::optional<std::string> id;
+        std::optional<std::string> label;
+        for (auto const& [key, value] : *object) {
+          if (key == "id") {
+            if (auto const* text = value.TryGetString()) id = *text;
+          } else if (key == "label") {
+            if (auto const* text = value.TryGetString()) label = *text;
+          }
+        }
+        if (!id || id->size() > 256 || !label || label->empty() || label->size() > 256) {
+          valid = false;
+          break;
+        }
+        groups.emplace_back(Utf8ToWide(*id), Utf8ToWide(*label));
+      }
+    }
+  }
+  std::vector<LiteLLMMenu::GroupManagerKey> keys;
+  auto keys_entry = options.find("keys");
+  if (!valid || keys_entry == options.end()) {
+    valid = false;
+  } else {
+    auto const* array = keys_entry->second.TryGetArray();
+    if (array == nullptr || array->size() > 512) {
+      valid = false;
+    } else {
+      for (auto const& item : *array) {
+        auto const* object = item.TryGetObject();
+        if (!object) {
+          valid = false;
+          break;
+        }
+        std::optional<std::string> id;
+        std::optional<std::string> name;
+        std::optional<std::string> group_id;
+        std::optional<std::string> group_label;
+        std::optional<std::string> multiplier;
+        for (auto const& [key, value] : *object) {
+          auto const* text = value.TryGetString();
+          if (!text) continue;
+          if (key == "id") id = *text;
+          else if (key == "name") name = *text;
+          else if (key == "groupID") group_id = *text;
+          else if (key == "groupLabel") group_label = *text;
+          else if (key == "multiplier") multiplier = *text;
+        }
+        if (!id || id->size() > 256 || !name || name->empty() || name->size() > 256) {
+          valid = false;
+          break;
+        }
+        keys.push_back(LiteLLMMenu::GroupManagerKey{
+            Utf8ToWide(*id),
+            Utf8ToWide(*name),
+            Utf8ToWide(group_id.value_or("")),
+            Utf8ToWide(group_label.value_or("")),
+            Utf8ToWide(multiplier.value_or(""))});
+      }
+    }
+  }
+  LiteLLMMenu::GroupManagerLabels labels;
+  auto labels_entry = options.find("labels");
+  if (!valid || labels_entry == options.end()) {
+    valid = false;
+  } else {
+    auto const* object = labels_entry->second.TryGetObject();
+    if (!object) {
+      valid = false;
+    } else {
+      auto read = [object](char const* name) -> std::wstring {
+        auto found = object->find(name);
+        if (found == object->end()) return std::wstring{};
+        auto const* text = found->second.TryGetString();
+        return text ? Utf8ToWide(*text) : std::wstring{};
+      };
+      labels.list_label = read("listLabel");
+      labels.add_label = read("addLabel");
+      labels.remove_label = read("removeLabel");
+      labels.name_label = read("nameLabel");
+      labels.group_label = read("groupLabel");
+      labels.enabled_label = read("enabledLabel");
+      labels.new_key_name = read("newKeyName");
+      labels.draft_label = read("draftLabel");
+      labels.deleted_label = read("deletedLabel");
+      labels.auto_grouping_label = read("autoGroupingLabel");
+      labels.close_label = read("closeLabel");
+      labels.apply_label = read("applyLabel");
+      labels.hint = read("hint");
+      if (labels.add_label.empty() || labels.remove_label.empty() || labels.close_label.empty() || labels.apply_label.empty()) valid = false;
+    }
+  }
+  if (!title || title->empty() || title->size() > 320 ||
+      !account_label || account_label->size() > 320 ||
+      !auto_grouping || !valid) {
+    promise.Reject("The group manager input is invalid.");
+    return;
+  }
+  try {
+    auto ui_dispatcher = context_.UIDispatcher();
+    auto js_dispatcher = context_.JSDispatcher();
+    auto leaf = leaf_;
+    ui_dispatcher.Post([leaf,
+                        title = Utf8ToWide(*title),
+                        account_label = Utf8ToWide(*account_label),
+                        groups = std::move(groups),
+                        keys = std::move(keys),
+                        labels,
+                        auto_grouping = *auto_grouping,
+                        promise,
+                        js_dispatcher]() mutable {
+      std::optional<LiteLLMMenu::GroupManagerResult> result;
+      try {
+        result = leaf->ShowGroupManager(std::move(title), std::move(account_label), std::move(groups),
+                                        std::move(keys), labels, auto_grouping);
+      } catch (...) {
+      }
+      js_dispatcher.Post([promise, result = std::move(result)]() mutable {
+        if (!result) {
+          promise.Resolve(std::nullopt);
+          return;
+        }
+        winrt::Microsoft::ReactNative::JSValueObject value;
+        value["autoGrouping"] = result->auto_grouping;
+        winrt::Microsoft::ReactNative::JSValueArray creates;
+        for (auto const& [name, group_id] : result->creates) {
+          winrt::Microsoft::ReactNative::JSValueObject entry;
+          entry["name"] = winrt::to_string(name);
+          entry["groupID"] = winrt::to_string(group_id);
+          creates.push_back(std::move(entry));
+        }
+        value["creates"] = std::move(creates);
+        winrt::Microsoft::ReactNative::JSValueArray updates;
+        for (auto const& update : result->updates) {
+          winrt::Microsoft::ReactNative::JSValueObject entry;
+          entry["keyID"] = winrt::to_string(update.key_id);
+          entry["name"] = winrt::to_string(update.name);
+          entry["groupID"] = winrt::to_string(update.group_id);
+          entry["enabled"] = update.enabled;
+          updates.push_back(std::move(entry));
+        }
+        value["updates"] = std::move(updates);
+        winrt::Microsoft::ReactNative::JSValueArray deletes;
+        for (auto const& key_id : result->deletes) deletes.push_back(winrt::to_string(key_id));
+        value["deletes"] = std::move(deletes);
+        promise.Resolve(std::optional<winrt::Microsoft::ReactNative::JSValueObject>(std::move(value)));
+      });
+    });
+  } catch (...) {
+    promise.Resolve(std::nullopt);
+  }
+}
+
 void WinUI3NativeLeafModule::ClearSecret(
     std::string const& domain,
     std::string const& field,

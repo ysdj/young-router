@@ -490,6 +490,37 @@ export interface NativeLocalization {
   fileFilterAll: string;
 }
 
+/** One relay group offered by the station, as the group manager sheet sees it. */
+export type RelayGroupManagerGroup = { id: string; label: string };
+/** One relay API key with the group it currently belongs to. */
+export type RelayGroupManagerKey = { id: string; name: string; groupID: string; groupLabel: string; multiplier: string; enabled: boolean };
+/** Localized labels for the native group manager sheet. */
+export type RelayGroupManagerLabels = {
+  listLabel: string;
+  addLabel: string;
+  removeLabel: string;
+  nameLabel: string;
+  groupLabel: string;
+  enabledLabel: string;
+  newKeyName: string;
+  draftLabel: string;
+  deletedLabel: string;
+  autoGroupingLabel: string;
+  closeLabel: string;
+  applyLabel: string;
+  hint: string;
+};
+/**
+ * What the sheet returns: the auto-grouping switch plus the key edits the user
+ * staged in it. The provider window stages them through the Core actions.
+ */
+export type RelayGroupManagerResult = {
+  autoGrouping: boolean;
+  creates: Array<{ name: string; groupID: string }>;
+  updates: Array<{ keyID: string; name: string; groupID: string; enabled: boolean }>;
+  deletes: string[];
+};
+
 export interface NativeLeafAdapter {
   window: NativeWindow;
   menuBar: NativeMenuBar;
@@ -520,6 +551,15 @@ export interface NativeLeafAdapter {
     restartLabel: string;
     laterLabel: string;
   }): Promise<"restart" | "later" | undefined>;
+  /** Native subordinate sheet: the station's keys with their groups. */
+  showGroupManager(options: {
+    title: string;
+    accountLabel: string;
+    groups: RelayGroupManagerGroup[];
+    keys: RelayGroupManagerKey[];
+    labels: RelayGroupManagerLabels;
+    autoGrouping: boolean;
+  }): Promise<RelayGroupManagerResult | undefined>;
   chooseModelsToAdd(options: {
     models: string[];
     providerName: string;

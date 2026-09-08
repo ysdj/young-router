@@ -13,6 +13,8 @@
 #include <winreg.h>
 #include <winver.h>
 #include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.UI.h>
+#include <winrt/Windows.System.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Microsoft.UI.Interop.h>
 #include <winrt/Microsoft.UI.Windowing.h>
@@ -942,6 +944,457 @@ std::optional<NativeSecretEditResult> WinUI3NativeLeaf::EditSecret(
   if (!RunOwnedModalWindow(dialog, window_handle_, {520, 190}, finished)) result.reset();
   input.Password(L"");
   return result;
+}
+
+std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
+    std::wstring title,
+    std::wstring account_label,
+    std::vector<std::pair<std::wstring, std::wstring>> groups,
+    std::vector<GroupManagerKey> keys,
+    GroupManagerLabels labels,
+    bool auto_grouping) {
+  namespace xaml = winrt::Microsoft::UI::Xaml;
+  namespace controls = winrt::Microsoft::UI::Xaml::Controls;
+
+  struct SheetRow {
+    std::wstring id;
+    std::wstring name;
+    std::wstring group_id;
+    std::wstring group_label;
+    std::wstring multiplier;
+    std::wstring original_name;
+    std::wstring original_group_id;
+    bool original_enabled = true;
+    bool enabled = true;
+    bool deleted = false;
+    bool draft = false;
+  };
+
+  auto rows = std::make_shared<std::vector<SheetRow>>();
+  for (auto const& key : keys) {
+    SheetRow row;
+    row.id = key.id;
+    row.name = key.name;
+    row.group_id = key.group_id;
+    row.group_label = key.group_label;
+    row.multiplier = key.multiplier;
+    row.original_name = key.name;
+    row.original_group_id = key.group_id;
+    rows->push_back(std::move(row));
+  }
+  auto syncing = std::make_shared<bool>(false);
+  auto applied = std::make_shared<bool>(false);
+
+  auto theme_brush = [](wchar_t const* resource, winrt::Windows::UI::Color fallback) {
+    try {
+      auto resources = winrt::Microsoft::UI::Xaml::Application::Current().Resources();
+      auto value = resources.Lookup(winrt::box_value(winrt::hstring(resource)));
+      if (auto brush = value.try_as<winrt::Microsoft::UI::Xaml::Media::SolidColorBrush>()) return brush;
+    } catch (...) {
+    }
+    return winrt::Microsoft::UI::Xaml::Media::SolidColorBrush(fallback);
+  };
+  auto group_index_for = [&groups](std::wstring const& id) -> int32_t {
+    for (size_t index = 0; index < groups.size(); ++index) {
+      if (groups[index].first == id) return static_cast<int32_t>(index);
+    }
+    return -1;
+  };
+  auto group_label_for = [&groups](std::wstring const& id) {
+    for (auto const& entry : groups) {
+      if (entry.first == id) return entry.second;
+    }
+    return id;
+  };
+
+  xaml::Window dialog;
+  dialog.Title(winrt::hstring(title));
+  controls::StackPanel root;
+  root.Spacing(8);
+  root.Margin(xaml::Thickness{20, 16, 20, 16});
+
+  controls::TextBlock account;
+  account.FontSize(kUIFontSize);
+  account.Text(winrt::hstring(account_label));
+  account.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+  root.Children().Append(account);
+
+  // Master-detail body: the key list with the ＋ / － toolbar on the left, the
+  // selected key on the right, and Close / Apply in the footer.
+  controls::Grid layout;
+  controls::ColumnDefinition left_column;
+  left_column.Width(xaml::GridLengthHelper::FromPixels(360));
+  controls::ColumnDefinition right_column;
+  layout.ColumnDefinitions().Append(left_column);
+  layout.ColumnDefinitions().Append(right_column);
+  controls::RowDefinition body_row;
+  controls::RowDefinition footer_row;
+  footer_row.Height(xaml::GridLengthHelper::Auto());
+  layout.RowDefinitions().Append(body_row);
+  layout.RowDefinitions().Append(footer_row);
+
+  controls::Grid left;
+  controls::RowDefinition list_header_row;
+  list_header_row.Height(xaml::GridLengthHelper::Auto());
+  left.RowDefinitions().Append(list_header_row);
+  left.RowDefinitions().Append(controls::RowDefinition());
+  controls::Grid list_header;
+  controls::ColumnDefinition list_title_column;
+  controls::ColumnDefinition remove_column;
+  remove_column.Width(xaml::GridLengthHelper::Auto());
+  controls::ColumnDefinition add_column;
+  add_column.Width(xaml::GridLengthHelper::Auto());
+  list_header.ColumnDefinitions().Append(list_title_column);
+  list_header.ColumnDefinitions().Append(remove_column);
+  list_header.ColumnDefinitions().Append(add_column);
+  controls::TextBlock list_title;
+  list_title.FontSize(kUIFontSize);
+  list_title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+  list_title.Text(winrt::hstring(labels.list_label));
+  list_title.VerticalAlignment(xaml::VerticalAlignment::Center);
+  controls::Grid::SetColumn(list_title, 0);
+  list_header.Children().Append(list_title);
+  controls::Button add_button;
+  add_button.FontSize(kUIFontSize);
+  add_button.Content(winrt::box_value(winrt::hstring(L"+")));
+  add_button.MinWidth(26);
+  add_button.Margin(xaml::Thickness{6, 0, 0, 0});
+  controls::Grid::SetColumn(add_button, 2);
+  list_header.Children().Append(add_button);
+  controls::Button remove_button;
+  remove_button.FontSize(kUIFontSize);
+  remove_button.Content(winrt::box_value(winrt::hstring(L"\u2212")));
+  remove_button.MinWidth(26);
+  remove_button.Margin(xaml::Thickness{6, 0, 0, 0});
+  controls::Grid::SetColumn(remove_button, 1);
+  list_header.Children().Append(remove_button);
+  left.Children().Append(list_header);
+
+  controls::Border list_frame;
+  list_frame.BorderThickness(xaml::Thickness{1, 1, 1, 1});
+  list_frame.BorderBrush(theme_brush(
+      L"ControlStrokeColorDefaultBrush", winrt::Windows::UI::Color{255, 140, 140, 140}));
+  list_frame.Background(theme_brush(
+      L"ControlFillColorDefaultBrush", winrt::Windows::UI::Color{255, 255, 255, 255}));
+  controls::ListView list;
+  list.SelectionMode(controls::ListViewSelectionMode::Single);
+  list.IsItemClickEnabled(true);
+  list.Height(300);
+  list.Padding(xaml::Thickness{0, 0, 0, 0});
+  list.BorderThickness(xaml::Thickness{0, 0, 0, 0});
+  list.Background(theme_brush(
+      L"ControlFillColorDefaultBrush", winrt::Windows::UI::Color{255, 255, 255, 255}));
+  controls::ScrollViewer::SetVerticalScrollBarVisibility(list, controls::ScrollBarVisibility::Auto);
+  controls::ScrollViewer::SetHorizontalScrollBarVisibility(list, controls::ScrollBarVisibility::Disabled);
+  list_frame.Child(list);
+  controls::Grid::SetRow(list_frame, 1);
+  left.Children().Append(list_frame);
+  controls::Grid::SetColumn(left, 0);
+  layout.Children().Append(left);
+
+  controls::StackPanel detail;
+  detail.Spacing(8);
+  detail.Margin(xaml::Thickness{18, 0, 0, 0});
+  controls::CheckBox enabled_box;
+  enabled_box.FontSize(kUIFontSize);
+  enabled_box.Content(winrt::box_value(winrt::hstring(labels.enabled_label)));
+  detail.Children().Append(enabled_box);
+  controls::Grid name_row;
+  controls::ColumnDefinition name_caption;
+  name_caption.Width(xaml::GridLengthHelper::FromPixels(44));
+  name_row.ColumnDefinitions().Append(name_caption);
+  name_row.ColumnDefinitions().Append(controls::ColumnDefinition());
+  controls::TextBlock name_caption_text;
+  name_caption_text.FontSize(kUIFontSize);
+  name_caption_text.Text(winrt::hstring(labels.name_label));
+  name_caption_text.VerticalAlignment(xaml::VerticalAlignment::Center);
+  controls::Grid::SetColumn(name_caption_text, 0);
+  name_row.Children().Append(name_caption_text);
+  controls::TextBox name_box;
+  name_box.FontSize(kUIFontSize);
+  controls::Grid::SetColumn(name_box, 1);
+  name_row.Children().Append(name_box);
+  detail.Children().Append(name_row);
+  controls::Grid group_row;
+  controls::ColumnDefinition group_caption;
+  group_caption.Width(xaml::GridLengthHelper::FromPixels(44));
+  group_row.ColumnDefinitions().Append(group_caption);
+  group_row.ColumnDefinitions().Append(controls::ColumnDefinition());
+  controls::TextBlock group_caption_text;
+  group_caption_text.FontSize(kUIFontSize);
+  group_caption_text.Text(winrt::hstring(labels.group_label));
+  group_caption_text.VerticalAlignment(xaml::VerticalAlignment::Center);
+  controls::Grid::SetColumn(group_caption_text, 0);
+  group_row.Children().Append(group_caption_text);
+  controls::ComboBox group_picker;
+  group_picker.FontSize(kUIFontSize);
+  for (auto const& entry : groups) group_picker.Items().Append(winrt::box_value(winrt::hstring(entry.second)));
+  controls::Grid::SetColumn(group_picker, 1);
+  group_row.Children().Append(group_picker);
+  detail.Children().Append(group_row);
+  controls::TextBlock hint;
+  hint.FontSize(kUIFontSize);
+  hint.Text(winrt::hstring(labels.hint));
+  hint.TextWrapping(xaml::TextWrapping::Wrap);
+  hint.Foreground(theme_brush(
+      L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+  detail.Children().Append(hint);
+  controls::Grid::SetColumn(detail, 1);
+  layout.Children().Append(detail);
+
+  controls::Grid footer;
+  controls::ColumnDefinition footer_toggle;
+  controls::ColumnDefinition footer_actions;
+  footer_actions.Width(xaml::GridLengthHelper::Auto());
+  footer.ColumnDefinitions().Append(footer_toggle);
+  footer.ColumnDefinitions().Append(footer_actions);
+  controls::CheckBox toggle;
+  toggle.FontSize(kUIFontSize);
+  toggle.Content(winrt::box_value(winrt::hstring(labels.auto_grouping_label)));
+  toggle.IsChecked(auto_grouping);
+  toggle.VerticalAlignment(xaml::VerticalAlignment::Center);
+  auto toggle_on = [&toggle]() {
+    auto checked = toggle.IsChecked();
+    return checked && checked.Value();
+  };
+  controls::Grid::SetColumn(toggle, 0);
+  footer.Children().Append(toggle);
+  controls::StackPanel actions;
+  actions.Orientation(controls::Orientation::Horizontal);
+  actions.HorizontalAlignment(xaml::HorizontalAlignment::Right);
+  actions.Spacing(8);
+  controls::Button close;
+  close.FontSize(kUIFontSize);
+  close.Content(winrt::box_value(winrt::hstring(labels.close_label)));
+  controls::Button apply;
+  apply.FontSize(kUIFontSize);
+  apply.Content(winrt::box_value(winrt::hstring(labels.apply_label)));
+  actions.Children().Append(close);
+  actions.Children().Append(apply);
+  controls::Grid::SetColumn(actions, 1);
+  footer.Children().Append(actions);
+  controls::Grid::SetRow(footer, 1);
+  controls::Grid::SetColumnSpan(footer, 2);
+  layout.Children().Append(footer);
+
+  root.Children().Append(layout);
+  dialog.Content(root);
+
+  auto selected_index = [&list]() -> int32_t { return list.SelectedIndex(); };
+
+  auto load_detail = [&]() {
+    const int32_t selected = selected_index();
+    const bool has_row = selected >= 0 && static_cast<size_t>(selected) < rows->size();
+    const bool editable = !toggle_on() && has_row;
+    add_button.IsEnabled(!groups.empty() && !toggle_on());
+    remove_button.IsEnabled(editable);
+    enabled_box.IsEnabled(editable);
+    name_box.IsEnabled(editable);
+    group_picker.IsEnabled(editable && !groups.empty());
+    *syncing = true;
+    if (!has_row) {
+      enabled_box.IsChecked(false);
+      name_box.Text(L"");
+      group_picker.SelectedIndex(-1);
+    } else {
+      auto const& row = (*rows)[static_cast<size_t>(selected)];
+      enabled_box.IsChecked(row.enabled);
+      name_box.Text(winrt::hstring(row.name));
+      group_picker.SelectedIndex(group_index_for(row.group_id));
+    }
+    *syncing = false;
+  };
+
+  auto rebuild = [&]() {
+    *syncing = true;
+    const int32_t selected = selected_index();
+    list.Items().Clear();
+    for (size_t index = 0; index < rows->size(); ++index) {
+      auto const& row = (*rows)[index];
+      controls::Grid grid;
+      grid.MinHeight(22);
+      grid.Background(index % 2 == 1
+          ? theme_brush(L"SubtleFillColorTransparentBrush", winrt::Windows::UI::Color{20, 128, 128, 128})
+          : theme_brush(L"ControlFillColorDefaultBrush", winrt::Windows::UI::Color{255, 255, 255, 255}));
+      controls::ColumnDefinition row_name;
+      controls::ColumnDefinition row_group;
+      controls::ColumnDefinition row_detail;
+      row_group.Width(xaml::GridLengthHelper::Auto());
+      row_detail.Width(xaml::GridLengthHelper::Auto());
+      grid.ColumnDefinitions().Append(row_name);
+      grid.ColumnDefinitions().Append(row_group);
+      grid.ColumnDefinitions().Append(row_detail);
+      controls::TextBlock name;
+      name.FontSize(kUIFontSize);
+      name.Margin(xaml::Thickness{8, 0, 8, 0});
+      name.VerticalAlignment(xaml::VerticalAlignment::Center);
+      name.Text(winrt::hstring(row.name));
+      name.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+      name.Foreground(row.deleted
+          ? theme_brush(L"TextFillColorTertiaryBrush", winrt::Windows::UI::Color{255, 150, 150, 150})
+          : theme_brush(L"TextFillColorPrimaryBrush", winrt::Windows::UI::Color{255, 30, 30, 30}));
+      controls::Grid::SetColumn(name, 0);
+      grid.Children().Append(name);
+      controls::TextBlock group;
+      group.FontSize(kUIFontSize);
+      group.Margin(xaml::Thickness{0, 0, 8, 0});
+      group.VerticalAlignment(xaml::VerticalAlignment::Center);
+      group.Text(winrt::hstring(row.group_label));
+      group.Foreground(theme_brush(
+          L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+      controls::Grid::SetColumn(group, 1);
+      grid.Children().Append(group);
+      controls::TextBlock detail_text;
+      detail_text.FontSize(kUIFontSize);
+      detail_text.Margin(xaml::Thickness{0, 0, 8, 0});
+      detail_text.VerticalAlignment(xaml::VerticalAlignment::Center);
+      detail_text.Text(winrt::hstring(row.deleted ? labels.deleted_label : (row.draft ? labels.draft_label : row.multiplier)));
+      detail_text.Foreground(theme_brush(
+          L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+      controls::Grid::SetColumn(detail_text, 2);
+      grid.Children().Append(detail_text);
+      list.Items().Append(grid);
+    }
+    if (selected >= 0 && static_cast<size_t>(selected) < rows->size()) {
+      list.SelectedIndex(selected);
+    } else {
+      list.SelectedIndex(-1);
+    }
+    *syncing = false;
+    load_detail();
+  };
+
+  auto commit_name = [&]() {
+    const int32_t selected = selected_index();
+    if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
+    std::wstring value(name_box.Text());
+    const auto first = value.find_first_not_of(L" \t");
+    const auto last = value.find_last_not_of(L" \t");
+    value = first == std::wstring::npos ? std::wstring{} : value.substr(first, last - first + 1);
+    if (value.empty()) {
+      *syncing = true;
+      name_box.Text(winrt::hstring((*rows)[static_cast<size_t>(selected)].name));
+      *syncing = false;
+      return;
+    }
+    if (value == (*rows)[static_cast<size_t>(selected)].name) return;
+    (*rows)[static_cast<size_t>(selected)].name = value;
+    rebuild();
+  };
+
+  list.SelectionChanged([&](auto const&, auto const&) {
+    if (*syncing) return;
+    load_detail();
+  });
+  add_button.Click([&](auto const&, auto const&) {
+    if (groups.empty()) return;
+    std::wstring base = labels.new_key_name.empty() ? std::wstring(L"New key") : labels.new_key_name;
+    std::wstring name = base;
+    int suffix = 2;
+    auto taken = [&rows](std::wstring const& candidate) {
+      for (auto const& row : *rows) {
+        if (row.name == candidate) return true;
+      }
+      return false;
+    };
+    while (taken(name)) {
+      name = base + L" " + std::to_wstring(suffix);
+      ++suffix;
+    }
+    SheetRow row;
+    row.id = L"draft";
+    row.name = name;
+    row.group_id = groups.front().first;
+    row.group_label = groups.front().second;
+    row.original_group_id = row.group_id;
+    row.draft = true;
+    rows->push_back(std::move(row));
+    rebuild();
+    list.SelectedIndex(static_cast<int32_t>(rows->size()) - 1);
+    name_box.Focus(winrt::Microsoft::UI::Xaml::FocusState::Programmatic);
+  });
+  remove_button.Click([&](auto const&, auto const&) {
+    const int32_t selected = selected_index();
+    if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
+    if ((*rows)[static_cast<size_t>(selected)].draft) {
+      rows->erase(rows->begin() + selected);
+      rebuild();
+      list.SelectedIndex(-1);
+      load_detail();
+    } else {
+      (*rows)[static_cast<size_t>(selected)].deleted = !(*rows)[static_cast<size_t>(selected)].deleted;
+      rebuild();
+      list.SelectedIndex(selected);
+      load_detail();
+    }
+  });
+  enabled_box.Click([&](auto const& sender, auto const&) {
+    if (*syncing) return;
+    const int32_t selected = selected_index();
+    if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
+    auto checked = sender.as<controls::CheckBox>().IsChecked();
+    (*rows)[static_cast<size_t>(selected)].enabled = checked && checked.Value();
+    rebuild();
+    list.SelectedIndex(selected);
+  });
+  group_picker.SelectionChanged([&](auto const&, auto const&) {
+    if (*syncing) return;
+    const int32_t selected = selected_index();
+    const auto group_index = group_picker.SelectedIndex();
+    if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
+    if (group_index < 0 || static_cast<size_t>(group_index) >= groups.size()) return;
+    (*rows)[static_cast<size_t>(selected)].group_id = groups[static_cast<size_t>(group_index)].first;
+    (*rows)[static_cast<size_t>(selected)].group_label = groups[static_cast<size_t>(group_index)].second;
+    rebuild();
+    list.SelectedIndex(selected);
+  });
+  name_box.LostFocus([&](auto const&, auto const&) {
+    if (*syncing) return;
+    commit_name();
+  });
+  name_box.KeyDown([&](auto const&, winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args) {
+    if (args.Key() != winrt::Windows::System::VirtualKey::Enter) return;
+    commit_name();
+  });
+  toggle.Click([&](auto const&, auto const&) { load_detail(); });
+  close.Click([&](auto const&, auto const&) {
+    *applied = false;
+    dialog.Close();
+  });
+  apply.Click([&](auto const&, auto const&) {
+    commit_name();
+    *applied = true;
+    dialog.Close();
+  });
+
+  std::optional<GroupManagerResult> outcome;
+  bool finished = false;
+  dialog.Closed([&](auto const&, auto const&) {
+    finished = true;
+    if (!*applied) return;
+    GroupManagerResult result;
+    auto checked = toggle.IsChecked();
+    result.auto_grouping = checked && checked.Value();
+    for (auto const& row : *rows) {
+      if (row.draft) {
+        if (!row.name.empty()) result.creates.emplace_back(row.name, row.group_id);
+        continue;
+      }
+      if (row.deleted) {
+        result.deletes.push_back(row.id);
+        continue;
+      }
+      if (row.name != row.original_name || row.group_id != row.original_group_id || row.enabled != row.original_enabled) {
+        result.updates.push_back(GroupManagerUpdate{row.id, row.name, row.group_id, row.enabled});
+      }
+    }
+    outcome = std::move(result);
+  });
+
+  rebuild();
+  load_detail();
+  if (!RunOwnedModalWindow(dialog, window_handle_, {780, 480}, finished)) return std::nullopt;
+  return outcome;
 }
 
 bool WinUI3NativeLeaf::SetLaunchAtLogin(bool enabled) {

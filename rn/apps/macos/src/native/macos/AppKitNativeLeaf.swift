@@ -112,6 +112,9 @@ private enum NativeRelayOriginPolicy {
     private var approvedCloseRoutes: Set<String> = []
     private var codexRestartConfirmationPanel: NSPanel?
     private var codexRestartConfirmationCompletion: ((String) -> Void)?
+    private var groupManagerSheet: NSPanel?
+    private var groupManagerCompletionBlock: ((NativeGroupManagerResult?) -> Void)?
+    private var groupManagerController: NativeGroupManagerController?
     private var activeReadOnlyCodeController: NativeReadOnlyCodeController?
     // Official device-code browser flow. The controller is deliberately
     // separate from relay login: it never installs script message handlers or
@@ -525,6 +528,92 @@ private enum NativeRelayOriginPolicy {
 
     @objc private func selectCodexRestartNow(_ sender: NSButton) {
         finishCodexRestartConfirmation(choice: "restart")
+    }
+
+    /// Native subordinate sheet of the provider window: the station's API
+    /// keys beside the group each one belongs to.  The sheet drafts its edits
+    /// locally and returns them as staged actions, so every Core write still
+    /// happens in the shared provider window.
+    func showGroupManager(
+        title: String,
+        accountLabel: String,
+        groups: [[String: String]],
+        keys: [[String: String]],
+        labels: [String: String],
+        autoGrouping: Bool,
+        completion: @escaping (NativeGroupManagerResult?) -> Void
+    ) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.showGroupManager(
+                    title: title,
+                    accountLabel: accountLabel,
+                    groups: groups,
+                    keys: keys,
+                    labels: labels,
+                    autoGrouping: autoGrouping,
+                    completion: completion
+                )
+            }
+            return
+        }
+        let options = groups.compactMap { entry -> NativeGroupManagerController.GroupOption? in
+            guard let id = entry["id"], let label = entry["label"], !label.isEmpty else { return nil }
+            return NativeGroupManagerController.GroupOption(id: id, label: label)
+        }
+        let rows = keys.compactMap { entry -> NativeGroupManagerController.KeyRow? in
+            guard let id = entry["id"], let name = entry["name"] else { return nil }
+            let groupID = entry["groupID"] ?? ""
+            let enabled = (entry["enabled"] ?? "1") != "0"
+            return NativeGroupManagerController.KeyRow(
+                id: id,
+                name: name,
+                groupID: groupID,
+                groupLabel: entry["groupLabel"] ?? groupID,
+                multiplier: entry["multiplier"] ?? "",
+                originalName: name,
+                originalGroupID: groupID,
+                originalEnabled: enabled,
+                enabled: enabled,
+                deleted: false,
+                isDraft: false
+            )
+        }
+        guard let sheetParent = routeWindows["providers-models"], rows.count <= 512, options.count <= 512 else {
+            completion(nil)
+            return
+        }
+        let controller = NativeGroupManagerController(
+            title: title,
+            accountLabel: accountLabel,
+            groups: options,
+            rows: rows,
+            labels: labels,
+            autoGrouping: autoGrouping
+        )
+        groupManagerController = controller
+        groupManagerCompletionBlock = completion
+        guard let panel = controller.makeSheet() else {
+            groupManagerController = nil
+            groupManagerCompletionBlock = nil
+            completion(nil)
+            return
+        }
+        groupManagerSheet = panel
+        NSApp.activate(ignoringOtherApps: true)
+        withoutAnimations {
+            sheetParent.beginSheet(panel) { [weak self] _ in
+                guard let self else { return }
+                // Any dismissal path — the sheet's own Close button or the
+                // provider window going away — resolves the pending promise.
+                let result = self.groupManagerController?.resultOnEnd()
+                let completion = self.groupManagerCompletionBlock
+                self.groupManagerCompletionBlock = nil
+                self.groupManagerSheet = nil
+                self.groupManagerController = nil
+                completion?(result)
+            }
+        }
     }
 
     private func finishCodexRestartConfirmation(choice: String) {
@@ -1710,6 +1799,500 @@ private final class NeutralDefaultButton: NSButton {
         keyEquivalent = ""
         super.draw(dirtyRect)
         keyEquivalent = "\r"
+    }
+}
+
+
+/// Thin separator frame around a native list inside a sheet, matching the
+/// shared table's frame instead of a heavier bezel box.
+private final class NativeListFrameView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.borderWidth = 1
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.borderColor = NSColor.separatorColor.cgColor
+    }
+}
+
+/// Result of the native group manager sheet: the auto-grouping switch plus the
+/// key edits the user staged in the master-detail editor.
+struct NativeGroupManagerResult {
+    struct Create {
+        let name: String
+        let groupID: String
+    }
+
+    struct Update {
+        let keyID: String
+        let name: String
+        let groupID: String
+        let enabled: Bool
+    }
+
+    let autoGrouping: Bool
+    let creates: [Create]
+    let updates: [Update]
+    let deletes: [String]
+}
+
+/// The group manager sheet: the pre-refactor master-detail editor.  The left
+/// list carries the keys with their group and rate plus the ＋/－ toolbar, the
+/// right pane edits the selected key, and the bottom bar applies or discards
+/// the staged edits.  Manual edits follow the auto-grouping switch because
+/// Core rejects them while automatic grouping owns the layout.
+private final class NativeGroupManagerController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+    struct GroupOption {
+        let id: String
+        let label: String
+    }
+
+    struct KeyRow {
+        let id: String
+        var name: String
+        var groupID: String
+        var groupLabel: String
+        var multiplier: String
+        let originalName: String
+        let originalGroupID: String
+        let originalEnabled: Bool
+        var enabled: Bool
+        var deleted: Bool
+        let isDraft: Bool
+    }
+
+    private let title: String
+    private let accountLabel: String
+    private let groups: [GroupOption]
+    private var rows: [KeyRow]
+    private let labels: [String: String]
+    private let initialAutoGrouping: Bool
+    private var syncingSelection = false
+    private var applied = false
+
+    private weak var panel: NSPanel?
+    private weak var table: NSTableView?
+    private weak var addButton: NSButton?
+    private weak var removeButton: NSButton?
+    private weak var enabledCheckbox: NSButton?
+    private weak var nameField: NSTextField?
+    private weak var groupPopUp: NSPopUpButton?
+    private weak var toggle: NSButton?
+
+    init(title: String, accountLabel: String, groups: [GroupOption], rows: [KeyRow], labels: [String: String], autoGrouping: Bool) {
+        self.title = title
+        self.accountLabel = accountLabel
+        self.groups = groups
+        self.rows = rows
+        self.labels = labels
+        self.initialAutoGrouping = autoGrouping
+    }
+
+    private func label(_ key: String, _ fallback: String = "") -> String {
+        let value = labels[key] ?? ""
+        return value.isEmpty ? fallback : value
+    }
+
+    private func groupLabel(for groupID: String) -> String {
+        groups.first(where: { $0.id == groupID })?.label ?? groupID
+    }
+
+    private func selectedGroupID(from popUp: NSPopUpButton?) -> String? {
+        guard let popUp, popUp.indexOfSelectedItem >= 0, popUp.indexOfSelectedItem < groups.count else { return nil }
+        return groups[popUp.indexOfSelectedItem].id
+    }
+
+    private var editingEnabled: Bool {
+        toggle?.state == .off
+    }
+
+    func makeSheet() -> NSPanel? {
+        let rowHeight: CGFloat = 22
+        let listHeight = min(360, max(120, CGFloat(rows.count + 1) * rowHeight + 2))
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 172 + listHeight),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        configureImmediatePresentation(panel)
+        panel.title = title
+        panel.isReleasedWhenClosed = false
+        self.panel = panel
+
+        let content = NSView()
+        panel.contentView = content
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        let accountField = NSTextField(labelWithString: accountLabel)
+        accountField.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        accountField.textColor = .secondaryLabelColor
+        accountField.lineBreakMode = .byTruncatingMiddle
+        accountField.maximumNumberOfLines = 1
+
+        // Left column: the key list with the ＋ / － toolbar.
+        let listTitle = NSTextField(labelWithString: label("listLabel"))
+        listTitle.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        let removeButton = NSButton(title: "", target: self, action: #selector(removeSelectedKey(_:)))
+        removeButton.bezelStyle = .rounded
+        removeButton.image = NSImage(named: NSImage.removeTemplateName)
+        removeButton.imagePosition = .imageOnly
+        removeButton.toolTip = label("removeLabel")
+        removeButton.setAccessibilityLabel(label("removeLabel"))
+        self.removeButton = removeButton
+        let addButton = NSButton(title: "", target: self, action: #selector(addDraftKey(_:)))
+        addButton.bezelStyle = .rounded
+        addButton.image = NSImage(named: NSImage.addTemplateName)
+        addButton.imagePosition = .imageOnly
+        addButton.toolTip = label("addLabel")
+        addButton.setAccessibilityLabel(label("addLabel"))
+        self.addButton = addButton
+
+        // The key list is the shared striped native table.
+        let listFrame = NativeListFrameView()
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .legacy
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("key-name"))
+        nameColumn.width = 170
+        let groupColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("key-group"))
+        groupColumn.width = 110
+        let multiplierColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("key-multiplier"))
+        multiplierColumn.width = 56
+        let table = NSTableView()
+        table.headerView = nil
+        table.style = .plain
+        table.addTableColumn(nameColumn)
+        table.addTableColumn(groupColumn)
+        table.addTableColumn(multiplierColumn)
+        table.rowHeight = rowHeight
+        table.intercellSpacing = .zero
+        table.gridStyleMask = []
+        table.usesAlternatingRowBackgroundColors = true
+        table.allowsColumnReordering = false
+        table.allowsMultipleSelection = false
+        table.allowsEmptySelection = true
+        table.focusRingType = .none
+        table.dataSource = self
+        table.delegate = self
+        self.table = table
+        scrollView.documentView = table
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        listFrame.addSubview(scrollView)
+
+        // Right column: the selected key.
+        let enabledCheckbox = NSButton(checkboxWithTitle: label("enabledLabel"), target: self, action: #selector(toggleSelectedEnabled(_:)))
+        enabledCheckbox.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        self.enabledCheckbox = enabledCheckbox
+        let nameLabel = NSTextField(labelWithString: label("nameLabel"))
+        nameLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        nameLabel.textColor = .secondaryLabelColor
+        let nameField = NSTextField(string: "")
+        nameField.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        nameField.delegate = self
+        nameField.target = self
+        nameField.action = #selector(commitNameField(_:))
+        nameField.setAccessibilityLabel(label("nameLabel"))
+        self.nameField = nameField
+        let groupFieldLabel = NSTextField(labelWithString: label("groupLabel"))
+        groupFieldLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        groupFieldLabel.textColor = .secondaryLabelColor
+        let groupPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
+        groupPopUp.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        groupPopUp.addItems(withTitles: groups.map { $0.label })
+        groupPopUp.target = self
+        groupPopUp.action = #selector(changeSelectedGroup(_:))
+        groupPopUp.setAccessibilityLabel(label("groupLabel"))
+        self.groupPopUp = groupPopUp
+        let hint = NSTextField(labelWithString: label("hint"))
+        hint.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        hint.textColor = .secondaryLabelColor
+        hint.lineBreakMode = .byWordWrapping
+        hint.maximumNumberOfLines = 3
+
+        let toggle = NSButton(checkboxWithTitle: label("autoGroupingLabel"), target: self, action: #selector(toggleAutoGrouping(_:)))
+        toggle.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        toggle.state = initialAutoGrouping ? .on : .off
+        self.toggle = toggle
+        let closeButton = NSButton(title: label("closeLabel"), target: self, action: #selector(closeSheet(_:)))
+        closeButton.bezelStyle = .rounded
+        closeButton.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        let applyButton = NSButton(title: label("applyLabel"), target: self, action: #selector(applySheet(_:)))
+        applyButton.bezelStyle = .rounded
+        applyButton.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        applyButton.keyEquivalent = "\r"
+        applyButton.keyEquivalentModifierMask = []
+
+        [titleLabel, accountField, listTitle, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, hint, toggle, closeButton, applyButton].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview($0)
+        }
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            accountField.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            accountField.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            accountField.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
+            listTitle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            listTitle.topAnchor.constraint(equalTo: accountField.bottomAnchor, constant: 12),
+            removeButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            removeButton.centerYAnchor.constraint(equalTo: listTitle.centerYAnchor),
+            removeButton.widthAnchor.constraint(equalToConstant: 26),
+            addButton.trailingAnchor.constraint(equalTo: removeButton.leadingAnchor, constant: -6),
+            addButton.centerYAnchor.constraint(equalTo: listTitle.centerYAnchor),
+            addButton.widthAnchor.constraint(equalToConstant: 26),
+            listFrame.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            listFrame.topAnchor.constraint(equalTo: listTitle.bottomAnchor, constant: 6),
+            listFrame.widthAnchor.constraint(equalToConstant: 360),
+            listFrame.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),
+            scrollView.leadingAnchor.constraint(equalTo: listFrame.leadingAnchor, constant: 1),
+            scrollView.trailingAnchor.constraint(equalTo: listFrame.trailingAnchor, constant: -1),
+            scrollView.topAnchor.constraint(equalTo: listFrame.topAnchor, constant: 1),
+            scrollView.bottomAnchor.constraint(equalTo: listFrame.bottomAnchor, constant: -1),
+            enabledCheckbox.leadingAnchor.constraint(equalTo: listFrame.trailingAnchor, constant: 18),
+            enabledCheckbox.topAnchor.constraint(equalTo: listFrame.topAnchor),
+            nameLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
+            nameLabel.topAnchor.constraint(equalTo: enabledCheckbox.bottomAnchor, constant: 12),
+            nameLabel.widthAnchor.constraint(equalToConstant: 44),
+            nameField.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 8),
+            nameField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            nameField.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
+            groupFieldLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
+            groupFieldLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 10),
+            groupFieldLabel.widthAnchor.constraint(equalToConstant: 44),
+            groupPopUp.leadingAnchor.constraint(equalTo: groupFieldLabel.trailingAnchor, constant: 8),
+            groupPopUp.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            groupPopUp.centerYAnchor.constraint(equalTo: groupFieldLabel.centerYAnchor),
+            hint.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
+            hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            hint.topAnchor.constraint(equalTo: groupFieldLabel.bottomAnchor, constant: 14),
+            toggle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            toggle.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            applyButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            applyButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
+            closeButton.trailingAnchor.constraint(equalTo: applyButton.leadingAnchor, constant: -8),
+            closeButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
+        ])
+        loadDetail()
+        return panel
+    }
+
+    /// The detail pane follows the list selection and the auto-grouping switch.
+    private func loadDetail() {
+        guard let table else { return }
+        let index = table.selectedRow
+        let hasRow = index >= 0 && index < rows.count
+        let editable = editingEnabled && hasRow
+        addButton?.isEnabled = editingEnabled && !groups.isEmpty
+        removeButton?.isEnabled = editable
+        enabledCheckbox?.isEnabled = editable
+        nameField?.isEnabled = editable
+        groupPopUp?.isEnabled = editable && !groups.isEmpty
+        guard hasRow else {
+            enabledCheckbox?.state = .off
+            nameField?.stringValue = ""
+            syncingSelection = true
+            groupPopUp?.selectItem(at: -1)
+            syncingSelection = false
+            return
+        }
+        let row = rows[index]
+        enabledCheckbox?.state = row.enabled ? .on : .off
+        nameField?.stringValue = row.name
+        syncingSelection = true
+        if let groupIndex = groups.firstIndex(where: { $0.id == row.groupID }) {
+            groupPopUp?.selectItem(at: groupIndex)
+        } else {
+            groupPopUp?.selectItem(at: -1)
+        }
+        syncingSelection = false
+    }
+
+    private func reloadAndSelect(_ index: Int) {
+        table?.reloadData()
+        if index >= 0 && index < rows.count {
+            table?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        } else {
+            table?.deselectAll(nil)
+        }
+        loadDetail()
+    }
+
+    private func commitNameField() {
+        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
+        let value = (nameField?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            nameField?.stringValue = rows[index].name
+            return
+        }
+        guard value != rows[index].name else { return }
+        rows[index].name = value
+        reloadAndSelect(index)
+    }
+
+    @objc private func commitNameField(_ sender: NSTextField) {
+        commitNameField()
+    }
+
+    @objc private func addDraftKey(_ sender: NSButton) {
+        guard let groupID = groups.first?.id else { return }
+        let base = label("newKeyName", "New key")
+        var name = base
+        var suffix = 2
+        let existing = Set(rows.map { $0.name })
+        while existing.contains(name) {
+            name = "\(base) \(suffix)"
+            suffix += 1
+        }
+        rows.append(KeyRow(
+            id: "draft:\(UUID().uuidString)",
+            name: name,
+            groupID: groupID,
+            groupLabel: groupLabel(for: groupID),
+            multiplier: "",
+            originalName: "",
+            originalGroupID: groupID,
+            originalEnabled: true,
+            enabled: true,
+            deleted: false,
+            isDraft: true
+        ))
+        let index = rows.count - 1
+        table?.reloadData()
+        table?.scrollRowToVisible(index)
+        reloadAndSelect(index)
+        panel?.makeFirstResponder(nameField)
+    }
+
+    @objc private func removeSelectedKey(_ sender: NSButton) {
+        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
+        if rows[index].isDraft {
+            rows.remove(at: index)
+            reloadAndSelect(-1)
+            return
+        }
+        rows[index].deleted.toggle()
+        reloadAndSelect(index)
+    }
+
+    @objc private func toggleSelectedEnabled(_ sender: NSButton) {
+        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
+        rows[index].enabled = sender.state == .on
+        reloadAndSelect(index)
+    }
+
+    @objc private func changeSelectedGroup(_ sender: NSPopUpButton) {
+        // loadDetail() also selects an item; only a user choice edits a row.
+        guard !syncingSelection else { return }
+        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
+        guard let groupID = selectedGroupID(from: sender) else { return }
+        rows[index].groupID = groupID
+        rows[index].groupLabel = groupLabel(for: groupID)
+        reloadAndSelect(index)
+    }
+
+    @objc private func toggleAutoGrouping(_ sender: NSButton) {
+        loadDetail()
+    }
+
+    @objc private func closeSheet(_ sender: NSButton) {
+        applied = false
+        if let panel, let parent = panel.sheetParent {
+            parent.endSheet(panel)
+        }
+    }
+
+    @objc private func applySheet(_ sender: NSButton) {
+        commitNameField()
+        applied = true
+        if let panel, let parent = panel.sheetParent {
+            parent.endSheet(panel)
+        }
+    }
+
+    /// The staged edits, or nil when the user closed the sheet without applying.
+    func resultOnEnd() -> NativeGroupManagerResult? {
+        guard applied else { return nil }
+        return NativeGroupManagerResult(
+            autoGrouping: (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on,
+            creates: rows.filter { $0.isDraft && !$0.deleted && !$0.name.isEmpty }.map {
+                NativeGroupManagerResult.Create(name: $0.name, groupID: $0.groupID)
+            },
+            updates: rows.filter {
+                !$0.isDraft && !$0.deleted && ($0.name != $0.originalName || $0.groupID != $0.originalGroupID || $0.enabled != $0.originalEnabled)
+            }.map {
+                NativeGroupManagerResult.Update(keyID: $0.id, name: $0.name, groupID: $0.groupID, enabled: $0.enabled)
+            },
+            deletes: rows.filter { !$0.isDraft && $0.deleted }.map { $0.id }
+        )
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        rows.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row >= 0 && row < rows.count else { return nil }
+        let entry = rows[row]
+        let columnID = tableColumn?.identifier.rawValue ?? "key-name"
+        let isName = columnID == "key-name"
+        let value: String
+        if isName {
+            value = entry.name
+        } else if columnID == "key-group" {
+            value = entry.groupLabel
+        } else {
+            value = entry.deleted ? label("deletedLabel") : (entry.isDraft ? label("draftLabel") : entry.multiplier)
+        }
+        let identifier = NSUserInterfaceItemIdentifier("group-manager-\(columnID)")
+        let cell: NSTableCellView
+        if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView {
+            cell = reused
+        } else {
+            cell = NSTableCellView()
+            cell.identifier = identifier
+            let label = NSTextField(labelWithString: "")
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+            label.lineBreakMode = .byTruncatingTail
+            label.maximumNumberOfLines = 1
+            cell.addSubview(label)
+            cell.textField = label
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
+                label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+        let text = cell.textField
+        text?.stringValue = value
+        text?.toolTip = value
+        text?.textColor = entry.deleted ? .tertiaryLabelColor : (isName ? .labelColor : .secondaryLabelColor)
+        cell.setAccessibilityLabel(value)
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        if syncingSelection { return }
+        loadDetail()
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        commitNameField()
     }
 }
 

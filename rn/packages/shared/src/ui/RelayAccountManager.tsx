@@ -487,43 +487,6 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
 
 type AccountLoading = { session: boolean; resources: boolean };
 
-/** 下级分组管理 dialog: the station's group list plus the auto-grouping switch. */
-export function StationGroupManagerDialog({ visible, account, disabled, translate, onClose, onAutoGrouping }: {
-  visible: boolean;
-  account: RelayAccount;
-  disabled: boolean;
-  translate: Translate;
-  onClose: () => void;
-  onAutoGrouping: (enabled: boolean) => void;
-}): React.JSX.Element {
-  const keysInGroup = (groupID: string): number => account.resources.filter((resource) => resource.groupID === groupID).length;
-  return <RelayDialogLayer visible={visible} onRequestClose={onClose}>
-    <View style={styles.dialogBackdrop}>
-      <View style={styles.decisionDialog} accessibilityViewIsModal>
-        <View style={styles.dialogHeader}><Text style={styles.dialogTitle}>{translate("relay.groupManager")}</Text><NativeButton title={translate("menu.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} /></View>
-        <View style={styles.decisionContent}>
-          {account.groups.length > 0 ? <View style={styles.groupManagerList}>
-            {account.groups.map((group) => <View key={group.id} style={styles.groupManagerRow}>
-              <Text numberOfLines={1} style={styles.groupManagerName}>{groupLabel(group, translate)}</Text>
-              <Text numberOfLines={1} style={styles.groupManagerMeta}>{translate("relay.groupKeysCount", { count: keysInGroup(group.id) })}</Text>
-            </View>)}
-          </View> : <Text style={styles.decisionMessage}>{translate("relay.groupsEmpty")}</Text>}
-          <View style={styles.groupManagerAutoRow}>
-            <NativeCheckbox
-              key={`auto-grouping:${account.id}`}
-              label={translate("relay.apiKeyAutoGrouping")}
-              value={account.autoGrouping}
-              disabled={disabled}
-              onValueChange={onAutoGrouping}
-            />
-          </View>
-        </View>
-        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("menu.close")} compact disabled={disabled} onPress={onClose} /></View></View>
-      </View>
-    </View>
-  </RelayDialogLayer>;
-}
-
 /**
  * 账号管理 for one relay station: list, add (native webview login), re-login,
  * rename, remember-password, refresh, and remove accounts, plus the station
@@ -580,7 +543,6 @@ export function StationAccountsPanel({
   const [formBusy, setFormBusy] = useState(false);
   const [removal, setRemoval] = useState<{ account: RelayAccount }>();
   const [removalPolicy, setRemovalPolicy] = useState<LocalDependencyPolicy>("detach");
-  const [groupManagerOpen, setGroupManagerOpen] = useState(false);
   // What a sign-in may save is asked by the native login flow after the
   // webview login succeeds; adding an account goes straight to sign-in.
   const beginAddLogin = async (): Promise<void> => {
@@ -855,6 +817,83 @@ export function StationAccountsPanel({
       setStationBusy(false);
     }
   };
+  // 分组管理 is the provider window's native subordinate sheet: the
+  // pre-refactor master-detail editor with the key list (＋ / －), the selected
+  // key's detail, and Close / Apply at the bottom.  Apply returns the staged
+  // edits; Close discards them.  Core rejects manual key writes while
+  // automatic grouping owns the layout, so the switch is staged around them.
+  const openGroupManager = async (): Promise<void> => {
+    const account = selected;
+    if (!account || !native.showGroupManager) return;
+    const groups = account.groups
+      .filter((group) => group.id !== "")
+      .map((group) => ({ id: group.id, label: groupLabel(group, translate) }));
+    if (account.type === "newapi") groups.unshift({ id: "", label: translate("relay.apiKeyUngrouped") });
+    // A key can point at a group the station no longer offers; keep it
+    // selectable so the picker never shows a different group than the row.
+    for (const resource of account.resources) {
+      if (resource.groupID && !groups.some((group) => group.id === resource.groupID)) {
+        groups.push({ id: resource.groupID, label: resourceGroupName(resource, account.groups, translate) });
+      }
+    }
+    const result = await native.showGroupManager({
+      title: translate("relay.groupManager"),
+      accountLabel: accountDisplayName(account, translate),
+      groups,
+      keys: account.resources.map((resource) => ({
+        id: resource.id,
+        name: resource.apiName || resource.name,
+        groupID: resource.groupID,
+        groupLabel: resourceGroupName(resource, account.groups, translate),
+        multiplier: resourceGroupMultiplier(resource, account.groups, translate),
+        enabled: resource.enabled,
+      })),
+      labels: {
+        listLabel: translate("providers.keys"),
+        addLabel: translate("common.add"),
+        removeLabel: translate("common.delete"),
+        nameLabel: translate("common.name"),
+        groupLabel: translate("relay.apiKeyGroup"),
+        enabledLabel: translate("common.enable"),
+        newKeyName: translate("relay.apiKeyNewName"),
+        draftLabel: translate("relay.apiKeyDraftLabel"),
+        deletedLabel: translate("relay.apiKeyDeletedLabel"),
+        autoGroupingLabel: translate("relay.apiKeyAutoGrouping"),
+        closeLabel: translate("menu.close"),
+        applyLabel: translate("menu.apply"),
+        hint: translate("relay.groupManagerHint"),
+      },
+      autoGrouping: account.autoGrouping,
+    });
+    if (!result) return;
+    setFormBusy(true);
+    setFeedback(undefined);
+    try {
+      // Manual key writes are rejected while auto-grouping owns the layout, so
+      // turning it off is staged first and turning it on is staged last.
+      if (account.autoGrouping && !result.autoGrouping) await apiKeyActions?.setAutoGrouping?.(account.id, false);
+      for (const create of result.creates) {
+        await apiKeyActions?.create?.(account.id, { name: create.name, groupID: create.groupID, enabled: true });
+      }
+      for (const update of result.updates) {
+        const resource = account.resources.find((item) => item.id === update.keyID);
+        if (!resource) continue;
+        if (update.name !== (resource.apiName || resource.name)) await apiKeyActions?.update?.(account.id, update.keyID, update.name);
+        if (update.groupID !== resource.groupID) await apiKeyActions?.setGroup?.(account.id, update.keyID, update.groupID);
+        if (update.enabled !== resource.enabled) await apiKeyActions?.setEnabled?.(account.id, update.keyID, update.enabled);
+      }
+      for (const keyID of result.deletes) {
+        await apiKeyActions?.remove?.(account.id, keyID, "detach_disabled");
+      }
+      if (!account.autoGrouping && result.autoGrouping) await apiKeyActions?.setAutoGrouping?.(account.id, true);
+      await refreshAccounts();
+      onStatus?.(translate("relay.apiKeyGroupStaged"));
+    } catch {
+      onStatus?.(translate("relay.operationFailed"));
+    } finally {
+      setFormBusy(false);
+    }
+  };
   const selectedStatus = selected ? effectiveLoginStatus(selected) : "unknown";
   const selectedSignedIn = selectedStatus === "signed_in";
   const accountRows = stationAccounts.map((account) => ({
@@ -914,30 +953,25 @@ export function StationAccountsPanel({
         {!selectedSignedIn ? <NativeButton title={translate("relay.goLogin")} compact disabled={controlsBusy || isAccountLoading(selected.id)} onPress={() => { void loginSelected(); }} /> : null}
       </View>
       <View style={styles.accountActionsRow}>
-        <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy} onPress={() => setGroupManagerOpen(true)} />
+        <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} />
       </View>
     </View> : null}
-    {selected ? <StationGroupManagerDialog
-      visible={groupManagerOpen}
-      account={selected}
+    <DependencyPolicyDialog
+      visible={Boolean(removal)}
+      title={translate("relay.removeLocalTitle")}
+      message={removal ? translate("relay.removeAccountBody", { label: accountDisplayName(removal.account, translate), keys: removalKeys, models: selectedRemovalModels }) : ""}
+      options={[
+        { value: "detach", label: translate("relay.policyRelease"), hint: translate("relay.policyReleaseHint") },
+        { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
+      ]}
+      value={removalPolicy}
       disabled={controlsBusy}
+      confirmLabel={translate("relay.removeLocal")}
+      onValueChange={setRemovalPolicy}
+      onClose={() => setRemoval(undefined)}
+      onConfirm={() => { void removeSelected(); }}
       translate={translate}
-      onClose={() => setGroupManagerOpen(false)}
-      onAutoGrouping={(enabled) => {
-        void (async () => {
-          setFormBusy(true);
-          try {
-            await apiKeyActions?.setAutoGrouping?.(selected.id, enabled);
-            await refreshAccounts();
-            onStatus?.(translate("relay.apiKeyAutoGroupingStaged"));
-          } catch {
-            onStatus?.(translate("relay.operationFailed"));
-          } finally {
-            setFormBusy(false);
-          }
-        })();
-      }}
-    /> : null}
+    />
     <DependencyPolicyDialog
       visible={Boolean(removal)}
       title={translate("relay.removeLocalTitle")}
@@ -1040,11 +1074,6 @@ const styles = StyleSheet.create({
   accountsEmptyText: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, textAlign: "center" },
   accountEditor: { minWidth: 0, gap: 5 },
   accountNameValue: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE },
-  groupManagerList: { minWidth: 0, gap: 4, maxHeight: 220 },
-  groupManagerRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 },
-  groupManagerName: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE },
-  groupManagerMeta: { flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },
-  groupManagerAutoRow: { minHeight: 26, paddingTop: 6, borderTopWidth: 1, borderTopColor: colors.separator },
   accountActionsRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
   fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
   fieldLabel: { width: 64, flexShrink: 0, color: colors.secondary, fontSize: UI_FONT_SIZE },

@@ -10,6 +10,10 @@ import type {
   NativeMenuAction,
   NativeMenuAnchor,
   LanguagePreference,
+  RelayGroupManagerGroup,
+  RelayGroupManagerKey,
+  RelayGroupManagerLabels,
+  RelayGroupManagerResult,
   ServiceStatus,
 } from "../types";
 
@@ -43,6 +47,14 @@ export interface NativeLeafBridge {
   }): Promise<void>;
   showCodexRestartConfirmation(title: string, message: string, restartLabel: string, laterLabel: string): Promise<"restart" | "later" | undefined>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
+  showGroupManager(options: {
+    title: string;
+    accountLabel: string;
+    groups: RelayGroupManagerGroup[];
+    keys: RelayGroupManagerKey[];
+    labels: RelayGroupManagerLabels;
+    autoGrouping: boolean;
+  }): Promise<RelayGroupManagerResult | undefined>;
   editSecret(
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav",
     field: string,
@@ -141,6 +153,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
       : undefined,
     showCodexRestartConfirmation: ({ title, message, restartLabel, laterLabel }) => bridge.showCodexRestartConfirmation(title, message, restartLabel, laterLabel),
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
+    showGroupManager: (options) => bridge.showGroupManager(options),
     editSecret: ({ domain, field, target, title, allowClear }) => bridge.editSecret(domain, field, target, title, allowClear),
     clearSecret: ({ domain, field, target }) => bridge.clearSecret(domain, field, target),
     copySecret: ({ domain, field, target }) => bridge.copySecret(domain, field, target),

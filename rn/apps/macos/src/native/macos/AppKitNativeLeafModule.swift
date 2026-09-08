@@ -114,6 +114,68 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    @objc(showGroupManager:resolver:rejecter:)
+    func showGroupManager(
+        _ options: [String: Any],
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard Set(options.keys).isSubset(of: ["title", "accountLabel", "groups", "keys", "labels", "autoGrouping"]),
+              let title = options["title"] as? String,
+              let accountLabel = options["accountLabel"] as? String,
+              let labels = options["labels"] as? [String: String],
+              let autoGrouping = options["autoGrouping"] as? Bool,
+              let groupEntries = options["groups"] as? [[String: String]],
+              groupEntries.count <= 512,
+              groupEntries.allSatisfy({
+                  !($0["label"] ?? "").isEmpty && ($0["label"]?.count ?? 0) <= 256 && ($0["id"]?.count ?? 0) <= 256
+              }),
+              let keyEntries = options["keys"] as? [[String: Any]],
+              keyEntries.count <= 512,
+              keyEntries.allSatisfy({
+                  let name = ($0["name"] as? String) ?? ""
+                  let id = ($0["id"] as? String) ?? ""
+                  return !name.isEmpty && name.count <= 256 && id.count <= 256
+              }) else {
+            reject("E_NATIVE_GROUP_INPUT", "The group manager input is invalid.", nil)
+            return
+        }
+        let groups = groupEntries.map { ["id": $0["id"] ?? "", "label": $0["label"] ?? ""] }
+        let keys: [[String: String]] = keyEntries.map {
+            [
+                "id": ($0["id"] as? String) ?? "",
+                "name": ($0["name"] as? String) ?? "",
+                "groupID": ($0["groupID"] as? String) ?? "",
+                "groupLabel": ($0["groupLabel"] as? String) ?? "",
+                "multiplier": ($0["multiplier"] as? String) ?? "",
+                "enabled": (($0["enabled"] as? Bool) ?? true) ? "1" : "0",
+            ]
+        }
+        DispatchQueue.main.async {
+            self.leaf.showGroupManager(
+                title: title,
+                accountLabel: accountLabel,
+                groups: groups,
+                keys: keys,
+                labels: labels,
+                autoGrouping: autoGrouping
+            ) { result in
+                guard let result else {
+                    resolve(nil)
+                    return
+                }
+                resolve([
+                    "autoGrouping": result.autoGrouping,
+                    "creates": result.creates.map { ["name": $0.name, "groupID": $0.groupID] },
+                    "updates": result.updates.map {
+                        ["keyID": $0.keyID, "name": $0.name, "groupID": $0.groupID, "enabled": $0.enabled]
+                    },
+                    "deletes": result.deletes,
+                ])
+            }
+        }
+    }
+
     @objc(showCodexRestartConfirmation:message:restartLabel:laterLabel:resolver:rejecter:)
     func showCodexRestartConfirmation(
         _ title: String,

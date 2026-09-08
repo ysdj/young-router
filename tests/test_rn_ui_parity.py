@@ -338,7 +338,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('providerInspector: { width: 300, minWidth: 300, maxWidth: 300')
         self.assertNotIn("<ScrollView contentContainerStyle={styles.providerEditorScroll}><ProviderEditor", self.ui)
         self.assert_ui_has("providerEditorContent: { flex: 1, minHeight: 0 }")
-        self.assert_ui_has("providerEditorScrollContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 8, paddingBottom: 12, gap: 6 }")
+        self.assert_ui_has("providerEditorScrollContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }")
+        self.assert_ui_has('persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }')
+        self.assert_ui_has('return <PersistentScrollView style={styles.providerEditorContent} contentContainerStyle={styles.providerEditorScrollContent} showsVerticalScrollIndicator nestedScrollEnabled onViewportHeightChange={setEditorViewportHeight} onContentHeightChange={setEditorContentHeight}>')
+        self.assert_ui_has('{kind === "apiKey" || (kind === "relay" && !station) ? <ProviderSourceFields')
+        self.assert_ui_has('{scrollable ? <NativePersistentScrollIndicator style={styles.persistentScrollIndicator} /> : null}')
+        self.assert_ui_has('showsHorizontalScrollIndicator={false}\n    onLayout=')
+        self.assert_ui_has('<PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
         self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
         self.assert_ui_has('providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
         self.assert_ui_has('inspectorContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 6')
@@ -2208,9 +2214,51 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('translate("relay.type")', relay)
         self.assertIn("detectType?: (origin: string) => Promise<RelayType | undefined>;", relay)
         self.assertIn("station.type ?? await detectType?.(station.origin)", relay)
-        self.assertIn("function StationGroupManagerDialog(", relay)
-        self.assertIn('translate("relay.groupManager")', relay)
-        self.assertIn('translate("relay.apiKeyAutoGrouping")', relay)
+        # 分组管理 stays the provider window's native subordinate sheet, but
+        # it carries the pre-refactor keys list: every key is shown with its
+        # group and the sheet drafts create / re-group / delete edits.
+        self.assertIn("const openGroupManager = async (): Promise<void> => {", relay)
+        self.assertIn("const result = await native.showGroupManager({", relay)
+        self.assertIn("apiKeyActions?.create?.(account.id, { name: create.name, groupID: create.groupID, enabled: true });", relay)
+        self.assertIn("apiKeyActions?.setGroup?.(account.id, update.keyID, update.groupID)", relay)
+        self.assertIn("apiKeyActions?.setEnabled?.(account.id, update.keyID, update.enabled)", relay)
+        self.assertIn("apiKeyActions?.update?.(account.id, update.keyID, update.name)", relay)
+        self.assertIn('apiKeyActions?.remove?.(account.id, keyID, "detach_disabled");', relay)
+        self.assertIn("await apiKeyActions?.setAutoGrouping?.(account.id, false);", relay)
+        self.assertIn('onStatus?.(translate("relay.apiKeyGroupStaged"));', relay)
+        types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
+        native_bridge = (ROOT / "rn/packages/shared/src/platform/nativeBridge.ts").read_text(encoding="utf-8")
+        platform_entry = (ROOT / "rn/packages/shared/src/platformEntry.ts").read_text(encoding="utf-8")
+        mac_module = (ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
+        mac_bridge = (ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
+        mac_leaf = (ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        windows_module = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
+        windows_module_header = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeafModule.h").read_text(encoding="utf-8")
+        windows_leaf = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        self.assertIn("showGroupManager(options: {", types)
+        self.assertIn("export type RelayGroupManagerResult = {", types)
+        self.assertIn("showGroupManager(options: {", native_bridge)
+        self.assertIn("showGroupManager?: (options: {", platform_entry)
+        self.assertIn("@objc(showGroupManager:resolver:rejecter:)", mac_module)
+        self.assertIn("RCT_EXTERN_METHOD(showGroupManager:(NSDictionary *)options", mac_bridge)
+        self.assertIn("func showGroupManager(", mac_leaf)
+        self.assertIn("REACT_METHOD(ShowGroupManager, L\"showGroupManager\")", windows_module_header)
+        self.assertIn("ShowGroupManager(", windows_leaf)
+        self.assertIn("WinUI3NativeLeafModule::ShowGroupManager(", windows_module)
+        # The sheet is the pre-refactor master-detail editor: key list with
+        # ＋ / －, the selected key's detail, and Close / Apply at the bottom.
+        self.assertIn("private final class NativeGroupManagerController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate", mac_leaf)
+        self.assertIn("@objc private func addDraftKey(_ sender: NSButton)", mac_leaf)
+        self.assertIn("@objc private func removeSelectedKey(_ sender: NSButton)", mac_leaf)
+        self.assertIn("@objc private func applySheet(_ sender: NSButton)", mac_leaf)
+        self.assertIn("@objc private func closeSheet(_ sender: NSButton)", mac_leaf)
+        self.assertIn("@objc private func toggleSelectedEnabled(_ sender: NSButton)", mac_leaf)
+        self.assertIn("func resultOnEnd() -> NativeGroupManagerResult?", mac_leaf)
+        self.assertIn("let autoGrouping: Bool\n    let creates: [Create]\n    let updates: [Update]\n    let deletes: [String]", mac_leaf)
+        self.assertIn("table.usesAlternatingRowBackgroundColors = true", mac_leaf)
+        self.assertIn("private final class NativeListFrameView: NSView", mac_leaf)
+        self.assertIn("struct GroupManagerResult {", (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeaf.h").read_text(encoding="utf-8"))
+        self.assertIn("grid.Background(index % 2 == 1", windows_leaf)
         self.assertNotIn("function RelayAccountManager(", relay)
         self.assertNotIn("relayNavigationItems", relay)
 
@@ -2270,6 +2318,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '// Group headers only separate the two kinds; a single-kind list skips',
             '// them so custom-only vendors see a plain key table.',
             'if (showHeaders) rows.push({ key: "group:custom", cells: [`${translate("providers.keysCustom")} · ${customKeys.length}`], spanning: true });',
+            'rows.push({ key: `custom:${key.id}`, cells: [showHeaders ? `\\t${key.name}` : key.name] });',
+            '// it shrinks until the whole inspector fits, so the pane keeps no scrollbar',
+            'const keysTableInlineRowHeights = tableRows.map((row) => (row.spanning ? 28 : 22));',
+            'const keysTableInlineAvailableHeight = keysTableInlineSiblingHeight === undefined ? undefined : paneViewportHeight - keysTableInlineSiblingHeight - 1;',
+            'keysTableInlineHeight = Math.min(keysTableInlineContentHeight, Math.max(fitted, Math.min(keysTableInlineMinHeight, keysTableInlineContentHeight)));',
+            'React.useLayoutEffect(() => { keysTableInlineRenderedHeight.current = keysTableInlineHeight; }, [keysTableInlineHeight]);',
             "rows.push({ key: `account:${account.id}`, cells: [accountDisplayName(account, translate)], spanning: true });",
             "cells: [`\\t${providedNameDrafts[row.key] ?? row.label}`],",
             "providedRows",
@@ -2302,7 +2356,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("<Modal", relay)
         self.assertNotIn("import { Modal,", relay)
         self.assertIn("function RelayDialogLayer(", relay)
-        self.assertEqual(3, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
+        self.assertEqual(2, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
         self.assertIn(
             'relayDialogLayer: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 100 }',
             relay,
