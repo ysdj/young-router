@@ -61,18 +61,55 @@
     if (logTab != nil) {
       props[@"initialLogTab"] = logTab;
     }
+    // The settings window is a native full-height source-list window: one
+    // sidebar material behind the whole window, a transparent title bar, and
+    // the shared React surface painting the opaque detail column on top.
+    NSSet<NSString *> *settingsShellRoutes = [NSSet setWithArray:@[
+      @"providers-models", @"runtime-settings", @"codex-settings", @"claude-settings",
+      @"data-management", @"logs", @"relay-accounts"
+    ]];
+    const BOOL settingsShell = [settingsShellRoutes containsObject:route];
     NSView *rootView = (NSView *)[rootViewFactory viewWithModuleName:@"LiteLLMMenu" initialProperties:props];
+    // RCTSurfaceHostingView defaults to an opaque white background on macOS.
+    // The route windows paint every surface themselves, so clearing it lets a
+    // window-level sidebar material show through the shared layout.
+    [(id)rootView setBackgroundColor:NSColor.clearColor];
     rootView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    NSView *contentView = rootView;
+    if (settingsShell) {
+      NSVisualEffectView *backdrop = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, 1052, 600)];
+      backdrop.material = NSVisualEffectMaterialSidebar;
+      backdrop.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+      backdrop.state = NSVisualEffectStateFollowsWindowActiveState;
+      backdrop.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+      rootView.frame = backdrop.bounds;
+      [backdrop addSubview:rootView];
+      contentView = backdrop;
+    }
     NSViewController *controller = [NSViewController new];
-    controller.view = rootView;
+    controller.view = contentView;
     if (existingWindow != nil) {
       existingWindow.contentViewController = controller;
       return existingWindow;
     }
+    NSWindowStyleMask styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+        NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
+    if (settingsShell) {
+      styleMask |= NSWindowStyleMaskFullSizeContentView;
+    }
     NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1052, 600)
-                                                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+                                                   styleMask:styleMask
                                                      backing:NSBackingStoreBuffered
                                                        defer:NO];
+    if (settingsShell) {
+      window.titlebarAppearsTransparent = YES;
+      window.titleVisibility = NSWindowTitleHidden;
+      if (@available(macOS 11.0, *)) {
+        window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
+      }
+      window.opaque = NO;
+      window.backgroundColor = NSColor.clearColor;
+    }
     window.contentViewController = controller;
     window.animationBehavior = NSWindowAnimationBehaviorNone;
     [window center];
@@ -122,7 +159,7 @@
       continue;
     }
     NSString *route = [[url path] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
-    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"logs"]];
+    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"general-settings", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"logs"]];
     if (![routes containsObject:route]) {
       continue;
     }

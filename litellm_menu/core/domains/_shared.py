@@ -112,3 +112,36 @@ def _direction_destination(source: int, length: int, data: Mapping[str, Any]) ->
     if direction == "down":
         return min(length - 1, source + 1)
     raise DomainError("A move destination is required")
+
+def local_proxy_endpoint() -> tuple[str, str]:
+    """The managed local proxy URL (with ``/v1``) and its master key.
+
+    Shared by the Codex and Claude "use local API" actions so both adopt the
+    exact port the runtime settings select (falling back to the default port)
+    and the configured LiteLLM master key (falling back to the built-in one).
+    """
+
+    import codex_config
+
+    port = codex_config.DEFAULT_PORT
+    try:
+        from runtime_settings_io import load_specs, read_settings_file
+
+        values = read_settings_file(_default_runtime_settings_path(), load_specs())
+        candidate = str(values.get("LITELLM_PORT", "")).strip()
+        if candidate.isdigit() and 0 < int(candidate) < 65536:
+            port = candidate
+    except Exception:
+        pass
+    key = codex_config.DEFAULT_KEY
+    candidates = (
+        codex_config.default_config_path(),
+        _default_runtime_root() / ".litellm-runtime" / "config.yaml",
+    )
+    for candidate in candidates:
+        try:
+            key = codex_config.local_api_key(codex_config.load_yaml(candidate))
+            break
+        except Exception:
+            continue
+    return f"http://127.0.0.1:{port}/v1", key

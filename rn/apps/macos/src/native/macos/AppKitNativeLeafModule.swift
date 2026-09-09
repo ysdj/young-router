@@ -658,6 +658,15 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         leaf.showVersion()
     }
 
+    @objc(versionInfo:rejecter:)
+    func versionInfo(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        resolve(leaf.versionInfo())
+    }
+
+    @objc func openExternalURL(_ url: String) {
+        leaf.openExternalURL(url)
+    }
+
     @objc func quit() {
         leaf.requestQuit()
     }

@@ -73,6 +73,9 @@ private enum NativeRelayOriginPolicy {
 
     // Keep the menu-bar shell anchored to the pre-RN AppKit app. The strings
     // are stable action IDs (plus the two presentation markers), not labels.
+    private static let settingsPaneRoutes: Set<String> = [
+        "general-settings", "providers-models", "runtime-settings", "codex-settings", "data-management", "logs",
+    ]
     private static let statusMenuOrder = [
         "status", "separator",
         "toggle-autostart", "toggle-codex-model-catalog", "separator",
@@ -109,6 +112,10 @@ private enum NativeRelayOriginPolicy {
     private var routeWindowFactory: ((String, String?, NSWindow?) -> NSWindow?)?
     private var reactHostStarter: (() -> Void)?
     private var routeWindows: [String: NSWindow] = [:]
+    /// The service menu is shown on right-click only; a left click opens the
+    /// single settings window directly.
+    private var statusMenu: NSMenu?
+    private var statusMenuVisible = false
     private var approvedCloseRoutes: Set<String> = []
     private var codexRestartConfirmationPanel: NSPanel?
     private var codexRestartConfirmationCompletion: ((String) -> Void)?
@@ -167,7 +174,12 @@ private enum NativeRelayOriginPolicy {
         statusItem.button?.image = Self.statusBarIcon
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.setAccessibilityLabel(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "LiteLLM Menu")
-        statusItem.menu = makeMenu()
+        // A left click opens the settings window; the status menu stays on
+        // right-click (and Control-click) for service and lifecycle actions.
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusItemPressed(_:))
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        statusMenu = makeMenu()
     }
 
     public func setRouteWindowFactory(_ factory: @escaping (String, String?, NSWindow?) -> NSWindow?) {
@@ -188,7 +200,7 @@ private enum NativeRelayOriginPolicy {
         statusItem.button?.image = Self.statusBarIcon
         statusItem.button?.toolTip = statusTitle
         statusItem.button?.setAccessibilityLabel(statusTitle)
-        if let status = statusItem.menu?.item(withTag: 1) {
+        if let status = statusMenu?.item(withTag: 1) {
             status.title = statusTitle
             configureStatusMenuItem(status)
         }
@@ -245,6 +257,15 @@ private enum NativeRelayOriginPolicy {
         // target for RN, not as a dashboard window.
         guard route != "home" else {
             hideHostWindow()
+            // "home" leaves the settings shell for the menu bar. Close the
+            // wizard sheet first, then the shared settings window, so no
+            // empty shell window stays onscreen after the route switch.
+            if routeWindows["provider-wizard"] != nil {
+                close(route: "provider-wizard")
+            }
+            if let settingsKey = settingsWindowKey() {
+                close(route: settingsKey)
+            }
             return
         }
 
@@ -253,11 +274,27 @@ private enum NativeRelayOriginPolicy {
         // supply AppKit controls, focus behavior, and system appearance.
         let windowRoute = canonicalRoute(route)
         ensureReactHostStarted()
-        if windowRoute == "provider-wizard", routeWindows["providers-models"] == nil,
+        if windowRoute == "provider-wizard", settingsWindowKey() == nil,
            let parentTitle = routeWindowTitle("providers-models") {
             // The provider wizard is a child of the provider workspace. A
             // native sheet keeps that workspace visible while AppKit locks it.
             open(route: "providers-models", title: parentTitle)
+        }
+        if Self.settingsPaneRoutes.contains(windowRoute),
+           let existingKey = settingsWindowKey(), existingKey != windowRoute,
+           let existing = routeWindows[existingKey] {
+            // Every settings pane shares one window. Switch the shared shell
+            // instead of opening a second settings window.
+            if let initialLogTab, windowRoute == "logs" {
+                emitAction("open-logs?tab=\(initialLogTab)")
+            } else {
+                emitAction("open-\(windowRoute)")
+            }
+            updateActivationPolicy()
+            configureImmediatePresentation(existing)
+            withoutAnimations { existing.makeKeyAndOrderFront(nil) }
+            NSApp.activate(ignoringOtherApps: true)
+            return
         }
         let window: NSWindow
         if let existing = routeWindows[windowRoute] {
@@ -282,7 +319,7 @@ private enum NativeRelayOriginPolicy {
         updateActivationPolicy()
         configureImmediatePresentation(window)
         withoutAnimations {
-            if windowRoute == "provider-wizard", let parent = routeWindows["providers-models"] {
+            if windowRoute == "provider-wizard", let parent = settingsWindow() {
                 if window.sheetParent == nil {
                     // AppKit disables the parent until endSheet is called.
                     parent.beginSheet(window)
@@ -308,7 +345,7 @@ private enum NativeRelayOriginPolicy {
         approvedCloseRoutes.insert(selectedRoute)
         defer { approvedCloseRoutes.remove(selectedRoute) }
         let restoreProviderModels = selectedRoute == "provider-wizard"
-            ? routeWindows["providers-models"] : nil
+            ? settingsWindow() : nil
         withoutAnimations {
             if let parent = window.sheetParent {
                 parent.endSheet(window)
@@ -579,7 +616,7 @@ private enum NativeRelayOriginPolicy {
                 isDraft: false
             )
         }
-        guard let sheetParent = routeWindows["providers-models"], rows.count <= 512, options.count <= 512 else {
+        guard let sheetParent = settingsWindow(), rows.count <= 512, options.count <= 512 else {
             completion(nil)
             return
         }
@@ -841,7 +878,7 @@ private enum NativeRelayOriginPolicy {
         // A login opened from the providers workspace attaches to that window
         // as a sheet: it is a subordinate surface, and the parent stays
         // unclickable until the flow finishes.
-        let sheetParent = embeddedWindow == nil ? routeWindows["providers-models"] : nil
+        let sheetParent = embeddedWindow == nil ? settingsWindow() : nil
         let embeddedClose: (() -> Void)? = embedded ? { [weak self] in
             self?.close(route: "provider-wizard")
         } : nil
@@ -1210,10 +1247,6 @@ private enum NativeRelayOriginPolicy {
     public func setShortcuts(_ shortcuts: [String: String]) {
         ensureSystemEditMenu()
         guard let mainMenu = NSApp.mainMenu else { return }
-        if mainMenu.items.contains(where: {
-            $0.representedObject as? String == "open-settings" ||
-            $0.submenu?.items.contains(where: { $0.representedObject as? String == "open-settings" }) == true
-        }) { return }
         let applicationMenu: NSMenu
         if let existing = mainMenu.items.first?.submenu {
             applicationMenu = existing
@@ -1223,12 +1256,20 @@ private enum NativeRelayOriginPolicy {
             appRoot.submenu = applicationMenu
             mainMenu.insertItem(appRoot, at: 0)
         }
-        if shortcuts["openMenu"]?.lowercased().contains("cmd+,") == true {
-            let item = applicationMenu.addItem(withTitle: localized("settings", fallback: "Settings..."), action: #selector(openCodex), keyEquivalent: ",")
-            item.keyEquivalentModifierMask = [.command]
-            item.target = self
-            item.representedObject = "open-settings"
+        // The storyboard owns the standard application menu. Localize and wire
+        // its About and Preferences items in place; appending new ones would
+        // duplicate them (About shows the standard panel, Preferences gets the
+        // Settings action and ⌘,).
+        if let aboutItem = applicationMenu.items.first(where: { $0.action == Selector(("orderFrontStandardAboutPanel:")) }) {
+            aboutItem.title = localized("about", fallback: "About LiteLLM Menu")
         }
+        if let preferencesItem = applicationMenu.items.first(where: { $0.action == nil && $0.keyEquivalent == "," }) {
+            preferencesItem.title = localized("settings", fallback: "Settings…")
+            preferencesItem.action = #selector(openCodex)
+            preferencesItem.target = self
+            preferencesItem.representedObject = "open-settings"
+        }
+        guard !applicationMenu.items.contains(where: { $0.representedObject as? String == "native-open-data-management" }) else { return }
         let dataManagementItem = applicationMenu.addItem(
             withTitle: localized("routeDataManagement", fallback: "Data Management"),
             action: #selector(openDataManagement),
@@ -1317,6 +1358,45 @@ private enum NativeRelayOriginPolicy {
         alert.runModal()
     }
 
+    /// Version strings for the shared About pane: the app bundle version plus
+    /// the LiteLLM version recorded beside the bundled Core runtime.
+    func versionInfo() -> [String: String] {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        let litellmURL = Bundle.main.resourceURL?
+            .appendingPathComponent("Core/runtime/LITELLM_VERSION", isDirectory: false)
+        let litellm = litellmURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        var result = [
+            "app": build.isEmpty ? version : "\(version) (\(build))",
+            "litellm": litellm,
+        ]
+        if let icon = NSApp.applicationIconImage,
+           let png = Self.pngData(from: icon, size: 64) {
+            result["icon"] = "data:image/png;base64," + png.base64EncodedString()
+        }
+        return result
+    }
+
+    private static func pngData(from image: NSImage, size: CGFloat) -> Data? {
+        let target = NSImage(size: NSSize(width: size, height: size))
+        target.lockFocus()
+        image.draw(in: NSRect(x: 0, y: 0, width: size, height: size))
+        target.unlockFocus()
+        guard let tiff = target.tiffRepresentation,
+              let representation = NSBitmapImageRep(data: tiff) else { return nil }
+        return representation.representation(using: .png, properties: [:])
+    }
+
+    /// Open an http(s) URL in the user's browser. Non-web schemes are ignored.
+    func openExternalURL(_ url: String) {
+        guard let parsed = URL(string: url),
+              let scheme = parsed.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else { return }
+        NSWorkspace.shared.open(parsed)
+    }
+
     private func registerSelection(
         _ url: URL?,
         purpose: String,
@@ -1377,7 +1457,30 @@ private enum NativeRelayOriginPolicy {
             return
         }
         menuNeedsRefresh = false
-        statusItem.menu = makeMenu(actions: menuActions)
+        statusMenu = makeMenu(actions: menuActions)
+    }
+
+    /// Left-clicking the status icon opens the settings window. The service
+    /// menu is reserved for the secondary click so the icon never behaves like
+    /// a navigation menu again.
+    @objc private func statusItemPressed(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        let secondaryClick = event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true
+        if secondaryClick {
+            showStatusMenu()
+            return
+        }
+        openNamedRoute("providers-models")
+    }
+
+    private func showStatusMenu() {
+        if statusMenu == nil { statusMenu = makeMenu(actions: menuActions) }
+        guard let menu = statusMenu else { return }
+        statusMenuVisible = true
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        // ``menuDidClose`` clears ``statusItem.menu`` so the next left click
+        // opens the settings window again.
     }
 
     public func menuWillOpen(_ menu: NSMenu) {
@@ -1386,6 +1489,10 @@ private enum NativeRelayOriginPolicy {
 
     public func menuDidClose(_ menu: NSMenu) {
         menuTracking = false
+        if statusMenuVisible {
+            statusMenuVisible = false
+            statusItem.menu = nil
+        }
         guard menuNeedsRefresh else { return }
         refreshStatusMenu()
     }
@@ -1596,6 +1703,15 @@ private enum NativeRelayOriginPolicy {
         routeWindows.first(where: { $0.value === window })?.key
     }
 
+    /// Registry key of the shared settings window, whichever pane created it.
+    private func settingsWindowKey() -> String? {
+        routeWindows.keys.first(where: { Self.settingsPaneRoutes.contains($0) })
+    }
+
+    private func settingsWindow() -> NSWindow? {
+        settingsWindowKey().flatMap { routeWindows[$0] }
+    }
+
     private func activeWindow() -> NSWindow? {
         if let keyWindow = NSApp.keyWindow, routeForWindow(keyWindow) != nil {
             return keyWindow
@@ -1631,49 +1747,23 @@ private enum NativeRelayOriginPolicy {
     }
 
     private func routeWindowLayout(for route: String) -> RouteWindowLayout {
-        switch route {
-        case "providers-models":
-            // The unified provider workspace carries provider, key, and model
-            // panes plus the detail column, so it starts wider than before.
+        if Self.settingsPaneRoutes.contains(route) {
+            // One window hosts every settings pane at one fixed size, so
+            // switching panes never moves or resizes the window. The size fits
+            // the widest workspace (provider three-column, assistant cards)
+            // without the former extra width. The window is full-size content
+            // view, so its content height includes the transparent title strip.
             return RouteWindowLayout(
-                contentSize: NSSize(width: 900, height: 640),
-                minSize: NSSize(width: 820, height: 560),
+                contentSize: NSSize(width: 960, height: 640),
+                minSize: NSSize(width: 900, height: 560),
                 maxSize: nil
             )
+        }
+        switch route {
         case "provider-wizard":
             return RouteWindowLayout(
                 contentSize: NSSize(width: 620, height: 460),
                 minSize: NSSize(width: 540, height: 420),
-                maxSize: nil
-            )
-        case "codex-settings", "claude-settings":
-            return RouteWindowLayout(
-                contentSize: NSSize(width: 1160, height: 700),
-                minSize: NSSize(width: 1100, height: 640),
-                maxSize: nil
-            )
-        case "runtime-settings":
-            return RouteWindowLayout(
-                contentSize: NSSize(width: 1080, height: 620),
-                minSize: NSSize(width: 800, height: 520),
-                maxSize: NSSize(width: 1160, height: CGFloat.greatestFiniteMagnitude)
-            )
-        case "data-management":
-            return RouteWindowLayout(
-                contentSize: NSSize(width: 600, height: 220),
-                // NSWindow's minimum is a frame size, so include the title bar
-                // while keeping the file row and its helper copy comfortably
-                // inside the smallest useful import layout.
-                minSize: NSSize(width: 500, height: 180),
-                // React resizes this utility window for the active pane. Keep
-                // enough room for the review and WebDAV panes without making
-                // the utility window feel like a full settings screen.
-                maxSize: NSSize(width: 680, height: 620)
-            )
-        case "logs":
-            return RouteWindowLayout(
-                contentSize: NSSize(width: 900, height: 580),
-                minSize: NSSize(width: 640, height: 420),
                 maxSize: nil
             )
         default:
@@ -1715,14 +1805,14 @@ private enum NativeRelayOriginPolicy {
     /// Keep the native window title in sync with the shared route localization.
     /// AppKit owns the title bar, but React owns the language preference.
     private func routeWindowTitle(_ route: String) -> String? {
+        // Settings panes share one window, so its title is the app name while
+        // the sidebar selection names the active pane (System Settings style).
+        if Self.settingsPaneRoutes.contains(canonicalRoute(route)) {
+            return localized("appTitle", fallback: "LiteLLM Menu")
+        }
         switch route {
         case "home": return localized("routeHome", fallback: "LiteLLM Menu")
-        case "providers-models": return "LiteLLM " + localized("routeProvidersModels", fallback: "Providers & Models")
         case "provider-wizard": return "LiteLLM " + localized("routeProviderWizard", fallback: "Add Provider")
-        case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
-        case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime Settings")
-        case "data-management": return localized("routeDataManagement", fallback: "Data Management")
-        case "logs": return "LiteLLM " + localized("routeLogs", fallback: "Logs")
         default: return nil
         }
     }

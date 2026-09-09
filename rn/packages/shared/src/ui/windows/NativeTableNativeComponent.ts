@@ -20,6 +20,10 @@ export interface NativeTableProps extends ViewProps {
   compact?: WithDefault<boolean, false>;
   followBottom?: WithDefault<boolean, false>;
   borderless?: WithDefault<boolean, false>;
+  sourceList?: WithDefault<boolean, false>;
+  rowSymbols?: ReadonlyArray<string>;
+  rowSymbolColors?: ReadonlyArray<string>;
+  rowImageNames?: ReadonlyArray<string>;
   disabledRowKeys?: ReadonlyArray<string>;
   secondaryCellKeys?: ReadonlyArray<string>;
   alertRowKeys?: ReadonlyArray<string>;

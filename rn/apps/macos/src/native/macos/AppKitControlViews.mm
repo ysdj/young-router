@@ -125,6 +125,8 @@ NSImage *ButtonSymbolImage(const std::string &symbol)
     symbolName = @"pencil";
   } else if (symbol == "import") {
     symbolName = @"tray.and.arrow.down";
+  } else if (symbol == "info") {
+    symbolName = @"info.circle";
   } else if (symbol == "power-off") {
     symbolName = @"power";
   } else if (symbol == "power-on") {
@@ -156,6 +158,15 @@ NSFont *TableCellFont()
   return [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightRegular];
 }
 
+// The settings sidebar follows the native reference: a 13pt medium label, the
+// same weight the system settings sidebar uses.
+constexpr CGFloat LiteLLMSourceListFontSize = 13.0;
+
+NSFont *SourceListFont()
+{
+  return [NSFont systemFontOfSize:LiteLLMSourceListFontSize weight:NSFontWeightMedium];
+}
+
 NSAttributedString *TableCellTitle(NSString *title, NSColor *color)
 {
   NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
@@ -166,6 +177,22 @@ NSAttributedString *TableCellTitle(NSString *title, NSColor *color)
     NSForegroundColorAttributeName: color,
     NSParagraphStyleAttributeName: paragraph,
   }];
+}
+
+// Sidebar badges use a compact rounded square behind a white SF Symbol, the
+// shape macOS uses for source-list icons. The shared shell passes sRGB hex
+// colors so both hosts render the same badge.
+NSColor *SourceListBadgeColor(NSString *hex)
+{
+  NSString *value = [hex stringByReplacingOccurrencesOfString:@"#" withString:@""];
+  if (value.length != 6 && value.length != 8) return NSColor.controlAccentColor;
+  unsigned int rgba = 0;
+  if (![[NSScanner scannerWithString:value] scanHexInt:&rgba]) return NSColor.controlAccentColor;
+  const CGFloat alpha = value.length == 8 ? ((rgba >> 24) & 0xFF) / 255.0 : 1.0;
+  return [NSColor colorWithSRGBRed:((rgba >> 16) & 0xFF) / 255.0
+                             green:((rgba >> 8) & 0xFF) / 255.0
+                              blue:(rgba & 0xFF) / 255.0
+                             alpha:alpha];
 }
 
 NSAttributedString *SelectableRowTitle(NSString *title, NSString *detail)
@@ -516,6 +543,26 @@ static LiteLLMInstantFocusBorderView *InstallInstantFocusBorder(NSView *field)
 
 @end
 
+@interface LiteLLMTabSearchField : NSSearchField
+@end
+
+@implementation LiteLLMTabSearchField
+
+- (BOOL)acceptsFirstResponder
+{
+  return self.enabled && self.editable;
+}
+
+- (void)resetCursorRects
+{
+  [super resetCursorRects];
+  if (self.enabled && self.editable) {
+    [self addCursorRect:self.bounds cursor:[NSCursor IBeamCursor]];
+  }
+}
+
+@end
+
 @interface LiteLLMTabSecureTextField : NSSecureTextField
 @property(nonatomic) BOOL liteLLMShowsFocusBorder;
 @property(nonatomic, strong) LiteLLMInstantFocusBorderView *liteLLMFocusBorderView;
@@ -784,6 +831,95 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 
 @end
 
+// A hairline used as the empty source-list group row above the About entry.
+@interface LiteLLMTableSeparatorView : NSView
+@end
+
+@implementation LiteLLMTableSeparatorView
+
+- (void)drawRect:(NSRect)dirtyRect
+{
+  [super drawRect:dirtyRect];
+  const NSRect line = NSMakeRect(12, NSMidY(self.bounds), MAX(0, NSWidth(self.bounds) - 24), 1);
+  [[NSColor separatorColor] setFill];
+  NSRectFill(line);
+}
+
+@end
+
+// A source-list row with the macOS settings badge: a rounded color square
+// holding a white SF Symbol followed by the pane title. ``NSTableCellView``
+// gives the row the native emphasized (white text on accent) selection style.
+@interface LiteLLMSourceListCellView : NSTableCellView
+@property(nonatomic, strong) NSView *badge;
+@property(nonatomic, strong) NSImageView *icon;
+@property(nonatomic, strong) NSTextField *label;
+/** YES when the icon sits on a colored/tile badge, so the tint stays white. */
+@property(nonatomic) BOOL badgeTinted;
+@end
+
+@implementation LiteLLMSourceListCellView
+
+- (instancetype)initWithFrame:(NSRect)frame
+{
+  if (self = [super initWithFrame:frame]) {
+    _badge = [[NSView alloc] initWithFrame:NSZeroRect];
+    _badge.translatesAutoresizingMaskIntoConstraints = NO;
+    _badge.wantsLayer = YES;
+    _badge.layer.cornerRadius = 4.5;
+    _badge.layer.masksToBounds = YES;
+    [self addSubview:_badge];
+
+    _icon = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    _icon.translatesAutoresizingMaskIntoConstraints = NO;
+    _icon.imageScaling = NSImageScaleProportionallyDown;
+    _icon.contentTintColor = NSColor.whiteColor;
+    [_badge addSubview:_icon];
+
+    _label = [NSTextField labelWithString:@""];
+    _label.translatesAutoresizingMaskIntoConstraints = NO;
+    _label.font = SourceListFont();
+    _label.lineBreakMode = NSLineBreakByTruncatingTail;
+    _label.maximumNumberOfLines = 1;
+    [self addSubview:_label];
+    self.textField = _label;
+
+    [NSLayoutConstraint activateConstraints:@[
+      [_badge.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
+      [_badge.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+      [_badge.widthAnchor constraintEqualToConstant:20],
+      [_badge.heightAnchor constraintEqualToConstant:20],
+      [_icon.centerXAnchor constraintEqualToAnchor:_badge.centerXAnchor],
+      [_icon.centerYAnchor constraintEqualToAnchor:_badge.centerYAnchor],
+      [_icon.widthAnchor constraintEqualToConstant:20],
+      [_icon.heightAnchor constraintEqualToConstant:20],
+      [_label.leadingAnchor constraintEqualToAnchor:_badge.trailingAnchor constant:8],
+      [_label.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
+      [_label.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+    ]];
+  }
+  return self;
+}
+
+- (void)setBackgroundStyle:(NSBackgroundStyle)backgroundStyle
+{
+  [super setBackgroundStyle:backgroundStyle];
+  // The badge keeps its color; only the title follows the row selection so a
+  // selected source-list row reads white on the accent fill. A monochrome
+  // badge-less icon follows the label color instead.
+  const BOOL emphasized = backgroundStyle == NSBackgroundStyleEmphasized;
+  self.label.textColor = emphasized
+      ? NSColor.alternateSelectedControlTextColor
+      : NSColor.secondaryLabelColor;
+  if (!self.badgeTinted) {
+    self.icon.contentTintColor = emphasized
+        ? NSColor.alternateSelectedControlTextColor
+        : NSColor.secondaryLabelColor;
+  }
+}
+
+@end
+
 // Keep the table border outside the scroll view.  NSScrollView's bezel is
 // tiled together with its clip view and scrollbars, so its trailing edge can
 // disappear behind a vertical scroller or become thicker at the header/body
@@ -1009,6 +1145,7 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitButtonProps>(props);
   const BOOL titleChanged = oldViewProps.title != newViewProps.title;
   const BOOL symbolChanged = oldViewProps.symbol != newViewProps.symbol;
+  const BOOL symbolWithTitleChanged = oldViewProps.symbolWithTitle != newViewProps.symbolWithTitle;
   const BOOL linkChanged = oldViewProps.link != newViewProps.link;
   const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
   const BOOL disabledChanged = oldViewProps.disabled != newViewProps.disabled;
@@ -1016,12 +1153,15 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
   BOOL useCompactControl = newViewProps.compact && !link;
   BOOL defaultAction = !link && newViewProps.primary && !newViewProps.disabled;
 
-  if (titleChanged || symbolChanged) {
+  if (titleChanged || symbolChanged || symbolWithTitleChanged) {
     NSString *title = StringFromStdString(newViewProps.title);
     NSImage *symbolImage = ButtonSymbolImage(newViewProps.symbol);
+    const BOOL showsTitle = symbolImage == nil || newViewProps.symbolWithTitle;
     _button.image = symbolImage;
-    _button.imagePosition = symbolImage == nil ? NSNoImage : NSImageOnly;
-    _button.title = symbolImage == nil ? title : @"";
+    _button.imagePosition = symbolImage == nil
+        ? NSNoImage
+        : (newViewProps.symbolWithTitle ? NSImageLeading : NSImageOnly);
+    _button.title = showsTitle ? title : @"";
     if (newViewProps.toolTip.empty()) {
       _button.toolTip = title;
     }
@@ -1060,12 +1200,12 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
   }
   if (!link && linkChanged) {
     _button.contentTintColor = nil;
-    _button.title = ButtonSymbolImage(newViewProps.symbol) == nil
+    _button.title = ButtonSymbolImage(newViewProps.symbol) == nil || newViewProps.symbolWithTitle
         ? StringFromStdString(newViewProps.title)
         : @"";
   }
 
-  if (titleChanged || symbolChanged || linkChanged || compactChanged) {
+  if (titleChanged || symbolChanged || symbolWithTitleChanged || linkChanged || compactChanged) {
     [_host setNeedsLayout:YES];
   }
   [super updateProps:props oldProps:oldProps];
@@ -1527,13 +1667,14 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
 
 @end
 
-@interface LiteLLMAppKitTextFieldComponentView () <NSTextFieldDelegate, NSTextViewDelegate, RCTLiteLLMAppKitTextFieldViewProtocol>
+@interface LiteLLMAppKitTextFieldComponentView () <NSTextFieldDelegate, NSSearchFieldDelegate, NSTextViewDelegate, RCTLiteLLMAppKitTextFieldViewProtocol>
 - (BOOL)activeControlIsEditing;
 @end
 
 @implementation LiteLLMAppKitTextFieldComponentView {
   LiteLLMAppKitTextFieldHostView *_host;
   LiteLLMTabTextField *_field;
+  LiteLLMTabSearchField *_searchField;
   LiteLLMTabSecureTextField *_secureField;
   NSScrollView *_scrollView;
   NSTextView *_multilineField;
@@ -1575,6 +1716,15 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
     _secureField.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
     ConfigureSingleLineTextField(_secureField);
 
+    _searchField = [[LiteLLMTabSearchField alloc] initWithFrame:NSZeroRect];
+    _searchField.identifier = LiteLLMTabStopIdentifier;
+    _searchField.delegate = self;
+    _searchField.target = self;
+    _searchField.action = @selector(submitted:);
+    _searchField.font = [NSFont systemFontOfSize:LiteLLMUIFontSize];
+    _searchField.sendsSearchStringImmediately = YES;
+    _searchField.sendsWholeSearchString = NO;
+
     _multilineField = [[LiteLLMTabTextView alloc] initWithFrame:NSZeroRect];
     _multilineField.identifier = LiteLLMTabStopIdentifier;
     _multilineField.delegate = self;
@@ -1605,7 +1755,8 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   const auto &newViewProps = *std::static_pointer_cast<const LiteLLMAppKitTextFieldProps>(props);
 
   const BOOL isMultiline = newViewProps.multiline;
-  NSView *activeControl = isMultiline ? _scrollView : (newViewProps.secureTextEntry ? _secureField : _field);
+  const BOOL isSearch = !isMultiline && newViewProps.search;
+  NSView *activeControl = isMultiline ? _scrollView : (newViewProps.secureTextEntry ? _secureField : (isSearch ? _searchField : _field));
   const BOOL activeControlChanged = _host.activeControl != activeControl;
   if (activeControlChanged) {
     _field.liteLLMShowsFocusBorder = NO;
@@ -1622,7 +1773,7 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   const BOOL shouldUpdateDisabled = activeControlChanged || oldViewProps.disabled != newViewProps.disabled;
   NSString *value = StringFromStdString(newViewProps.value);
   NSString *placeholder = StringFromStdString(newViewProps.placeholder);
-  NSTextField *activeField = isMultiline ? nil : (newViewProps.secureTextEntry ? _secureField : _field);
+  NSTextField *activeField = isMultiline ? nil : (newViewProps.secureTextEntry ? _secureField : (isSearch ? _searchField : _field));
   NSString *activeValue = isMultiline ? _multilineField.string : activeField.stringValue;
   // Fabric may recycle this component after clearing its AppKit backing
   // control while the controlled React value is unchanged. Restore a blank
@@ -1666,12 +1817,15 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   _synchronizing = YES;
   _field.stringValue = @"";
   _secureField.stringValue = @"";
+  _searchField.stringValue = @"";
   _multilineField.string = @"";
   _synchronizing = NO;
   _field.placeholderString = nil;
   _secureField.placeholderString = nil;
+  _searchField.placeholderString = nil;
   _field.enabled = YES;
   _secureField.enabled = YES;
+  _searchField.enabled = YES;
   _field.liteLLMShowsFocusBorder = NO;
   _secureField.liteLLMShowsFocusBorder = NO;
   _multilineField.editable = YES;
@@ -1700,13 +1854,14 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   _secureField.liteLLMShowsFocusBorder = NO;
   _field.delegate = nil;
   _secureField.delegate = nil;
+  _searchField.delegate = nil;
   _multilineField.delegate = nil;
   [super invalidate];
 }
 
 - (void)controlTextDidChange:(NSNotification *)notification
 {
-  if (_synchronizing || (notification.object != _field && notification.object != _secureField)) {
+  if (_synchronizing || (notification.object != _field && notification.object != _secureField && notification.object != _searchField)) {
     return;
   }
   [self emitTextChanged:((NSTextField *)notification.object).stringValue];
@@ -1719,6 +1874,8 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
     [self emitBlur];
   } else if (notification.object == _secureField) {
     _secureField.liteLLMShowsFocusBorder = NO;
+    [self emitBlur];
+  } else if (notification.object == _searchField) {
     [self emitBlur];
   }
 }
@@ -1755,7 +1912,8 @@ doCommandBySelector:(SEL)commandSelector
     return;
   }
   NSString *text = _host.activeControl == _scrollView ? _multilineField.string :
-      (_host.activeControl == _secureField ? _secureField.stringValue : _field.stringValue);
+      (_host.activeControl == _secureField ? _secureField.stringValue :
+      (_host.activeControl == _searchField ? _searchField.stringValue : _field.stringValue));
   LiteLLMAppKitTextFieldEventEmitter::OnSubmitEditing event{StdStringFromString(text)};
   std::static_pointer_cast<const LiteLLMAppKitTextFieldEventEmitter>(_eventEmitter)->onSubmitEditing(event);
 }
@@ -1792,7 +1950,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
 @end
 
 @implementation LiteLLMAppKitSwitchComponentView {
-  NSButton *_switch;
+  NSSwitch *_switch;
   LiteLLMAppKitControlHostView *_host;
   BOOL _synchronizing;
 }
@@ -1812,9 +1970,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
   if (self = [super initWithFrame:frame]) {
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitSwitchProps>();
     _props = defaultProps;
-    _switch = [LiteLLMTabSwitch checkboxWithTitle:@"" target:self action:@selector(changed:)];
+    // A real NSSwitch, not a checkbox: boolean runtime settings read as the
+    // same on/off control the system Settings panes use.
+    _switch = [[NSSwitch alloc] initWithFrame:NSZeroRect];
     _switch.identifier = LiteLLMTabStopIdentifier;
     _switch.controlSize = NSControlSizeRegular;
+    _switch.target = self;
+    _switch.action = @selector(changed:);
     _host = [[LiteLLMAppKitControlHostView alloc] initWithFrame:NSZeroRect];
     _host.control = _switch;
     self.contentView = _host;
@@ -1927,6 +2089,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 }
 
 @interface LiteLLMAppKitTableComponentView () <NSTableViewDataSource, NSTableViewDelegate, RCTLiteLLMAppKitTableViewProtocol>
+- (void)applySourceListChrome:(BOOL)sourceList;
 - (void)updateColumnMinimumWidths;
 - (void)updateScrollerVisibility;
 - (void)tableColumnDidResize:(NSNotification *)notification;
@@ -2027,14 +2190,18 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const bool firstColumnPaddingChanged = oldViewProps.firstColumnHorizontalPadding != newViewProps.firstColumnHorizontalPadding;
   const bool overflowBehaviorChanged = oldViewProps.preserveColumnWidths != newViewProps.preserveColumnWidths ||
       oldViewProps.scrollTrailingColumnOverflow != newViewProps.scrollTrailingColumnOverflow;
+  const bool sourceListChanged = oldViewProps.sourceList != newViewProps.sourceList;
   const bool rowsChanged = oldViewProps.rowKeys != newViewProps.rowKeys ||
       oldViewProps.cells != newViewProps.cells ||
+      oldViewProps.rowSymbols != newViewProps.rowSymbols ||
+      oldViewProps.rowSymbolColors != newViewProps.rowSymbolColors ||
+      oldViewProps.rowImageNames != newViewProps.rowImageNames ||
       oldViewProps.disabledRowKeys != newViewProps.disabledRowKeys ||
       oldViewProps.secondaryCellKeys != newViewProps.secondaryCellKeys ||
       oldViewProps.alertRowKeys != newViewProps.alertRowKeys ||
       oldViewProps.spanningRowKeys != newViewProps.spanningRowKeys;
   const bool dataChanged = columnsChanged || compactChanged || paddingChanged || firstColumnPaddingChanged ||
-      overflowBehaviorChanged || rowsChanged;
+      overflowBehaviorChanged || sourceListChanged || rowsChanged;
   const BOOL initialDataLoad = !_hasLoadedData;
   const BOOL wasFollowingBottom = newViewProps.followBottom && dataChanged
       ? (initialDataLoad || TableIsFollowingBottom(_scrollView, _tableView))
@@ -2042,8 +2209,14 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
   _tableView.usesAlternatingRowBackgroundColors = newViewProps.alternatingRows;
   _frameView.framed = !newViewProps.borderless;
-  if (compactChanged) {
-    _tableView.rowHeight = newViewProps.compact ? 22 : 28;
+  if (sourceListChanged) {
+    [self applySourceListChrome:newViewProps.sourceList];
+  }
+  if (compactChanged || sourceListChanged) {
+    // Sidebar rows use the compact native source-list rhythm while keeping the
+    // bundled icon tile optically centered.
+    _tableView.rowHeight = newViewProps.sourceList ? 26 : (newViewProps.compact ? 22 : 28);
+    _tableView.intercellSpacing = newViewProps.sourceList ? NSMakeSize(0, 2) : NSZeroSize;
     if (_tableView.headerView != nil) {
       NSRect headerFrame = _tableView.headerView.frame;
       headerFrame.size.height = newViewProps.compact ? 24 : 28;
@@ -2155,6 +2328,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   _requestedColumnWidths.clear();
   _userResizedColumns.clear();
   _hasLoadedData = NO;
+  // Fabric recycles native views by component type, so a sidebar source list
+  // can be handed to an ordinary data table. Reset the chrome that the props
+  // reset above no longer describes, otherwise the next table inherits the
+  // previous table's style.
+  [self applySourceListChrome:NO];
+  _tableView.intercellSpacing = NSZeroSize;
   _scrollView.hasHorizontalScroller = NO;
   _scrollView.hasVerticalScroller = NO;
   _scrollView.acceptsHorizontalScroll = NO;
@@ -2163,6 +2342,33 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   _clipView.acceptsVerticalScroll = NO;
   _tableView.acceptsHorizontalScroll = NO;
   _tableView.acceptsVerticalScroll = NO;
+}
+
+- (void)applySourceListChrome:(BOOL)sourceList
+{
+  _tableView.style = sourceList ? NSTableViewStyleSourceList : NSTableViewStylePlain;
+  _tableView.selectionHighlightStyle = sourceList
+      ? NSTableViewSelectionHighlightStyleSourceList
+      : NSTableViewSelectionHighlightStyleRegular;
+  _tableView.floatsGroupRows = sourceList;
+  // The settings sidebar splits the source list into a pane table and a
+  // separate About table; the coordinated selection lives in the JS
+  // selectedKey props, so an empty per-table selection must be representable.
+  _tableView.allowsEmptySelection = YES;
+  _tableView.backgroundColor = sourceList ? NSColor.clearColor : NSColor.controlBackgroundColor;
+  _scrollView.drawsBackground = !sourceList;
+  // Source-list rows stay transparent: the settings window itself carries one
+  // sidebar material behind every pane, so a per-table backdrop would double
+  // the vibrancy and leave the surrounding sidebar a different shade.
+  if (sourceList) {
+    if (_tableView.headerView != nil) {
+      _tableView.headerView = nil;
+      [_scrollView tile];
+    }
+  } else if (_tableView.headerView == nil) {
+    _tableView.headerView = [[NSTableHeaderView alloc] initWithFrame:NSZeroRect];
+    [_scrollView tile];
+  }
 }
 
 - (void)updateColumnMinimumWidths
@@ -2404,7 +2610,19 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
 - (CGFloat)tableView:(NSTableView *)tableView heightOfRow:(NSInteger)row
 {
-  return [self isSpanningRow:row] ? tableView.rowHeight + 6 : tableView.rowHeight;
+  if ([self isSpanningRow:row]) {
+    // An empty source-list group row is the hairline separator above the
+    // About entry, not a section header.
+    const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+    const size_t columnCount = viewProps.columnLabels.size();
+    const size_t cellIndex = static_cast<size_t>(row) * columnCount;
+    if (viewProps.sourceList && columnCount > 0 &&
+        (cellIndex >= viewProps.cells.size() || viewProps.cells[cellIndex].empty())) {
+      return 14;
+    }
+    return tableView.rowHeight + 6;
+  }
+  return tableView.rowHeight;
 }
 
 - (NSView *)tableView:(NSTableView *)tableView
@@ -2419,6 +2637,15 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   if ([self isSpanningRow:row]) {
     const size_t cellIndex = static_cast<size_t>(row) * columnCount;
     NSString *value = cellIndex < viewProps.cells.size() ? StringFromStdString(viewProps.cells[cellIndex]) : @"";
+    if (viewProps.sourceList && value.length == 0) {
+      NSUserInterfaceItemIdentifier identifier = @"LiteLLMAppKitTableSeparatorCell";
+      LiteLLMTableSeparatorView *cell = (LiteLLMTableSeparatorView *)[tableView makeViewWithIdentifier:identifier owner:self];
+      if (cell == nil) {
+        cell = [[LiteLLMTableSeparatorView alloc] initWithFrame:NSZeroRect];
+        cell.identifier = identifier;
+      }
+      return cell;
+    }
     NSUserInterfaceItemIdentifier identifier = @"LiteLLMAppKitTableGroupCell";
     LiteLLMTableGroupCellView *cell = (LiteLLMTableGroupCellView *)[tableView makeViewWithIdentifier:identifier owner:self];
     if (cell == nil) {
@@ -2436,6 +2663,58 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     cell.label.font = TableCellFont();
     cell.label.textColor = NSColor.labelColor;
     cell.label.attributedStringValue = TableCellTitle(value, NSColor.labelColor);
+    cell.label.toolTip = value;
+    cell.label.accessibilityLabel = value;
+    cell.toolTip = value;
+    cell.accessibilityLabel = value;
+    return cell;
+  }
+  if (viewProps.sourceList && static_cast<size_t>(row) < viewProps.rowSymbols.size() &&
+      !viewProps.rowSymbols[static_cast<size_t>(row)].empty()) {
+    const size_t cellIndex = static_cast<size_t>(row) * columnCount;
+    NSString *value = cellIndex < viewProps.cells.size() ? StringFromStdString(viewProps.cells[cellIndex]) : @"";
+    NSUserInterfaceItemIdentifier identifier = @"LiteLLMAppKitSourceListCell";
+    LiteLLMSourceListCellView *cell = (LiteLLMSourceListCellView *)[tableView makeViewWithIdentifier:identifier owner:self];
+    if (cell == nil) {
+      cell = [[LiteLLMSourceListCellView alloc] initWithFrame:NSZeroRect];
+      cell.identifier = identifier;
+    }
+    NSString *symbol = StringFromStdString(viewProps.rowSymbols[static_cast<size_t>(row)]);
+    NSString *colorHex = static_cast<size_t>(row) < viewProps.rowSymbolColors.size()
+        ? StringFromStdString(viewProps.rowSymbolColors[static_cast<size_t>(row)])
+        : @"";
+    NSString *imageName = static_cast<size_t>(row) < viewProps.rowImageNames.size()
+        ? StringFromStdString(viewProps.rowImageNames[static_cast<size_t>(row)])
+        : @"";
+    // A bundled icon tile already carries its own badge color and glyph, so
+    // the SF Symbol is only the fallback when the asset is unavailable. An
+    // empty color renders a plain monochrome symbol with no badge, which is
+    // how the About row appears in the system settings sidebar.
+    NSImage *tileImage = imageName.length > 0 ? [NSImage imageNamed:imageName] : nil;
+    if (tileImage != nil) {
+      cell.badgeTinted = YES;
+      cell.badge.layer.backgroundColor = NSColor.clearColor.CGColor;
+      cell.icon.contentTintColor = nil;
+      cell.icon.image = tileImage;
+    } else if (colorHex.length > 0) {
+      cell.badgeTinted = YES;
+      cell.badge.layer.backgroundColor = SourceListBadgeColor(colorHex).CGColor;
+      cell.icon.contentTintColor = NSColor.whiteColor;
+      NSImage *iconImage = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+      iconImage = [iconImage imageWithSymbolConfiguration:
+          [NSImageSymbolConfiguration configurationWithPointSize:14 weight:NSFontWeightSemibold]];
+      cell.icon.image = iconImage;
+    } else {
+      cell.badgeTinted = NO;
+      cell.badge.layer.backgroundColor = NSColor.clearColor.CGColor;
+      cell.icon.contentTintColor = NSColor.secondaryLabelColor;
+      NSImage *iconImage = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
+      iconImage = [iconImage imageWithSymbolConfiguration:
+          [NSImageSymbolConfiguration configurationWithPointSize:15 weight:NSFontWeightMedium]];
+      cell.icon.image = iconImage;
+    }
+    cell.label.font = SourceListFont();
+    cell.label.stringValue = value;
     cell.label.toolTip = value;
     cell.label.accessibilityLabel = value;
     cell.toolTip = value;
