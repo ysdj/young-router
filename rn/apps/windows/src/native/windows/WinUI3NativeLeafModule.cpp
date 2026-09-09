@@ -956,6 +956,34 @@ void WinUI3NativeLeafModule::ShowVersion() noexcept {
   }
 }
 
+void WinUI3NativeLeafModule::VersionInfo(
+    winrt::Microsoft::ReactNative::ReactPromise<winrt::Microsoft::ReactNative::JSValueObject> const& promise) noexcept {
+  auto leaf = leaf_;
+  try {
+    context_.UIDispatcher().Post([leaf, promise] {
+      auto info = leaf->VersionInfo();
+      winrt::Microsoft::ReactNative::JSValueObject result;
+      result["app"] = winrt::to_string(info.app);
+      result["litellm"] = winrt::to_string(info.litellm);
+      promise.Resolve(result);
+    });
+  } catch (...) {
+    winrt::Microsoft::ReactNative::JSValueObject result;
+    result["app"] = std::string{};
+    result["litellm"] = std::string{};
+    promise.Resolve(result);
+  }
+}
+
+void WinUI3NativeLeafModule::OpenExternalURL(std::wstring const& url) noexcept {
+  if (url.empty() || url.size() > 8192) return;
+  try {
+    auto leaf = leaf_;
+    context_.UIDispatcher().Post([leaf, url] { leaf->OpenExternalURL(url); });
+  } catch (...) {
+  }
+}
+
 void WinUI3NativeLeafModule::Quit() noexcept {
   try {
     auto leaf = leaf_;

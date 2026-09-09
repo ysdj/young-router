@@ -35,6 +35,8 @@ struct WinUI3NativeLeafModule {
   REACT_SYNC_METHOD(SystemLocale, L"systemLocale");
   REACT_METHOD(SetLaunchAtLogin, L"setLaunchAtLogin");
   REACT_METHOD(ShowVersion, L"showVersion");
+  REACT_METHOD(VersionInfo, L"versionInfo");
+  REACT_METHOD(OpenExternalURL, L"openExternalURL");
   REACT_METHOD(Quit, L"quit");
   REACT_METHOD(SetShortcuts, L"setShortcuts");
   REACT_EVENT(MenuAction, L"menuAction");
@@ -112,6 +114,8 @@ struct WinUI3NativeLeafModule {
   std::string SystemLocale() noexcept;
   void SetLaunchAtLogin(bool enabled, winrt::Microsoft::ReactNative::ReactPromise<bool> promise) noexcept;
   void ShowVersion() noexcept;
+  void VersionInfo(winrt::Microsoft::ReactNative::ReactPromise<winrt::Microsoft::ReactNative::JSValueObject> const& promise) noexcept;
+  void OpenExternalURL(std::wstring const& url) noexcept;
   void Quit() noexcept;
   void SetShortcuts(winrt::Microsoft::ReactNative::JSValueObject const& shortcuts) noexcept;
 

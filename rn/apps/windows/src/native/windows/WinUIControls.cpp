@@ -24,8 +24,10 @@
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <winrt/Microsoft.UI.Xaml.Media.Imaging.h>
 #include <winrt/Microsoft.Web.WebView2.Core.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.UI.h>
@@ -40,6 +42,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -55,6 +58,7 @@ using winrt::Microsoft::UI::Xaml::Controls::ComboBox;
 using winrt::Microsoft::UI::Xaml::Controls::FontIcon;
 using winrt::Microsoft::UI::Xaml::Controls::Grid;
 using winrt::Microsoft::UI::Xaml::Controls::HyperlinkButton;
+using winrt::Microsoft::UI::Xaml::Controls::Image;
 using winrt::Microsoft::UI::Xaml::Controls::ListView;
 using winrt::Microsoft::UI::Xaml::Controls::ListViewSelectionMode;
 using winrt::Microsoft::UI::Xaml::Controls::Orientation;
@@ -74,6 +78,9 @@ using winrt::Microsoft::UI::Xaml::Thickness;
 namespace web = winrt::Microsoft::Web::WebView2::Core;
 
 constexpr double kUIFontSize = 13.0;
+// The settings sidebar follows the native reference: a 13pt medium label.
+constexpr double kSourceListFontSize = 13.0;
+constexpr double kSourceListGlyphFontSize = 15.0;
 
 winrt::hstring ToHString(std::string const& value) {
   return winrt::to_hstring(value);
@@ -125,6 +132,39 @@ SolidColorBrush AlternatingRowBrush() {
 
 SolidColorBrush SecondaryTextBrush() {
   return ThemeBrush(L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115});
+}
+
+SolidColorBrush TransparentBrush() {
+  return SolidColorBrush(winrt::Windows::UI::Color{0, 0, 0, 0});
+}
+
+// Sidebar badges use a rounded color square behind a white Segoe Fluent Icons
+// glyph. The shared shell passes SF Symbol names and sRGB hex colors so both
+// hosts render the same badge.
+winrt::Windows::UI::Color SourceListBadgeColor(std::vector<std::string> const& colors, size_t index) {
+  const std::string hex = index < colors.size() ? colors[index] : std::string{};
+  unsigned int value = 0;
+  if (hex.size() != 7 || hex[0] != '#') return winrt::Windows::UI::Color{255, 0, 95, 184};
+  try {
+    value = static_cast<unsigned int>(std::stoul(hex.substr(1), nullptr, 16));
+  } catch (...) {
+    return winrt::Windows::UI::Color{255, 0, 95, 184};
+  }
+  return winrt::Windows::UI::Color{
+      255,
+      static_cast<uint8_t>((value >> 16) & 0xFF),
+      static_cast<uint8_t>((value >> 8) & 0xFF),
+      static_cast<uint8_t>(value & 0xFF)};
+}
+
+wchar_t const* SourceListGlyph(std::string const& symbol) {
+  if (symbol == "square.stack.3d.up") return L"\xE7B8";
+  if (symbol == "gearshape.2") return L"\xE713";
+  if (symbol == "terminal") return L"\xE756";
+  if (symbol == "arrow.up.arrow.down") return L"\xE895";
+  if (symbol == "list.bullet.rectangle") return L"\xE8A5";
+  if (symbol == "info.circle") return L"\xE946";
+  return L"\xE74D";
 }
 
 ScrollViewer FindTextEditorScrollViewer(
@@ -236,6 +276,38 @@ struct ButtonComponentView final
     const auto symbol = props.symbol.value_or("");
     if (symbol.empty()) {
       button_.Content(winrt::box_value(ToHString(props.title)));
+    } else if (props.symbolWithTitle.value_or(false)) {
+      // Keep the translated title next to a leading glyph instead of turning
+      // the control into an icon-only button.
+      auto row = StackPanel{};
+      row.Orientation(Orientation::Horizontal);
+      row.Spacing(6);
+      auto icon = FontIcon{};
+      icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
+      icon.FontSize(kUIFontSize);
+      if (symbol == "check") icon.Glyph(L"\xE73E");
+      else if (symbol == "close") icon.Glyph(L"\xE711");
+      else if (symbol == "copy") icon.Glyph(L"\xE8C8");
+      else if (symbol == "edit") icon.Glyph(L"\xE70F");
+      else if (symbol == "import") icon.Glyph(L"\xE8B5");
+      else if (symbol == "info") icon.Glyph(L"\xE946");
+      else if (symbol == "power-on" || symbol == "power-off") icon.Glyph(L"\xE7E8");
+      else if (symbol == "minus") icon.Glyph(L"\xE738");
+      else if (symbol == "pause") icon.Glyph(L"\xE769");
+      else if (symbol == "play") icon.Glyph(L"\xE768");
+      else if (symbol == "plus") icon.Glyph(L"\xE710");
+      else if (symbol == "refresh") icon.Glyph(L"\xE72C");
+      else if (symbol == "chevron-up") icon.Glyph(L"\xE70E");
+      else if (symbol == "chevron-down") icon.Glyph(L"\xE70D");
+      else icon.Glyph(L"\xE74D");
+      icon.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+      auto label = TextBlock{};
+      label.FontSize(kUIFontSize);
+      label.Text(ToHString(props.title));
+      label.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+      row.Children().Append(icon);
+      row.Children().Append(label);
+      button_.Content(row);
     } else {
       auto icon = FontIcon{};
       icon.FontFamily(FontFamily(L"Segoe MDL2 Assets"));
@@ -245,6 +317,7 @@ struct ButtonComponentView final
       else if (symbol == "copy") icon.Glyph(L"\xE8C8");
       else if (symbol == "edit") icon.Glyph(L"\xE70F");
       else if (symbol == "import") icon.Glyph(L"\xE8B5");
+      else if (symbol == "info") icon.Glyph(L"\xE946");
       else if (symbol == "power-on" || symbol == "power-off") icon.Glyph(L"\xE7E8");
       else if (symbol == "minus") icon.Glyph(L"\xE738");
       else if (symbol == "pause") icon.Glyph(L"\xE769");
@@ -536,6 +609,7 @@ struct TableComponentView final
     auto header_row = winrt::Microsoft::UI::Xaml::Controls::RowDefinition{};
     auto body_row = winrt::Microsoft::UI::Xaml::Controls::RowDefinition{};
     header_row.Height(winrt::Microsoft::UI::Xaml::GridLengthHelper::Auto());
+    header_row_ = header_row;
     table_.RowDefinitions().Append(header_row);
     table_.RowDefinitions().Append(body_row);
 
@@ -651,6 +725,9 @@ struct TableComponentView final
     disabled_row_keys_.clear();
     secondary_cell_keys_.clear();
     spanning_row_keys_.clear();
+    row_symbols_.clear();
+    row_symbol_colors_.clear();
+    row_image_names_.clear();
     has_applied_ = false;
     syncing_ = false;
 
@@ -709,13 +786,35 @@ struct TableComponentView final
     const auto alert_row_keys = props.alertRowKeys.value_or(std::vector<std::string>{});
     const auto spanning_row_keys = props.spanningRowKeys.value_or(std::vector<std::string>{});
     const auto column_count = props.columnLabels.size();
+    const bool source_list = props.sourceList.value_or(false);
+    const bool source_list_changed = !has_applied_ || source_list_ != source_list;
+    const auto row_symbols = props.rowSymbols.value_or(std::vector<std::string>{});
+    const auto row_symbol_colors = props.rowSymbolColors.value_or(std::vector<std::string>{});
+    const auto row_image_names = props.rowImageNames.value_or(std::vector<std::string>{});
     const bool columns_changed = !has_applied_ || column_labels_ != props.columnLabels || column_widths_ != props.columnWidths || compact_ != props.compact;
-    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || alert_row_keys_ != alert_row_keys || spanning_row_keys_ != spanning_row_keys || compact_ != props.compact;
+    const bool rows_changed = !has_applied_ || row_keys_ != props.rowKeys || cells_ != props.cells || alternating_rows_ != props.alternatingRows || disabled_row_keys_ != disabled_row_keys || secondary_cell_keys_ != secondary_cell_keys || alert_row_keys_ != alert_row_keys || spanning_row_keys_ != spanning_row_keys || compact_ != props.compact || source_list_changed || row_symbols_ != row_symbols || row_symbol_colors_ != row_symbol_colors || row_image_names_ != row_image_names;
     const bool selection_changed = !has_applied_ || selected_key_ != props.selectedKey;
     const bool was_following_bottom = props.followBottom.value_or(false) && rows_changed
         ? (!has_applied_ || ListIsFollowingBottom(list_))
         : false;
     syncing_ = true;
+
+    if (source_list_changed) {
+      // A sidebar source list has no column header and lets the window
+      // background and the list selection show through the rows.
+      header_frame_.Visibility(source_list ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed
+                                           : winrt::Microsoft::UI::Xaml::Visibility::Visible);
+      if (header_row_) {
+        header_row_.Height(source_list ? winrt::Microsoft::UI::Xaml::GridLengthHelper::FromPixels(0)
+                                       : winrt::Microsoft::UI::Xaml::GridLengthHelper::Auto());
+      }
+      table_frame_.Background(source_list ? TransparentBrush() : ThemeBrush(
+          L"ControlFillColorDefaultBrush",
+          winrt::Windows::UI::Color{255, 255, 255, 255}));
+      list_.Background(source_list ? TransparentBrush() : ThemeBrush(
+          L"ControlFillColorDefaultBrush",
+          winrt::Windows::UI::Color{255, 255, 255, 255}));
+    }
 
     if (columns_changed) {
       table_.MinWidth(TableWidth(props.columnWidths, column_count));
@@ -739,10 +838,13 @@ struct TableComponentView final
       list_.Items().Clear();
       for (size_t row_index = 0; row_index < props.rowKeys.size(); ++row_index) {
         auto row = Grid{};
-        row.MinHeight(props.compact.value_or(false) ? 22.0 : 28.0);
+        row.MinHeight(source_list ? 26.0 : (props.compact.value_or(false) ? 22.0 : 28.0));
+        if (source_list) row.Margin(winrt::Microsoft::UI::Xaml::Thickness{0, 1, 0, 1});
         const bool disabled = std::find(disabled_row_keys.begin(), disabled_row_keys.end(), props.rowKeys[row_index]) != disabled_row_keys.end();
         if (props.alternatingRows.value_or(false) && row_index % 2 == 1) {
           row.Background(AlternatingRowBrush());
+        } else if (source_list) {
+          row.Background(TransparentBrush());
         } else {
           row.Background(ThemeBrush(
               L"ControlFillColorDefaultBrush",
@@ -752,17 +854,89 @@ struct TableComponentView final
         const bool spanning = std::find(spanning_row_keys.begin(), spanning_row_keys.end(), props.rowKeys[row_index]) != spanning_row_keys.end();
         if (spanning) {
           const auto cell_index = row_index * column_count;
+          const auto spanning_text = cell_index < props.cells.size() ? props.cells[cell_index] : std::string{};
+          if (source_list && spanning_text.empty()) {
+            // Empty source-list group row: the hairline separator above the
+            // About entry, matching the macOS sidebar.
+            row.MinHeight(14);
+            auto separator = Border{};
+            separator.Height(14);
+            separator.BorderThickness(winrt::Microsoft::UI::Xaml::Thickness{0, 1, 0, 0});
+            separator.BorderBrush(ThemeBrush(
+                L"ControlStrokeColorDefaultBrush", winrt::Windows::UI::Color{255, 140, 140, 140}));
+            Grid::SetColumnSpan(separator, static_cast<int32_t>(std::max<size_t>(1, column_count)));
+            row.Children().Append(separator);
+          } else {
           auto label = TextBlock{};
           label.FontSize(kUIFontSize);
           label.FontWeight(winrt::Windows::UI::Text::FontWeights::Normal());
-          label.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
+          label.Text(ToHString(spanning_text));
           if (!label.Text().empty()) ToolTipService::SetToolTip(label, winrt::box_value(label.Text()));
           const double vertical_margin = props.compact.value_or(false) ? 4.0 : 7.0;
           label.Margin({8, vertical_margin, 8, vertical_margin});
           label.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
           Grid::SetColumnSpan(label, static_cast<int32_t>(std::max<size_t>(1, column_count)));
           row.Children().Append(label);
+          }
         } else {
+          if (source_list && row_index < row_symbols.size() && !row_symbols[row_index].empty()) {
+            // Source-list row: colored badge with a white glyph plus the pane
+            // title, matching the macOS sidebar presentation.
+            auto content = StackPanel{};
+            content.Orientation(Orientation::Horizontal);
+            content.Spacing(8);
+            content.Padding(winrt::Microsoft::UI::Xaml::Thickness{4, 0, 8, 0});
+            content.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+            auto badge = Border{};
+            badge.Width(20);
+            badge.Height(20);
+            winrt::Microsoft::UI::Xaml::CornerRadius badge_radius{};
+            badge_radius.TopLeft = 4.5;
+            badge_radius.TopRight = 4.5;
+            badge_radius.BottomRight = 4.5;
+            badge_radius.BottomLeft = 4.5;
+            badge.CornerRadius(badge_radius);
+            // An empty color renders a plain monochrome symbol with no badge,
+            // the way the About row appears in the system settings sidebar.
+            const bool tinted_badge = row_index < row_symbol_colors.size() && !row_symbol_colors[row_index].empty();
+            badge.Background(tinted_badge
+                ? SolidColorBrush(SourceListBadgeColor(row_symbol_colors, row_index))
+                : TransparentBrush());
+            auto glyph = FontIcon{};
+            glyph.FontFamily(FontFamily(L"Segoe Fluent Icons"));
+            glyph.FontSize(kSourceListGlyphFontSize);
+            glyph.Foreground(tinted_badge
+                ? SolidColorBrush(winrt::Windows::UI::Colors::White())
+                : SecondaryTextBrush());
+            glyph.Glyph(SourceListGlyph(row_symbols[row_index]));
+            auto badge_content = Grid{};
+            badge_content.Children().Append(glyph);
+            // A bundled icon tile carries its own badge color and glyph. It is
+            // layered over the glyph so a missing asset still shows the symbol.
+            if (row_index < row_image_names.size() && !row_image_names[row_index].empty()) {
+              auto tile = Image{};
+              tile.Stretch(winrt::Microsoft::UI::Xaml::Media::Stretch::UniformToFill);
+              std::wstring tile_uri = L"ms-appx:///Assets/Sidebar/";
+              tile_uri += ToHString(row_image_names[row_index]).c_str();
+              tile_uri += L".png";
+              tile.Source(winrt::Microsoft::UI::Xaml::Media::Imaging::BitmapImage{
+                  winrt::Windows::Foundation::Uri{winrt::hstring{tile_uri}}});
+              badge_content.Children().Append(tile);
+            }
+            badge.Child(badge_content);
+            auto label = TextBlock{};
+            label.FontSize(kSourceListFontSize);
+            label.FontWeight(winrt::Windows::UI::Text::FontWeights::Medium());
+            const auto cell_index = row_index * column_count;
+            label.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
+            if (!label.Text().empty()) ToolTipService::SetToolTip(label, winrt::box_value(label.Text()));
+            label.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+            label.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+            content.Children().Append(badge);
+            content.Children().Append(label);
+            Grid::SetColumnSpan(content, static_cast<int32_t>(std::max<size_t>(1, column_count)));
+            row.Children().Append(content);
+          } else {
           for (size_t column_index = 0; column_index < column_count; ++column_index) {
             const auto cell_index = row_index * column_count + column_index;
             auto cell = TextBlock{};
@@ -783,6 +957,7 @@ struct TableComponentView final
             Grid::SetColumn(cell, static_cast<int32_t>(column_index));
             row.Children().Append(cell);
           }
+          }
         }
         list_.Items().Append(row);
       }
@@ -799,6 +974,10 @@ struct TableComponentView final
     selected_key_ = props.selectedKey;
     alternating_rows_ = props.alternatingRows;
     compact_ = props.compact;
+    source_list_ = source_list;
+    row_symbols_ = row_symbols;
+    row_symbol_colors_ = row_symbol_colors;
+    row_image_names_ = row_image_names;
     disabled_row_keys_ = disabled_row_keys;
     secondary_cell_keys_ = secondary_cell_keys;
     alert_row_keys_ = alert_row_keys;
@@ -817,6 +996,7 @@ struct TableComponentView final
   Grid table_{nullptr};
   Grid header_{nullptr};
   Border header_frame_{nullptr};
+  winrt::Microsoft::UI::Xaml::Controls::RowDefinition header_row_{nullptr};
   ListView list_{nullptr};
   ScrollViewer horizontal_scroller_{nullptr};
   bool has_applied_ = false;
@@ -827,6 +1007,10 @@ struct TableComponentView final
   std::string selected_key_;
   std::optional<bool> alternating_rows_;
   std::optional<bool> compact_;
+  std::optional<bool> source_list_;
+  std::vector<std::string> row_symbols_;
+  std::vector<std::string> row_symbol_colors_;
+  std::vector<std::string> row_image_names_;
   std::vector<std::string> disabled_row_keys_;
   std::vector<std::string> secondary_cell_keys_;
   std::vector<std::string> alert_row_keys_;

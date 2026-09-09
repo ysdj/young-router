@@ -40,7 +40,9 @@ import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 type ButtonProps = {
   title: string;
-  symbol?: "check" | "close" | "copy" | "edit" | "import" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash" | "chevron-up" | "chevron-down";
+  symbol?: "check" | "close" | "copy" | "edit" | "import" | "info" | "minus" | "pause" | "play" | "plus" | "power-off" | "power-on" | "refresh" | "trash" | "chevron-up" | "chevron-down";
+  /** Keep the title visible next to a leading symbol instead of icon-only. */
+  symbolWithTitle?: boolean;
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;
@@ -145,6 +147,14 @@ type TableProps = {
   compact?: boolean;
   followBottom?: boolean;
   framed?: boolean;
+  /** Sidebar source-list chrome: no header, single full-width column. */
+  sourceList?: boolean;
+  /** Per-row SF Symbol names (macOS) / semantic icon names (Windows). */
+  rowSymbols?: string[];
+  /** Per-row sRGB hex badge colors behind each source-list symbol. */
+  rowSymbolColors?: string[];
+  /** Per-row bundled icon-tile asset names; preferred over symbol/color. */
+  rowImageNames?: string[];
   cellHorizontalPadding?: number;
   firstColumnHorizontalPadding?: number;
   preserveColumnWidths?: boolean;
@@ -211,12 +221,15 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
     primary: props.primary === true,
     destructive: props.destructive === true,
     link: props.link === true,
+    symbolWithTitle: props.symbolWithTitle === true,
   };
   // A caller may enlarge a button, but must never reduce a translated title to
   // an ellipsis. Symbol-only and compact glyph buttons intentionally use their
-  // caller/native icon size rather than the text-button minimum width.
-  const titleWidth = !props.symbol && !(compact && isCompactGlyphTitle(props.title))
-    ? { minWidth: nativeButtonMinimumWidth(props.title, compact), flexShrink: 0 }
+  // caller/native icon size rather than the text-button minimum width. A
+  // symbol-with-title button reserves room for the leading icon.
+  const showsTitle = props.symbolWithTitle === true || !props.symbol;
+  const titleWidth = showsTitle && !(compact && isCompactGlyphTitle(props.title))
+    ? { minWidth: nativeButtonMinimumWidth(props.title, compact) + (props.symbol ? 22 : 0), flexShrink: 0 }
     : undefined;
   const style = [props.link ? styles.linkButton : styles.button, props.style, titleWidth];
   if (Platform.OS === "windows") {
@@ -248,12 +261,12 @@ export function NativeSegmentedControl(props: SegmentedProps & { ref?: React.Ref
   return <NativeSegmentedControlWithRef {...props} ref={props.ref} />;
 }
 
-export function NativeTextField({ style, onChangeText, onSubmitEditing, ...props }: TextInputProps): React.JSX.Element {
+export function NativeTextField({ style, onChangeText, onSubmitEditing, search = false, ...props }: TextInputProps & { search?: boolean }): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WinUITextInput value={props.value} placeholder={props.placeholder} multiline={props.multiline} secureTextEntry={props.secureTextEntry} disabled={props.editable === false} keyboardType={props.keyboardType} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} onBlur={() => props.onBlur?.({} as never)} onSubmitEditing={(event) => onSubmitEditing?.({ ...event, nativeEvent: { text: event.nativeEvent.text } } as never)} style={style} />;
+    return <WinUITextInput value={props.value} placeholder={props.placeholder} multiline={props.multiline} secureTextEntry={props.secureTextEntry} search={search} disabled={props.editable === false} keyboardType={props.keyboardType} onChangeText={(event) => onChangeText?.(event.nativeEvent.text)} onBlur={() => props.onBlur?.({} as never)} onSubmitEditing={(event) => onSubmitEditing?.({ ...event, nativeEvent: { text: event.nativeEvent.text } } as never)} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitTextField {...props} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
+    return <AppKitTextField {...props} search={search} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
   }
   return <TextInput {...props} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
 }
@@ -300,19 +313,28 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
 }
 
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, framed = true, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
-  const stripedRows = striped && (alternatingRows || rows.length > 0);
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, alternatingRows = false, compact = true, followBottom = false, framed = true, sourceList = false, rowSymbols = [], rowSymbolColors = [], rowImageNames = [], cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = [], secondaryCellKeys = [], onSelectionChange, onRowDoublePress, style, alertRowKeys = [] }: TableProps): React.JSX.Element {
+  const stripedRows = striped && !sourceList && (alternatingRows || rows.length > 0);
   const spanningRowKeys = rows.filter((row) => row.spanning).map((row) => row.key);
   const nativeProps = {
     columnLabels: columns.map((column) => column.label),
     columnWidths: columns.map((column) => column.width),
     rowKeys: rows.map((row) => row.key),
-    cells: rows.flatMap((row) => row.cells),
+    // Spanning (group) rows paint one full-width cell, but the native tables
+    // address cells positionally by row * columnCount. Pad every spanning row
+    // to the column count so following rows keep their columns aligned.
+    cells: rows.flatMap((row) => row.spanning
+      ? [row.cells[0] ?? "", ...Array(Math.max(0, columns.length - 1)).fill("")]
+      : row.cells),
     selectedKey,
     alternatingRows: stripedRows,
     compact,
     followBottom,
     borderless: !framed,
+    sourceList,
+    rowSymbols,
+    rowSymbolColors,
+    rowImageNames,
     disabledRowKeys,
     secondaryCellKeys,
     alertRowKeys,

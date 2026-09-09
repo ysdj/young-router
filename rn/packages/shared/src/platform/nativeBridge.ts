@@ -102,6 +102,9 @@ export interface NativeLeafBridge {
   clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
   restartCodex(): Promise<boolean>;
+  showVersion?(): void;
+  versionInfo?(): Promise<{ app: string; litellm: string; icon?: string }>;
+  openExternalURL?(url: string): void;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
 }
@@ -165,6 +168,9 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     clearRelayCredentials: (accountId) => bridge.clearRelayCredentials(accountId),
     setLaunchAtLogin: (enabled) => bridge.setLaunchAtLogin(enabled),
     restartCodex: () => bridge.restartCodex(),
+    showVersion: () => bridge.showVersion?.(),
+    versionInfo: bridge.versionInfo ? () => bridge.versionInfo!() : undefined,
+    openExternalURL: bridge.openExternalURL ? (url) => bridge.openExternalURL!(url) : undefined,
     setLocalization: (strings) => bridge.setLocalization(strings),
     setShortcuts: (shortcuts) => bridge.setShortcuts(shortcuts),
   };

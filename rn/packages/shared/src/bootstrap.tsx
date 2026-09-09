@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { AppRegistry } from "react-native";
-import { canonicalWindowRoute, DESKTOP_ROUTES, LOG_TABS } from "./routes";
+import { canonicalWindowRoute, DESKTOP_ROUTES, isSettingsPaneRoute, LOG_TABS } from "./routes";
 import { LiteLLMMenuApp } from "./ui/LiteLLMMenuApp";
 import type { AppRoute, IpcClient, LogTab, NativeLeafAdapter } from "./types";
 
@@ -35,7 +35,10 @@ export function registerLiteLLMMenu(componentName: string, dependencies: Desktop
         if (route === "logs") setLogTabRequest(tab && LOG_TABS.includes(tab) ? tab : "requests");
         const requestedWindow = canonicalWindowRoute(route);
         const currentWindow = canonicalWindowRoute(props.initialRoute ?? "home");
-        if (!isPrimaryHost && requestedWindow !== currentWindow) return;
+        // The settings window hosts every settings pane, so any open-* action
+        // that targets a pane belongs to this root even though the requested
+        // pane is not the route the window was created with.
+        if (!isPrimaryHost && !isSettingsPaneRoute(currentWindow) && requestedWindow !== currentWindow) return;
         setRouteRequest(route);
         setRouteRequestSequence((current) => current + 1);
       }
