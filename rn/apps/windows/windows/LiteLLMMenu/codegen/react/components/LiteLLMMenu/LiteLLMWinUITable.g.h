@@ -34,8 +34,13 @@ struct LiteLLMWinUITableProps : winrt::implements<LiteLLMWinUITableProps, winrt:
        compact = cloneFromProps->compact;
        followBottom = cloneFromProps->followBottom;
        borderless = cloneFromProps->borderless;
+       sourceList = cloneFromProps->sourceList;
+       rowSymbols = cloneFromProps->rowSymbols;
+       rowSymbolColors = cloneFromProps->rowSymbolColors;
+       rowImageNames = cloneFromProps->rowImageNames;
        disabledRowKeys = cloneFromProps->disabledRowKeys;
        secondaryCellKeys = cloneFromProps->secondaryCellKeys;
+       alertRowKeys = cloneFromProps->alertRowKeys;
        spanningRowKeys = cloneFromProps->spanningRowKeys;
        onSelectionChange = cloneFromProps->onSelectionChange;
        onRowDoublePress = cloneFromProps->onRowDoublePress;  
@@ -73,11 +78,26 @@ struct LiteLLMWinUITableProps : winrt::implements<LiteLLMWinUITableProps, winrt:
   REACT_FIELD(borderless)
   std::optional<bool> borderless{};
 
+  REACT_FIELD(sourceList)
+  std::optional<bool> sourceList{};
+
+  REACT_FIELD(rowSymbols)
+  std::optional<std::vector<std::string>> rowSymbols;
+
+  REACT_FIELD(rowSymbolColors)
+  std::optional<std::vector<std::string>> rowSymbolColors;
+
+  REACT_FIELD(rowImageNames)
+  std::optional<std::vector<std::string>> rowImageNames;
+
   REACT_FIELD(disabledRowKeys)
   std::optional<std::vector<std::string>> disabledRowKeys;
 
   REACT_FIELD(secondaryCellKeys)
   std::optional<std::vector<std::string>> secondaryCellKeys;
+
+  REACT_FIELD(alertRowKeys)
+  std::optional<std::vector<std::string>> alertRowKeys;
 
   REACT_FIELD(spanningRowKeys)
   std::optional<std::vector<std::string>> spanningRowKeys;

@@ -1424,6 +1424,22 @@ class ClaudeSettingsDomain:
                 raise ClaudeSettingsError(str(exc)) from None
             self._revision += 1
             return self.snapshot()
+        if action in {"use_local_api", "useLocalApi"}:
+            # Point Claude Desktop at this app's own proxy and adopt its
+            # master key. The Anthropic-compatible base URL carries no /v1.
+            if self._desktop is None:
+                raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+            from ._shared import local_proxy_endpoint
+
+            base_url, key = local_proxy_endpoint()
+            base_url = base_url.removesuffix("/v1")
+            try:
+                self._desktop.patch({"inferenceGatewayBaseUrl": base_url})
+                self._desktop.stage_secret("desktop_gateway_api_key", key)
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+            self._revision += 1
+            return self.snapshot()
         if action in {"desktop_models_patch", "desktopModelsPatch"}:
             if self._desktop is None:
                 raise ClaudeSettingsError("Claude Desktop configuration is unavailable")

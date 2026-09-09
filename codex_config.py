@@ -26,7 +26,7 @@ import urllib.request
 import yaml
 
 
-DEFAULT_PORT = "4000"
+DEFAULT_PORT = "12389"
 DEFAULT_KEY = "sk-local-litellm"
 LOCAL_MODEL_LIST_TIMEOUT_SECONDS = 1.0
 LOCAL_MODEL_LIST_MAX_BYTES = 512 * 1024

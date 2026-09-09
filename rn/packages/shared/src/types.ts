@@ -17,6 +17,7 @@ export type IpcMethod =
 
 export type AppRoute =
   | "home"
+  | "general-settings"
   | "providers-models"
   | "codex-settings"
   | "claude-settings"
@@ -425,6 +426,8 @@ export type NativeTrayAdapter = NativeTray;
 
 export interface NativeLocalization {
   appTitle: string;
+  /** Application-menu About item. */
+  about: string;
   autoStart: string;
   serviceUnavailable: string;
   serviceStatus: string;
@@ -616,6 +619,12 @@ export interface NativeLeafAdapter {
   clearRelayCredentials(accountId: string): Promise<void>;
   setLaunchAtLogin(enabled: boolean): Promise<void>;
   restartCodex(): Promise<boolean>;
+  /** Native About/version panel (app version and build). */
+  showVersion?(): void;
+  /** App and bundled LiteLLM versions for the shared About pane. */
+  versionInfo?(): Promise<{ app: string; litellm: string; icon?: string }>;
+  /** Open an http(s) URL in the user's browser. */
+  openExternalURL?(url: string): void;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
 }

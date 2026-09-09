@@ -1,10 +1,10 @@
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState, useContext } from "react";
-import { AppState, FlatList, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
+import { AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type NativeScrollEvent, type NativeSyntheticEvent, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, localizeCodexValidationMessage, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
-import { canonicalWindowRoute, LOG_TABS, routeMenuActions, ROUTES } from "../routes";
-import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField } from "./NativeControls";
+import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TABS, routeMenuActions, ROUTES, SETTINGS_PANES, SETTINGS_PANE_PRESENTATION } from "../routes";
+import { NativeButton, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle } from "./NativeControls";
 import { CODE_EDITOR_HTML, CodeEditorWebView } from "./code-editor/CodeEditorWebView";
 import {
   accountDisplayName,
@@ -31,6 +31,7 @@ import {
   type StationDraft,
 } from "./RelayAccountManager";
 import { suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
+import { isAssistantEditorOpen, isProviderWizardOpen, setAssistantEditorOpen, setProviderWizardOpen, subscribeProviderWizard } from "./providerWizardGate";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import type {
   AppRoute,
@@ -61,7 +62,7 @@ type NativeSecretClear = (options: {
   target?: string;
 }) => Promise<void>;
 type SecretState = { revision: number; present: boolean; status: string; error: string; commitRequest: number };
-type PendingField = { commit: () => void | Promise<void>; reset: () => void; isDirty?: () => boolean; flushBeforeAssistantEditor?: boolean };
+type PendingField = { commit: () => void | Promise<void>; reset: () => void; isDirty?: () => boolean; hasError?: () => boolean; flushBeforeAssistantEditor?: boolean };
 type PendingFieldRegistry = {
   register: (id: symbol, field?: PendingField) => void;
   setDirty: (id: symbol, dirty: boolean) => void;
@@ -184,7 +185,6 @@ const compactStyles = StyleSheet.create({
   tablePane: { gap: 4 },
   tableTitleRow: { height: 22 },
   inlineGap: { gap: 4 },
-  section: { paddingTop: 8, gap: 6 },
   formRow: { minHeight: 24, gap: 2 },
   formRowControl: { gap: 1 },
   input: { minHeight: 24 },
@@ -196,6 +196,10 @@ const compactStyles = StyleSheet.create({
 // files edited by another process, so a low-frequency check avoids waking the
 // Core and native table surfaces continuously while retaining bounded pickup.
 const SETTINGS_DISK_POLL_MS = 5_000;
+// Immediate settings commit: a staged control change applies shortly after the
+// last edit so the runtime picks it up without an explicit Apply button. The
+// short debounce coalesces rapid toggles into one Core apply.
+const IMMEDIATE_APPLY_DEBOUNCE_MS = 500;
 const LOG_VIEW_POLL_MS = 5_000;
 const REQUEST_LOG_POLL_MS = 1_000;
 const RECOVERY_LOG_POLL_MS = 1_000;
@@ -207,6 +211,10 @@ const ROUTE_TRACE_SCROLLBAR_MIN_THUMB_WIDTH = 32;
 const WEBDAV_FORM_LABEL_WIDTH = 108;
 const SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH = 360;
 const SETTINGS_STRUCTURED_SCROLLBAR_GUTTER = 18;
+// The settings window draws a full-height sidebar behind a transparent title
+// bar, so the shared sidebar content starts below the traffic lights while the
+// window material itself extends to the top edge.
+const SETTINGS_TITLEBAR_INSET = Platform.OS === "macos" ? 32 : 0;
 const COLUMN_GAP = 8;
 const DSH_VISION_ROUTER_QUICK_KEYS = [
   "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED",
@@ -488,10 +496,10 @@ function isApplyResult(value: unknown): value is IpcResults["apply"] {
     && Array.isArray(result.issues);
 }
 
-function applyResultMessage(result: IpcResults["apply"], translate: Translate): string {
+function applyResultMessage(result: IpcResults["apply"], translate: Translate, appliedKey?: string | null): string {
   if (result.status === "partial") return translate("relay.applyPartial", { completed: result.completed_operations, pending: result.pending_operations });
   if (result.status === "failed") return translate("relay.applyFailed", { pending: result.pending_operations });
-  return translate("common.applied");
+  return translate(appliedKey ?? "common.applied");
 }
 
 function applyIssuesForDisplay(result: IpcResults["apply"]): ValidationSummary["issues"] {
@@ -513,7 +521,13 @@ function errorMessage(reason: unknown, translate: Translate): string {
     revision_conflict: "error.revisionConflict",
     validation_failed: "error.validationFailed",
   };
-  return translate(keyByCode[code] ?? "error.generic");
+  const known = keyByCode[code];
+  if (known) return translate(known);
+  // Surface the Core's already-sanitized failure detail instead of a generic
+  // "error" so an actionable cause (for example a rejected value) is visible.
+  const detail = stringValue(asRecord(reason).message).trim();
+  if (detail && detail.length <= 160) return detail;
+  return translate("error.generic");
 }
 
 function isEditorCapabilityConflict(reason: unknown): boolean {
@@ -572,6 +586,7 @@ function domainForRoute(route: AppRoute): ConfigDomain | undefined {
     case "codex-settings": return "codex";
     case "claude-settings": return "claude";
     case "runtime-settings": return "runtime";
+    case "general-settings": return "runtime";
     case "logs": return "logs";
     default: return undefined;
   }
@@ -719,7 +734,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
   useEffect(() => {
     if (!isPrimaryHost) return;
     native.setLocalization({
-      appTitle: translate("app.title"), autoStart: translate("menu.autoStart"), serviceUnavailable: translate("error.coreUnavailable"),
+      appTitle: translate("app.title"), about: translate("menu.about"), autoStart: translate("menu.autoStart"), serviceUnavailable: translate("error.coreUnavailable"),
       serviceStatus: translate("service.status", { status: "{status}" }),
       serviceStarting: translate("service.starting"), serviceRunning: translate("service.running"),
       serviceRunningOnPort: translate("service.runningOnPort", { port: "{port}" }),
@@ -730,7 +745,7 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
       cancel: translate("menu.cancel"), set: translate("common.set"), clear: translate("common.clear"), stage: translate("common.stageRaw"), find: translate("common.find"),
       findNext: translate("common.findNext"), edit: translate("common.edit"), undo: translate("common.undo"),
       redo: translate("common.redo"), cut: translate("common.cut"), copy: translate("common.copy"),
-      paste: translate("common.paste"), selectAll: translate("common.selectAll"), settings: translate("menu.codex"),
+      paste: translate("common.paste"), selectAll: translate("common.selectAll"), settings: translate("menu.settings"),
       reload: translate("menu.reload"), closeWindow: translate("menu.close"), menuQuit: translate("menu.quit"), version: translate("common.version"),
       build: translate("common.build"), ok: translate("common.ok"), invalidText: translate("common.invalidText"),
       routeHome: translate("route.home"), routeProvidersModels: translate("card.providersModels"),
@@ -794,8 +809,14 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
     if (isWindowManagerHost) {
       if (routeRequest !== "home") {
         const windowRoute = canonicalWindowRoute(routeRequest);
-        native.window.open(windowRoute);
-        native.window.focus(windowRoute);
+        // The native host already opened or focused the shared settings
+        // window before it emitted this action. Re-opening a settings pane
+        // here would emit the same action again and loop, so only non-pane
+        // surfaces (the provider wizard) need the React-side open.
+        if (!isSettingsPaneRoute(windowRoute)) {
+          native.window.open(windowRoute);
+          native.window.focus(windowRoute);
+        }
       }
       return;
     }
@@ -985,21 +1006,170 @@ export function LiteLLMMenuApp({ ipc, native, translate: hostTranslate, initialS
     native.menuBar.setActions(actions);
   }, [isPrimaryHost, native, serviceOperationPending, snapshot, translate]);
 
+  // The native host keeps one window for every settings pane. Capture the
+  // route the window was created with so a pane switch can still close that
+  // exact native window; later panes only change the shared route state.
+  const settingsWindowRoute = useRef<AppRoute | undefined>(undefined);
+  if (settingsWindowRoute.current === undefined && isSettingsShellRoute(route)) {
+    settingsWindowRoute.current = canonicalWindowRoute(route);
+  }
+
+  // The provider wizard is the exempted sub-sheet: hold immediate apply while
+  // it is mounted so its partial provider/key/model steps are not written and
+  // reloaded before the user finishes. The provider pane applies the finished
+  // draft as soon as the sheet closes.
+  useEffect(() => {
+    if (route !== "provider-wizard") return;
+    setProviderWizardOpen(true);
+    return () => setProviderWizardOpen(false);
+  }, [route]);
+
   return (
     <View style={styles.root} accessibilityLabel={translate("app.title")}>
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {!error && route !== "home" && snapshot ? <RouteSurface route={route} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute(route === "provider-wizard" && Platform.OS === "windows" ? "providers-models" : "home")} /> : null}
+      {!error && route !== "home" && snapshot ? (isSettingsShellRoute(route)
+        ? <SettingsShell route={route} windowRoute={settingsWindowRoute.current ?? canonicalWindowRoute(route)} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute("home")} />
+        : <RouteSurface route={route} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute(route === "provider-wizard" && Platform.OS === "windows" ? "providers-models" : "home")} />) : null}
       {!error && route === "home" ? <View style={styles.menuBarHost} /> : null}
     </View>
   );
+}
+
+/**
+ * The single settings window. A native source list on the left selects one of
+ * the shared route surfaces on the right. Every pane commits its staged
+ * configuration as it changes, so there is no route-level Apply/Close footer;
+ * only the provider wizard sheet keeps explicit Apply/Close actions.
+ */
+function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onNavigate, onClose, onRegisterFlush }: {
+  route: AppRoute;
+  windowRoute: AppRoute;
+  snapshot: CoreSnapshot;
+  ipc: IpcClient;
+  native: NativeLeafAdapter;
+  translate: Translate;
+  logTabRequest?: LogTab;
+  nativeAction?: { id: string; sequence: number };
+  onSnapshot: (next: CoreSnapshot) => void;
+  onNavigate: (route: AppRoute) => void;
+  onClose: () => void;
+  onRegisterFlush?: (flush?: () => Promise<boolean>) => void;
+}): React.JSX.Element {
+  const flushActivePane = useRef<(() => Promise<boolean>) | undefined>(undefined);
+  const registerFlush = useCallback((flush?: () => Promise<boolean>): void => {
+    flushActivePane.current = flush;
+  }, []);
+  const closing = useRef(false);
+  const pane = canonicalWindowRoute(route);
+  useEffect(() => {
+    if (!nativeAction?.id.startsWith("request-close-") || closing.current) return;
+    closing.current = true;
+    void (async () => {
+      let canClose = true;
+      try {
+        // Commit the focused field before the window disappears so the last
+        // edit still reaches Core and applies immediately. A field with an
+        // invalid draft reports false and keeps the window open for repair.
+        canClose = await flushActivePane.current?.() ?? true;
+      } catch {
+        // A rejected commit must not strand the window on screen.
+      }
+      if (!canClose) {
+        closing.current = false;
+        // The native host ordered the window out before asking React to
+        // confirm. Bring it back so the invalid field and its inline error
+        // stay visible for repair.
+        native.window.focus(windowRoute);
+        return;
+      }
+      try {
+        // macOS closes the registered settings window by its registry key;
+        // the Windows host tracks the active pane in its single window.
+        native.window.close(Platform.OS === "windows" ? pane : windowRoute);
+      } finally {
+        onClose();
+      }
+    })();
+  }, [native.window, nativeAction?.id, nativeAction?.sequence, onClose, pane, windowRoute]);
+  // Window-level dialog slot: a pane publishes its dialog node here so it
+  // covers the whole settings window instead of the pane that opened it.
+  const [assistantDialog, setAssistantDialog] = useState<React.ReactNode>(null);
+  const [appInfo, setAppInfo] = useState<{ app: string; litellm: string; icon?: string }>();
+  useEffect(() => {
+    let active = true;
+    if (!native.versionInfo) return undefined;
+    void native.versionInfo().then((next) => { if (active) setAppInfo(next); }).catch(() => undefined);
+    return () => { active = false; };
+  }, [native]);
+  // Beta Display's native settings layout: an app identity header and a pane
+  // source list. About lives in the native application/tray menu.
+  const paneRows = useMemo(() => SETTINGS_PANES.map(({ id, titleKey }) => ({ key: id, cells: [translate(titleKey)] })), [translate]);
+  const paneSymbols = useMemo(() => SETTINGS_PANES.map(({ id }) => SETTINGS_PANE_PRESENTATION[id]?.symbol ?? ""), []);
+  const paneSymbolColors = useMemo(() => SETTINGS_PANES.map(({ id }) => SETTINGS_PANE_PRESENTATION[id]?.color ?? ""), []);
+  const paneImageNames = useMemo(() => SETTINGS_PANES.map(({ id }) => SETTINGS_PANE_PRESENTATION[id]?.image ?? ""), []);
+  const paneTitleKey = SETTINGS_PANES.find(({ id }) => id === pane)?.titleKey ?? "app.title";
+  const lastSelection = useRef<{ key: string; at: number }>({ key: "", at: 0 });
+  const selectPane = (key: string): void => {
+    // The native table emits both a selection change and the row action for a
+    // single click; keep one logical selection.
+    const now = Date.now();
+    if (lastSelection.current.key === key && now - lastSelection.current.at < 250) return;
+    lastSelection.current = { key, at: now };
+    const next = SETTINGS_PANES.find(({ id }) => id === key)?.id;
+    if (!next) return;
+    onNavigate(next);
+    // Let the native host follow the pane: it retitles the Windows window and
+    // keeps the active route in sync so a later close hides that window.
+    native.window.open(next);
+  };
+  return <View style={styles.settingsShell}>
+    <View style={styles.settingsSidebar}>
+      <View style={styles.settingsSidebarHeader}>
+        {appInfo?.icon ? <Image source={{ uri: appInfo.icon }} style={styles.settingsSidebarAppIcon} /> : null}
+        <Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>
+      </View>
+      <View style={styles.settingsSidebarDivider} />
+      <NativeTable
+        columns={[{ label: "", width: 186 }]}
+        rows={paneRows}
+        selectedKey={pane}
+        striped={false}
+        compact={false}
+        framed={false}
+        sourceList
+        rowSymbols={paneSymbols}
+        rowSymbolColors={paneSymbolColors}
+        rowImageNames={paneImageNames}
+        cellHorizontalPadding={12}
+        firstColumnHorizontalPadding={12}
+        scrollTrailingColumnOverflow
+        onSelectionChange={selectPane}
+        style={styles.settingsSidebarList}
+      />
+      <View style={styles.settingsSidebarSpacer} />
+    </View>
+    <View style={styles.settingsDetail}>
+      <View style={styles.settingsPaneHeader}><Text numberOfLines={1} style={styles.settingsPaneTitle}>{translate(paneTitleKey)}</Text></View>
+      <View style={styles.settingsPaneDivider} />
+      <View style={[styles.settingsDetailBody, (pane === "runtime-settings" || pane === "data-management") && styles.settingsDetailBodyBare]}>
+        <View style={styles.settingsDetailPane}>
+          <RouteSurface key={pane} route={pane} shell windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} onRegisterAssistantDialog={setAssistantDialog} />
+        </View>
+      </View>
+    </View>
+    {assistantDialog}
+  </View>;
 }
 
 function WindowTitle({ title, validation }: { title: string; validation?: string }): React.JSX.Element {
   return <View style={styles.windowTitleBlock}><Text style={styles.windowTitle}>{title}</Text>{validation ? <Text style={styles.validationText}>{validation}</Text> : null}</View>;
 }
 
-function DialogFooter({ status, leading, children, compact = false, borderless = false }: { status?: string; leading?: React.ReactNode; children: React.ReactNode; compact?: boolean; borderless?: boolean }): React.JSX.Element {
-  return <View style={[styles.footer, compact && styles.footerCompact, borderless && styles.footerBorderless]}>{leading ?? (status ? <Text numberOfLines={1} style={styles.footerStatus}>{status}</Text> : <View />)}<View style={styles.footerSpacer} /><View style={styles.footerButtons}>{children}</View></View>;
+/** Immediate apply is blocked while a sub-sheet with explicit actions is open. */
+function useImmediateApplyBlocked(): boolean {
+  const [blocked, setBlocked] = useState<boolean>(() => isProviderWizardOpen() || isAssistantEditorOpen());
+  useEffect(() => subscribeProviderWizard(() => setBlocked(isProviderWizardOpen() || isAssistantEditorOpen())), []);
+  return blocked;
 }
 
 function IconButton({ label, symbol, title, disabled, onPress }: { label: string; symbol?: "chevron-up" | "chevron-down" | "copy" | "minus" | "pause" | "play" | "plus" | "trash"; title: string; disabled?: boolean; onPress: () => void }): React.JSX.Element {
@@ -1014,7 +1184,7 @@ function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: 
   return <NativeSegmentedControl ref={nativeRef} labels={labels} selectedValue={selectedValue} disabled={disabled} onChange={({ nativeEvent }) => { const next = values[nativeEvent.index]; if (next) onSelect(next.id); }} style={[styles.windowTabs, style]} />;
 }
 
-function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onNavigate, onClose }: { route: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; nativeAction?: { id: string; sequence: number }; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void }): React.JSX.Element {
+function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onNavigate, onClose, onRegisterFlush, onRegisterAssistantDialog }: { route: AppRoute; shell?: boolean; windowRoute?: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; nativeAction?: { id: string; sequence: number }; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void; onRegisterFlush?: (flush?: () => Promise<boolean>) => void; onRegisterAssistantDialog?: (node: React.ReactNode) => void }): React.JSX.Element {
   const settingsRoute = isAssistantSettingsRoute(route);
   // The Codex and Claude settings routes are aliases for one shared surface.
   // Both domains stay visible and staged together, so there is no active tab
@@ -1039,7 +1209,11 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
   const probedSurfaceApplyQueue = useRef<Promise<void>>(Promise.resolve());
   const importPlanToken = useRef<string | undefined>(undefined);
   const pendingFields = useRef(new Map<symbol, PendingField>());
-  const [, forcePendingFieldDirtyRender] = useState(0);
+  // The pending-field dirty set lives in a ref for synchronous reads, but a
+  // state counter makes it reactive: the immediate-apply effect must re-run
+  // when the last dirty field clears, otherwise a single text edit would wait
+  // for an unrelated change before it reaches Core.
+  const [pendingFieldRevision, forcePendingFieldDirtyRender] = useState(0);
   const pendingFieldDirtyIdsRef = useRef<ReadonlySet<symbol>>(new Set());
   useEffect(() => {
     if (!settingsRoute) setActiveAssistantFile(undefined);
@@ -1132,7 +1306,9 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
         publishResult(value.valid ? translate("common.applied") : `${value.issues.length} ${translate("common.validationIssues")}`);
       } else if (isApplyResult(value)) {
         setIssues(applyIssuesForDisplay(value));
-        publishResult(applyResultMessage(value, translate));
+        // An explicit caller message wins for the applied case so instant
+        // applies can say "Saved" instead of the generic "Applied".
+        publishResult(applyResultMessage(value, translate, message));
       } else {
         setIssues([]);
         publishResult(message === null ? undefined : translate(message));
@@ -1438,7 +1614,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     }
     return "keep";
   }, [ipc, native, onSnapshot, translate]);
-  const apply = (): Promise<void> => {
+  const apply = (options?: { silent?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {
     if ((!settingsRoute && !domain) || domain === "logs") return Promise.resolve();
     return run(async () => {
       await flushPendingFields();
@@ -1464,7 +1640,7 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       }
       const confirmations = [...risks, ...diskConflicts.map((name) => `overwrite_external_${name}`)];
       const applyOnce = (nextRevision: number): Promise<IpcResults["apply"]> => (
-        settingsRoute || route === "providers-models" || domain === undefined
+        settingsRoute || route === "providers-models" || route === "data-management" || domain === undefined
           ? ipc.applyDomains([...domains], nextRevision, confirmations.length > 0 ? confirmations : undefined)
           : ipc.apply(domain, nextRevision, confirmations.length > 0 ? confirmations : undefined)
       );
@@ -1506,8 +1682,70 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
       }
       if (diskConflicts.length > 0) setKeptDiskGeneration({});
       return result;
-    });
+    }, options?.silent ? null : (options?.message ?? "common.applied"), options?.keepControlsEnabled === true);
   };
+  // The settings shell commits as the user changes controls. Wait for the
+  // route's serial dispatch queue, then apply the staged domains; the debounce
+  // coalesces a burst of toggles into one Core apply. A failed apply keeps its
+  // draft dirty but is not retried until the next edit changes the revision,
+  // so a validation error cannot turn into an apply loop.
+  const autoAppliedKey = useRef("");
+  const immediateApplyBlocked = useImmediateApplyBlocked();
+  const autoApplyKey = shell && actionSnapshot && !immediateApplyBlocked
+    ? (() => {
+      const domains = stagedDomainsForRoute(actionSnapshot);
+      return domains.length === 0 ? "" : `${domains.join(",")}@${actionSnapshot.revision}`;
+    })()
+    : "";
+  useEffect(() => {
+    if (!shell) return;
+    if (!autoApplyKey) {
+      autoAppliedKey.current = "";
+      return;
+    }
+    if (busy || hasPendingFieldEdits()) return;
+    if (autoAppliedKey.current === autoApplyKey) return;
+    // Instant-apply settings show their lifecycle in the status bar: saving
+    // while the debounce runs, then a brief confirmation once Core accepted
+    // the staged value.
+    setResult(translate("common.saving"));
+    const timer = setTimeout(() => {
+      if (autoAppliedKey.current === autoApplyKey) return;
+      autoAppliedKey.current = autoApplyKey;
+      // Keep the pane interactive while the background apply runs; the
+      // dispatch queue serializes any edit made in the meantime.
+      void apply({ message: "common.saved", keepControlsEnabled: true });
+    }, IMMEDIATE_APPLY_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [autoApplyKey, busy, hasPendingFieldEdits, pendingFieldRevision, shell, translate]);
+  // The shell owns the window-close path; expose one flush so it can commit a
+  // focused text/secret field and apply it before the native window closes.
+  // It reports false when a field still holds an invalid draft, so the shell
+  // can keep the window open instead of silently discarding the edit.
+  const flushAndApply = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
+  const invalidCloseNotice = useRef(false);
+  flushAndApply.current = async (): Promise<boolean> => {
+    await flushPendingFields();
+    if (hasPendingFieldEdits()) {
+      invalidCloseNotice.current = true;
+      setResult(translate("runtime.fixInvalidBeforeClose"));
+      return false;
+    }
+    await dispatchQueue.current;
+    await apply({ silent: true });
+    return true;
+  };
+  // Clear the close-blocked notice as soon as the invalid drafts are fixed.
+  useEffect(() => {
+    if (!invalidCloseNotice.current || hasPendingFieldEdits()) return;
+    invalidCloseNotice.current = false;
+    setResult(undefined);
+  }, [hasPendingFieldEdits, pendingFieldRevision]);
+  useEffect(() => {
+    if (!shell || !onRegisterFlush) return;
+    onRegisterFlush(() => flushAndApply.current());
+    return () => onRegisterFlush(undefined);
+  }, [onRegisterFlush, shell]);
   const activateProviderAndRestart = async (): Promise<boolean> => {
     let completed = false;
     await run(async () => {
@@ -1540,40 +1778,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     }, null, false, false);
     return completed;
   };
-  const applyDataManagement = (selectedSections: ConfigDomain[]): Promise<void> => runDataManagement("import", async () => {
-    await flushPendingFields();
-    const refreshed = await ipc.snapshot();
-    revision.current = refreshed.revision;
-    latestSnapshot.current = refreshed;
-    onSnapshot(refreshed);
-    const domains = selectedSections.filter((name) => refreshed.drafts[name]?.dirty);
-    if (domains.length === 0) return { cancelled: true };
-    const risks = domains.includes("claude") ? riskCodes(refreshed, "claude") : [];
-    const diskConflicts = domains.filter((name) => refreshed.disk[name]?.changed);
-    const unacknowledgedDiskConflicts = diskConflicts.filter((name) => !isEditableDiskDomain(name) || keptDiskGeneration[name] !== refreshed.disk[name]?.generation);
-    if (unacknowledgedDiskConflicts.length > 0) {
-      const accepted = await native.showConfirmation({ title: translate("settings.diskChangedTitle"), message: translate("settings.overwriteDiskConfirm"), confirmLabel: translate("settings.keepDraft") });
-      if (!accepted) return { cancelled: true };
-    }
-    if (risks.length > 0) {
-      const accepted = await native.showConfirmation({ title: translate("claude.confirmation.required"), message: translate("claude.confirmation.required"), confirmLabel: translate("screen.confirm") });
-      if (!accepted) return { cancelled: true };
-    }
-    const confirmations = [...risks, ...diskConflicts.map((name) => `overwrite_external_${name}`)];
-    const applied = await ipc.applyDomains(domains, refreshed.revision, confirmations.length > 0 ? confirmations : undefined);
-    revision.current = applied.revision;
-    if (!applied.domains?.includes("relay_accounts") && applied.status === "applied" && (domains.includes("providers_models") || domains.includes("runtime")) && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
-      // Provider Apply reloads the managed proxy in CoreStore. Runtime-only
-      // changes still use the existing UI lifecycle operation.
-      if (!domains.includes("providers_models")) {
-        const reloaded = await ipc.dispatch({ type: "service.reload" }, applied.revision);
-        revision.current = reloaded.revision;
-      }
-    }
-    if (domains.includes("codex") || domains.includes("claude")) setSettingsRawBaselineToken((current) => current + 1);
-    if (diskConflicts.length > 0) setKeptDiskGeneration({});
-    return applied;
-  }, "common.applied");
   const inspectImportDataManagement = async (): Promise<IpcResults["import_preview"] | undefined> => {
     let inspected: IpcResults["import_preview"] | undefined;
     await runDataManagement("import", async () => {
@@ -1604,7 +1808,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     message: translate("dataManagement.importReplaceDraftWarning", { sections: sections.join(" · ") }),
     confirmLabel: translate("dataManagement.importSelected"),
   });
-  const resizeDataManagement = useCallback((width: number, height: number): Promise<boolean> => native.window.setContentSize?.("data-management", width, height) ?? Promise.resolve(false), [native.window]);
   const exportDataManagement = (sections: ConfigDomain[]): Promise<void> => runDataManagement("export", async () => {
     const fileToken = await native.saveFilePicker({ suggestedName: "litellm-menu-data.json" });
     if (!fileToken) return { cancelled: true };
@@ -1614,23 +1817,6 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     await flushPendingFields();
     return ipc.probe(undefined, undefined, "webdav");
   }, "webdav.probe");
-  const applyWebDav = (): Promise<void> => runWebDavOperation(async () => {
-    await flushPendingFields();
-    const refreshed = await ipc.snapshot();
-    revision.current = refreshed.revision;
-    latestSnapshot.current = refreshed;
-    onSnapshot(refreshed);
-    if (!refreshed.drafts.webdav?.dirty) return { cancelled: true };
-    const diskChanged = refreshed.disk.webdav?.changed === true;
-    if (diskChanged) {
-      const accepted = await native.showConfirmation({ title: translate("settings.diskChangedTitle"), message: translate("settings.overwriteDiskConfirm"), confirmLabel: translate("settings.keepDraft") });
-      if (!accepted) return { cancelled: true };
-    }
-    const applied = await ipc.apply("webdav", refreshed.revision, diskChanged ? ["overwrite_external_webdav"] : undefined);
-    revision.current = applied.revision;
-    if (diskChanged) setKeptDiskGeneration((current) => ({ ...current, webdav: undefined }));
-    return applied;
-  }, "common.applied");
   const syncWebDav = (action: WebDavSyncAction): Promise<void> => runWebDavOperation(async () => {
     await flushPendingFields();
     const refreshed = await ipc.snapshot();
@@ -1796,6 +1982,9 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     }
   };
   useEffect(() => {
+    // The settings shell owns its window-close path so one flush covers the
+    // active pane; only the provider wizard sheet closes itself here.
+    if (shell) return;
     if (nativeAction?.id !== `request-close-${route}` && nativeAction?.id !== `request-close-${canonicalWindowRoute(route)}`) return;
     requestClose();
   }, [nativeAction?.sequence]);
@@ -1879,19 +2068,52 @@ function RouteSurface({ route, snapshot, ipc, native, translate, logTabRequest, 
     },
     apiKeyActions: relayApiKeyActions,
   }), [commitRelayMetadata, detectRelayType, refresh, refreshRelayResources, relayApiKeyActions]);
+  // The assistant file editor is a window-level sheet: RouteSurface owns its
+  // state, but the shell mounts the node at the window root so it dims and
+  // covers the whole settings window instead of being clipped by the detail
+  // column it was opened from.
+  const assistantDialogProps = useRef<React.ComponentProps<typeof AssistantFileEditorDialog>>(undefined as never);
+  assistantDialogProps.current = {
+    target: activeAssistantFile,
+    ipc,
+    busy,
+    translate,
+    onEditorConflict: resolveRawEditorConflict,
+    rawReloadToken: settingsRawReloadToken,
+    rawBaselineToken: settingsRawBaselineToken,
+    syncRevision: activeAssistantFile ? snapshot?.revision : undefined,
+    onFlushPendingFields: flushPendingFields,
+    onSave: async () => {
+      await flushAssistantEditorFields();
+      await apply({ silent: true });
+    },
+    onClose: () => setActiveAssistantFile(undefined),
+  };
+  useEffect(() => {
+    if (!shell || !onRegisterAssistantDialog) return undefined;
+    // The editor sheet owns an explicit Save action; hold immediate apply
+    // while it is open so the pane cannot write a half-finished document.
+    setAssistantEditorOpen(activeAssistantFile !== undefined);
+    onRegisterAssistantDialog(activeAssistantFile ? <AssistantFileEditorDialog {...assistantDialogProps.current} /> : null);
+    return () => {
+      setAssistantEditorOpen(false);
+      onRegisterAssistantDialog(null);
+    };
+  }, [activeAssistantFile, busy, onRegisterAssistantDialog, settingsRawBaselineToken, settingsRawReloadToken, shell, snapshot?.revision]);
+
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={styles.windowSurface}>
-    {route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} validation={issues.length > 0 ? `${issues.length} ${translate("common.validationIssues")}` : undefined} /> : null}
-    {route === "providers-models" || route === "provider-wizard" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.settingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
+    {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <WindowTitle title={windowTitle} validation={issues.length > 0 ? `${issues.length} ${translate("common.validationIssues")}` : undefined} /> : null}
+    {route === "providers-models" || route === "provider-wizard" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.settingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} onActivateAndRestart={activateProviderAndRestart} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
+    {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} translate={translate} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} /> : null}
-    {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} busy={busy} webDavOperationBusy={webDavOperationBusy} statuses={dataManagementStatuses} hasPendingChanges={hasPendingFieldEdits()} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onResize={resizeDataManagement} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onApplyImported={applyDataManagement} onProbeWebDav={probeWebDav} onApplyWebDav={applyWebDav} onSyncWebDav={syncWebDav} /> : null}
+    {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} busy={busy} webDavOperationBusy={webDavOperationBusy} statuses={dataManagementStatuses} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} /> : null}
     {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
     </View> : null}
-    {route !== "logs" && route !== "provider-wizard" && route !== "data-management" ? <DialogFooter status={result} leading={route === "runtime-settings" ? <ActionButton title={translate("common.restoreDefaults")} disabled={busy} style={styles.runtimeRestoreButton} onPress={() => dispatch("restore_defaults")} /> : undefined}><><ActionButton title={translate("menu.close")} disabled={busy} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={requestClose} /><ActionButton primary title={route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")} disabled={busy || !routeHasStagedChanges(actionSnapshot)} style={route === "runtime-settings" ? styles.wideButton : undefined} onPress={apply} /></></DialogFooter> : null}
-    {settingsRoute ? <AssistantFileEditorDialog target={activeAssistantFile} ipc={ipc} busy={busy} translate={translate} onEditorConflict={resolveRawEditorConflict} rawReloadToken={settingsRawReloadToken} rawBaselineToken={settingsRawBaselineToken} syncRevision={activeAssistantFile ? snapshot?.revision : undefined} onFlushPendingFields={flushPendingFields} onClose={() => setActiveAssistantFile(undefined)} /> : null}
+    {shell && result ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{result}</Text></View> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -3226,7 +3448,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const providerRows = useMemo(
     () => providers.map((item) => ({
       key: editorIdentifier(item),
-      cells: [providerDisplayName(item), String(asRecords(item.models).length || numberValue(item.model_count))],
+      cells: [providerDisplayName(item)],
     })),
     [providerDisplayName, providers],
   );
@@ -3234,10 +3456,25 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     () => providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier),
     [providers],
   );
-  const modelRows = useMemo(
-    () => models.map((item) => ({ key: editorIdentifier(item), cells: [modelDisplayName(providerId, item), modelUpstreamDisplay(providerId, item), `${modelProviderKeyLabel(item, provider ?? {}, translate)} / ${modelOrderText(providerId, item)}`] })),
-    [modelDisplayName, modelOrderText, modelUpstreamDisplay, models, provider, providerId, translate],
-  );
+  const modelRows = useMemo(() => {
+    // The key name is its own column: one spanning row per key, with that
+    // key's models listed (and indented) underneath it.
+    const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
+    const grouped = new Map<string, UnknownRecord[]>();
+    for (const item of models) {
+      const keyName = modelProviderKeyLabel(item, provider ?? {}, translate);
+      const list = grouped.get(keyName);
+      if (list) list.push(item);
+      else grouped.set(keyName, [item]);
+    }
+    for (const [keyName, list] of grouped) {
+      rows.push({ key: `key:${keyName}`, cells: [keyName], spanning: true });
+      for (const item of list) {
+        rows.push({ key: editorIdentifier(item), cells: [`\t${modelUpstreamDisplay(providerId, item)}`, modelDisplayName(providerId, item), modelOrderText(providerId, item)] });
+      }
+    }
+    return rows;
+  }, [modelDisplayName, modelOrderText, modelUpstreamDisplay, models, provider, providerId, translate]);
   const disabledModelKeys = useMemo(
     () => models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier),
     [models, provider?.enabled],
@@ -3315,21 +3552,23 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     <View style={styles.providerLeftColumn}>
       <View style={styles.providerToolbar}>
         <WindowTabs values={[{ id: "providers", title: translate("providers.providers") }, { id: "routes", title: translate("providers.routes") }]} selected={viewMode} onSelect={(value) => chooseViewMode(value as "providers" | "routes")} />
-        <ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />
+        {/* The wizard is an action, not a third tab: keep it right-aligned so
+            it never reads as part of the segmented control. */}
         <View style={styles.toolbarSpacer} />
+        <ActionButton title={translate("providers.addWizard")} disabled={busy} style={styles.providerWizardToolbarButton} onPress={onOpenWizard} />
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
         <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="↑" title={translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
-          <NativeTable columns={[{ label: translate("providers.provider"), width: 116 }, { label: translate("providers.providerKey"), width: 166 }, { label: translate("common.order"), width: 72 }, { label: translate("providers.upstream"), width: 136 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} compact onSelectionChange={selectRoute} style={styles.nativeRouteTable} />
+          <NativeTable columns={[{ label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130 }, { label: translate("common.order"), width: 64 }, { label: translate("providers.upstream"), width: 120 }]} rows={routeRows} disabledRowKeys={disabledRouteKeys} selectedKey={selectedRoute ?? ""} compact onSelectionChange={selectRoute} style={styles.nativeRouteTable} />
         </TablePane>
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
           <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={onOpenWizard} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !provider} onPress={confirmDeleteProvider} /></>}>
-            <NativeTable columns={[{ label: translate("providers.provider"), width: 96 }, { label: translate("providers.modelCount"), width: 56 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
+            <NativeTable columns={[{ label: translate("providers.provider"), width: 132 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
           <View style={styles.providerMiddlePane}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<><IconButton label="+" title={translate("providers.newModel")} disabled={busy || !provider || providerKindSelected === "openai" || providerKindSelected === "claude"} onPress={addModel} /><IconButton label="⧉" title={translate("common.copy")} disabled={busy || !model} onPress={duplicateModel} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !model} onPress={confirmDeleteModel} /></>}>
-              <NativeTable columns={[{ label: translate("providers.model"), width: 110 }, { label: translate("providers.upstream"), width: 128 }, { label: translate("providers.keyOrderColumn"), width: 110 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
+              <NativeTable columns={[{ label: translate("providers.keyModelColumn"), width: 124 }, { label: translate("providers.model"), width: 108 }, { label: translate("common.order"), width: 48 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
               {provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy || fetchKeyChoices.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} disabled={busy || !selectedFetchKey} onPress={fetchModels} /></View> : null}
             </TablePane>
           </View>
@@ -4207,7 +4446,10 @@ function CodexWorkspace({ snapshot, busy, translate, dispatch, onSecretState }: 
           } else void dispatch("patch", { model }, "codex");
         }} />
         : <TextField label={translate("common.model")} value={displayedModel} disabled={busy} onDraftChange={setModelDraft} onCommit={(model) => dispatch("patch", { model }, "codex")} />}
-      <TextField label={translate("codex.gateway")} value={gateway} disabled={busy || !directProvider} onCommit={commitGateway} />
+      <View style={styles.assistantFieldRow}>
+        <TextField label={translate("codex.gateway")} value={gateway} disabled={busy || !directProvider} onCommit={commitGateway} style={styles.assistantFieldFlex} />
+        <NativeButton title={translate("settings.useLocalApi")} compact disabled={busy || !directProvider} toolTip={translate("settings.useLocalApiHint")} accessibilityLabel={translate("settings.useLocalApi")} onPress={() => { void dispatch("use_local_api", {}, "codex"); }} />
+      </View>
       <NativeSecretField plainText autoCommit label={translate("common.apiKey")} busy={busy} domain="codex" field="api_key" onSecretState={onSecretState} />
     </View>
   </View>;
@@ -4255,7 +4497,10 @@ function ClaudeScreen({ snapshot, busy, translate, dispatch, onSecretState }: { 
       <View style={assistantSettingsStyles.quickFields}>
         <PickerField label={translate("claude.desktopProvider")} value={desktopProvider} values={[{ value: "", label: translate("common.none") }, "gateway", "anthropic", "bedrock", "vertex", "foundry"]} disabled={busy || !desktopAvailable} onSelect={(value) => { void updateDesktopProvider(value); }} />
         <TextField label={translate("common.model")} value={desktopModel} disabled={busy || !desktopAvailable} onCommit={(value) => { void updateDesktopModel(value); }} />
-        <TextField label={translate("claude.desktopGateway")} value={stringValue(desktop.gateway_url)} disabled={busy || !desktopAvailable} onCommit={(value) => { void updateDesktopGateway(value); }} />
+        <View style={styles.assistantFieldRow}>
+          <TextField label={translate("claude.desktopGateway")} value={stringValue(desktop.gateway_url)} disabled={busy || !desktopAvailable} onCommit={(value) => { void updateDesktopGateway(value); }} style={styles.assistantFieldFlex} />
+          <NativeButton title={translate("settings.useLocalApi")} compact disabled={busy || !desktopAvailable} toolTip={translate("settings.useLocalApiHint")} accessibilityLabel={translate("settings.useLocalApi")} onPress={() => { void dispatch("use_local_api", {}, "claude"); }} />
+        </View>
         <NativeSecretField plainText autoCommit label={translate("common.apiKey")} busy={busy || !desktopAvailable} domain="claude" field="desktop_gateway_api_key" onSecretState={onSecretState} />
       </View>
     </View>
@@ -4268,10 +4513,15 @@ function ClaudeScreen({ snapshot, busy, translate, dispatch, onSecretState }: { 
   </View>;
 }
 
-function AssistantFileEditorDialog({ target, ipc, busy, translate, onEditorConflict, rawReloadToken, rawBaselineToken, syncRevision, onFlushPendingFields, onClose }: { target?: AssistantFileTarget; ipc: IpcClient; busy: boolean; translate: Translate; onEditorConflict: RawEditorConflictHandler; rawReloadToken: number; rawBaselineToken: number; syncRevision?: number; onFlushPendingFields: () => Promise<void>; onClose: () => void }): React.JSX.Element {
+function AssistantFileEditorDialog({ target, ipc, busy, translate, onEditorConflict, rawReloadToken, rawBaselineToken, syncRevision, onFlushPendingFields, onSave, onClose }: { target?: AssistantFileTarget; ipc: IpcClient; busy: boolean; translate: Translate; onEditorConflict: RawEditorConflictHandler; rawReloadToken: number; rawBaselineToken: number; syncRevision?: number; onFlushPendingFields: () => Promise<void>; onSave: () => Promise<void>; onClose: () => void }): React.JSX.Element {
   if (!target) return <></>;
   const close = (): void => {
+    // Close stages the editor text without writing it; the pane applies the
+    // finished draft after the sheet is gone.
     void onFlushPendingFields().then(onClose).catch(() => undefined);
+  };
+  const save = (): void => {
+    void onSave().then(onClose).catch(() => undefined);
   };
   return <View style={assistantFileSurfaceStyles.editorLayer} accessibilityViewIsModal onAccessibilityEscape={close}>
     <View style={assistantFileSurfaceStyles.editorDialog}>
@@ -4284,6 +4534,7 @@ function AssistantFileEditorDialog({ target, ipc, busy, translate, onEditorConfl
       <RawEditor showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRaw} label={target.label} domain={target.domain} document={target.document} language={target.language} ipc={ipc} translate={translate} onConflict={onEditorConflict} reloadToken={rawReloadToken} baselineToken={rawBaselineToken} />
       <View style={assistantFileSurfaceStyles.editorFooter}>
         <ActionButton title={translate("menu.close")} disabled={busy} onPress={close} />
+        <ActionButton primary title={translate("common.save")} disabled={busy} onPress={save} />
       </View>
     </View>
   </View>;
@@ -4333,8 +4584,8 @@ function AssistantSettingsWorkspace({ snapshot, busy, translate, dispatch, onSec
     ],
   } satisfies Record<string, AssistantFileTarget[]>;
   return <SettingsWorkspace validationStatus={validationStatus} validationStatusStyle={validationStatusStyle} translate={translate} missingMessage={missingMessage} structured={<View style={[styles.assistantQuickGrid, assistantSettingsLayoutStyles.boundedGrid]}>
-    <View style={assistantSettingsStyles.domainCard}><View style={assistantSettingsStyles.domainHeader}><Text style={assistantSettingsStyles.cardTitle}>{translate("card.codexSettings")}</Text><Text style={assistantSettingsStyles.domainHint}>{translate("settings.basicFieldsHint")}</Text></View><CodexWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} /></View>
-    <View style={assistantSettingsStyles.domainCard}><View style={assistantSettingsStyles.domainHeader}><Text style={assistantSettingsStyles.cardTitle}>{translate("card.claudeSettings")}</Text><Text style={assistantSettingsStyles.domainHint}>{translate("settings.basicFieldsHint")}</Text></View><ClaudeScreen snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} /></View>
+    <View style={assistantSettingsStyles.domainCard}><View style={assistantSettingsStyles.domainHeader}><Text style={assistantSettingsStyles.cardTitle}>{translate("card.codexSettings")}</Text></View><CodexWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} /></View>
+    <View style={assistantSettingsStyles.domainCard}><View style={assistantSettingsStyles.domainHeader}><Text style={assistantSettingsStyles.cardTitle}>{translate("card.claudeSettings")}</Text></View><ClaudeScreen snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} /></View>
   </View>} files={<View style={assistantFileSurfaceStyles.fileGroups}>
     {fileGroup(translate("card.codexSettings"), translate("settings.codexFilesHint"), fileTargets.codex)}
     {fileGroup(translate("claude.desktopSection"), translate("settings.claudeDesktopFilesHint"), fileTargets.desktop)}
@@ -4342,35 +4593,146 @@ function AssistantSettingsWorkspace({ snapshot, busy, translate, dispatch, onSec
   </View>} />;
 }
 
-function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
-  const state = domainState(snapshot, "runtime");
-  const settings = asRecords(state.settings).length > 0 ? asRecords(state.settings) : asRecords(state.categories).flatMap((category) => asRecords(category.settings));
-  const groups = groupBy(settings, (item) => stringValue(item.category, translate("runtime.categories")));
-  const [contentWidth, setContentWidth] = useState(0);
-  const oneColumn = contentWidth > 0 && contentWidth < 1_000;
-  const dshSyncToken = DSH_VISION_ROUTER_QUICK_KEYS.map((key) => `${key}:${stringValue(settings.find((item) => identifier(item) === key)?.value)}`).join("|");
-  return <View style={styles.runtimeWorkspaceFrame}><ScrollView style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace} onLayout={({ nativeEvent }) => setContentWidth(nativeEvent.layout.width)}>{Object.keys(groups).length === 0 ? <EmptyState translate={translate} /> : Object.entries(groups).map(([category, entries]) => <Section key={category} title={runtimeCategoryLabel(category, translate)}><View style={[styles.runtimeTwoColumnForm, oneColumn && styles.runtimeOneColumnForm]}>{entries.map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}</View></Section>)}</ScrollView></View>;
+function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, translate, onSnapshot }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; dispatch: Dispatch; translate: Translate; onSnapshot: (next: CoreSnapshot) => void }): React.JSX.Element {
+  const [autoStartBusy, setAutoStartBusy] = useState(false);
+  const [status, setStatus] = useState<string>();
+  const autoStartEnabled = snapshot?.service.auto_start_state === "enabled";
+  const serviceState = snapshot?.service.state ?? "unknown";
+  const runtimeSettings = asRecords(domainState(snapshot, "runtime").settings);
+  const portItem = runtimeSettings.find((item) => identifier(item) === "LITELLM_PORT");
+  const portValue = stringValue(portItem?.value, "");
+  const portDefault = stringValue(portItem?.default, "12389");
+  const validatePort = (next: string): string | undefined => {
+    const trimmed = next.trim();
+    if (!/^\d+$/.test(trimmed)) return translate("runtime.invalidInteger");
+    const parsed = Number(trimmed);
+    if (!(parsed >= 1 && parsed <= 65535)) return translate("runtime.outOfRange", { min: "1", max: "65535" });
+    return undefined;
+  };
+  const serviceLabel = serviceState === "running"
+    ? translate("service.runningOnPort", { port: String(snapshot?.service.port ?? "") })
+    : serviceState === "starting" ? translate("service.starting")
+      : serviceState === "unhealthy" ? translate("service.unhealthy")
+        : serviceState === "stopped" ? translate("service.stopped")
+          : translate("service.unknown");
+  const setAutoStart = async (enabled: boolean): Promise<void> => {
+    if (!snapshot || autoStartBusy) return;
+    setAutoStartBusy(true);
+    setStatus(undefined);
+    try {
+      // Launch-at-login is two-sided: Core records the preference and the host
+      // registers or removes the login item.
+      await ipc.dispatch({ type: enabled ? "service.autostart_enable" : "service.autostart_disable" }, snapshot.revision);
+      await native.setLaunchAtLogin(enabled);
+      onSnapshot(await ipc.snapshot());
+      setStatus(translate("common.saved"));
+    } catch (reason: unknown) {
+      setStatus(errorMessage(reason, translate));
+    } finally {
+      setAutoStartBusy(false);
+    }
+  };
+  return <ScrollView style={styles.generalScroll} contentContainerStyle={styles.generalContent}>
+    <View style={styles.generalSection}>
+      <Text style={styles.generalSectionTitle}>{translate("general.startup")}</Text>
+      <View style={styles.generalRow}>
+        <Text style={styles.generalRowLabel}>{translate("general.autoStart")}</Text>
+        <NativeToggle value={autoStartEnabled} disabled={autoStartBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
+      </View>
+      <Text style={styles.generalRowHint}>{translate("general.autoStartHint")}</Text>
+    </View>
+    <View style={styles.generalSection}>
+      <Text style={styles.generalSectionTitle}>{translate("general.service")}</Text>
+      <View style={styles.generalRow}>
+        <Text style={styles.generalRowLabel}>{translate("general.serviceState")}</Text>
+        <Text numberOfLines={1} style={styles.generalRowValue}>{serviceLabel}</Text>
+      </View>
+      <Text style={styles.generalRowHint}>{translate("general.serviceHint")}</Text>
+      <View style={styles.generalRow}>
+        <Text style={styles.generalRowLabel}>{translate("general.port")}</Text>
+        <RuntimeValueField label={translate("general.port")} value={portValue} keyboardType="numeric" validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next })} />
+      </View>
+      <Text style={styles.generalRowHint}>{translate("general.portHint", { default: portDefault })}</Text>
+    </View>
+    {status ? <Text style={styles.generalStatus}>{status}</Text> : null}
+  </ScrollView>;
 }
 
-function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses, hasPendingChanges, translate, dispatch, onSecretState, onResize, onFlushPendingFields, onTabSwitchError, onInspectImport, onImport, onConfirmImportReplace, onExport, onApplyImported, onProbeWebDav, onApplyWebDav, onSyncWebDav }: {
+function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
+  const state = domainState(snapshot, "runtime");
+  const allSettings = asRecords(state.settings).length > 0 ? asRecords(state.settings) : asRecords(state.categories).flatMap((category) => asRecords(category.settings));
+  // Settings owned by the General pane (for example the proxy port) stay in
+  // the runtime domain but are not repeated here.
+  const settings = allSettings.filter((item) => item.hidden !== true);
+  const groups = groupBy(settings, (item) => stringValue(item.category, translate("runtime.categories")));
+  const categories = Object.keys(groups);
+  // A visible table of contents instead of a hidden popup: every category is
+  // one click away and the list follows the scroll position, so a 71-setting
+  // pane stays navigable while each setting keeps its help on one compact row.
+  const [activeCategory, setActiveCategory] = useState("");
+  const [sectionOffsets, setSectionOffsets] = useState<Record<string, number>>({});
+  const scrollRef = useRef<ScrollView>(null);
+  const currentCategory = categories.includes(activeCategory) ? activeCategory : (categories[0] ?? "");
+  const tocRows = useMemo(() => categories.map((name) => ({ key: name, cells: [runtimeCategoryLabel(name, translate)] })), [categories, translate]);
+  const dshSyncToken = DSH_VISION_ROUTER_QUICK_KEYS.map((key) => `${key}:${stringValue(settings.find((item) => identifier(item) === key)?.value)}`).join("|");
+  const jumpToCategory = (name: string): void => {
+    setActiveCategory(name);
+    const offset = sectionOffsets[name];
+    // Position instantly: a table-of-contents jump should land exactly on the
+    // section rather than animate through every row in between.
+    if (offset !== undefined) scrollRef.current?.scrollTo({ y: Math.max(0, offset - 2), animated: false });
+  };
+  const trackScroll = ({ nativeEvent }: NativeSyntheticEvent<NativeScrollEvent>): void => {
+    const position = nativeEvent.contentOffset.y + 12;
+    let current = categories[0] ?? "";
+    for (const name of categories) {
+      const offset = sectionOffsets[name];
+      if (offset !== undefined && offset <= position) current = name;
+    }
+    setActiveCategory(current);
+  };
+  return <View style={styles.runtimeWorkspaceFrame}>
+    <View style={styles.runtimeWorkspaceBody}>
+      <View style={styles.runtimeToc}>
+        <NativeTable
+          columns={[{ label: "", width: 148 }]}
+          rows={tocRows}
+          selectedKey={currentCategory}
+          striped={false}
+          compact
+          framed={false}
+          sourceList
+          cellHorizontalPadding={8}
+          firstColumnHorizontalPadding={8}
+          onSelectionChange={jumpToCategory}
+          style={styles.runtimeTocList}
+        />
+      </View>
+      <ScrollView ref={scrollRef} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace} showsHorizontalScrollIndicator={false} onScroll={trackScroll} scrollEventThrottle={32}>
+        {categories.length === 0 ? <EmptyState translate={translate} /> : categories.map((name) => <View key={name} style={styles.runtimeSection} onLayout={({ nativeEvent }) => { setSectionOffsets((current) => current[name] === nativeEvent.layout.y ? current : { ...current, [name]: nativeEvent.layout.y }); }}>
+          <Text style={styles.runtimeSectionTitle}>{runtimeCategoryLabel(name, translate)}</Text>
+          <View style={styles.runtimeFieldList}>{(groups[name] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}</View>
+        </View>)}
+      </ScrollView>
+    </View>
+  </View>;
+}
+
+function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses, translate, dispatch, onSecretState, onFlushPendingFields, onTabSwitchError, onInspectImport, onImport, onConfirmImportReplace, onExport, onProbeWebDav, onSyncWebDav }: {
   snapshot?: CoreSnapshot;
   busy: boolean;
   webDavOperationBusy: boolean;
   statuses: Partial<Record<DataManagementTab, string>>;
-  hasPendingChanges: boolean;
   translate: Translate;
   dispatch: Dispatch;
   onSecretState: (state: SecretState) => void;
-  onResize: (width: number, height: number) => Promise<boolean>;
   onFlushPendingFields: () => Promise<void>;
   onTabSwitchError: (tab: DataManagementTab, reason: unknown) => void;
   onInspectImport: () => Promise<IpcResults["import_preview"] | undefined>;
   onImport: (sections: ConfigDomain[]) => Promise<IpcResults["import"] | undefined>;
   onConfirmImportReplace: (sections: string[]) => Promise<boolean>;
   onExport: (sections: ConfigDomain[]) => Promise<void>;
-  onApplyImported: (sections: ConfigDomain[]) => Promise<void>;
   onProbeWebDav: () => Promise<void>;
-  onApplyWebDav: () => Promise<void>;
   onSyncWebDav: (action: WebDavSyncAction) => Promise<void>;
 }): React.JSX.Element {
   const [tab, setTab] = useState<DataManagementTab>("import");
@@ -4379,32 +4741,14 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
   const [stagedSections, setStagedSections] = useState<ConfigDomain[]>([]);
   const [exportSections, setExportSections] = useState<ConfigDomain[]>([...DATA_PACKAGE_DOMAINS]);
   const [syncAction, setSyncAction] = useState<WebDavSyncAction>("sync");
+  const dataManagementTabRows = useMemo(() => ([
+    { id: "import" as DataManagementTab, title: translate("dataManagement.tab.import") },
+    { id: "export" as DataManagementTab, title: translate("dataManagement.tab.export") },
+    { id: "webdav" as DataManagementTab, title: translate("dataManagement.tab.webdav") },
+  ]).map(({ id, title }) => ({ key: id, cells: [title] })), [translate]);
   const detectedImportSections = useMemo(() => DATA_PACKAGE_DOMAINS.filter((domain) => importPreview?.detected_sections.includes(domain)), [importPreview]);
-  const importedDirty = stagedSections.some((domain) => snapshot?.drafts[domain]?.dirty);
   const importReviewReady = importPreview !== undefined && stagedSections.length === 0;
   const replacingDraftSections = importSections.filter((domain) => importPreview?.preview[domain]?.will_replace_draft === true);
-  const windows = Platform.OS === "windows";
-  const importItemCount = stagedSections.length || detectedImportSections.length;
-  const importHeight = importItemCount === 0
-    ? windows ? 168 : 148
-    : importItemCount <= 2
-      ? windows ? (replacingDraftSections.length > 0 ? 320 : 285) : (replacingDraftSections.length > 0 ? 305 : 270)
-      : windows ? (replacingDraftSections.length > 0 ? 385 : 350) : (replacingDraftSections.length > 0 ? 370 : 335);
-  useEffect(() => {
-    // Keep each pane content-sized. The default landing height matches the
-    // compact utility-window baseline; review panes expand only when content
-    // requires it.
-    const size = tab === "webdav"
-      ? { width: windows ? 660 : 640, height: windows ? 520 : 480 }
-      : tab === "export"
-        ? { width: windows ? 640 : 620, height: windows ? 340 : 320 }
-        : importItemCount === 0
-          ? { width: windows ? 620 : 600, height: importHeight }
-          : importItemCount <= 2
-            ? { width: windows ? 640 : 620, height: importHeight }
-            : { width: windows ? 660 : 640, height: importHeight };
-    void onResize(size.width, size.height);
-  }, [detectedImportSections.length, importHeight, onResize, stagedSections.length, tab]);
   const switchDataManagementTab = (next: DataManagementTab): void => {
     if (next === tab) return;
     const previous = tab;
@@ -4446,7 +4790,6 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
     }
     setStagedSections(DATA_PACKAGE_DOMAINS.filter((domain) => imported.draft_domains.includes(domain)));
   };
-  const hasWebDavChanges = snapshot?.drafts.webdav?.dirty === true;
   const syncOptions: Array<{ id: WebDavSyncAction; title: string }> = [
     { id: "sync", title: translate("dataManagement.syncSmart") },
     { id: "push", title: translate("dataManagement.syncPush") },
@@ -4458,12 +4801,23 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
     return <ActionButton title={translate(allSelected ? "dataManagement.deselectAll" : "dataManagement.selectAll")} disabled={busy || availableCount === 0} onPress={allSelected ? onDeselectAll : onSelectAll} />;
   };
   return <View style={styles.dataManagementWorkspace}>
-    <View style={[styles.dataManagementTabBar, dataManagementPolishStyles.tabBar]}><WindowTabs values={[
-      { id: "import", title: translate("dataManagement.tab.import") },
-      { id: "export", title: translate("dataManagement.tab.export") },
-      { id: "webdav", title: translate("dataManagement.tab.webdav") },
-    ]} selected={tab} onSelect={(next) => switchDataManagementTab(next as DataManagementTab)} style={[styles.dataManagementTabs, dataManagementPolishStyles.tabs]} /></View>
-    {tab === "import" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent, !importPreview && dataManagementPolishStyles.importLandingContent]}>
+    <View style={styles.dataManagementRail}>
+      <NativeTable
+        columns={[{ label: "", width: 132 }]}
+        rows={dataManagementTabRows}
+        selectedKey={tab}
+        striped={false}
+        compact
+        framed={false}
+        sourceList
+        cellHorizontalPadding={8}
+        firstColumnHorizontalPadding={8}
+        onSelectionChange={(key) => switchDataManagementTab(key as DataManagementTab)}
+        style={styles.dataManagementRailList}
+      />
+    </View>
+    <View style={styles.dataManagementDetail}>
+    {tab === "import" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>
       {!importPreview ? <View style={[styles.dataManagementImportIntro, dataManagementPolishStyles.importIntro]}><View style={styles.dataManagementImportFileRow}><Text style={styles.dataManagementImportFileLabel}>{translate("dataManagement.importFile")}</Text><View style={styles.dataManagementImportFileValue}><Text numberOfLines={1} style={styles.dataManagementImportFilePlaceholder}>{translate("dataManagement.noImportFile")}</Text></View><ActionButton title={translate("dataManagement.chooseImportFile")} disabled={busy} onPress={() => { void chooseImportFile(); }} /></View><Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.importHint")}</Text></View> : null}
       {importReviewReady ? <>
         <View style={dataManagementPolishStyles.paneIntro}><Text style={dataManagementPolishStyles.paneHeading}>{translate("dataManagement.importContent")}</Text><Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.importRecognizedHint")}</Text></View>
@@ -4474,7 +4828,7 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
         </DataManagementGroup>
       </> : null}
       {stagedSections.length > 0 ? <DataManagementGroup>
-        <View style={styles.dataManagementSelectionBar}><Text style={[styles.dataManagementSelectionCount, dataManagementPolishStyles.compactText]}>{translate("dataManagement.selectedCount", { count: stagedSections.length })}</Text>{importedDirty ? <ActionButton title={translate("menu.apply")} disabled={busy} onPress={() => { void onApplyImported(stagedSections); }} /> : null}</View>
+        <View style={styles.dataManagementSelectionBar}><Text style={[styles.dataManagementSelectionCount, dataManagementPolishStyles.compactText]}>{translate("dataManagement.selectedCount", { count: stagedSections.length })}</Text></View>
           {sectionList(stagedSections, stagedSections, true, () => undefined)}
       </DataManagementGroup> : null}
       {statuses.import ? <Text style={[styles.dataManagementStatus, dataManagementPolishStyles.compactText]}>{statuses.import}</Text> : null}
@@ -4497,13 +4851,14 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
     </View> : null}
     {tab === "webdav" ? <View style={[styles.dataManagementWebDavPane, styles.dataManagementWebDavContent, dataManagementPolishStyles.webDavContent]}>
       <View style={dataManagementPolishStyles.paneIntro}><Text style={dataManagementPolishStyles.paneHeading}>{translate("dataManagement.syncSettings")}</Text><Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.webdavHint")}</Text></View>
-      <WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={onProbeWebDav} hasChanges={hasWebDavChanges || hasPendingChanges} onApply={onApplyWebDav}>
+      <WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onProbe={onProbeWebDav}>
         <View style={[styles.dataManagementSyncContent, dataManagementPolishStyles.syncContent]}>
           <View style={styles.dataManagementSyncScope}><Text style={styles.dataManagementSyncScopeLabel}>{translate("dataManagement.webdavScope")}</Text><Text numberOfLines={2} style={styles.dataManagementSyncScopeValue}>{translate("dataManagement.section.providersModels")} · {translate("dataManagement.section.relayAccounts")}</Text></View>
           <View style={styles.dataManagementDirection}><Text style={styles.dataManagementDirectionLabel}>{translate("dataManagement.syncDirection")}</Text><NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSyncLabel} disabled={busy || webDavOperationBusy} onChange={({ nativeEvent }) => { const option = syncOptions[nativeEvent.index]; if (option) setSyncAction(option.id); }} style={styles.dataManagementDirectionPicker} /><ActionButton title={translate("dataManagement.syncNow")} disabled={busy || webDavOperationBusy || snapshot?.webdav.enabled !== true} onPress={() => { void onSyncWebDav(syncAction); }} /></View>
         </View>
       </WebDavWorkspace>
     </View> : null}
+    </View>
   </View>;
 }
 
@@ -4515,6 +4870,8 @@ function DataManagementGroup({ children, style }: { children?: React.ReactNode; 
 
 function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSecret, dshSyncToken }: { item: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; dshSyncToken: string }): React.JSX.Element {
   const [jsonResetToken, setJsonResetToken] = useState(0);
+  const [valueError, setValueError] = useState<string>();
+  const [resetToken, setResetToken] = useState(0);
   const key = identifier(item);
   const previousDshSyncToken = useRef(dshSyncToken);
   useEffect(() => {
@@ -4528,17 +4885,47 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
   const storageKind = stringValue(item.storage_kind, kind);
   const value = stringValue(item.value);
   const unit = runtimeUnitLabel(stringValue(item.unit), translate);
+  const isBoolean = kind === "boolean" || kind === "toggle" || kind === "bool" || kind === "bool_auto";
+  const isSelect = kind === "select" || kind === "choice" || kind === "enum";
+  const isMultiline = kind === "json";
+  const numericKind = ["number", "integer", "int", "float", "mb", "optional_int", "optional_float", "optional_mb"].includes(storageKind);
+  const rawDefaultValue = DSH_VISION_ROUTER_QUICK_DEFAULTS[key] ?? stringValue(item.default);
+  const booleanDefaultValue = rawDefaultValue === "1" || rawDefaultValue.toLowerCase() === "true";
+  // A setting reads as modified only when it holds an explicit non-default
+  // value; an empty optional field means "use the default" and is not a change.
+  const modified = value !== "" && (isBoolean
+    ? (booleanValue(item.value) ? "1" : "0") !== (booleanDefaultValue ? "1" : "0")
+    : value !== rawDefaultValue);
+  const minimum = numberValue(item.minimum, Number.NaN);
+  const maximum = numberValue(item.maximum, Number.NaN);
+  // Commit-time validation: an invalid draft stays in the field with an inline
+  // message instead of reaching Core, so a typo can never be applied silently.
+  const validate = numericKind ? (next: string): string | undefined => {
+    const trimmed = next.trim();
+    if (trimmed === "") return storageKind.startsWith("optional") ? undefined : translate("runtime.invalidNumber");
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) return translate("runtime.invalidNumber");
+    if ((storageKind === "integer" || storageKind === "int") && !/^-?\d+$/.test(trimmed)) return translate("runtime.invalidInteger");
+    if ((Number.isFinite(minimum) && parsed < minimum) || (Number.isFinite(maximum) && parsed > maximum)) {
+      return translate("runtime.outOfRange", { min: String(minimum), max: String(maximum) });
+    }
+    return undefined;
+  } : undefined;
+  const resetToDefault = (): void => {
+    setResetToken((current) => current + 1);
+    void dispatch("set_setting", { key, value: isBoolean ? booleanDefaultValue : rawDefaultValue });
+  };
   let control: React.ReactNode;
   let action: React.ReactNode;
-  if (kind === "boolean" || kind === "toggle" || kind === "bool" || kind === "bool_auto") {
-    control = <NativeCheckbox label={label} labelVisible={false} value={booleanValue(item.value)} disabled={busy} onValueChange={(next) => dispatch("set_setting", { key, value: kind === "bool_auto" ? (next ? "auto" : "off") : next })} style={styles.runtimeBooleanControl} />;
-  } else if (kind === "select" || kind === "choice" || kind === "enum") {
+  if (isBoolean) {
+    control = <NativeToggle value={booleanValue(item.value)} disabled={busy} accessibilityLabel={label} onValueChange={(next) => dispatch("set_setting", { key, value: kind === "bool_auto" ? (next ? "auto" : "off") : next })} style={styles.runtimeBooleanControl} />;
+  } else if (isSelect) {
     const optionValues = stringList(item.options);
     const visibleOptionValues = optionValues.filter((option) => !(DSH_VISION_ROUTER_QUICK_KEYS.some((quickKey) => quickKey === key) && option === "inherit"));
     const optionLabels = visibleOptionValues.map((option) => runtimeOptionLabel(key, option, translate));
     const selectedIndex = visibleOptionValues.indexOf(value);
     control = <NativePicker labels={optionLabels} selectedValue={optionLabels[selectedIndex] ?? optionLabels[0] ?? ""} disabled={busy} onChange={({ nativeEvent }) => { const next = optionValues[nativeEvent.index]; const visibleNext = visibleOptionValues[nativeEvent.index] ?? next; if (visibleNext !== undefined) void dispatch("set_setting", { key, value: visibleNext }); }} style={styles.runtimeValueControl} />;
-  } else if (kind === "json") {
+  } else if (isMultiline) {
     // JSON may contain provider credentials. Keep the document in the native
     // editor and stage it through the one-time Core secret capability while
     // still giving the user a real multiline textarea.
@@ -4548,13 +4935,17 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} onSecretState={onSecretState} setTitle={translate("common.set")} />;
     action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => clearSecret({ domain: "runtime", field: "setting", target: key })} />;
   } else {
-    control = <RuntimeValueField label={label} value={value} keyboardType={["number", "integer", "int", "float", "mb", "optional_int", "optional_float", "optional_mb"].includes(storageKind) ? "numeric" : undefined} onCommit={(next) => dispatch("set_setting", { key, value: next })} />;
+    control = <RuntimeValueField label={label} value={value} keyboardType={numericKind ? "numeric" : undefined} validate={validate} resetToken={resetToken} resetValue={rawDefaultValue} onCommit={(next) => dispatch("set_setting", { key, value: next })} onErrorChange={setValueError} />;
   }
-  const isBoolean = kind === "boolean" || kind === "toggle" || kind === "bool" || kind === "bool_auto";
-  const isMultiline = kind === "json";
+  // Keep the reset clickable while an apply is in flight: the dispatch queue
+  // serializes it, and a disabled button here reads as a dead control.
+  const resetAction = modified && action === undefined
+    ? <NativeButton title="" symbol="refresh" compact toolTip={`${translate("runtime.resetToDefault")} (${rawDefaultValue || translate("common.empty")})`} accessibilityLabel={translate("runtime.resetToDefault")} onPress={resetToDefault} style={styles.runtimeResetButton} />
+    : null;
   if (isMultiline) {
     return <View style={[styles.runtimeField, styles.runtimeMultilineField]}>
       <View style={styles.runtimeMultilineHeader}>
+        <View style={[styles.runtimeModifiedBar, styles.runtimeModifiedBarInline, modified && styles.runtimeModifiedBarActive]} />
         <Text style={styles.runtimeMultilineLabel} accessibilityLabel={label}>{label}</Text>
         {action ? <View style={styles.runtimeMultilineHeaderActions}>{action}</View> : null}
       </View>
@@ -4562,16 +4953,31 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
       <RuntimeFieldMeta item={item} translate={translate} multiline />
     </View>;
   }
-  return <View style={styles.runtimeField}><View style={styles.runtimeInputRow}><Text numberOfLines={2} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</Text><View style={styles.runtimeValueSlot}>{control}</View>{!isBoolean && unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}{!isBoolean ? <View style={styles.runtimeActionSlot}>{action}</View> : null}</View><RuntimeFieldMeta item={item} translate={translate} /></View>;
+  return <View style={styles.runtimeField}>
+    <View style={styles.runtimeInputRow}>
+      <View style={[styles.runtimeModifiedBar, modified && styles.runtimeModifiedBarActive]} />
+      <TooltipText numberOfLines={1} tooltip={label} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</TooltipText>
+      <View style={styles.runtimeValueSlot}>{control}</View>
+      {!isBoolean && unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}
+      <View style={styles.runtimeActionSlot}>{action ?? resetAction}</View>
+    </View>
+    {valueError ? <Text style={styles.runtimeFieldError}>{valueError}</Text> : null}
+    <RuntimeFieldMeta item={item} translate={translate} />
+  </View>;
 }
 
 function RuntimeFieldMeta({ item, translate, multiline = false }: { item: UnknownRecord; translate: Translate; multiline?: boolean }): React.JSX.Element {
   const key = identifier(item);
   const kind = stringValue(item.kind, "text");
   const rawDefaultValue = DSH_VISION_ROUTER_QUICK_DEFAULTS[key] ?? stringValue(item.default, translate("common.empty"));
-  const defaultValue = kind === "select" || kind === "choice" || kind === "enum"
-    ? runtimeOptionLabel(key, rawDefaultValue, translate)
-    : rawDefaultValue;
+  // Boolean settings carry "1"/"0" in the schema; show the switch state a
+  // user actually reads instead of the raw flag.
+  const booleanDefault = rawDefaultValue === "1" || rawDefaultValue.toLowerCase() === "true";
+  const defaultValue = kind === "boolean" || kind === "toggle" || kind === "bool" || kind === "bool_auto"
+    ? translate(booleanDefault ? "common.enabled" : "common.disabled")
+    : kind === "select" || kind === "choice" || kind === "enum"
+      ? runtimeOptionLabel(key, rawDefaultValue, translate)
+      : rawDefaultValue;
   const help = runtimeFieldHelp(key, stringValue(item.help), translate);
   if (multiline) {
     return <View style={[styles.runtimeHelpSlot, styles.runtimeMultilineHelpSlot]}>
@@ -4579,34 +4985,47 @@ function RuntimeFieldMeta({ item, translate, multiline = false }: { item: Unknow
       {help ? <Text style={styles.runtimeHelpText}>{help}</Text> : null}
     </View>;
   }
-  return <View style={styles.runtimeHelpSlot}><Text style={styles.runtimeHelpText}>{translate("common.default")}: {defaultValue}{help ? `\n${help}` : ""}</Text></View>;
+  // The full tip is always visible: it wraps under the row instead of being
+  // clipped into a tooltip-only single line.
+  const meta = `${translate("common.default")}: ${defaultValue}${help ? ` · ${help}` : ""}`;
+  return <View style={styles.runtimeHelpSlot}><Text style={styles.runtimeHelpText}>{meta}</Text></View>;
 }
 
 type PendingTextFieldState = {
   draft: string;
+  error?: string;
   onChangeText: (next: string) => void;
   commit: () => Promise<void>;
   reset: () => void;
+  /** Replace the local draft with an explicit value (reset-to-default). */
+  resetTo: (next: string) => void;
   isDirty: () => boolean;
+  hasError: () => boolean;
 };
 
 // Keep ordinary text local across every settings surface while typing. Blur,
 // submit, and Apply are the only commit points, so active typing never waits
-// for a Core dispatch or a full snapshot publication.
-function usePendingTextField(value: string, onCommit: (next: string) => void | Promise<void>, label: string, onDraftChange?: (next: string) => void): PendingTextFieldState {
+// for a Core dispatch or a full snapshot publication. A validator runs at the
+// commit point only: an invalid draft stays local, keeps the row dirty, and
+// surfaces an inline error instead of being written to Core.
+function usePendingTextField(value: string, onCommit: (next: string) => void | Promise<void>, label: string, onDraftChange?: (next: string) => void, validate?: (next: string) => string | undefined): PendingTextFieldState {
   const [draft, setDraft] = useState(value);
+  const [error, setError] = useState<string>();
   const registry = useContext(PendingFieldContext);
   const fieldId = useRef(Symbol(label));
   const draftRef = useRef(value);
   const committedRef = useRef(value);
   const valueRef = useRef(value);
   const dirtyRef = useRef(false);
+  const errorRef = useRef<string | undefined>(undefined);
   const commitInFlight = useRef<Promise<void> | undefined>(undefined);
   const onCommitRef = useRef(onCommit);
   const onDraftChangeRef = useRef(onDraftChange);
+  const validateRef = useRef(validate);
 
   useEffect(() => { onCommitRef.current = onCommit; }, [onCommit]);
   useEffect(() => { onDraftChangeRef.current = onDraftChange; }, [onDraftChange]);
+  useEffect(() => { validateRef.current = validate; }, [validate]);
   useEffect(() => {
     valueRef.current = value;
     if (!dirtyRef.current) {
@@ -4616,6 +5035,11 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
       onDraftChangeRef.current?.(value);
     }
   }, [value]);
+
+  const setFieldError = useCallback((next: string | undefined): void => {
+    errorRef.current = next;
+    setError(next);
+  }, []);
 
   const setDirty = useCallback((dirty: boolean): void => {
     dirtyRef.current = dirty;
@@ -4630,6 +5054,14 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
         continue;
       }
       const submitted = draftRef.current;
+      const validationMessage = validateRef.current?.(submitted);
+      if (validationMessage) {
+        // Keep the draft and the dirty flag so the user can correct it; the
+        // row stays visibly unsaved until the value validates.
+        setFieldError(validationMessage);
+        return;
+      }
+      setFieldError(undefined);
       const operation = Promise.resolve(onCommitRef.current(submitted)).then(() => {
         committedRef.current = submitted;
         if (draftRef.current === submitted) setDirty(false);
@@ -4641,16 +5073,19 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
         if (commitInFlight.current === operation) commitInFlight.current = undefined;
       }
     }
-  }, [setDirty]);
+  }, [setDirty, setFieldError]);
 
   const onChangeText = useCallback((next: string): void => {
     draftRef.current = next;
     setDraft(next);
     onDraftChangeRef.current?.(next);
+    // Clear a stale inline error while the user edits; the next commit
+    // re-validates before anything reaches Core.
+    if (errorRef.current !== undefined) setFieldError(undefined);
     // If an earlier staged value is still in flight, returning to the last
     // known draft still needs one more stage after that write finishes.
     setDirty(next !== committedRef.current || commitInFlight.current !== undefined);
-  }, [setDirty]);
+  }, [setDirty, setFieldError]);
 
   const reset = useCallback((): void => {
     const next = valueRef.current;
@@ -4658,11 +5093,23 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
     draftRef.current = next;
     setDraft(next);
     onDraftChangeRef.current?.(next);
+    setFieldError(undefined);
     setDirty(false);
-  }, [setDirty]);
+  }, [setDirty, setFieldError]);
+
+  // Reset-to-default must clear an uncommitted local draft too, otherwise the
+  // field keeps showing the old value after the Core value returns to default.
+  const resetTo = useCallback((next: string): void => {
+    committedRef.current = next;
+    draftRef.current = next;
+    setDraft(next);
+    onDraftChangeRef.current?.(next);
+    setFieldError(undefined);
+    setDirty(false);
+  }, [setDirty, setFieldError]);
 
   useEffect(() => {
-    registry?.register(fieldId.current, { commit, reset, isDirty: () => dirtyRef.current, flushBeforeAssistantEditor: true });
+    registry?.register(fieldId.current, { commit, reset, isDirty: () => dirtyRef.current, hasError: () => errorRef.current !== undefined, flushBeforeAssistantEditor: true });
     return () => {
       // Selection changes can remove the editor before AppKit/WinUI delivers
       // its blur event. Preserve the local draft instead of silently dropping
@@ -4672,15 +5119,18 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
     };
   }, [commit, registry, reset]);
 
-  return { draft, onChangeText, commit, reset, isDirty: () => dirtyRef.current };
+  return { draft, error, onChangeText, commit, reset, resetTo, isDirty: () => dirtyRef.current, hasError: () => errorRef.current !== undefined };
 }
 
-function RuntimeValueField({ label, value, keyboardType, onCommit }: { label: string; value: string; keyboardType?: "default" | "numeric"; onCommit: (value: string) => void | Promise<void> }): React.JSX.Element {
-  const field = usePendingTextField(value, onCommit, label);
-  return <NativeTextField style={[styles.input, styles.runtimeValueControl]} value={field.draft} onChangeText={field.onChangeText} onBlur={() => { void field.commit().catch(() => undefined); }} onSubmitEditing={() => { void field.commit().catch(() => undefined); }} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />;
+function RuntimeValueField({ label, value, keyboardType, validate, resetToken = 0, resetValue = "", onCommit, onErrorChange }: { label: string; value: string; keyboardType?: "default" | "numeric"; validate?: (next: string) => string | undefined; resetToken?: number; resetValue?: string; onCommit: (value: string) => void | Promise<void>; onErrorChange?: (message?: string) => void }): React.JSX.Element {
+  const field = usePendingTextField(value, onCommit, label, undefined, validate);
+  useEffect(() => { onErrorChange?.(field.error); }, [field.error, onErrorChange]);
+  // A reset click replaces any uncommitted draft with the default value.
+  useEffect(() => { if (resetToken > 0) field.resetTo(resetValue); }, [resetToken]);
+  return <NativeTextField style={[styles.input, styles.runtimeValueControl, field.error !== undefined && styles.runtimeValueControlInvalid]} value={field.draft} onChangeText={field.onChangeText} onBlur={() => { void field.commit().catch(() => undefined); }} onSubmitEditing={() => { void field.commit().catch(() => undefined); }} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />;
 }
 
-function WebDavWorkspace({ snapshot, busy, status, translate, dispatch, onSecretState, onProbe, hasChanges, onApply, children }: { snapshot?: CoreSnapshot; busy: boolean; status?: string; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onProbe: () => Promise<void>; hasChanges: boolean; onApply: () => Promise<void>; children: React.ReactNode }): React.JSX.Element {
+function WebDavWorkspace({ snapshot, busy, status, translate, dispatch, onSecretState, onProbe, children }: { snapshot?: CoreSnapshot; busy: boolean; status?: string; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; onProbe: () => Promise<void>; children: React.ReactNode }): React.JSX.Element {
   const state = domainState(snapshot, "webdav");
   const labelAlign = "left";
   return <DataManagementGroup style={styles.webDavForm}>
@@ -4695,7 +5145,7 @@ function WebDavWorkspace({ snapshot, busy, status, translate, dispatch, onSecret
         <TextField label={translate("webdav.httpTimeout")} value={stringValue(state.timeout)} labelWidth={WEBDAV_FORM_LABEL_WIDTH} labelAlign={labelAlign} controlWidth={150} suffix={translate("webdav.seconds")} hintStyle={dataManagementPolishStyles.compactText} keyboardType="numeric" onCommit={(timeout) => dispatch("patch", { timeout })} />
       </View>
       <View style={[styles.webdavSyncArea, dataManagementPolishStyles.webDavSyncArea]}>{children}</View>
-      <View style={[styles.webdavActionRow, dataManagementPolishStyles.webDavActionRow]}><ActionButton title={translate("dataManagement.testConnection")} disabled={busy} onPress={() => { void onProbe(); }} />{status ? <Text numberOfLines={1} style={[styles.webdavActionStatus, dataManagementPolishStyles.compactText]}>{status}</Text> : null}<View style={styles.webdavActionSpacer} /><ActionButton primary title={translate("common.saveAndApply")} disabled={busy || !hasChanges} onPress={() => { void onApply(); }} /></View>
+      <View style={[styles.webdavActionRow, dataManagementPolishStyles.webDavActionRow]}><ActionButton title={translate("dataManagement.testConnection")} disabled={busy} onPress={() => { void onProbe(); }} />{status ? <Text numberOfLines={1} style={[styles.webdavActionStatus, dataManagementPolishStyles.compactText]}>{status}</Text> : null}</View>
     </View>
   </DataManagementGroup>;
 }
@@ -5914,10 +6364,6 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   </View>;
 }
 
-function Section({ title, action, children }: { title: string; action?: React.ReactNode; children: React.ReactNode }): React.JSX.Element {
-  return <View style={[styles.section, compactStyles.section]}><View style={[styles.sectionHeader, compactStyles.inlineGap]}><Text style={styles.sectionTitle}>{title}</Text>{action}</View>{children}</View>;
-}
-
 function EmptyState({ translate }: { translate: Translate }): React.JSX.Element { return <Text style={styles.empty}>{translate("screen.noData")}</Text>; }
 
 const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: () => void; disabled?: boolean; primary?: boolean; danger?: boolean; style?: StyleProp<ViewStyle> }>(function ActionButton({ title, onPress, disabled, primary, danger, style }, ref): React.JSX.Element {
@@ -6505,9 +6951,8 @@ const systemColors = {
 // the same inset, helper-copy treatment, and native-preference spacing.
 const dataManagementPolishStyles = StyleSheet.create({
   tabBar: { height: 42, minHeight: 42 },
-  tabs: { width: 360, height: 28 },
+  tabs: { width: 272, height: 28 },
   paneScrollContent: { flexGrow: 1, paddingTop: 14, paddingHorizontal: 12, paddingBottom: 14, gap: 14 },
-  importLandingContent: { justifyContent: "center" },
   webDavContent: { flexGrow: 1, gap: 14, paddingTop: 14, paddingHorizontal: 12, paddingBottom: 14 },
   paneIntro: { gap: 3, paddingHorizontal: 2 },
   paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
@@ -6525,18 +6970,18 @@ const dataManagementPolishStyles = StyleSheet.create({
 });
 
 const assistantSettingsStyles = {
-  domainCard: { minWidth: 0, flexGrow: 1, flexBasis: 420, gap: 8, padding: 12, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.window },
-  domainHeader: { gap: 2 },
+  domainCard: { minWidth: 0, alignSelf: "stretch" as const, gap: 10, paddingVertical: 12 },
+  domainHeader: { gap: 2, paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
   cardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" as const },
   domainHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   domainBody: { gap: 8 },
-  quickFields: { gap: 6 },
+  quickFields: { gap: 8 },
   subsection: { gap: 7, paddingTop: 8, borderTopWidth: 1, borderTopColor: systemColors.separator },
   subsectionHeader: { gap: 2 },
   subsectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" as const },
   subsectionHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   fileGroup: { gap: 5 },
-  fileGroupHeader: { gap: 2 },
+  fileGroupHeader: { gap: 2, paddingBottom: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
   fileGroupTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" as const },
   fileGroupHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
 };
@@ -6548,9 +6993,9 @@ const assistantSettingsLayoutStyles = StyleSheet.create({
 });
 
 const assistantFileSurfaceStyles = StyleSheet.create({
-  filesSection: { gap: 10, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
-  fileGroups: { gap: 14 },
-  fileRow: { minHeight: 40, flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
+  filesSection: { gap: 8, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
+  fileGroups: { gap: 10 },
+  fileRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 4, borderBottomWidth: 1, borderBottomColor: systemColors.separator },
   fileMeta: { flex: 1, minWidth: 0, gap: 2 },
   fileLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   fileHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
@@ -6637,10 +7082,12 @@ const styles = StyleSheet.create({
   routeTraceNoSelection: { flex: 1, alignItems: "center", justifyContent: "center", padding: 20 },
   routeTraceNoSelectionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "center" },
   routeTraceInfoText: { color: systemColors.label },
-  root: { flex: 1, minWidth: 420, backgroundColor: systemColors.window },
+  root: { flex: 1, minWidth: 420 }, assistantFieldRow: { minWidth: 0, flexDirection: "row", alignItems: "flex-end", gap: 8 }, assistantFieldFlex: { flex: 1, minWidth: 0 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 20, paddingTop: 10, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
-  footer: { height: 52, minHeight: 52, flexShrink: 0, flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 8, gap: 6 }, footerCompact: { height: 48, minHeight: 48, paddingHorizontal: 14, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, backgroundColor: systemColors.control }, footerBorderless: { borderTopWidth: 0 }, footerStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, flexShrink: 1 }, footerSpacer: { flex: 1 }, footerButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, wideButton: { minWidth: 92 }, runtimeRestoreButton: { minWidth: 120 },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 16, paddingTop: 6, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
+  // Settings window: a native source-list sidebar next to the active pane.
+  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: 20, height: 20, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsSidebarDivider: { height: 1, flexShrink: 0, marginHorizontal: 12, backgroundColor: systemColors.separator }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" }, settingsPaneDivider: { height: 1, flexShrink: 0, backgroundColor: systemColors.separator },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, generalRowLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { width: 40, minWidth: 40, height: 24, marginLeft: 6 }, generalRowHint: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, generalStatus: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },
@@ -6671,12 +7118,12 @@ const styles = StyleSheet.create({
   providerAuthStatusRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 },
   providerAuthStatusLabel: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerAuthStatusValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 154, minWidth: 154, maxWidth: 154, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 280 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 300, minWidth: 300, maxWidth: 300, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, probeSummaryTrigger: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, probeSummaryTriggerPressed: { opacity: 0.65 }, probeSummary: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
-  codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, assistantSettingsScroll: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground, borderWidth: 1, borderColor: systemColors.separator }, assistantSettingsScrollContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 20, gap: 20 }, assistantQuickSection: { gap: 10 }, assistantSectionHeader: { flexDirection: "row", alignItems: "baseline", justifyContent: "space-between", gap: 12 }, assistantSectionHint: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right" }, assistantQuickGrid: { flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, assistantRawSection: { gap: 10, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, assistantRawGrid: { flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, assistantRawEditor: { flex: 0, flexGrow: 1, flexShrink: 1, flexBasis: 480, minWidth: 360, height: 286, minHeight: 240 }, codexStructuredPane: { flex: 1, minWidth: 0, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }, codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch", gap: 14, paddingLeft: 16, paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER, paddingTop: 10, paddingBottom: 16 }, codexStructuredWithHorizontalScrollbar: { paddingBottom: 32 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, section: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 10, gap: 8 }, sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
-  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 8 }, runtimeWorkspace: { padding: 14, gap: 12 }, runtimeScrollSurface: { flex: 1, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, runtimeTwoColumnForm: { flexDirection: "row", flexWrap: "wrap", columnGap: 20, rowGap: 8 }, runtimeOneColumnForm: { flexDirection: "column", flexWrap: "nowrap" }, runtimeField: { minWidth: 486, flexGrow: 1, flexBasis: 486, gap: 4 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 180, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 180, minWidth: 180, height: 26 }, runtimeBooleanControl: { width: 24, minWidth: 24, height: 24, alignSelf: "flex-start" }, runtimeUnit: { width: 60, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { marginLeft: 134, paddingTop: 4, minWidth: 0 }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, minWidth: 0 }, runtimeMultilineField: { minWidth: 486, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
-  dataManagementWorkspace: { flex: 1, minHeight: 0 }, dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, justifyContent: "center", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, dataManagementTabs: { width: 280, height: 24, alignSelf: "center", flexShrink: 0 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: 10, paddingHorizontal: 4, paddingBottom: 14 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementImportFileLabel: { width: 72, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSyncScopeLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementDirectionLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementDirectionPicker: { width: 210, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
-  webDavForm: { flexGrow: 0, paddingHorizontal: 2 }, webdavFormBody: { gap: 6 }, webdavStateRow: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "flex-start" }, webdavSyncArea: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionRow: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavActionSpacer: { flex: 1 }, webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: "flex-start" }, webdavStateSpacer: { flex: 1 }, webdavStateStatus: { maxWidth: 180, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right", lineHeight: 15 }, webdavFormRows: { width: "60%", gap: 5 }, webdavPasswordInput: { width: "100%", minHeight: 26 },
-  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: "100%", minWidth: 0, height: 28, flexShrink: 0, marginTop: 0, marginBottom: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },
+  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 140, minWidth: 140, maxWidth: 140, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 280 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 290, minWidth: 290, maxWidth: 290, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, probeSummaryTrigger: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, probeSummaryTriggerPressed: { opacity: 0.65 }, probeSummary: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
+  codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, assistantSettingsScroll: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground, borderWidth: 1, borderColor: systemColors.separator }, assistantSettingsScrollContent: { flexGrow: 1, paddingHorizontal: 14, paddingTop: 10, paddingBottom: 14, gap: 14 }, assistantQuickSection: { gap: 8 }, assistantSectionHeader: { flexDirection: "row", alignItems: "baseline", justifyContent: "space-between", gap: 12 }, assistantSectionHint: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right" }, assistantQuickGrid: { flexDirection: "column", gap: 10 }, assistantRawSection: { gap: 10, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, assistantRawGrid: { flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, assistantRawEditor: { flex: 0, flexGrow: 1, flexShrink: 1, flexBasis: 480, minWidth: 360, height: 286, minHeight: 240 }, codexStructuredPane: { flex: 1, minWidth: 0, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }, codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch", gap: 14, paddingLeft: 16, paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER, paddingTop: 10, paddingBottom: 16 }, codexStructuredWithHorizontalScrollbar: { paddingBottom: 32 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
+  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeToc: { width: 156, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }, runtimeTocList: { flex: 1, minHeight: 0 }, runtimeWorkspace: { width: "100%", padding: 14, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeSection: { gap: 6 }, runtimeSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeFieldList: { gap: 10 }, runtimeField: { minWidth: 0, alignSelf: "stretch", gap: 2 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeModifiedBar: { width: 2, alignSelf: "stretch", marginRight: 6, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { alignSelf: "center", height: 16, marginRight: 6 }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: 142, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 160, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 160, minWidth: 160, height: 26 }, runtimeBooleanControl: { width: 40, minWidth: 40, height: 24, alignSelf: "flex-start", marginLeft: 8 }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { paddingLeft: 142, paddingTop: 1, minWidth: 0, alignSelf: "stretch" }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, minWidth: 0, flexShrink: 1 }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
+  dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementRail: { width: 140, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }, dataManagementRailList: { flex: 1, minHeight: 0 }, dataManagementDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, paddingHorizontal: 12, justifyContent: "flex-start", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, dataManagementTabs: { width: 272, height: 24, alignSelf: "flex-start", flexShrink: 0 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: 10, paddingHorizontal: 4, paddingBottom: 14 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementImportFileLabel: { width: 72, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSyncScopeLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementDirectionLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementDirectionPicker: { width: 210, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
+  webDavForm: { flexGrow: 0, paddingHorizontal: 2 }, webdavFormBody: { gap: 6 }, webdavStateRow: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "flex-start" }, webdavSyncArea: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionRow: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: "flex-start" }, webdavStateSpacer: { flex: 1 }, webdavStateStatus: { maxWidth: 180, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right", lineHeight: 15 }, webdavFormRows: { width: "60%", gap: 5 }, webdavPasswordInput: { width: "100%", minHeight: 26 },
+  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },
   form: { gap: 6 }, structuredForm: { gap: 6 }, featureGrid: { flexDirection: "row", flexWrap: "wrap", columnGap: 12, rowGap: 4 }, featureGridItem: { flexGrow: 1, flexBasis: 180, minWidth: 180 }, field: { gap: 5, minWidth: 220, flexGrow: 1, flexBasis: 300 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, inputWithAction: { flexDirection: "row", alignItems: "center", gap: 6 }, inputFlex: { flex: 1 }, toggleRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, toggleControl: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, toggleNativeControl: { width: "100%", minWidth: 220, minHeight: 22 }, actions: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, nativeSecretSetButton: { minWidth: 42, height: 26 }, action: {}, actionPrimary: {}, actionDanger: {}, actionDisabled: {}, actionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, actionTextPrimary: {}, actionTextDanger: {}, tabStrip: { flexDirection: "row", flexWrap: "wrap", gap: 6 }, tab: {}, tabSelected: {}, inlineMeta: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 6 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, infoPair: { gap: 2, minWidth: 160 }, rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 }, logRecords: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, maxHeight: 360, overflow: "scroll", padding: 10, gap: 6 }, logRecord: { color: systemColors.label, fontFamily: "Menlo", fontSize: UI_FONT_SIZE }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, result: { color: systemColors.green, fontSize: UI_FONT_SIZE }, warning: { color: systemColors.brown, fontSize: UI_FONT_SIZE, backgroundColor: systemColors.control, padding: 8, borderRadius: 4 }, issueBox: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.control, padding: 12, gap: 5 }, issue: { color: systemColors.red, fontSize: UI_FONT_SIZE }, cardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
   nativeSecretMultilineControl: { alignItems: "flex-start", minHeight: 108 },
   nativeSecretTextArea: { minHeight: 108, height: 108, alignSelf: "stretch" },

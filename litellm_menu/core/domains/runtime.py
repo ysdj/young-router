@@ -236,6 +236,7 @@ class RuntimeSettingsDomain:
             "retained": is_secret and baseline_value != default,
             "will_clear": is_secret and baseline_value != default and value == default,
             "secret": is_secret,
+            "hidden": bool(metadata.get("hidden", False)),
             "retain_existing": str(metadata.get("retain_existing", "")),
         }
 

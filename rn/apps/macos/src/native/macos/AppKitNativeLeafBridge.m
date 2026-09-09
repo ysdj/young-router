@@ -35,6 +35,8 @@ RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD(systemLocale)
 RCT_EXTERN_METHOD(setLaunchAtLogin:(BOOL)enabled resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(restartCodex:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
 RCT_EXTERN_METHOD(showVersion)
+RCT_EXTERN_METHOD(versionInfo:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+RCT_EXTERN_METHOD(openExternalURL:(NSString *)url)
 RCT_EXTERN_METHOD(quit)
 @end
 #endif

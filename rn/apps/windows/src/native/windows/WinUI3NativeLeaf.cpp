@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <winreg.h>
 #include <winver.h>
@@ -52,24 +53,26 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   // These are the legacy window content sizes in 96-DPI logical pixels. They
   // deliberately live at the native window boundary: React owns the shared
   // page, while Win32 owns frame constraints and DPI conversion.
-  if (route == L"providers-models") return {780, 560};
+  // Every settings pane shares one window, so it uses one minimum size wide
+  // enough for the sidebar plus the widest pane.
+  if (route == L"general-settings" || route == L"providers-models" || route == L"codex-settings" ||
+      route == L"claude-settings" || route == L"runtime-settings" || route == L"data-management" ||
+      route == L"logs") {
+    return {900, 560};
+  }
   if (route == L"provider-wizard") return {540, 420};
-  if (route == L"codex-settings" || route == L"claude-settings") return {1100, 640};
-  if (route == L"runtime-settings") return {800, 520};
-  if (route == L"data-management") return {500, 180};
-  if (route == L"logs") return {640, 420};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
   return {320, 160};
 }
 
 ContentSize RouteInitialContentSize(std::wstring_view route) {
-  if (route == L"providers-models") return {860, 560};
+  if (route == L"general-settings" || route == L"providers-models" || route == L"codex-settings" ||
+      route == L"claude-settings" || route == L"runtime-settings" || route == L"data-management" ||
+      route == L"logs") {
+    return {960, 640};
+  }
   if (route == L"provider-wizard") return {620, 460};
-  if (route == L"codex-settings" || route == L"claude-settings") return {1160, 700};
-  if (route == L"runtime-settings") return {1080, 620};
-  if (route == L"data-management") return {620, 220};
-  if (route == L"logs") return {900, 580};
   return {320, 160};
 }
 
@@ -426,6 +429,12 @@ bool WinUI3NativeLeaf::HandleWindowMessage(UINT message, WPARAM wparam, LPARAM l
 
 void WinUI3NativeLeaf::OpenRoute(std::wstring_view route) {
   active_route_ = route;
+  if (route == L"home") {
+    // "home" leaves the settings shell for the tray, mirroring the macOS
+    // host: hide the single window instead of showing an empty shell pane.
+    if (window_handle_ != nullptr) ShowWindow(window_handle_, SW_HIDE);
+    return;
+  }
   if (window_handle_ != nullptr) {
     SetWindowTextW(window_handle_, RouteTitle(route).c_str());
     const auto frame = FrameTrackSizeForContent(window_handle_, RouteInitialContentSize(route));
@@ -1425,6 +1434,58 @@ void WinUI3NativeLeaf::ShowVersion() const {
   MessageBoxW(window_handle_, text.c_str(), Localized("appTitle", L"LiteLLM Menu").c_str(), MB_OK | MB_ICONINFORMATION);
 }
 
+WinUI3NativeLeaf::VersionInfoResult WinUI3NativeLeaf::VersionInfo() const {
+  VersionInfoResult result;
+  try {
+    auto version = winrt::Windows::ApplicationModel::Package::Current().Id().Version();
+    wchar_t packaged[64]{};
+    swprintf_s(packaged, L"%u.%u.%u", version.Major, version.Minor, version.Build);
+    result.app = packaged;
+  } catch (...) {
+    DWORD size = GetFileVersionInfoSizeW(ModulePath().c_str(), nullptr);
+    if (size > 0) {
+      std::vector<BYTE> data(size);
+      VS_FIXEDFILEINFO* info = nullptr;
+      UINT info_size = 0;
+      if (GetFileVersionInfoW(ModulePath().c_str(), 0, size, data.data()) &&
+          VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &info_size) && info != nullptr) {
+        wchar_t buffer[64]{};
+        swprintf_s(buffer, L"%u.%u.%u",
+            HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS), HIWORD(info->dwFileVersionLS));
+        result.app = buffer;
+      }
+    }
+  }
+  try {
+    // The About pane shows the LiteLLM runtime version recorded beside the
+    // bundled Core runtime.
+    std::filesystem::path path(ModulePath());
+    path = path.parent_path() / L"Core" / L"runtime" / L"LITELLM_VERSION";
+    std::wifstream stream(path);
+    std::wstring line;
+    if (stream && std::getline(stream, line)) {
+      while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) line.pop_back();
+      result.litellm = line;
+    }
+  } catch (...) {
+  }
+  return result;
+}
+
+void WinUI3NativeLeaf::OpenExternalURL(std::wstring_view url) {
+  if (url.empty() || url.size() > 8192) return;
+  try {
+    winrt::Windows::Foundation::Uri parsed{std::wstring(url)};
+    auto scheme = std::wstring(parsed.SchemeName());
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::towlower);
+    if (scheme != L"http" && scheme != L"https") return;
+  } catch (...) {
+    return;
+  }
+  std::wstring command(url);
+  ShellExecuteW(nullptr, L"open", command.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 void WinUI3NativeLeaf::Quit() {
   if (quit_in_progress_ || quitting_) return;
   quit_in_progress_ = true;
@@ -1506,9 +1567,9 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
       }
       continue;
     }
-    if (action.id == L"open-providers-models" || action.id == L"webdav-status" ||
-        action.id == L"open-data-management" || action.id == L"open-logs" ||
-        action.id == L"show-version") {
+    if (action.id == L"open-general-settings" || action.id == L"open-providers-models" ||
+        action.id == L"webdav-status" || action.id == L"open-data-management" ||
+        action.id == L"open-logs" || action.id == L"show-version") {
       add_separator();
     }
     AppendMenuW(menu, flags,
@@ -1574,15 +1635,14 @@ std::wstring WinUI3NativeLeaf::Localized(std::string const& key, std::wstring_vi
 }
 
 std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
-  if (route == L"home") return Localized("appTitle", L"LiteLLM Menu");
-  if (route == L"providers-models") return Localized("routeProvidersModels", L"Providers & Models");
-  if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
-  if (route == L"codex-settings" || route == L"claude-settings") {
-    return Localized("routeCodexSettings", L"Codex / Claude Settings");
+  // Settings panes share one window, so its title is the app name while the
+  // sidebar selection names the active pane (System Settings style).
+  if (route == L"home" || route == L"general-settings" || route == L"providers-models" ||
+      route == L"codex-settings" || route == L"claude-settings" || route == L"runtime-settings" ||
+      route == L"data-management" || route == L"logs") {
+    return Localized("appTitle", L"LiteLLM Menu");
   }
-  if (route == L"runtime-settings") return Localized("routeRuntimeSettings", L"Runtime Settings");
-  if (route == L"data-management") return Localized("routeDataManagement", L"Data Management");
-  if (route == L"logs") return Localized("routeLogs", L"Logs");
+  if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
   return Localized("appTitle", L"LiteLLM Menu");
 }
 

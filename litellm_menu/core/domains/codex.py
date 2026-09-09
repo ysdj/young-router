@@ -481,6 +481,29 @@ class CodexSettingsDomain:
                 if name == "select_model":
                     patch = {"litellm_model": data.get("selection")}
                 self._draft = self._sync(config_text, auth_text, patch)
+        elif name in {"use_local_api", "uselocalapi"}:
+            # Point the selected provider at this app's own proxy and adopt its
+            # master key, so the external Codex client talks to LiteLLM Menu.
+            from ._shared import local_proxy_endpoint
+
+            base_url, key = local_proxy_endpoint()
+            structured = self._draft.get("structured")
+            structured = structured if isinstance(structured, Mapping) else {}
+            direct = str(structured.get("model_provider") or "").strip()
+            patch: dict[str, Any] = {"api_key": key}
+            if direct == "openai":
+                patch["direct_connection"] = {"provider": "openai", "base_url": base_url}
+            elif direct:
+                providers: list[dict[str, Any]] = []
+                for item in structured.get("providers") or []:
+                    if not isinstance(item, Mapping):
+                        continue
+                    entry = copy.deepcopy(dict(item))
+                    if str(entry.get("id") or "").strip() == direct:
+                        entry["base_url"] = base_url
+                    providers.append(entry)
+                patch["providers"] = providers
+            self._draft = self._sync(config_text, auth_text, patch)
         elif name in {"reset", "cancel", "reload", "restore_defaults"}:
             self._draft = copy.deepcopy(self._raw)
         else:

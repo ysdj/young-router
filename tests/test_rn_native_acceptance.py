@@ -88,16 +88,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("POINT MinimumTrackSizeForActiveRoute() const;", header)
         self.assertIn("ContentSize RouteMinimumContentSize(std::wstring_view route)", leaf)
-        for route, width, height in (
-            ("providers-models", 780, 560),
-            ("runtime-settings", 800, 520),
-            ("data-management", 500, 180),
-            ("provider-wizard", 540, 420),
-            ("logs", 640, 420),
-        ):
-            self.assertIn(f'route == L"{route}") return {{{width}, {height}}};', leaf)
-        self.assertIn('route == L"codex-settings" || route == L"claude-settings"', leaf)
-        self.assertIn("return {1100, 640};", leaf)
+        # Every settings pane shares one window, so it uses one minimum size
+        # wide enough for the sidebar plus the widest pane.
+        self.assertIn('route == L"providers-models" || route == L"codex-settings"', leaf)
+        self.assertIn("return {960, 640};", leaf)
+        self.assertIn('route == L"provider-wizard") return {540, 420};', leaf)
         self.assertIn("MinimumTrackSizeForActiveRoute();", leaf)
         self.assertIn("DipToPhysicalPixels", leaf)
         self.assertIn("AdjustWindowRectExForDpi", leaf)
@@ -107,8 +102,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
         self.assertIn("ContentSize RouteInitialContentSize", leaf)
-        for size in ("{780, 560}", "{860, 560}", "{1160, 700}", "{1080, 620}", "{620, 220}", "{620, 460}", "{900, 580}"):
-            self.assertIn(size, leaf)
+        # Settings panes share one window with one responsive initial size.
+        self.assertIn("return {960, 640};", leaf)
+        self.assertIn("{620, 460}", leaf)
         self.assertIn("RouteInitialContentSize(route)", leaf)
 
     def test_macos_file_capability_exchange_never_blocks_appkit(self) -> None:
@@ -148,16 +144,26 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_macos_route_geometry_matches_the_responsive_constraints(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        for width, height, min_width, min_height in (
-            (900, 640, 820, 560),
-            (1160, 700, 1100, 640),
-            (1080, 620, 800, 520),
-            (600, 220, 500, 180),
-            (620, 460, 540, 420),
-            (900, 580, 640, 420),
-        ):
-            self.assertIn(f"contentSize: NSSize(width: {width}, height: {height})", leaf)
-            self.assertIn(f"minSize: NSSize(width: {min_width}, height: {min_height})", leaf)
+        # One shared settings window plus the provider wizard sheet.
+        self.assertIn("if Self.settingsPaneRoutes.contains(route) {", leaf)
+        # One fixed size for every pane, so switching panes never resizes the
+        # window; it only needs to fit the widest workspace.
+        self.assertIn("contentSize: NSSize(width: 960, height: 640)", leaf)
+        self.assertIn("minSize: NSSize(width: 900, height: 560)", leaf)
+        self.assertNotIn("applySettingsPaneLayout", leaf)
+        # The General pane joins the shared settings window on both hosts.
+        self.assertIn('"general-settings", "providers-models", "runtime-settings"', leaf)
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        self.assertIn('route == L"general-settings" || route == L"providers-models"', windows)
+        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        self.assertIn('@"general-settings", @"providers-models"', app_delegate)
+        # About moved from the sidebar to the native menus; the storyboard's
+        # standard About item is localized and Preferences gets the Settings
+        # action instead of appending duplicates.
+        self.assertIn('$0.action == Selector(("orderFrontStandardAboutPanel:"))', leaf)
+        self.assertIn('preferencesItem.action = #selector(openCodex)', leaf)
+        self.assertIn("contentSize: NSSize(width: 620, height: 460)", leaf)
+        self.assertIn("minSize: NSSize(width: 540, height: 420)", leaf)
         # The former relay windows are folded into the unified workspace.
         self.assertNotIn('case "relay-accounts":', leaf)
         self.assertNotIn('case "relay-add":', leaf)
@@ -179,7 +185,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # The wizard is a child of the unified provider workspace; legacy
         # relay routes are canonicalized into it.
         self.assertIn('if route == "relay-add" { return "provider-wizard" }', leaf)
-        self.assertIn('if windowRoute == "provider-wizard", routeWindows["providers-models"] == nil', open_route)
+        self.assertIn('if windowRoute == "provider-wizard", settingsWindowKey() == nil', open_route)
         self.assertIn("parent.beginSheet(window)", open_route)
         self.assertIn("window.sheetParent == nil", open_route)
         self.assertIn("parent.endSheet(window)", close_route)
@@ -236,15 +242,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
-        self.assertIn('case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")', mac)
-        self.assertIn('route == L"codex-settings" || route == L"claude-settings"', windows)
-        self.assertIn('Localized("routeCodexSettings", L"Codex / Claude Settings")', windows)
+        # Codex and Claude are panes of the shared settings window, whose title
+        # is the app name; the sidebar names the active pane.
+        self.assertIn('if Self.settingsPaneRoutes.contains(canonicalRoute(route)) {', mac)
+        self.assertIn('return localized("appTitle", fallback: "LiteLLM Menu")', mac)
+        self.assertIn('route == L"codex-settings" ||', windows)
+        self.assertIn('return Localized("appTitle", L"LiteLLM Menu");', windows)
 
     def test_macos_settings_shortcut_opens_the_combined_settings_surface(self) -> None:
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        shortcut = mac.split('if shortcuts["openMenu"]?.lowercased().contains("cmd+,") == true {', 1)[1].split('if shortcuts["reload"]', 1)[0]
+        shortcut = mac.split('if let preferencesItem = applicationMenu.items.first(where: { $0.action == nil && $0.keyEquivalent == "," }) {', 1)[1].split('guard !applicationMenu.items.contains', 1)[0]
 
-        self.assertIn("action: #selector(openCodex)", shortcut)
+        self.assertIn("preferencesItem.action = #selector(openCodex)", shortcut)
         self.assertNotIn("action: #selector(openRuntime)", shortcut)
 
     def test_native_trays_show_a_status_header_and_checked_toggle_actions(self) -> None:
@@ -259,8 +268,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn(".foregroundColor: NSColor.secondaryLabelColor", status_item)
         self.assertIn('AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status_title_.c_str());', windows)
         self.assertIn('auto add_separator = [&menu, &needs_separator]()', windows)
-        self.assertIn('action.id == L"open-providers-models" || action.id == L"webdav-status" ||', windows)
-        self.assertIn('action.id == L"open-data-management" || action.id == L"open-logs" ||', windows)
+        self.assertIn('action.id == L"open-general-settings" || action.id == L"open-providers-models" ||', windows)
+        self.assertIn('action.id == L"open-data-management" ||', windows)
+        self.assertIn('action.id == L"open-logs" || action.id == L"show-version") {', windows)
         self.assertIn('menu.autoenablesItems = false', mac)
         self.assertNotIn('"webdav-status", "webdav-toggle"', mac)
 
@@ -558,6 +568,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("public func warm()", bridge)
         self.assertIn("[CoreIPCBridge.shared warm];", app_delegate)
 
+    def test_home_deep_links_leave_no_empty_settings_window(self) -> None:
+        """A "home" deep link leaves the settings shell for the menu bar or
+        tray; the hosts must dismiss the open settings window instead of
+        leaving an empty shared shell pane onscreen."""
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        win_leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+
+        self.assertIn('guard route != "home" else {', leaf)
+        self.assertIn('close(route: "provider-wizard")', leaf)
+        self.assertIn("close(route: settingsKey)", leaf)
+        self.assertIn('if (route == L"home") {', win_leaf)
+
     def test_macos_deep_links_allow_only_the_logs_tab_parameter(self) -> None:
         app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         info = (MAC_PROJECT / "LiteLLMMenu-macOS/Info.plist").read_text(encoding="utf-8")
@@ -579,6 +601,28 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("config-watch", leaf)
         self.assertNotIn('language-settings', app_delegate)
         self.assertNotIn('language-settings', leaf)
+
+    def test_settings_window_uses_a_full_height_sidebar_material(self) -> None:
+        """The settings window keeps one sidebar material behind the whole
+        window and a transparent title bar, so the sidebar reads as a single
+        full-height surface instead of a gray table on a white pane."""
+        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+
+        self.assertIn("NSWindowStyleMaskFullSizeContentView", app_delegate)
+        self.assertIn("window.titlebarAppearsTransparent = YES;", app_delegate)
+        self.assertIn("window.titleVisibility = NSWindowTitleHidden;", app_delegate)
+        self.assertIn("window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;", app_delegate)
+        self.assertIn("NSVisualEffectMaterialSidebar", app_delegate)
+        self.assertIn("NSVisualEffectBlendingModeBehindWindow", app_delegate)
+        self.assertIn("[backdrop addSubview:rootView];", app_delegate)
+        self.assertIn("[(id)rootView setBackgroundColor:NSColor.clearColor];", app_delegate)
+        self.assertIn("const BOOL settingsShell = [settingsShellRoutes containsObject:route];", app_delegate)
+        # The material belongs to the window; a per-table backdrop would stack
+        # a second vibrancy layer over only the table's own rows.
+        self.assertNotIn("NSVisualEffectMaterialSidebar", controls)
+        self.assertIn("contentSize: NSSize(width: 960, height: 640)", leaf)
 
     def test_macos_reopen_shows_the_primary_configuration_window(self) -> None:
         app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
@@ -689,6 +733,55 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("native.tray.setStatus(next.service);", ui)
         self.assertNotIn("native.tray.setActions(actions);", ui)
 
+    def test_macos_status_item_left_click_opens_settings_and_right_click_shows_the_menu(self) -> None:
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        # The status item no longer owns a permanent menu: a left click opens
+        # the shared settings window and only a secondary click shows the
+        # service menu.
+        self.assertIn("statusItem.button?.target = self", leaf)
+        self.assertIn("statusItem.button?.action = #selector(statusItemPressed(_:))", leaf)
+        self.assertIn("statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])", leaf)
+        self.assertIn("statusMenu = makeMenu()", leaf)
+        self.assertNotIn("statusItem.menu = makeMenu()", leaf)
+        press = leaf.split("@objc private func statusItemPressed", 1)[1].split("public func menuWillOpen", 1)[0]
+        self.assertIn("event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true", press)
+        self.assertIn("showStatusMenu()", press)
+        self.assertIn('openNamedRoute("providers-models")', press)
+        menu = leaf.split("private func showStatusMenu()", 1)[1].split("public func menuWillOpen", 1)[0]
+        self.assertIn("statusItem.menu = menu", menu)
+        self.assertIn("statusItem.button?.performClick(nil)", menu)
+        close_menu = leaf.split("public func menuDidClose", 1)[1].split("private func addMenuActionItem", 1)[0]
+        self.assertIn("statusItem.menu = nil", close_menu)
+        self.assertIn("statusMenuVisible = false", close_menu)
+
+    def test_native_hosts_expose_app_and_litellm_versions_for_the_about_pane(self) -> None:
+        mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        mac_module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
+        mac_bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
+        win_leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        win_header = (WIN_NATIVE / "WinUI3NativeLeaf.h").read_text(encoding="utf-8")
+        win_module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
+        win_module_header = (WIN_NATIVE / "WinUI3NativeLeafModule.h").read_text(encoding="utf-8")
+
+        self.assertIn("func versionInfo() -> [String: String]", mac_leaf)
+        self.assertIn('appendingPathComponent("Core/runtime/LITELLM_VERSION", isDirectory: false)', mac_leaf)
+        self.assertIn('"litellm": litellm,', mac_leaf)
+        self.assertIn('result["icon"] = "data:image/png;base64," + png.base64EncodedString()', mac_leaf)
+        self.assertIn("func openExternalURL(_ url: String)", mac_leaf)
+        self.assertIn("scheme == \"http\" || scheme == \"https\"", mac_leaf)
+        self.assertIn("@objc(versionInfo:rejecter:)", mac_module)
+        self.assertIn("@objc func openExternalURL(_ url: String)", mac_module)
+        self.assertIn("RCT_EXTERN_METHOD(versionInfo:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)", mac_bridge)
+        self.assertIn("RCT_EXTERN_METHOD(openExternalURL:(NSString *)url)", mac_bridge)
+        self.assertIn("struct VersionInfoResult {", win_header)
+        self.assertIn("VersionInfoResult VersionInfo() const;", win_header)
+        self.assertIn("void OpenExternalURL(std::wstring_view url);", win_header)
+        self.assertIn('L"Core" / L"runtime" / L"LITELLM_VERSION"', win_leaf)
+        self.assertIn('REACT_METHOD(VersionInfo, L"versionInfo");', win_module_header)
+        self.assertIn('REACT_METHOD(OpenExternalURL, L"openExternalURL");', win_module_header)
+        self.assertIn('result["litellm"] = winrt::to_string(info.litellm);', win_module)
+        self.assertIn('ShellExecuteW(nullptr, L"open", command.c_str(), nullptr, nullptr, SW_SHOWNORMAL);', win_leaf)
+
     def test_macos_quit_cancels_startup_and_finishes_off_the_main_thread(self) -> None:
         bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -737,10 +830,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('emitAction("request-close-\\(route)")', leaf)
         self.assertIn("requestClose(route: window.flatMap(routeForWindow), hiding: window)", leaf)
         self.assertIn("request-close-", ui)
-        clean_close = ui.split("if (!needsDiscardConfirmation) {", 1)[1].split("}", 1)[0]
-        self.assertIn("closeRoute();", clean_close)
-        self.assertIn("return;", clean_close)
-        self.assertIn("onPress={requestClose}", ui)
+        # The settings shell owns its window-close path: it flushes the active
+        # pane and closes the shared window without a discard dialog.
+        self.assertIn('if (!nativeAction?.id.startsWith("request-close-") || closing.current) return;', ui)
+        self.assertIn("canClose = await flushActivePane.current?.() ?? true;", ui)
+        self.assertIn("if (!canClose) {", ui)
+        self.assertIn("native.window.focus(windowRoute);", ui)
+        self.assertIn('native.window.close(Platform.OS === "windows" ? pane : windowRoute);', ui)
+        self.assertIn('if (shell) return;', ui)
 
     def test_macos_content_size_bridge_resizes_the_existing_react_window(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -763,7 +860,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             bridge,
         )
 
-    def test_macos_routes_use_independent_react_windows_and_show_dock_only_with_ui(self) -> None:
+    def test_macos_route_windows_share_one_settings_window_and_show_dock_only_with_ui(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         info = (MAC_PROJECT / "LiteLLMMenu-macOS/Info.plist").read_text(encoding="utf-8")
@@ -771,6 +868,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("private var routeWindows: [String: NSWindow] = [:]", leaf)
         self.assertIn("setRouteWindowFactory", leaf)
         self.assertIn("routeWindowFactory?(route, initialLogTab, existing)", leaf)
+        # Every settings pane reuses one registry key; only the provider wizard
+        # is still an independent child window created by the same factory.
+        self.assertIn("private static let settingsPaneRoutes: Set<String> = [", leaf)
+        self.assertIn("private func settingsWindowKey() -> String? {", leaf)
+        self.assertIn("if Self.settingsPaneRoutes.contains(windowRoute),", leaf)
         self.assertIn("NSWindow *existingWindow", app_delegate)
         self.assertIn('self.initialProps = @{ @"isPrimaryHost": @YES, @"isWindowManagerHost": @YES };', app_delegate)
         self.assertIn('@"isPrimaryHost": @NO', app_delegate)
@@ -1053,7 +1155,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('"pending_account"', core_ipc)
         # The providers-window login attaches as a subordinate sheet, so the
         # parent stays blocked until the flow ends.
-        self.assertIn('let sheetParent = embeddedWindow == nil ? routeWindows["providers-models"] : nil', mac_leaf)
+        self.assertIn('let sheetParent = embeddedWindow == nil ? settingsWindow() : nil', mac_leaf)
         self.assertIn('sheetParent.beginSheet(panel, completionHandler: nil)', mac_leaf)
         self.assertIn('panel.sheetParent?.endSheet(panel)', mac_leaf)
         self.assertIn("embedded: true,", wizard_ui)
@@ -1474,7 +1576,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("cell.scrollable = YES", mac)
         self.assertIn("ConfigureSingleLineTextField(_field);", mac)
         self.assertIn("ConfigureSingleLineTextField(_plainField);", mac)
-        self.assertEqual(2, mac.count("[self addCursorRect:self.bounds cursor:[NSCursor IBeamCursor]];"))
+        self.assertEqual(3, mac.count("[self addCursorRect:self.bounds cursor:[NSCursor IBeamCursor]];"))
+        self.assertIn("@interface LiteLLMTabSearchField : NSSearchField", mac)
         self.assertIn("stageSecretForDomain", mac)
         self.assertIn("stageSecretForDomain(", mac_core)
         self.assertIn("PasswordBox password_box_", windows)
@@ -1716,7 +1819,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("column.maxWidth = CGFLOAT_MAX;", controls)
         self.assertIn("const bool rowsChanged = oldViewProps.rowKeys != newViewProps.rowKeys ||", controls)
         self.assertIn("oldViewProps.cells != newViewProps.cells ||", controls)
-        self.assertIn("overflowBehaviorChanged || rowsChanged;", controls)
+        self.assertIn("overflowBehaviorChanged || sourceListChanged || rowsChanged;", controls)
         self.assertNotIn("_dataSignature", controls)
         self.assertNotIn("nextDataSignature", controls)
         self.assertIn("- (void)updateScrollerVisibility", controls)
@@ -1854,14 +1957,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("if (labelsChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", segmented)
         self.assertNotIn("_control.selectedSegment = SegmentIndex(viewProps.labels", segmented)
         self.assertIn("const BOOL titleChanged = oldViewProps.title != newViewProps.title;", button)
-        self.assertIn("if (titleChanged || symbolChanged || linkChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
+        self.assertIn("if (titleChanged || symbolChanged || symbolWithTitleChanged || linkChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", button)
         self.assertIn('symbolName = @"pause.fill";', controls)
         self.assertIn('symbolName = @"play.fill";', controls)
         self.assertIn('symbolName = @"minus";', controls)
         self.assertIn('symbolName = @"trash";', controls)
         self.assertIn('symbolName = @"tray.and.arrow.down";', controls)
         self.assertIn('symbolName = @"arrow.clockwise";', controls)
-        self.assertIn("_button.imagePosition = symbolImage == nil ? NSNoImage : NSImageOnly;", button)
+        self.assertIn("_button.imagePosition = symbolImage == nil\n        ? NSNoImage\n        : (newViewProps.symbolWithTitle ? NSImageLeading : NSImageOnly);", button)
+        self.assertIn('symbolName = @"info.circle";', controls)
 
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         self.assertIn('const auto symbol = props.symbol.value_or("");', windows)

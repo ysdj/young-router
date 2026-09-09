@@ -83,6 +83,9 @@ type NativeModule = {
   systemLocale?: () => string;
   setLaunchAtLogin?: (enabled: boolean) => Promise<boolean>;
   restartCodex?: () => Promise<boolean>;
+  showVersion?: () => void;
+  versionInfo?: () => Promise<{ app: string; litellm: string; icon?: string }>;
+  openExternalURL?: (url: string) => void;
   quit?: () => void;
   setShortcuts?: (shortcuts: Record<string, string>) => void;
 };
@@ -169,6 +172,9 @@ const nativeBridge: NativeLeafBridge = {
     if (!await leaf.setLaunchAtLogin(enabled)) throw new Error("The system could not update the login item.");
   },
   restartCodex: async () => leaf.restartCodex?.() ?? false,
+  showVersion: () => call("showVersion"),
+  versionInfo: leaf.versionInfo ? () => leaf.versionInfo!() : undefined,
+  openExternalURL: (url) => call("openExternalURL", url),
   setLocalization: (strings) => {
     nativeStrings = strings;
     call("setLocalization", strings);

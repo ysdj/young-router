@@ -9,6 +9,7 @@ export interface NativeTextInputProps extends ViewProps {
   placeholder?: string;
   multiline?: WithDefault<boolean, false>;
   secureTextEntry?: WithDefault<boolean, false>;
+  search?: WithDefault<boolean, false>;
   disabled?: WithDefault<boolean, false>;
   keyboardType?: string;
   onChangeText?: DirectEventHandler<ChangeEvent>;

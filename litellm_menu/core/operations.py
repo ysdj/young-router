@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -44,6 +45,8 @@ MAX_OPERATION_OUTPUT_BYTES = 128 * 1024
 MAX_USAGE_ROWS = 100
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
 OWNER_RECORD_VERSION = 2
+# Local proxy port used when no valid preference is configured.
+DEFAULT_LOCAL_PORT = 12389
 OWNER_TOKEN_ENV = "LITELLM_MENU_SERVICE_OWNER_TOKEN"
 CORE_PID_ENV = "LITELLM_MENU_CORE_PID"
 OWNER_TOKEN_BYTES = 32
@@ -113,6 +116,7 @@ class RuntimePaths:
     settings: Path
     pid: Path
     owner: Path
+    port: Path
     autostart: Path
     webdav_enabled: Path
     webdav_status: Path
@@ -132,6 +136,7 @@ class RuntimePaths:
             settings=Path(os.environ.get("LITELLM_MENU_RUNTIME_SETTINGS_FILE", base / "runtime-settings.env")).expanduser(),
             pid=Path(os.environ.get("LITELLM_NATIVE_PID_FILE", runtime / "litellm.pid")).expanduser(),
             owner=Path(os.environ.get("LITELLM_NATIVE_OWNER_FILE", runtime / "litellm.owner")).expanduser(),
+            port=Path(os.environ.get("LITELLM_MENU_PORT_FILE", runtime / "litellm.port")).expanduser(),
             autostart=Path(os.environ.get("LITELLM_AUTOSTART_STATE_FILE", runtime / "autostart.enabled")).expanduser(),
             webdav_enabled=Path(os.environ.get("LITELLM_WEBDAV_SYNC_ENABLED_FILE", runtime / "webdav-sync.enabled")).expanduser(),
             webdav_status=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATUS_FILE", runtime / "webdav-sync-status.json")).expanduser(),
@@ -387,7 +392,7 @@ class CoreServiceController:
         )
 
     def _remove_owner_files(self) -> None:
-        for path in (self.paths.pid, self.paths.owner):
+        for path in (self.paths.pid, self.paths.owner, self.paths.port):
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -581,12 +586,61 @@ class CoreServiceController:
 
     def _configured_port(self, env: Mapping[str, str] | None = None) -> int:
         source = env if env is not None else self._runtime_env(strict=False)
-        value = source.get("LITELLM_PORT", "4000")
+        value = source.get("LITELLM_PORT", DEFAULT_LOCAL_PORT)
         try:
             port = int(value)
         except ValueError:
-            return 4000
-        return port if 1 <= port <= 65535 else 4000
+            return DEFAULT_LOCAL_PORT
+        return port if 1 <= port <= 65535 else DEFAULT_LOCAL_PORT
+
+    def _recorded_port(self) -> int | None:
+        """The port the managed service actually bound, if recorded."""
+
+        try:
+            raw = read_text(self.paths.port)
+        except PersistenceError:
+            return None
+        if raw is None:
+            return None
+        try:
+            port = int(raw.strip())
+        except ValueError:
+            return None
+        return port if 1 <= port <= 65535 else None
+
+    def _effective_port(self) -> int:
+        """Prefer the bound port of the managed service over the preference.
+
+        A configured port that was occupied at start steps forward, so health
+        checks and the reported status must follow the recorded port while the
+        service owns it.
+        """
+
+        if self._read_owner_record() is not None:
+            recorded = self._recorded_port()
+            if recorded is not None:
+                return recorded
+        return self._configured_port()
+
+    @staticmethod
+    def _port_available(port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                return False
+        return True
+
+    def _first_free_port(self, start: int) -> int:
+        """Step forward from the configured port until one can be bound."""
+
+        candidate = start
+        while candidate <= 65535:
+            if self._port_available(candidate):
+                return candidate
+            candidate += 1
+        return start
 
     def _recorded_pid(self) -> int | None:
         try:
@@ -638,7 +692,7 @@ class CoreServiceController:
         return pid
 
     def _health(self, port: int | None = None) -> bool:
-        target_port = self._configured_port() if port is None else port
+        target_port = self._effective_port() if port is None else port
         request = urllib.request.Request(
             f"http://127.0.0.1:{target_port}/health/liveliness",
             headers={"Accept": "application/json", "User-Agent": "LiteLLM-Menu-Core/1"},
@@ -664,7 +718,7 @@ class CoreServiceController:
         (whose health probe times out instead of refusing).
         """
 
-        target_port = self._configured_port() if port is None else port
+        target_port = self._effective_port() if port is None else port
         request = urllib.request.Request(
             f"http://127.0.0.1:{target_port}/health/liveliness",
             headers={"Accept": "application/json", "User-Agent": "LiteLLM-Menu-Core/1"},
@@ -713,7 +767,7 @@ class CoreServiceController:
         if not force and cached is not None and now - cached[0] < SERVICE_STATUS_CACHE_SECONDS:
             return copy.deepcopy(cached[1])
         pid = self._pid()
-        port = self._configured_port()
+        port = self._effective_port()
         healthy = self._health(port)
         if healthy and pid is not None:
             state = "running"
@@ -785,8 +839,6 @@ class CoreServiceController:
             self._stop_process_group(orphaned_pid)
             self._remove_owner_files()
             current = self.status(force=True)
-        if current["state"] == "unknown":
-            raise RuntimeError("The configured LiteLLM port is already in use")
         if current["state"] == "unhealthy":
             raise RuntimeError("A managed LiteLLM service is already active")
         self._stage_runtime_config()
@@ -795,7 +847,11 @@ class CoreServiceController:
         environment = self._runtime_env()
         owner_token = secrets.token_urlsafe(OWNER_TOKEN_BYTES)
         environment[OWNER_TOKEN_ENV] = owner_token
-        port = self._configured_port(environment)
+        # An occupied configured port steps forward to the next free port; the
+        # effective port is recorded beside the owner record so health checks
+        # and the status projection follow the listener that actually started.
+        port = self._first_free_port(self._configured_port(environment))
+        environment["LITELLM_PORT"] = str(port)
         workers = environment.get("LITELLM_NUM_WORKERS", MACOS_DEFAULT_WORKERS if sys.platform == "darwin" else "16")
         launcher = [self.litellm_bin]
         if os.name == "nt" and Path(self.litellm_bin).suffix.lower() in {".cmd", ".bat"}:
@@ -853,6 +909,7 @@ class CoreServiceController:
                 )
             self._write_owner_record(process, owner_token)
             atomic_write_text(self.paths.pid, f"{process.pid}\n")
+            atomic_write_text(self.paths.port, f"{port}\n")
             self._invalidate_status_cache()
         except (OSError, PersistenceError) as exc:
             if "process" in locals():

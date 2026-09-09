@@ -133,6 +133,12 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       bool auto_grouping);
   bool SetLaunchAtLogin(bool enabled);
   void ShowVersion() const;
+  struct VersionInfoResult {
+    std::wstring app;
+    std::wstring litellm;
+  };
+  VersionInfoResult VersionInfo() const;
+  void OpenExternalURL(std::wstring_view url);
   void Quit();
 
  private:
