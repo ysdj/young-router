@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config_editor_core.load import load_config
-from litellm_menu.api_base import isolated_http_opener, service_root
+from young_router.api_base import isolated_http_opener, service_root
 
 
 MAX_TARGETS = 4
@@ -103,11 +103,11 @@ def default_config_path() -> pathlib.Path:
     if configured:
         return pathlib.Path(configured).expanduser()
     root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip() or os.environ.get(
-        "LITELLM_MENU_HOME", ""
+        "YOUNG_ROUTER_HOME", ""
     ).strip()
     if root:
         return pathlib.Path(root).expanduser() / "config.yaml"
-    return pathlib.Path.home() / ".litellm-menu" / "config.yaml"
+    return pathlib.Path.home() / ".young-router" / "config.yaml"
 
 
 def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
@@ -197,7 +197,7 @@ def _fetch_json(
         headers={
             "Accept": "application/json",
             "Authorization": authorization,
-            "User-Agent": "LiteLLM-Menu-Usage/1",
+            "User-Agent": "Young-Router-Usage/1",
         },
         method="GET",
     )

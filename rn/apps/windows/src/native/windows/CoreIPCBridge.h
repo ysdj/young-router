@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 class CoreIPCBridge {
  public:
@@ -159,4 +159,4 @@ class CoreIPCBridge {
   std::thread poll_thread_;
 };
 
-}  // namespace LiteLLMMenu
+}  // namespace YoungRouter

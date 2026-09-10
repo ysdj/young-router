@@ -30,8 +30,8 @@ DEFAULT_PORT = "12389"
 DEFAULT_KEY = "sk-local-litellm"
 LOCAL_MODEL_LIST_TIMEOUT_SECONDS = 1.0
 LOCAL_MODEL_LIST_MAX_BYTES = 512 * 1024
-LITELLM_CODEX_PROVIDER_ID = "litellm-menu"
-LITELLM_CODEX_PROVIDER_NAME = "LiteLLM Menu"
+LITELLM_CODEX_PROVIDER_ID = "young-router"
+LITELLM_CODEX_PROVIDER_NAME = "Young Router"
 # Codex 0.153.x decides whether compaction requests are remote/encrypted from
 # the provider display name: only the exact ``OpenAI`` (or an Azure) name uses
 # encrypted remote Responses compaction, every other name uses the local
@@ -144,12 +144,12 @@ def default_config_path() -> pathlib.Path:
     if configured:
         return pathlib.Path(configured).expanduser()
     root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip() or os.environ.get(
-        "LITELLM_MENU_HOME", ""
+        "YOUNG_ROUTER_HOME", ""
     ).strip()
     return (
         pathlib.Path(root).expanduser() / "config.yaml"
         if root
-        else pathlib.Path.home() / ".litellm-menu" / "config.yaml"
+        else pathlib.Path.home() / ".young-router" / "config.yaml"
     )
 
 
@@ -242,7 +242,7 @@ def _local_exposed_models(api_key: str) -> tuple[list[str], bool]:
     """Read the model IDs LiteLLM currently exposes on its local API.
 
     The configured ``model_list`` is intentionally not a catalog source.  A
-    model becomes selectable in Codex only after the running LiteLLM Menu
+    model becomes selectable in Codex only after the running Young Router
     answers the authenticated ``/v1/models`` request.  Any transport,
     authentication, response-shape, or size failure therefore produces no
     exposed models.
@@ -255,7 +255,7 @@ def _local_exposed_models(api_key: str) -> tuple[list[str], bool]:
         headers={
             "Accept": "application/json",
             "Authorization": f"Bearer {api_key}",
-            "User-Agent": "LiteLLM-Menu-Codex-Settings/1",
+            "User-Agent": "Young-Router-Codex-Settings/1",
         },
         method="GET",
     )
@@ -787,7 +787,7 @@ def configured_models(config: dict[str, Any]) -> list[dict[str, Any]]:
         model = str(entry.get("model_name") or "").strip()
         if not model:
             continue
-        model_enabled = info.get("x-litellm-menu-model-enabled")
+        model_enabled = info.get("x-young-router-model-enabled")
         if not isinstance(model_enabled, bool):
             model_enabled = provider.get("enabled") is not False
         result.append(
@@ -1056,10 +1056,10 @@ def editor_payload(
         "structured": structured_config(config, auth),
         "models": models,
         # ``exposed_models`` is the only source used by the managed Codex
-        # catalog.  It is deliberately empty when LiteLLM Menu is stopped or
+        # catalog.  It is deliberately empty when Young Router is stopped or
         # its authenticated model endpoint is unavailable.
         "exposed_models": exposed_models,
-        "litellm_menu_enabled": menu_enabled,
+        "young_router_enabled": menu_enabled,
         "local_base_url": local_base_url(),
         "local_api_key": local_key,
         "validation_errors": errors,
@@ -1654,7 +1654,7 @@ def apply_structured_patch(
         # compaction support from the provider display name, so the row name
         # selects the compaction protocol used by NEW tasks:
         #
-        # - Default (capability false or unknown): the neutral ``LiteLLM Menu``
+        # - Default (capability false or unknown): the neutral ``Young Router``
         #   name, so Codex picks its local context-checkpoint summary and the
         #   gateway never receives encrypted signed history on an unverified
         #   route.
@@ -1699,7 +1699,7 @@ def apply_structured_patch(
             "openai_auth",
             {},
         )
-        # This provider is routed through LiteLLM Menu. Remove the legacy
+        # This provider is routed through Young Router. Remove the legacy
         # opt-in so Codex emits hosted Responses search through the local
         # gateway instead of calling an unsupported standalone endpoint.
         result = remove_table_value(
@@ -1992,7 +1992,7 @@ def _read_json_stdin() -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Configure Codex through LiteLLM Menu.")
+    parser = argparse.ArgumentParser(description="Configure Codex through Young Router.")
     parser.add_argument("command", choices=("load", "sync", "apply-editor"))
     parser.add_argument("--config", default=str(default_config_path()))
     args = parser.parse_args(argv)

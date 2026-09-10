@@ -7,9 +7,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from litellm_menu.core import CoreIPCClient, CoreIPCServer, CoreStore
-from litellm_menu.core.domains.logs import MAX_VIEW_BYTES, LOG_TABS, LogsDomain
-from litellm_menu.core.service import LOG_TABS as CORE_LOG_TABS
+from young_router.core import CoreIPCClient, CoreIPCServer, CoreStore
+from young_router.core.domains.logs import MAX_VIEW_BYTES, LOG_TABS, LogsDomain
+from young_router.core.service import LOG_TABS as CORE_LOG_TABS
 
 
 class _UsageReader:
@@ -43,7 +43,7 @@ class LogsDomainTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"failed at {root}/config.yaml Bearer {secret}\n",
                 encoding="utf-8",
             )
@@ -64,7 +64,7 @@ class LogsDomainTests(unittest.TestCase):
             token = "synthetic-menu-token"
             password = "synthetic-menu-password"
             api_key = "synthetic-menu-api-key"
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"token={token} password: {password} api_key={api_key} ANTHROPIC_AUTH_TOKEN={token}\n",
                 encoding="utf-8",
             )
@@ -82,7 +82,7 @@ class LogsDomainTests(unittest.TestCase):
     def test_service_log_removes_console_color_control_sequences(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 "[2026-08-01T04:10:11Z] \x1b[92mLiteLLM Proxy:WARNING\x1b[0m: safe detail\n",
                 encoding="utf-8",
             )
@@ -103,7 +103,7 @@ class LogsDomainTests(unittest.TestCase):
                 "provider": "example-provider",
                 "status": "ok",
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"[2026-08-01T04:10:11Z] litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -118,9 +118,9 @@ class LogsDomainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = root / "runtime-settings.env"
-            settings.write_text("LITELLM_MENU_LOG_VIEW_LIMIT=2\n", encoding="utf-8")
-            previous = root / "menu-server.log.1"
-            current = root / "menu-server.log"
+            settings.write_text("YOUNG_ROUTER_LOG_VIEW_LIMIT=2\n", encoding="utf-8")
+            previous = root / "server.log.1"
+            current = root / "server.log"
             older = {
                 "timestamp": "2026-08-01T04:10:11Z",
                 "event": "selected_deployment",
@@ -157,8 +157,8 @@ class LogsDomainTests(unittest.TestCase):
     def test_cleared_route_trace_does_not_restore_previous_segment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            previous = root / "menu-server.log.1"
-            current = root / "menu-server.log"
+            previous = root / "server.log.1"
+            current = root / "server.log"
             previous.write_text(
                 "litellm_route_trace "
                 + json.dumps(
@@ -228,7 +228,7 @@ class LogsDomainTests(unittest.TestCase):
                     },
                 },
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"[2026-08-01T04:10:11Z] litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -276,7 +276,7 @@ model_list:
                     "model": "openai/upstream-chat",
                 },
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -302,7 +302,7 @@ model_list:
                     "reason": "upstream-status-504",
                 },
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -330,7 +330,7 @@ model_list:
                     {"api_base": "https://other.example/v1"},
                 ],
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -359,7 +359,7 @@ model_list:
                     },
                 },
             ]
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 "\n".join(
                     f"litellm_route_trace {json.dumps(record)}" for record in records
                 ) + "\n",
@@ -386,7 +386,7 @@ model_list:
                     {"api_base": "https://other.example/v1"},
                 ],
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -424,7 +424,7 @@ model_list:
                     "exception": {"reason": "upstream-network-connectivity"},
                 },
             ]
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 "\n".join(
                     f"litellm_route_trace {json.dumps(record)}" for record in records
                 ) + "\n",
@@ -457,7 +457,7 @@ model_list:
                     },
                 },
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -482,7 +482,7 @@ model_list:
                 )
                 for index in range(3000)
             ]
-            (root / "menu-server.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            (root / "server.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
             view = LogsDomain(root).view("route-trace")
             encoded = json.dumps(view, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -711,7 +711,7 @@ model_list:
     def test_service_log_omits_litellm_banner_noise(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 "\n".join(
                     [
                         "[2026-08-01T04:10:11Z] #----------------------#",
@@ -731,7 +731,7 @@ model_list:
     def test_service_traceback_lines_are_one_selectable_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 "\n".join(
                     [
                         "[2026-08-01T04:10:12Z] INFO: Traceback (most recent call last):",
@@ -873,7 +873,7 @@ model_list:
                     {"id": "deployment-c", "provider": "provider-c", "model": "openai/three", "order": 3},
                 ],
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -900,7 +900,7 @@ model_list:
                     ),
                 },
             }
-            (root / "menu-server.log").write_text(
+            (root / "server.log").write_text(
                 f"litellm_route_trace {json.dumps(payload)}\n",
                 encoding="utf-8",
             )
@@ -914,16 +914,16 @@ model_list:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = root / "runtime-settings.env"
-            (root / "menu-actions.log").write_text(
+            (root / "actions.log").write_text(
                 "\n".join(f"line-{index}" for index in range(150)) + "\n",
                 encoding="utf-8",
             )
             domain = LogsDomain(root, runtime_settings_path=settings)
 
-            self.assertEqual(10_000, domain.view("menu")["log"]["limit"])
-            settings.write_text("LITELLM_MENU_LOG_VIEW_LIMIT=100\n", encoding="utf-8")
+            self.assertEqual(10_000, domain.view("actions")["log"]["limit"])
+            settings.write_text("YOUNG_ROUTER_LOG_VIEW_LIMIT=100\n", encoding="utf-8")
 
-            tab = domain.view("menu")["log"]
+            tab = domain.view("actions")["log"]
             self.assertEqual(100, tab["limit"])
             self.assertEqual(100, tab["line_count"])
 
@@ -1119,9 +1119,9 @@ model_list:
             )
             domain = LogsDomain(root)
 
-            with mock.patch("litellm_menu.core.domains.logs.time.time", return_value=now):
+            with mock.patch("young_router.core.domains.logs.time.time", return_value=now):
                 first = domain.view("recovery")
-            with mock.patch("litellm_menu.core.domains.logs.time.time", return_value=now + 1):
+            with mock.patch("young_router.core.domains.logs.time.time", return_value=now + 1):
                 second = domain.view("recovery", known_revision=first["revision"])
 
             self.assertEqual("cooldown=61s", first["log"]["records"][0]["detail"])
@@ -1230,36 +1230,36 @@ model_list:
     def test_pause_filter_clear_and_resume_are_view_operations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "menu-actions.log"
+            source = root / "actions.log"
             source.write_text("first action\nsecond action\n", encoding="utf-8")
             domain = LogsDomain(root)
 
-            domain.dispatch("logs.set_filter", {"tab": "menu", "filter": "second"})
-            self.assertEqual(1, domain.view("menu")["log"]["line_count"])
-            domain.dispatch("logs.pause", {"tab": "menu"})
-            self.assertTrue(domain.view("menu")["log"]["paused"])
-            domain.dispatch("logs.clear", {"tab": "menu"})
-            self.assertEqual(0, domain.view("menu")["log"]["line_count"])
+            domain.dispatch("logs.set_filter", {"tab": "actions", "filter": "second"})
+            self.assertEqual(1, domain.view("actions")["log"]["line_count"])
+            domain.dispatch("logs.pause", {"tab": "actions"})
+            self.assertTrue(domain.view("actions")["log"]["paused"])
+            domain.dispatch("logs.clear", {"tab": "actions"})
+            self.assertEqual(0, domain.view("actions")["log"]["line_count"])
             self.assertTrue(source.exists())
-            domain.dispatch("logs.resume", {"tab": "menu"})
-            self.assertEqual(1, domain.view("menu")["log"]["line_count"])
+            domain.dispatch("logs.resume", {"tab": "actions"})
+            self.assertEqual(1, domain.view("actions")["log"]["line_count"])
 
     def test_clear_while_playing_reveals_only_new_lines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "menu-actions.log"
+            source = root / "actions.log"
             source.write_text("first action\nsecond action\n", encoding="utf-8")
             domain = LogsDomain(root)
 
-            self.assertEqual(2, domain.view("menu")["log"]["line_count"])
-            domain.dispatch("logs.clear", {"tab": "menu"})
-            self.assertEqual(0, domain.view("menu")["log"]["line_count"])
+            self.assertEqual(2, domain.view("actions")["log"]["line_count"])
+            domain.dispatch("logs.clear", {"tab": "actions"})
+            self.assertEqual(0, domain.view("actions")["log"]["line_count"])
             domain.dispatch(
                 "logs.record_menu_action",
-                {"tab": "menu", "menu_action": "open-logs"},
+                {"tab": "actions", "menu_action": "open-logs"},
             )
 
-            view = domain.view("menu")["log"]
+            view = domain.view("actions")["log"]
             self.assertEqual(1, view["line_count"])
             self.assertTrue(view["records"][0].endswith("open-logs"))
 
@@ -1269,9 +1269,9 @@ model_list:
 
             domain.dispatch(
                 "logs.record_menu_action",
-                {"tab": "menu", "menu_action": "open-logs"},
+                {"tab": "actions", "menu_action": "open-logs"},
             )
-            record = domain.view("menu")["log"]["records"][-1]
+            record = domain.view("actions")["log"]["records"][-1]
 
             self.assertRegex(record, r"^\[\d{4}-\d{2}-\d{2}T.*Z\] \[INFO\] open-logs$")
 
@@ -1279,7 +1279,7 @@ model_list:
                 with self.assertRaisesRegex(ValueError, "Menu action is invalid"):
                     domain.dispatch(
                         "logs.record_menu_action",
-                        {"tab": "menu", "menu_action": removed_or_invalid_action},
+                        {"tab": "actions", "menu_action": removed_or_invalid_action},
                     )
 
     def test_menu_action_recording_is_not_a_configuration_draft(self) -> None:
@@ -1290,7 +1290,7 @@ model_list:
                 {
                     "domain": "logs",
                     "type": "logs.record_menu_action",
-                    "payload": {"tab": "menu", "menu_action": "open-logs"},
+                    "payload": {"tab": "actions", "menu_action": "open-logs"},
                 }
             )
 
@@ -1299,11 +1299,11 @@ model_list:
     def test_line_limit_is_bounded_and_changes_the_projected_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "menu-actions.log").write_text("one\ntwo\nthree\n", encoding="utf-8")
+            (root / "actions.log").write_text("one\ntwo\nthree\n", encoding="utf-8")
             domain = LogsDomain(root)
 
-            domain.dispatch("logs.set_limit", {"tab": "menu", "limit": 2})
-            tab = domain.view("menu")["log"]
+            domain.dispatch("logs.set_limit", {"tab": "actions", "limit": 2})
+            tab = domain.view("actions")["log"]
 
             self.assertEqual(2, tab["limit"])
             self.assertEqual(["two", "three"], tab["records"])
@@ -1311,10 +1311,10 @@ model_list:
     def test_core_snapshot_projects_domain_records_to_the_typed_log_map(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "menu-actions.log").write_text("safe action\n", encoding="utf-8")
+            (root / "actions.log").write_text("safe action\n", encoding="utf-8")
             core = CoreStore(domains=[LogsDomain(root)])
 
-            tab = core.log_view("menu")["log"]
+            tab = core.log_view("actions")["log"]
 
             self.assertTrue(tab["available"])
             self.assertEqual(["safe action"], tab["records"])
@@ -1322,7 +1322,7 @@ model_list:
     def test_global_snapshot_does_not_read_or_carry_log_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "menu-server.log").write_text("safe line\n", encoding="utf-8")
+            (root / "server.log").write_text("safe line\n", encoding="utf-8")
             domain = LogsDomain(root)
             core = CoreStore(domains=[domain])
 
@@ -1335,12 +1335,12 @@ model_list:
     def test_unchanged_log_view_returns_only_its_revision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "menu-actions.log").write_text("safe action\n", encoding="utf-8")
+            (root / "actions.log").write_text("safe action\n", encoding="utf-8")
             domain = LogsDomain(root)
 
-            first = domain.view("menu")
+            first = domain.view("actions")
             with mock.patch.object(domain, "_read_lines", side_effect=AssertionError("unexpected repeat read")):
-                second = domain.view("menu", first["revision"])
+                second = domain.view("actions", first["revision"])
 
             self.assertFalse(second["changed"])
             self.assertIsNone(second["log"])
@@ -1348,7 +1348,7 @@ model_list:
     def test_ipc_log_view_is_separate_and_revision_conditional(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "menu-actions.log").write_text("safe action\n", encoding="utf-8")
+            (root / "actions.log").write_text("safe action\n", encoding="utf-8")
             core = CoreStore(domains=[LogsDomain(root)])
             server = CoreIPCServer(core)
             endpoint = server.start()
@@ -1357,10 +1357,10 @@ model_list:
             self.addCleanup(client.close)
 
             snapshot = client.call("snapshot")["snapshot"]
-            first = client.call("logs", {"tab": "menu"})
-            second = client.call("logs", {"tab": "menu", "revision": first["revision"]})
+            first = client.call("logs", {"tab": "actions"})
+            second = client.call("logs", {"tab": "actions", "revision": first["revision"]})
 
-            self.assertNotIn("records", snapshot["logs"]["menu"])
+            self.assertNotIn("records", snapshot["logs"]["actions"])
             self.assertEqual(["safe action"], first["log"]["records"])
             self.assertFalse(second["changed"])
             self.assertIsNone(second["log"])

@@ -27,7 +27,7 @@
 #include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 namespace {
 
 namespace json = winrt::Windows::Data::Json;
@@ -39,9 +39,9 @@ constexpr size_t kMaxSessionBytes = 96 * 1024;
 constexpr size_t kMaxPasswordBytes = 4096;
 constexpr size_t kCredentialChunkBytes = 2400;
 constexpr size_t kMaxCredentialChunks = 48;
-constexpr wchar_t kCredentialRoot[] = L"LiteLLM Menu/relay/";
+constexpr wchar_t kCredentialRoot[] = L"Young Router/relay/";
 constexpr wchar_t kImmediateWebPresentationScript[] = LR"JS((() => {
-  const styleID = '__litellm_menu_immediate_presentation';
+  const styleID = '__young_router_immediate_presentation';
   const gradientPattern = /gradient[(]/i;
   const imageProperties = ['background-image', 'border-image-source', 'mask-image'];
   const splitImageLayers = (value) => {
@@ -475,7 +475,7 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
   if (cookie_header.find_first_of("\r\n") != std::string::npos ||
       (captured_access && captured_access->find_first_of("\r\n") != std::string::npos)) return std::nullopt;
   auto session = WinHttpHandle(WinHttpOpen(
-      L"LiteLLM-Menu/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+      L"Young-Router/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
   if (!session) return std::nullopt;
   WinHttpSetTimeouts(session.get(), 12000, 12000, 12000, 12000);
@@ -615,7 +615,7 @@ std::wstring WebViewDataFolder() {
   if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &folder)) || folder == nullptr) return {};
   std::filesystem::path path(folder);
   CoTaskMemFree(folder);
-  path /= L"LiteLLM Menu";
+  path /= L"Young Router";
   path /= L"WebView2";
   std::error_code error;
   std::filesystem::create_directories(path, error);
@@ -1318,4 +1318,4 @@ bool ClearWindowsRelayCredentials(std::string const& account_id) {
   return password && session;
 }
 
-}  // namespace LiteLLMMenu
+}  // namespace YoungRouter

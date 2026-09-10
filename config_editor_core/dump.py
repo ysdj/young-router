@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from litellm_menu.api_base import normalize_configured_api_base
+from young_router.api_base import normalize_configured_api_base
 
 from .schema import (
     DEFAULT_API_KEY_NAME,

@@ -6,25 +6,25 @@ from hook_test_utils import *
 class HookDshVisionRouterTests(HookTestCase):
     def _clear_dsh_runtime_overrides(self) -> None:
         for key in (
-            "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
-            "LITELLM_MENU_VISION_ROUTER_CONFIG_JSON",
-            "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED",
-            "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND",
-            "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK",
-            "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
-            "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS",
-            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
-            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
+            "YOUNG_ROUTER_VISION_ROUTER_CONFIG_JSON",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_FREE_FALLBACK",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
         ):
             self.set_env(key, None)
 
     def test_dsh_quick_options_override_matching_json_fields(self) -> None:
         hooks, _ = load_hook_module()
-        from litellm_menu import dsh_vision_router as router
+        from young_router import dsh_vision_router as router
 
         self._clear_dsh_runtime_overrides()
         self.set_env(
-            "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
             json.dumps(
                 {
                     "enabled": True,
@@ -47,12 +47,12 @@ class HookDshVisionRouterTests(HookTestCase):
                 }
             ),
         )
-        self.set_env("LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", "0")
-        self.set_env("LITELLM_MENU_DSH_VISION_ROUTER_BACKEND", "auto")
-        self.set_env("LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK", "0")
-        self.set_env("LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "17")
-        self.set_env("LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS", "123")
-        self.set_env("LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "1")
+        self.set_env("YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED", "0")
+        self.set_env("YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND", "auto")
+        self.set_env("YOUNG_ROUTER_DSH_VISION_ROUTER_FREE_FALLBACK", "0")
+        self.set_env("YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "17")
+        self.set_env("YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS", "123")
+        self.set_env("YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "1")
 
         self.assertFalse(router._router_enabled())
         self.assertEqual("auto", router._router_backend())
@@ -68,11 +68,11 @@ class HookDshVisionRouterTests(HookTestCase):
 
     def test_dsh_json_http_provider_options_are_materialized_without_secrets(self) -> None:
         hooks, _ = load_hook_module()
-        from litellm_menu import dsh_vision_router as router
+        from young_router import dsh_vision_router as router
 
         self._clear_dsh_runtime_overrides()
         self.set_env(
-            "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
             json.dumps(
                 {
                     "enabled": True,
@@ -112,10 +112,10 @@ class HookDshVisionRouterTests(HookTestCase):
         )
 
     def test_explicit_auto_quick_backend_does_not_restore_retired_provider(self) -> None:
-        from litellm_menu import dsh_vision_router as router
+        from young_router import dsh_vision_router as router
 
         self._clear_dsh_runtime_overrides()
-        self.set_env("LITELLM_MENU_DSH_VISION_ROUTER_BACKEND", "auto")
+        self.set_env("YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND", "auto")
 
         providers = router._configured_provider_chain()
 
@@ -124,20 +124,20 @@ class HookDshVisionRouterTests(HookTestCase):
 
     def test_local_helper_uses_portable_core_path_and_explicit_override(self) -> None:
         hooks, _ = load_hook_module()
-        self.set_env("LITELLM_MENU_CORE_ROOT", "/tmp/synthetic-core")
-        self.set_env("LITELLM_MENU_VISION_HELPER", None)
+        self.set_env("YOUNG_ROUTER_CORE_ROOT", "/tmp/synthetic-core")
+        self.set_env("YOUNG_ROUTER_VISION_HELPER", None)
         self.assertEqual(
             hooks._vision_helper_source(),
             Path("/tmp/synthetic-core/bin/vision_ocr"),
         )
 
-        self.set_env("LITELLM_MENU_VISION_HELPER", "/tmp/synthetic-helper")
+        self.set_env("YOUNG_ROUTER_VISION_HELPER", "/tmp/synthetic-helper")
         self.assertEqual(hooks._vision_helper_source(), Path("/tmp/synthetic-helper"))
 
     async def test_local_backend_reads_data_url_without_api(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(
-            "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
             json.dumps({"backend": "local", "localFormat": "compact"}),
         )
 
@@ -172,7 +172,7 @@ class HookDshVisionRouterTests(HookTestCase):
     async def test_local_backend_detailed_format_is_preserved(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(
-            "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
             json.dumps({"backend": "local", "localFormat": "detailed"}),
         )
 
@@ -204,7 +204,7 @@ class HookDshVisionRouterTests(HookTestCase):
     async def test_auto_backend_falls_back_to_local_when_api_fails(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(
-            "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
             json.dumps({"backend": "auto"}),
         )
 

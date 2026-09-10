@@ -15,39 +15,39 @@ class ReactNativeReleaseTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertNotIn("LITELLM_MENU_AUTO_BUILD", test_script)
+        self.assertNotIn("YOUNG_ROUTER_AUTO_BUILD", test_script)
         self.assertNotIn("build-and-install-macos.sh", test_script)
-        self.assertIn("LITELLM_MENU_MACOS_OUTPUT", installer)
-        self.assertIn("/Applications/LiteLLM Menu.app", installer)
+        self.assertIn("YOUNG_ROUTER_MACOS_OUTPUT", installer)
+        self.assertIn("/Applications/Young Router.app", installer)
         self.assertIn("codesign --verify --deep --strict", installer)
-        self.assertIn(".LiteLLMMenu.previous", installer)
+        self.assertIn(".YoungRouter.previous", installer)
         self.assertIn('INSTALL_COMPLETE=1', installer)
         self.assertIn('RESTART_ARMED=0', installer)
         self.assertIn('RESTART_ARMED=1', installer)
         self.assertIn('[[ -n "$(installed_pids)" ]] || open -g "$DESTINATION"', installer)
         self.assertNotIn("open -n", installer)
-        self.assertNotIn('tell application id "menu.litellm.menu" to quit', installer)
+        self.assertNotIn('tell application id "young.router.app" to quit', installer)
         self.assertIn("stop_installed_app", installer)
         self.assertIn("pids_are_alive()", installer)
         self.assertIn('kill -TERM "$pid"', installer)
         self.assertIn('while pids_are_alive "$bundle_pids"; do', installer)
         self.assertIn('done <<<"$bundle_pids"', installer)
-        self.assertIn('line ~ /\\/LiteLLM ?Menu[^\\/]*\\.app\\/Contents\\/MacOS\\/LiteLLMMenu$/', installer)
-        self.assertIn('*/LiteLLM*Menu*.app/Contents/MacOS/LiteLLMMenu', installer)
-        self.assertIn('START_TIMEOUT_SECONDS="${LITELLM_MENU_START_TIMEOUT_SECONDS:-70}"', installer)
-        self.assertIn('STOP_TIMEOUT_SECONDS="${LITELLM_MENU_STOP_TIMEOUT_SECONDS:-20}"', installer)
+        self.assertIn('line ~ /\\/Young ?Router[^\\/]*\\.app\\/Contents\\/MacOS\\/YoungRouter$/', installer)
+        self.assertIn('*/Young*Router*.app/Contents/MacOS/YoungRouter', installer)
+        self.assertIn('START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"', installer)
+        self.assertIn('STOP_TIMEOUT_SECONDS="${YOUNG_ROUTER_STOP_TIMEOUT_SECONDS:-20}"', installer)
         self.assertIn('STOP_GRACE_POLLS=20', installer)
         self.assertIn('REQUIRED_HEALTH_CHECKS=3', installer)
         self.assertIn('LAUNCH_RETRY_SECONDS=1', installer)
         self.assertNotIn("preserved_proxy_port", installer)
         self.assertNotIn("refuse_running_install", installer)
-        build_replacement = installer.index('LITELLM_MENU_MACOS_OUTPUT="$STAGED_APP"')
+        build_replacement = installer.index('YOUNG_ROUTER_MACOS_OUTPUT="$STAGED_APP"')
         self.assertIn('kill -KILL "$pid"', installer)
         self.assertLess(installer.index('kill -TERM "$pid"'), installer.index('kill -KILL "$pid"'))
         self.assertIn('start_installed_app "$OLD_PIDS"', installer)
         self.assertIn('curl --fail --silent --show-error --max-time 1', installer)
         self.assertIn('health/liveliness', installer)
-        self.assertIn(' -m litellm_menu.macos_proxy ', installer)
+        self.assertIn(' -m young_router.macos_proxy ', installer)
         self.assertIn('stable_checks >= REQUIRED_HEALTH_CHECKS', installer)
         self.assertIn('restore_previous_app', installer)
         self.assertIn("copy_tree()", installer)
@@ -60,14 +60,14 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn('sleep 1', installer)
         self.assertNotIn('codesign --verify --deep --strict --verbose=2 "$DESTINATION"', installer)
         self.assertIn('INSTALLED_RUNTIME="$DESTINATION/Contents/Resources/Core/runtime"', installer)
-        self.assertIn('export LITELLM_MENU_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"', installer)
+        self.assertIn('export YOUNG_ROUTER_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"', installer)
         self.assertIn('"$INSTALLED_RUNTIME/LITELLM_VERSION"', installer)
-        self.assertIn("/Applications/LiteLLM Menu.app/Contents/Resources/Core/runtime/bin/python}", test_script)
+        self.assertIn("/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}", test_script)
         self.assertIn("export PYTHONDONTWRITEBYTECODE=1", test_script)
 
         staged_copy = installer.index('copy_tree "$STAGED_APP" "$INSTALL_STAGE"')
         select_installed_runtime = installer.index(
-            'export LITELLM_MENU_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"'
+            'export YOUNG_ROUTER_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"'
         )
         replace_previous = installer.index('mv "$DESTINATION" "$PREVIOUS_APP"')
         install_replacement = installer.index('if ! mv "$INSTALL_STAGE" "$DESTINATION"; then')
@@ -92,7 +92,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('if ! stop_installed_app "$OLD_PIDS"; then', installer)
         self.assertIn('REMAINING_OLD_PIDS="$(bundle_processes)"', installer)
         self.assertIn('if [[ -n "$REMAINING_OLD_PIDS" ]] && ! stop_installed_app "$REMAINING_OLD_PIDS"; then', installer)
-        self.assertIn("The old LiteLLM Menu app did not stop; restoring the previous bundle.", installer)
+        self.assertIn("The old Young Router app did not stop; restoring the previous bundle.", installer)
         self.assertLess(start_replacement, delete_previous)
         self.assertLess(delete_previous, mark_complete)
 
@@ -122,17 +122,17 @@ class ReactNativeReleaseTests(unittest.TestCase):
         script = (ROOT / "scripts" / "package-release.sh").read_text(encoding="utf-8")
 
         self.assertIn("pnpm run build:macos", script)
-        self.assertIn("LITELLM_MENU_MACOS_OUTPUT", script)
-        self.assertIn("LITELLM_MENU_RESET_METRO_CACHE=1", script)
+        self.assertIn("YOUNG_ROUTER_MACOS_OUTPUT", script)
+        self.assertIn("YOUNG_ROUTER_RESET_METRO_CACHE=1", script)
         self.assertIn("export LITELLM_LOCAL_MODEL_COST_MAP=true", script)
         self.assertIn("runtime/bin/python", script)
         self.assertIn('test -x "$CORE/bin/vision_ocr"', script)
         self.assertIn("Core/bin/vision_ocr", script)
         self.assertIn('test -f "$CORE/sitecustomize.py"', script)
         self.assertIn("RELOCATED_CORE", script)
-        self.assertIn("LITELLM_MENU_PROXY_PROCESS=1", script)
+        self.assertIn("YOUNG_ROUTER_PROXY_PROCESS=1", script)
         self.assertIn("image_generation_routing_hook", script)
-        self.assertIn("-m litellm_menu.core --help", script)
+        self.assertIn("-m young_router.core --help", script)
         self.assertIn("archive-list.txt", script)
         self.assertIn("Resources/Core/(\\.venv|venv)", script)
         self.assertNotIn("mac_menu/build.sh", script)
@@ -156,7 +156,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertLess(installer_update, installer.index('INSTALLED_RUNTIME="$DESTINATION'))
         self.assertLess(
             installer_update,
-            installer.index('LITELLM_MENU_MACOS_OUTPUT="$STAGED_APP"'),
+            installer.index('YOUNG_ROUTER_MACOS_OUTPUT="$STAGED_APP"'),
         )
 
         macos_update = macos.index('"$PROJECT_ROOT/scripts/update-litellm.sh"')
@@ -174,7 +174,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
 
         self.assertIn("pnpm run build:macos", workflow)
         self.assertIn("pnpm run build:windows", workflow)
-        self.assertIn("LITELLM_MENU_REFRESH_PODS", workflow)
+        self.assertIn("YOUNG_ROUTER_REFRESH_PODS", workflow)
         self.assertIn("node scripts/bootstrap-rnmacos-085.mjs", workflow)
         self.assertIn('test -f "$APP/Contents/Resources/Core/sitecustomize.py"', workflow)
         self.assertIn("image_generation_routing_hook", workflow)
@@ -216,7 +216,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         bootstrap = (ROOT / "rn/scripts/bootstrap-rnmacos-085.mjs").read_text(
             encoding="utf-8"
         )
-        self.assertIn("LITELLM_MENU_REFRESH_RN_VENDOR", bootstrap)
+        self.assertIn("YOUNG_ROUTER_REFRESH_RN_VENDOR", bootstrap)
         self.assertIn("Reusing verified react-native-macos vendor dependencies.", bootstrap)
         self.assertIn("yarnRelease, 'install', '--immutable'", bootstrap)
         package = json.loads((ROOT / "rn/package.json").read_text(encoding="utf-8"))
@@ -229,10 +229,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn("pnpm run build &", script)
         self.assertIn("STATIC_CHECKS_PID=$!", script)
         self.assertIn('wait "$STATIC_CHECKS_PID"', script)
-        self.assertIn("LITELLM_MENU_REFRESH_PODS", script)
+        self.assertIn("YOUNG_ROUTER_REFRESH_PODS", script)
         self.assertIn("Reusing CocoaPods workspace", script)
         self.assertIn('! -d "$APP_ROOT/macos/Pods"', script)
-        self.assertIn('! -d "$APP_ROOT/macos/LiteLLMMenu.xcworkspace"', script)
+        self.assertIn('! -d "$APP_ROOT/macos/YoungRouter.xcworkspace"', script)
         self.assertLess(
             script.index("pnpm run check:macos &"),
             script.index('pod install --project-directory="$APP_ROOT/macos"'),
@@ -258,7 +258,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("xcrun --sdk macosx --find swiftc", script)
         self.assertIn("xcrun --sdk macosx --show-sdk-path", script)
         self.assertIn('-sdk "$MACOS_SDK"', script)
-        self.assertIn("LITELLM_MENU_PROXY_PROCESS=1", script)
+        self.assertIn("YOUNG_ROUTER_PROXY_PROCESS=1", script)
         self.assertIn("image_generation_routing_hook", script)
         self.assertIn("strip -x -S", script)
         self.assertIn("case \"$(file -b \"$binary\")\"", script)
@@ -288,7 +288,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotIn('service/runtime_settings.sh', script)
 
         runtime_io = (ROOT / "runtime_settings_io.py").read_text(encoding="utf-8")
-        runtime_schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
+        runtime_schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         self.assertIn("runtime_settings_metadata", runtime_io)
         self.assertNotIn(' / "service" / ', runtime_io)
         self.assertIn("RUNTIME_SETTINGS_SCHEMA", runtime_schema)
@@ -299,7 +299,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("ENV['HERMES_COMMIT']", podfile)
 
         project = (
-            ROOT / "rn/apps/macos/macos/LiteLLMMenu.xcodeproj/project.pbxproj"
+            ROOT / "rn/apps/macos/macos/YoungRouter.xcodeproj/project.pbxproj"
         ).read_text(encoding="utf-8")
         release_target = project[
             project.index("5142015C2437B4B40078DB4F /* Release */"):project.index(
@@ -312,7 +312,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         )
         self.assertIn('export CLI_PATH=\\"${PROJECT_DIR}/../../../scripts/bundle-macos.mjs\\"', project)
         self.assertNotIn("EXTRA_PACKAGER_ARGS", project)
-        self.assertIn("process.env.LITELLM_MENU_RESET_METRO_CACHE === '1'", bundle_wrapper)
+        self.assertIn("process.env.YOUNG_ROUTER_RESET_METRO_CACHE === '1'", bundle_wrapper)
         self.assertIn("process.env.CI", bundle_wrapper)
         self.assertIn("arg !== '--reset-cache'", bundle_wrapper)
         self.assertIn("scripts/bundle.js", bundle_wrapper)
@@ -328,7 +328,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("scripts\\update_litellm.py", script)
         self.assertIn("RunCodegenWindows=false", script)
         self.assertIn('"sitecustomize.py"', script)
-        self.assertIn("LITELLM_MENU_PROXY_PROCESS", script)
+        self.assertIn("YOUNG_ROUTER_PROXY_PROCESS", script)
         self.assertIn("image_generation_routing_hook", script)
 
     def test_macos_metro_config_keeps_the_macos_bundle_platform(self) -> None:

@@ -38,7 +38,7 @@ class VersionPaths:
                 / "apps"
                 / "macos"
                 / "macos"
-                / "LiteLLMMenu-macOS"
+                / "YoungRouter-macOS"
                 / "Info.plist"
             ),
             rn_macos_project=(
@@ -47,7 +47,7 @@ class VersionPaths:
                 / "apps"
                 / "macos"
                 / "macos"
-                / "LiteLLMMenu.xcodeproj"
+                / "YoungRouter.xcodeproj"
                 / "project.pbxproj"
             ),
             windows_manifests=(
@@ -56,17 +56,17 @@ class VersionPaths:
                 / "apps"
                 / "windows"
                 / "windows"
-                / "LiteLLMMenu"
+                / "YoungRouter"
                 / "Package.appxmanifest",
                 root
                 / "rn"
                 / "apps"
                 / "windows"
                 / "windows"
-                / "LiteLLMMenu.Package"
+                / "YoungRouter.Package"
                 / "Package.appxmanifest",
             ),
-            cask_file=root / "Casks" / "litellm-menu.rb",
+            cask_file=root / "Casks" / "young-router.rb",
         )
 
 
@@ -283,7 +283,7 @@ def show(paths: VersionPaths, as_json: bool = False) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage LiteLLM Menu app version metadata.")
+    parser = argparse.ArgumentParser(description="Manage Young Router app version metadata.")
     parser.add_argument(
         "--root",
         type=Path,

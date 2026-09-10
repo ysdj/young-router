@@ -459,13 +459,13 @@ class HookPatchTests(HookTestCase):
             "call_type": "aresponses",
             "model": "kimi-k3",
             "input": "weather",
-            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_young_router_upstream_url_surface": "openai/responses",
         }
 
         hooks._remember_selected_deployment_for_request(request_kwargs, deployment)
 
         self.assertEqual(
-            request_kwargs["_litellm_menu_upstream_url_surface"], "anthropic"
+            request_kwargs["_young_router_upstream_url_surface"], "anthropic"
         )
         self.assertEqual(
             request_kwargs["model_info"]["upstream_url_surface"], "anthropic"
@@ -2672,7 +2672,7 @@ class HookPatchTests(HookTestCase):
             {
                 "call_type": "aresponses",
                 "model": "default-chat",
-                "_litellm_menu_upstream_url_surface": "openai/responses",
+                "_young_router_upstream_url_surface": "openai/responses",
                 "model_info": {
                     "id": "dual-route",
                     "upstream_url_surface": "openai/responses",
@@ -2684,14 +2684,14 @@ class HookPatchTests(HookTestCase):
             "default-chat",
             request_kwargs={
                 "model": "default-chat",
-                "_litellm_menu_upstream_url_surface": "openai/responses",
+                "_young_router_upstream_url_surface": "openai/responses",
             },
         )
         chat = Router().get_available_deployment(
             "default-chat",
             request_kwargs={
                 "model": "default-chat",
-                "_litellm_menu_upstream_url_surface": "openai/chat",
+                "_young_router_upstream_url_surface": "openai/chat",
             },
         )
 

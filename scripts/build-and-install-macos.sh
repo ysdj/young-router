@@ -2,11 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DESTINATION="${LITELLM_MENU_INSTALL_APP:-/Applications/LiteLLM Menu.app}"
+DESTINATION="${YOUNG_ROUTER_INSTALL_APP:-/Applications/Young Router.app}"
 DEVELOPER_DIR="${DEVELOPER_DIR:-}"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/litellm-menu-install.XXXXXX")"
-STAGED_APP="$STAGE_ROOT/LiteLLM Menu.app"
+STAGE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/young-router-install.XXXXXX")"
+STAGED_APP="$STAGE_ROOT/Young Router.app"
 INSTALL_STAGE=""
 PREVIOUS_APP=""
 FAILED_APP=""
@@ -14,8 +14,8 @@ INSTALL_COMPLETE=0
 RESTART_ARMED=0
 OLD_PIDS=""
 NEW_PIDS=""
-START_TIMEOUT_SECONDS="${LITELLM_MENU_START_TIMEOUT_SECONDS:-70}"
-STOP_TIMEOUT_SECONDS="${LITELLM_MENU_STOP_TIMEOUT_SECONDS:-20}"
+START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"
+STOP_TIMEOUT_SECONDS="${YOUNG_ROUTER_STOP_TIMEOUT_SECONDS:-20}"
 STOP_GRACE_POLLS=20
 REQUIRED_HEALTH_CHECKS=3
 LAUNCH_RETRY_SECONDS=1
@@ -59,7 +59,7 @@ bundle_roots() {
           pid = $1
           line = $0
           sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", line)
-          if (line ~ /\/LiteLLM ?Menu[^\/]*\.app\/Contents\/MacOS\/LiteLLMMenu$/) print pid
+          if (line ~ /\/Young ?Router[^\/]*\.app\/Contents\/MacOS\/YoungRouter$/) print pid
         }
       '
 }
@@ -89,7 +89,7 @@ installed_pids() {
   local pid command
   while read -r pid; do
     command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-    [[ "$command" == */LiteLLM*Menu*.app/Contents/MacOS/LiteLLMMenu ]] && printf '%s\n' "$pid"
+    [[ "$command" == */Young*Router*.app/Contents/MacOS/YoungRouter ]] && printf '%s\n' "$pid"
   done < <(bundle_processes)
   return 0
 }
@@ -120,7 +120,7 @@ stop_installed_app() {
   deadline=$((SECONDS + STOP_TIMEOUT_SECONDS))
   while pids_are_alive "$bundle_pids"; do
     if (( SECONDS >= deadline )); then
-      echo "LiteLLM Menu did not stop its captured process tree within ${STOP_TIMEOUT_SECONDS}s." >&2
+      echo "Young Router did not stop its captured process tree within ${STOP_TIMEOUT_SECONDS}s." >&2
       return 1
     fi
     sleep 0.05
@@ -153,7 +153,7 @@ core_pid_for_app() {
     [[ -n "$child" ]] || continue
     command=$(ps -p "$child" -o command= 2>/dev/null || true)
     if [[ "$command" == "$DESTINATION/Contents/Resources/Core/runtime/"* ]] \
-      && [[ "$command" == *" -m litellm_menu.core "* ]] \
+      && [[ "$command" == *" -m young_router.core "* ]] \
       && [[ "$command" == *" --parent-pid $app_pid"* ]]; then
       printf '%s\n' "$child"
       return 0
@@ -170,7 +170,7 @@ proxy_port_for_app() {
     [[ -n "$process_pid" ]] || continue
     command=$(ps -p "$process_pid" -o command= 2>/dev/null || true)
     if [[ "$command" != *"run_server()"* \
-      && "$command" != *" -m litellm_menu.macos_proxy "* ]]; then
+      && "$command" != *" -m young_router.macos_proxy "* ]]; then
       continue
     fi
     port=$(awk '{ for (field = 1; field < NF; field += 1) if ($field == "--port") { print $(field + 1); exit } }' <<<"$command")
@@ -213,7 +213,7 @@ report_startup_state() {
   local state="$1"
   [[ "$state" == "$LAST_STARTUP_STATE" ]] && return 0
   LAST_STARTUP_STATE="$state"
-  printf 'LiteLLM Menu: %s\n' "$state"
+  printf 'Young Router: %s\n' "$state"
 }
 
 wait_for_started_app() {
@@ -274,7 +274,7 @@ start_installed_app() {
   # then prove the new process remains healthy before discarding the rollback
   # bundle.
   wait_for_started_app "$rejected_pids" || {
-    echo "The new LiteLLM Menu app did not start from $DESTINATION." >&2
+    echo "The new Young Router app did not start from $DESTINATION." >&2
     return 1
   }
   return 0
@@ -284,7 +284,7 @@ restore_previous_app() {
   local restore_failed=0
   if [[ -n "$PREVIOUS_APP" && ( -e "$PREVIOUS_APP" || -L "$PREVIOUS_APP" ) ]]; then
     if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
-      FAILED_APP="$(dirname "$DESTINATION")/.LiteLLMMenu.failed.$$.app"
+      FAILED_APP="$(dirname "$DESTINATION")/.YoungRouter.failed.$$.app"
       rm -rf "$FAILED_APP"
       mv "$DESTINATION" "$FAILED_APP" || restore_failed=1
     fi
@@ -298,7 +298,7 @@ restore_previous_app() {
 case "$(uname -s)" in
   Darwin) ;;
   *)
-    echo "LiteLLM Menu installation is supported only on macOS." >&2
+    echo "Young Router installation is supported only on macOS." >&2
     exit 1
     ;;
 esac
@@ -309,12 +309,12 @@ esac
 }
 
 [[ "$DESTINATION" = /* && "$DESTINATION" == *.app ]] || {
-  echo "LITELLM_MENU_INSTALL_APP must be an absolute .app path." >&2
+  echo "YOUNG_ROUTER_INSTALL_APP must be an absolute .app path." >&2
   exit 1
 }
 DESTINATION="$(cd "$(dirname "$DESTINATION")" && pwd -P)/$(basename "$DESTINATION")"
-[[ "$DESTINATION" == "/Applications/LiteLLM Menu.app" ]] || {
-  echo "Refusing an installation destination other than /Applications/LiteLLM Menu.app." >&2
+[[ "$DESTINATION" == "/Applications/Young Router.app" ]] || {
+  echo "Refusing an installation destination other than /Applications/Young Router.app." >&2
   exit 1
 }
 
@@ -326,15 +326,15 @@ if [[ -n "$DEVELOPER_DIR" ]]; then
 fi
 
 "$ROOT/scripts/update-litellm.sh"
-export LITELLM_MENU_LITELLM_VERSION_UPDATED=1
-printf '%s\n' "LiteLLM Menu: preparing replacement build"
+export YOUNG_ROUTER_LITELLM_VERSION_UPDATED=1
+printf '%s\n' "Young Router: preparing replacement build"
 
 # The installed app already carries the exact portable Python runtime needed
 # by repeat local builds. Reuse it only when no caller supplied another
 # runtime, its pinned LiteLLM version matches this checkout, and the portable
 # launchers are present. The macOS host, project Python sources, smoke tests,
 # signing, replacement, and readiness checks still run on every build.
-if [[ -z "${LITELLM_MENU_CORE_RUNTIME_SOURCE:-}" \
+if [[ -z "${YOUNG_ROUTER_CORE_RUNTIME_SOURCE:-}" \
   && -z "${LITELLM_RELEASE_RUNTIME_SOURCE:-}" ]]; then
   INSTALLED_RUNTIME="$DESTINATION/Contents/Resources/Core/runtime"
   if [[ -x "$INSTALLED_RUNTIME/python/bin/python3.12" \
@@ -342,30 +342,30 @@ if [[ -z "${LITELLM_MENU_CORE_RUNTIME_SOURCE:-}" \
     && -x "$INSTALLED_RUNTIME/bin/litellm" \
     && -f "$INSTALLED_RUNTIME/LITELLM_VERSION" \
     && "$(tr -d '[:space:]' < "$INSTALLED_RUNTIME/LITELLM_VERSION")" == "$(tr -d '[:space:]' < "$ROOT/LITELLM_VERSION")" ]]; then
-    export LITELLM_MENU_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"
+    export YOUNG_ROUTER_CORE_RUNTIME_SOURCE="$INSTALLED_RUNTIME"
     printf 'Reusing installed Core runtime: %s\n' "$INSTALLED_RUNTIME"
   fi
 fi
 
 (
   cd "$ROOT/rn"
-  printf '%s\n' "LiteLLM Menu: building and validating macOS bundle"
+  printf '%s\n' "Young Router: building and validating macOS bundle"
   pnpm install --frozen-lockfile
-  LITELLM_MENU_MACOS_OUTPUT="$STAGED_APP" pnpm run build:macos
+  YOUNG_ROUTER_MACOS_OUTPUT="$STAGED_APP" pnpm run build:macos
 )
 
-test -x "$STAGED_APP/Contents/MacOS/LiteLLMMenu"
+test -x "$STAGED_APP/Contents/MacOS/YoungRouter"
 test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/python"
 test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/litellm"
 test -x "$STAGED_APP/Contents/Resources/Core/runtime/bin/node"
 test -x "$STAGED_APP/Contents/Resources/Core/bin/vision_ocr"
-test -f "$STAGED_APP/Contents/Resources/Core/litellm_menu/pi-web-access/index.ts"
+test -f "$STAGED_APP/Contents/Resources/Core/young_router/pi-web-access/index.ts"
 plutil -lint "$STAGED_APP/Contents/Info.plist" >/dev/null
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
-printf '%s\n' "LiteLLM Menu: staged bundle verified"
+printf '%s\n' "Young Router: staged bundle verified"
 
-INSTALL_STAGE="$(dirname "$DESTINATION")/.LiteLLMMenu.install.$$.app"
-PREVIOUS_APP="$(dirname "$DESTINATION")/.LiteLLMMenu.previous.$$.app"
+INSTALL_STAGE="$(dirname "$DESTINATION")/.YoungRouter.install.$$.app"
+PREVIOUS_APP="$(dirname "$DESTINATION")/.YoungRouter.previous.$$.app"
 rm -rf "$INSTALL_STAGE" "$PREVIOUS_APP"
 copy_tree "$STAGED_APP" "$INSTALL_STAGE"
 codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"
@@ -375,7 +375,7 @@ codesign --verify --deep --strict --verbose=2 "$INSTALL_STAGE"
 # stopping them only after the new bundle is in place shortens the listener
 # outage to the stop/start interval.
 OLD_PIDS="$(bundle_processes)"
-printf '%s\n' "LiteLLM Menu: replacing bundle and stopping previous process"
+printf '%s\n' "Young Router: replacing bundle and stopping previous process"
 # Arm the EXIT relaunch before moving the live bundle, so an interrupted swap
 # cannot leave the installed path without an app to launch.
 RESTART_ARMED=1
@@ -388,17 +388,17 @@ if ! mv "$INSTALL_STAGE" "$DESTINATION"; then
 fi
 INSTALL_STAGE=""
 if ! refresh_installed_app_icon; then
-  echo "The new LiteLLM Menu app icon could not be refreshed; restoring the previous bundle." >&2
+  echo "The new Young Router app icon could not be refreshed; restoring the previous bundle." >&2
   restore_previous_app || {
-    echo "The previous LiteLLM Menu bundle could not be restored." >&2
+    echo "The previous Young Router bundle could not be restored." >&2
     exit 1
   }
   exit 1
 fi
 if ! stop_installed_app "$OLD_PIDS"; then
-  echo "The old LiteLLM Menu app did not stop; restoring the previous bundle." >&2
+  echo "The old Young Router app did not stop; restoring the previous bundle." >&2
   restore_previous_app || {
-    echo "The previous LiteLLM Menu bundle could not be restored." >&2
+    echo "The previous Young Router bundle could not be restored." >&2
     exit 1
   }
   exit 1
@@ -408,18 +408,18 @@ fi
 # the replacement, so no old listener can survive into the new lifecycle.
 REMAINING_OLD_PIDS="$(bundle_processes)"
 if [[ -n "$REMAINING_OLD_PIDS" ]] && ! stop_installed_app "$REMAINING_OLD_PIDS"; then
-  echo "The old LiteLLM Menu proxy did not stop; restoring the previous bundle." >&2
+  echo "The old Young Router proxy did not stop; restoring the previous bundle." >&2
   restore_previous_app || {
-    echo "The previous LiteLLM Menu bundle could not be restored." >&2
+    echo "The previous Young Router bundle could not be restored." >&2
     exit 1
   }
   exit 1
 fi
-printf '%s\n' "LiteLLM Menu: starting replacement and checking Core/proxy health"
+printf '%s\n' "Young Router: starting replacement and checking Core/proxy health"
 if ! start_installed_app "$OLD_PIDS"; then
-  echo "The new LiteLLM Menu app failed readiness checks; restoring the previous bundle." >&2
+  echo "The new Young Router app failed readiness checks; restoring the previous bundle." >&2
   restore_previous_app || {
-    echo "The previous LiteLLM Menu bundle could not be restored." >&2
+    echo "The previous Young Router bundle could not be restored." >&2
     exit 1
   }
   exit 1
@@ -430,4 +430,4 @@ rm -rf "$PREVIOUS_APP"
 PREVIOUS_APP=""
 INSTALL_COMPLETE=1
 
-printf '%s\n' "LiteLLM Menu: running ($DESTINATION)"
+printf '%s\n' "Young Router: running ($DESTINATION)"

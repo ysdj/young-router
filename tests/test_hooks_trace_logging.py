@@ -322,7 +322,7 @@ class HookTraceLoggingTests(HookTestCase):
 
     async def test_recent_request_success_log_is_safe_summary(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
             self.set_log_env(log_path)
@@ -393,7 +393,7 @@ class HookTraceLoggingTests(HookTestCase):
 
     async def test_pre_call_publishes_pending_request_before_completion(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         hooks._REQUEST_STARTED_TIMES.clear()
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
@@ -424,7 +424,7 @@ class HookTraceLoggingTests(HookTestCase):
 
     async def test_stream_request_log_advances_to_terminal_status(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
             self.set_log_env(log_path)
@@ -465,7 +465,7 @@ class HookTraceLoggingTests(HookTestCase):
 
     async def test_completed_stream_summary_logs_success(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
             self.set_log_env(log_path)
@@ -563,7 +563,7 @@ class HookTraceLoggingTests(HookTestCase):
 
     async def test_recent_request_failure_log_omits_error_message_body(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         class ProviderError(Exception):
             status_code = 429
@@ -732,7 +732,7 @@ class HookTraceLoggingTests(HookTestCase):
             cap = hooks.MIN_LOG_MAX_BYTES
             log_path.write_text("a" * (cap + 1024), encoding="utf-8")
             self.set_log_env(log_path)
-            self.set_env("LITELLM_MENU_LOG_MAX_BYTES", str(cap))
+            self.set_env("YOUNG_ROUTER_LOG_MAX_BYTES", str(cap))
 
             hooks._append_recent_request({"status": "success", "marker": "latest"})
 
@@ -745,7 +745,7 @@ class HookTraceLoggingTests(HookTestCase):
 
     def test_recent_request_rotation_uses_local_log_cap_key(self) -> None:
         hooks, _ = load_hook_module()
-        self.set_env("LITELLM_MENU_LOG_MAX_BYTES", "300000")
+        self.set_env("YOUNG_ROUTER_LOG_MAX_BYTES", "300000")
 
         self.assertEqual(hooks._recent_requests_max_bytes(), 300000)
 
@@ -772,7 +772,7 @@ class HookTraceLoggingTests(HookTestCase):
         }
         error = TemporaryFailure("boom")
 
-        with self.assertLogs("litellm_menu.route_trace", level="WARNING") as captured:
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
             hooks._mark_exception_for_deployment_failover(error, request_kwargs)
 
         raw_payload = captured.output[0].split("litellm_route_trace ", 1)[1]
@@ -813,7 +813,7 @@ class HookTraceLoggingTests(HookTestCase):
             "content": [{"type": "output_text", "text": "Let me check the state."}],
         }
 
-        with self.assertLogs("litellm_menu.route_trace", level="WARNING") as captured:
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
             record = hooks._request_log_record(
                 "success", kwargs, text_only_response, start, end
             )
@@ -863,7 +863,7 @@ class HookTraceLoggingTests(HookTestCase):
                 }
             ],
         }
-        with self.assertNoLogs("litellm_menu.route_trace", level="WARNING"):
+        with self.assertNoLogs("young_router.route_trace", level="WARNING"):
             hooks._request_log_record(
                 "success",
                 {**base_kwargs, "completion_start_time": start + timedelta(milliseconds=29500)},
@@ -872,7 +872,7 @@ class HookTraceLoggingTests(HookTestCase):
                 end,
             )
         # First token streamed early: not the buffered-flush signature.
-        with self.assertNoLogs("litellm_menu.route_trace", level="WARNING"):
+        with self.assertNoLogs("young_router.route_trace", level="WARNING"):
             hooks._request_log_record(
                 "success",
                 {**base_kwargs, "completion_start_time": start + timedelta(milliseconds=500)},

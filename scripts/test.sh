@@ -20,9 +20,9 @@ if [[ -n "${LITELLM_TEST_PYTHON:-}" ]]; then
   TEST_COMMAND=("$LITELLM_TEST_PYTHON")
   # Keep focused Core and integration tests on the selected runtime too.
   export PYTHON="$LITELLM_TEST_PYTHON"
-elif [[ -x "${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/Core/runtime/bin/python}" ]] \
-  && "${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/Core/runtime/bin/python}" -c 'import yaml, litellm' >/dev/null 2>&1; then
-  TEST_COMMAND=("${LITELLM_BUNDLED_TEST_PYTHON:-/Applications/LiteLLM Menu.app/Contents/Resources/Core/runtime/bin/python}")
+elif [[ -x "${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}" ]] \
+  && "${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}" -c 'import yaml, litellm' >/dev/null 2>&1; then
+  TEST_COMMAND=("${YOUNG_ROUTER_BUNDLED_TEST_PYTHON:-/Applications/Young Router.app/Contents/Resources/Core/runtime/bin/python}")
 elif command -v uv >/dev/null 2>&1; then
   TEST_COMMAND=(
     uv run --python 3.12
@@ -42,7 +42,7 @@ import sys
 raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
 PY
 then
-  echo "LiteLLM Menu tests require Python 3.11+; set LITELLM_TEST_PYTHON to a supported interpreter." >&2
+  echo "Young Router tests require Python 3.11+; set LITELLM_TEST_PYTHON to a supported interpreter." >&2
   exit 1
 fi
 

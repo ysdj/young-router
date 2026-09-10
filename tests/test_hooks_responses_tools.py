@@ -1059,10 +1059,10 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 "model": "openai/oai-deepseek-v4-pro",
                 "input": "hello",
                 "use_chat_completions_api": True,
-                "_litellm_menu_upstream_url_surface": "openai/chat",
-                "_litellm_menu_upstream_url_surface_deployment_id": "chat-route",
-                "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
-                "_litellm_menu_protocol_fallback_client_surface": "openai/responses",
+                "_young_router_upstream_url_surface": "openai/chat",
+                "_young_router_upstream_url_surface_deployment_id": "chat-route",
+                "_young_router_protocol_fallback_from_surface": "openai/responses",
+                "_young_router_protocol_fallback_client_surface": "openai/responses",
                 "model_info": {
                     "id": "chat-route",
                     "upstream_url_surface": "openai/chat",
@@ -1095,7 +1095,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
 
             self.assertEqual(response["output_text"], "ok")
             self.assertEqual(
-                bridge_kwargs["_litellm_menu_protocol_fallback_from_surface"],
+                bridge_kwargs["_young_router_protocol_fallback_from_surface"],
                 "openai/responses",
             )
             deployment = {
@@ -1121,8 +1121,8 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 "model": "openai/oai-deepseek-v4-pro",
                 "input": "hello",
                 "use_chat_completions_api": True,
-                "_litellm_menu_upstream_url_surface": "openai/chat",
-                "_litellm_menu_upstream_url_surface_deployment_id": "chat-route",
+                "_young_router_upstream_url_surface": "openai/chat",
+                "_young_router_upstream_url_surface_deployment_id": "chat-route",
                 "model_info": {
                     "id": "chat-route",
                     "upstream_url_surface": "openai/chat",
@@ -1130,9 +1130,9 @@ class HookResponsesToolBridgeTests(HookTestCase):
                 },
             }
             outer_request = {
-                "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
-                "_litellm_menu_protocol_fallback_client_surface": "openai/responses",
-                "_litellm_menu_upstream_url_surface_deployment_id": "chat-route",
+                "_young_router_protocol_fallback_from_surface": "openai/responses",
+                "_young_router_protocol_fallback_client_surface": "openai/responses",
+                "_young_router_upstream_url_surface_deployment_id": "chat-route",
                 "model_info": bridge_kwargs["model_info"],
             }
 
@@ -1193,7 +1193,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             input="试一下computeruse",
             reasoning={"effort": "xhigh"},
             use_chat_completions_api=True,
-            _litellm_menu_upstream_url_surface="openai/chat",
+            _young_router_upstream_url_surface="openai/chat",
             tools=[
                 {"type": "tool_search"},
                 {
@@ -1445,7 +1445,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
 
     async def test_responses_api_proxy_request_path_does_not_change_deployment_order(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         deployments = [
             {
@@ -1488,7 +1488,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
 
     async def test_responses_api_non_string_type_does_not_break_routing(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         def aresponses():
             pass

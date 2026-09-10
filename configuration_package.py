@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict combined configuration packages for LiteLLM Menu.
+"""Strict combined configuration packages for Young Router.
 
 The package is intentionally a new, self-contained format.  It can carry the
 runtime-settings snapshot, the provider/model configuration document, or both.
@@ -33,7 +33,7 @@ from runtime_settings_io import (
 )
 
 
-PACKAGE_FORMAT = "litellm-menu-configuration-package"
+PACKAGE_FORMAT = "young-router-configuration-package"
 PACKAGE_VERSION = 1
 RUNTIME_SETTINGS_SECTION = "runtime_settings"
 PROVIDERS_MODELS_SECTION = "providers_models"
@@ -299,7 +299,7 @@ def import_package(path: Path) -> dict[str, Any]:
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Import or export LiteLLM Menu configuration packages.")
+    parser = argparse.ArgumentParser(description="Import or export Young Router configuration packages.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     export = subparsers.add_parser("export", help="Write one selected configuration package.")
     export.add_argument("--sections", required=True, help="runtime_settings, providers_models, or all")

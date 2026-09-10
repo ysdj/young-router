@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from litellm_menu.core.domains.providers_models import DomainError, ProvidersModelsDomain
+from young_router.core.domains.providers_models import DomainError, ProvidersModelsDomain
 
 
 def relay_source(
@@ -313,7 +313,7 @@ class RelayModelBindingTests(unittest.TestCase):
                         "    api_keys:",
                         "      - name: relay-key",
                         '        value: "sk-legacy-fixture"',
-                        "    x-litellm-menu-relay-keys:",
+                        "    x-young-router-relay-keys:",
                         "      version: 1",
                         "      slots:",
                         "        - id: provider-slot-legacy",
@@ -334,11 +334,11 @@ class RelayModelBindingTests(unittest.TestCase):
                         '      id: "00000001"',
                         "      provider: provider-a",
                         "      api_key_name: relay-key",
-                        "      x-litellm-menu-provider-key-id: provider-slot-legacy",
-                        "      x-litellm-menu-relay-catalog-mode: independent",
-                        "      x-litellm-menu-relay-source-model: stale-upstream",
-                        "      x-litellm-menu-order-mode: manual",
-                        "      x-litellm-menu-manual-order: 3",
+                        "      x-young-router-provider-key-id: provider-slot-legacy",
+                        "      x-young-router-relay-catalog-mode: independent",
+                        "      x-young-router-relay-source-model: stale-upstream",
+                        "      x-young-router-order-mode: manual",
+                        "      x-young-router-manual-order: 3",
                         "",
                     ]
                 ),
@@ -352,8 +352,8 @@ class RelayModelBindingTests(unittest.TestCase):
 
             domain.apply()
             saved = path.read_text(encoding="utf-8")
-            self.assertNotIn("x-litellm-menu-relay-catalog-mode", saved)
-            self.assertNotIn("x-litellm-menu-relay-source-model", saved)
+            self.assertNotIn("x-young-router-relay-catalog-mode", saved)
+            self.assertNotIn("x-young-router-relay-source-model", saved)
 
     def test_linked_import_preflight_materializes_multiplier_and_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -392,11 +392,11 @@ class RelayModelBindingTests(unittest.TestCase):
             domain.apply()
 
             saved = path.read_text(encoding="utf-8")
-            self.assertIn("x-litellm-menu-relay-keys", saved)
-            self.assertIn("x-litellm-menu-provider-key-id", saved)
-            self.assertIn("x-litellm-menu-order-mode: relay_multiplier", saved)
-            self.assertNotIn("x-litellm-menu-relay-catalog-mode", saved)
-            self.assertNotIn("x-litellm-menu-relay-source-model", saved)
+            self.assertIn("x-young-router-relay-keys", saved)
+            self.assertIn("x-young-router-provider-key-id", saved)
+            self.assertIn("x-young-router-order-mode: relay_multiplier", saved)
+            self.assertNotIn("x-young-router-relay-catalog-mode", saved)
+            self.assertNotIn("x-young-router-relay-source-model", saved)
 
             reloaded_domain = ProvidersModelsDomain(path)
             reloaded = reloaded_domain.snapshot()["providers"][0]

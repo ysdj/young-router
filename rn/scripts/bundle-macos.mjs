@@ -10,7 +10,7 @@ const bundleScript = path.resolve(
   '..',
   'vendor/react-native-macos-0.85/packages/react-native/scripts/bundle.js',
 );
-const resetMetroCache = process.env.CI || process.env.LITELLM_MENU_RESET_METRO_CACHE === '1';
+const resetMetroCache = process.env.CI || process.env.YOUNG_ROUTER_RESET_METRO_CACHE === '1';
 const args = resetMetroCache
   ? process.argv.slice(2)
   : process.argv.slice(2).filter(arg => arg !== '--reset-cache');

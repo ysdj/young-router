@@ -101,8 +101,8 @@ POINT FrameTrackSizeForContent(HWND window, ContentSize content) {
 }
 
 LRESULT CALLBACK TrayWindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-  auto leaf = reinterpret_cast<LiteLLMMenu::WinUI3NativeLeaf*>(GetPropW(window, L"LiteLLMMenu.NativeLeaf"));
-  auto previous = leaf ? reinterpret_cast<WNDPROC>(GetPropW(window, L"LiteLLMMenu.PreviousWindowProc")) : nullptr;
+  auto leaf = reinterpret_cast<YoungRouter::WinUI3NativeLeaf*>(GetPropW(window, L"YoungRouter.NativeLeaf"));
+  auto previous = leaf ? reinterpret_cast<WNDPROC>(GetPropW(window, L"YoungRouter.PreviousWindowProc")) : nullptr;
   if (leaf) {
     if (message == WM_GETMINMAXINFO) {
       LRESULT result = previous
@@ -134,7 +134,7 @@ std::wstring CodeEditorWebViewDataFolder() {
   }
   std::filesystem::path path(folder);
   CoTaskMemFree(folder);
-  path /= L"LiteLLM Menu";
+  path /= L"Young Router";
   path /= L"CodeEditorWebView2";
   std::error_code error;
   std::filesystem::create_directories(path, error);
@@ -173,7 +173,7 @@ bool RunOwnedModalWindow(
     bool& finished) {
   HWND dialog_handle = nullptr;
   winrt::check_hresult(dialog.as<::IWindowNative>()->get_WindowHandle(&dialog_handle));
-  LiteLLMMenu::DisableWindowTransitions(dialog_handle);
+  YoungRouter::DisableWindowTransitions(dialog_handle);
   const bool disable_owner = owner != nullptr && IsWindow(owner);
   if (disable_owner) {
     SetWindowLongPtrW(dialog_handle, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
@@ -181,7 +181,7 @@ bool RunOwnedModalWindow(
   }
 
   auto window_id = winrt::Microsoft::UI::GetWindowIdFromWindow(dialog_handle);
-  const auto frame = LiteLLMMenu::FrameTrackSizeForContentDips(
+  const auto frame = YoungRouter::FrameTrackSizeForContentDips(
       dialog_handle, content_size_dips.Width, content_size_dips.Height);
   winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(window_id).Resize({frame.x, frame.y});
   dialog.Activate();
@@ -280,7 +280,7 @@ winrt::fire_and_forget InitializeReadOnlyCodeViewer(
 }
 }  // namespace
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 void DisableWindowTransitions(HWND window) noexcept {
   if (window == nullptr) return;
@@ -310,8 +310,8 @@ WinUI3NativeLeaf::~WinUI3NativeLeaf() {
   RemoveTray();
   if (window_handle_ != nullptr && previous_window_proc_ != nullptr) {
     SetWindowLongPtrW(window_handle_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(previous_window_proc_));
-    RemovePropW(window_handle_, L"LiteLLMMenu.PreviousWindowProc");
-    RemovePropW(window_handle_, L"LiteLLMMenu.NativeLeaf");
+    RemovePropW(window_handle_, L"YoungRouter.PreviousWindowProc");
+    RemovePropW(window_handle_, L"YoungRouter.NativeLeaf");
   }
 }
 
@@ -371,7 +371,7 @@ void WinUI3NativeLeaf::SetLocalization(std::map<std::string, std::wstring> strin
     SetWindowTextW(window_handle_, RouteTitle(active_route_).c_str());
   }
   if (tray_visible_) {
-    auto tooltip = status_title_.empty() ? Localized("appTitle", L"LiteLLM Menu") : status_title_;
+    auto tooltip = status_title_.empty() ? Localized("appTitle", L"Young Router") : status_title_;
     wcsncpy_s(tray_.szTip, tooltip.c_str(), _TRUNCATE);
     Shell_NotifyIconW(NIM_MODIFY, &tray_);
   }
@@ -1414,14 +1414,14 @@ bool WinUI3NativeLeaf::SetLaunchAtLogin(bool enabled) {
       KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
   DWORD type = 0;
   DWORD size = 0;
-  LONG existing = RegQueryValueExW(key, L"LiteLLMMenu", nullptr, &type, nullptr, &size);
+  LONG existing = RegQueryValueExW(key, L"YoungRouter", nullptr, &type, nullptr, &size);
   LONG result = ERROR_SUCCESS;
   if (enabled) {
     std::wstring command = L"\"" + executable + L"\"";
-    result = RegSetValueExW(key, L"LiteLLMMenu", 0, REG_SZ,
+    result = RegSetValueExW(key, L"YoungRouter", 0, REG_SZ,
         reinterpret_cast<BYTE const*>(command.c_str()), static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
   } else if (existing == ERROR_SUCCESS) {
-    result = RegDeleteValueW(key, L"LiteLLMMenu");
+    result = RegDeleteValueW(key, L"YoungRouter");
   } else if (existing != ERROR_FILE_NOT_FOUND) {
     result = existing;
   }
@@ -1431,7 +1431,7 @@ bool WinUI3NativeLeaf::SetLaunchAtLogin(bool enabled) {
 
 void WinUI3NativeLeaf::ShowVersion() const {
   std::wstring text = VersionText();
-  MessageBoxW(window_handle_, text.c_str(), Localized("appTitle", L"LiteLLM Menu").c_str(), MB_OK | MB_ICONINFORMATION);
+  MessageBoxW(window_handle_, text.c_str(), Localized("appTitle", L"Young Router").c_str(), MB_OK | MB_ICONINFORMATION);
 }
 
 WinUI3NativeLeaf::VersionInfoResult WinUI3NativeLeaf::VersionInfo() const {
@@ -1508,7 +1508,7 @@ void WinUI3NativeLeaf::EnsureTray() {
   tray_.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
   tray_.uCallbackMessage = kTrayMessage;
   tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-  wcsncpy_s(tray_.szTip, status_title_.empty() ? L"LiteLLM Menu" : status_title_.c_str(), _TRUNCATE);
+  wcsncpy_s(tray_.szTip, status_title_.empty() ? L"Young Router" : status_title_.c_str(), _TRUNCATE);
   tray_visible_ = Shell_NotifyIconW(NIM_ADD, &tray_) == TRUE;
 }
 
@@ -1557,7 +1557,7 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
     auto const& action = actions_[index];
     const bool is_language_choice = action.id == L"set-language-system" ||
         action.id == L"set-language-en" || action.id == L"set-language-zh-Hans";
-    if (action.id == L"language-menu") continue;
+    if (action.id == L"language-picker") continue;
     UINT flags = MF_STRING | (action.enabled ? MF_ENABLED : MF_GRAYED);
     if (action.checked) flags |= MF_CHECKED;
     if (is_language_choice) {
@@ -1582,7 +1582,7 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
   if (language_menu != nullptr && GetMenuItemCount(language_menu) > 0) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     auto label = std::find_if(actions_.begin(), actions_.end(), [](auto const& action) {
-      return action.id == L"language-menu";
+      return action.id == L"language-picker";
     });
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(language_menu),
         label == actions_.end() ? L"Language" : label->title.c_str());
@@ -1598,9 +1598,9 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
 
 void WinUI3NativeLeaf::InstallWindowHook() {
   if (window_handle_ == nullptr || previous_window_proc_ != nullptr) return;
-  SetPropW(window_handle_, L"LiteLLMMenu.NativeLeaf", reinterpret_cast<HANDLE>(this));
+  SetPropW(window_handle_, L"YoungRouter.NativeLeaf", reinterpret_cast<HANDLE>(this));
   previous_window_proc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(window_handle_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(TrayWindowProc)));
-  if (previous_window_proc_ != nullptr) SetPropW(window_handle_, L"LiteLLMMenu.PreviousWindowProc", reinterpret_cast<HANDLE>(previous_window_proc_));
+  if (previous_window_proc_ != nullptr) SetPropW(window_handle_, L"YoungRouter.PreviousWindowProc", reinterpret_cast<HANDLE>(previous_window_proc_));
 }
 
 std::wstring WinUI3NativeLeaf::VersionText() const {
@@ -1626,7 +1626,7 @@ std::wstring WinUI3NativeLeaf::VersionText() const {
       return buffer;
     }
   }
-  return Localized("appTitle", L"LiteLLM Menu");
+  return Localized("appTitle", L"Young Router");
 }
 
 std::wstring WinUI3NativeLeaf::Localized(std::string const& key, std::wstring_view fallback) const {
@@ -1640,10 +1640,10 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
   if (route == L"home" || route == L"general-settings" || route == L"providers-models" ||
       route == L"codex-settings" || route == L"claude-settings" || route == L"runtime-settings" ||
       route == L"data-management" || route == L"logs") {
-    return Localized("appTitle", L"LiteLLM Menu");
+    return Localized("appTitle", L"Young Router");
   }
   if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
-  return Localized("appTitle", L"LiteLLM Menu");
+  return Localized("appTitle", L"Young Router");
 }
 
 void WinUI3NativeLeaf::RemoveTray() {

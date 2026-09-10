@@ -12,5 +12,5 @@ Sensitive editor text follows the same native-only read/edit/stage boundary;
 React receives only the editor token and the staged revision.
 
 The Objective-C bridges and Swift sources are registered in the checked-in
-`LiteLLMMenu-macOS` Xcode target. Its release build embeds a relocatable Python
+`YoungRouter-macOS` Xcode target. Its release build embeds a relocatable Python
 Core runtime under `Contents/Resources/Core`.

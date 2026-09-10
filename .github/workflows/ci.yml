@@ -36,13 +36,13 @@ jobs:
       - name: Install test dependencies
         run: |
           brew install uv
-          uv venv --python 3.12 "$RUNNER_TEMP/litellm-menu-ci"
-          uv pip install --python "$RUNNER_TEMP/litellm-menu-ci/bin/python" "litellm[proxy]==$(tr -d '[:space:]' < LITELLM_VERSION)" "fastapi==0.140.3" PyYAML Pillow
+          uv venv --python 3.12 "$RUNNER_TEMP/young-router-ci"
+          uv pip install --python "$RUNNER_TEMP/young-router-ci/bin/python" "litellm[proxy]==$(tr -d '[:space:]' < LITELLM_VERSION)" "fastapi==0.140.3" PyYAML Pillow
 
       - name: Run full test suite
         env:
-          LITELLM_TEST_PYTHON: ${{ runner.temp }}/litellm-menu-ci/bin/python
-          LITELLM_MENU_AUTO_BUILD: "0"
+          LITELLM_TEST_PYTHON: ${{ runner.temp }}/young-router-ci/bin/python
+          YOUNG_ROUTER_AUTO_BUILD: "0"
         run: ./scripts/test.sh
 
       - name: Check shared React Native contract
@@ -50,16 +50,16 @@ jobs:
 
       - name: Build React Native macOS host
         env:
-          LITELLM_MENU_MACOS_OUTPUT: ${{ runner.temp }}/LiteLLM Menu.app
-          LITELLM_MENU_REFRESH_PODS: "1"
+          YOUNG_ROUTER_MACOS_OUTPUT: ${{ runner.temp }}/Young Router.app
+          YOUNG_ROUTER_REFRESH_PODS: "1"
         working-directory: rn
         run: pnpm run build:macos
 
       - name: Verify React Native macOS bundle
         env:
-          APP: ${{ runner.temp }}/LiteLLM Menu.app
+          APP: ${{ runner.temp }}/Young Router.app
         run: |
-          test -x "$APP/Contents/MacOS/LiteLLMMenu"
+          test -x "$APP/Contents/MacOS/YoungRouter"
           test -x "$APP/Contents/Resources/Core/runtime/bin/python"
           test -x "$APP/Contents/Resources/Core/runtime/bin/litellm"
           test -f "$APP/Contents/Resources/Core/sitecustomize.py"
@@ -68,11 +68,11 @@ jobs:
           test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" = "$(tr -d '[:space:]' < BUILD_NUMBER)"
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$APP/Contents/Resources/Core" \
             "$APP/Contents/Resources/Core/runtime/bin/python" -c \
-            'import litellm.proxy.proxy_server, litellm_menu.core'
-          PYTHONDONTWRITEBYTECODE=1 LITELLM_MENU_PROXY_PROCESS=1 \
+            'import litellm.proxy.proxy_server, young_router.core'
+          PYTHONDONTWRITEBYTECODE=1 YOUNG_ROUTER_PROXY_PROCESS=1 \
             PYTHONPATH="$APP/Contents/Resources/Core" \
             "$APP/Contents/Resources/Core/runtime/bin/python" -c \
-            'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("litellm_menu.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "LiteLLMMenuHook"'
+            'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("young_router.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "YoungRouterHook"'
           codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Validate scripts and metadata
@@ -92,19 +92,19 @@ jobs:
 
           while IFS= read -r -d '' file; do
             [[ -f "$file" ]] || continue
-            "$RUNNER_TEMP/litellm-menu-ci/bin/python" -m py_compile "$file"
+            "$RUNNER_TEMP/young-router-ci/bin/python" -m py_compile "$file"
           done < <(git ls-files -z '*.py')
 
-          ruby -c Casks/litellm-menu.rb
-          brew style Casks/litellm-menu.rb
+          ruby -c Casks/young-router.rb
+          brew style Casks/young-router.rb
 
-          "$RUNNER_TEMP/litellm-menu-ci/bin/python" scripts/version.py sync
+          "$RUNNER_TEMP/young-router-ci/bin/python" scripts/version.py sync
           git diff --exit-code -- \
-            VERSION BUILD_NUMBER Casks/litellm-menu.rb \
-            rn/apps/macos/macos/LiteLLMMenu-macOS/Info.plist \
-            rn/apps/macos/macos/LiteLLMMenu.xcodeproj/project.pbxproj \
-            rn/apps/windows/windows/LiteLLMMenu/Package.appxmanifest \
-            rn/apps/windows/windows/LiteLLMMenu.Package/Package.appxmanifest
+            VERSION BUILD_NUMBER Casks/young-router.rb \
+            rn/apps/macos/macos/YoungRouter-macOS/Info.plist \
+            rn/apps/macos/macos/YoungRouter.xcodeproj/project.pbxproj \
+            rn/apps/windows/windows/YoungRouter/Package.appxmanifest \
+            rn/apps/windows/windows/YoungRouter.Package/Package.appxmanifest
 
           while IFS= read -r -d '' file; do
             [[ -f "$file" ]] || continue
@@ -126,7 +126,7 @@ jobs:
           cache-dependency-path: rn/pnpm-lock.yaml
       - name: Install shared UI dependencies
         working-directory: rn
-        run: pnpm install --filter @litellm-menu/rn-app --frozen-lockfile
+        run: pnpm install --filter @young-router/rn-app --frozen-lockfile
       - name: Check shared RN contract
         run: ./scripts/check-rn.sh
 
@@ -146,7 +146,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Install shared UI dependencies
         working-directory: rn
-        run: pnpm install --filter @litellm-menu/rn-app --frozen-lockfile
+        run: pnpm install --filter @young-router/rn-app --frozen-lockfile
       - name: Check shared RN contract and types
         working-directory: rn
         run: pnpm run build
