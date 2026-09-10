@@ -431,7 +431,7 @@ class HookStreamingToolEventTests(HookTestCase):
         original_completed_payload = (
             streaming_module._ResponsesStreamCompletionState.completed_payload
         )
-        computer_facade_module = importlib.import_module("litellm_menu.computer_facade")
+        computer_facade_module = importlib.import_module("young_router.computer_facade")
         original_resolve = (
             computer_facade_module._resolve_web_search_function_calls_stream_rounds
         )
@@ -1880,7 +1880,7 @@ class HookStreamingToolEventTests(HookTestCase):
                 }
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "画一张图：一只猫在桌上写字。"}],
@@ -1917,7 +1917,7 @@ class HookStreamingToolEventTests(HookTestCase):
                 }
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "model_info": {"id": "route-a", "route_key": "route-a-key", "order": 1},
@@ -1966,7 +1966,7 @@ class HookStreamingToolEventTests(HookTestCase):
                 return {"output": [{"type": "image_generation_call", "result": VALID_IMAGE_RESULT}]}
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "画一张图"}],
@@ -2005,7 +2005,7 @@ class HookStreamingToolEventTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "画一张图：一只猫在桌上写字。"}],
@@ -2068,7 +2068,7 @@ class HookStreamingToolEventTests(HookTestCase):
 
         router = FakeRouter()
         proxy_server.llm_router = router
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Say pong only."}],
@@ -2102,7 +2102,7 @@ class HookStreamingToolEventTests(HookTestCase):
         # recoverable failure, advance directly to the verified peer.
         self.assertEqual(calls[0]["_excluded_deployment_ids"], ["order1-a"])
         self.assertEqual(
-            calls[0]["_litellm_menu_verified_fallback_deployment_ids"],
+            calls[0]["_young_router_verified_fallback_deployment_ids"],
             ["order1-b"],
         )
         self.assertTrue(calls[0]["litellm_metadata"][hooks._STREAM_ERROR_FALLBACK_METADATA_KEY])

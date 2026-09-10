@@ -199,7 +199,7 @@ def save_config(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Load and save LiteLLM Menu provider configuration.")
+    parser = argparse.ArgumentParser(description="Load and save Young Router provider configuration.")
     parser.add_argument("command", choices=["load", "save"])
     parser.add_argument("--config", default=str(CONFIG_YAML))
     args = parser.parse_args()

@@ -6,10 +6,10 @@ import ts from "typescript";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const coreSchemaPath = path.resolve(root, "..", "litellm_menu", "core", "ipc-v1.schema.json");
+const coreSchemaPath = path.resolve(root, "..", "young_router", "core", "ipc-v1.schema.json");
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const coreSchema = JSON.parse(fs.readFileSync(coreSchemaPath, "utf8"));
-const typesPath = process.env.LITELLM_MENU_CONTRACT_TYPES || path.join(root, "packages/shared/src/types.ts");
+const typesPath = process.env.YOUNG_ROUTER_CONTRACT_TYPES || path.join(root, "packages/shared/src/types.ts");
 const types = fs.readFileSync(typesPath, "utf8");
 const ipc = fs.readFileSync(path.join(root, "packages/shared/src/ipc.ts"), "utf8");
 const source = ts.createSourceFile(typesPath, types, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -128,8 +128,8 @@ function assertMethodTypeMap(name, contractField) {
   }
 }
 
-if (packageJson.private !== true || packageJson.name !== "@litellm-menu/rn-app") {
-  fail("rn/package.json must remain a private @litellm-menu package");
+if (packageJson.private !== true || packageJson.name !== "@young-router/rn-app") {
+  fail("rn/package.json must remain a private @young-router package");
 }
 if (!ipc.includes("createIpcClient")) fail("versioned typed IPC client is missing");
 if (coreSchema.protocol_version !== 1 || coreSchema.request?.properties?.protocol_version?.const !== 1) {

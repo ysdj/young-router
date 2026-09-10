@@ -101,7 +101,7 @@ def command_push(args: argparse.Namespace) -> int:
     remote_bundle_url = bundle_url(settings)
     bundle_size, manifest = push_bundle(client, settings, config_path, args.state, "push")
 
-    print(f"Pushed LiteLLM Menu config to {_redact_url(remote_bundle_url)}")
+    print(f"Pushed Young Router config to {_redact_url(remote_bundle_url)}")
     print(f"Bundle bytes: {bundle_size}")
     print_manifest_summary("Local snapshot", manifest)
     return 0
@@ -115,7 +115,7 @@ def command_pull(args: argparse.Namespace) -> int:
     result = pull_bundle(client, settings, config_path, args.state, "pull")
     manifest = result["manifest"]
 
-    print(f"Pulled LiteLLM Menu config from {_redact_url(remote_bundle_url)}")
+    print(f"Pulled Young Router config from {_redact_url(remote_bundle_url)}")
     print_manifest_summary("Remote snapshot", manifest)
     for path in result["installed"]:
         print(f"Installed: {path}")
@@ -304,7 +304,7 @@ def _run_recorded_command(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Sync LiteLLM Menu config.yaml over WebDAV.")
+    parser = argparse.ArgumentParser(description="Sync Young Router config.yaml over WebDAV.")
     parser.add_argument("command", choices=["settings", "configure", "probe", "push", "pull", "sync", "status"])
     parser.add_argument("--config", type=pathlib.Path, default=default_config_yaml())
     parser.add_argument("--settings", type=pathlib.Path, default=default_settings_file())

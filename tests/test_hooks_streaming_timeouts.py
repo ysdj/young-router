@@ -60,7 +60,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
     async def test_structured_compaction_uses_compaction_budget_after_first_event(self) -> None:
         hooks, _ = load_hook_module()
-        routing_module = importlib.import_module("litellm_menu.routing")
+        routing_module = importlib.import_module("young_router.routing")
         previous_compaction_timeout = (
             routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
         )
@@ -127,7 +127,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
     async def test_structured_compaction_waits_longer_for_first_stream_chunk(self) -> None:
         hooks, _ = load_hook_module()
-        routing_module = importlib.import_module("litellm_menu.routing")
+        routing_module = importlib.import_module("young_router.routing")
         previous_compaction_timeout = (
             routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
         )
@@ -367,12 +367,12 @@ class HookStreamingTimeoutTests(HookTestCase):
 
         proxy_server.llm_router = FakeRouter()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "0")
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
             self.set_log_env(log_path)
-            self.set_env("LITELLM_MENU_STREAM_START_TIMEOUT_SECONDS", "0.01")
+            self.set_env("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS", "0.01")
             request_data = {
                 "model": "default-chat",
                 "input": [{"role": "user", "content": "Say pong only."}],
@@ -448,7 +448,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
 
         request_data = {
@@ -557,8 +557,8 @@ class HookStreamingTimeoutTests(HookTestCase):
                 raise AssertionError("active streams must not invoke fallback")
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
-        self.set_env("LITELLM_MENU_STALL_TIMEOUT_SECONDS", "0.05")
+        hook = hooks.YoungRouterHook()
+        self.set_env("YOUNG_ROUTER_STALL_TIMEOUT_SECONDS", "0.05")
 
         async def original_stream():
             yield {"type": "response.created", "response": {"id": "resp-original"}}
@@ -608,7 +608,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 raise AssertionError("reasoning stream activity must not invoke fallback")
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "1")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -650,7 +650,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 raise AssertionError("active streams must not invoke fallback")
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "1")
 
         async def original_stream():
@@ -895,7 +895,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Say pong only."}],
@@ -954,7 +954,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Say pong only."}],
@@ -1022,7 +1022,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 "response": {"id": "resp-chat-recovered"},
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         class FakeRouter:
             def _get_all_deployments(self, model_name, team_id=None):
@@ -1085,14 +1085,14 @@ class HookStreamingTimeoutTests(HookTestCase):
         )
         self.assertEqual(len(calls), 1)
         self.assertEqual(candidate_results, [[chat_deployment]])
-        self.assertNotIn("_litellm_menu_upstream_url_surface", calls[0])
+        self.assertNotIn("_young_router_upstream_url_surface", calls[0])
         self.assertEqual(calls[0]["_target_order"], 1)
         self.assertEqual(
             calls[0]["_excluded_deployment_ids"],
             ["other-route", "responses-route"],
         )
         self.assertEqual(
-            calls[0]["_litellm_menu_verified_fallback_deployment_ids"],
+            calls[0]["_young_router_verified_fallback_deployment_ids"],
             ["chat-route"],
         )
         self.assertIn(
@@ -1149,7 +1149,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 return recovered_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "0")
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
@@ -1209,7 +1209,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
         request_data = {
@@ -1257,7 +1257,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 raise AssertionError("visible partial streams must not invoke fallback")
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
 
         async def original_stream():
@@ -1308,7 +1308,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
     def test_route_recovery_polls_on_local_stream_timeout(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        exc = TimeoutError("LiteLLM Menu stream idle timeout after 45s without a new chunk")
+        exc = TimeoutError("Young Router stream idle timeout after 45s without a new chunk")
         exc.status_code = 504
         exc.body = {"reason": "stream_idle_timeout"}
         request_data = {

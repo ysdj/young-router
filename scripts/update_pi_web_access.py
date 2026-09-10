@@ -54,7 +54,7 @@ NODE_ARCHIVE_BASE_URL = os.environ.get(
     "https://nodejs.org/dist",
 )
 DEFAULT_TIMEOUT_SECONDS = 120
-USER_AGENT = "LiteLLM-Menu/pi-web-access-build"
+USER_AGENT = "Young-Router/pi-web-access-build"
 PACKAGE_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 NODE_VERSION_PATTERN = re.compile(r"^v22\.[0-9]+\.[0-9]+$")
 FALLBACK_PI_PEERS = (
@@ -352,7 +352,7 @@ def update(
     latest, tarball_url, version_payload = _package_metadata(registry_url)
     npm = _find_executable("LITELLM_NPM_BIN")
 
-    with tempfile.TemporaryDirectory(prefix="litellm-menu-pi-web-access-") as directory:
+    with tempfile.TemporaryDirectory(prefix="young-router-pi-web-access-") as directory:
         work = Path(directory)
         package_tarball = work / "pi-web-access.tgz"
         package_tarball.write_bytes(_request_bytes(tarball_url))
@@ -375,7 +375,7 @@ def update(
 
 def parse_arguments(arguments: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, help="Core/litellm_menu/pi-web-access destination")
+    parser.add_argument("--output", required=True, help="Core/young_router/pi-web-access destination")
     parser.add_argument("--node-output", help="Directory receiving node or node.exe")
     parser.add_argument("--node-source", help="Existing Node 22 executable or distribution directory")
     parser.add_argument("--registry-url", default=PACKAGE_REGISTRY_URL)

@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
+from young_router.core.domains.relay_accounts import RelayAccountsDomain
 
 
 class StatefulRelayHTTPClient:

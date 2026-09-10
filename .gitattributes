@@ -6,4 +6,4 @@ rn/apps/windows/windows/**/*.ico binary
 rn/apps/windows/windows/**/*.rc binary
 
 # The RN Windows generator owns this output, including its emitted spacing.
-rn/apps/windows/windows/LiteLLMMenu/codegen/** whitespace=-trailing-space
+rn/apps/windows/windows/YoungRouter/codegen/** whitespace=-trailing-space

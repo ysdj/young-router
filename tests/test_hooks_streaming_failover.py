@@ -8,7 +8,7 @@ from hook_test_utils import *
 class HookStreamingFailoverTests(HookTestCase):
     async def test_chat_route_exhaustion_propagates_error_instead_of_cancellation(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["litellm_menu.streaming"]
+        streaming_module = sys.modules["young_router.streaming"]
         original_fallback = streaming_module._stream_streaming_error_fallback
         self.addCleanup(
             setattr,
@@ -118,7 +118,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             chunk
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=incomplete_stream(),
                 request_data=request_data,
@@ -196,7 +196,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             chunk
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=incomplete_stream(),
                 request_data=request_data,
@@ -239,7 +239,7 @@ class HookStreamingFailoverTests(HookTestCase):
             RuntimeError,
             "Chat Completions stream ended before a terminal finish_reason",
         ):
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=incomplete_stream(),
                 request_data=request_data,
@@ -292,7 +292,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=incomplete_stream(),
                 request_data=request_data,
@@ -430,7 +430,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=reasoning_only_stream(),
                 request_data=request_data,
@@ -509,7 +509,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=whitespace_only_stream(),
                 request_data=request_data,
@@ -610,7 +610,7 @@ class HookStreamingFailoverTests(HookTestCase):
                 return recovered_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Continue."}],
@@ -660,7 +660,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=request_data,
@@ -697,7 +697,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=request_data,
@@ -732,7 +732,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response={
                     "id": "resp-reasoning-only",
@@ -943,7 +943,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
     async def test_structured_compaction_uses_longer_stream_start_deadline(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        routing_module = importlib.import_module("litellm_menu.routing")
+        routing_module = importlib.import_module("young_router.routing")
         previous_compaction_timeout = (
             routing_module._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS
         )
@@ -1549,7 +1549,7 @@ class HookStreamingFailoverTests(HookTestCase):
         response = await wrapped(**request_data)
 
         with self.assertRaises(RuntimeError) as raised:
-            async for _chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for _chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=request_data,
@@ -1606,7 +1606,7 @@ class HookStreamingFailoverTests(HookTestCase):
         )
     async def test_pre_call_deployment_hook_preserves_upstream_metadata_when_opted_in(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "metadata": {"trace_id": "client-trace"},
             "litellm_metadata": {"model_group": "default-chat"},
@@ -2049,7 +2049,7 @@ class HookStreamingFailoverTests(HookTestCase):
         )
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=helper_kwargs,
@@ -2217,7 +2217,7 @@ class HookStreamingFailoverTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=helper_kwargs,
@@ -2237,10 +2237,10 @@ class HookStreamingFailoverTests(HookTestCase):
 
     async def test_responses_stream_web_search_tool_without_evidence_preserves_context_in_route_recovery(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0.004")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         recovery_requests = []
 

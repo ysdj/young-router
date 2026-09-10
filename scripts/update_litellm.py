@@ -46,7 +46,7 @@ def has_installable_artifact(files: object) -> bool:
 def latest_stable_version() -> str:
     request = urllib.request.Request(
         PYPI_JSON_URL,
-        headers={"Accept": "application/json", "User-Agent": "litellm-menu-version-check"},
+        headers={"Accept": "application/json", "User-Agent": "young-router-version-check"},
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         payload = json.load(response)

@@ -7,13 +7,13 @@ import stat
 import tempfile
 import unittest
 
-from litellm_menu.core import ConfirmationNeeded, CoreStore
-from litellm_menu.core.domains.claude import (
+from young_router.core import ConfirmationNeeded, CoreStore
+from young_router.core.domains.claude import (
     ClaudeSettingsDomain,
     ClaudeSettingsError,
     ConfirmationRequired,
 )
-from litellm_menu.core.domains.language import (
+from young_router.core.domains.language import (
     LANGUAGE_OPTIONS,
     LanguageSettingsDomain,
     LanguageSettingsError,
@@ -849,17 +849,17 @@ class LanguageSettingsDomainTests(unittest.TestCase):
     def test_language_file_environment_override_keeps_preview_state_separate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "preview-language.json"
-            previous = os.environ.get("LITELLM_MENU_LANGUAGE_FILE")
-            os.environ["LITELLM_MENU_LANGUAGE_FILE"] = str(path)
+            previous = os.environ.get("YOUNG_ROUTER_LANGUAGE_FILE")
+            os.environ["YOUNG_ROUTER_LANGUAGE_FILE"] = str(path)
             try:
                 domain = LanguageSettingsDomain()
                 domain.dispatch("set_language", {"language": "zh-Hans"})
                 domain.apply()
             finally:
                 if previous is None:
-                    os.environ.pop("LITELLM_MENU_LANGUAGE_FILE", None)
+                    os.environ.pop("YOUNG_ROUTER_LANGUAGE_FILE", None)
                 else:
-                    os.environ["LITELLM_MENU_LANGUAGE_FILE"] = previous
+                    os.environ["YOUNG_ROUTER_LANGUAGE_FILE"] = previous
             self.assertEqual({"language": "zh-Hans"}, json.loads(path.read_text(encoding="utf-8")))
 
     def test_malformed_optional_files_keep_routes_registered_and_reloadable(self) -> None:
@@ -921,10 +921,10 @@ class LanguageSettingsDomainTests(unittest.TestCase):
             with self.assertRaises(LanguageSettingsError):
                 domain.dispatch("set", {"language": "fr"})
         translator = create_translator("zh-Hans")
-        self.assertEqual("Claude 设置", translator("menu.claude"))
-        self.assertEqual("外部设置", translator("menu.codex"))
-        self.assertEqual("常规", translator("menu.general"))
-        self.assertEqual("日志 (路由恢复 1, 冷却 2)", translator("menu.logsSummary", {"recovering": 1, "cooldown": 2}))
+        self.assertEqual("Claude 设置", translator("status.claude"))
+        self.assertEqual("外部设置", translator("status.codex"))
+        self.assertEqual("常规", translator("status.general"))
+        self.assertEqual("日志 (路由恢复 1, 冷却 2)", translator("status.logsSummary", {"recovering": 1, "cooldown": 2}))
         self.assertEqual("正在加载文档...", translator("common.secureEditorLoading"))
         self.assertEqual("provider-custom", translator("provider-custom"))
 

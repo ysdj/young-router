@@ -14,7 +14,7 @@
 #include <vector>
 #include <winrt/Windows.Data.Json.h>
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 namespace {
 
 constexpr size_t kMaxIpcMessageBytes = 4 * 1024 * 1024;
@@ -146,7 +146,7 @@ bool HasRequiredCoreFiles(std::wstring const& core_directory) {
   namespace fs = std::filesystem;
   std::error_code error;
   std::vector<fs::path> required{
-      fs::path(core_directory) / L"litellm_menu" / L"core" / L"__main__.py",
+      fs::path(core_directory) / L"young_router" / L"core" / L"__main__.py",
       fs::path(core_directory) / L"config_editor_core" / L"api.py",
       fs::path(core_directory) / L"webdav" / L"core.py",
       fs::path(core_directory) / L"codex_config.py",
@@ -378,8 +378,8 @@ std::optional<std::string> CoreIPCBridge::ReadPlainTextSecret(
   return ReadSecret(
       capability->token,
       domain == "runtime" && field == "setting" && target &&
-          (*target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON" ||
-           *target == "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"));
+          (*target == "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON" ||
+           *target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"));
 }
 
 std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
@@ -696,13 +696,13 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
   std::wstring directory = PrivateRuntimeDirectory();
   std::wstring descriptor = directory + L"\\endpoint.json";
   std::wstring core_directory = ExecutableDirectory() + L"\\Core";
-  std::wstring python = Environment(L"LITELLM_MENU_CORE_PYTHON");
+  std::wstring python = Environment(L"YOUNG_ROUTER_CORE_PYTHON");
   if (python.empty()) python = core_directory + L"\\runtime\\bin\\python.exe";
   if (!IsExecutableFile(python) || !HasRequiredCoreFiles(core_directory)) {
     RemoveDirectoryW(directory.c_str());
     throw std::runtime_error("core unavailable");
   }
-  std::wstring command = Quote(python) + L" -m litellm_menu.core --endpoint-file " + Quote(descriptor) +
+  std::wstring command = Quote(python) + L" -m young_router.core --endpoint-file " + Quote(descriptor) +
       L" --parent-pid " + std::to_wstring(GetCurrentProcessId());
   std::vector<wchar_t> mutable_command(command.begin(), command.end());
   mutable_command.push_back(L'\0');
@@ -754,7 +754,7 @@ CoreIPCBridge::HttpResult CoreIPCBridge::Request(
     std::string const& body,
     std::wstring const& token,
     int receive_timeout_ms) {
-  WinHttpHandle session{WinHttpOpen(L"LiteLLMMenuCore/1", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
+  WinHttpHandle session{WinHttpOpen(L"YoungRouterCore/1", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
   if (!session) throw std::runtime_error("core unavailable");
   // Server long-poll is bounded at 20 seconds; 30 seconds keeps an ordinary
   // `event: null` heartbeat from invalidating the one-shot Core session.
@@ -968,4 +968,4 @@ void CoreIPCBridge::TakeCoreLocked(
   InvalidateCoreLocked(preserve_subscription);
 }
 
-}  // namespace LiteLLMMenu
+}  // namespace YoungRouter

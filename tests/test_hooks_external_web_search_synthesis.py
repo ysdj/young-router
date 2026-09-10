@@ -494,7 +494,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                     },
                     "litellm_params": {"model": "openai/vendor-chat"},
                     "request_params": {},
-                    "_litellm_menu_upstream_url_surface": "openai/chat",
+                    "_young_router_upstream_url_surface": "openai/chat",
                 }
                 if len(calls) == 1:
                     return {
@@ -543,7 +543,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "input": "查询上海今天天气。",
             "stream": True,
             "use_chat_completions_api": True,
-            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_young_router_upstream_url_surface": "openai/chat",
             "tools": [hooks._pi_web_access_tool_definitions()[0]],
             "litellm_metadata": {
                 hooks._WEB_SEARCH_EXTERNAL_BRIDGE_KEY: True,
@@ -564,7 +564,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             [{"type": "search", "query": "上海天气 今天"}],
         )
         self.assertEqual(
-            active_bridge_request["_litellm_menu_upstream_url_surface"],
+            active_bridge_request["_young_router_upstream_url_surface"],
             "openai/chat",
         )
         self.assertEqual(
@@ -664,7 +664,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             "model": "mapped-chat",
             "input": "Investigate the claim with the required skill.",
             "stream": True,
-            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_young_router_upstream_url_surface": "openai/chat",
             "tools": bridge_tools,
         }
 
@@ -1287,8 +1287,8 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
                 ],
             }
 
-        self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRIES", "1")
-        self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS", "0")
+        self.set_env("YOUNG_ROUTER_EXTERNAL_WEB_SEARCH_MODEL_RETRIES", "1")
+        self.set_env("YOUNG_ROUTER_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS", "0")
 
         response = await hooks._external_web_search_continue_or_synthesize(
             request_kwargs={
@@ -1444,7 +1444,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
     async def test_external_web_search_stream_empty_continuation_does_not_route_recover(self) -> None:
         hooks, _ = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         route_recovery_calls = []
 
@@ -1635,8 +1635,8 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             calls.append(kwargs)
             raise ServiceUnavailable("upstream 503")
 
-        self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRIES", "2")
-        self.set_env("LITELLM_MENU_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS", "0")
+        self.set_env("YOUNG_ROUTER_EXTERNAL_WEB_SEARCH_MODEL_RETRIES", "2")
+        self.set_env("YOUNG_ROUTER_EXTERNAL_WEB_SEARCH_MODEL_RETRY_DELAY_SECONDS", "0")
 
         with self.assertRaises(ServiceUnavailable) as context:
             await hooks._external_web_search_continue_or_synthesize(
@@ -1816,7 +1816,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
 
     async def test_external_web_search_post_call_suppress_marker_skips_hook(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         response = {
             "id": "resp_raw",
             "object": "response",
@@ -2507,10 +2507,10 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
     async def test_external_web_search_stream_prepares_continuation_recovery_before_continuation_task(self) -> None:
         hooks, _ = load_hook_module()
         original_run_action = hooks._external_web_search_run_action
-        bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = bridge_module._external_web_search_run_action
         original_continue = bridge_module._external_web_search_continue_or_synthesize
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         executed_actions = []
@@ -2889,7 +2889,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        self.set_env("LITELLM_MENU_WEB_SEARCH_MAX_ROUNDS", "2")
+        self.set_env("YOUNG_ROUTER_WEB_SEARCH_MAX_ROUNDS", "2")
         result = await hooks._resolve_web_search_function_calls(
             response,
             {
@@ -3273,7 +3273,7 @@ class HookExternalWebSearchSynthesisTests(HookTestCase):
             ],
         }
 
-        self.set_env("LITELLM_MENU_WEB_SEARCH_MAX_ROUNDS", "3")
+        self.set_env("YOUNG_ROUTER_WEB_SEARCH_MAX_ROUNDS", "3")
         chunks = [
             jsonable_stream_chunk(chunk)
             async for chunk in hooks._resolve_web_search_function_calls_stream_rounds(

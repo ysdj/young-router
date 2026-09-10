@@ -44,7 +44,7 @@ class HookCodexFastTierTests(HookTestCase):
         self._set_codex_config(
             'service_tier = "fast"\n[features]\nfast_mode = true\n'
         )
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         updated = await hook.async_pre_call_deployment_hook(
             self._codex_responses_request(), "aresponses"
@@ -63,7 +63,7 @@ class HookCodexFastTierTests(HookTestCase):
         self._set_codex_config(
             'service_tier = "priority"\n[features]\nfast_mode = true\n'
         )
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         for explicit_tier in ("standard", "priority", "flex", None):
             original = self._codex_responses_request(service_tier=explicit_tier)
 
@@ -81,7 +81,7 @@ class HookCodexFastTierTests(HookTestCase):
         self._set_codex_config(
             'service_tier = "fast"\n[features]\nfast_mode = true\n'
         )
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = self._codex_responses_request()
         original["proxy_server_request"]["headers"] = {"User-Agent": "curl/8.0"}
         original["extra_headers"] = {"User-Agent": "curl/8.0"}
@@ -96,7 +96,7 @@ class HookCodexFastTierTests(HookTestCase):
         self._set_codex_config(
             'service_tier = "fast"\n[features]\nfast_mode = true\n'
         )
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = self._codex_responses_request()
         original["proxy_server_request"]["method"] = "GET"
 
@@ -110,7 +110,7 @@ class HookCodexFastTierTests(HookTestCase):
         self._set_codex_config(
             'service_tier = "fast"\n[features]\nfast_mode = false\n'
         )
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = self._codex_responses_request()
 
         updated = await hook.async_pre_call_deployment_hook(original, "aresponses")
@@ -123,7 +123,7 @@ class HookCodexFastTierTests(HookTestCase):
         config_path = self._set_codex_config(
             'service_tier = "fast"\n[features]\nfast_mode = false\n'
         )
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.assertIsNone(
             await hook.async_pre_call_deployment_hook(
                 self._codex_responses_request(), "aresponses"
@@ -162,7 +162,7 @@ class HookCodexFastTierTests(HookTestCase):
         self._set_codex_config(
             'service_tier = "fast"\n[features]\nfast_mode = true\n'
         )
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         calls = []
         original_trace = hooks._route_trace
         hooks._route_trace = lambda event, **fields: calls.append((event, fields))

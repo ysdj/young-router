@@ -24,28 +24,28 @@ def _default_config_yaml() -> pathlib.Path:
 
     runtime_root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip()
     if not runtime_root:
-        runtime_root = os.environ.get("LITELLM_MENU_HOME", "").strip()
+        runtime_root = os.environ.get("YOUNG_ROUTER_HOME", "").strip()
     if runtime_root:
         return pathlib.Path(runtime_root).expanduser() / "config.yaml"
 
-    return pathlib.Path.home() / ".litellm-menu" / "config.yaml"
+    return pathlib.Path.home() / ".young-router" / "config.yaml"
 
 
 CONFIG_YAML = _default_config_yaml()
 DISABLED_MODELS_KEY = "disabled_model_list"
 DEFAULT_API_KEY_NAME = "default"
-MENU_MODEL_ENABLED_KEY = "x-litellm-menu-model-enabled"
+MENU_MODEL_ENABLED_KEY = "x-young-router-model-enabled"
 MENU_ROUTE_KEY = "route_key"
 MENU_API_KEY_NAME_KEY = "api_key_name"
-MENU_RELAY_KEYS_KEY = "x-litellm-menu-relay-keys"
+MENU_RELAY_KEYS_KEY = "x-young-router-relay-keys"
 MENU_RELAY_KEYS_VERSION = 1
-MENU_PROVIDER_KEY_ID_KEY = "x-litellm-menu-provider-key-id"
-MENU_RELAY_CATALOG_MODE_KEY = "x-litellm-menu-relay-catalog-mode"
-MENU_RELAY_SOURCE_MODEL_KEY = "x-litellm-menu-relay-source-model"
-MENU_ORDER_MODE_KEY = "x-litellm-menu-order-mode"
-MENU_MANUAL_ORDER_KEY = "x-litellm-menu-manual-order"
-MENU_PROVIDER_SOURCE_KEY = "x-litellm-menu-provider-source"
-MENU_PROVIDER_AUTH_KEY = "x-litellm-menu-provider-auth"
+MENU_PROVIDER_KEY_ID_KEY = "x-young-router-provider-key-id"
+MENU_RELAY_CATALOG_MODE_KEY = "x-young-router-relay-catalog-mode"
+MENU_RELAY_SOURCE_MODEL_KEY = "x-young-router-relay-source-model"
+MENU_ORDER_MODE_KEY = "x-young-router-order-mode"
+MENU_MANUAL_ORDER_KEY = "x-young-router-manual-order"
+MENU_PROVIDER_SOURCE_KEY = "x-young-router-provider-source"
+MENU_PROVIDER_AUTH_KEY = "x-young-router-provider-auth"
 PROVIDER_KEY_SOURCE_KINDS = {"independent", "relay"}
 PROVIDER_SOURCE_KINDS = {"custom", "relay"}
 PROVIDER_AUTH_KINDS = {"api_key", "openai_login", "claude_login"}
@@ -56,7 +56,7 @@ UPSTREAM_URL_SURFACE_KEY = "upstream_url_surface"
 UPSTREAM_URL_SURFACES = {"openai/chat", "openai/responses", "anthropic"}
 UPSTREAM_PROTOCOL_MODE_KEY = "upstream_protocol_mode"
 UPSTREAM_PROTOCOL_MODES = {"fallback", "fixed"}
-CURRENT_HOOK_CALLBACK = "litellm_menu.callbacks.image_generation_routing_hook"
+CURRENT_HOOK_CALLBACK = "young_router.callbacks.image_generation_routing_hook"
 YAML_MAX_EXPANDED_NODES = 100_000
 YAML_MAX_NESTING_DEPTH = 100
 YAML_MAX_FINAL_STRUCTURE_NODES = 100_000
@@ -295,7 +295,7 @@ def _stable_provider_key_id(provider_name: Any, api_key_name: Any) -> str:
     provider = _string_value(provider_name).strip()
     key_name = _string_value(api_key_name).strip()
     digest = hashlib.sha256(
-        f"litellm-menu-provider-key-v1\x1f{provider}\x1f{key_name}".encode("utf-8")
+        f"young-router-provider-key-v1\x1f{provider}\x1f{key_name}".encode("utf-8")
     ).hexdigest()[:32]
     # Avoid a token-like ``key-<long value>`` shape: generic snapshot
     # redaction correctly treats that pattern as a possible credential.

@@ -88,7 +88,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "upstream_url_surface": "openai/responses",
                 "supported_upstream_url_surfaces": ["openai/responses"],
             },
-            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_young_router_upstream_url_surface": "openai/responses",
         }
 
         self.assertIsNone(
@@ -1300,7 +1300,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
 
     async def test_pre_call_drops_tool_choice_when_tools_are_empty(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         request_kwargs = {
             "call_type": "aresponses",
@@ -1592,7 +1592,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat"],
             },
-            _litellm_menu_upstream_url_surface="openai/chat",
+            _young_router_upstream_url_surface="openai/chat",
         )
 
         self.assertEqual(response["output_text"], "ok")
@@ -1633,7 +1633,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "upstream_url_surface": "openai/chat",
                 "supported_upstream_url_surfaces": ["openai/chat"],
             },
-            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_young_router_upstream_url_surface": "openai/chat",
         }
         outer_responses = {
             "call_type": "aresponses",
@@ -1664,7 +1664,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
                 "provider": "relay-provider",
                 "upstream_url_surface": "anthropic",
             },
-            "_litellm_menu_upstream_url_surface": "anthropic",
+            "_young_router_upstream_url_surface": "anthropic",
         }
 
         bridge_kwargs = hooks._responses_chat_bridge_preemptive_kwargs(
@@ -1717,7 +1717,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
             },
         )
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         chunks = [
             jsonable_stream_chunk(chunk)
             async for chunk in hook.async_post_call_streaming_iterator_hook(
@@ -1738,7 +1738,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
 
     async def test_codex_compaction_request_preserves_native_request_shape(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         request_kwargs = {
             "call_type": "aresponses",
@@ -1785,7 +1785,7 @@ class HookResponsesChatBridgeTests(HookTestCase):
 
     async def test_codex_compaction_request_strips_existing_bridge_metadata(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         request_kwargs = {
             "call_type": "aresponses",

@@ -11,7 +11,7 @@ import unittest
 import urllib.request
 from unittest import mock
 
-from litellm_menu.core import (
+from young_router.core import (
     CoreIPCClient,
     CoreIPCServer,
     CoreStore,
@@ -24,10 +24,10 @@ from litellm_menu.core import (
     encode_message,
     load_protocol_schema,
 )
-from litellm_menu.core import __main__ as core_main
-from litellm_menu.core.protocol import validate_method_result
-from litellm_menu.core.persistence import AtomicJSONStore, PersistenceError
-from litellm_menu.core.security import REDACT_TEXT, redact, safe_error_message
+from young_router.core import __main__ as core_main
+from young_router.core.protocol import validate_method_result
+from young_router.core.persistence import AtomicJSONStore, PersistenceError
+from young_router.core.security import REDACT_TEXT, redact, safe_error_message
 
 
 class CoreProtocolTests(unittest.TestCase):
@@ -42,8 +42,8 @@ class CoreProtocolTests(unittest.TestCase):
             served.set()
 
         with (
-            mock.patch("litellm_menu.core.ipc.http.server.ThreadingHTTPServer.serve_forever", serve_forever),
-            mock.patch("litellm_menu.core.ipc.http.server.ThreadingHTTPServer.shutdown"),
+            mock.patch("young_router.core.ipc.http.server.ThreadingHTTPServer.serve_forever", serve_forever),
+            mock.patch("young_router.core.ipc.http.server.ThreadingHTTPServer.shutdown"),
         ):
             server.start()
             self.assertTrue(served.wait(1.0))
@@ -494,7 +494,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
         result = core.import_package(
             package={
-                "format": "litellm-menu-core-package",
+                "format": "young-router-core-package",
                 "version": 1,
                 "sections": {"runtime": {"port": "4000"}},
             },
@@ -513,7 +513,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             ]
         )
         package = {
-            "format": "litellm-menu-core-package",
+            "format": "young-router-core-package",
             "version": 1,
             "sections": {"providers_models": {"value": "imported"}},
         }
@@ -529,7 +529,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         self.assertEqual("invalid_sections", raised.exception.code)
 
     def test_language_package_export_and_import_are_selectable(self) -> None:
-        from litellm_menu.core.domains.language import LanguageSettingsDomain
+        from young_router.core.domains.language import LanguageSettingsDomain
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "language.json"
@@ -606,7 +606,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
         imported = core.import_package(
             package={
-                "format": "litellm-menu-core-package",
+                "format": "young-router-core-package",
                 "version": 1,
                 "sections": {
                     "language": {"state": {"choice": "system"}},
@@ -629,7 +629,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         with self.assertRaises(Exception) as raised:
             core.import_package(
                 package={
-                    "format": "litellm-menu-core-package",
+                    "format": "young-router-core-package",
                     "version": 1,
                     "sections": {"language": {"state": {"choice": "system"}}},
                 },
@@ -676,7 +676,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 core.import_package(
                     package={
-                        "format": "litellm-menu-core-package",
+                        "format": "young-router-core-package",
                         "version": 1,
                         "sections": {
                             "providers_models": {"value": "first-import"},
@@ -701,7 +701,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = Path(directory) / "settings.json"
             settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"synthetic-token"}}\n', encoding="utf-8")
-            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+            from young_router.core.domains.claude import ClaudeSettingsDomain
 
             core = CoreStore(domains=[ClaudeSettingsDomain(settings)])
             snapshot = json.dumps(core.snapshot())
@@ -737,7 +737,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = Path(directory) / "settings.json"
             settings.write_text('{"model":"disk-model"}\n', encoding="utf-8")
-            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+            from young_router.core.domains.claude import ClaudeSettingsDomain
 
             core = CoreStore(domains=[ClaudeSettingsDomain(settings)])
             server = CoreIPCServer(core)
@@ -786,7 +786,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+            from young_router.core.domains.claude import ClaudeSettingsDomain
 
             core = CoreStore(
                 domains=[ClaudeSettingsDomain(
@@ -835,7 +835,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
     def test_editor_capability_is_session_bound_and_rejects_a_stale_revision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+            from young_router.core.domains.claude import ClaudeSettingsDomain
 
             core = CoreStore(domains=[ClaudeSettingsDomain(Path(directory) / "settings.json")])
             server = CoreIPCServer(core)
@@ -870,7 +870,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         """
 
         with tempfile.TemporaryDirectory() as directory:
-            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+            from young_router.core.domains.claude import ClaudeSettingsDomain
 
             core = CoreStore(
                 domains=[
@@ -914,7 +914,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
     def test_editor_stage_rotates_the_capability_for_continuous_editing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+            from young_router.core.domains.claude import ClaudeSettingsDomain
 
             core = CoreStore(domains=[ClaudeSettingsDomain(Path(directory) / "settings.json")])
             server = CoreIPCServer(core)
@@ -956,7 +956,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         """The React editor can reload a document and continue staging after token loss."""
 
         with tempfile.TemporaryDirectory() as directory:
-            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+            from young_router.core.domains.claude import ClaudeSettingsDomain
 
             core = CoreStore(domains=[ClaudeSettingsDomain(Path(directory) / "settings.json")])
             server = CoreIPCServer(core)
@@ -994,7 +994,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         """
 
         with tempfile.TemporaryDirectory() as directory:
-            from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+            from young_router.core.domains.claude import ClaudeSettingsDomain
 
             core = CoreStore(domains=[ClaudeSettingsDomain(Path(directory) / "settings.json")])
             server = CoreIPCServer(core)
@@ -1026,7 +1026,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
     def test_codex_raw_editors_remain_valid_when_the_sibling_document_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            from litellm_menu.core.domains.codex import CodexSettingsDomain
+            from young_router.core.domains.codex import CodexSettingsDomain
 
             root = Path(directory)
             config = root / "config.yaml"
@@ -1069,7 +1069,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertIn("second", refreshed_auth["text"])
 
     def test_claude_plaintext_dispatch_requires_native_capabilities(self) -> None:
-        from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+        from young_router.core.domains.claude import ClaudeSettingsDomain
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1107,7 +1107,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertTrue(core.snapshot()["domains"]["claude"]["settings"]["autoMemoryDirectoryConfigured"])
 
     def test_claude_snapshot_hides_command_and_permission_rule_text_but_editor_ipc_returns_it(self) -> None:
-        from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+        from young_router.core.domains.claude import ClaudeSettingsDomain
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1188,7 +1188,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             )
 
     def test_secret_capability_rejects_stale_revision_and_http_response_is_presence_only(self) -> None:
-        from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
+        from young_router.core.domains.webdav import WebDAVSettingsDomain
 
         with tempfile.TemporaryDirectory() as directory:
             settings = Path(directory) / "webdav.json"
@@ -1228,7 +1228,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertNotIn("synthetic-secret", body.decode("utf-8"))
 
     def test_provider_api_key_plaintext_readback_is_narrow_and_read_once(self) -> None:
-        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+        from young_router.core.domains.providers_models import ProvidersModelsDomain
 
         api_key = "test-provider-api-key"
         with tempfile.TemporaryDirectory() as directory:
@@ -1405,7 +1405,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
 class CoreIPCTests(unittest.TestCase):
     def test_dispatch_returns_the_fetch_summary_through_authenticated_ipc(self) -> None:
-        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
+        from young_router.core.domains.providers_models import ProvidersModelsDomain
 
         class ModelListResponse:
             status = 200
@@ -1448,7 +1448,7 @@ class CoreIPCTests(unittest.TestCase):
             provider_id = snapshot["domains"]["providers_models"]["providers"][0]["id"]
             opener = ModelListOpener()
             with mock.patch(
-                "litellm_menu.core.domains.providers_models.isolated_http_opener",
+                "young_router.core.domains.providers_models.isolated_http_opener",
                 return_value=opener,
             ):
                 staged = client.call(
@@ -1594,13 +1594,13 @@ class CoreIPCTests(unittest.TestCase):
             self.assertIn(preview["import_plan_token"], server._import_plans)
 
     def test_import_plan_expiry_consumes_only_the_expired_lease(self) -> None:
-        from litellm_menu.core.service import PreparedImport
+        from young_router.core.service import PreparedImport
 
         target = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
         server = CoreIPCServer(target)
         prepared = PreparedImport(
             package={
-                "format": "litellm-menu-core-package",
+                "format": "young-router-core-package",
                 "version": 1,
                 "sections": {"language": {"state": {"choice": "en"}}},
             },
@@ -1608,7 +1608,7 @@ class CoreIPCTests(unittest.TestCase):
             preview={"language": {"available": True, "will_replace_draft": False}},
             revision=target.revision,
         )
-        with mock.patch("litellm_menu.core.ipc.IMPORT_PLAN_TTL_SECONDS", -1):
+        with mock.patch("young_router.core.ipc.IMPORT_PLAN_TTL_SECONDS", -1):
             token = server._register_import_plan(prepared, session_token="owner-session")
 
         with self.assertRaises(Exception) as expired:
@@ -1672,8 +1672,8 @@ class CoreIPCTests(unittest.TestCase):
         self.assertEqual(["language"], result["domains"])
 
     def test_provider_apply_with_auth_manager_survives_transaction_checkpoint(self) -> None:
-        from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-        from litellm_menu.core.provider_auth import ProviderAuthManager
+        from young_router.core.domains.providers_models import ProvidersModelsDomain
+        from young_router.core.provider_auth import ProviderAuthManager
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

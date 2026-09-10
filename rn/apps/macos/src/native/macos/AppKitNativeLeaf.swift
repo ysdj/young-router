@@ -65,7 +65,7 @@ private enum NativeRelayOriginPolicy {
         contentsOf: Bundle.main.url(forResource: "AppIcon", withExtension: "icns")!
     )!
     private static let statusBarIcon: NSImage = {
-        let image = NSImage(named: NSImage.Name("MenuIcon"))!
+        let image = NSImage(named: NSImage.Name("StatusBarIcon"))!
         image.size = NSSize(width: 20, height: 20)
         image.isTemplate = true
         return image
@@ -92,7 +92,7 @@ private enum NativeRelayOriginPolicy {
         "service-start", "service-stop", "service-restart", "service-reload", "service-health",
     ]
     private static let applicationMenuActionIDs = [
-        "language-menu", "set-language-system", "set-language-en", "set-language-zh-Hans",
+        "language-picker", "set-language-system", "set-language-en", "set-language-zh-Hans",
     ]
     public static let shared = AppKitNativeLeaf()
     /// The Core capability exchange is asynchronous so AppKit never waits on
@@ -143,7 +143,7 @@ private enum NativeRelayOriginPolicy {
     private var menuNeedsRefresh = false
     private var pendingActions: [String] = []
     private var strings: [String: String] = [
-        "appTitle": "LiteLLM Menu", "autoStart": "Auto Start at Login", "serviceUnavailable": "service unavailable",
+        "appTitle": "Young Router", "autoStart": "Auto Start at Login", "serviceUnavailable": "service unavailable",
         "serviceStatus": "Status: {status}", "serviceStarting": "Starting",
         "cancel": "Cancel", "set": "Set", "clear": "Clear", "stage": "Stage", "find": "Find", "findNext": "Find Next",
         "edit": "Edit", "undo": "Undo", "redo": "Redo", "cut": "Cut", "copy": "Copy",
@@ -151,8 +151,8 @@ private enum NativeRelayOriginPolicy {
         "reload": "Reload", "closeWindow": "Close Window", "version": "Version",
         "build": "build", "ok": "OK", "invalidText": "The document contains invalid text.",
         "languageMenu": "Language", "languageSystem": "System", "languageEnglish": "English", "languageSimplifiedChinese": "简体中文",
-        "menuQuit": "Quit LiteLLM Menu",
-        "routeHome": "LiteLLM Menu", "routeProvidersModels": "Providers & Models",
+        "menuQuit": "Quit Young Router",
+        "routeHome": "Young Router", "routeProvidersModels": "Providers & Models",
         "routeProviderWizard": "Add Provider",
         "providerAuthInstruction": "Complete sign-in on the official provider page. The code below is shown only for this device-code flow.",
         "providerAuthCode": "Device code", "providerAuthCopy": "Copy", "providerAuthBlocked": "This navigation was blocked because it is outside the official provider authentication flow.",
@@ -173,7 +173,7 @@ private enum NativeRelayOriginPolicy {
         statusItem.button?.title = ""
         statusItem.button?.image = Self.statusBarIcon
         statusItem.button?.imagePosition = .imageOnly
-        statusItem.button?.setAccessibilityLabel(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "LiteLLM Menu")
+        statusItem.button?.setAccessibilityLabel(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Young Router")
         // A left click opens the settings window; the status menu stays on
         // right-click (and Control-click) for service and lifecycle actions.
         statusItem.button?.target = self
@@ -508,7 +508,7 @@ private enum NativeRelayOriginPolicy {
             defer: false
         )
         configureImmediatePresentation(panel)
-        panel.title = localized("appTitle", fallback: "LiteLLM Menu")
+        panel.title = localized("appTitle", fallback: "Young Router")
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
@@ -1251,8 +1251,8 @@ private enum NativeRelayOriginPolicy {
         if let existing = mainMenu.items.first?.submenu {
             applicationMenu = existing
         } else {
-            applicationMenu = NSMenu(title: "LiteLLM Menu")
-            let appRoot = NSMenuItem(title: "LiteLLM Menu", action: nil, keyEquivalent: "")
+            applicationMenu = NSMenu(title: "Young Router")
+            let appRoot = NSMenuItem(title: "Young Router", action: nil, keyEquivalent: "")
             appRoot.submenu = applicationMenu
             mainMenu.insertItem(appRoot, at: 0)
         }
@@ -1261,7 +1261,7 @@ private enum NativeRelayOriginPolicy {
         // duplicate them (About shows the standard panel, Preferences gets the
         // Settings action and ⌘,).
         if let aboutItem = applicationMenu.items.first(where: { $0.action == Selector(("orderFrontStandardAboutPanel:")) }) {
-            aboutItem.title = localized("about", fallback: "About LiteLLM Menu")
+            aboutItem.title = localized("about", fallback: "About Young Router")
         }
         if let preferencesItem = applicationMenu.items.first(where: { $0.action == nil && $0.keyEquivalent == "," }) {
             preferencesItem.title = localized("settings", fallback: "Settings…")
@@ -1291,7 +1291,7 @@ private enum NativeRelayOriginPolicy {
         }
         if !applicationMenu.items.contains(where: { $0.action == #selector(quit) || $0.action == #selector(NSApplication.terminate(_:)) }) {
             applicationMenu.addItem(.separator())
-            let quitItem = applicationMenu.addItem(withTitle: localized("menuQuit", fallback: "Quit LiteLLM Menu"), action: #selector(quit), keyEquivalent: "q")
+            let quitItem = applicationMenu.addItem(withTitle: localized("menuQuit", fallback: "Quit Young Router"), action: #selector(quit), keyEquivalent: "q")
             quitItem.keyEquivalentModifierMask = [.command]
             quitItem.target = self
             quitItem.representedObject = "native-quit"
@@ -1351,7 +1351,7 @@ private enum NativeRelayOriginPolicy {
         let build = info["CFBundleVersion"] as? String ?? "?"
         let alert = NSAlert()
         configureImmediatePresentation(alert.window)
-        alert.messageText = localized("appTitle", fallback: "LiteLLM Menu")
+        alert.messageText = localized("appTitle", fallback: "Young Router")
         alert.informativeText = "\(localized("version", fallback: "Version")) \(version) (\(localized("build", fallback: "build")) \(build))"
         alert.addButton(withTitle: localized("ok", fallback: "OK"))
         NSApp.activate(ignoringOtherApps: true)
@@ -1535,7 +1535,7 @@ private enum NativeRelayOriginPolicy {
         case "open-data-management": return localized("routeDataManagement", fallback: "Data Management")
         case "open-logs", "open-logs?tab=recovery": return localized("routeLogs", fallback: "Logs")
         case "show-version": return localized("version", fallback: "Version")
-        case "quit": return localized("menuQuit", fallback: "Quit LiteLLM Menu")
+        case "quit": return localized("menuQuit", fallback: "Quit Young Router")
         default: return nil
         }
     }
@@ -1620,7 +1620,7 @@ private enum NativeRelayOriginPolicy {
             case "open-settings": item.title = localized("settings", fallback: "Settings...")
             case "native-reload": item.title = localized("reload", fallback: "Reload")
             case "native-close-window": item.title = localized("closeWindow", fallback: "Close Window")
-            case "native-quit": item.title = localized("menuQuit", fallback: "Quit LiteLLM Menu")
+            case "native-quit": item.title = localized("menuQuit", fallback: "Quit Young Router")
             default: break
             }
         }
@@ -1634,10 +1634,10 @@ private enum NativeRelayOriginPolicy {
 
     private func installLanguageMenu(in applicationMenu: NSMenu) {
         applicationMenu.items
-            .filter { $0.representedObject as? String == "native-language-menu" }
+            .filter { $0.representedObject as? String == "native-language-picker" }
             .forEach(applicationMenu.removeItem)
         let root = NSMenuItem(title: localized("languageMenu", fallback: "Language"), action: nil, keyEquivalent: "")
-        root.representedObject = "native-language-menu"
+        root.representedObject = "native-language-picker"
         let submenu = NSMenu(title: root.title)
         for (id, key, fallback) in [
             ("set-language-system", "languageSystem", "System"),
@@ -1791,7 +1791,7 @@ private enum NativeRelayOriginPolicy {
 
     private func routeTitle(_ route: String) -> String? {
         switch route {
-        case "home": return localized("routeHome", fallback: "LiteLLM Menu")
+        case "home": return localized("routeHome", fallback: "Young Router")
         case "providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "Codex / Claude Settings")
@@ -1808,17 +1808,17 @@ private enum NativeRelayOriginPolicy {
         // Settings panes share one window, so its title is the app name while
         // the sidebar selection names the active pane (System Settings style).
         if Self.settingsPaneRoutes.contains(canonicalRoute(route)) {
-            return localized("appTitle", fallback: "LiteLLM Menu")
+            return localized("appTitle", fallback: "Young Router")
         }
         switch route {
-        case "home": return localized("routeHome", fallback: "LiteLLM Menu")
+        case "home": return localized("routeHome", fallback: "Young Router")
         case "provider-wizard": return "LiteLLM " + localized("routeProviderWizard", fallback: "Add Provider")
         default: return nil
         }
     }
 
     private func isAllowedLogTab(_ tab: String) -> Bool {
-        ["requests", "service", "menu", "route-trace", "recovery", "online-usage"].contains(tab)
+        ["requests", "service", "actions", "route-trace", "recovery", "online-usage"].contains(tab)
     }
 
     private func localized(_ key: String, fallback: String) -> String {
@@ -2391,7 +2391,7 @@ final class NativeSplitView: NSSplitView {
         super.init(frame: frameRect)
         isVertical = true
         dividerStyle = .thin
-        autosaveName = "LiteLLMMenu.SettingsSplitView"
+        autosaveName = "YoungRouter.SettingsSplitView"
     }
 
     required init?(coder: NSCoder) {
@@ -3398,7 +3398,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     private static let immediateWebPresentationScript = """
     (() => {
-      const styleID = '__litellm_menu_immediate_presentation';
+      const styleID = '__young_router_immediate_presentation';
       const gradientPattern = /gradient[(]/i;
       const imageProperties = ['background-image', 'border-image-source', 'mask-image'];
       const splitImageLayers = (value) => {
@@ -3574,7 +3574,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                         const value = node?.value;
                         if (typeof value === 'string' && value.length) {
                           const password = value.slice(0, 4096);
-                          sessionStorage.setItem('__litellm_menu_relay_password', password);
+                          sessionStorage.setItem('__young_router_relay_password', password);
                           try { window.webkit.messageHandlers.litellmRelayPassword.postMessage(password); } catch {}
                         }
                       };
@@ -4095,7 +4095,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     private func captureBrowserCredentials(attempt: NativeRelayLoginAttempt, completion: @escaping () -> Void) {
         let passwordExpression = mode == .login
-            ? "sessionStorage.getItem('__litellm_menu_relay_password') || document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || ''"
+            ? "sessionStorage.getItem('__young_router_relay_password') || document.querySelector('input[type=password],input[autocomplete=current-password]')?.value || ''"
             : "''"
         let script = """
         (() => ({

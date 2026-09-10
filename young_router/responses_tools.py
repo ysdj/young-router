@@ -1,0 +1,1123 @@
+from __future__ import annotations
+
+import json
+
+from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import request_context as _request_context_module
+from . import routing as _routing_module
+from . import tools as _tools_module
+from . import trace as _trace_module
+
+
+from .base import (
+    Any,
+    HostedToolPlan,
+    Optional,
+    _COMPUTER_FACADE_BROWSER_BACKEND,
+    _COMPUTER_FACADE_CHROME_BACKEND,
+    _COMPUTER_FACADE_MCP_BACKEND,
+    _HOSTED_GA_COMPUTER_TOOL_TYPES,
+    _HOSTED_WEB_SEARCH_TOOL_TYPES,
+    _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
+    _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY,
+    _RESPONSES_BRIDGE_NAMESPACE_KEY,
+    _RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY,
+    _TOOL_SEARCH_BRIDGE_FUNCTION_NAME,
+    copy,
+    re,
+)
+
+
+
+def _responses_chat_bridge_tool_schema(value: Any) -> Any:
+    """Sanitize one JSON-schema fragment for the bridged tool surface.
+
+    Drops the two constructs strict third-party tool validators reject:
+    empty ``enum`` members, and a ``type`` sibling beside ``$ref``. The
+    Moonshot-flavored schema validator used by relays in front of Kimi
+    models returns ``when using $ref, type should be defined in the
+    referenced schema instead of the parent schema`` for the latter, and
+    Codex Desktop's compacted namespace-tool schemas (``$defs.__schemaN``)
+    emit exactly that shape. Removing the redundant sibling is lossless for
+    validators that follow the referenced schema.
+    """
+
+    if isinstance(value, list):
+        return [_responses_chat_bridge_tool_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+
+    sanitized: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "enum" and isinstance(item, list) and not item:
+            continue
+        sanitized[key] = _responses_chat_bridge_tool_schema(item)
+    if "$ref" in sanitized and "type" in sanitized:
+        del sanitized["type"]
+    return sanitized
+
+
+def _responses_chat_bridge_function_parameters(value: Any) -> dict:
+    """Return a JSON-schema object accepted by the function-tool bridge.
+
+    The Responses function-tool shape requires an object parameter schema.
+    Keep the caller's properties and required members unchanged, while making
+    the omitted empty ``required`` member explicit for tools with no required
+    arguments.  This is a protocol-shape repair, not a provider-specific
+    schema rewrite.
+    """
+
+    normalized = _responses_chat_bridge_tool_schema(value)
+    if not isinstance(normalized, dict):
+        normalized = {}
+    else:
+        normalized = copy.deepcopy(normalized)
+    normalized.setdefault("type", "object")
+    if not isinstance(normalized.get("properties"), dict):
+        normalized["properties"] = {}
+    if "required" not in normalized:
+        normalized["required"] = []
+    return normalized
+
+
+def _responses_function_tool_schema_compat_retry_kwargs(
+    request_kwargs: Any,
+) -> Optional[dict]:
+    """Drop only explicit ``strict=false`` on one function-tool retry.
+
+    ``strict`` defaults to false for the Chat function-tool shape.  A few
+    gateways reject the explicit member while accepting the equivalent
+    omitted form, so this keeps the schema and semantics intact while giving
+    the same protocol one narrowly bounded compatibility attempt.  Explicit
+    ``strict=true`` is preserved.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "litellm_metadata",
+    ) or {}
+    if metadata.get(_RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY) is True:
+        return None
+    tools = request_kwargs.get("tools")
+    if not isinstance(tools, list):
+        return None
+
+    updated_tools = copy.deepcopy(tools)
+    changed = False
+    for tool in updated_tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "function" and tool.get("strict") is False:
+            tool.pop("strict", None)
+            changed = True
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("strict") is False:
+            function.pop("strict", None)
+            changed = True
+    if not changed:
+        return None
+    retry_kwargs = request_kwargs.copy()
+    retry_kwargs["tools"] = updated_tools
+    retry_metadata = metadata.copy()
+    retry_metadata[_RESPONSES_FUNCTION_TOOL_SCHEMA_RETRY_METADATA_KEY] = True
+    retry_kwargs["litellm_metadata"] = retry_metadata
+    return retry_kwargs
+
+
+def _responses_chat_bridge_tool_schema_has_empty_enum(value: Any) -> bool:
+    if isinstance(value, list):
+        return any(_responses_chat_bridge_tool_schema_has_empty_enum(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+    return any(
+        (key == "enum" and isinstance(item, list) and not item)
+        or _responses_chat_bridge_tool_schema_has_empty_enum(item)
+        for key, item in value.items()
+    )
+
+
+def _responses_bridge_function_tool(tool: Any) -> Optional[dict]:
+    if not isinstance(tool, dict) or tool.get("type") != "function":
+        return None
+
+    function = tool.get("function")
+    function_dict = function if isinstance(function, dict) else {}
+    name = _routing_module._valid_chat_tool_name(function_dict.get("name") or tool.get("name"))
+    if name is None:
+        return None
+
+    parameters = function_dict.get("parameters")
+    if parameters is None:
+        parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {}
+
+    converted: dict[str, Any] = {
+        "type": "function",
+        "name": name,
+        "parameters": _responses_chat_bridge_function_parameters(parameters),
+    }
+    description = _responses_bridge_tool_description(tool)
+    if isinstance(description, str):
+        converted["description"] = description
+
+    strict = function_dict.get("strict")
+    if strict is None:
+        strict = tool.get("strict")
+    if isinstance(strict, bool):
+        converted["strict"] = strict
+
+    # LiteLLM preserves a few Responses function-tool extensions during its
+    # own Responses->Chat conversion. Keep only the safe, documented ones.
+    for key in ("cache_control", "defer_loading", "allowed_callers", "input_examples"):
+        if key in tool:
+            converted[key] = tool[key]
+    return converted
+
+
+def _responses_bridge_custom_tool(tool: Any) -> Optional[dict]:
+    if not isinstance(tool, dict) or tool.get("type") != "custom":
+        return None
+
+    name = _routing_module._valid_chat_tool_name(tool.get("name"))
+    if name is None:
+        return None
+
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Raw custom tool input.",
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": False,
+        }
+
+    converted: dict[str, Any] = {
+        "type": "function",
+        "name": name,
+        "parameters": _responses_chat_bridge_function_parameters(parameters),
+        _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY: True,
+    }
+    description = _responses_bridge_tool_description(tool)
+    if isinstance(description, str):
+        converted["description"] = description
+    return converted
+
+
+def _responses_bridge_tool_description(tool: dict, namespace: Optional[str] = None) -> Optional[str]:
+    description = tool.get("description")
+    if not isinstance(description, str):
+        function = tool.get("function")
+        function_dict = function if isinstance(function, dict) else {}
+        description = function_dict.get("description")
+    if not isinstance(description, str):
+        description = ""
+    description = " ".join(description.split())
+
+    notes: list[str] = []
+    function = tool.get("function")
+    function_dict = function if isinstance(function, dict) else {}
+    tool_name = _routing_module._valid_chat_tool_name(
+        function_dict.get("name") or tool.get("name")
+    )
+    if tool_name in {"exec_command", "shell"}:
+        notes.append(
+            "Use this local shell tool to inspect repository files, list paths, "
+            "search text, and run project commands."
+        )
+    elif tool_name == "exec" and tool.get("type") == "custom":
+        notes.append(
+            "The raw input to this tool must be executable JavaScript for the "
+            "code-mode runtime. Never pass a bare *** Begin Patch block as the "
+            "tool input. Apply patches from JavaScript with "
+            "text(await tools.apply_patch(patchText))."
+        )
+    elif tool_name == "write_stdin":
+        notes.append("Use this only to continue a running exec_command session.")
+    elif tool_name == "apply_patch":
+        notes.append(
+            "Use this for file edits; inspect files with local read/search commands first."
+        )
+    elif tool_name in {"list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"}:
+        notes.append("Use this for MCP resources, not normal workspace files.")
+
+    if namespace:
+        notes.append(
+            f"This tool was originally exposed under the {namespace} namespace."
+        )
+
+    if not notes:
+        return description or None
+    note = " ".join(notes)
+    if description:
+        if note in description:
+            return description
+        return f"{description} {note}"
+    return note
+
+
+def _responses_bridge_tool_search_tool(tool: Any) -> Optional[dict]:
+    if not isinstance(tool, dict) or tool.get("type") != "tool_search":
+        return None
+
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language query for deferred tool discovery.",
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum number of matching tools to return.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+
+    description = tool.get("description")
+    if not isinstance(description, str) or not description.strip():
+        description = (
+            "Search the client-side deferred tool registry and return matching "
+            "tool definitions, such as Codex sub-agent tools."
+        )
+
+    converted: dict[str, Any] = {
+        "type": "function",
+        "name": _TOOL_SEARCH_BRIDGE_FUNCTION_NAME,
+        "description": description,
+        "parameters": _responses_chat_bridge_function_parameters(parameters),
+    }
+    if isinstance(tool.get("execution"), str):
+        converted["x-young-router-responses-tool-search-execution"] = tool["execution"]
+    return converted
+
+
+def _responses_bridge_namespace_tools(tool: Any) -> list[dict]:
+    if not isinstance(tool, dict) or tool.get("type") != "namespace":
+        return []
+    child_tools = tool.get("tools")
+    if not isinstance(child_tools, list):
+        return []
+    namespace = tool.get("name")
+    namespace_name = namespace.strip() if isinstance(namespace, str) else ""
+
+    converted_tools: list[dict] = []
+    seen_names: set[str] = set()
+    for child_tool in child_tools:
+        converted = _responses_bridge_function_tool(child_tool)
+        if converted is None:
+            converted = _responses_bridge_custom_tool(child_tool)
+        if converted is None:
+            continue
+        name = converted.get("name")
+        if not isinstance(name, str) or name in seen_names:
+            continue
+        if namespace_name:
+            converted[_RESPONSES_BRIDGE_NAMESPACE_KEY] = namespace_name
+            description = _responses_bridge_tool_description(child_tool, namespace_name)
+            if description:
+                converted["description"] = description
+        seen_names.add(name)
+        converted_tools.append(converted)
+    return converted_tools
+
+
+def _responses_bridge_web_search_options(tool: Any) -> Optional[dict]:
+    if not isinstance(tool, dict) or tool.get("type") not in {
+        "web_search",
+        "web_search_preview",
+    }:
+        return None
+
+    options: dict[str, Any] = {}
+    search_context_size = tool.get("search_context_size")
+    if isinstance(search_context_size, str) and search_context_size in {
+        "low",
+        "medium",
+        "high",
+    }:
+        options["search_context_size"] = search_context_size
+
+    user_location = tool.get("user_location")
+    if isinstance(user_location, dict):
+        options["user_location"] = user_location.copy()
+
+    return options
+
+
+def _responses_bridge_provider_native_web_search_tool(tool: Any) -> Optional[dict]:
+    """Keep a provider server-tool declaration intact during tool bridging.
+
+    OpenRouter's ``openrouter:web_search`` is executed by the upstream
+    gateway, not by the local pi worker. It must never be replaced with the
+    local function pair merely because another client tool needs a Chat
+    compatibility bridge.
+    """
+
+    if not isinstance(tool, dict):
+        return None
+    if tool.get("type") not in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
+        return None
+    return copy.deepcopy(tool)
+
+
+def _pi_web_access_tool_definitions() -> list[dict[str, Any]]:
+    """Return the model-facing function tools registered by pi-web-access.
+
+    The proxy executes these calls through the bundled pi-web-access worker.
+    Keep the public names and parameter shape aligned with the extension so a
+    model can choose them normally; do not replace them with a private proxy
+    function or an instruction that forces a call.
+    """
+    return [
+        {
+            "type": "function",
+            "name": "web_search",
+            "description": (
+                "Search the web using the configured pi-web-access providers. "
+                "Use query for one search or queries for several varied searches. "
+                "Returns source URLs and snippets; use fetch_content to read a "
+                "known result page."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Single search query.",
+                    },
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple varied search queries.",
+                    },
+                    "numResults": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "description": "Results per query (default 5, max 20).",
+                    },
+                    "includeContent": {
+                        "type": "boolean",
+                        "description": "Request full page content when supported.",
+                    },
+                    "recencyFilter": {
+                        "type": "string",
+                        "enum": ["day", "week", "month", "year"],
+                        "description": "Optional recency filter.",
+                    },
+                    "domainFilter": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional domain allow/deny list.",
+                    },
+                    "provider": {
+                        "description": "Optional configured provider or provider list.",
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
+                    },
+                    "workflow": {
+                        "type": "string",
+                        "enum": ["none", "summary-review", "auto-summary"],
+                        "description": "Search workflow; use none for a direct result set.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "fetch_content",
+            "description": (
+                "Fetch a known URL and extract readable content as markdown. "
+                "Use this after web_search when the snippets are insufficient."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Single URL to fetch."},
+                    "urls": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple URLs to fetch.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["readable", "raw", "answer"],
+                        "description": "Fetch mode; readable is the default.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Question for mode answer.",
+                    },
+                    "forceClone": {
+                        "type": "boolean",
+                        "description": "Force cloning a large GitHub repository.",
+                    },
+                    "answerModel": {"type": "string"},
+                    "timestamp": {"type": "string"},
+                    "frames": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "model": {"type": "string"},
+                    "auth": {"oneOf": [{"type": "string"}, {"type": "boolean"}]},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def _responses_external_web_search_bridge_tools(
+    tools: Any,
+) -> tuple[Optional[list[dict]], dict[str, Any]]:
+    if not isinstance(tools, list):
+        return None, {"changed": False}
+
+    bridged_tools: list[dict] = []
+    bridged_web_search_tools = 0
+    has_direct_search_tool = _tools_module._tools_include_pi_web_access_tool(tools)
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") in ({"web_search", "web_search_preview"} | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES):
+            bridged_web_search_tools += 1
+            if not has_direct_search_tool:
+                bridged_tools.extend(_pi_web_access_tool_definitions())
+                has_direct_search_tool = True
+            continue
+        bridged_tools.append(copy.deepcopy(tool))
+
+    changed = bridged_web_search_tools > 0 and bridged_tools != tools
+    stats = {
+        "changed": changed,
+        "original_count": len(tools),
+        "kept_count": len(bridged_tools),
+        "bridged_web_search_tools": bridged_web_search_tools,
+        "kept_tool_types": _trace_module._trace_tool_types(bridged_tools),
+        "kept_tool_names": _trace_module._trace_tool_names(bridged_tools),
+    }
+    return bridged_tools if changed else None, stats
+
+
+def _responses_external_web_search_bridge_tool_choice(tool_choice: Any) -> Any:
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    if tool_choice.get("type") not in ({"web_search", "web_search_preview"} | _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES):
+        return tool_choice
+    # A hosted tool choice cannot be represented after the fallback becomes an
+    # ordinary pi-web-access function. Keep the model's normal choice policy;
+    # do not force a particular local function call.
+    return "auto"
+
+
+def _responses_input_tool_search_output_tool_names(value: Any) -> list[str]:
+    names: list[str] = []
+
+    def add_name(name: Any) -> None:
+        if not isinstance(name, str):
+            return
+        normalized = name.strip()
+        if normalized and normalized not in names:
+            names.append(normalized)
+
+    def visit_tool(tool: Any) -> None:
+        if not isinstance(tool, dict):
+            return
+        add_name(tool.get("name"))
+        child_tools = tool.get("tools")
+        if isinstance(child_tools, list):
+            for child_tool in child_tools:
+                visit_tool(child_tool)
+
+    for tool in _responses_input_tool_search_output_tools(value):
+        visit_tool(tool)
+    return names
+
+
+def _responses_input_tool_search_output_tools(value: Any) -> list[dict]:
+    tools: list[dict] = []
+
+    def append_tool(tool: Any) -> None:
+        if isinstance(tool, dict) and len(tools) < 80:
+            tools.append(tool)
+
+    def visit(item: Any, depth: int = 0) -> None:
+        if depth > 8 or len(tools) >= 80:
+            return
+        if isinstance(item, dict):
+            if item.get("type") == "tool_search_output":
+                output_tools = item.get("tools")
+                if isinstance(output_tools, list):
+                    for tool in output_tools:
+                        append_tool(tool)
+                return
+            for nested in item.values():
+                if isinstance(nested, (dict, list)):
+                    visit(nested, depth + 1)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested, depth + 1)
+
+    visit(value)
+    return tools
+
+
+def _responses_input_additional_tools(value: Any) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+
+    tools: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            continue
+        item_tools = item.get("tools")
+        if not isinstance(item_tools, list):
+            continue
+        for tool in item_tools:
+            if isinstance(tool, dict):
+                tools.append(tool)
+    return tools
+
+
+def _responses_function_tool_item_id(value: Any, *, output: bool = False) -> Any:
+    if not isinstance(value, str) or not value:
+        return value
+    expected_prefix = "fco_" if output else "fc_"
+    if value.startswith(expected_prefix):
+        return value
+    replaced_prefix = "ctco_" if output else "ctc_"
+    suffix = value[len(replaced_prefix) :] if value.startswith(replaced_prefix) else value
+    return f"{expected_prefix}{suffix}"
+
+
+def _responses_chat_bridge_input(value: Any) -> tuple[Any, dict[str, Any]]:
+    if not isinstance(value, list):
+        return value, {"changed": False, "dropped_tool_search_items": 0}
+
+    filtered: list[Any] = []
+    dropped_tool_search = 0
+    dropped_additional_tools = 0
+    converted_custom_tool_calls = 0
+    converted_custom_tool_outputs = 0
+    for item in value:
+        if isinstance(item, dict) and item.get("type") in {
+            "tool_search_call",
+            "tool_search_output",
+        }:
+            dropped_tool_search += 1
+            continue
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            dropped_additional_tools += 1
+            continue
+        updated_item = copy.deepcopy(item)
+        # Custom declarations become ordinary functions with an ``input``
+        # parameter at this bridge boundary. Normalize replay items here too;
+        # otherwise LiteLLM serializes the raw custom payload under ``content``
+        # and the history contradicts the function schema sent upstream.
+        if (
+            isinstance(updated_item, dict)
+            and updated_item.get("type") == "custom_tool_call"
+            and isinstance(updated_item.get("input"), str)
+        ):
+            raw_input = updated_item.pop("input")
+            updated_item["type"] = "function_call"
+            if "id" in updated_item:
+                updated_item["id"] = _responses_function_tool_item_id(
+                    updated_item.get("id")
+                )
+            updated_item["arguments"] = json.dumps(
+                {"input": raw_input},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            converted_custom_tool_calls += 1
+        elif (
+            isinstance(updated_item, dict)
+            and updated_item.get("type") == "custom_tool_call_output"
+        ):
+            updated_item["type"] = "function_call_output"
+            if "id" in updated_item:
+                updated_item["id"] = _responses_function_tool_item_id(
+                    updated_item.get("id"),
+                    output=True,
+                )
+            converted_custom_tool_outputs += 1
+        filtered.append(updated_item)
+
+    if (
+        dropped_tool_search == 0
+        and dropped_additional_tools == 0
+        and converted_custom_tool_calls == 0
+        and converted_custom_tool_outputs == 0
+    ):
+        return value, {"changed": False, "dropped_tool_search_items": 0}
+    stats = {
+        "changed": True,
+        "dropped_tool_search_items": dropped_tool_search,
+    }
+    if dropped_additional_tools:
+        stats["dropped_additional_tools_items"] = dropped_additional_tools
+    if converted_custom_tool_calls:
+        stats["converted_custom_tool_calls"] = converted_custom_tool_calls
+    if converted_custom_tool_outputs:
+        stats["converted_custom_tool_outputs"] = converted_custom_tool_outputs
+    return filtered, stats
+
+
+def _append_unique_string(target: list[str], value: Any) -> None:
+    if not isinstance(value, str):
+        return
+    normalized = value.strip()
+    if normalized and normalized not in target:
+        target.append(normalized)
+
+
+def _responses_hosted_tool_plan(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> HostedToolPlan:
+    hosted_web_search = False
+    hosted_web_search_preview = False
+    hosted_computer = False
+    client_namespaces: list[str] = []
+    client_functions: list[str] = []
+    passthrough_tools: list[dict] = []
+    hosted_computer_tools: list[dict] = []
+    computer_environment: Optional[dict] = None
+
+    def visit_tool(tool: Any) -> None:
+        nonlocal hosted_web_search
+        nonlocal hosted_web_search_preview
+        nonlocal hosted_computer
+        nonlocal computer_environment
+        if not isinstance(tool, dict):
+            return
+        tool_type = tool.get("type")
+        if tool_type in _HOSTED_WEB_SEARCH_TOOL_TYPES:
+            hosted_web_search = True
+            if tool_type == "web_search_preview":
+                hosted_web_search_preview = True
+            return
+        if tool_type in _HOSTED_GA_COMPUTER_TOOL_TYPES:
+            hosted_computer = True
+            hosted_computer_tools.append(copy.deepcopy(tool))
+            environment = tool.get("environment")
+            if isinstance(environment, dict):
+                computer_environment = copy.deepcopy(environment)
+            return
+        if tool_type == "namespace":
+            _append_unique_string(client_namespaces, tool.get("name"))
+            child_tools = tool.get("tools")
+            if isinstance(child_tools, list):
+                for child_tool in child_tools:
+                    if not isinstance(child_tool, dict):
+                        continue
+                    function = child_tool.get("function")
+                    function_dict = function if isinstance(function, dict) else {}
+                    _append_unique_string(
+                        client_functions,
+                        function_dict.get("name") or child_tool.get("name"),
+                    )
+            passthrough_tools.append(tool)
+            return
+
+        if tool_type == "function":
+            function = tool.get("function")
+            function_dict = function if isinstance(function, dict) else {}
+            _append_unique_string(
+                client_functions,
+                function_dict.get("name") or tool.get("name"),
+            )
+            passthrough_tools.append(tool)
+            return
+
+        if tool_type == "tool_search":
+            _append_unique_string(client_functions, _TOOL_SEARCH_BRIDGE_FUNCTION_NAME)
+            passthrough_tools.append(tool)
+            return
+
+        if tool_type == "custom":
+            _append_unique_string(client_functions, tool.get("name"))
+            passthrough_tools.append(tool)
+            return
+
+        passthrough_tools.append(tool)
+
+    for request in (request_kwargs, outer_request_kwargs):
+        if not isinstance(request, dict):
+            continue
+        if "web_search_options" in request:
+            hosted_web_search = True
+        tools = request.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                visit_tool(tool)
+        for discovered_tool in _responses_input_tool_search_output_tools(request.get("input")):
+            visit_tool(discovered_tool)
+        for additional_tool in _responses_input_additional_tools(request.get("input")):
+            visit_tool(additional_tool)
+
+    facade_required = hosted_computer
+    unsupported_reason: Optional[str] = None
+    available_executor_hints: list[str] = []
+    for namespace in client_namespaces:
+        lowered = namespace.lower()
+        if lowered == "mcp__computer_use":
+            _append_unique_string(available_executor_hints, _COMPUTER_FACADE_MCP_BACKEND)
+        elif lowered in {"browser", "browser_use", "mcp__browser", "mcp__browser_use"}:
+            _append_unique_string(
+                available_executor_hints,
+                _COMPUTER_FACADE_BROWSER_BACKEND,
+            )
+        elif lowered in {"chrome", "chrome_browser", "mcp__chrome"}:
+            _append_unique_string(
+                available_executor_hints,
+                _COMPUTER_FACADE_CHROME_BACKEND,
+            )
+
+    return HostedToolPlan(
+        hosted_web_search=hosted_web_search,
+        hosted_web_search_preview=hosted_web_search_preview,
+        hosted_computer=hosted_computer,
+        client_namespaces=client_namespaces,
+        client_functions=client_functions,
+        passthrough_tools=passthrough_tools,
+        facade_required=facade_required,
+        unsupported_reason=unsupported_reason,
+        hosted_computer_tools=hosted_computer_tools,
+        computer_environment=computer_environment,
+        available_executor_hints=available_executor_hints,
+    )
+
+
+def _append_unique_chat_tool(
+    target: list[dict],
+    tool: dict,
+    seen_names: set[str],
+) -> bool:
+    name = tool.get("name")
+    if not isinstance(name, str) or name in seen_names:
+        return False
+    seen_names.add(name)
+    target.append(tool)
+    return True
+
+
+def _responses_chat_bridge_sanitize_tools(
+    tools: Any,
+    *,
+    input_value: Any = None,
+    bridge_web_search: bool = True,
+    bridge_provider_native_web_search: bool = False,
+) -> tuple[Optional[list[dict]], Optional[dict], dict[str, Any]]:
+    if not isinstance(tools, list):
+        return None, None, {"changed": False}
+
+    tool_search_output_tool_names = _responses_input_tool_search_output_tool_names(
+        input_value
+    )
+    suppress_tool_search_bridge = bool(tool_search_output_tool_names)
+    sanitized: list[dict] = []
+    seen_tool_names: set[str] = set()
+    web_search_options: Optional[dict] = None
+    dropped_types: list[str] = []
+    invalid_function_tools = 0
+    bridged_tool_search_tools = 0
+    suppressed_tool_search_tools = 0
+    bridged_namespace_tools = 0
+    bridged_custom_tools = 0
+    bridged_tool_search_output_tools = 0
+    bridged_web_search_tools = 0
+    for tool in tools:
+        tool_type = tool.get("type") if isinstance(tool, dict) else None
+        converted = _responses_bridge_function_tool(tool)
+        if converted is not None:
+            _append_unique_chat_tool(sanitized, converted, seen_tool_names)
+            continue
+        converted = _responses_bridge_custom_tool(tool)
+        if converted is not None:
+            if _append_unique_chat_tool(sanitized, converted, seen_tool_names):
+                bridged_custom_tools += 1
+            continue
+        converted = _responses_bridge_tool_search_tool(tool)
+        if converted is not None:
+            if suppress_tool_search_bridge:
+                suppressed_tool_search_tools += 1
+                if tool_type not in dropped_types:
+                    dropped_types.append(str(tool_type))
+                continue
+            if _append_unique_chat_tool(sanitized, converted, seen_tool_names):
+                bridged_tool_search_tools += 1
+            continue
+        namespace_tools = _responses_bridge_namespace_tools(tool)
+        if namespace_tools:
+            for namespace_tool in namespace_tools:
+                if _append_unique_chat_tool(
+                    sanitized,
+                    namespace_tool,
+                    seen_tool_names,
+                ):
+                    bridged_namespace_tools += 1
+            continue
+        provider_native_web_search = _responses_bridge_provider_native_web_search_tool(
+            tool
+        )
+        if provider_native_web_search is not None:
+            if bridge_provider_native_web_search:
+                added_local_web_tools = False
+                for direct_tool in _pi_web_access_tool_definitions():
+                    converted_direct_tool = _responses_bridge_function_tool(direct_tool)
+                    if converted_direct_tool is not None and _append_unique_chat_tool(
+                        sanitized,
+                        converted_direct_tool,
+                        seen_tool_names,
+                    ):
+                        added_local_web_tools = True
+                if added_local_web_tools:
+                    bridged_web_search_tools += 1
+                continue
+            # Provider-native server tools do not have a Chat function name.
+            # Route them by their declared type and keep the complete
+            # declaration intact; neither a Hosted declaration nor a client
+            # function bridge may silently replace it with pi-web-access.
+            if provider_native_web_search not in sanitized:
+                sanitized.append(provider_native_web_search)
+            continue
+        converted_web_search_options = _responses_bridge_web_search_options(tool)
+        if converted_web_search_options is not None:
+            if not bridge_web_search:
+                sanitized.append(copy.deepcopy(tool))
+                continue
+            added_local_web_tools = False
+            for direct_tool in _pi_web_access_tool_definitions():
+                converted_direct_tool = _responses_bridge_function_tool(direct_tool)
+                if converted_direct_tool is not None and _append_unique_chat_tool(
+                    sanitized,
+                    converted_direct_tool,
+                    seen_tool_names,
+                ):
+                    added_local_web_tools = True
+            if added_local_web_tools:
+                # Count the hosted declaration being replaced, not each local
+                # function that represents it.
+                bridged_web_search_tools += 1
+            continue
+        if tool_type == "function":
+            invalid_function_tools += 1
+        elif isinstance(tool_type, str) and tool_type not in dropped_types:
+            dropped_types.append(tool_type)
+
+    for discovered_tool in _responses_input_tool_search_output_tools(input_value):
+        converted = _responses_bridge_function_tool(discovered_tool)
+        discovered_tools = [converted] if converted is not None else []
+        if converted is None:
+            discovered_tools = _responses_bridge_namespace_tools(discovered_tool)
+        for discovered_chat_tool in discovered_tools:
+            if _append_unique_chat_tool(
+                sanitized,
+                discovered_chat_tool,
+                seen_tool_names,
+            ):
+                bridged_tool_search_output_tools += 1
+
+    changed = (
+        sanitized != tools
+        or any(_responses_chat_bridge_tool_schema_has_empty_enum(tool) for tool in tools)
+        or bridged_web_search_tools > 0
+        or suppressed_tool_search_tools > 0
+        or bridged_tool_search_output_tools > 0
+    )
+    stats = {
+        "changed": changed,
+        "original_count": len(tools),
+        "kept_count": len(sanitized),
+        "dropped_types": dropped_types,
+        "invalid_function_tools": invalid_function_tools,
+        "bridged_tool_search_tools": bridged_tool_search_tools,
+        "suppressed_tool_search_tools": suppressed_tool_search_tools,
+        "bridged_namespace_tools": bridged_namespace_tools,
+        "bridged_custom_tools": bridged_custom_tools,
+        "bridged_tool_search_output_tools": bridged_tool_search_output_tools,
+        "bridged_web_search_tools": bridged_web_search_tools,
+        "tool_search_output_tool_names": tool_search_output_tool_names[:40],
+        "kept_tool_names": _trace_module._trace_tool_names(sanitized),
+    }
+    return sanitized, web_search_options, stats
+
+
+def _append_responses_chat_bridge_instruction(
+    retry_kwargs: dict,
+    stats: dict[str, Any],
+) -> None:
+    names = stats.get("tool_search_output_tool_names")
+    if not isinstance(names, list) or not names:
+        return
+    visible_names = [name for name in names if isinstance(name, str) and name][:8]
+    if not visible_names:
+        return
+
+    note = (
+        "Responses compatibility note: the previous tool_search result is already "
+        "available as callable tools in this request"
+    )
+    note = f"{note}: {', '.join(visible_names)}. "
+    note += (
+        "If one of these tools satisfies the user request, call it directly instead "
+        "of calling tool_search again for the same tool."
+    )
+    existing = retry_kwargs.get("instructions")
+    if isinstance(existing, str) and existing.strip():
+        if note not in existing:
+            retry_kwargs["instructions"] = f"{existing.rstrip()}\n\n{note}"
+    else:
+        retry_kwargs["instructions"] = note
+
+
+def _request_current_time_context(
+    request_kwargs: Optional[dict],
+) -> Optional[dict[str, str]]:
+    text = _responses_web_search_bridge_module._external_web_search_request_text(request_kwargs)
+    if not text:
+        return None
+
+    date_match = re.search(
+        r"<\s*current_date\s*>\s*(\d{4}-\d{2}-\d{2})\s*<\s*/\s*current_date\s*>",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if date_match is None:
+        date_match = re.search(
+            r"\bcurrent[_ -]?date\b\s*[:=]\s*(\d{4}-\d{2}-\d{2})\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if date_match is None:
+        return None
+
+    context = {"current_date": date_match.group(1)}
+    timezone_match = re.search(
+        r"<\s*timezone\s*>\s*([^<\n\r]+?)\s*<\s*/\s*timezone\s*>",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if timezone_match is not None:
+        timezone_text = " ".join(timezone_match.group(1).split())
+        if timezone_text:
+            context["timezone"] = timezone_text
+    return context
+
+
+def _current_time_context_instruction(request_kwargs: Optional[dict]) -> str:
+    context = _request_current_time_context(request_kwargs)
+    if not context:
+        return ""
+    current_date = context["current_date"]
+    timezone_text = context.get("timezone")
+    if timezone_text:
+        date_text = f"{current_date} in timezone {timezone_text}"
+    else:
+        date_text = current_date
+    return (
+        "Authoritative request time context: current date is "
+        f"{date_text}. For relative or current-time queries such as today, "
+        "tomorrow, now, latest/current weather, news, schedules, or similar "
+        "facts, ground search queries and final answers in this date context "
+        "and do not substitute a different year."
+    )
+
+def _responses_chat_bridge_sanitize_tool_choice(
+    tool_choice: Any,
+    kept_tool_names: set[str],
+) -> Any:
+    if not kept_tool_names:
+        return None
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice if tool_choice in {"auto", "none", "required"} else "auto"
+    if not isinstance(tool_choice, dict):
+        return "auto"
+
+    tool_choice_type = tool_choice.get("type")
+    if tool_choice_type in {"auto", "none", "required"}:
+        return tool_choice_type
+
+    if tool_choice_type == "function":
+        function = tool_choice.get("function")
+        function_dict = function if isinstance(function, dict) else {}
+        name = _routing_module._valid_chat_tool_name(function_dict.get("name") or tool_choice.get("name"))
+        if name in kept_tool_names:
+            return {"type": "function", "function": {"name": name}}
+        return "auto"
+
+    if tool_choice_type == "custom":
+        name = _routing_module._valid_chat_tool_name(tool_choice.get("name"))
+        if name in kept_tool_names:
+            return {"type": "function", "function": {"name": name}}
+        return "auto"
+
+    if tool_choice_type in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
+        # Provider-native server-tool choices have no function name. Preserve
+        # the caller's declaration so a client-tool bridge cannot redirect it
+        # to the local pi worker.
+        return copy.deepcopy(tool_choice)
+
+    return "auto"
+
+
+def _responses_function_tool_bridge_sanitize_tool_choice(
+    tool_choice: Any,
+    kept_tool_names: set[str],
+) -> Any:
+    if not kept_tool_names:
+        return None
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice if tool_choice in {"auto", "none", "required"} else "auto"
+    if not isinstance(tool_choice, dict):
+        return "auto"
+
+    tool_choice_type = tool_choice.get("type")
+    if tool_choice_type in {"auto", "none", "required"}:
+        return tool_choice
+
+    if tool_choice_type == "function":
+        function = tool_choice.get("function")
+        function_dict = function if isinstance(function, dict) else {}
+        name = _routing_module._valid_chat_tool_name(function_dict.get("name") or tool_choice.get("name"))
+        if name in kept_tool_names:
+            return {"type": "function", "name": name}
+        return "auto"
+
+    if tool_choice_type == "custom":
+        name = _routing_module._valid_chat_tool_name(tool_choice.get("name"))
+        if name in kept_tool_names:
+            return {"type": "function", "name": name}
+        return "auto"
+
+    if tool_choice_type in {"web_search", "web_search_preview"}:
+        # A hosted choice has no faithful representation after a fallback to
+        # local pi-web-access functions. Preserve normal model discretion.
+        return "auto"
+
+    if tool_choice_type in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
+        # Provider-native server-tool choices have no function name. Preserve
+        # the caller's declaration instead of turning it into a local call.
+        return copy.deepcopy(tool_choice)
+
+    return "auto"

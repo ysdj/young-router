@@ -13,7 +13,7 @@ class SearchEndpointTests(unittest.TestCase):
     def _module():
         # Import lazily so unittest discovery does not preload the real LiteLLM
         # web-search classes before the callback tests install their stubs.
-        return importlib.import_module("litellm_menu.search_endpoint")
+        return importlib.import_module("young_router.search_endpoint")
 
     def test_commands_to_actions_supports_queries_literal_urls_and_refs(self) -> None:
         search_endpoint = self._module()
@@ -68,8 +68,8 @@ class SearchEndpointTests(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            previous = os.environ.get("LITELLM_MENU_SEARCH_STATE_FILE")
-            os.environ["LITELLM_MENU_SEARCH_STATE_FILE"] = str(
+            previous = os.environ.get("YOUNG_ROUTER_SEARCH_STATE_FILE")
+            os.environ["YOUNG_ROUTER_SEARCH_STATE_FILE"] = str(
                 Path(temp_dir) / "search-state.json"
             )
             search_endpoint._bridge._external_web_search_run_actions = fake_run_actions
@@ -85,9 +85,9 @@ class SearchEndpointTests(unittest.TestCase):
             finally:
                 search_endpoint._bridge._external_web_search_run_actions = original
                 if previous is None:
-                    os.environ.pop("LITELLM_MENU_SEARCH_STATE_FILE", None)
+                    os.environ.pop("YOUNG_ROUTER_SEARCH_STATE_FILE", None)
                 else:
-                    os.environ["LITELLM_MENU_SEARCH_STATE_FILE"] = previous
+                    os.environ["YOUNG_ROUTER_SEARCH_STATE_FILE"] = previous
         self.assertIn("output", response)
         self.assertRegex(response["output"], r"Reference: turn\d+search0")
         self.assertEqual(
@@ -111,8 +111,8 @@ class SearchEndpointTests(unittest.TestCase):
         result = f"Title: Stable source\nURL: {url}\nSnippet: synthetic"
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            previous = os.environ.get("LITELLM_MENU_SEARCH_STATE_FILE")
-            os.environ["LITELLM_MENU_SEARCH_STATE_FILE"] = str(
+            previous = os.environ.get("YOUNG_ROUTER_SEARCH_STATE_FILE")
+            os.environ["YOUNG_ROUTER_SEARCH_STATE_FILE"] = str(
                 Path(temp_dir) / "search-state.json"
             )
             try:
@@ -131,9 +131,9 @@ class SearchEndpointTests(unittest.TestCase):
                 )
             finally:
                 if previous is None:
-                    os.environ.pop("LITELLM_MENU_SEARCH_STATE_FILE", None)
+                    os.environ.pop("YOUNG_ROUTER_SEARCH_STATE_FILE", None)
                 else:
-                    os.environ["LITELLM_MENU_SEARCH_STATE_FILE"] = previous
+                    os.environ["YOUNG_ROUTER_SEARCH_STATE_FILE"] = previous
 
         self.assertEqual(errors, [])
         self.assertEqual(actions, [{"type": "openPage", "url": url}])

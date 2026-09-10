@@ -277,7 +277,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         chunks = [
             hooks._jsonable(chunk)
             async for chunk in hook.async_post_call_streaming_iterator_hook(
@@ -574,7 +574,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         chunks = [
             hooks._jsonable(chunk)
             async for chunk in hook.async_post_call_streaming_iterator_hook(
@@ -693,7 +693,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             ],
         }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "call_type": "aresponses",
             "model": "legacy-chat",
@@ -801,7 +801,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             tools=[{"type": "web_search"}],
             tool_choice="auto",
             use_chat_completions_api=True,
-            _litellm_menu_upstream_url_surface="openai/chat",
+            _young_router_upstream_url_surface="openai/chat",
             model_info={
                 "id": "chatroute",
                 "provider": "provider_chat",

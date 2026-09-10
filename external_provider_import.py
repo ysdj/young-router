@@ -601,7 +601,7 @@ def _add_editor_model(
         return
 
     model_enabled = _bool(
-        source.get("x-litellm-menu-model-enabled", source.get("model_enabled", source.get("enabled", True))),
+        source.get("x-young-router-model-enabled", source.get("model_enabled", source.get("enabled", True))),
         True,
     )
     effective_enabled = (provider_enabled if provider_enabled is not None else provider.enabled) and model_enabled
@@ -705,7 +705,7 @@ def _import_litellm(data: dict[str, Any]) -> _Drafts | None:
             "ssl_verify": params.get("ssl_verify"),
             "upstream_url_surface": info.get("upstream_url_surface"),
             "model_info": info,
-            "x-litellm-menu-model-enabled": info.get("x-litellm-menu-model-enabled", True),
+            "x-young-router-model-enabled": info.get("x-young-router-model-enabled", True),
             "supports_responses_image_generation_tool": info.get("supports_responses_image_generation_tool"),
         }
         for capability_key in WEB_SEARCH_CAPABILITY_KEYS + COMPACTION_CAPABILITY_KEYS:

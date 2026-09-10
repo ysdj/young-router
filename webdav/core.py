@@ -25,9 +25,9 @@ except Exception:  # pragma: no cover - surfaced by validate_config()
     yaml = None
 
 
-APP_NAME = "litellm-menu"
+APP_NAME = "young-router"
 ARCHIVE_VERSION = 1
-DEFAULT_REMOTE_NAME = "litellm-menu-config.json"
+DEFAULT_REMOTE_NAME = "young-router-config.json"
 CONFIG_BUNDLE_FORMAT = "json"
 CONFIG_BUNDLE_MAX_BYTES = 16 * 1024 * 1024
 MANIFEST_MAX_BYTES = 64 * 1024
@@ -202,10 +202,10 @@ class Settings:
 def default_root() -> pathlib.Path:
     root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip()
     if not root:
-        root = os.environ.get("LITELLM_MENU_HOME", "").strip()
+        root = os.environ.get("YOUNG_ROUTER_HOME", "").strip()
     if root:
         return pathlib.Path(root).expanduser()
-    return pathlib.Path.home() / ".litellm-menu"
+    return pathlib.Path.home() / ".young-router"
 
 
 def default_config_yaml() -> pathlib.Path:
@@ -500,7 +500,7 @@ def validate_config_bytes(name: str, data: bytes, required_key: str) -> dict[str
 
         return load_yaml_text(text, pathlib.Path(name))
     except Exception as exc:
-        raise SyncError(f"{name} does not use the current LiteLLM Menu schema: {exc}") from exc
+        raise SyncError(f"{name} does not use the current Young Router schema: {exc}") from exc
 
 
 def local_summary(config_path: pathlib.Path) -> dict[str, int]:
@@ -663,7 +663,7 @@ def _validate_bundle_header(manifest: dict[str, Any]) -> None:
     if set(manifest) != expected_fields:
         raise SyncError("WebDAV sync bundle has unexpected top-level fields")
     if manifest.get("app") != APP_NAME or manifest.get("version") != ARCHIVE_VERSION:
-        raise SyncError("WebDAV sync bundle was not created by this LiteLLM Menu version")
+        raise SyncError("WebDAV sync bundle was not created by this Young Router version")
     if manifest.get("format") != CONFIG_BUNDLE_FORMAT:
         raise SyncError("WebDAV sync bundle must use the current JSON format")
     if not isinstance(manifest.get("created_at"), str) or not manifest["created_at"].strip():
@@ -942,7 +942,7 @@ class WebDAVClient:
         retryable_error: SyncError | None = None
         for attempt in range(1, attempts + 1):
             request_headers = {
-                "User-Agent": "LiteLLM Menu WebDAV Sync",
+                "User-Agent": "Young Router WebDAV Sync",
                 **(headers or {}),
             }
             if self.settings.username or self.settings.password:
@@ -1001,7 +1001,7 @@ class WebDAVClient:
         if not curl:
             raise original_error
         request_headers = {
-            "User-Agent": "LiteLLM Menu WebDAV Sync",
+            "User-Agent": "Young Router WebDAV Sync",
             **(headers or {}),
         }
         if self.settings.username or self.settings.password:

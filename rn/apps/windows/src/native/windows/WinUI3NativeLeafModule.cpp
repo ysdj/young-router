@@ -36,8 +36,8 @@ HWND HostWindow(winrt::Microsoft::ReactNative::ReactContext const& context) {
   return reinterpret_cast<HWND>(value);
 }
 
-std::vector<LiteLLMMenu::NativeMenuAction> NativeActions(winrt::Microsoft::ReactNative::JSValueArray const& actions) {
-  std::vector<LiteLLMMenu::NativeMenuAction> result;
+std::vector<YoungRouter::NativeMenuAction> NativeActions(winrt::Microsoft::ReactNative::JSValueArray const& actions) {
+  std::vector<YoungRouter::NativeMenuAction> result;
   for (auto const& action : actions) {
     auto object = action.TryGetObject();
     if (!object) continue;
@@ -118,7 +118,7 @@ std::optional<std::wstring> ShowSavePicker(
 }
 }  // namespace
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 void WinUI3NativeLeafModule::Initialize(winrt::Microsoft::ReactNative::ReactContext const& context) noexcept {
   try {
@@ -355,7 +355,7 @@ void WinUI3NativeLeafModule::ShowActionMenu(
   try {
     auto leaf = leaf_;
     auto js_dispatcher = context_.JSDispatcher();
-    LiteLLMMenu::NativeMenuAnchor menu_anchor{*x, *y, *width, *height};
+    YoungRouter::NativeMenuAnchor menu_anchor{*x, *y, *width, *height};
     context_.UIDispatcher().Post([leaf, title, items, menu_anchor, promise, js_dispatcher] {
       auto selected = leaf->ShowActionMenu(title, items, menu_anchor);
       js_dispatcher.Post([promise, selected] {
@@ -548,7 +548,7 @@ void WinUI3NativeLeafModule::ShowGroupManager(
       }
     }
   }
-  std::vector<LiteLLMMenu::GroupManagerKey> keys;
+  std::vector<YoungRouter::GroupManagerKey> keys;
   auto keys_entry = options.find("keys");
   if (!valid || keys_entry == options.end()) {
     valid = false;
@@ -581,7 +581,7 @@ void WinUI3NativeLeafModule::ShowGroupManager(
           valid = false;
           break;
         }
-        keys.push_back(LiteLLMMenu::GroupManagerKey{
+        keys.push_back(YoungRouter::GroupManagerKey{
             Utf8ToWide(*id),
             Utf8ToWide(*name),
             Utf8ToWide(group_id.value_or("")),
@@ -590,7 +590,7 @@ void WinUI3NativeLeafModule::ShowGroupManager(
       }
     }
   }
-  LiteLLMMenu::GroupManagerLabels labels;
+  YoungRouter::GroupManagerLabels labels;
   auto labels_entry = options.find("labels");
   if (!valid || labels_entry == options.end()) {
     valid = false;
@@ -640,7 +640,7 @@ void WinUI3NativeLeafModule::ShowGroupManager(
                         auto_grouping = *auto_grouping,
                         promise,
                         js_dispatcher]() mutable {
-      std::optional<LiteLLMMenu::GroupManagerResult> result;
+      std::optional<YoungRouter::GroupManagerResult> result;
       try {
         result = leaf->ShowGroupManager(std::move(title), std::move(account_label), std::move(groups),
                                         std::move(keys), labels, auto_grouping);

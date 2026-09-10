@@ -9,8 +9,8 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
-from litellm_menu.core.persistence import atomic_write_json
-from litellm_menu.core.provider_auth import ProviderAuthManager, credential_env_name
+from young_router.core.persistence import atomic_write_json
+from young_router.core.provider_auth import ProviderAuthManager, credential_env_name
 
 
 class ProviderAuthManagerTests(unittest.TestCase):

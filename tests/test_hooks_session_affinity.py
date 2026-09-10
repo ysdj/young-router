@@ -231,7 +231,7 @@ class SessionAffinityFilterTests(HookTestCase):
 class HookFilterSessionAffinityTests(HookTestCase):
     async def test_filter_deployments_applies_affinity_last(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         with tempfile.TemporaryDirectory() as directory:
             self.set_env(
                 hooks._SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
@@ -264,7 +264,7 @@ class HookFilterSessionAffinityTests(HookTestCase):
         """Affinity never forces a cooled deployment: the peer wins instead."""
 
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         with tempfile.TemporaryDirectory() as directory:
@@ -337,7 +337,7 @@ class HookFilterSessionAffinityTests(HookTestCase):
 
     async def test_filter_deployments_without_affinity_keeps_all(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         with tempfile.TemporaryDirectory() as directory:
             self.set_env(
                 hooks._SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
@@ -375,7 +375,7 @@ class HookFilterSessionAffinityTests(HookTestCase):
 
 class AffinityTransientStateResetTests(HookTestCase):
     def test_reset_transient_routing_state_removes_affinity_file(self) -> None:
-        from litellm_menu.core.operations import CoreServiceController
+        from young_router.core.operations import CoreServiceController
 
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
@@ -387,12 +387,12 @@ class AffinityTransientStateResetTests(HookTestCase):
             self.assertFalse(affinity_path.exists())
 
     def test_runtime_env_exports_affinity_file(self) -> None:
-        from litellm_menu.core.operations import CoreServiceController
+        from young_router.core.operations import CoreServiceController
 
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
             environment = controller._runtime_env()
             self.assertEqual(
                 str(controller.paths.affinity),
-                environment["LITELLM_MENU_SESSION_DEPLOYMENT_AFFINITY_FILE"],
+                environment["YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY_FILE"],
             )

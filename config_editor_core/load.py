@@ -262,7 +262,7 @@ def _model_to_editor(
             UPSTREAM_PROTOCOL_MODE_KEY,
             UPSTREAM_URL_SURFACE_KEY,
             "supported_upstream_url_surfaces",
-            "x-litellm-menu-upstream-url-surface-order",
+            "x-young-router-upstream-url-surface-order",
             MENU_MODEL_ENABLED_KEY,
         }
     }

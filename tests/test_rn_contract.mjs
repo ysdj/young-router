@@ -11,7 +11,7 @@ const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".
 const rnRoot = path.join(repository, "rn");
 const checker = path.join(rnRoot, "scripts", "check-contract.mjs");
 const original = fs.readFileSync(path.join(rnRoot, "packages", "shared", "src", "types.ts"), "utf8");
-const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "litellm-menu-contract-"));
+const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "young-router-contract-"));
 
 function run(types) {
   const candidate = path.join(temporary, "types.ts");
@@ -19,7 +19,7 @@ function run(types) {
   return spawnSync(process.execPath, [checker], {
     cwd: rnRoot,
     encoding: "utf8",
-    env: { ...process.env, LITELLM_MENU_CONTRACT_TYPES: candidate },
+    env: { ...process.env, YOUNG_ROUTER_CONTRACT_TYPES: candidate },
   });
 }
 

@@ -6,9 +6,9 @@ import time
 import unittest
 from unittest import mock
 
-from litellm_menu.core.domains.codex import CodexSettingsDomain
-from litellm_menu.core.model_catalog import catalog_model_names
-from litellm_menu.core.service import CoreStore
+from young_router.core.domains.codex import CodexSettingsDomain
+from young_router.core.model_catalog import catalog_model_names
+from young_router.core.service import CoreStore
 
 
 CONFIG = ("providers:\n"
@@ -79,7 +79,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             return_value=(["public-a"], True),
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             core = self._core(Path(directory))
@@ -106,7 +106,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             return_value=(["public-a"], True),
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             root = Path(directory)
@@ -142,7 +142,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             domain = self._domain(Path(directory))
@@ -177,7 +177,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             domain = self._domain(Path(directory))
@@ -212,7 +212,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             domain = self._domain(Path(directory))
@@ -223,7 +223,7 @@ class CodexRestartPromptTests(unittest.TestCase):
 
             # A previous run acknowledged a catalog that included a runtime
             # route outside the configured model list.
-            from litellm_menu.core.model_catalog import write_catalog
+            from young_router.core.model_catalog import write_catalog
 
             write_catalog(catalog_path, ["public-a", "phantom-route"], registry=domain._context_registry)
             domain._catalog_acknowledged_signature = domain._catalog_signature(
@@ -251,7 +251,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             root = Path(directory)
@@ -293,7 +293,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             root = Path(directory)
@@ -342,7 +342,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             root = Path(directory)
@@ -388,7 +388,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             root = Path(directory)
@@ -434,7 +434,7 @@ class CodexRestartPromptTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             root = Path(directory)

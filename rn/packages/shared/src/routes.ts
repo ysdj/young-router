@@ -6,14 +6,14 @@ export interface RouteDefinition {
 }
 
 export const ROUTES: readonly RouteDefinition[] = [
-  { id: "general-settings", titleKey: "menu.general" },
-  { id: "providers-models", titleKey: "menu.providers" },
-  { id: "runtime-settings", titleKey: "menu.runtime" },
-  { id: "codex-settings", titleKey: "menu.codex" },
-  { id: "claude-settings", titleKey: "menu.claude" },
-  { id: "data-management", titleKey: "menu.dataManagement" },
+  { id: "general-settings", titleKey: "status.general" },
+  { id: "providers-models", titleKey: "status.providers" },
+  { id: "runtime-settings", titleKey: "status.runtime" },
+  { id: "codex-settings", titleKey: "status.codex" },
+  { id: "claude-settings", titleKey: "status.claude" },
+  { id: "data-management", titleKey: "status.dataManagement" },
   { id: "provider-wizard", titleKey: "providers.wizard.title" },
-  { id: "logs", titleKey: "menu.logs" },
+  { id: "logs", titleKey: "status.logs" },
 ];
 
 export const MENU_ROUTES: readonly RouteDefinition[] = ROUTES.filter(
@@ -68,7 +68,7 @@ export const DESKTOP_ROUTES: readonly AppRoute[] = ["home", ...ROUTES.map(({ id 
 export const LOG_TABS: readonly LogTab[] = [
   "requests",
   "service",
-  "menu",
+  "actions",
   "route-trace",
   "recovery",
   "online-usage",

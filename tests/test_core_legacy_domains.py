@@ -13,14 +13,14 @@ import threading
 import unittest
 from unittest import mock
 
-from litellm_menu.core.domains import DomainError
-from litellm_menu.core.domains.codex import CodexSettingsDomain
-from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
-from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
-from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
-from litellm_menu.core.model_catalog import catalog_is_current
-from litellm_menu.core.service import CoreError, CoreStore
+from young_router.core.domains import DomainError
+from young_router.core.domains.codex import CodexSettingsDomain
+from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.domains.relay_accounts import RelayAccountsDomain
+from young_router.core.domains.runtime import RuntimeSettingsDomain
+from young_router.core.domains.webdav import WebDAVSettingsDomain
+from young_router.core.model_catalog import catalog_is_current
+from young_router.core.service import CoreError, CoreStore
 from runtime_settings_io import RuntimeSettingSpec
 
 
@@ -55,7 +55,7 @@ future_top_level:
 
 class ProvidersModelsDomainTests(unittest.TestCase):
     def test_account_login_provider_stages_adapter_and_private_claude_token(self) -> None:
-        from litellm_menu.core.provider_auth import ProviderAuthManager
+        from young_router.core.provider_auth import ProviderAuthManager
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -114,7 +114,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
             domain.apply()
             saved = path.read_text(encoding="utf-8")
-            self.assertIn("os.environ/LITELLM_MENU_AUTH_", saved)
+            self.assertIn("os.environ/YOUNG_ROUTER_AUTH_", saved)
             self.assertNotIn(token, saved)
 
     def test_relay_provider_source_sets_name_and_url_atomically(self) -> None:
@@ -191,7 +191,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                             "provider_type": "custom",
                             "relay_station_id": "",
                             "extra": {
-                                "x-litellm-menu-provider-source": {
+                                "x-young-router-provider-source": {
                                     "kind": "relay",
                                     "station_id": station["id"],
                                 }
@@ -215,7 +215,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual("", custom["relay_station_id"])
             self.assertEqual(
                 {"kind": "custom"},
-                custom["extra"]["x-litellm-menu-provider-source"],
+                custom["extra"]["x-young-router-provider-source"],
             )
             self.assertEqual("Custom Provider", custom["name"])
             self.assertEqual("https://custom.example.test/v1", custom["api_base"])
@@ -224,7 +224,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
             providers.apply()
             saved = config_path.read_text(encoding="utf-8")
-            self.assertIn("x-litellm-menu-provider-source: {kind: custom}", saved)
+            self.assertIn("x-young-router-provider-source: {kind: custom}", saved)
             reloaded = ProvidersModelsDomain(config_path).snapshot()["providers"][0]
             self.assertEqual("custom", reloaded["provider_type"])
             self.assertEqual("", reloaded["relay_station_id"])
@@ -1459,7 +1459,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
             home = root / "codex"
             home.mkdir()
-            catalog_path = home / "litellm-menu-model-catalog.json"
+            catalog_path = home / "young-router-model-catalog.json"
             (home / "config.toml").write_text(
                 f'model = "default-chat"\nmodel_catalog_json = "{catalog_path}"\n',
                 encoding="utf-8",
@@ -1528,7 +1528,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertTrue(snapshot["domains"]["codex"]["model_catalog"]["enabled"])
             self.assertTrue(snapshot["domains"]["codex"]["model_catalog"]["restart_required"])
             self.assertEqual("enabled", snapshot["domains"]["codex"]["model_catalog"]["change_reason"])
-            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
             acknowledged = core.dispatch(
@@ -1599,13 +1599,13 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 ["default-chat", "second-chat", "third-chat"],
                 enabled["result"]["model_catalog"]["public_models"],
             )
-            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(
                 ["default-chat", "second-chat", "third-chat"],
                 [model["slug"] for model in catalog["models"]],
             )
 
-    def test_enabled_catalog_keeps_last_verified_models_when_litellm_menu_is_unavailable(self) -> None:
+    def test_enabled_catalog_keeps_last_verified_models_when_young_router_is_unavailable(self) -> None:
         endpoint = {"result": (["default-chat"], True)}
 
         def exposed_models(_api_key: str):
@@ -1641,7 +1641,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual(["default-chat"], snapshot["public_models"])
             self.assertFalse(snapshot["restart_required"])
             self.assertIsNone(snapshot["change_reason"])
-            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
     def test_enabled_catalog_updates_when_litellm_reports_an_empty_model_list(self) -> None:
@@ -1685,7 +1685,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual([], snapshot["public_models"])
             self.assertTrue(snapshot["restart_required"])
             self.assertEqual("catalog_repaired", snapshot["change_reason"])
-            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual([], catalog["models"])
 
     @mock.patch("codex_config._local_exposed_models", return_value=(["default-chat"], True))
@@ -1709,7 +1709,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
                 expected_revision=enabled["revision"],
             )
-            catalog_path = home / "litellm-menu-model-catalog.json"
+            catalog_path = home / "young-router-model-catalog.json"
             catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
             catalog["models"][0]["description"] = "stale metadata"
             catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
@@ -1742,7 +1742,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 {"domain": "codex", "type": "acknowledge_model_catalog_restart", "payload": {}},
                 expected_revision=enabled["revision"],
             )
-            catalog_path = home / "litellm-menu-model-catalog.json"
+            catalog_path = home / "young-router-model-catalog.json"
             catalog_path.unlink()
 
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
@@ -1756,7 +1756,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             return_value=(["model-a", "model-b"], True),
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             root = Path(directory)
@@ -1809,7 +1809,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             core.apply("codex", revision=staged["revision"])
 
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
-            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
 
             self.assertEqual(["model-b", "model-a"], snapshot["public_models"])
             self.assertEqual(["model-b", "model-a"], [model["slug"] for model in catalog["models"]])
@@ -1826,7 +1826,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             "codex_config._local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
             root = Path(directory)
@@ -1884,7 +1884,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             codex._catalog_source_checked_at = 0.0
             first = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertFalse(first["restart_required"])
-            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
             # A second fresh observation completes the repair and queues the
@@ -1893,7 +1893,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             repaired = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertTrue(repaired["restart_required"])
             self.assertEqual("catalog_repaired", repaired["change_reason"])
-            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
 
             core.dispatch(
@@ -1916,7 +1916,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             # /v1/models surface does not expose.
             self.assertFalse(catalog_state["restart_required"])
             self.assertIsNone(catalog_state["change_reason"])
-            catalog = json.loads((home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8"))
+            catalog = json.loads((home / "young-router-model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["deepseek-v4-flash"], [model["slug"] for model in catalog["models"]])
 
     def test_sync_and_apply_preserve_unknown_toml_and_auth_fields(self) -> None:
@@ -1963,7 +1963,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
     def test_optional_runtime_numbers_allow_empty_inherit_and_enforce_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
-            key = "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS"
+            key = "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS"
             projected = next(item for item in domain.snapshot()["settings"] if item["key"] == key)
             self.assertEqual("integer", projected["kind"])
             self.assertEqual("optional_int", projected["storage_kind"])
@@ -1979,13 +1979,13 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
     def test_runtime_schema_loads_from_an_isolated_bundled_core_without_service_shells(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = root / "litellm_menu" / "core"
+            package = root / "young_router" / "core"
             package.mkdir(parents=True)
-            (root / "litellm_menu" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "young_router" / "__init__.py").write_text("", encoding="utf-8")
             (package / "__init__.py").write_text("", encoding="utf-8")
             source_root = Path(__file__).resolve().parents[1]
             (package / "runtime_settings_schema.py").write_bytes(
-                (source_root / "litellm_menu/core/runtime_settings_schema.py").read_bytes()
+                (source_root / "young_router/core/runtime_settings_schema.py").read_bytes()
             )
             module_path = root / "runtime_settings_io.py"
             module_path.write_bytes((source_root / "runtime_settings_io.py").read_bytes())
@@ -2006,7 +2006,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             loaded = module.load_specs()
             self.assertGreater(len(loaded), 20)
             self.assertEqual("4000", loaded["LITELLM_PORT"].default)
-            self.assertEqual("0", loaded["LITELLM_MENU_MCP_AUTO_APPROVE"].default)
+            self.assertEqual("0", loaded["YOUNG_ROUTER_MCP_AUTO_APPROVE"].default)
 
     def test_bool_auto_uses_checkbox_projection_and_auto_off_storage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2063,32 +2063,32 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
 
             self.assertEqual(
                 "1",
-                settings["LITELLM_MENU_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED"]["value"],
+                settings["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED"]["value"],
             )
             self.assertEqual(
                 "0",
-                settings["LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"]["value"],
+                settings["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"]["value"],
             )
             self.assertEqual(
                 "toggle",
-                settings["LITELLM_MENU_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED"]["kind"],
+                settings["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED"]["kind"],
             )
             self.assertEqual(
                 "toggle",
-                settings["LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"]["kind"],
+                settings["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"]["kind"],
             )
 
             domain.dispatch(
                 "set_setting",
                 {
-                    "key": "LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED",
+                    "key": "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED",
                     "value": True,
                 },
             )
             domain.apply()
 
             self.assertIn(
-                "LITELLM_MENU_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED=1",
+                "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED=1",
                 path.read_text(encoding="utf-8"),
             )
 
@@ -2121,18 +2121,18 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime-settings.env"
             path.write_text(
-                "LITELLM_MENU_VISION_BRIDGE_API_KEY=replace-me-secret\n",
+                "YOUNG_ROUTER_VISION_BRIDGE_API_KEY=replace-me-secret\n",
                 encoding="utf-8",
             )
             domain = RuntimeSettingsDomain(path)
-            self.assertNotIn("LITELLM_MENU_VISION_BRIDGE_API_KEY", {item["key"] for item in domain.snapshot()["settings"]})
+            self.assertNotIn("YOUNG_ROUTER_VISION_BRIDGE_API_KEY", {item["key"] for item in domain.snapshot()["settings"]})
             domain.apply()
-            self.assertNotIn("LITELLM_MENU_VISION_BRIDGE_API_KEY", path.read_text(encoding="utf-8"))
+            self.assertNotIn("YOUNG_ROUTER_VISION_BRIDGE_API_KEY", path.read_text(encoding="utf-8"))
 
     def test_pi_web_access_json_default_is_not_reported_as_configured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
-            key = "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
+            key = "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"
             field = next(item for item in domain.snapshot()["settings"] if item["key"] == key)
 
             self.assertFalse(field["configured"])
@@ -2148,7 +2148,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
             core = CoreStore(domains=[domain])
-            key = "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON"
+            key = "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON"
             value = '{\n  "provider": "duckduckgo"\n}'
 
             result = core.stage_secret("runtime", "setting", key, value, revision=core.revision)
@@ -2157,7 +2157,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             self.assertNotIn(value, json.dumps(core.snapshot()))
 
             with self.assertRaisesRegex(CoreError, "unavailable"):
-                core.trusted_secret_descriptor("runtime", "setting", "LITELLM_MENU_VISION_BRIDGE_API_KEY")
+                core.trusted_secret_descriptor("runtime", "setting", "YOUNG_ROUTER_VISION_BRIDGE_API_KEY")
 
 
 class WebDAVSettingsDomainTests(unittest.TestCase):

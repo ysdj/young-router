@@ -24,7 +24,7 @@ model_list:
 litellm_settings:
   drop_params: true
   callbacks:
-    - litellm_menu.callbacks.image_generation_routing_hook
+    - young_router.callbacks.image_generation_routing_hook
   public_model_groups:
     - default-chat
 

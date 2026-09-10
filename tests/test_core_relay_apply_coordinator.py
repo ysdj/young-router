@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
-from litellm_menu.core.service import CoreStore
+from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.domains.relay_accounts import RelayAccountsDomain
+from young_router.core.service import CoreStore
 
 
 class RelayCoordinatorHTTP:
@@ -371,7 +371,7 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             provider_id = providers.snapshot()["providers"][0]["id"]
             opener = ModelListOpener()
             with patch(
-                "litellm_menu.core.domains.providers_models.isolated_http_opener",
+                "young_router.core.domains.providers_models.isolated_http_opener",
                 return_value=opener,
             ):
                 fetched = core.dispatch(
@@ -507,7 +507,7 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             provider_id = restarted_providers.snapshot()["providers"][0]["id"]
             opener = ModelListOpener()
             with patch(
-                "litellm_menu.core.domains.providers_models.isolated_http_opener",
+                "young_router.core.domains.providers_models.isolated_http_opener",
                 return_value=opener,
             ):
                 restarted.dispatch(
