@@ -4,7 +4,7 @@ import json
 from types import SimpleNamespace
 import unittest
 
-from litellm_menu.core.native_codex_catalog import read_native_catalog
+from young_router.core.native_codex_catalog import read_native_catalog
 
 
 class NativeCodexCatalogTests(unittest.TestCase):

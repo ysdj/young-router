@@ -411,7 +411,7 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
               <Text numberOfLines={2} style={styles.apiKeyDialogSubtitle}>{translate("relay.apiKeyCreateDescription")}</Text>
             </View>
           </View>
-          <NativeButton title={translate("menu.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} />
+          <NativeButton title={translate("status.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} />
         </View>
         <View style={styles.apiKeyDialogContent}>
           <View style={styles.apiKeyStageBanner}>
@@ -450,7 +450,7 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
             </View>
           </View>
         </View>
-        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("menu.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={translate("relay.apiKeyCreate")} primary disabled={disabled || !name.trim()} onPress={() => onCreate({ name: name.trim(), groupID: groupID || undefined, enabled })} /></View></View>
+        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={translate("relay.apiKeyCreate")} primary disabled={disabled || !name.trim()} onPress={() => onCreate({ name: name.trim(), groupID: groupID || undefined, enabled })} /></View></View>
       </View>
     </View>
   </RelayDialogLayer>;
@@ -473,13 +473,13 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
   return <RelayDialogLayer visible={visible} onRequestClose={onClose}>
     <View style={styles.dialogBackdrop}>
       <View style={styles.decisionDialog} accessibilityViewIsModal>
-        <View style={styles.dialogHeader}><Text style={styles.dialogTitle}>{title}</Text><NativeButton title={translate("menu.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} /></View>
+        <View style={styles.dialogHeader}><Text style={styles.dialogTitle}>{title}</Text><NativeButton title={translate("status.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} /></View>
         <View style={styles.decisionContent}>
           <Text style={styles.decisionMessage}>{message}</Text>
           <View style={styles.decisionField}><Text style={styles.decisionLabel}>{translate("relay.dependencyPolicy")}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedOption.label} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onValueChange(option.value); }} style={styles.decisionControl} /></View>
           <Text style={styles.decisionHint}>{selectedOption.hint}</Text>
         </View>
-        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("menu.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={confirmLabel} primary destructive={confirmLabel === translate("common.delete")} disabled={disabled} onPress={onConfirm} /></View></View>
+        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={confirmLabel} primary destructive={confirmLabel === translate("common.delete")} disabled={disabled} onPress={onConfirm} /></View></View>
       </View>
     </View>
   </RelayDialogLayer>;
@@ -859,8 +859,8 @@ export function StationAccountsPanel({
         draftLabel: translate("relay.apiKeyDraftLabel"),
         deletedLabel: translate("relay.apiKeyDeletedLabel"),
         autoGroupingLabel: translate("relay.apiKeyAutoGrouping"),
-        closeLabel: translate("menu.close"),
-        applyLabel: translate("menu.apply"),
+        closeLabel: translate("status.close"),
+        applyLabel: translate("status.apply"),
         hint: translate("relay.groupManagerHint"),
       },
       autoGrouping: account.autoGrouping,

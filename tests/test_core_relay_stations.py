@@ -5,8 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError
-from litellm_menu.core.service import CoreStore
+from young_router.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError
+from young_router.core.service import CoreStore
 
 
 class RelayStationDomainTests(unittest.TestCase):

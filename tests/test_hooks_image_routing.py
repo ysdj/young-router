@@ -8,7 +8,7 @@ from hook_test_utils import *
 
 class HookImageRoutingTests(HookTestCase):
     def test_image_generation_module_contains_only_imggen_behavior(self) -> None:
-        tree = ast.parse((ROOT / "litellm_menu" / "image_generation.py").read_text(encoding="utf-8"))
+        tree = ast.parse((ROOT / "young_router" / "image_generation.py").read_text(encoding="utf-8"))
         definitions = [
             node.name
             for node in tree.body
@@ -297,7 +297,7 @@ class HookImageRoutingTests(HookTestCase):
             }
             chunks = [
                 chunk
-                async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+                async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                     user_api_key_dict=None,
                     response=upstream_stream(),
                     request_data=request_data,
@@ -317,7 +317,7 @@ class HookImageRoutingTests(HookTestCase):
 
     async def test_responses_api_image_generation_tool_does_not_use_static_capability_filter(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         def aresponses():
             pass
@@ -351,7 +351,7 @@ class HookImageRoutingTests(HookTestCase):
 
     async def test_responses_api_image_generation_edit_keeps_image_input_candidates_for_runtime_probe(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         deployments = [
             {
@@ -394,7 +394,7 @@ class HookImageRoutingTests(HookTestCase):
 
     async def test_responses_api_with_image_input_does_not_use_vision_capability_filter(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         def aresponses():
             pass
@@ -435,7 +435,7 @@ class HookImageRoutingTests(HookTestCase):
 
     async def test_responses_api_with_image_input_skips_declared_unsafe_deployment(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         def aresponses():
             pass
@@ -480,7 +480,7 @@ class HookImageRoutingTests(HookTestCase):
 
     async def test_chat_completions_image_url_keeps_responses_only_unsafe_deployment(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         deployments = [
             {
@@ -517,7 +517,7 @@ class HookImageRoutingTests(HookTestCase):
 
     async def test_chat_completions_image_url_does_not_use_vision_capability_filter(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         deployments = [
             {
@@ -732,7 +732,7 @@ class HookImageRoutingTests(HookTestCase):
 
     async def test_pre_call_image_budget_trace_contains_only_numeric_image_metadata(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         import base64
 
@@ -1040,7 +1040,7 @@ class HookImageRoutingTests(HookTestCase):
                 raise AssertionError("plain text requests must not invoke image fallback")
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {"model": "default-chat", "input": "Say pong only."}
         original = {"output_text": "pong"}
 
@@ -1065,7 +1065,7 @@ class HookImageRoutingTests(HookTestCase):
                 }
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": "Continue the long-running paper translation and report status.",
@@ -1089,7 +1089,7 @@ class HookImageRoutingTests(HookTestCase):
                 raise AssertionError("policy refusals must not invoke image fallback")
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": "make a disallowed image",

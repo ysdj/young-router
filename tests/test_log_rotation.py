@@ -4,18 +4,18 @@ import os
 import tempfile
 import unittest
 
-from litellm_menu import log_rotation
+from young_router import log_rotation
 
 
 class LogRotationTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmpdir.cleanup)
-        self.log_path = os.path.join(self._tmpdir.name, "menu-server.log")
+        self.log_path = os.path.join(self._tmpdir.name, "server.log")
         for key in (
             log_rotation.LOG_MAX_BYTES_ENV,
             log_rotation.LOG_BACKUP_SEGMENTS_ENV,
-            "LITELLM_MENU_SERVICE_LOG",
+            "YOUNG_ROUTER_SERVICE_LOG",
         ):
             os.environ.pop(key, None)
         self.addCleanup(lambda: os.environ.pop(key, None))
@@ -71,7 +71,7 @@ class LogRotationTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.log_path + ".4"))
 
     def test_write_bounded_stream_rotates_managed_log(self) -> None:
-        os.environ["LITELLM_MENU_SERVICE_LOG"] = self.log_path
+        os.environ["YOUNG_ROUTER_SERVICE_LOG"] = self.log_path
         maximum = 400
         with open(self.log_path, "w", encoding="utf-8") as handle:
             handle.write("x" * 350)

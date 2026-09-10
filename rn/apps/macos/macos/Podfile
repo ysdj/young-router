@@ -18,7 +18,7 @@ require File.join(react_native_macos_path, "scripts/react_native_pods")
 
 prepare_react_native_project!
 
-target 'LiteLLMMenu-macOS' do
+target 'YoungRouter-macOS' do
   platform :macos, '14.0'
   use_native_modules!
 

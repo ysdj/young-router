@@ -6,7 +6,7 @@ DEVELOPER_DIR="${DEVELOPER_DIR:-}"
 VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 BUILD_NUMBER="$(tr -d '[:space:]' < "$ROOT/BUILD_NUMBER")"
 ARCH="$(uname -m)"
-OUTPUT="${1:-$ROOT/artifacts/litellm-menu-$VERSION-$BUILD_NUMBER-macos-$ARCH.tar.zst}"
+OUTPUT="${1:-$ROOT/artifacts/young-router-$VERSION-$BUILD_NUMBER-macos-$ARCH.tar.zst}"
 UV_BIN="${LITELLM_UV_BIN:-$(command -v uv 2>/dev/null || true)}"
 ZSTD_BIN="${LITELLM_ZSTD_BIN:-$(command -v zstd 2>/dev/null || true)}"
 
@@ -42,30 +42,30 @@ if [[ -z "$ZSTD_BIN" || ! -x "$ZSTD_BIN" ]]; then
   exit 1
 fi
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/litellm-menu-release.XXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/young-router-release.XXXXXX")"
 cleanup() {
   [[ ! -d "$WORK_DIR" ]] || rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
-APP="$WORK_DIR/LiteLLM Menu.app"
+APP="$WORK_DIR/Young Router.app"
 CORE="$APP/Contents/Resources/Core"
 (
   cd "$ROOT/rn"
-  LITELLM_MENU_MACOS_OUTPUT="$APP" \
-    LITELLM_MENU_REFRESH_PODS=1 \
-    LITELLM_MENU_RESET_METRO_CACHE=1 \
+  YOUNG_ROUTER_MACOS_OUTPUT="$APP" \
+    YOUNG_ROUTER_REFRESH_PODS=1 \
+    YOUNG_ROUTER_RESET_METRO_CACHE=1 \
     LITELLM_UV_BIN="$UV_BIN" \
     pnpm run build:macos
 )
 
-test -x "$APP/Contents/MacOS/LiteLLMMenu"
+test -x "$APP/Contents/MacOS/YoungRouter"
 test -x "$CORE/runtime/bin/python"
 test -x "$CORE/runtime/bin/litellm"
 test -x "$CORE/runtime/bin/node"
 test -x "$CORE/bin/vision_ocr"
-test -f "$CORE/litellm_menu/core/__main__.py"
-test -f "$CORE/litellm_menu/pi-web-access/index.ts"
+test -f "$CORE/young_router/core/__main__.py"
+test -f "$CORE/young_router/pi-web-access/index.ts"
 test -f "$CORE/sitecustomize.py"
 plutil -lint "$APP/Contents/Info.plist"
 test "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" = "$VERSION"
@@ -75,9 +75,9 @@ test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" = "$BUI
 export LITELLM_LOCAL_MODEL_COST_MAP=true
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$CORE" \
   "$CORE/runtime/bin/python" -c \
-  'import litellm.proxy.proxy_server, litellm_menu.core, codex_config, config_editor_core, configuration_package, webdav.core'
+  'import litellm.proxy.proxy_server, young_router.core, codex_config, config_editor_core, configuration_package, webdav.core'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$CORE" \
-  "$CORE/runtime/bin/python" -m litellm_menu.core --help >/dev/null
+  "$CORE/runtime/bin/python" -m young_router.core --help >/dev/null
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null
 codesign --verify --deep --strict --verbose=2 "$APP"
 
@@ -87,25 +87,25 @@ mkdir -p "$(dirname "$RELOCATED_CORE")"
 rsync -a "$CORE/" "$RELOCATED_CORE/"
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELOCATED_CORE" \
   "$RELOCATED_CORE/runtime/bin/python" -c \
-  'import litellm.proxy.proxy_server, litellm_menu.core'
-PYTHONDONTWRITEBYTECODE=1 LITELLM_MENU_PROXY_PROCESS=1 PYTHONPATH="$RELOCATED_CORE" \
+  'import litellm.proxy.proxy_server, young_router.core'
+PYTHONDONTWRITEBYTECODE=1 YOUNG_ROUTER_PROXY_PROCESS=1 PYTHONPATH="$RELOCATED_CORE" \
   "$RELOCATED_CORE/runtime/bin/python" -c \
-  'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("litellm_menu.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "LiteLLMMenuHook"'
+  'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("young_router.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "YoungRouterHook"'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELOCATED_CORE" \
-  "$RELOCATED_CORE/runtime/bin/python" -m litellm_menu.core --help >/dev/null
+  "$RELOCATED_CORE/runtime/bin/python" -m young_router.core --help >/dev/null
 PYTHONDONTWRITEBYTECODE=1 "$RELOCATED_CORE/runtime/bin/litellm" --help >/dev/null
 rm -rf "$WORK_DIR/relocated"
 
 mkdir -p "$(dirname "$OUTPUT")"
 TEMP_OUTPUT="$OUTPUT.tmp"
 rm -f "$TEMP_OUTPUT"
-COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C "$WORK_DIR" "LiteLLM Menu.app" \
+COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C "$WORK_DIR" "Young Router.app" \
   | "$ZSTD_BIN" -q -T0 -19 -o "$TEMP_OUTPUT"
 ARCHIVE_LIST="$WORK_DIR/archive-list.txt"
 "$ZSTD_BIN" -q -d -c "$TEMP_OUTPUT" | tar -tf - >"$ARCHIVE_LIST"
-grep -Fq "LiteLLM Menu.app/Contents/Resources/Core/runtime/bin/python" "$ARCHIVE_LIST"
-grep -Fq "LiteLLM Menu.app/Contents/Resources/Core/bin/vision_ocr" "$ARCHIVE_LIST"
-if grep -Eq 'LiteLLM Menu\.app/Contents/Resources/Core/(\.venv|venv)(/|$)|Contents/Resources/App/' "$ARCHIVE_LIST"; then
+grep -Fq "Young Router.app/Contents/Resources/Core/runtime/bin/python" "$ARCHIVE_LIST"
+grep -Fq "Young Router.app/Contents/Resources/Core/bin/vision_ocr" "$ARCHIVE_LIST"
+if grep -Eq 'Young Router\.app/Contents/Resources/Core/(\.venv|venv)(/|$)|Contents/Resources/App/' "$ARCHIVE_LIST"; then
   echo "Release archive contains a development runtime or legacy bundle path." >&2
   exit 1
 fi

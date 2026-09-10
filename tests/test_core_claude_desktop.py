@@ -5,12 +5,12 @@ import pathlib
 import tempfile
 import unittest
 
-from litellm_menu.core.claude_desktop import (
+from young_router.core.claude_desktop import (
     ClaudeDesktopConfig,
     ClaudeDesktopConfigError,
     ClaudeDeveloperSettings,
 )
-from litellm_menu.core.domains.claude import ClaudeSettingsDomain
+from young_router.core.domains.claude import ClaudeSettingsDomain
 
 
 def _write_desktop_config(root: pathlib.Path, config: dict[str, object]) -> pathlib.Path:

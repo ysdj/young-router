@@ -6,14 +6,14 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-from litellm_menu.core.domains.relay_accounts import (
+from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.domains.relay_accounts import (
     DETECTION_TIMEOUT_SECONDS,
     RelayAccountsDomain,
     RelayAccountsError,
     RelayHTTPClient,
 )
-from litellm_menu.core.service import CoreError, CoreStore
+from young_router.core.service import CoreError, CoreStore
 
 
 class FakeRelayHTTPClient:
@@ -126,7 +126,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             imported = core.import_package(
                 package={
-                    "format": "litellm-menu-core-package",
+                    "format": "young-router-core-package",
                     "version": 1,
                     "sections": {"relay_accounts": self._remembered_relay_package()},
                 },
@@ -176,7 +176,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             with self.assertRaises(CoreError):
                 core.import_package(
                     package={
-                        "format": "litellm-menu-core-package",
+                        "format": "young-router-core-package",
                         "version": 1,
                         "sections": {
                             "relay_accounts": self._remembered_relay_package(),

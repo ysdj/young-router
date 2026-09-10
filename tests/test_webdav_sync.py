@@ -82,7 +82,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             bundle, manifest = webdav_core.create_bundle(source_config)
             result = webdav_core.install_bundle(bundle, target_config)
 
-            self.assertEqual(manifest["app"], "litellm-menu")
+            self.assertEqual(manifest["app"], "young-router")
             self.assertTrue(target_config.exists())
             self.assertEqual(result["manifest"]["summary"]["active_models"], 1)
 
@@ -208,8 +208,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             bundle, _manifest = webdav_core.create_bundle(source)
             text = bundle.decode("utf-8")
             duplicate_key_bundle = text.replace(
-                '"app": "litellm-menu",',
-                '"app": "litellm-menu", "app": "litellm-menu",',
+                '"app": "young-router",',
+                '"app": "young-router", "app": "young-router",',
                 1,
             ).encode("utf-8")
 
@@ -249,13 +249,13 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             webdav_core._settings_from_raw(
                 {
                     "url": "https://example.com/webdav/",
-                    "remote_name": "litellm-menu-config.tar.gz",
+                    "remote_name": "young-router-config.tar.gz",
                 }
             )
 
     def test_legacy_tar_url_is_rejected(self) -> None:
         settings = webdav_core.Settings(
-            url="https://example.com/webdav/litellm-menu-config.tar.gz"
+            url="https://example.com/webdav/young-router-config.tar.gz"
         )
 
         with self.assertRaisesRegex(webdav_core.SyncError, "tar/tgz"):
@@ -644,7 +644,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("configured remote file", output)
         self.assertIn("https://example.com/dav/resource/config.json", output)
-        self.assertNotIn(".litellm-menu-probe", output)
+        self.assertNotIn(".young-router-probe", output)
 
     def test_checkpoint_after_retries_uses_curl_fallback(self) -> None:
         settings = webdav_core.Settings(url="https://example.com/dav/resource/", username="webdav", password="token")

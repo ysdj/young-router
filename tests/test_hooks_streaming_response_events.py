@@ -73,7 +73,7 @@ class HookStreamingResponseEventTests(HookTestCase):
         }
 
         with self.assertRaises(RuntimeError) as raised:
-            async for _chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for _chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=original_stream(),
                 request_data=request_data,
@@ -136,7 +136,7 @@ class HookStreamingResponseEventTests(HookTestCase):
 
         with self.assertRaises(RuntimeError) as raised:
             chunks = []
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=context_failed_stream("resp-original"),
                 request_data=request_data,
@@ -162,7 +162,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             yield {"type": "response.output_text.delta", "delta": "hello"}
             yield {"type": "response.completed", "response": {"id": "resp-original"}}
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Say hello."}],
@@ -222,7 +222,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "legacy-chat",
             "input": [{"role": "user", "content": "Use the provided local document context only"}],
@@ -284,7 +284,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             yield {"type": "response.output_text.delta", "delta": "HI_OK"}
             yield FakeCompletedEvent()
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Say HI_OK."}],
@@ -332,7 +332,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Say done."}],
@@ -459,7 +459,7 @@ class HookStreamingResponseEventTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=original_stream(),
                 request_data=request_data,
@@ -549,7 +549,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Print 12345."}],
@@ -610,7 +610,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [
@@ -667,7 +667,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Compact this session."}],
@@ -732,7 +732,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Run pwd."}],
@@ -794,7 +794,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Run pwd."}],
@@ -869,7 +869,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 },
             }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         first_output = "alpha-" + ("a" * 125000) + "-omega"
         second_output = "start-" + ("b" * 125000) + "-finish"
         request_data = {
@@ -940,7 +940,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             yield {"type": "response.output_text.delta", "delta": "partial answer"}
             raise GatewayTimeout("upstream-status-504")
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Print a partial answer."}],
@@ -994,7 +994,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             original_yield_start_buffered,
         )
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         chunks = [
             jsonable_stream_chunk(chunk)
             async for chunk in hook.async_post_call_streaming_iterator_hook(
@@ -1039,7 +1039,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "画一张图。"}],
@@ -1090,7 +1090,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "画一张图。"}],
@@ -1140,7 +1140,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [{"role": "user", "content": "Say pong only."}],
@@ -1177,7 +1177,7 @@ class HookStreamingResponseEventTests(HookTestCase):
                 raise AssertionError("non-temporary stream errors must not invoke fallback")
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         error = ValueError("malformed local stream chunk")
 
         async def original_stream():

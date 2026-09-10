@@ -1,10 +1,10 @@
-# LiteLLM Menu
+# Young Router
 
-LiteLLM Menu is a native macOS and Windows desktop application that runs and manages a local [LiteLLM](https://github.com/BerriAI/litellm) proxy service. It consolidates multi-provider model routing, deployment fallback, Responses API compatibility, vision bridging, web search bridging, image generation tool adaptation, and selectable Codex configuration into a single app-owned local endpoint.
+Young Router is a native macOS and Windows desktop application that runs and manages a local [LiteLLM](https://github.com/BerriAI/litellm) proxy service. It consolidates multi-provider model routing, deployment fallback, Responses API compatibility, vision bridging, web search bridging, image generation tool adaptation, and selectable Codex configuration into a single app-owned local endpoint.
 
 The desktop UI is delivered through the shared React Native workspace in
 [`rn/`](./rn/): React/TypeScript owns routes, components, interaction and
-i18n; `litellm_menu/core/` owns the single staged state source and versioned
+i18n; `young_router/core/` owns the single staged state source and versioned
 local IPC; AppKit and WinUI 3 provide only native leaves.
 
 See [Architecture / 架构](./docs/ARCHITECTURE.md) for directory ownership,
@@ -16,7 +16,7 @@ dependency rules, and the staged cleanup plan.
 
 ### Native Desktop Hosts
 
-LiteLLM Menu uses one shared React/TypeScript UI with an AppKit status item and native macOS controls, plus a WinUI 3 window, native controls, and Windows tray. The app automatically starts and monitors its local LiteLLM proxy while it is open, and shuts that proxy down before it exits. No Docker container, database, virtual environment, or system Python installation is required. Release builds include self-contained Python and Node.js runtimes, Python Core, and pinned LiteLLM dependencies.
+Young Router uses one shared React/TypeScript UI with an AppKit status item and native macOS controls, plus a WinUI 3 window, native controls, and Windows tray. The app automatically starts and monitors its local LiteLLM proxy while it is open, and shuts that proxy down before it exits. No Docker container, database, virtual environment, or system Python installation is required. Release builds include self-contained Python and Node.js runtimes, Python Core, and pinned LiteLLM dependencies.
 
 The native menu is grouped by task:
 
@@ -40,7 +40,7 @@ The routing constraint patch integrates exclusions and cooldowns directly into L
 
 ### Responses API Compatibility
 
-Each deployment uses one of OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), or OpenAI Chat Completions (`/v1/chat/completions`). LiteLLM Menu first follows the client-facing protocol in auto-adapt mode, then switches to the configured backup when the upstream rejects that protocol.
+Each deployment uses one of OpenAI Responses (`/v1/responses`), Anthropic Messages (`/v1/messages`), or OpenAI Chat Completions (`/v1/chat/completions`). Young Router first follows the client-facing protocol in auto-adapt mode, then switches to the configured backup when the upstream rejects that protocol.
 
 The bridge handles:
 
@@ -61,7 +61,7 @@ Standalone image model routes (`/v1/images/generations`) are handled separately 
 ### dsh-vision-router fallback
 
 The bundled dsh-vision-router-compatible chain is a text-only fallback for image
-requests. LiteLLM Menu first sends the original image request to the selected
+requests. Young Router first sends the original image request to the selected
 deployment. If that deployment explicitly rejects image input, the chain tries
 the configured local Ollama/LM Studio providers, ordered HTTP providers, and the
 optional free fallback chain; the resulting visual context is appended as text
@@ -72,7 +72,7 @@ Configure it in Runtime Settings with the quick controls for enabled state,
 backend, free fallback, timeout, max tokens, Ollama, and LM Studio. Each quick
 control has a `Follow advanced JSON`/`inherit` choice, so it does not overwrite
 custom values in the advanced `dsh-vision-router config` JSON textarea
-(`LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON`). The JSON document remains the
+(`YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON`). The JSON document remains the
 place for ordered `httpProviders`, dsh-style `{provider,model,fallbacks}`
 entries, provider endpoints/models, `apiKeyEnv`, and `prompt`. Raw API keys are
 not stored in the configuration document. Invalid configuration is rejected by
@@ -86,7 +86,7 @@ When a Responses API request includes `web_search` tool usage:
 1. **Native hosted search** is attempted first when route metadata indicates support or support is unknown on a Responses-capable route.
 2. **External bridge** activates when the route is chat-only, explicitly lacks hosted web search support, or returns an unsupported hosted-tool error.
 
-The external bridge executes the bundled [pi-web-access](https://github.com/nicobailon/pi-web-access) extension through its Pi SDK worker. Search and page-fetch parameters are configurable through runtime settings; the extension's provider, routing, credentials, and SSRF policy are supplied as a private `web-search.json` configuration. The Runtime Settings field `LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON` accepts that JSON object and never exports it as a plain process setting.
+The external bridge executes the bundled [pi-web-access](https://github.com/nicobailon/pi-web-access) extension through its Pi SDK worker. Search and page-fetch parameters are configurable through runtime settings; the extension's provider, routing, credentials, and SSRF policy are supplied as a private `web-search.json` configuration. The Runtime Settings field `YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON` accepts that JSON object and never exports it as a plain process setting.
 
 The bridge exposes focused search queries and source URLs to the model. Query planning is model-driven; the bridge does not add request-specific query rewrites.
 
@@ -117,7 +117,7 @@ the native declaration itself. An explicit capability flag of
 the local fallback.
 After that explicit native rejection, the route's negative capability is
 remembered per deployment, upstream surface, and search-tool family for
-LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS seconds (default 600).
+YOUNG_ROUTER_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS seconds (default 600).
 Matching requests use pi-web-access directly during the TTL; expiry probes the
 native declaration again. Transport, Exa, quota, policy, and other transient
 failures never populate this memory, and 0 disables it.
@@ -132,12 +132,12 @@ The facade intercepts computer action calls, routes them to the configured backe
 
 ### Codex Optimization
 
-LiteLLM Menu includes targeted optimizations for [Codex](https://github.com/openai/codex) CLI and similar Responses API clients:
+Young Router includes targeted optimizations for [Codex](https://github.com/openai/codex) CLI and similar Responses API clients:
 
 - **Codex Settings** — a single staged editor combines typed settings for connection, behavior, features, permissions, providers, MCP/plugins, and advanced options with synchronized `config.toml` and `auth.json` text views. Applying a LiteLLM deployment stages its local endpoint/key, without overwriting unrelated Codex settings or credentials. By default new tasks compact through the local checkpoint summary; only a model with the explicit compaction opt-in described below advertises remote encrypted compaction.
-- **Managed Codex model catalog** — the menu-bar switch publishes exactly the model IDs returned by the running LiteLLM Menu `/v1/models` endpoint, keeping the current and review models first only when that endpoint exposes them. Configured-only or stale selections are never added as fallbacks. A failed endpoint probe leaves the last verified catalog intact; a successful empty response clears it.
-- **Fast default tier** — when effective `CODEX_HOME/config.toml` has `service_tier = "fast"` (or `"priority"`) and `[features].fast_mode = true`, Menu injects the upstream value `"priority"` only into reliably identified Codex native `/v1/responses` requests whose original body has no `service_tier`. The config is refreshed on the next request after Apply; explicit tiers and non-Codex traffic are never overwritten. Known boundary: if Desktop strips a manual Standard selection into an absent HTTP field while config remains Fast, the gateway cannot distinguish it; the config file is this shim's explicit switch.
-- **Codex compaction selection** — applying a LiteLLM deployment stages its local endpoint/key under a custom provider row whose display name chooses the compaction protocol for **new** Codex tasks: by default the neutral `LiteLLM Menu` name makes Codex use its local context-checkpoint summary, while a model whose `model_info` explicitly sets `supports_responses_compaction: true` (unified alias `supports_compaction`) advertises the exact `OpenAI` name so new tasks use encrypted remote compaction through the local gateway. The field is never inferred from provider names, model names, or gpt versions. Capability decisions always belong to the actual target route: the proxy sends a history-free probe before forwarding signed history on every non-official host (official OpenAI hosts skip it), and an unsupported deployment fails over to other candidate deployments. When every candidate rejects encrypted compaction, Codex receives an explicit protocol error — Menu never converts signed history into a local plaintext summary or fabricates encrypted content. Already-running tasks cached their provider identity when they started and cannot be switched mid-protocol; they need a new task (or an opt-in route) to change compaction behavior. The capability result stays cached per deployment and Responses surface for 30 minutes by default (adjustable in Runtime Settings).
+- **Managed Codex model catalog** — the menu-bar switch publishes exactly the model IDs returned by the running Young Router `/v1/models` endpoint, keeping the current and review models first only when that endpoint exposes them. Configured-only or stale selections are never added as fallbacks. A failed endpoint probe leaves the last verified catalog intact; a successful empty response clears it.
+- **Fast default tier** — when effective `CODEX_HOME/config.toml` has `service_tier = "fast"` (or `"priority"`) and `[features].fast_mode = true`, Young Router injects the upstream value `"priority"` only into reliably identified Codex native `/v1/responses` requests whose original body has no `service_tier`. The config is refreshed on the next request after Apply; explicit tiers and non-Codex traffic are never overwritten. Known boundary: if Desktop strips a manual Standard selection into an absent HTTP field while config remains Fast, the gateway cannot distinguish it; the config file is this shim's explicit switch.
+- **Codex compaction selection** — applying a LiteLLM deployment stages its local endpoint/key under a custom provider row whose display name chooses the compaction protocol for **new** Codex tasks: by default the neutral `Young Router` name makes Codex use its local context-checkpoint summary, while a model whose `model_info` explicitly sets `supports_responses_compaction: true` (unified alias `supports_compaction`) advertises the exact `OpenAI` name so new tasks use encrypted remote compaction through the local gateway. The field is never inferred from provider names, model names, or gpt versions. Capability decisions always belong to the actual target route: the proxy sends a history-free probe before forwarding signed history on every non-official host (official OpenAI hosts skip it), and an unsupported deployment fails over to other candidate deployments. When every candidate rejects encrypted compaction, Codex receives an explicit protocol error — Young Router never converts signed history into a local plaintext summary or fabricates encrypted content. Already-running tasks cached their provider identity when they started and cannot be switched mid-protocol; they need a new task (or an opt-in route) to change compaction behavior. The capability result stays cached per deployment and Responses surface for 30 minutes by default (adjustable in Runtime Settings).
 - **Reasoning effort compatibility** — when an upstream returns an error indicating `xhigh` reasoning effort is unsupported, the proxy retries with a compatible effort level (`high` or `max`) and records the compat retry.
 - **Usage normalization** — the `response.completed` event's `usage` block is normalized to the Codex-expected schema (`input_tokens`, `output_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens`, `total_tokens`), including conversion from Chat Completions `prompt_tokens`/`completion_tokens` naming.
 - **Browser-compatible headers** — for providers that require standard browser headers, the proxy injects a browser User-Agent and Accept headers on retry.
@@ -174,10 +174,10 @@ The Core validates the editable configuration and stages the validated result to
 Install the app and its self-contained runtime with one command:
 
 ```bash
-brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu && brew trust ysdj/litellm-menu && brew install --cask ysdj/litellm-menu/litellm-menu
+brew tap ysdj/young-router https://github.com/ysdj/young-router && brew trust ysdj/young-router && brew install --cask ysdj/young-router/young-router
 ```
 
-Open **LiteLLM Menu** from Applications after installation. Future updates only need `brew upgrade --cask litellm-menu`.
+Open **Young Router** from Applications after installation. Future updates only need `brew upgrade --cask young-router`.
 
 Homebrew downloads the prebuilt app and bundled runtime. Opening it starts the menu-owned service without a first-run dependency install.
 
@@ -186,12 +186,12 @@ Homebrew downloads the prebuilt app and bundled runtime. Opening it starts the m
 Clone the repository and build the app bundle:
 
 ```bash
-git clone https://github.com/ysdj/litellm-menu.git
-cd litellm-menu
+git clone https://github.com/ysdj/young-router.git
+cd young-router
 cd rn
 pnpm run bootstrap:rnmacos
 pnpm install --frozen-lockfile
-LITELLM_MENU_MACOS_OUTPUT="$PWD/../artifacts/LiteLLM Menu.app" pnpm run build:macos
+YOUNG_ROUTER_MACOS_OUTPUT="$PWD/../artifacts/Young Router.app" pnpm run build:macos
 ```
 
 The desktop dependency line is pinned to React Native `0.85.3`, React Native
@@ -202,7 +202,7 @@ separate Hermes toolchain before invoking CocoaPods/Xcode.
 The output is a signed React Native app with its relocatable Core runtime. Use an isolated output for a preview and never overwrite or launch over a user-owned installation during routine verification. Launch an explicit artifact only after reviewing it:
 
 ```bash
-open "$PWD/../artifacts/LiteLLM Menu.app"
+open "$PWD/../artifacts/Young Router.app"
 ```
 
 On Windows, run the equivalent host build from a Developer PowerShell:
@@ -215,7 +215,7 @@ pnpm run build:windows
 
 ### First Launch
 
-1. Open LiteLLM Menu from its menu bar icon.
+1. Open Young Router from its menu bar icon.
 2. The application starts the local LiteLLM proxy and Python Core from its bundled runtime.
 3. Click **Service Provider Management...** to sign in to official OpenAI/Claude accounts or manage relay-station accounts. Click **Providers & Models...** to configure API-key providers, API keys, models, and deployment order.
 4. Click **Apply Config** to stage and activate the configuration.
@@ -225,7 +225,7 @@ pnpm run build:windows
 
 ## Configuration
 
-The primary configuration file is `~/.litellm-menu/config.yaml`. A sanitized example is provided as `config.example.yaml`.
+The primary configuration file is `~/.young-router/config.yaml`. A sanitized example is provided as `config.example.yaml`.
 
 ### Key Sections
 
@@ -279,21 +279,21 @@ Adjustable through the menu without editing config files:
 
 | Setting | Environment Variable | Default |
 |---|---|---|
-| Stall timeout | `LITELLM_MENU_STALL_TIMEOUT_SECONDS` | 120 |
-| Request timeout | `LITELLM_MENU_REQUEST_TIMEOUT_SECONDS` | 7200 |
-| Codex parent completion barrier | `LITELLM_MENU_CODEX_DESCENDANT_CLEANUP` | 1 (on) |
-| Deployment cooldown failures | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
-| Deployment cooldown seconds | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
-| Compaction capability memory | `LITELLM_MENU_CODEX_COMPACTION_CAPABILITY_TTL_SECONDS` | 1800 |
-| Web search unsupported memory | `LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` | 600 |
-| Web search max results | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 5 |
-| Web fetch timeout | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
-| dsh-vision-router quick controls | `LITELLM_MENU_DSH_VISION_ROUTER_ENABLED`, `..._BACKEND`, `..._FREE_FALLBACK`, `..._TIMEOUT_SECONDS`, `..._MAX_TOKENS`, `..._LOCAL_OLLAMA_ENABLED`, `..._LOCAL_LM_STUDIO_ENABLED` | inherit / empty (keep advanced JSON) |
-| dsh-vision-router config JSON | `LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON` | built-in fallback chain |
-| Computer facade backend | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
-| Computer facade max steps | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
-| MCP auto-approval | `LITELLM_MENU_MCP_AUTO_APPROVE` | 0 (off) |
-| Route recovery interval | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
+| Stall timeout | `YOUNG_ROUTER_STALL_TIMEOUT_SECONDS` | 120 |
+| Request timeout | `YOUNG_ROUTER_REQUEST_TIMEOUT_SECONDS` | 7200 |
+| Codex parent completion barrier | `YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP` | 1 (on) |
+| Deployment cooldown failures | `YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
+| Deployment cooldown seconds | `YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
+| Compaction capability memory | `YOUNG_ROUTER_CODEX_COMPACTION_CAPABILITY_TTL_SECONDS` | 1800 |
+| Web search unsupported memory | `YOUNG_ROUTER_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` | 600 |
+| Web search max results | `YOUNG_ROUTER_WEB_SEARCH_MAX_RESULTS` | 5 |
+| Web fetch timeout | `YOUNG_ROUTER_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
+| dsh-vision-router quick controls | `YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED`, `..._BACKEND`, `..._FREE_FALLBACK`, `..._TIMEOUT_SECONDS`, `..._MAX_TOKENS`, `..._LOCAL_OLLAMA_ENABLED`, `..._LOCAL_LM_STUDIO_ENABLED` | inherit / empty (keep advanced JSON) |
+| dsh-vision-router config JSON | `YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON` | built-in fallback chain |
+| Computer facade backend | `YOUNG_ROUTER_COMPUTER_FACADE_BACKEND` | auto |
+| Computer facade max steps | `YOUNG_ROUTER_COMPUTER_FACADE_MAX_STEPS` | 20 |
+| MCP auto-approval | `YOUNG_ROUTER_MCP_AUTO_APPROVE` | 0 (off) |
+| Route recovery interval | `YOUNG_ROUTER_RECOVERY_INTERVAL_SECONDS` | 5 |
 
 ### Configuration Files
 
@@ -303,12 +303,12 @@ Provider/model import and export live in **Providers & Models**; runtime import 
 
 ## Deep Links
 
-Both native hosts accept fixed `litellm-menu://open/<route>` links. For example, macOS can open settings without relying on status-item automation:
+Both native hosts accept fixed `young-router://open/<route>` links. For example, macOS can open settings without relying on status-item automation:
 
 ```bash
-open "litellm-menu://open/providers-models"
-open "litellm-menu://open/codex-settings"
-open "litellm-menu://open/logs?tab=service"
+open "young-router://open/providers-models"
+open "young-router://open/codex-settings"
+open "young-router://open/logs?tab=service"
 ```
 
 Deep links only navigate to allowlisted local routes. They cannot carry configuration values or trigger Apply.
@@ -338,7 +338,7 @@ Build a macOS preview or release only when explicitly needed, with an isolated o
 
 ### Version Management
 
-`VERSION`, `BUILD_NUMBER`, the RN macOS plist/Xcode project, both Windows manifests, and `Casks/litellm-menu.rb` are kept in sync through `scripts/version.py`.
+`VERSION`, `BUILD_NUMBER`, the RN macOS plist/Xcode project, both Windows manifests, and `Casks/young-router.rb` are kept in sync through `scripts/version.py`.
 
 LiteLLM is checked and advanced to the latest stable PyPI release at the beginning of every macOS and Windows build. `./scripts/update-litellm.sh --check` reports whether `LITELLM_VERSION` is current. A build may compile LiteLLM from its source distribution in the controlled build environment when PyPI has not published a matching wheel; the completed app still packages and runs the exact locked version, so app startup never compiles or upgrades LiteLLM.
 
@@ -352,9 +352,9 @@ MIT License. See [LICENSE](LICENSE).
 
 ---
 
-# LiteLLM Menu（中文）
+# 漾路由（Young Router）
 
-LiteLLM Menu 是一个 macOS 与 Windows 原生桌面应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、dsh-vision-router 视觉回退、网页搜索桥接、图像生成工具适配，以及可选择模型的 Codex 配置整合到一个由应用管理的本地端点中。
+漾路由是一个 macOS 与 Windows 原生桌面应用，用于运行和管理本地 [LiteLLM](https://github.com/BerriAI/litellm) 代理服务。它将多供应商模型路由、部署回退、Responses API 兼容、dsh-vision-router 视觉回退、网页搜索桥接、图像生成工具适配，以及可选择模型的 Codex 配置整合到一个由应用管理的本地端点中。
 
 ---
 
@@ -362,15 +362,15 @@ LiteLLM Menu 是一个 macOS 与 Windows 原生桌面应用，用于运行和管
 
 ### 双平台原生宿主
 
-LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原生控件，以及 WinUI 3 窗口、Windows 原生控件和托盘组成。应用打开时会自动启动并监控本地 LiteLLM 代理，退出前关闭所辖服务。无需 Docker、数据库、虚拟环境或系统 Python；发布包内置独立 Python 运行时、Python Core 和锁定版本的 LiteLLM 依赖。
+漾路由由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原生控件，以及 WinUI 3 窗口、Windows 原生控件和托盘组成。应用打开时会自动启动并监控本地 LiteLLM 代理，退出前关闭所辖服务。无需 Docker、数据库、虚拟环境或系统 Python；发布包内置独立 Python 运行时、Python Core 和锁定版本的 LiteLLM 依赖。
 
-原生菜单按任务分为三组：
+状态项操作按任务分为三组：
 
 - **App** — 控制登录时自动启动；应用打开期间会保持其所辖 LiteLLM 服务运行。
 - **Configuration** — 打开 **Providers & Models...**、**Codex / Claude Settings...** 或 **Runtime Settings...**。供应商页可从当前 Codex/Claude 设置、文件或已登录的 New API/Sub2API 中转站账号导入；供应商和运行时文件分别在各自页面导入或导出。
 - **Diagnostics** — 记录或查看路由追踪，检查恢复状态与最近请求，打开服务或配置监听日志，以及配置 WebDAV 同步。
 
-状态项始终保持中性的 `LL`，不会用颜色或符号表达异常。发生路由恢复时，悬停文字和菜单中的可点击恢复状态行会显示当前步骤、分类原因、尝试次数、心跳时间，以及恢复仍在推进还是可能卡住。
+状态项始终保持中性的 `YR`，不会用颜色或符号表达异常。发生路由恢复时，悬停文字和状态项操作中的可点击恢复状态行会显示当前步骤、分类原因、尝试次数、心跳时间，以及恢复仍在推进还是可能卡住。
 
 ### 部署回退与路由
 
@@ -417,7 +417,7 @@ LiteLLM Menu 由一套共享 React/TypeScript UI、AppKit 状态项与 macOS 原
 1. **原生托管搜索** — 路由元数据表明支持或支持状态未知时，优先在支持 Responses 的路由上尝试原生托管搜索。
 2. **外部桥接** — 路由仅支持聊天、明确不支持托管网页搜索，或返回不支持托管工具错误时激活。
 
-外部桥接通过 Pi SDK worker 执行内置的 [pi-web-access](https://github.com/nicobailon/pi-web-access) 扩展，并读取模型选定的来源页面。搜索与页面抓取参数可通过运行时设置配置；扩展的 provider、路由、凭据和 SSRF 策略写入私有 `web-search.json` 配置。运行时设置 `LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON` 可直接录入该 JSON 对象，配置不会作为明文进程设置导出。
+外部桥接通过 Pi SDK worker 执行内置的 [pi-web-access](https://github.com/nicobailon/pi-web-access) 扩展，并读取模型选定的来源页面。搜索与页面抓取参数可通过运行时设置配置；扩展的 provider、路由、凭据和 SSRF 策略写入私有 `web-search.json` 配置。运行时设置 `YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON` 可直接录入该 JSON 对象，配置不会作为明文进程设置导出。
 
 桥接器向模型暴露聚焦的搜索查询和来源 URL。查询规划由模型驱动：模型决定是否直接回答、换词、查看下一页或打开某个来源；默认四个动作轮次让它在多次换词后仍有机会查看刚找到的来源。桥接器不添加特定于请求的查询重写。
 
@@ -437,7 +437,7 @@ OpenRouter 的原生服务端搜索是第三种线路：OpenRouter Codex 请求�
 `openrouter:web_search`。因此未知路由用原生声明本身完成探测；显式
 `supports_*_web_search: false` 或确定性的原生拒绝才启用本地回退工具。
 原生搜索明确返回不支持后，会按部署、上游线路和搜索工具族记忆负能力，保留
-`LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` 秒（默认 600 秒）；记忆期间直接使用
+`YOUNG_ROUTER_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` 秒（默认 600 秒）；记忆期间直接使用
 本机 pi-web-access，过期后重新探测原生搜索。传输、Exa、配额、策略及其他瞬时失败不会写入
 该记忆，设为 0 可关闭跨请求记忆。
 
@@ -451,12 +451,12 @@ Facade 拦截 computer 动作调用，路由到已配置的后端，并返回观
 
 ### Codex 优化
 
-LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似 Responses API 客户端的定向优化：
+漾路由包含针对 [Codex](https://github.com/openai/codex) CLI 及类似 Responses API 客户端的定向优化：
 
 - **Codex Settings** — 单一草稿窗口把连接、行为、功能开关、权限、provider、MCP/plugin 与高级选项的结构化控制，同 `config.toml` / `auth.json` 的实时文本视图同步；选择并 Apply LiteLLM 部署会暂存本地端点与密钥，同时保留其余 Codex 设置和认证字段。默认情况下新建任务使用本地检查点摘要压缩；只有下面描述的显式 opt-in 模型才会公布远程加密压缩。
-- **托管 Codex 模型目录** — 菜单栏开关只会把运行中的 LiteLLM Menu `/v1/models` 实际返回的模型 ID 发布给 Codex；当前模型和 review 模型仅在端点确实暴露它们时保持在前。已配置但未暴露的模型和陈旧选择都不会作为回退加入。端点探测失败时保留上一次已验证的目录；只有端点成功返回空列表时才会清空目录。
-- **Fast 默认 tier** — 当有效 `CODEX_HOME/config.toml` 同时包含 `service_tier = "fast"`（也兼容 `"priority"`）和 `[features].fast_mode = true` 时，Menu 只会为可可靠识别的 Codex 原生 `/v1/responses` 请求、且原始请求未提供 `service_tier` 时注入上游标准值 `"priority"`。配置文件每次请求按变更刷新，因此 Codex Settings 的 Apply 后下一请求生效；显式 tier 与非 Codex 流量绝不覆盖。已知边界：若 Desktop 在用户手动选择 Standard 后先把该选择剥为“字段缺失”，而配置仍为 Fast，网关无法仅从 HTTP 请求区分这种情形；此 shim 的明确开关是配置文件。
-- **Codex 压缩方式选择** — Apply LiteLLM 部署时会在自定义 provider 行暂存本地端点与密钥，并以该行的显示名决定**新建** Codex 任务的压缩协议：默认的中性名 `LiteLLM Menu` 让 Codex 使用本地检查点摘要；而 `model_info` 中显式声明 `supports_responses_compaction: true`（统一别名 `supports_compaction`）的模型才会使用精确的 `OpenAI` 显示名，使新任务经本地网关走加密远程压缩。该字段绝不依据 provider 名、模型名或 gpt 版本推断。能力判定始终属于实际目标路由：除官方 OpenAI 主机外，代理在转发签名历史前都会先发送不带历史的能力探测，明确不支持的 deployment 会让请求切换到其他候选 deployment；当所有候选都不支持加密压缩时，Codex 收到明确的协议错误——Menu 既不会把签名历史转换成本地明文摘要，也绝不伪造加密压缩条目。已在运行的任务在创建时就缓存了 provider 身份，无法在协议中途切换；要改变压缩行为需要新建任务（或选择明确 opt-in 的路由）。能力结果默认按 deployment 与 Responses surface 记忆 30 分钟（可在运行时设置调整）。
+- **托管 Codex 模型目录** — 状态栏开关只会把运行中的漾路由 `/v1/models` 实际返回的模型 ID 发布给 Codex；当前模型和 review 模型仅在端点确实暴露它们时保持在前。已配置但未暴露的模型和陈旧选择都不会作为回退加入。端点探测失败时保留上一次已验证的目录；只有端点成功返回空列表时才会清空目录。
+- **Fast 默认 tier** — 当有效 `CODEX_HOME/config.toml` 同时包含 `service_tier = "fast"`（也兼容 `"priority"`）和 `[features].fast_mode = true` 时，漾路由只会为可可靠识别的 Codex 原生 `/v1/responses` 请求、且原始请求未提供 `service_tier` 时注入上游标准值 `"priority"`。配置文件每次请求按变更刷新，因此 Codex Settings 的 Apply 后下一请求生效；显式 tier 与非 Codex 流量绝不覆盖。已知边界：若 Desktop 在用户手动选择 Standard 后先把该选择剥为“字段缺失”，而配置仍为 Fast，网关无法仅从 HTTP 请求区分这种情形；此 shim 的明确开关是配置文件。
+- **Codex 压缩方式选择** — Apply LiteLLM 部署时会在自定义 provider 行暂存本地端点与密钥，并以该行的显示名决定**新建** Codex 任务的压缩协议：默认的中性名 `Young Router` 让 Codex 使用本地检查点摘要；而 `model_info` 中显式声明 `supports_responses_compaction: true`（统一别名 `supports_compaction`）的模型才会使用精确的 `OpenAI` 显示名，使新任务经本地网关走加密远程压缩。该字段绝不依据 provider 名、模型名或 gpt 版本推断。能力判定始终属于实际目标路由：除官方 OpenAI 主机外，代理在转发签名历史前都会先发送不带历史的能力探测，明确不支持的 deployment 会让请求切换到其他候选 deployment；当所有候选都不支持加密压缩时，Codex 收到明确的协议错误——漾路由既不会把签名历史转换成本地明文摘要，也绝不伪造加密压缩条目。已在运行的任务在创建时就缓存了 provider 身份，无法在协议中途切换；要改变压缩行为需要新建任务（或选择明确 opt-in 的路由）。能力结果默认按 deployment 与 Responses surface 记忆 30 分钟（可在运行时设置调整）。
 - **推理强度兼容** — 上游返回表明 `xhigh` 推理强度不支持的错误时，代理以兼容强度级别（`high` 或 `max`）重试，并记录兼容重试。
 - **用量归一化** — `response.completed` 事件的 `usage` 块被归一化为 Codex 期望的架构（`input_tokens`、`output_tokens`、`input_tokens_details.cached_tokens`、`output_tokens_details.reasoning_tokens`、`total_tokens`），包括从 Chat Completions 的 `prompt_tokens`/`completion_tokens` 命名转换。
 - **浏览器兼容头** — 对需要标准浏览器头的供应商，代理在重试时注入浏览器 User-Agent 和 Accept 头。
@@ -464,7 +464,7 @@ LiteLLM Menu 包含针对 [Codex](https://github.com/openai/codex) CLI 及类似
 
 ### WebDAV 配置同步
 
-通过 WebDAV 进行可选的双向配置同步。同步逻辑比较本地状态、远程状态和上次成功基线，决定推送、拉取还是合并。设置（URL、凭据、远程名称、同步间隔、超时）可通过菜单配置。同步的配置包可能包含 API 密钥；凭据以本地文件存储，文件权限设为 `0600`。
+通过 WebDAV 进行可选的双向配置同步。同步逻辑比较本地状态、远程状态和上次成功基线，决定推送、拉取还是合并。设置（URL、凭据、远程名称、同步间隔、超时）可通过状态项操作配置。同步的配置包可能包含 API 密钥；凭据以本地文件存储，文件权限设为 `0600`。
 
 ### 路由追踪与可观测性
 
@@ -493,24 +493,24 @@ Python Core 验证可编辑配置，并将验证通过的结果暂存到 `.litel
 使用一条命令安装应用及其自带运行时：
 
 ```bash
-brew tap ysdj/litellm-menu https://github.com/ysdj/litellm-menu && brew trust ysdj/litellm-menu && brew install --cask ysdj/litellm-menu/litellm-menu
+brew tap ysdj/young-router https://github.com/ysdj/young-router && brew trust ysdj/young-router && brew install --cask ysdj/young-router/young-router
 ```
 
-安装后直接从“应用程序”打开 **LiteLLM Menu**。以后更新只需运行 `brew upgrade --cask litellm-menu`。
+安装后直接从“应用程序”打开 **漾路由**。以后更新只需运行 `brew upgrade --cask young-router`。
 
-Homebrew 会下载预构建应用及其内置运行时。打开后直接启动由菜单管理的服务，首次运行不会安装依赖。
+Homebrew 会下载预构建应用及其内置运行时。打开后直接启动由漾路由管理的服务，首次运行不会安装依赖。
 
 ### 手动构建
 
 克隆仓库并构建应用包：
 
 ```bash
-git clone https://github.com/ysdj/litellm-menu.git
-cd litellm-menu
+git clone https://github.com/ysdj/young-router.git
+cd young-router
 cd rn
 pnpm run bootstrap:rnmacos
 pnpm install --frozen-lockfile
-LITELLM_MENU_MACOS_OUTPUT="$PWD/../artifacts/LiteLLM Menu.app" pnpm run build:macos
+YOUNG_ROUTER_MACOS_OUTPUT="$PWD/../artifacts/Young Router.app" pnpm run build:macos
 ```
 
 桌面依赖线固定为 React Native `0.85.3`、React Native Windows
@@ -521,7 +521,7 @@ commit。`build:macos` 会在调用 CocoaPods/Xcode 前校验该源码及其独�
 输出是带可迁移 Core runtime 的已签名 RN 应用。预览必须使用隔离输出，日常验证不得覆盖或替换用户正在使用的安装；检查产物后才可显式启动：
 
 ```bash
-open "$PWD/../artifacts/LiteLLM Menu.app"
+open "$PWD/../artifacts/Young Router.app"
 ```
 
 Windows 请从 Developer PowerShell 执行：
@@ -534,7 +534,7 @@ pnpm run build:windows
 
 ### 首次启动
 
-1. 从菜单栏图标（"LL" 状态项）打开 LiteLLM Menu。
+1. 从状态栏图标（"YR" 状态项）打开漾路由。
 2. 应用从内置运行时启动本地 LiteLLM 代理和 Python Core。
 3. 点击 **服务商管理...** 登录 OpenAI/Claude 官方账号或管理中转站账号；点击 **Providers & Models...** 配置 API-key 供应商、API 密钥、模型和部署顺序。
 4. 点击 **Apply Config** 暂存并激活配置。
@@ -544,7 +544,7 @@ pnpm run build:windows
 
 ## 配置
 
-主配置文件为 `~/.litellm-menu/config.yaml`。仓库提供已脱敏的示例文件 `config.example.yaml`。
+主配置文件为 `~/.young-router/config.yaml`。仓库提供已脱敏的示例文件 `config.example.yaml`。
 
 ### 主要配置段
 
@@ -593,25 +593,25 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 
 ### 运行时设置
 
-可通过菜单调整，无需编辑配置文件：
+可通过状态栏图标操作调整，无需编辑配置文件：
 
 | 设置项 | 环境变量 | 默认值 |
 |---|---|---|
-| 停滞超时 | `LITELLM_MENU_STALL_TIMEOUT_SECONDS` | 120 |
-| 请求超时 | `LITELLM_MENU_REQUEST_TIMEOUT_SECONDS` | 7200 |
-| Codex 父线程完成屏障 | `LITELLM_MENU_CODEX_DESCENDANT_CLEANUP` | 1（开启） |
-| 部署冷却失败次数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
-| 部署冷却秒数 | `LITELLM_MENU_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
-| 压缩能力记忆 | `LITELLM_MENU_CODEX_COMPACTION_CAPABILITY_TTL_SECONDS` | 1800 |
-| 网页搜索不支持记忆 | `LITELLM_MENU_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` | 600 |
-| 网页搜索最大结果数 | `LITELLM_MENU_WEB_SEARCH_MAX_RESULTS` | 5 |
-| 网页获取超时 | `LITELLM_MENU_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
-| dsh-vision-router 快捷设置 | `LITELLM_MENU_DSH_VISION_ROUTER_ENABLED`、`..._BACKEND`、`..._FREE_FALLBACK`、`..._TIMEOUT_SECONDS`、`..._MAX_TOKENS`、`..._LOCAL_OLLAMA_ENABLED`、`..._LOCAL_LM_STUDIO_ENABLED` | 跟随高级 JSON / 留空 |
-| dsh-vision-router 配置 JSON | `LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON` | 内置回退链 |
-| Computer facade 后端 | `LITELLM_MENU_COMPUTER_FACADE_BACKEND` | auto |
-| Computer facade 最大步数 | `LITELLM_MENU_COMPUTER_FACADE_MAX_STEPS` | 20 |
-| MCP 自动同意 | `LITELLM_MENU_MCP_AUTO_APPROVE` | 0（关闭） |
-| 路由恢复间隔 | `LITELLM_MENU_RECOVERY_INTERVAL_SECONDS` | 5 |
+| 停滞超时 | `YOUNG_ROUTER_STALL_TIMEOUT_SECONDS` | 120 |
+| 请求超时 | `YOUNG_ROUTER_REQUEST_TIMEOUT_SECONDS` | 7200 |
+| Codex 父线程完成屏障 | `YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP` | 1（开启） |
+| 部署冷却失败次数 | `YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FAILURES` | 2 |
+| 部署冷却秒数 | `YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_SECONDS` | 300 |
+| 压缩能力记忆 | `YOUNG_ROUTER_CODEX_COMPACTION_CAPABILITY_TTL_SECONDS` | 1800 |
+| 网页搜索不支持记忆 | `YOUNG_ROUTER_WEB_SEARCH_UNSUPPORTED_TTL_SECONDS` | 600 |
+| 网页搜索最大结果数 | `YOUNG_ROUTER_WEB_SEARCH_MAX_RESULTS` | 5 |
+| 网页获取超时 | `YOUNG_ROUTER_WEB_FETCH_TIMEOUT_SECONDS` | 12 |
+| dsh-vision-router 快捷设置 | `YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED`、`..._BACKEND`、`..._FREE_FALLBACK`、`..._TIMEOUT_SECONDS`、`..._MAX_TOKENS`、`..._LOCAL_OLLAMA_ENABLED`、`..._LOCAL_LM_STUDIO_ENABLED` | 跟随高级 JSON / 留空 |
+| dsh-vision-router 配置 JSON | `YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON` | 内置回退链 |
+| Computer facade 后端 | `YOUNG_ROUTER_COMPUTER_FACADE_BACKEND` | auto |
+| Computer facade 最大步数 | `YOUNG_ROUTER_COMPUTER_FACADE_MAX_STEPS` | 20 |
+| MCP 自动同意 | `YOUNG_ROUTER_MCP_AUTO_APPROVE` | 0（关闭） |
+| 路由恢复间隔 | `YOUNG_ROUTER_RECOVERY_INTERVAL_SECONDS` | 5 |
 
 ### 配置文件
 
@@ -621,12 +621,12 @@ Provider Base URL 可以填写主机/根路径、带或不带 `/v1`、带或不�
 
 ## 深链
 
-两个原生宿主都接受固定的 `litellm-menu://open/<route>` 深链。例如在 macOS 打开设置：
+两个原生宿主都接受固定的 `young-router://open/<route>` 深链。例如在 macOS 打开设置：
 
 ```bash
-open "litellm-menu://open/providers-models"
-open "litellm-menu://open/codex-settings"
-open "litellm-menu://open/logs?tab=service"
+open "young-router://open/providers-models"
+open "young-router://open/codex-settings"
+open "young-router://open/logs?tab=service"
 ```
 
 深链只能导航到允许的本地页面，不能携带配置值或触发 Apply。
@@ -654,7 +654,7 @@ pnpm exec tsc --noEmit
 
 ### 版本管理
 
-`VERSION`、`BUILD_NUMBER`、RN macOS plist/Xcode 工程、两个 Windows manifest 和 `Casks/litellm-menu.rb` 通过 `scripts/version.py` 保持同步。
+`VERSION`、`BUILD_NUMBER`、RN macOS plist/Xcode 工程、两个 Windows manifest 和 `Casks/young-router.rb` 通过 `scripts/version.py` 保持同步。
 
 每次 macOS 与 Windows 构建开始时，LiteLLM 都会检查并推进到 PyPI 最新稳定版。`./scripts/update-litellm.sh --check` 可检查 `LITELLM_VERSION` 是否最新。若 PyPI 尚未提供匹配 wheel，构建环境会受控地从源码分发构建 LiteLLM；完成后的应用仍打包并运行这个精确锁定版本，因此应用启动时不会编译或自动升级 LiteLLM。
 

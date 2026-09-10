@@ -56,7 +56,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
         )
         env = dict(os.environ)
-        env.pop("LITELLM_MENU_PROXY_PROCESS", None)
+        env.pop("YOUNG_ROUTER_PROXY_PROCESS", None)
 
         result = subprocess.run(
             [sys.executable, "-c", script, str(path)],
@@ -247,7 +247,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                 model_info:
                   id: "00000042"
                   provider: primary
-                  x-litellm-menu-model-enabled: false
+                  x-young-router-model-enabled: false
                   upstream_url_surface: openai/responses
                   supported_upstream_url_surfaces: [openai/responses]
             """
@@ -260,7 +260,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             path.with_name("config.disabled-models.yaml")
         )["disabled_model_list"]
         saved_states = {
-            entry["model_name"]: entry["model_info"]["x-litellm-menu-model-enabled"]
+            entry["model_name"]: entry["model_info"]["x-young-router-model-enabled"]
             for entry in disabled_entries
         }
         self.assertEqual(
@@ -348,7 +348,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         saved = config_schema._load_yaml(path)
         self.assertEqual(
             {"kind": "relay", "station_id": "station-example"},
-            saved["providers"]["custom_provider"]["x-litellm-menu-provider-source"],
+            saved["providers"]["custom_provider"]["x-young-router-provider-source"],
         )
         reloaded = config_load.load_config(path)["providers"][0]
         self.assertEqual("relay", reloaded["provider_type"])
@@ -359,7 +359,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             """
             providers:
               openai-account:
-                x-litellm-menu-provider-auth:
+                x-young-router-provider-auth:
                   kind: openai_login
                   credential_ref: provider-auth-example
             model_list:
@@ -388,7 +388,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertNotIn("api_keys", saved["providers"]["openai-account"])
         self.assertEqual(
             {"kind": "openai_login", "credential_ref": "provider-auth-example"},
-            saved["providers"]["openai-account"]["x-litellm-menu-provider-auth"],
+            saved["providers"]["openai-account"]["x-young-router-provider-auth"],
         )
         self.assertEqual(
             "chatgpt/gpt-5.4",
@@ -402,15 +402,15 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
               claude-account:
                 api_keys:
                   - name: claude-oauth
-                    value: os.environ/LITELLM_MENU_AUTH_EXAMPLE
-                x-litellm-menu-provider-auth:
+                    value: os.environ/YOUNG_ROUTER_AUTH_EXAMPLE
+                x-young-router-provider-auth:
                   kind: claude_login
                   credential_ref: provider-auth-claude
             model_list:
               - model_name: claude-sonnet
                 litellm_params:
                   model: anthropic/claude-sonnet-4-5
-                  api_key: os.environ/LITELLM_MENU_AUTH_EXAMPLE
+                  api_key: os.environ/YOUNG_ROUTER_AUTH_EXAMPLE
                   order: 1
                 model_info:
                   id: "00000004"
@@ -427,7 +427,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         config_api.save_config(payload["providers"], path)
         source = path.read_text(encoding="utf-8")
 
-        self.assertIn("os.environ/LITELLM_MENU_AUTH_EXAMPLE", source)
+        self.assertIn("os.environ/YOUNG_ROUTER_AUTH_EXAMPLE", source)
         self.assertNotIn("sk-ant-oat", source)
 
     def test_save_round_trip_keeps_multiple_providers_nested(self) -> None:
@@ -675,7 +675,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
                   provider: primary
                   upstream_url_surface: openai/responses
                   supported_upstream_url_surfaces: [openai/responses]
-                  x-litellm-menu-upstream-url-surface-order:
+                  x-young-router-upstream-url-surface-order:
                     - openai/responses
                     - anthropic
                     - openai/chat
@@ -684,13 +684,13 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         payload = config_load.load_config(path)
         model = payload["providers"][0]["models"][0]
-        self.assertNotIn("x-litellm-menu-upstream-url-surface-order", model["model_info_extra"])
+        self.assertNotIn("x-young-router-upstream-url-surface-order", model["model_info_extra"])
         self.assertNotIn("supported_upstream_url_surfaces", model)
 
         config_api.save_config(payload["providers"], path)
         saved_model_info = config_schema._load_yaml(path)["model_list"][0]["model_info"]
         self.assertEqual("openai/responses", saved_model_info["upstream_url_surface"])
-        self.assertNotIn("x-litellm-menu-upstream-url-surface-order", saved_model_info)
+        self.assertNotIn("x-young-router-upstream-url-surface-order", saved_model_info)
         self.assertNotIn("supported_upstream_url_surfaces", saved_model_info)
 
     def test_load_rejects_removed_api_key_enabled_flag(self) -> None:
@@ -1435,7 +1435,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             model_list: []
             litellm_settings:
               callbacks:
-                - litellm_menu.callbacks.image_generation_routing_hook
+                - young_router.callbacks.image_generation_routing_hook
                 - example.unsupported_callback
             """
         )

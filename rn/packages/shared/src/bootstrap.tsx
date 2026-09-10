@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { AppRegistry } from "react-native";
 import { canonicalWindowRoute, DESKTOP_ROUTES, isSettingsPaneRoute, LOG_TABS } from "./routes";
-import { LiteLLMMenuApp } from "./ui/LiteLLMMenuApp";
+import { YoungRouterApp } from "./ui/YoungRouterApp";
 import type { AppRoute, IpcClient, LogTab, NativeLeafAdapter } from "./types";
 
 export interface DesktopHostDependencies {
@@ -11,7 +11,7 @@ export interface DesktopHostDependencies {
   subscribeNativeAction?: (listener: (action: string) => void) => () => void;
 }
 
-export function registerLiteLLMMenu(componentName: string, dependencies: DesktopHostDependencies): void {
+export function registerYoungRouter(componentName: string, dependencies: DesktopHostDependencies): void {
   AppRegistry.registerComponent(componentName, () => function DesktopHost(props: { initialRoute?: AppRoute; initialLogTab?: LogTab; isPrimaryHost?: boolean; isWindowManagerHost?: boolean }): React.JSX.Element {
     const isPrimaryHost = props.isPrimaryHost !== false;
     // Every route window has its own React root, but all roots in the desktop
@@ -43,6 +43,6 @@ export function registerLiteLLMMenu(componentName: string, dependencies: Desktop
         setRouteRequestSequence((current) => current + 1);
       }
     }, [isPrimaryHost, nativeAction, props.initialRoute]);
-    return <LiteLLMMenuApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} nativeAction={nativeAction} />;
+    return <YoungRouterApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} nativeAction={nativeAction} />;
   });
 }

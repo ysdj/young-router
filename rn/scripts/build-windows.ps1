@@ -4,11 +4,11 @@ $RnRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $ProjectRoot = (Resolve-Path (Join-Path $RnRoot "..")).Path
 $AppRoot = Join-Path $RnRoot "apps\windows"
 if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
-  $Core = Join-Path ([System.IO.Path]::GetTempPath()) ("litellm-menu-rn-core-" + [guid]::NewGuid().ToString("N"))
+  $Core = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-rn-core-" + [guid]::NewGuid().ToString("N"))
 } else {
-  $Core = Join-Path $env:RUNNER_TEMP ("litellm-menu-rn-core-" + [guid]::NewGuid().ToString("N"))
+  $Core = Join-Path $env:RUNNER_TEMP ("young-router-rn-core-" + [guid]::NewGuid().ToString("N"))
 }
-$PiWork = Join-Path ([System.IO.Path]::GetTempPath()) ("litellm-menu-pi-web-access-" + [guid]::NewGuid().ToString("N"))
+$PiWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-pi-web-access-" + [guid]::NewGuid().ToString("N"))
 $PiPackage = Join-Path $PiWork "package"
 $PiNode = Join-Path $PiWork "node"
 
@@ -50,10 +50,10 @@ try {
       "sitecustomize.py")) {
     Copy-CoreSource (Join-Path $ProjectRoot $Name) (Join-Path $Core $Name)
   }
-  foreach ($Name in @("litellm_menu", "config_editor_core", "webdav")) {
+  foreach ($Name in @("young_router", "config_editor_core", "webdav")) {
     Copy-CoreSource (Join-Path $ProjectRoot $Name) (Join-Path $Core $Name)
   }
-  Copy-CoreSource $PiPackage (Join-Path $Core "litellm_menu\pi-web-access")
+  Copy-CoreSource $PiPackage (Join-Path $Core "young_router\pi-web-access")
   Get-ChildItem -LiteralPath $Core -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
   Get-ChildItem -LiteralPath $Core -Recurse -File -Include "*.pyc", "*.pyo" | Remove-Item -Force
 
@@ -87,7 +87,7 @@ set "RUNTIME_ROOT=%~dp0"
 '@
   Set-Content -LiteralPath (Join-Path $RuntimeBin "litellm.cmd") -Value $LiteLLMCommand -Encoding ascii
   Copy-Item -LiteralPath (Join-Path $ProjectRoot "LITELLM_VERSION") -Destination (Join-Path $Core "runtime\LITELLM_VERSION") -Force
-  if (-not (Test-Path (Join-Path $Core "litellm_menu\pi-web-access\index.ts"))) {
+  if (-not (Test-Path (Join-Path $Core "young_router\pi-web-access\index.ts"))) {
     throw "The bundled pi-web-access package is missing."
   }
   if (-not (Test-Path (Join-Path $RuntimeBin "node.exe"))) {
@@ -95,8 +95,8 @@ set "RUNTIME_ROOT=%~dp0"
   }
   $PiSmokeConfig = Join-Path $PiWork "smoke-config"
   "" | & (Join-Path $RuntimeBin "node.exe") `
-    (Join-Path $Core "litellm_menu\pi_web_access_worker.mjs") `
-    --entry (Join-Path $Core "litellm_menu\pi-web-access\index.ts") `
+    (Join-Path $Core "young_router\pi_web_access_worker.mjs") `
+    --entry (Join-Path $Core "young_router\pi-web-access\index.ts") `
     --config-dir $PiSmokeConfig
   if ($LASTEXITCODE -ne 0) {
     throw "The bundled pi-web-access worker could not load its staged SDK."
@@ -104,23 +104,23 @@ set "RUNTIME_ROOT=%~dp0"
 
   $Python = Join-Path $RuntimeBin "python.exe"
   $PreviousPythonPath = $env:PYTHONPATH
-  $PreviousProxyProcess = $env:LITELLM_MENU_PROXY_PROCESS
+  $PreviousProxyProcess = $env:YOUNG_ROUTER_PROXY_PROCESS
   try {
     $env:PYTHONPATH = $Core
-    & $Python -c "import litellm.proxy.proxy_server, litellm_menu.core, codex_config, config_editor_core, configuration_package, external_provider_import, webdav.core"
+    & $Python -c "import litellm.proxy.proxy_server, young_router.core, codex_config, config_editor_core, configuration_package, external_provider_import, webdav.core"
     if ($LASTEXITCODE -ne 0) { throw "Bundled Windows Core import smoke test failed." }
     & (Join-Path $RuntimeBin "litellm.cmd") --help | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Bundled Windows LiteLLM launcher smoke test failed." }
 
-    $PortableSmoke = Join-Path ([System.IO.Path]::GetTempPath()) ("litellm-menu-portable-core-" + [guid]::NewGuid().ToString("N"))
+    $PortableSmoke = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-portable-core-" + [guid]::NewGuid().ToString("N"))
     try {
       Copy-Item -LiteralPath $Core -Destination $PortableSmoke -Recurse -Force
       $PortablePython = Join-Path $PortableSmoke "runtime\bin\python.exe"
       $env:PYTHONPATH = $PortableSmoke
-      & $PortablePython -c "import litellm.proxy.proxy_server, litellm_menu.core"
+      & $PortablePython -c "import litellm.proxy.proxy_server, young_router.core"
       if ($LASTEXITCODE -ne 0) { throw "Relocated Windows Core import smoke test failed." }
-      $env:LITELLM_MENU_PROXY_PROCESS = "1"
-      & $PortablePython -c "from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn('litellm_menu.callbacks.image_generation_routing_hook', config_file_path='runtime/config.yaml'); assert callback.__class__.__name__ == 'LiteLLMMenuHook'"
+      $env:YOUNG_ROUTER_PROXY_PROCESS = "1"
+      & $PortablePython -c "from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn('young_router.callbacks.image_generation_routing_hook', config_file_path='runtime/config.yaml'); assert callback.__class__.__name__ == 'YoungRouterHook'"
       if ($LASTEXITCODE -ne 0) { throw "Relocated Windows callback smoke test failed." }
       & (Join-Path $PortableSmoke "runtime\bin\litellm.cmd") --help | Out-Null
       if ($LASTEXITCODE -ne 0) { throw "Relocated Windows LiteLLM launcher smoke test failed." }
@@ -129,7 +129,7 @@ set "RUNTIME_ROOT=%~dp0"
     }
   } finally {
     $env:PYTHONPATH = $PreviousPythonPath
-    $env:LITELLM_MENU_PROXY_PROCESS = $PreviousProxyProcess
+    $env:YOUNG_ROUTER_PROXY_PROCESS = $PreviousProxyProcess
   }
 
   $CoreRoot = (Resolve-Path $Core).Path
@@ -137,8 +137,8 @@ set "RUNTIME_ROOT=%~dp0"
   # would select a ReleaseBundle solution configuration that this generated
   # Composition solution does not define.
   pnpm --dir $AppRoot exec react-native run-windows --no-launch --no-deploy --no-packager --release --arch x64 `
-    --sln "windows\LiteLLMMenu.sln" --proj "windows\LiteLLMMenu\LiteLLMMenu.vcxproj" `
-    --msbuildprops "LiteLLMMenuCoreStagingDir=$CoreRoot;RunCodegenWindows=false"
+    --sln "windows\YoungRouter.sln" --proj "windows\YoungRouter\YoungRouter.vcxproj" `
+    --msbuildprops "YoungRouterCoreStagingDir=$CoreRoot;RunCodegenWindows=false"
 
   $BundledPython = Get-ChildItem -LiteralPath (Join-Path $AppRoot "windows") -Recurse -File -Filter "python.exe" |
     Where-Object { $_.FullName -match '[\\/]Core[\\/]runtime[\\/]bin[\\/]python\.exe$' } |
@@ -157,8 +157,8 @@ set "RUNTIME_ROOT=%~dp0"
   if (-not (Test-Path (Join-Path $BundledBin "node.exe"))) {
     throw "The Windows build output does not contain Core/runtime/bin/node.exe."
   }
-  if (-not (Test-Path (Join-Path $BundledCore "litellm_menu\pi-web-access\index.ts"))) {
-    throw "The Windows build output does not contain litellm_menu/pi-web-access/index.ts."
+  if (-not (Test-Path (Join-Path $BundledCore "young_router\pi-web-access\index.ts"))) {
+    throw "The Windows build output does not contain young_router/pi-web-access/index.ts."
   }
   if (-not (Test-Path $BundledVersion) -or (Get-Content -Raw $BundledVersion).Trim() -ne $LiteLLMVersion) {
     throw "The Windows build output does not contain the pinned LiteLLM release lock."
@@ -166,7 +166,7 @@ set "RUNTIME_ROOT=%~dp0"
   $PreviousPythonPath = $env:PYTHONPATH
   try {
     $env:PYTHONPATH = $BundledCore
-    & $BundledPython.FullName -c "import litellm.proxy.proxy_server, litellm_menu.core"
+    & $BundledPython.FullName -c "import litellm.proxy.proxy_server, young_router.core"
     if ($LASTEXITCODE -ne 0) { throw "Packaged Windows Core import smoke test failed." }
     & $BundledLiteLLM --help | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Packaged Windows LiteLLM launcher smoke test failed." }

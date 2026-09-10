@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from litellm_menu import macos_proxy
+from young_router import macos_proxy
 
 
 class MacOSProxyLauncherTests(unittest.TestCase):

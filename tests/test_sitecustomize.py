@@ -38,8 +38,8 @@ class SiteCustomizeTests(unittest.TestCase):
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        env.pop("LITELLM_MENU_PROXY_PROCESS", None)
-        env.pop("LITELLM_MENU_TIMESTAMP_OUTPUT", None)
+        env.pop("YOUNG_ROUTER_PROXY_PROCESS", None)
+        env.pop("YOUNG_ROUTER_TIMESTAMP_OUTPUT", None)
         env.update(
             {
                 "LITELLM_TEMPLATE_ROOT": str(template),
@@ -57,14 +57,14 @@ class SiteCustomizeTests(unittest.TestCase):
             check=False,
         )
 
-    def test_litellm_menu_config_callback_imports_from_pythonpath(self) -> None:
+    def test_young_router_config_callback_imports_from_pythonpath(self) -> None:
         self.require_litellm()
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             runtime = temp / "runtime"
             template = temp / "template"
             runtime.mkdir()
-            package = template / "litellm_menu"
+            package = template / "young_router"
             package.mkdir(parents=True)
             (runtime / "config.yaml").write_text("model_list: []\n", encoding="utf-8")
             (package / "__init__.py").write_text("", encoding="utf-8")
@@ -80,15 +80,15 @@ class SiteCustomizeTests(unittest.TestCase):
                 code=textwrap.dedent(
                     """
                     from litellm.proxy.types_utils.utils import get_instance_fn
-                    print(get_instance_fn("litellm_menu.callbacks.value", config_file_path="config.yaml"))
+                    print(get_instance_fn("young_router.callbacks.value", config_file_path="config.yaml"))
                     """
                 ),
-                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "loaded-from-template")
-            self.assertFalse((runtime / "litellm_menu" / "callbacks.py").exists())
+            self.assertFalse((runtime / "young_router" / "callbacks.py").exists())
 
     def test_litellm_config_callback_fallback_rejects_unowned_modules(self) -> None:
         self.require_litellm()
@@ -119,7 +119,7 @@ class SiteCustomizeTests(unittest.TestCase):
                         raise SystemExit("expected ImportError")
                     """
                 ),
-                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -172,7 +172,7 @@ class SiteCustomizeTests(unittest.TestCase):
                     )
                     """
                 ),
-                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -216,7 +216,7 @@ class SiteCustomizeTests(unittest.TestCase):
                     print(any(name == "litellm" or name.startswith("litellm.") for name in sys.modules))
                     """
                 ),
-                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -240,8 +240,8 @@ class SiteCustomizeTests(unittest.TestCase):
                     """
                 ),
                 extra_env={
-                    "LITELLM_MENU_PROXY_PROCESS": "1",
-                    "LITELLM_MENU_TIMESTAMP_OUTPUT": "1",
+                    "YOUNG_ROUTER_PROXY_PROCESS": "1",
+                    "YOUNG_ROUTER_TIMESTAMP_OUTPUT": "1",
                 },
             )
 
@@ -254,15 +254,15 @@ class SiteCustomizeTests(unittest.TestCase):
             temp = Path(temp_dir)
             runtime = temp / "runtime"
             runtime.mkdir()
-            service_log = temp / "menu-server.log"
+            service_log = temp / "server.log"
             service_log.write_text("a" * 300_000, encoding="utf-8")
             env = os.environ.copy()
             env.update(
                 {
-                    "LITELLM_MENU_PROXY_PROCESS": "1",
-                    "LITELLM_MENU_TIMESTAMP_OUTPUT": "1",
-                    "LITELLM_MENU_LOG_MAX_BYTES": "262144",
-                    "LITELLM_MENU_SERVICE_LOG": str(service_log),
+                    "YOUNG_ROUTER_PROXY_PROCESS": "1",
+                    "YOUNG_ROUTER_TIMESTAMP_OUTPUT": "1",
+                    "YOUNG_ROUTER_LOG_MAX_BYTES": "262144",
+                    "YOUNG_ROUTER_SERVICE_LOG": str(service_log),
                     "PYTHONPATH": str(ROOT),
                 }
             )
@@ -303,7 +303,7 @@ class SiteCustomizeTests(unittest.TestCase):
                     print(classifier(Exception("No api key passed in.")))
                     """
                 ),
-                extra_env={"LITELLM_MENU_PROXY_PROCESS": "1"},
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -331,7 +331,7 @@ class SiteCustomizeTests(unittest.TestCase):
                     print(urllib.request.getproxies())
                     """
                 ),
-                extra_env={"LITELLM_MENU_DISABLE_SYSTEM_PROXY_LOOKUP": "1"},
+                extra_env={"YOUNG_ROUTER_DISABLE_SYSTEM_PROXY_LOOKUP": "1"},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -365,14 +365,14 @@ class SiteCustomizeTests(unittest.TestCase):
 
                     assert getattr(urllib.request.getproxies, _SYSTEM_PROXY_LOOKUP_PATCH_ATTR)
                     assert getattr(urllib.request.proxy_bypass, _SYSTEM_PROXY_LOOKUP_PATCH_ATTR)
-                    assert "LITELLM_MENU_SYSTEM_PROXY_SNAPSHOT" not in os.environ
+                    assert "YOUNG_ROUTER_SYSTEM_PROXY_SNAPSHOT" not in os.environ
                     print(urllib.request.getproxies())
                     print(urllib.request.proxy_bypass("printer"))
                     print(urllib.request.proxy_bypass("service.example.test"))
                     print(urllib.request.proxy_bypass("public.test"))
                     """
                 ),
-                extra_env={"LITELLM_MENU_SYSTEM_PROXY_SNAPSHOT": snapshot},
+                extra_env={"YOUNG_ROUTER_SYSTEM_PROXY_SNAPSHOT": snapshot},
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)

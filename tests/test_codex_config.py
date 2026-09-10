@@ -69,7 +69,7 @@ class CodexConfigTests(unittest.TestCase):
                     model_info:
                       id: a1b2c3d5
                       provider: active
-                      x-litellm-menu-model-enabled: false
+                      x-young-router-model-enabled: false
                       upstream_url_surface: openai/responses
                       supported_upstream_url_surfaces: [openai/responses]
                   - model_name: unavailable-chat
@@ -300,7 +300,7 @@ class CodexConfigTests(unittest.TestCase):
         ``supports_responses_compaction: true`` is the only case allowed to
         advertise the exact ``OpenAI`` name (which makes new Codex tasks use
         encrypted remote compaction); ``false`` and an absent field both keep
-        the neutral ``LiteLLM Menu`` name (local checkpoint summary). The
+        the neutral ``Young Router`` name (local checkpoint summary). The
         upstream model name (gpt-6-astra here) never triggers remote
         compaction by itself.
         """

@@ -2,9 +2,9 @@ module.exports = {
   project: {
     windows: {
       sourceDir: "windows",
-      solutionFile: "LiteLLMMenu.sln",
+      solutionFile: "YoungRouter.sln",
       project: {
-        projectFile: "LiteLLMMenu/LiteLLMMenu.vcxproj",
+        projectFile: "YoungRouter/YoungRouter.vcxproj",
       },
       useWinUI3: true,
     },

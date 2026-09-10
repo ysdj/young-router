@@ -109,7 +109,7 @@ class HookStreamingCompactionTests(HookTestCase):
         proxy_server.llm_router = UnexpectedRouter()
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=original_stream(),
                 request_data=request_data,
@@ -304,7 +304,7 @@ class HookStreamingCompactionTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=failed_stream(),
                 request_data=request_data,
@@ -376,7 +376,7 @@ class HookStreamingCompactionTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=failed_stream(),
                 request_data=request_data,
@@ -460,7 +460,7 @@ class HookStreamingCompactionTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=unsupported_stream(),
                 request_data=request_data,
@@ -564,7 +564,7 @@ class HookStreamingCompactionTests(HookTestCase):
         proxy_server.llm_router = FakeRouter()
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=failed_after_headers(),
                 request_data=request_data,
@@ -648,7 +648,7 @@ class HookStreamingCompactionTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=unsupported_stream(),
                 request_data=request_data,
@@ -743,7 +743,7 @@ class HookStreamingCompactionTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=original_stream(),
                 request_data=request_data,
@@ -805,7 +805,7 @@ class HookStreamingCompactionTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=original_stream(),
                 request_data=request_data,
@@ -868,7 +868,7 @@ class HookStreamingCompactionTests(HookTestCase):
 
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=stalled_after_done_stream(),
                 request_data=request_data,
@@ -982,7 +982,7 @@ class HookStreamingCompactionTests(HookTestCase):
         proxy_server.llm_router = UnexpectedRouter()
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=original_stream(),
                 request_data=request_data,
@@ -1061,7 +1061,7 @@ class HookStreamingCompactionTests(HookTestCase):
         proxy_server.llm_router = FakeRouter()
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=original_stream(),
                 request_data=request_data,
@@ -1091,8 +1091,8 @@ class HookStreamingCompactionTests(HookTestCase):
                 {"type": "compaction_trigger", "id": "compact-now"},
             ],
             "stream": True,
-            "_litellm_menu_upstream_url_surface": "openai/responses",
-            "_litellm_menu_upstream_url_surface_deployment_id": "third-party-route",
+            "_young_router_upstream_url_surface": "openai/responses",
+            "_young_router_upstream_url_surface_deployment_id": "third-party-route",
             "model_info": {
                 "id": "third-party-route",
                 "order": 1,
@@ -1156,9 +1156,9 @@ class HookStreamingCompactionTests(HookTestCase):
                 {"type": "compaction_trigger", "id": "compact-now"},
             ],
             "stream": True,
-            "_litellm_menu_upstream_url_surface": "openai/chat",
+            "_young_router_upstream_url_surface": "openai/chat",
             "litellm_metadata": {
-                "_litellm_menu_upstream_url_surface": "openai/chat",
+                "_young_router_upstream_url_surface": "openai/chat",
             },
             "model_info": {
                 "id": "chat-configured-route",
@@ -1385,7 +1385,7 @@ class HookStreamingCompactionTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [
@@ -1462,7 +1462,7 @@ class HookStreamingCompactionTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [
@@ -1740,7 +1740,7 @@ class HookStreamingCompactionTests(HookTestCase):
         )
         chunks = [
             jsonable_stream_chunk(chunk)
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=request_data,
@@ -1893,7 +1893,7 @@ class HookStreamingCompactionTests(HookTestCase):
                 return incomplete_fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [
@@ -2223,7 +2223,7 @@ class HookStreamingCompactionTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [
@@ -2275,7 +2275,7 @@ class HookStreamingCompactionTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [
@@ -2819,7 +2819,7 @@ class HookStreamingCompactionTests(HookTestCase):
                 return fallback_stream()
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "default-chat",
             "input": [

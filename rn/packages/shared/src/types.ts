@@ -31,7 +31,7 @@ export type AppRoute =
 export type LogTab =
   | "requests"
   | "service"
-  | "menu"
+  | "actions"
   | "route-trace"
   | "recovery"
   | "online-usage";

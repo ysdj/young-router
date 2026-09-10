@@ -4,8 +4,8 @@ import json
 import tempfile
 import unittest
 
-from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
-from litellm_menu.core.service import CoreStore
+from young_router.core.domains.relay_accounts import RelayAccountsDomain
+from young_router.core.service import CoreStore
 
 
 class RelayMutationHTTPClient:

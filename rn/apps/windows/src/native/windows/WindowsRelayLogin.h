@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 struct WindowsRelayLoginOptions {
   std::string account_id;
@@ -43,4 +43,4 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
 bool ClearWindowsRelayCredentials(std::string const& account_id);
 bool ClearWindowsRelayPassword(std::string const& account_id);
 
-}  // namespace LiteLLMMenu
+}  // namespace YoungRouter

@@ -15,19 +15,19 @@ from typing import Any, Callable, Optional
 
 
 def _bounded_writer(stream: Any, text: str) -> int:
-    from litellm_menu.log_rotation import write_bounded_stream
+    from young_router.log_rotation import write_bounded_stream
 
     return write_bounded_stream(stream, text)
 
 
 _IMAGE_EDIT_USAGE_PATCH_ATTR = "_openai_image_edit_usage_patch"
-_CONFIG_CALLBACK_IMPORT_PATCH_ATTR = "_litellm_menu_config_callback_import_patch"
-_SYSTEM_PROXY_LOOKUP_PATCH_ATTR = "_litellm_menu_system_proxy_lookup_patch"
-_SYSTEM_PROXY_SNAPSHOT_ENV = "LITELLM_MENU_SYSTEM_PROXY_SNAPSHOT"
-_CONFIG_CALLBACK_ORIGINAL_ATTR = "_litellm_menu_config_callback_import_original"
-_OPTIONAL_DATABASE_ERROR_PATCH_ATTR = "_litellm_menu_optional_database_error_patch"
-_TIMESTAMPED_OUTPUT_ATTR = "_litellm_menu_timestamped_output"
-_CORE_PARENT_WATCHDOG_ATTR = "_litellm_menu_core_parent_watchdog"
+_CONFIG_CALLBACK_IMPORT_PATCH_ATTR = "_young_router_config_callback_import_patch"
+_SYSTEM_PROXY_LOOKUP_PATCH_ATTR = "_young_router_system_proxy_lookup_patch"
+_SYSTEM_PROXY_SNAPSHOT_ENV = "YOUNG_ROUTER_SYSTEM_PROXY_SNAPSHOT"
+_CONFIG_CALLBACK_ORIGINAL_ATTR = "_young_router_config_callback_import_original"
+_OPTIONAL_DATABASE_ERROR_PATCH_ATTR = "_young_router_optional_database_error_patch"
+_TIMESTAMPED_OUTPUT_ATTR = "_young_router_timestamped_output"
+_CORE_PARENT_WATCHDOG_ATTR = "_young_router_core_parent_watchdog"
 
 
 class _TimestampedOutputState:
@@ -67,7 +67,7 @@ class _TimestampedOutput:
 
 
 def _install_timestamped_proxy_output() -> None:
-    if os.environ.get("LITELLM_MENU_TIMESTAMP_OUTPUT") != "1":
+    if os.environ.get("YOUNG_ROUTER_TIMESTAMP_OUTPUT") != "1":
         return
     if getattr(sys.stdout, _TIMESTAMPED_OUTPUT_ATTR, False):
         return
@@ -87,7 +87,7 @@ def _install_core_parent_watchdog() -> None:
     if os.name == "nt":
         return
     try:
-        core_pid = int(os.environ.get("LITELLM_MENU_CORE_PID", ""))
+        core_pid = int(os.environ.get("YOUNG_ROUTER_CORE_PID", ""))
     except ValueError:
         return
     # `start_new_session=True` makes the proxy master its process-group
@@ -274,7 +274,7 @@ def _patch_litellm_config_callback_import(utils: Any) -> None:
             if (
                 config_file_path is None
                 or not isinstance(value, str)
-                or not value.startswith("litellm_menu.")
+                or not value.startswith("young_router.")
             ):
                 raise
 
@@ -369,13 +369,13 @@ def _install_uvicorn_websocket_frame_limit_patch() -> None:
     then closes the connection with code 1009 before the request reaches
     the pipeline and Codex reports ``websocket closed by server before
     response.completed`` followed by its reconnect ladder.  The installer
-    lives in ``litellm_menu.base`` so both this early hook (interpreter
+    lives in ``young_router.base`` so both this early hook (interpreter
     startup, covering the LiteLLM CLI launch path) and the callback-time
-    ``litellm_menu.patches.install_all`` share one implementation.
+    ``young_router.patches.install_all`` share one implementation.
     """
 
     def _patch(uvicorn_module: Any) -> None:
-        from litellm_menu.base import _install_websocket_frame_limit_patch
+        from young_router.base import _install_websocket_frame_limit_patch
 
         _install_websocket_frame_limit_patch()
 
@@ -384,7 +384,7 @@ def _install_uvicorn_websocket_frame_limit_patch() -> None:
 
 def _install_system_proxy_lookup_patch() -> None:
     raw_snapshot = os.environ.pop(_SYSTEM_PROXY_SNAPSHOT_ENV, "")
-    if not raw_snapshot and os.environ.get("LITELLM_MENU_DISABLE_SYSTEM_PROXY_LOOKUP") != "1":
+    if not raw_snapshot and os.environ.get("YOUNG_ROUTER_DISABLE_SYSTEM_PROXY_LOOKUP") != "1":
         return
     if getattr(urllib.request.getproxies, _SYSTEM_PROXY_LOOKUP_PATCH_ATTR, False):
         return
@@ -442,7 +442,7 @@ def _install_system_proxy_lookup_patch() -> None:
 
 
 _install_system_proxy_lookup_patch()
-if os.environ.get("LITELLM_MENU_PROXY_PROCESS") == "1":
+if os.environ.get("YOUNG_ROUTER_PROXY_PROCESS") == "1":
     _install_core_parent_watchdog()
     _install_timestamped_proxy_output()
     _install_litellm_config_callback_import_patch()

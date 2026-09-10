@@ -13,14 +13,14 @@ import textwrap
 import unittest
 from unittest import mock
 
-from litellm_menu.core import CoreStore
-from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
-from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
-from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
-from litellm_menu.core.domains._shared import DomainError
-from litellm_menu.core.operations import CoreServiceController
-from litellm_menu.core.persistence import PersistenceError
+from young_router.core import CoreStore
+from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.domains.relay_accounts import RelayAccountsDomain
+from young_router.core.domains.runtime import RuntimeSettingsDomain
+from young_router.core.domains.webdav import WebDAVSettingsDomain
+from young_router.core.domains._shared import DomainError
+from young_router.core.operations import CoreServiceController
+from young_router.core.persistence import PersistenceError
 
 
 PROVIDER_CONFIG = """
@@ -80,29 +80,29 @@ class CoreOperationsTests(unittest.TestCase):
             stdout="S+\n",
             stderr="",
         )
-        with mock.patch("litellm_menu.core.operations.subprocess.run", return_value=zombie):
+        with mock.patch("young_router.core.operations.subprocess.run", return_value=zombie):
             self.assertFalse(CoreServiceController._process_alive(4811))
-        with mock.patch("litellm_menu.core.operations.subprocess.run", return_value=sleeping):
+        with mock.patch("young_router.core.operations.subprocess.run", return_value=sleeping):
             self.assertTrue(CoreServiceController._process_alive(4811))
 
     def test_windows_batch_launcher_uses_the_bundled_python(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(
                 directory,
-                python=r"C:\\LiteLLM Menu\\Core\\runtime\\python.exe",
-                litellm_bin=r"C:\\LiteLLM Menu\\Core\\runtime\\bin\\litellm.cmd",
+                python=r"C:\\Young Router\\Core\\runtime\\python.exe",
+                litellm_bin=r"C:\\Young Router\\Core\\runtime\\bin\\litellm.cmd",
             )
             process = mock.Mock(pid=4812)
             process.poll.return_value = None
-            with mock.patch("litellm_menu.core.operations.os.name", "nt"), mock.patch.object(
+            with mock.patch("young_router.core.operations.os.name", "nt"), mock.patch.object(
                 controller, "status", return_value={"state": "stopped"}
             ), mock.patch.object(controller, "_stage_runtime_config"), mock.patch.object(
                 controller, "_runtime_env", return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "1"}
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=True
             ), mock.patch(
-                "litellm_menu.core.operations.atomic_write_text"
-            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                "young_router.core.operations.atomic_write_text"
+            ), mock.patch("young_router.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
 
             command = popen.call_args.args[0]
@@ -116,8 +116,8 @@ class CoreOperationsTests(unittest.TestCase):
             controller = CoreServiceController(directory)
             process = mock.Mock(pid=4813)
             process.poll.return_value = None
-            with mock.patch("litellm_menu.core.operations.os.name", "posix"), mock.patch(
-                "litellm_menu.core.operations.sys.platform", "darwin"
+            with mock.patch("young_router.core.operations.os.name", "posix"), mock.patch(
+                "young_router.core.operations.sys.platform", "darwin"
             ), mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
                 controller, "_stage_runtime_config"
             ), mock.patch.object(
@@ -127,12 +127,12 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=True
             ), mock.patch(
-                "litellm_menu.core.operations.atomic_write_text"
-            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                "young_router.core.operations.atomic_write_text"
+            ), mock.patch("young_router.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
 
             command = popen.call_args.args[0]
-            self.assertEqual([controller.python, "-m", "litellm_menu.macos_proxy"], command[:3])
+            self.assertEqual([controller.python, "-m", "young_router.macos_proxy"], command[:3])
             workers_index = command.index("--workers")
             self.assertEqual("16", command[workers_index + 1])
             self.assertNotIn("--run_gunicorn", command)
@@ -143,8 +143,8 @@ class CoreOperationsTests(unittest.TestCase):
             controller = CoreServiceController(directory)
             process = mock.Mock(pid=4815)
             process.poll.return_value = None
-            with mock.patch("litellm_menu.core.operations.os.name", "posix"), mock.patch(
-                "litellm_menu.core.operations.sys.platform", "darwin"
+            with mock.patch("young_router.core.operations.os.name", "posix"), mock.patch(
+                "young_router.core.operations.sys.platform", "darwin"
             ), mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
                 controller, "_stage_runtime_config"
             ), mock.patch.object(
@@ -154,8 +154,8 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=True
             ), mock.patch(
-                "litellm_menu.core.operations.atomic_write_text"
-            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                "young_router.core.operations.atomic_write_text"
+            ), mock.patch("young_router.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
 
             command = popen.call_args.args[0]
@@ -168,8 +168,8 @@ class CoreOperationsTests(unittest.TestCase):
             controller = CoreServiceController(directory)
             process = mock.Mock(pid=4816)
             process.poll.return_value = None
-            with mock.patch("litellm_menu.core.operations.os.name", "posix"), mock.patch(
-                "litellm_menu.core.operations.sys.platform", "linux"
+            with mock.patch("young_router.core.operations.os.name", "posix"), mock.patch(
+                "young_router.core.operations.sys.platform", "linux"
             ), mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
                 controller, "_stage_runtime_config"
             ), mock.patch.object(
@@ -179,8 +179,8 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=True
             ), mock.patch(
-                "litellm_menu.core.operations.atomic_write_text"
-            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                "young_router.core.operations.atomic_write_text"
+            ), mock.patch("young_router.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
 
             self.assertIn("--run_gunicorn", popen.call_args.args[0])
@@ -264,8 +264,8 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=True
             ), mock.patch(
-                "litellm_menu.core.operations.atomic_write_text"
-            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", side_effect=spawn):
+                "young_router.core.operations.atomic_write_text"
+            ), mock.patch("young_router.core.operations.subprocess.Popen", side_effect=spawn):
                 controller.start()
 
             self.assertFalse(controller.paths.recovery.exists())
@@ -280,7 +280,7 @@ class CoreOperationsTests(unittest.TestCase):
             running = {"state": "running", "pid": 4818, "port": 4000}
 
             with mock.patch.object(controller, "status", return_value=running), mock.patch(
-                "litellm_menu.core.operations.subprocess.Popen"
+                "young_router.core.operations.subprocess.Popen"
             ) as popen:
                 self.assertEqual(running, controller.start())
 
@@ -343,36 +343,36 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual([], events)
 
     def test_default_core_exposes_stopped_service_before_starting_the_proxy(self) -> None:
-        with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
+        with mock.patch("young_router.core.operations.CoreServiceController") as controller_type:
             controller = controller_type.return_value
             controller.status.return_value = {"state": "stopped"}
             controller.dispatch.return_value = {"state": "stopped"}
 
-            core = CoreStore.with_default_domains(runtime_root="/tmp/litellm-menu-core-start")
+            core = CoreStore.with_default_domains(runtime_root="/tmp/young-router-core-start")
 
         controller.start.assert_not_called()
         self.assertEqual("stopped", core.snapshot()["service"]["state"])
 
     def test_new_app_core_resets_transient_routing_state(self) -> None:
-        with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
+        with mock.patch("young_router.core.operations.CoreServiceController") as controller_type:
             controller = controller_type.return_value
             controller.status.return_value = {"state": "stopped"}
             controller.dispatch.return_value = {"state": "stopped"}
 
             CoreStore.with_default_domains(
-                runtime_root="/tmp/litellm-menu-core-new-app",
+                runtime_root="/tmp/young-router-core-new-app",
                 reset_transient_routing_state=True,
             )
 
         controller.reset_transient_routing_state.assert_called_once_with()
 
     def test_default_core_exposes_a_non_running_service_for_diagnostics(self) -> None:
-        with mock.patch("litellm_menu.core.operations.CoreServiceController") as controller_type:
+        with mock.patch("young_router.core.operations.CoreServiceController") as controller_type:
             controller = controller_type.return_value
             controller.status.return_value = {"state": "unknown"}
             controller.dispatch.return_value = {"state": "unknown"}
 
-            core = CoreStore.with_default_domains(runtime_root="/tmp/litellm-menu-core-unavailable")
+            core = CoreStore.with_default_domains(runtime_root="/tmp/young-router-core-unavailable")
 
         controller.start.assert_not_called()
         self.assertEqual("unknown", core.snapshot()["service"]["state"])
@@ -507,9 +507,9 @@ class CoreOperationsTests(unittest.TestCase):
             controller = CoreServiceController(
                 root,
                 environment={
-                    "LITELLM_MENU_VISION_BRIDGE_API_KEY": "test-inherited-secret",
-                    "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON": '{"enabled":false}',
-                    "LITELLM_MENU_VISION_ROUTER_CONFIG_JSON": '{"enabled":false}',
+                    "YOUNG_ROUTER_VISION_BRIDGE_API_KEY": "test-inherited-secret",
+                    "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON": '{"enabled":false}',
+                    "YOUNG_ROUTER_VISION_ROUTER_CONFIG_JSON": '{"enabled":false}',
                 },
             )
             environment = controller._runtime_env()
@@ -518,9 +518,9 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual("3", environment["LITELLM_NUM_WORKERS"])
             self.assertNotIn("LITELLM_CONFIG_WATCH_INTERVAL", environment)
             self.assertNotIn("LITELLM_CONFIG_WATCH_SETTLE_INTERVAL", environment)
-            self.assertNotIn("LITELLM_MENU_VISION_BRIDGE_API_KEY", environment)
+            self.assertNotIn("YOUNG_ROUTER_VISION_BRIDGE_API_KEY", environment)
             self.assertEqual(
-                json.loads(environment["LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"]),
+                json.loads(environment["YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"]),
                 {
                     "enabled": True,
                     "backend": "auto",
@@ -533,7 +533,7 @@ class CoreOperationsTests(unittest.TestCase):
                     "localLmStudio": {"enabled": False},
                 },
             )
-            self.assertNotIn("LITELLM_MENU_VISION_ROUTER_CONFIG_JSON", environment)
+            self.assertNotIn("YOUNG_ROUTER_VISION_ROUTER_CONFIG_JSON", environment)
             with mock.patch.object(controller, "_health", return_value=True):
                 self.assertEqual("unknown", controller.status()["state"])
 
@@ -541,7 +541,7 @@ class CoreOperationsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             domain = RuntimeSettingsDomain(root / "runtime-settings.env")
-            json_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            json_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
             domain.dispatch(
                 "set_setting",
                 {
@@ -558,12 +558,12 @@ class CoreOperationsTests(unittest.TestCase):
                     ),
                 },
             )
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", "value": "off"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND", "value": "local"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK", "value": "off"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "27"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS", "value": "2048"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "off"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED", "value": "off"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND", "value": "local"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_FREE_FALLBACK", "value": "off"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "27"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS", "value": "2048"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "off"})
             domain.apply()
 
             environment = CoreServiceController(root)._runtime_env()
@@ -579,14 +579,14 @@ class CoreOperationsTests(unittest.TestCase):
                 },
                 merged,
             )
-            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", environment)
-            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_BACKEND", environment)
+            self.assertNotIn("YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED", environment)
+            self.assertNotIn("YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND", environment)
 
     def test_dsh_json_values_remain_when_quick_settings_are_unconfigured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             domain = RuntimeSettingsDomain(root / "runtime-settings.env")
-            json_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            json_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
             custom = {
                 "enabled": False,
                 "backend": "local",
@@ -605,7 +605,7 @@ class CoreOperationsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             domain = RuntimeSettingsDomain(root / "runtime-settings.env")
-            json_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            json_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
             custom = {
                 "enabled": False,
                 "backend": "api",
@@ -617,10 +617,10 @@ class CoreOperationsTests(unittest.TestCase):
             domain.dispatch("set_setting", {"key": json_key, "value": json.dumps(custom)})
             # Explicit values override JSON, including values that previously
             # collided with schema defaults.
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", "value": "on"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "45"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS", "value": "4096"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "off"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED", "value": "on"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "45"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS", "value": "4096"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "off"})
             domain.apply()
 
             overridden = json.loads(CoreServiceController(root)._runtime_env()[json_key])
@@ -629,10 +629,10 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(4096, overridden["maxTokens"])
             self.assertFalse(overridden["localOllama"]["enabled"])
 
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", "value": "inherit"})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": ""})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS", "value": ""})
-            domain.dispatch("set_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "inherit"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED", "value": "inherit"})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": ""})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS", "value": ""})
+            domain.dispatch("set_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED", "value": "inherit"})
             domain.apply()
 
             inherited = json.loads(CoreServiceController(root)._runtime_env()[json_key])
@@ -641,28 +641,28 @@ class CoreOperationsTests(unittest.TestCase):
     def test_dsh_inherit_and_empty_quick_values_do_not_reach_proxy_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            json_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+            json_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
             config = '{"enabled":false,"timeoutSeconds":13}'
             encoded = base64.urlsafe_b64encode(config.encode("utf-8")).decode("ascii").rstrip("=")
             (root / "runtime-settings.env").write_text(
                 f"{json_key}=base64:{encoded}\n"
-                "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED=inherit\n"
-                "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS=\n",
+                "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED=inherit\n"
+                "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS=\n",
                 encoding="utf-8",
             )
 
             environment = CoreServiceController(root)._runtime_env()
             self.assertEqual(json.loads(config), json.loads(environment[json_key]))
-            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", environment)
-            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", environment)
+            self.assertNotIn("YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED", environment)
+            self.assertNotIn("YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS", environment)
 
     def test_dsh_quick_controls_and_json_are_one_bidirectional_draft(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             domain = RuntimeSettingsDomain(root / "runtime-settings.env")
-            config_key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
-            enabled_key = "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED"
-            backend_key = "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND"
+            config_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
+            enabled_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED"
+            backend_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND"
 
             fields = {item["key"]: item for item in domain.snapshot()["fields"]}
             self.assertEqual("on", fields[enabled_key]["value"])
@@ -675,7 +675,7 @@ class CoreOperationsTests(unittest.TestCase):
             with self.assertRaisesRegex(DomainError, "Runtime settings are invalid"):
                 domain.dispatch(
                     "set_setting",
-                    {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "0"},
+                    {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS", "value": "0"},
                 )
 
             domain.stage_secret(
@@ -686,9 +686,9 @@ class CoreOperationsTests(unittest.TestCase):
             fields = {item["key"]: item for item in domain.snapshot()["fields"]}
             self.assertEqual("on", fields[enabled_key]["value"])
             self.assertEqual("local", fields[backend_key]["value"])
-            self.assertEqual("12", fields["LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS"]["value"])
+            self.assertEqual("12", fields["YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS"]["value"])
 
-            domain.dispatch("clear_setting", {"key": "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS"})
+            domain.dispatch("clear_setting", {"key": "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS"})
             cleared = json.loads(domain.trusted_secret_value("setting", config_key))
             self.assertNotIn("timeoutSeconds", cleared)
 
@@ -696,8 +696,8 @@ class CoreOperationsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "runtime-settings.env").write_text(
-                "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON=base64:not-valid-json\n"
-                "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED=0\n",
+                "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON=base64:not-valid-json\n"
+                "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED=0\n",
                 encoding="utf-8",
             )
             controller = CoreServiceController(root)
@@ -706,11 +706,11 @@ class CoreOperationsTests(unittest.TestCase):
                 controller._runtime_env()
 
             fallback = controller._runtime_env(strict=False)
-            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON", fallback)
-            self.assertNotIn("LITELLM_MENU_DSH_VISION_ROUTER_ENABLED", fallback)
+            self.assertNotIn("YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON", fallback)
+            self.assertNotIn("YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED", fallback)
 
     def test_codex_descendant_cleanup_uses_runtime_settings_value(self) -> None:
-        key = "LITELLM_MENU_CODEX_DESCENDANT_CLEANUP"
+        key = "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             domain = RuntimeSettingsDomain(root / "runtime-settings.env")
@@ -733,15 +733,15 @@ class CoreOperationsTests(unittest.TestCase):
             environment = controller._runtime_env()
             core_root = Path(__file__).resolve().parents[1]
 
-            self.assertEqual("1", environment["LITELLM_MENU_PROXY_PROCESS"])
-            self.assertEqual("1", environment["LITELLM_MENU_TIMESTAMP_OUTPUT"])
-            self.assertEqual(str(Path(directory) / "menu-server.log"), environment["LITELLM_MENU_SERVICE_LOG"])
+            self.assertEqual("1", environment["YOUNG_ROUTER_PROXY_PROCESS"])
+            self.assertEqual("1", environment["YOUNG_ROUTER_TIMESTAMP_OUTPUT"])
+            self.assertEqual(str(Path(directory) / "server.log"), environment["YOUNG_ROUTER_SERVICE_LOG"])
             self.assertEqual(str(Path(directory) / "recent-requests.jsonl"), environment["LITELLM_RECENT_REQUESTS_LOG"])
             self.assertEqual("true", environment["LITELLM_LOCAL_MODEL_COST_MAP"])
-            self.assertEqual(str(controller.paths.recovery), environment["LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE"])
-            self.assertEqual(str(controller.paths.cooldowns), environment["LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE"])
+            self.assertEqual(str(controller.paths.recovery), environment["YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"])
+            self.assertEqual(str(controller.paths.cooldowns), environment["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE"])
             self.assertEqual(
-                "litellm_menu.search_endpoint:register",
+                "young_router.search_endpoint:register",
                 environment["LITELLM_WORKER_STARTUP_HOOKS"],
             )
             self.assertEqual(str(core_root), environment["LITELLM_TEMPLATE_ROOT"])
@@ -771,11 +771,11 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=True
             ), mock.patch(
-                "litellm_menu.core.operations.atomic_write_text"
-            ), mock.patch("litellm_menu.core.operations.subprocess.Popen", return_value=process) as popen:
+                "young_router.core.operations.atomic_write_text"
+            ), mock.patch("young_router.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
 
-            service_log = Path(directory) / "menu-server.log"
+            service_log = Path(directory) / "server.log"
             self.assertTrue(service_log.exists())
             self.assertIs(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
             self.assertEqual(str(service_log), popen.call_args.kwargs["stdout"].name)
@@ -783,7 +783,7 @@ class CoreOperationsTests(unittest.TestCase):
     def test_relocated_core_resolves_the_owned_callback_from_pythonpath(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package = root / "litellm_menu"
+            package = root / "young_router"
             package.mkdir()
             (package / "__init__.py").write_text("", encoding="utf-8")
             (package / "callbacks.py").write_text("value = 'portable'\n", encoding="utf-8")
@@ -797,7 +797,7 @@ class CoreOperationsTests(unittest.TestCase):
             environment = os.environ.copy()
             environment.update(
                 {
-                    "LITELLM_MENU_PROXY_PROCESS": "1",
+                    "YOUNG_ROUTER_PROXY_PROCESS": "1",
                     "PYTHONPATH": str(root),
                 }
             )
@@ -807,7 +807,7 @@ class CoreOperationsTests(unittest.TestCase):
                     "-c",
                     (
                         "from litellm.proxy.types_utils.utils import get_instance_fn; "
-                        "print(get_instance_fn('litellm_menu.callbacks.value', "
+                        "print(get_instance_fn('young_router.callbacks.value', "
                         "config_file_path='config.yaml'))"
                     ),
                 ],
@@ -857,7 +857,7 @@ class CoreOperationsTests(unittest.TestCase):
             first = CoreServiceController(directory)
             token = "synthetic-service-owner-token-1234567890"
             environment = os.environ.copy()
-            environment["LITELLM_MENU_SERVICE_OWNER_TOKEN"] = token
+            environment["YOUNG_ROUTER_SERVICE_OWNER_TOKEN"] = token
             process = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
                 env=environment,
@@ -941,13 +941,13 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(controller, "_runtime_env", return_value={"LITELLM_HEALTH_WAIT_SECONDS": "1"}), mock.patch.object(
                 controller, "_configured_port", return_value=4000
             ), mock.patch(
-                "litellm_menu.core.operations.subprocess.Popen", return_value=process
+                "young_router.core.operations.subprocess.Popen", return_value=process
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=False
             ), mock.patch.object(controller, "_stop_process_group") as stop_group, mock.patch(
-                "litellm_menu.core.operations.time.sleep"
+                "young_router.core.operations.time.sleep"
             ), mock.patch(
-                "litellm_menu.core.operations.time.monotonic", side_effect=[0, 0, 2]
+                "young_router.core.operations.time.monotonic", side_effect=[0, 0, 2]
             ):
                 with self.assertRaisesRegex(RuntimeError, "did not become healthy"):
                     controller.start()
@@ -979,7 +979,7 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(
                 controller, "_runtime_env", return_value={"LITELLM_HEALTH_WAIT_SECONDS": "1"}
             ), mock.patch.object(controller, "_configured_port", return_value=4000), mock.patch(
-                "litellm_menu.core.operations.subprocess.Popen", return_value=replacement
+                "young_router.core.operations.subprocess.Popen", return_value=replacement
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=True
             ):
@@ -1016,7 +1016,7 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(controller, "_runtime_env", return_value={}), mock.patch.object(
                 controller, "_configured_port", return_value=4000
             ), mock.patch(
-                "litellm_menu.core.operations.subprocess.Popen", return_value=process
+                "young_router.core.operations.subprocess.Popen", return_value=process
             ), mock.patch.object(
                 controller, "_write_owner_record", side_effect=PersistenceError("write failed")
             ), mock.patch.object(controller, "_stop_process_group") as stop_group:
@@ -1033,7 +1033,7 @@ class CoreOperationsTests(unittest.TestCase):
             controller = CoreServiceController(directory)
             token = "synthetic-service-owner-token-1234567890"
             environment = os.environ.copy()
-            environment["LITELLM_MENU_SERVICE_OWNER_TOKEN"] = token
+            environment["YOUNG_ROUTER_SERVICE_OWNER_TOKEN"] = token
             process = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
                 env=environment,
@@ -1097,7 +1097,7 @@ class CoreOperationsTests(unittest.TestCase):
             exported = core.export(["providers_models", "runtime"], destination_token=export_token)
             payload = json.loads(package.read_text(encoding="utf-8"))
 
-            self.assertEqual("litellm-menu-configuration-package", payload["format"])
+            self.assertEqual("young-router-configuration-package", payload["format"])
             self.assertEqual(2, exported["section_count"])
             self.assertNotIn("replace-me-secret", json.dumps(exported))
             import_token = core.file_capabilities.register(package, "import")
@@ -1257,7 +1257,7 @@ class CoreOperationsTests(unittest.TestCase):
                 destination_token=core.file_capabilities.register(provider_json, "export"),
             )
             payload = json.loads(provider_json.read_text(encoding="utf-8"))
-            self.assertEqual("litellm-menu-domain-settings", payload["format"])
+            self.assertEqual("young-router-domain-settings", payload["format"])
             self.assertEqual("providers_models", payload["domain"])
             self.assertEqual(1, result["section_count"])
             self.assertNotIn("replace-me-secret", json.dumps(result))

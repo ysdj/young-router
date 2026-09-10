@@ -9,7 +9,7 @@ SHARED = ROOT / "rn/packages/shared/src"
 MAC_NATIVE = ROOT / "rn/apps/macos/src/native/macos"
 WIN_NATIVE = ROOT / "rn/apps/windows/src/native/windows"
 MAC_PROJECT = ROOT / "rn/apps/macos/macos"
-WIN_PROJECT = ROOT / "rn/apps/windows/windows/LiteLLMMenu"
+WIN_PROJECT = ROOT / "rn/apps/windows/windows/YoungRouter"
 
 
 class ReactNativeNativeAcceptanceTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_windows_close_is_requested_through_shared_react_before_hiding(self) -> None:
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
 
         self.assertIn("message == WM_CLOSE && !quitting_", leaf)
         self.assertIn('DispatchAction("request-close-" + WideToUtf8(active_route_));', leaf)
@@ -124,8 +124,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         mac_controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         win_leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
-        mac_app = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
-        win_app = (WIN_PROJECT / "LiteLLMMenu.cpp").read_text(encoding="utf-8")
+        mac_app = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        win_app = (WIN_PROJECT / "YoungRouter.cpp").read_text(encoding="utf-8")
 
         for source in (mac_leaf, win_leaf, mac_app, win_app):
             self.assertNotIn("configuration-package", source)
@@ -155,7 +155,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('"general-settings", "providers-models", "runtime-settings"', leaf)
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
         self.assertIn('route == L"general-settings" || route == L"providers-models"', windows)
-        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         self.assertIn('@"general-settings", @"providers-models"', app_delegate)
         # About moved from the sidebar to the native menus; the storyboard's
         # standard About item is localized and Preferences gets the Settings
@@ -245,9 +245,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # Codex and Claude are panes of the shared settings window, whose title
         # is the app name; the sidebar names the active pane.
         self.assertIn('if Self.settingsPaneRoutes.contains(canonicalRoute(route)) {', mac)
-        self.assertIn('return localized("appTitle", fallback: "LiteLLM Menu")', mac)
+        self.assertIn('return localized("appTitle", fallback: "Young Router")', mac)
         self.assertIn('route == L"codex-settings" ||', windows)
-        self.assertIn('return Localized("appTitle", L"LiteLLM Menu");', windows)
+        self.assertIn('return Localized("appTitle", L"Young Router");', windows)
 
     def test_macos_settings_shortcut_opens_the_combined_settings_surface(self) -> None:
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
@@ -284,7 +284,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('if (is_language_choice) {', windows)
 
     def test_windows_uses_app_sdk_single_instance_and_hot_protocol_routing(self) -> None:
-        source = (WIN_PROJECT / "LiteLLMMenu.cpp").read_text(encoding="utf-8")
+        source = (WIN_PROJECT / "YoungRouter.cpp").read_text(encoding="utf-8")
         pch = (WIN_PROJECT / "pch.h").read_text(encoding="utf-8")
 
         self.assertIn("Microsoft.Windows.AppLifecycle.h", pch)
@@ -299,24 +299,24 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("config-watch", source)
 
     def test_macos_prevents_duplicate_direct_bundle_launches_before_appkit_starts(self) -> None:
-        source = (MAC_PROJECT / "LiteLLMMenu-macOS/main.m").read_text(encoding="utf-8")
-        plist = (MAC_PROJECT / "LiteLLMMenu-macOS/Info.plist").read_text(encoding="utf-8")
+        source = (MAC_PROJECT / "YoungRouter-macOS/main.m").read_text(encoding="utf-8")
+        plist = (MAC_PROJECT / "YoungRouter-macOS/Info.plist").read_text(encoding="utf-8")
 
         self.assertIn("LSMultipleInstancesProhibited", plist)
-        self.assertIn("LiteLLMMenuExistingInstance", source)
+        self.assertIn("YoungRouterExistingInstance", source)
         self.assertIn("NSWorkspace.sharedWorkspace.runningApplications", source)
-        self.assertIn("LiteLLMMenuIsManagedApplication", source)
-        self.assertIn("LiteLLMMenuAcquireInstanceLock", source)
+        self.assertIn("YoungRouterIsManagedApplication", source)
+        self.assertIn("YoungRouterAcquireInstanceLock", source)
         self.assertIn("NSApplicationSupportDirectory", source)
-        self.assertIn('kLiteLLMMenuInstanceNamespace = @"menu.litellm.menu"', source)
-        self.assertIn("Contents/MacOS/LiteLLMMenu", source)
+        self.assertIn('kYoungRouterInstanceNamespace = @"young.router.app"', source)
+        self.assertIn("Contents/MacOS/YoungRouter", source)
         self.assertNotIn("NSTemporaryDirectory", source)
         self.assertIn("flock(descriptor, LOCK_EX | LOCK_NB)", source)
         self.assertIn("NSApplicationMain", source)
-        self.assertLess(source.index("LiteLLMMenuAcquireInstanceLock"), source.rindex("NSApplicationMain"))
+        self.assertLess(source.index("YoungRouterAcquireInstanceLock"), source.rindex("NSApplicationMain"))
 
     def test_macos_starts_the_hidden_primary_host_for_live_menu_state(self) -> None:
-        source = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        source = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         launch = source.split("- (void)applicationDidFinishLaunching:", 1)[1].split(
             "- (void)startReactHostWhenNeeded", 1
         )[0]
@@ -396,7 +396,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac_spec = (SHARED / "ui/macos/NativeCodeWebViewNativeComponent.ts").read_text(encoding="utf-8")
         windows_spec = (SHARED / "ui/windows/NativeCodeWebViewNativeComponent.ts").read_text(encoding="utf-8")
         wrapper = (SHARED / "ui/code-editor/CodeEditorWebView.tsx").read_text(encoding="utf-8")
-        core_ipc = (ROOT / "litellm_menu/core/ipc.py").read_text(encoding="utf-8")
+        core_ipc = (ROOT / "young_router/core/ipc.py").read_text(encoding="utf-8")
         mac_bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         windows_bridge = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
         native_controls = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
@@ -479,7 +479,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("scrollView.autohidesScrollers = YES;", component)
 
     def test_native_login_item_registration_follows_core_target_state(self) -> None:
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
@@ -493,7 +493,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("setLaunchAtLogin?: (enabled: boolean) => Promise<boolean>", platform)
 
     def test_macos_codex_catalog_toggle_uses_a_separate_non_modal_restart_confirmation(self) -> None:
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
         bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
@@ -530,7 +530,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_shared_ui_owns_lifecycle_menu_actions_startup_and_safe_recovery(self) -> None:
         """Both native leaves route lifecycle commands through one React IPC path."""
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
@@ -564,7 +564,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('void runServiceOperation("start");', ui)
 
         bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
-        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         self.assertIn("public func warm()", bridge)
         self.assertIn("[CoreIPCBridge.shared warm];", app_delegate)
 
@@ -581,15 +581,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('if (route == L"home") {', win_leaf)
 
     def test_macos_deep_links_allow_only_the_logs_tab_parameter(self) -> None:
-        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
-        info = (MAC_PROJECT / "LiteLLMMenu-macOS/Info.plist").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        info = (MAC_PROJECT / "YoungRouter-macOS/Info.plist").read_text(encoding="utf-8")
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
 
-        self.assertIn('objectForInfoDictionaryKey:@"LiteLLMMenuRouteScheme"', app_delegate)
-        self.assertIn('routeScheme = @"litellm-menu"', app_delegate)
+        self.assertIn('objectForInfoDictionaryKey:@"YoungRouterRouteScheme"', app_delegate)
+        self.assertIn('routeScheme = @"young-router"', app_delegate)
         self.assertIn('[[url scheme] isEqualToString:routeScheme]', app_delegate)
-        self.assertIn("<key>LiteLLMMenuRouteScheme</key>", info)
-        self.assertIn("<string>litellm-menu</string>", info)
+        self.assertIn("<key>YoungRouterRouteScheme</key>", info)
+        self.assertIn("<string>young-router</string>", info)
         self.assertIn("items.count == 1", app_delegate)
         self.assertIn('[item.name isEqualToString:@"tab"]', app_delegate)
         self.assertIn("openRouteFromDeepLink:route logTab:logTab", app_delegate)
@@ -606,7 +606,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         """The settings window keeps one sidebar material behind the whole
         window and a transparent title bar, so the sidebar reads as a single
         full-height surface instead of a gray table on a white pane."""
-        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
 
@@ -618,14 +618,19 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NSVisualEffectBlendingModeBehindWindow", app_delegate)
         self.assertIn("[backdrop addSubview:rootView];", app_delegate)
         self.assertIn("[(id)rootView setBackgroundColor:NSColor.clearColor];", app_delegate)
-        self.assertIn("const BOOL settingsShell = [settingsShellRoutes containsObject:route];", app_delegate)
+        # The native shell predicate mirrors isSettingsShellRoute() instead of
+        # an explicit route whitelist; a whitelist silently dropped General
+        # onto a plain titled window while the shared shell still reserved its
+        # title-bar inset.
+        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard"]];', app_delegate)
+        self.assertIn("const BOOL settingsShell = ![standaloneRoutes containsObject:route];", app_delegate)
         # The material belongs to the window; a per-table backdrop would stack
         # a second vibrancy layer over only the table's own rows.
         self.assertNotIn("NSVisualEffectMaterialSidebar", controls)
         self.assertIn("contentSize: NSSize(width: 960, height: 640)", leaf)
 
     def test_macos_reopen_shows_the_primary_configuration_window(self) -> None:
-        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
 
         self.assertIn("applicationShouldHandleReopen", app_delegate)
@@ -640,73 +645,73 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
     def test_macos_bundle_prohibits_duplicate_menu_bar_instances(self) -> None:
         """A second launch must activate the existing app, not add another LL item."""
 
-        info = (MAC_PROJECT / "LiteLLMMenu-macOS/Info.plist").read_text(encoding="utf-8")
-        main = (MAC_PROJECT / "LiteLLMMenu-macOS/main.m").read_text(encoding="utf-8")
+        info = (MAC_PROJECT / "YoungRouter-macOS/Info.plist").read_text(encoding="utf-8")
+        main = (MAC_PROJECT / "YoungRouter-macOS/main.m").read_text(encoding="utf-8")
 
         self.assertIn("<key>LSMultipleInstancesProhibited</key>", info)
         self.assertIn("<true/>", info.split("<key>LSMultipleInstancesProhibited</key>", 1)[1].split("</dict>", 1)[0])
         self.assertIn("NSWorkspace.sharedWorkspace.runningApplications", main)
-        self.assertIn("LiteLLMMenuIsManagedApplication", main)
+        self.assertIn("YoungRouterIsManagedApplication", main)
         self.assertIn("application.processIdentifier != currentPID", main)
         self.assertIn("activateWithOptions", main)
-        self.assertLess(main.index("LiteLLMMenuExistingInstance()"), main.index("NSApplicationMain(argc, argv)"))
+        self.assertLess(main.index("YoungRouterExistingInstance()"), main.index("NSApplicationMain(argc, argv)"))
 
     def test_macos_preview_metadata_keeps_the_production_instance_identity(self) -> None:
         build = (ROOT / "rn/scripts/build-macos.sh").read_text(encoding="utf-8")
-        main = (MAC_PROJECT / "LiteLLMMenu-macOS/main.m").read_text(encoding="utf-8")
+        main = (MAC_PROJECT / "YoungRouter-macOS/main.m").read_text(encoding="utf-8")
 
-        self.assertIn("LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER is unsupported", build)
-        self.assertIn("LITELLM_MENU_MACOS_DISPLAY_NAME", build)
-        self.assertIn("LITELLM_MENU_MACOS_ROUTE_SCHEME", build)
-        self.assertIn("LITELLM_MENU_MACOS_PREVIEW_PROFILE_ROOT", build)
-        self.assertIn("LITELLM_MENU_MACOS_PREVIEW_PORT", build)
-        self.assertIn("LiteLLMMenuPreviewProfileRoot", build)
-        self.assertIn("LiteLLMMenuPreviewPort", build)
-        self.assertIn('PREVIEW_BUNDLE_IDENTIFIER="menu.litellm.menu"', build)
+        self.assertIn("YOUNG_ROUTER_MACOS_BUNDLE_IDENTIFIER is unsupported", build)
+        self.assertIn("YOUNG_ROUTER_MACOS_DISPLAY_NAME", build)
+        self.assertIn("YOUNG_ROUTER_MACOS_ROUTE_SCHEME", build)
+        self.assertIn("YOUNG_ROUTER_MACOS_PREVIEW_PROFILE_ROOT", build)
+        self.assertIn("YOUNG_ROUTER_MACOS_PREVIEW_PORT", build)
+        self.assertIn("YoungRouterPreviewProfileRoot", build)
+        self.assertIn("YoungRouterPreviewPort", build)
+        self.assertIn('PREVIEW_BUNDLE_IDENTIFIER="young.router.app"', build)
         self.assertIn("Set :CFBundleIdentifier $PREVIEW_BUNDLE_IDENTIFIER", build)
-        self.assertIn('kLiteLLMMenuInstanceNamespace = @"menu.litellm.menu"', main)
+        self.assertIn('kYoungRouterInstanceNamespace = @"young.router.app"', main)
         self.assertNotIn("distinct preview bundle", main)
 
     def test_macos_preview_profile_is_embedded_without_a_second_instance_identity(self) -> None:
         bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
 
         self.assertIn("previewProfileEnvironment", bridge)
-        self.assertIn('guard let rawRoot = Bundle.main.object(forInfoDictionaryKey: "LiteLLMMenuPreviewProfileRoot")', bridge)
-        self.assertNotIn('Bundle.main.bundleIdentifier != "menu.litellm.menu"', bridge)
-        self.assertIn('"LiteLLMMenuPreviewProfileRoot"', bridge)
-        self.assertIn('"LiteLLMMenuPreviewPort"', bridge)
+        self.assertIn('guard let rawRoot = Bundle.main.object(forInfoDictionaryKey: "YoungRouterPreviewProfileRoot")', bridge)
+        self.assertNotIn('Bundle.main.bundleIdentifier != "young.router.app"', bridge)
+        self.assertIn('"YoungRouterPreviewProfileRoot"', bridge)
+        self.assertIn('"YoungRouterPreviewPort"', bridge)
         for key in (
             "LITELLM_RUNTIME_ROOT",
             "LITELLM_CONFIG_FILE",
             "CODEX_HOME",
             "CLAUDE_CONFIG_DIR",
-            "LITELLM_MENU_RUNTIME_SETTINGS_FILE",
+            "YOUNG_ROUTER_RUNTIME_SETTINGS_FILE",
         ):
             self.assertIn(f'environment["{key}"]', bridge)
 
-    def test_macos_uses_the_monochrome_double_l_menu_icon_asset(self) -> None:
+    def test_macos_uses_the_monochrome_double_l_status_icon_asset(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         icon_contents = (
             MAC_PROJECT
-            / "LiteLLMMenu-macOS/Assets.xcassets/MenuIcon.imageset/Contents.json"
+            / "YoungRouter-macOS/Assets.xcassets/StatusBarIcon.imageset/Contents.json"
         ).read_text(encoding="utf-8")
 
-        self.assertIn('NSImage(named: NSImage.Name("MenuIcon"))!', leaf)
+        self.assertIn('NSImage(named: NSImage.Name("StatusBarIcon"))!', leaf)
         self.assertIn("image.size = NSSize(width: 20, height: 20)", leaf)
         self.assertIn("image.isTemplate = true", leaf)
         self.assertNotIn('("L" as NSString).draw(', leaf)
         self.assertIn("NSStatusItem.squareLength", leaf)
         self.assertIn("statusItem.button?.image = Self.statusBarIcon", leaf)
         self.assertNotIn("systemSymbolName:", leaf)
-        self.assertIn('"filename" : "menu_icon.png"', icon_contents)
-        self.assertIn('"filename" : "menu_icon@2x.png"', icon_contents)
+        self.assertIn('"filename" : "status_icon.png"', icon_contents)
+        self.assertIn('"filename" : "status_icon@2x.png"', icon_contents)
         self.assertNotIn("template-rendering-intent", icon_contents)
 
     def test_macos_status_item_is_ready_before_react_and_defers_menu_rebuilds_while_tracking(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         platform_entry = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
 
         native_shell = app_delegate.index("AppKitNativeLeaf *nativeLeaf = AppKitNativeLeaf.shared;")
         core_warm = app_delegate.index("[CoreIPCBridge.shared warm];")
@@ -785,7 +790,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
     def test_macos_quit_cancels_startup_and_finishes_off_the_main_thread(self) -> None:
         bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
 
         self.assertIn("private let stoppingLock = NSLock()", bridge)
         self.assertIn("guard beginStopping() else { return }", bridge)
@@ -799,14 +804,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("applicationWillTerminate", app_delegate)
 
     def test_language_is_a_state_backed_native_menu_submenu_not_a_route(self) -> None:
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
-        core_service = (ROOT / "litellm_menu/core/service.py").read_text(encoding="utf-8")
+        core_service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
 
         for source in (ui, mac, windows):
-            self.assertIn("language-menu", source)
+            self.assertIn("language-picker", source)
             self.assertIn("set-language-system", source)
             self.assertIn("set-language-en", source)
             self.assertIn("set-language-zh-Hans", source)
@@ -819,7 +824,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_macos_physical_close_is_approved_by_shared_react_state(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
 
         self.assertIn("NSWindowDelegate", leaf)
         self.assertIn("func windowShouldClose(_ sender: NSWindow) -> Bool", leaf)
@@ -862,8 +867,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_macos_route_windows_share_one_settings_window_and_show_dock_only_with_ui(self) -> None:
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
-        app_delegate = (MAC_PROJECT / "LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
-        info = (MAC_PROJECT / "LiteLLMMenu-macOS/Info.plist").read_text(encoding="utf-8")
+        app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        info = (MAC_PROJECT / "YoungRouter-macOS/Info.plist").read_text(encoding="utf-8")
 
         self.assertIn("private var routeWindows: [String: NSWindow] = [:]", leaf)
         self.assertIn("setRouteWindowFactory", leaf)
@@ -876,14 +881,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NSWindow *existingWindow", app_delegate)
         self.assertIn('self.initialProps = @{ @"isPrimaryHost": @YES, @"isWindowManagerHost": @YES };', app_delegate)
         self.assertIn('@"isPrimaryHost": @NO', app_delegate)
-        self.assertIn("viewWithModuleName:@\"LiteLLMMenu\" initialProperties:props", app_delegate)
+        self.assertIn("viewWithModuleName:@\"YoungRouter\" initialProperties:props", app_delegate)
         self.assertNotIn("NSApplicationActivationPolicyRegular", app_delegate)
         self.assertIn("LSUIElement", info)
         self.assertIn("<key>CFBundleIconFile</key>\n\t<string>AppIcon</string>", info)
         self.assertNotIn("CFBundleIconName", info)
         app_icon = (
             MAC_PROJECT
-            / "LiteLLMMenu-macOS/Assets.xcassets/AppIcon.appiconset/icon_1024.png"
+            / "YoungRouter-macOS/Assets.xcassets/AppIcon.appiconset/icon_1024.png"
         )
         self.assertTrue(app_icon.is_file())
         self.assertIn("NSApp.setActivationPolicy(.accessory)", leaf)
@@ -900,7 +905,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
         bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         mac_module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
         mac_bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
@@ -933,7 +938,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
         bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         mac_module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
         mac_bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
@@ -1080,7 +1085,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_localization_crosses_the_native_leaf_contract(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
 
@@ -1089,12 +1094,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("native.setLocalization({", ui)
         self.assertIn('translate("common.find")', ui)
         self.assertNotIn('webdavToggle: translate("webdav.enabled")', ui)
-        self.assertIn('menuQuit: translate("menu.quit")', ui)
+        self.assertIn('menuQuit: translate("status.quit")', ui)
         self.assertIn("func setLocalization", mac)
         localization = mac.split("func setLocalization", 1)[1].split("func setMenuActions", 1)[0]
         self.assertIn("window.title = title", localization)
         self.assertNotIn("configure(window", localization)
-        self.assertIn('localized("menuQuit", fallback: "Quit LiteLLM Menu")', mac)
+        self.assertIn('localized("menuQuit", fallback: "Quit Young Router")', mac)
         self.assertIn('"webdav-status"', mac)
         self.assertIn("void WinUI3NativeLeaf::SetLocalization", windows)
 
@@ -1112,7 +1117,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows_module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
         windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
         windows_core = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
-        core_ipc = (ROOT / "litellm_menu/core/ipc.py").read_text(encoding="utf-8")
+        core_ipc = (ROOT / "young_router/core/ipc.py").read_text(encoding="utf-8")
 
         self.assertIn("relayLogin(options:", types)
         self.assertIn('type: "newapi" | "sub2api"', types)
@@ -1123,7 +1128,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("relayLogin?: (options:", platform)
 
         relay_ui = (SHARED / "ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
-        wizard_ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        wizard_ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         # The station sign-in lives in the shared wizard window; the account
         # panel keeps the sanitized native session boundary.
         self.assertIn("language,", relay_ui)
@@ -1228,7 +1233,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("func webView(_ webView: WKWebView, didStartProvisionalNavigation", mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didFailProvisionalNavigation", mac_leaf)
         self.assertIn("private var capturedPassword: String?", mac_leaf)
-        self.assertIn("__litellm_menu_relay_password", mac_leaf)
+        self.assertIn("__young_router_relay_password", mac_leaf)
         self.assertIn("rememberPassword: Bool?,", mac_leaf)
         self.assertIn("let capturedPassword = self.capturedPassword", mac_leaf)
         self.assertIn("password: rememberPassword == true ? capturedPassword : nil", mac_leaf)
@@ -1366,7 +1371,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
         relay_ui = (SHARED / "ui/RelayAccountManager.tsx").read_text(encoding="utf-8")
-        logs_ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        logs_ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac_leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         mac_module = (MAC_NATIVE / "AppKitNativeLeafModule.swift").read_text(encoding="utf-8")
         mac_bridge = (MAC_NATIVE / "AppKitNativeLeafBridge.m").read_text(encoding="utf-8")
@@ -1375,7 +1380,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows_module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
         windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
         windows_core = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
-        core_ipc = (ROOT / "litellm_menu/core/ipc.py").read_text(encoding="utf-8")
+        core_ipc = (ROOT / "young_router/core/ipc.py").read_text(encoding="utf-8")
 
         self.assertIn("restoreRelaySession(options:", types)
         self.assertIn("restoreRelaySession(options:", bridge)
@@ -1454,7 +1459,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('ClearChunkedCredential(account_id, L"session")', windows_relay)
 
     def test_fetched_model_selection_is_a_native_promise_dialog_on_both_hosts(self) -> None:
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
         bridge = (SHARED / "platform/nativeBridge.ts").read_text(encoding="utf-8")
         platform = (SHARED / "platformEntry.ts").read_text(encoding="utf-8")
@@ -1540,7 +1545,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_inline_secret_inputs_keep_passwords_inside_native_hosts(self) -> None:
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac_spec = (SHARED / "ui/macos/NativeSecureTextInputNativeComponent.ts").read_text(
             encoding="utf-8"
         )
@@ -1552,7 +1557,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         windows_codegen = (
             WIN_PROJECT
-            / "codegen/react/components/LiteLLMMenu/LiteLLMWinUISecureTextInput.g.h"
+            / "codegen/react/components/YoungRouter/LiteLLMWinUISecureTextInput.g.h"
         ).read_text(encoding="utf-8")
 
         self.assertIn("export function NativeSecureTextInput", adapter)
@@ -1606,8 +1611,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn('onEdit={() => stageSecret({ domain: "runtime"', ui)
 
     def test_provider_api_key_plaintext_readback_is_narrow_and_native_only(self) -> None:
-        ipc = (ROOT / "litellm_menu" / "core" / "ipc.py").read_text(encoding="utf-8")
-        service = (ROOT / "litellm_menu" / "core" / "service.py").read_text(encoding="utf-8")
+        ipc = (ROOT / "young_router" / "core" / "ipc.py").read_text(encoding="utf-8")
+        service = (ROOT / "young_router" / "core" / "service.py").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         windows_header = (WIN_NATIVE / "CoreIPCBridge.h").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
@@ -1624,7 +1629,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("secret/read", (SHARED / "platform" / "nativeBridge.ts").read_text(encoding="utf-8"))
 
     def test_provider_api_key_uses_native_plaintext_auto_commit(self) -> None:
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         mac_core = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
@@ -1654,7 +1659,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         windows_core = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
 
-        key = "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON"
+        key = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
         for source in (mac, mac_core, windows, windows_core):
             self.assertIn(key, source)
         self.assertIn("allowMultiline:", mac_core)
@@ -1857,9 +1862,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("preserveColumnWidths={preserveColumnWidths}", native_controls)
         self.assertIn("scrollTrailingColumnOverflow?: boolean;", native_controls)
         self.assertIn("scrollTrailingColumnOverflow={scrollTrailingColumnOverflow}", native_controls)
-        self.assertIn("cellHorizontalPadding={6}", (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8"))
-        self.assertIn("firstColumnHorizontalPadding={0}", (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8"))
-        logs_ui = (SHARED / "ui" / "LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        self.assertIn("cellHorizontalPadding={6}", (SHARED / "ui" / "YoungRouterApp.tsx").read_text(encoding="utf-8"))
+        self.assertIn("firstColumnHorizontalPadding={0}", (SHARED / "ui" / "YoungRouterApp.tsx").read_text(encoding="utf-8"))
+        logs_ui = (SHARED / "ui" / "YoungRouterApp.tsx").read_text(encoding="utf-8")
         logs_workspace = logs_ui.split("function LogsWorkspace", 1)[1].split("function Section", 1)[0]
         self.assertIn(
             "columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths",
@@ -2160,7 +2165,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_windows_controls_are_registered_fabric_winui_content_islands(self) -> None:
         controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
-        app = (WIN_PROJECT / "LiteLLMMenu.cpp").read_text(encoding="utf-8")
+        app = (WIN_PROJECT / "YoungRouter.cpp").read_text(encoding="utf-8")
 
         self.assertIn("ContentIslandComponentView", controls)
         self.assertIn("RegisterWinUIControls(packageBuilder)", app)
@@ -2209,7 +2214,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
-        ui = (SHARED / "ui/LiteLLMMenuApp.tsx").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac_spec = (SHARED / "ui/macos/NativeTextEditorNativeComponent.ts").read_text(
             encoding="utf-8"
         )
@@ -2218,7 +2223,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         windows_codegen = (
             WIN_PROJECT
-            / "codegen/react/components/LiteLLMMenu/LiteLLMWinUITextEditor.g.h"
+            / "codegen/react/components/YoungRouter/LiteLLMWinUITextEditor.g.h"
         ).read_text(encoding="utf-8")
 
         self.assertIn("TextEditorIsFollowingBottom", mac)

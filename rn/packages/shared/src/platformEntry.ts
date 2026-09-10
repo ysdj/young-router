@@ -3,7 +3,7 @@ import { createTranslator } from "./i18n";
 import { createIpcClient } from "./ipc";
 import { createNativeIpcTransport, createNativeLeafBridgeAdapter, type NativeIpcBridge, type NativeLeafBridge } from "./platform/nativeBridge";
 import { routeMenuActions } from "./routes";
-import { registerLiteLLMMenu } from "./bootstrap";
+import { registerYoungRouter } from "./bootstrap";
 import type { LanguagePreference, NativeLocalization, NativeMenuAction, NativeMenuAnchor, RelayGroupManagerGroup, RelayGroupManagerKey, RelayGroupManagerLabels, RelayGroupManagerResult, ServiceStatus } from "./types";
 
 type NativeModule = {
@@ -92,7 +92,7 @@ type NativeModule = {
 
 const core = NativeModules.LiteLLMCore as NativeModule | undefined;
 const leaf = NativeModules.LiteLLMNativeLeaf as NativeModule | undefined;
-if (!core?.send || !leaf) throw new Error("The LiteLLM Menu native host is unavailable.");
+if (!core?.send || !leaf) throw new Error("The Young Router native host is unavailable.");
 
 const coreEvents = new NativeEventEmitter(core as never);
 const leafEvents = new NativeEventEmitter(leaf as never);
@@ -194,7 +194,7 @@ const ipc = createIpcClient(createNativeIpcTransport(ipcBridge));
 // windows can then use this cached snapshot synchronously on their first frame.
 void ipc.snapshot().catch(() => undefined);
 
-registerLiteLLMMenu("LiteLLMMenu", {
+registerYoungRouter("YoungRouter", {
   ipc,
   native,
   translate: createTranslator("system", systemLocale),

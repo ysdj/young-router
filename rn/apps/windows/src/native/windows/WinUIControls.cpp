@@ -4,18 +4,18 @@
 
 #if defined(RNW_NEW_ARCH)
 
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUIButton.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUICheckbox.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUICodeWebView.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUIPicker.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISecureTextInput.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISegmentedControl.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISelectableRow.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISplitView.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUISwitch.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUITable.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUITextEditor.g.h"
-#include "codegen/react/components/LiteLLMMenu/LiteLLMWinUITextInput.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUIButton.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUICheckbox.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUICodeWebView.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUIPicker.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUISecureTextInput.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUISegmentedControl.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUISelectableRow.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUISplitView.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUISwitch.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUITable.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUITextEditor.g.h"
+#include "codegen/react/components/YoungRouter/LiteLLMWinUITextInput.g.h"
 
 #include <shlobj.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
@@ -93,7 +93,7 @@ std::wstring CodeEditorWebViewDataFolder() {
   }
   std::filesystem::path path(folder);
   CoTaskMemFree(folder);
-  path /= L"LiteLLM Menu";
+  path /= L"Young Router";
   path /= L"CodeEditorWebView2";
   std::error_code error;
   std::filesystem::create_directories(path, error);
@@ -221,7 +221,7 @@ struct SecureInputLifecycle final {
 
 struct ButtonComponentView final
     : winrt::implements<ButtonComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUIButton<ButtonComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUIButton<ButtonComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     container_ = Grid{};
@@ -255,16 +255,16 @@ struct ButtonComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUIButtonProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUIButtonProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUIButton<ButtonComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUIButtonProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUIButtonProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUIButton<ButtonComponentView>::UpdateProps(view, props, old_props);
     ApplyProps();
   }
 
  private:
   void EmitPress() noexcept {
     if (auto emitter = EventEmitter()) {
-      winrt::LiteLLMMenu::Codegen::LiteLLMWinUIButtonEventEmitter::OnPress args;
+      winrt::YoungRouter::Codegen::LiteLLMWinUIButtonEventEmitter::OnPress args;
       emitter->onPress(std::move(args));
     }
   }
@@ -378,7 +378,7 @@ struct ButtonComponentView final
 
 struct SegmentedComponentView final
     : winrt::implements<SegmentedComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISegmentedControl<SegmentedComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUISegmentedControl<SegmentedComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     panel_ = StackPanel{};
@@ -391,9 +391,9 @@ struct SegmentedComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISegmentedControlProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISegmentedControlProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISegmentedControl<SegmentedComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISegmentedControlProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISegmentedControlProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUISegmentedControl<SegmentedComponentView>::UpdateProps(view, props, old_props);
     ApplyProps();
   }
 
@@ -436,7 +436,7 @@ struct SegmentedComponentView final
       item.Click([this, index](auto const&, auto const&) {
         if (!Props() || index >= static_cast<int32_t>(Props()->labels.size())) return;
         if (auto emitter = EventEmitter()) {
-          winrt::LiteLLMMenu::Codegen::LiteLLMWinUISegmentedControlEventEmitter::OnChange args;
+          winrt::YoungRouter::Codegen::LiteLLMWinUISegmentedControlEventEmitter::OnChange args;
           args.index = index;
           args.value = Props()->labels[static_cast<size_t>(index)];
           emitter->onChange(std::move(args));
@@ -459,7 +459,7 @@ struct SegmentedComponentView final
 
 struct PickerComponentView final
     : winrt::implements<PickerComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUIPicker<PickerComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUIPicker<PickerComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     picker_ = ComboBox{};
@@ -469,7 +469,7 @@ struct PickerComponentView final
       const auto index = picker_.SelectedIndex();
       if (index < 0 || index >= static_cast<int32_t>(Props()->labels.size())) return;
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUIPickerEventEmitter::OnChange args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUIPickerEventEmitter::OnChange args;
         args.index = index;
         args.value = Props()->labels[static_cast<size_t>(index)];
         emitter->onChange(std::move(args));
@@ -484,9 +484,9 @@ struct PickerComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUIPickerProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUIPickerProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUIPicker<PickerComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUIPickerProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUIPickerProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUIPicker<PickerComponentView>::UpdateProps(view, props, old_props);
     ApplyProps();
   }
 
@@ -525,7 +525,7 @@ struct PickerComponentView final
 
 struct CheckboxComponentView final
     : winrt::implements<CheckboxComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICheckbox<CheckboxComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUICheckbox<CheckboxComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     checkbox_ = CheckBox{};
@@ -533,7 +533,7 @@ struct CheckboxComponentView final
     checkbox_.Click([this](auto const&, auto const&) {
       if (syncing_) return;
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUICheckboxEventEmitter::OnValueChange args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUICheckboxEventEmitter::OnValueChange args;
         auto checked = checkbox_.IsChecked();
         args.value = checked && checked.Value();
         emitter->onValueChange(std::move(args));
@@ -548,15 +548,15 @@ struct CheckboxComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICheckboxProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICheckboxProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICheckbox<CheckboxComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICheckboxProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICheckboxProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUICheckbox<CheckboxComponentView>::UpdateProps(view, props, old_props);
     ApplyProps(old_props);
   }
 
  private:
   void ApplyProps(
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICheckboxProps> const& old_props) noexcept {
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICheckboxProps> const& old_props) noexcept {
     if (!checkbox_ || !Props()) return;
     auto const& props = *Props();
     const bool value_changed = !old_props || old_props->value != props.value;
@@ -593,7 +593,7 @@ struct CheckboxComponentView final
 
 struct TableComponentView final
     : winrt::implements<TableComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITable<TableComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUITable<TableComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     root_ = Grid{};
@@ -649,7 +649,7 @@ struct TableComponentView final
         return;
       }
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange args;
         args.index = index;
         args.key = Props()->rowKeys[static_cast<size_t>(index)];
         emitter->onSelectionChange(std::move(args));
@@ -661,7 +661,7 @@ struct TableComponentView final
       if (!list_.Items().IndexOf(args.ClickedItem(), index) || index >= Props()->rowKeys.size()) return;
       if (IsSpanningKey(Props()->rowKeys[index])) return;
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange event;
+        winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange event;
         event.index = static_cast<int32_t>(index);
         event.key = Props()->rowKeys[index];
         emitter->onSelectionChange(std::move(event));
@@ -673,7 +673,7 @@ struct TableComponentView final
       if (index < 0 || index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
       if (IsSpanningKey(Props()->rowKeys[static_cast<size_t>(index)])) return;
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter::OnRowDoublePress args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnRowDoublePress args;
         args.index = index;
         args.key = Props()->rowKeys[static_cast<size_t>(index)];
         emitter->onRowDoublePress(std::move(args));
@@ -694,9 +694,9 @@ struct TableComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITable<TableComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITableProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITableProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUITable<TableComponentView>::UpdateProps(view, props, old_props);
     ApplyProps();
   }
 
@@ -732,11 +732,11 @@ struct TableComponentView final
     syncing_ = false;
 
     auto old_props = Props();
-    winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableProps> empty_props;
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITable<TableComponentView>::UpdateProps(
+    winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITableProps> empty_props;
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUITable<TableComponentView>::UpdateProps(
         view, empty_props, old_props);
-    std::shared_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITableEventEmitter> empty_emitter;
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITable<TableComponentView>::UpdateEventEmitter(
+    std::shared_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter> empty_emitter;
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUITable<TableComponentView>::UpdateEventEmitter(
         empty_emitter);
   }
 
@@ -1019,7 +1019,7 @@ struct TableComponentView final
 
 struct TextEditorComponentView final
     : winrt::implements<TextEditorComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITextEditor<TextEditorComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextEditor<TextEditorComponentView> {
   struct ViewportState final {
     double horizontal_offset = 0.0;
     double vertical_offset = 0.0;
@@ -1036,7 +1036,7 @@ struct TextEditorComponentView final
     editor_.TextChanged([this](auto const&, auto const&) {
       if (syncing_) return;
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextEditorEventEmitter::OnChangeText args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUITextEditorEventEmitter::OnChangeText args;
         args.text = winrt::to_string(editor_.Text());
         emitter->onChangeText(std::move(args));
       }
@@ -1048,9 +1048,9 @@ struct TextEditorComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextEditorProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextEditorProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITextEditor<TextEditorComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextEditorProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextEditorProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextEditor<TextEditorComponentView>::UpdateProps(view, props, old_props);
     ApplyProps();
   }
 
@@ -1174,7 +1174,7 @@ struct TextEditorComponentView final
 
 struct CodeWebViewComponentView final
     : winrt::implements<CodeWebViewComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView> {
   ~CodeWebViewComponentView() {
     ReleaseWebView();
   }
@@ -1202,9 +1202,9 @@ struct CodeWebViewComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateProps(
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICodeWebViewProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICodeWebViewProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateProps(
         view, props, old_props);
     ApplyProps(old_props);
   }
@@ -1216,11 +1216,11 @@ struct CodeWebViewComponentView final
     ReleaseWebView();
     std::deque<std::string>{}.swap(emitted_editor_texts_);
     auto old_props = Props();
-    winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewProps> empty_props;
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateProps(
+    winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICodeWebViewProps> empty_props;
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateProps(
         view, empty_props, old_props);
-    std::shared_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewEventEmitter> empty_emitter;
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateEventEmitter(
+    std::shared_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICodeWebViewEventEmitter> empty_emitter;
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUICodeWebView<CodeWebViewComponentView>::UpdateEventEmitter(
         empty_emitter);
   }
 
@@ -1273,7 +1273,7 @@ struct CodeWebViewComponentView final
   }
 
   void ApplyProps(
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewProps> const& old_props) noexcept {
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICodeWebViewProps> const& old_props) noexcept {
     if (disposed_ || !Props()) return;
     auto const& props = *Props();
     if (props.html.empty() || props.documentKey.empty() ||
@@ -1420,7 +1420,7 @@ struct CodeWebViewComponentView final
       emitted_editor_texts_.push_back(text);
       if (emitted_editor_texts_.size() > 8) emitted_editor_texts_.pop_front();
       if (!EventEmitter()) return;
-      winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewEventEmitter::OnEditorChange event;
+      winrt::YoungRouter::Codegen::LiteLLMWinUICodeWebViewEventEmitter::OnEditorChange event;
       event.text = text;
       event.added = BoundedCount(payload, L"added");
       event.changed = BoundedCount(payload, L"changed");
@@ -1434,7 +1434,7 @@ struct CodeWebViewComponentView final
   void EmitEditorError(std::string message) noexcept {
     if (disposed_) return;
     if (auto emitter = EventEmitter()) {
-      winrt::LiteLLMMenu::Codegen::LiteLLMWinUICodeWebViewEventEmitter::OnEditorError event;
+      winrt::YoungRouter::Codegen::LiteLLMWinUICodeWebViewEventEmitter::OnEditorError event;
       event.message = std::move(message);
       emitter->onEditorError(std::move(event));
     }
@@ -1509,7 +1509,7 @@ void RegisterCodeWebViewRecycleHandler(
 
 struct SplitterComponentView final
     : winrt::implements<SplitterComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISplitView<SplitterComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUISplitView<SplitterComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     root_ = Grid{};
@@ -1530,9 +1530,9 @@ struct SplitterComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISplitViewProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISplitViewProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISplitView<SplitterComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISplitViewProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISplitViewProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUISplitView<SplitterComponentView>::UpdateProps(view, props, old_props);
     ApplyProps();
   }
 
@@ -1546,7 +1546,7 @@ struct SplitterComponentView final
 
   void EmitPaneWidth(float width) noexcept {
     if (auto emitter = EventEmitter()) {
-      winrt::LiteLLMMenu::Codegen::LiteLLMWinUISplitViewEventEmitter::OnPaneWidthChange args;
+      winrt::YoungRouter::Codegen::LiteLLMWinUISplitViewEventEmitter::OnPaneWidthChange args;
       args.width = width;
       emitter->onPaneWidthChange(std::move(args));
     }
@@ -1574,7 +1574,7 @@ struct SplitterComponentView final
 
 struct TextInputComponentView final
     : winrt::implements<TextInputComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     text_box_ = TextBox{};
@@ -1588,21 +1588,21 @@ struct TextInputComponentView final
     text_box_.TextChanged([this](auto const&, auto const&) {
       if (syncing_) return;
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputEventEmitter::OnChangeText args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUITextInputEventEmitter::OnChangeText args;
         args.text = winrt::to_string(text_box_.Text());
         emitter->onChangeText(std::move(args));
       }
     });
     text_box_.LostFocus([this](auto const&, auto const&) {
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputEventEmitter::OnBlur args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUITextInputEventEmitter::OnBlur args;
         emitter->onBlur(std::move(args));
       }
     });
     text_box_.KeyDown([this](auto const&, winrt::Microsoft::UI::Xaml::Input::KeyRoutedEventArgs const& args) {
       if (args.Key() != winrt::Windows::System::VirtualKey::Enter || (Props() && Props()->multiline.value_or(false))) return;
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputEventEmitter::OnSubmitEditing event;
+        winrt::YoungRouter::Codegen::LiteLLMWinUITextInputEventEmitter::OnSubmitEditing event;
         event.text = winrt::to_string(text_box_.Text());
         emitter->onSubmitEditing(std::move(event));
       }
@@ -1614,15 +1614,15 @@ struct TextInputComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextInputProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUITextInput<TextInputComponentView>::UpdateProps(view, props, old_props);
     ApplyProps(old_props);
   }
 
  private:
   void ApplyProps(
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept {
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUITextInputProps> const& old_props) noexcept {
     if (!text_box_ || !Props()) return;
     auto const& props = *Props();
     // Ignore unrelated Fabric commits while an editor has locally accepted
@@ -1667,7 +1667,7 @@ struct TextInputComponentView final
 
 struct SecureTextInputComponentView final
     : winrt::implements<SecureTextInputComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISecureTextInput<SecureTextInputComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUISecureTextInput<SecureTextInputComponentView> {
   SecureTextInputComponentView() = default;
 
   ~SecureTextInputComponentView() {
@@ -1745,16 +1745,16 @@ struct SecureTextInputComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISecureTextInput<SecureTextInputComponentView>::UpdateProps(
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISecureTextInputProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISecureTextInputProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUISecureTextInput<SecureTextInputComponentView>::UpdateProps(
         view, props, old_props);
     ApplyProps(old_props);
   }
 
   void UpdateEventEmitter(
-      std::shared_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputEventEmitter> const& emitter) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISecureTextInput<SecureTextInputComponentView>::UpdateEventEmitter(emitter);
+      std::shared_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISecureTextInputEventEmitter> const& emitter) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUISecureTextInput<SecureTextInputComponentView>::UpdateEventEmitter(emitter);
     if (emitter && !last_status_.empty()) {
       EmitState(last_revision_, last_present_, last_status_, last_error_, last_commit_request_);
     }
@@ -1767,7 +1767,7 @@ struct SecureTextInputComponentView final
   }
 
   bool IsPlainTextAutoCommitField(
-      winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps const& props) const noexcept {
+      winrt::YoungRouter::Codegen::LiteLLMWinUISecureTextInputProps const& props) const noexcept {
     if (!props.plainText.value_or(false) || !props.autoCommit.value_or(false)) return false;
     if (props.domain == "providers_models") {
       return props.field == "api_key" && !props.target.empty();
@@ -1783,8 +1783,8 @@ struct SecureTextInputComponentView final
           (props.field == "deployment_token" || props.field == "desktop_gateway_api_key");
     }
     return props.domain == "runtime" && props.field == "setting" &&
-        (props.target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON" ||
-         props.target == "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON");
+        (props.target == "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON" ||
+         props.target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON");
   }
 
   bool IsPlainTextAutoCommitField() const noexcept {
@@ -1825,7 +1825,7 @@ struct SecureTextInputComponentView final
   }
 
   void ApplyProps(
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputProps> const& old_props) noexcept {
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISecureTextInputProps> const& old_props) noexcept {
     if (!password_box_ || !multiline_box_ || !Props()) return;
     auto const& props = *Props();
     const bool identity_changed = !old_props || old_props->domain != props.domain ||
@@ -1974,10 +1974,10 @@ struct SecureTextInputComponentView final
       std::thread([lifecycle, dispatcher, weak_self, generation, disabled, domain = std::move(domain), field = std::move(field), target = std::move(target), secret = std::move(*secret)]() mutable {
         if (!lifecycle->alive.load(std::memory_order_acquire) ||
             lifecycle->generation.load(std::memory_order_acquire) != generation) return;
-        auto capability = LiteLLMMenu::CoreIPCBridge::Shared().CreateSecretCapability(
+        auto capability = YoungRouter::CoreIPCBridge::Shared().CreateSecretCapability(
             domain, field, target.empty() ? std::nullopt : std::optional<std::string>{target}, "settings");
-        std::optional<LiteLLMMenu::CoreIPCBridge::SecretStageResult> result;
-        if (capability) result = LiteLLMMenu::CoreIPCBridge::Shared().StageSecret(capability->token, secret, false);
+        std::optional<YoungRouter::CoreIPCBridge::SecretStageResult> result;
+        if (capability) result = YoungRouter::CoreIPCBridge::Shared().StageSecret(capability->token, secret, false);
         if (!lifecycle->alive.load(std::memory_order_acquire) ||
             lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) return;
         dispatcher.TryEnqueue([lifecycle, weak_self, generation, disabled, result = std::move(result)]() mutable {
@@ -1997,7 +1997,7 @@ struct SecureTextInputComponentView final
   void FinishStage(
       uint64_t generation,
       bool disabled,
-      std::optional<LiteLLMMenu::CoreIPCBridge::SecretStageResult> result) noexcept {
+      std::optional<YoungRouter::CoreIPCBridge::SecretStageResult> result) noexcept {
     if (!Current(generation)) return;
     lifecycle_->staging.store(false, std::memory_order_release);
     SetInputEnabled(!disabled);
@@ -2024,7 +2024,7 @@ struct SecureTextInputComponentView final
     SetInputEnabled(false);
     try {
       std::thread([lifecycle, dispatcher, weak_self, generation, disabled, domain, field, target] {
-        auto value = LiteLLMMenu::CoreIPCBridge::Shared().ReadPlainTextSecret(domain, field, target);
+        auto value = YoungRouter::CoreIPCBridge::Shared().ReadPlainTextSecret(domain, field, target);
         if (!lifecycle->alive.load(std::memory_order_acquire) ||
             lifecycle->generation.load(std::memory_order_acquire) != generation || !dispatcher) {
           return;
@@ -2069,7 +2069,7 @@ struct SecureTextInputComponentView final
     last_commit_request_ = std::max(0, commit_request);
     try {
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUISecureTextInputEventEmitter::OnSecretState args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUISecureTextInputEventEmitter::OnSecretState args;
         args.revision = last_revision_;
         args.present = last_present_;
         args.status = std::move(status);
@@ -2108,7 +2108,7 @@ struct SecureTextInputComponentView final
 
 struct SwitchComponentView final
     : winrt::implements<SwitchComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISwitch<SwitchComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUISwitch<SwitchComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     toggle_ = Button{};
@@ -2126,7 +2126,7 @@ struct SwitchComponentView final
       value_ = !value_;
       UpdateGlyph();
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUISwitchEventEmitter::OnValueChange args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUISwitchEventEmitter::OnValueChange args;
         args.value = value_;
         emitter->onValueChange(std::move(args));
       }
@@ -2138,15 +2138,15 @@ struct SwitchComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISwitchProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISwitchProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISwitch<SwitchComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISwitchProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISwitchProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUISwitch<SwitchComponentView>::UpdateProps(view, props, old_props);
     ApplyProps(old_props);
   }
 
  private:
   void ApplyProps(
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISwitchProps> const& old_props) noexcept {
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISwitchProps> const& old_props) noexcept {
     if (!toggle_ || !Props()) return;
     auto const& props = *Props();
     const bool value_changed = !old_props || old_props->value != props.value;
@@ -2173,7 +2173,7 @@ struct SwitchComponentView final
 
 struct SelectableRowComponentView final
     : winrt::implements<SelectableRowComponentView, winrt::IInspectable>,
-      winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISelectableRow<SelectableRowComponentView> {
+      winrt::YoungRouter::Codegen::BaseLiteLLMWinUISelectableRow<SelectableRowComponentView> {
   void InitializeContentIsland(ContentIslandComponentView const& island_view) noexcept {
     island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
     button_ = Button{};
@@ -2194,7 +2194,7 @@ struct SelectableRowComponentView final
     button_.Content(content_);
     button_.Click([this](auto const&, auto const&) {
       if (auto emitter = EventEmitter()) {
-        winrt::LiteLLMMenu::Codegen::LiteLLMWinUISelectableRowEventEmitter::OnPress args;
+        winrt::YoungRouter::Codegen::LiteLLMWinUISelectableRowEventEmitter::OnPress args;
         emitter->onPress(std::move(args));
       }
     });
@@ -2205,9 +2205,9 @@ struct SelectableRowComponentView final
 
   void UpdateProps(
       winrt::Microsoft::ReactNative::ComponentView const& view,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISelectableRowProps> const& props,
-      winrt::com_ptr<winrt::LiteLLMMenu::Codegen::LiteLLMWinUISelectableRowProps> const& old_props) noexcept override {
-    winrt::LiteLLMMenu::Codegen::BaseLiteLLMWinUISelectableRow<SelectableRowComponentView>::UpdateProps(view, props, old_props);
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISelectableRowProps> const& props,
+      winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUISelectableRowProps> const& old_props) noexcept override {
+    winrt::YoungRouter::Codegen::BaseLiteLLMWinUISelectableRow<SelectableRowComponentView>::UpdateProps(view, props, old_props);
     ApplyProps();
   }
 
@@ -2239,7 +2239,7 @@ void RegisterComponent(
         std::function<void(winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const&)>)) noexcept {
   register_component(package_builder, [](winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const& builder) {
     builder.SetContentIslandComponentViewInitializer([](ContentIslandComponentView const& island_view) noexcept {
-      LiteLLMMenu::ConfigureImmediateXamlPresentation();
+      YoungRouter::ConfigureImmediateXamlPresentation();
       auto user_data = winrt::make_self<TComponent>();
       user_data->InitializeContentIsland(island_view);
       island_view.UserData(*user_data);
@@ -2249,12 +2249,12 @@ void RegisterComponent(
 
 void RegisterCodeWebView(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
-  winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUICodeWebViewNativeComponent<CodeWebViewComponentView>(
+  winrt::YoungRouter::Codegen::RegisterLiteLLMWinUICodeWebViewNativeComponent<CodeWebViewComponentView>(
       package_builder,
       [](winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const& builder) {
         builder.SetContentIslandComponentViewInitializer(
             [](ContentIslandComponentView const& island_view) noexcept {
-              LiteLLMMenu::ConfigureImmediateXamlPresentation();
+              YoungRouter::ConfigureImmediateXamlPresentation();
               auto user_data = winrt::make_self<CodeWebViewComponentView>();
               user_data->InitializeContentIsland(island_view);
               RegisterCodeWebViewRecycleHandler(island_view, user_data);
@@ -2265,12 +2265,12 @@ void RegisterCodeWebView(
 
 void RegisterTable(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
-  winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUITableNativeComponent<TableComponentView>(
+  winrt::YoungRouter::Codegen::RegisterLiteLLMWinUITableNativeComponent<TableComponentView>(
       package_builder,
       [](winrt::Microsoft::ReactNative::Composition::IReactCompositionViewComponentBuilder const& builder) {
         builder.SetContentIslandComponentViewInitializer(
             [](ContentIslandComponentView const& island_view) noexcept {
-              LiteLLMMenu::ConfigureImmediateXamlPresentation();
+              YoungRouter::ConfigureImmediateXamlPresentation();
               auto user_data = winrt::make_self<TableComponentView>();
               user_data->InitializeContentIsland(island_view);
               auto weak = user_data->get_weak();
@@ -2285,7 +2285,7 @@ void RegisterTable(
 
 }  // namespace
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 void ConfigureImmediateXamlPresentation() noexcept {
   try {
@@ -2307,52 +2307,52 @@ void RegisterWinUIControls(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const& package_builder) noexcept {
   RegisterComponent<ButtonComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUIButtonNativeComponent<ButtonComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUIButtonNativeComponent<ButtonComponentView>);
   RegisterComponent<SegmentedComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUISegmentedControlNativeComponent<SegmentedComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISegmentedControlNativeComponent<SegmentedComponentView>);
   RegisterComponent<PickerComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUIPickerNativeComponent<PickerComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUIPickerNativeComponent<PickerComponentView>);
   RegisterComponent<CheckboxComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUICheckboxNativeComponent<CheckboxComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUICheckboxNativeComponent<CheckboxComponentView>);
   RegisterTable(package_builder);
   RegisterComponent<TextEditorComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUITextEditorNativeComponent<TextEditorComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUITextEditorNativeComponent<TextEditorComponentView>);
   RegisterCodeWebView(package_builder);
   RegisterComponent<SecureTextInputComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUISecureTextInputNativeComponent<SecureTextInputComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISecureTextInputNativeComponent<SecureTextInputComponentView>);
   // ContentIsland children are Composition visuals, not XAML UIElements that a
   // WinUI SplitView can accept as Pane/Content. This component is therefore a
   // narrow native drag leaf; React owns pane layout and positions the leaf.
   RegisterComponent<SplitterComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUISplitViewNativeComponent<SplitterComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISplitViewNativeComponent<SplitterComponentView>);
   RegisterComponent<TextInputComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUITextInputNativeComponent<TextInputComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUITextInputNativeComponent<TextInputComponentView>);
   RegisterComponent<SwitchComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUISwitchNativeComponent<SwitchComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISwitchNativeComponent<SwitchComponentView>);
   RegisterComponent<SelectableRowComponentView>(
       package_builder,
-      winrt::LiteLLMMenu::Codegen::RegisterLiteLLMWinUISelectableRowNativeComponent<SelectableRowComponentView>);
+      winrt::YoungRouter::Codegen::RegisterLiteLLMWinUISelectableRowNativeComponent<SelectableRowComponentView>);
 }
 
-}  // namespace LiteLLMMenu
+}  // namespace YoungRouter
 
 #else
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 void ConfigureImmediateXamlPresentation() noexcept {}
 
 void RegisterWinUIControls(
     winrt::Microsoft::ReactNative::IReactPackageBuilder const&) noexcept {}
 
-}  // namespace LiteLLMMenu
+}  // namespace YoungRouter
 
 #endif  // defined(RNW_NEW_ARCH)

@@ -146,15 +146,15 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertEqual(
             keepalive,
-            b": litellm_menu route_recovery phase=network attempt=1\n\n",
+            b": young_router route_recovery phase=network attempt=1\n\n",
         )
 
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["litellm_menu.streaming"]
-        state_module = sys.modules["litellm_menu.state"]
+        streaming_module = sys.modules["young_router.streaming"]
+        state_module = sys.modules["young_router.state"]
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "route-recovery-state.json"
-            self.set_env("LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE", str(state_path))
+            self.set_env("YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE", str(state_path))
             request_data = {
                 "model": "default-chat",
                 "stream": True,
@@ -186,7 +186,7 @@ class HookRouteRecoveryTests(HookTestCase):
             )
             self.assertEqual(
                 keepalive,
-                ": litellm_menu route_recovery phase=attempt attempt=1\n\n",
+                ": young_router route_recovery phase=attempt attempt=1\n\n",
             )
             self.assertIsInstance(keepalive, str)
             touched = json.loads(state_path.read_text(encoding="utf-8"))
@@ -887,7 +887,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_network_route_recovery_ignores_configured_poll_deadline(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["litellm_menu.streaming"]
+        streaming_module = sys.modules["young_router.streaming"]
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
         original_keepalive_min_delay = (
             hooks._ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS
@@ -951,8 +951,8 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_network_stream_fallback_never_raises_client_reconnect(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["litellm_menu.streaming"]
-        routing_module = sys.modules["litellm_menu.routing"]
+        streaming_module = sys.modules["young_router.streaming"]
+        routing_module = sys.modules["young_router.routing"]
         original_fallback = streaming_module._stream_streaming_error_fallback
         original_recovery = streaming_module._stream_route_recovery_poll
         original_disconnect = routing_module._raise_retryable_stream_disconnect
@@ -1431,7 +1431,7 @@ class HookRouteRecoveryTests(HookTestCase):
             async def aresponses(self, **payload):
                 calls.append(copy.deepcopy(payload))
                 if payload.get("stream") is True:
-                    exc = TimeoutError("LiteLLM Menu stream start timeout after 60s without the first stream event")
+                    exc = TimeoutError("Young Router stream start timeout after 60s without the first stream event")
                     exc.status_code = 504
                     exc.body = {"reason": "stream_start_timeout"}
                     exc.failed_deployment_id = "chatroute"
@@ -1730,7 +1730,7 @@ class HookRouteRecoveryTests(HookTestCase):
             },
         }
         first_exception = TimeoutError(
-            "LiteLLM Menu stream start timeout after 60s without the first stream event"
+            "Young Router stream start timeout after 60s without the first stream event"
         )
         first_exception.status_code = 504
         first_exception.body = {"reason": "stream_start_timeout"}
@@ -1966,7 +1966,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_route_recovery_stops_replaying_original_web_search_after_attempt_starts_search(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
         attempts = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
@@ -2014,7 +2014,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_route_recovery_continues_with_web_search_recovery_payload_after_attempt_timeout(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
         attempts = []
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
@@ -2132,7 +2132,7 @@ class HookRouteRecoveryTests(HookTestCase):
         response = hooks._route_recovery_stream_response(request_data, first_exception)
         chunks = [
             chunk
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=request_data,
@@ -2219,7 +2219,7 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         chunks = [
             chunk
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=request_data,
@@ -2246,7 +2246,7 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         self.assertEqual(
             keepalive,
-            b": litellm_menu route_recovery phase=cooldown attempt=1\n\n",
+            b": young_router route_recovery phase=cooldown attempt=1\n\n",
         )
 
     async def test_chat_route_recovery_exhaustion_emits_native_error_chunk(self) -> None:
@@ -2289,7 +2289,7 @@ class HookRouteRecoveryTests(HookTestCase):
         response = hooks._route_recovery_stream_response(request_data, first_exception)
         chunks = [
             chunk
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=request_data,
@@ -2374,7 +2374,7 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         chunks = [
             chunk
-            async for chunk in hooks.LiteLLMMenuHook().async_post_call_streaming_iterator_hook(
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
                 user_api_key_dict=None,
                 response=response,
                 request_data=request_data,
@@ -2399,7 +2399,7 @@ class HookRouteRecoveryTests(HookTestCase):
                 request_data=request_data,
                 phase="cooldown",
             ),
-            b": litellm_menu route_recovery phase=cooldown attempt=1\n\n",
+            b": young_router route_recovery phase=cooldown attempt=1\n\n",
         )
 
     async def test_chat_completions_route_recovery_waits_for_shared_cooldown(self) -> None:
@@ -2469,7 +2469,7 @@ class HookRouteRecoveryTests(HookTestCase):
             first_chunk = await anext(stream)
             self.assertEqual(
                 first_chunk,
-                b": litellm_menu route_recovery phase=cooldown attempt=0\n\n",
+                b": young_router route_recovery phase=cooldown attempt=0\n\n",
             )
             self.assertEqual(calls, [])
             chunks.extend([first_chunk])
@@ -2484,7 +2484,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
     async def test_route_recovery_poll_normalizes_completed_usage_for_codex(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        streaming_module = sys.modules["litellm_menu.streaming"]
+        streaming_module = sys.modules["young_router.streaming"]
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
 
         class GatewayTimeout(Exception):

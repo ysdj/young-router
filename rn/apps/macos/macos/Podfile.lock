@@ -2652,7 +2652,7 @@ SPEC CHECKSUMS:
   FBLazyVector: 2e2e9ebe8ee457b4200bad8d123e554870d8aa41
   fmt: 4cf0c5ec5864511c96d8d4bd7b03c3c69040af06
   glog: 8fb6f603b9feab8ebedb130c6e0683bbeafa6fb0
-  hermes-engine: a4af2f3508bf1763b798444d72e636d595782ea2
+  hermes-engine: 7a1ae7e29baf404b1774a0967ccca61c35f30ee0
   RCT-Folly: 49542469679b3c59485604badd9af263834c0d81
   RCTDeprecation: 3808e36294137f9ee5668f4df2e73dc079cd1dcf
   RCTRequired: eab921f34c9b942168eba5039935b58ce6431f7f
@@ -2720,12 +2720,12 @@ SPEC CHECKSUMS:
   React-timing: 47fa2872eeddba6a64e4290c38f2aca4b3894515
   React-utils: c85a7f1036ba6399757b35db398537db08edeaa6
   React-webperformancenativemodule: 366a623a3eb5e5e4db1c69b0bd4fd775f0b98d9f
-  ReactAppDependencyProvider: f0b79efcaed68652d5875cc97fa69ab326ce651c
+  ReactAppDependencyProvider: 93fd6f8cfe7c15bd42aeca0e491fc9514e4b2cea
   ReactCodegen: 5cdee07cf8c8d8a818bcd41adab14100d41f24eb
   ReactCommon: eecb5e3d8346bd3336cb3906820cea7243067ff6
   SocketRocket: d4aabe649be1e368d1318fdf28a022d714d65748
   Yoga: 0320302cb4d83fb132729fed9ebb570de98e7245
 
-PODFILE CHECKSUM: 991ddcb0f563eec6c37044ef4e688304754adcdd
+PODFILE CHECKSUM: 5c142f02026a3728eac7480f86684b25de47d5d8
 
 COCOAPODS: 1.17.0

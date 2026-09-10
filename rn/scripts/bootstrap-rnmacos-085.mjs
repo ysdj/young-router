@@ -30,7 +30,7 @@ function main() {
   const vendorParent = path.dirname(vendorDirectory);
   const yarnRelease = path.join(vendorDirectory, manifest.yarnRelease);
   const shouldRefreshInstall = Boolean(
-    process.env.CI || process.env.LITELLM_MENU_REFRESH_RN_VENDOR === '1',
+    process.env.CI || process.env.YOUNG_ROUTER_REFRESH_RN_VENDOR === '1',
   );
 
   if (!existsSync(vendorDirectory)) {

@@ -66,7 +66,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "tools": [{"type": "mcp", "server_label": "example", "require_approval": "always"}],
         }
 
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             request,
             call_type="aresponses",
         )
@@ -490,7 +490,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "supports_responses_function_tools": True,
         }
 
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             original,
             call_type="aresponses",
         )
@@ -527,7 +527,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "tools": [],
         }
 
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             original,
             call_type="aresponses",
         )
@@ -655,7 +655,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_injects_codex_tool_registry_instruction(self) -> None:
         hooks, _ = load_hook_module()
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             self._codex_collaboration_request(),
             call_type="aresponses",
         )
@@ -748,7 +748,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_injects_codex_descendant_cleanup_instruction(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         modified = await hook.async_pre_call_deployment_hook(
             self._codex_collaboration_request(),
@@ -1355,7 +1355,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "parallel_tool_calls": False,
         }
 
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         modified = await hook.async_pre_call_deployment_hook(
             original,
             call_type="aresponses",
@@ -1415,7 +1415,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "tool_choice": "auto",
         }
 
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             original,
             call_type="aresponses",
         )
@@ -1487,7 +1487,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "input": [signed_call, encrypted_reasoning, mutable_call, invalid_call],
         }
 
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             original,
             call_type="aresponses",
         )
@@ -2300,7 +2300,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ],
         }
 
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             original,
             call_type="aresponses",
         )
@@ -2375,7 +2375,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ],
         }
 
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             original,
             call_type="aresponses",
         )
@@ -2430,7 +2430,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
                 },
             ],
         }
-        first = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        first = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             first_request,
             call_type="aresponses",
         )
@@ -2464,7 +2464,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
                 },
             ],
         }
-        second = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        second = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             second_request,
             call_type="aresponses",
         )
@@ -2490,7 +2490,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
                 },
             ],
         }
-        third = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        third = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             third_request,
             call_type="aresponses",
         )
@@ -2541,7 +2541,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ],
         }
 
-        modified = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        modified = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             original,
             call_type="aresponses",
         )
@@ -2557,7 +2557,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_preserves_unavailable_request_user_input_history(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "call_type": "aresponses",
             "model": "default-chat",
@@ -2617,7 +2617,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_adds_compat_provider_browser_headers(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://headers.example/v1",
             "extra_headers": {"X-Trace": "keep-me"},
@@ -2637,7 +2637,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_forwards_codex_user_agent(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://headers.example/v1",
             "proxy_server_request": {
@@ -2655,14 +2655,14 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_forwards_litellm_params_proxy_user_agent(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://example.com/v1",
             "extra_headers": {"X-Trace": "keep-me"},
             "litellm_params": {
                 "proxy_server_request": {
                     "headers": {
-                        "User-Agent": "LiteLLM%20Menu/1 CFNetwork/3860.600.21 Darwin/25.5.0",
+                        "User-Agent": "Young%20Router/1 CFNetwork/3860.600.21 Darwin/25.5.0",
                     },
                 },
             },
@@ -2675,14 +2675,14 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(modified["extra_headers"]["X-Trace"], "keep-me")
         self.assertEqual(
             modified["extra_headers"]["User-Agent"],
-            "LiteLLM%20Menu/1 CFNetwork/3860.600.21 Darwin/25.5.0",
+            "Young%20Router/1 CFNetwork/3860.600.21 Darwin/25.5.0",
         )
         self.assertNotIn("Accept", modified["extra_headers"])
         self.assertEqual(original["extra_headers"], {"X-Trace": "keep-me"})
 
     async def test_pre_call_deployment_hook_preserves_explicit_litellm_headers(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://example.com/v1",
             "extra_headers": {
@@ -2704,7 +2704,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_codex_user_agent_overrides_old_extra_header(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://headers.example/v1",
             "extra_headers": {"user-agent": "Mozilla/5.0 stale"},
@@ -2724,7 +2724,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_existing_user_agent(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "metadata": {"api_base": "https://api.headers.example/v1"},
             "extra_headers": {"user-agent": "custom-client"},
@@ -2742,7 +2742,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_reads_compat_provider_api_base_from_litellm_params(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "litellm_params": {
                 "api_base": "https://headers.example/v1",
@@ -2763,7 +2763,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_moves_metadata_internal_by_default(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "metadata": {"trace_id": "client-trace", "api_base": "https://example.com/v1"},
             "litellm_metadata": {"model_group": "default-chat"},
@@ -2781,7 +2781,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_responses_client_metadata_upstream(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         client_metadata = {
             "thread_id": "thread-test-0001",
             "x-codex-turn-metadata": '{"request_kind":"compaction"}',
@@ -2815,7 +2815,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_codex_compaction_headers_upstream(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         turn_metadata = (
             '{"session_id":"thread-test-0001",'
             '"thread_id":"thread-test-0001",'
@@ -2878,7 +2878,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_does_not_add_responses_client_metadata_to_chat_bridge(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "call_type": "aresponses",
             "model": "default-chat",
@@ -2894,7 +2894,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_preserves_codex_compaction_history_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         previous_compaction = {
             "type": "compaction",
             "id": "compaction_previous",
@@ -2952,7 +2952,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_preserves_realistic_structured_compaction_request_shape(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         image_url = "data:image/png;base64," + "A" * 180_000
         original = {
             "call_type": "aresponses",
@@ -3055,7 +3055,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_keeps_ordinary_codex_turn_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "call_type": "aresponses",
             "model": "default-chat",
@@ -3089,7 +3089,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_restores_plaintext_agent_message_content(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         encrypted_value = "gAAAAABvalidopaqueagentmessage"
         plaintext_value = "补充一项对抗边界：同一轮并行工具调用不能提前放行。"
         original = {
@@ -3152,7 +3152,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=95)
@@ -3219,7 +3219,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=95)
@@ -3286,7 +3286,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_ignores_other_api_bases(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {"api_base": "https://example.com/v1"}
 
         modified = await hook.async_pre_call_deployment_hook(original, call_type=None)
@@ -3295,7 +3295,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_pre_call_deployment_hook_uses_browser_header_retry_marker(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original = {
             "api_base": "https://api.image.example/v1",
             "litellm_metadata": {
@@ -3317,7 +3317,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     async def test_responses_api_does_not_prefer_browser_compatible_deployments(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         def aresponses():
             pass

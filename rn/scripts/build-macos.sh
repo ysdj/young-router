@@ -6,9 +6,9 @@ PROJECT_ROOT="$(cd "$ROOT/.." && pwd)"
 APP_ROOT="$ROOT/apps/macos"
 DEVELOPER_DIR="${DEVELOPER_DIR:-}"
 UV_BIN="${LITELLM_UV_BIN:-$(command -v uv 2>/dev/null || true)}"
-RUNTIME_SOURCE="${LITELLM_MENU_CORE_RUNTIME_SOURCE:-${LITELLM_RELEASE_RUNTIME_SOURCE:-}}"
+RUNTIME_SOURCE="${YOUNG_ROUTER_CORE_RUNTIME_SOURCE:-${LITELLM_RELEASE_RUNTIME_SOURCE:-}}"
 ARCH="$(uname -m)"
-RUNTIME_WORK="$(mktemp -d "${TMPDIR:-/tmp}/litellm-menu-rn-runtime.XXXXXX")"
+RUNTIME_WORK="$(mktemp -d "${TMPDIR:-/tmp}/young-router-rn-runtime.XXXXXX")"
 cleanup() {
   [[ -z "$RUNTIME_WORK" ]] || rm -rf "$RUNTIME_WORK"
 }
@@ -42,9 +42,9 @@ command -v pnpm >/dev/null 2>&1 || {
   exit 1
 }
 
-if [[ "${LITELLM_MENU_LITELLM_VERSION_UPDATED:-}" != "1" ]]; then
+if [[ "${YOUNG_ROUTER_LITELLM_VERSION_UPDATED:-}" != "1" ]]; then
   "$PROJECT_ROOT/scripts/update-litellm.sh"
-  export LITELLM_MENU_LITELLM_VERSION_UPDATED=1
+  export YOUNG_ROUTER_LITELLM_VERSION_UPDATED=1
 fi
 
 NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])')"
@@ -120,17 +120,17 @@ fi
 # and the cross-platform CI job.
 pnpm run check:macos &
 STATIC_CHECKS_PID=$!
-if [[ "${LITELLM_MENU_REFRESH_PODS:-0}" == "1" \
+if [[ "${YOUNG_ROUTER_REFRESH_PODS:-0}" == "1" \
   || -n "${CI:-}" \
   || ! -d "$APP_ROOT/macos/Pods" \
-  || ! -d "$APP_ROOT/macos/LiteLLMMenu.xcworkspace" \
+  || ! -d "$APP_ROOT/macos/YoungRouter.xcworkspace" \
   || ! -f "$APP_ROOT/macos/Podfile.lock" ]]; then
   if ! pod install --project-directory="$APP_ROOT/macos"; then
     wait "$STATIC_CHECKS_PID" || true
     exit 1
   fi
 else
-  printf '%s\n' "Reusing CocoaPods workspace (set LITELLM_MENU_REFRESH_PODS=1 after native dependency or codegen changes)."
+  printf '%s\n' "Reusing CocoaPods workspace (set YOUNG_ROUTER_REFRESH_PODS=1 after native dependency or codegen changes)."
 fi
 wait "$STATIC_CHECKS_PID"
 RNMACOS_CLI="$ROOT/vendor/react-native-macos-0.85/packages/react-native/cli.js"
@@ -140,13 +140,13 @@ RNMACOS_CLI="$ROOT/vendor/react-native-macos-0.85/packages/react-native/cli.js"
 )
 
 APP="$(xcodebuild \
-  -workspace "$APP_ROOT/macos/LiteLLMMenu.xcworkspace" \
-  -scheme LiteLLMMenu-macOS \
+  -workspace "$APP_ROOT/macos/YoungRouter.xcworkspace" \
+  -scheme YoungRouter-macOS \
   -configuration Release \
   -showBuildSettings 2>/dev/null \
   | awk -F ' = ' '/TARGET_BUILD_DIR = / { target = $2 } /FULL_PRODUCT_NAME = / { product = $2 } END { if (target && product) print target "/" product }')"
 if [[ -z "$APP" || ! -d "$APP" ]]; then
-  echo "React Native macOS build did not produce LiteLLMMenu.app." >&2
+  echo "React Native macOS build did not produce YoungRouter.app." >&2
   exit 4
 fi
 
@@ -163,14 +163,14 @@ for file in \
 do
   cp "$PROJECT_ROOT/$file" "$CORE/$file"
 done
-for directory in litellm_menu config_editor_core webdav; do
+for directory in young_router config_editor_core webdav; do
   rsync -a \
     --exclude '__pycache__/' \
     --exclude '*.pyc' \
     --exclude '*.pyo' \
     "$PROJECT_ROOT/$directory/" "$CORE/$directory/"
 done
-copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/litellm_menu/pi-web-access"
+copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/pi-web-access"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \
@@ -178,7 +178,7 @@ if [[ -n "$RUNTIME_SOURCE" ]]; then
     || ! -x "$RUNTIME_SOURCE/bin/python" \
     || ! -x "$RUNTIME_SOURCE/bin/litellm" \
     || ! -x "$RUNTIME_SOURCE/python/bin/python3.12" ]]; then
-    echo "LITELLM_MENU_CORE_RUNTIME_SOURCE must use the portable release-runtime layout, not a virtualenv." >&2
+    echo "YOUNG_ROUTER_CORE_RUNTIME_SOURCE must use the portable release-runtime layout, not a virtualenv." >&2
     exit 5
   fi
   copy_tree "$RUNTIME_SOURCE" "$CORE/runtime"
@@ -246,11 +246,11 @@ else
   }
 fi
 
-[[ -f "$CORE/litellm_menu/core/__main__.py" ]] || {
+[[ -f "$CORE/young_router/core/__main__.py" ]] || {
   echo "Bundled Core launcher is missing." >&2
   exit 5
 }
-[[ -f "$CORE/litellm_menu/pi-web-access/index.ts" ]] || {
+[[ -f "$CORE/young_router/pi-web-access/index.ts" ]] || {
   echo "The bundled pi-web-access package is missing." >&2
   exit 5
 }
@@ -259,7 +259,7 @@ fi
   exit 5
 }
 [[ -x "$CORE/runtime/bin/python" ]] || {
-  echo "A self-contained Core runtime is required. Set LITELLM_MENU_CORE_RUNTIME_SOURCE." >&2
+  echo "A self-contained Core runtime is required. Set YOUNG_ROUTER_CORE_RUNTIME_SOURCE." >&2
   exit 5
 }
 [[ -x "$CORE/runtime/bin/litellm" ]] || {
@@ -272,8 +272,8 @@ fi
 }
 PI_WEB_ACCESS_SMOKE_CONFIG="$RUNTIME_WORK/pi-web-access-smoke-config"
 if ! printf '' | "$CORE/runtime/bin/node" \
-  "$CORE/litellm_menu/pi_web_access_worker.mjs" \
-  --entry "$CORE/litellm_menu/pi-web-access/index.ts" \
+  "$CORE/young_router/pi_web_access_worker.mjs" \
+  --entry "$CORE/young_router/pi-web-access/index.ts" \
   --config-dir "$PI_WEB_ACCESS_SMOKE_CONFIG"; then
   echo "The bundled pi-web-access worker could not load its staged SDK." >&2
   exit 5
@@ -302,7 +302,7 @@ done < <(find "$CORE/runtime/site-packages" -type f \( -name '*.so' -o -name '*.
 # A full-tree compileall pass adds roughly 100 MB of caches, most of which
 # this app never imports. Remove stale caches before the real startup smoke
 # imports populate only the modules on the active path.
-find "$CORE/litellm_menu" "$CORE/runtime/site-packages" \
+find "$CORE/young_router" "$CORE/runtime/site-packages" \
   \( -type d -name __pycache__ -prune -exec rm -rf {} + \) \
   -o \( -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete \)
 
@@ -313,7 +313,7 @@ find "$CORE/litellm_menu" "$CORE/runtime/site-packages" \
 export LITELLM_LOCAL_MODEL_COST_MAP=true
 PYTHONDONTWRITEBYTECODE=0 \
 PYTHONPATH="$CORE:$CORE/runtime/site-packages" \
-LITELLM_MENU_PROXY_PROCESS=1 \
+YOUNG_ROUTER_PROXY_PROCESS=1 \
 LITELLM_TEMPLATE_ROOT="$CORE" \
   "$CORE/runtime/python/bin/python3.12" -c '
 from litellm import run_server
@@ -323,11 +323,11 @@ from gunicorn.app.base import BaseApplication
 from uvicorn.workers import UvicornWorker
 
 callback = get_instance_fn(
-    "litellm_menu.callbacks.image_generation_routing_hook",
+    "young_router.callbacks.image_generation_routing_hook",
     config_file_path="runtime/config.yaml",
 )
 assert app is not None
-assert callback.__class__.__name__ == "LiteLLMMenuHook"
+assert callback.__class__.__name__ == "YoungRouterHook"
 assert run_server is not None and BaseApplication is not None and UvicornWorker is not None
 '
 [[ -f "$CORE/runtime/site-packages/litellm/__pycache__/__init__.cpython-312.pyc" ]] || {
@@ -335,14 +335,14 @@ assert run_server is not None and BaseApplication is not None and UvicornWorker 
   exit 5
 }
 
-PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core, litellm_menu.core.__main__, litellm_menu.macos_proxy, codex_config, config_editor_core, configuration_package, external_provider_import, webdav.core'
+PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, young_router.core, young_router.core.__main__, young_router.macos_proxy, codex_config, config_editor_core, configuration_package, external_provider_import, webdav.core'
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null
 PORTABLE_SMOKE="$RUNTIME_WORK/portable-core"
 copy_tree "$CORE" "$PORTABLE_SMOKE"
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PORTABLE_SMOKE" "$PORTABLE_SMOKE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, litellm_menu.core'
-PYTHONDONTWRITEBYTECODE=1 LITELLM_MENU_PROXY_PROCESS=1 PYTHONPATH="$PORTABLE_SMOKE" \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PORTABLE_SMOKE" "$PORTABLE_SMOKE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, young_router.core'
+PYTHONDONTWRITEBYTECODE=1 YOUNG_ROUTER_PROXY_PROCESS=1 PYTHONPATH="$PORTABLE_SMOKE" \
   "$PORTABLE_SMOKE/runtime/bin/python" -c \
-  'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("litellm_menu.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "LiteLLMMenuHook"'
+  'from litellm.proxy.types_utils.utils import get_instance_fn; callback = get_instance_fn("young_router.callbacks.image_generation_routing_hook", config_file_path="runtime/config.yaml"); assert callback.__class__.__name__ == "YoungRouterHook"'
 PYTHONDONTWRITEBYTECODE=1 "$PORTABLE_SMOKE/runtime/bin/litellm" --help >/dev/null
 
 # The smoke imports above deliberately exercise bytecode generation, but
@@ -359,19 +359,19 @@ BUILD_NUMBER="$(tr -d '[:space:]' < "$PROJECT_ROOT/BUILD_NUMBER")"
   || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP/Contents/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist" >/dev/null \
   || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_NUMBER" "$APP/Contents/Info.plist" >/dev/null
-if [[ -n "${LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER:-}" ]]; then
-  echo "LITELLM_MENU_MACOS_BUNDLE_IDENTIFIER is unsupported: every LiteLLM Menu build must use the production instance identity." >&2
+if [[ -n "${YOUNG_ROUTER_MACOS_BUNDLE_IDENTIFIER:-}" ]]; then
+  echo "YOUNG_ROUTER_MACOS_BUNDLE_IDENTIFIER is unsupported: every Young Router build must use the production instance identity." >&2
   exit 6
 fi
-if [[ -n "${LITELLM_MENU_MACOS_DISPLAY_NAME:-}" \
-  || -n "${LITELLM_MENU_MACOS_ROUTE_SCHEME:-}" \
-  || -n "${LITELLM_MENU_MACOS_PREVIEW_PROFILE_ROOT:-}" \
-  || -n "${LITELLM_MENU_MACOS_PREVIEW_PORT:-}" ]]; then
-  PREVIEW_BUNDLE_IDENTIFIER="menu.litellm.menu"
-  PREVIEW_DISPLAY_NAME="${LITELLM_MENU_MACOS_DISPLAY_NAME:-LiteLLM Menu Preview}"
-  PREVIEW_ROUTE_SCHEME="${LITELLM_MENU_MACOS_ROUTE_SCHEME:-litellm-menu-preview}"
-  PREVIEW_PROFILE_ROOT="${LITELLM_MENU_MACOS_PREVIEW_PROFILE_ROOT:-}"
-  PREVIEW_PORT="${LITELLM_MENU_MACOS_PREVIEW_PORT:-}"
+if [[ -n "${YOUNG_ROUTER_MACOS_DISPLAY_NAME:-}" \
+  || -n "${YOUNG_ROUTER_MACOS_ROUTE_SCHEME:-}" \
+  || -n "${YOUNG_ROUTER_MACOS_PREVIEW_PROFILE_ROOT:-}" \
+  || -n "${YOUNG_ROUTER_MACOS_PREVIEW_PORT:-}" ]]; then
+  PREVIEW_BUNDLE_IDENTIFIER="young.router.app"
+  PREVIEW_DISPLAY_NAME="${YOUNG_ROUTER_MACOS_DISPLAY_NAME:-Young Router Preview}"
+  PREVIEW_ROUTE_SCHEME="${YOUNG_ROUTER_MACOS_ROUTE_SCHEME:-young-router-preview}"
+  PREVIEW_PROFILE_ROOT="${YOUNG_ROUTER_MACOS_PREVIEW_PROFILE_ROOT:-}"
+  PREVIEW_PORT="${YOUNG_ROUTER_MACOS_PREVIEW_PORT:-}"
   [[ "$PREVIEW_BUNDLE_IDENTIFIER" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] \
     && [[ "$PREVIEW_DISPLAY_NAME" != *$'\n'* ]] \
     && [[ "$PREVIEW_ROUTE_SCHEME" =~ ^[A-Za-z][A-Za-z0-9.-]*$ ]] || {
@@ -390,35 +390,35 @@ if [[ -n "${LITELLM_MENU_MACOS_DISPLAY_NAME:-}" \
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $PREVIEW_BUNDLE_IDENTIFIER" "$APP/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $PREVIEW_DISPLAY_NAME" "$APP/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleName $PREVIEW_DISPLAY_NAME" "$APP/Contents/Info.plist"
-  /usr/libexec/PlistBuddy -c "Set :LiteLLMMenuRouteScheme $PREVIEW_ROUTE_SCHEME" "$APP/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :YoungRouterRouteScheme $PREVIEW_ROUTE_SCHEME" "$APP/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLName $PREVIEW_BUNDLE_IDENTIFIER.routes" "$APP/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 $PREVIEW_ROUTE_SCHEME" "$APP/Contents/Info.plist"
   if [[ -n "$PREVIEW_PROFILE_ROOT" ]]; then
-    /usr/libexec/PlistBuddy -c "Delete :LiteLLMMenuPreviewProfileRoot" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
-    /usr/libexec/PlistBuddy -c "Add :LiteLLMMenuPreviewProfileRoot string $PREVIEW_PROFILE_ROOT" "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Delete :LiteLLMMenuPreviewPort" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
-    /usr/libexec/PlistBuddy -c "Add :LiteLLMMenuPreviewPort string $PREVIEW_PORT" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Delete :YoungRouterPreviewProfileRoot" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c "Add :YoungRouterPreviewProfileRoot string $PREVIEW_PROFILE_ROOT" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Delete :YoungRouterPreviewPort" "$APP/Contents/Info.plist" >/dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c "Add :YoungRouterPreviewPort string $PREVIEW_PORT" "$APP/Contents/Info.plist"
   fi
 fi
 codesign --force --deep --sign - "$APP" >/dev/null
 codesign --verify --deep --strict --verbose=2 "$APP"
 
-if [[ -n "${LITELLM_MENU_MACOS_OUTPUT:-}" ]]; then
-  OUTPUT="$LITELLM_MENU_MACOS_OUTPUT"
+if [[ -n "${YOUNG_ROUTER_MACOS_OUTPUT:-}" ]]; then
+  OUTPUT="$YOUNG_ROUTER_MACOS_OUTPUT"
   [[ "$OUTPUT" = /* ]] || OUTPUT="$ROOT/$OUTPUT"
   [[ "$OUTPUT" == *.app ]] || {
-    echo "LITELLM_MENU_MACOS_OUTPUT must name an .app bundle." >&2
+    echo "YOUNG_ROUTER_MACOS_OUTPUT must name an .app bundle." >&2
     exit 6
   }
   mkdir -p "$(dirname "$OUTPUT")"
   OUTPUT="$(cd "$(dirname "$OUTPUT")" && pwd -P)/$(basename "$OUTPUT")"
   case "$OUTPUT" in
     /|"$HOME"|"$PROJECT_ROOT"|"$ROOT")
-      echo "Refusing unsafe LITELLM_MENU_MACOS_OUTPUT: $OUTPUT" >&2
+      echo "Refusing unsafe YOUNG_ROUTER_MACOS_OUTPUT: $OUTPUT" >&2
       exit 6
       ;;
   esac
-  STAGED_OUTPUT="$(dirname "$OUTPUT")/.LiteLLMMenu.$$.app"
+  STAGED_OUTPUT="$(dirname "$OUTPUT")/.YoungRouter.$$.app"
   rm -rf "$STAGED_OUTPUT"
   copy_tree "$APP" "$STAGED_OUTPUT"
   rm -rf "$OUTPUT"

@@ -66,12 +66,12 @@ class StreamKeepaliveChunkTests(HookTestCase):
 
         native_keepalive = hooks._stream_keepalive_chunk(native_request, 4)
         self.assertIsInstance(native_keepalive, bytes)
-        self.assertTrue(native_keepalive.startswith(b": litellm_menu keepalive "))
+        self.assertTrue(native_keepalive.startswith(b": young_router keepalive "))
         self.assertTrue(hooks._is_stream_keepalive_chunk(native_keepalive))
 
         other_keepalive = hooks._stream_keepalive_chunk(other_request, 5)
         self.assertIsInstance(other_keepalive, str)
-        self.assertTrue(other_keepalive.startswith(": litellm_menu keepalive "))
+        self.assertTrue(other_keepalive.startswith(": young_router keepalive "))
         self.assertTrue(hooks._is_stream_keepalive_chunk(other_keepalive))
 
     def test_keepalive_predicate_rejects_other_events(self) -> None:
@@ -207,7 +207,7 @@ class DownstreamKeepaliveStreamTests(HookTestCase):
 class HookKeepaliveIntegrationTests(HookTestCase):
     async def test_hook_delivers_keepalive_during_buffered_start_silence(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV, "0.05")
 
         request_data = {

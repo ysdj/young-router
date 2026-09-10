@@ -6,13 +6,13 @@ import tempfile
 import unittest
 from unittest import mock
 
-from litellm_menu.core import ConfirmationNeeded, CoreStore
-from litellm_menu.core.domains.claude import ClaudeSettingsDomain
-from litellm_menu.core.domains.codex import CodexSettingsDomain
-from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-from litellm_menu.core.domains.runtime import RuntimeSettingsDomain
-from litellm_menu.core.domains.webdav import WebDAVSettingsDomain
-from litellm_menu.core.service import RecoverableDomain
+from young_router.core import ConfirmationNeeded, CoreStore
+from young_router.core.domains.claude import ClaudeSettingsDomain
+from young_router.core.domains.codex import CodexSettingsDomain
+from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.domains.runtime import RuntimeSettingsDomain
+from young_router.core.domains.webdav import WebDAVSettingsDomain
+from young_router.core.service import RecoverableDomain
 
 
 class CoreDiskConflictTests(unittest.TestCase):
@@ -90,7 +90,7 @@ class CoreDiskConflictTests(unittest.TestCase):
             path.write_text(external, encoding="utf-8")
 
             with (
-                mock.patch("litellm_menu.core.service._checkpoint_files") as checkpoints,
+                mock.patch("young_router.core.service._checkpoint_files") as checkpoints,
                 self.assertRaises(ConfirmationNeeded) as raised,
             ):
                 core.apply("claude", revision=core.revision)

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from litellm_menu.core.model_catalog import (
+from young_router.core.model_catalog import (
     catalog_is_current,
     catalog_model_names,
     catalog_names_from_editor,
@@ -14,12 +14,12 @@ from litellm_menu.core.model_catalog import (
     selected_model_names,
     write_catalog,
 )
-from litellm_menu.core.model_contexts import (
+from young_router.core.model_contexts import (
     DEFAULT_MODEL_CONTEXT_REFRESH_HOURS,
     MODEL_CONTEXT_SOURCES,
     ModelContextRegistry,
 )
-from litellm_menu.core.runtime_settings_schema import runtime_settings_metadata
+from young_router.core.runtime_settings_schema import runtime_settings_metadata
 
 
 def _number_text_for_schema(value: float) -> str:
@@ -32,12 +32,12 @@ class ModelCatalogTests(unittest.TestCase):
         setting = next(
             item
             for item in runtime_settings_metadata()
-            if item.get("key") == "LITELLM_MENU_MODEL_CONTEXT_REFRESH_HOURS"
+            if item.get("key") == "YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS"
         )
         self.assertEqual("6", setting["default"])
 
     def test_runtime_schema_defaults_match_proxy_defaults(self) -> None:
-        from litellm_menu import base as base_module
+        from young_router import base as base_module
 
         defaults_by_key = {
             str(item.get("key")): str(item.get("default"))
@@ -45,39 +45,39 @@ class ModelCatalogTests(unittest.TestCase):
         }
         self.assertEqual(
             str(int(base_module._WEBSOCKET_MAX_FRAME_DEFAULT_BYTES)),
-            defaults_by_key["LITELLM_MENU_WEBSOCKET_MAX_FRAME_BYTES"],
+            defaults_by_key["YOUNG_ROUTER_WEBSOCKET_MAX_FRAME_BYTES"],
         )
         self.assertEqual(
             _number_text_for_schema(
                 base_module._HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS
             ),
-            defaults_by_key["LITELLM_MENU_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS"],
+            defaults_by_key["YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS"],
         )
         self.assertEqual(
             _number_text_for_schema(
                 base_module._HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES
             ),
-            defaults_by_key["LITELLM_MENU_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"],
+            defaults_by_key["YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"],
         )
         self.assertEqual(
             "1" if base_module._PREFIX_IMAGE_PREVIEW_ENABLED_DEFAULT else "0",
-            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_PREVIEW_ENABLED"],
+            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_PREVIEW_ENABLED"],
         )
         self.assertEqual(
             str(base_module._PREFIX_IMAGE_PREVIEW_MIN_BYTES_DEFAULT),
-            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_PREVIEW_MIN_BYTES"],
+            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_PREVIEW_MIN_BYTES"],
         )
         self.assertEqual(
             base_module._PREFIX_IMAGE_MODE_DEFAULT,
-            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_MODE"],
+            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_MODE"],
         )
         self.assertEqual(
             str(base_module._PREFIX_IMAGE_RECENT_COUNT_DEFAULT),
-            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_RECENT_COUNT"],
+            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_RECENT_COUNT"],
         )
         self.assertEqual(
             "1" if base_module._PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT else "0",
-            defaults_by_key["LITELLM_MENU_PREFIX_IMAGE_ORIGINAL_PATH"],
+            defaults_by_key["YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"],
         )
 
     def test_selected_names_keep_explicit_models_in_order_and_dedupe(self) -> None:
@@ -180,7 +180,7 @@ class ModelCatalogTests(unittest.TestCase):
             "model_messages": {"instructions_template": "Native prompt"},
         }
         with mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[native_profile],
         ):
             model = catalog_payload(["5.6 Sol"])["models"][0]
@@ -203,7 +203,7 @@ class ModelCatalogTests(unittest.TestCase):
         }
 
         with mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[native_profile],
         ), mock.patch("litellm.model_cost", {}):
             model = catalog_payload(["gpt-5.6-sol"])["models"][0]
@@ -267,7 +267,7 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertNotIn("ultra", capability.supported_levels)
 
             with mock.patch(
-                "litellm_menu.core.model_catalog.load_native_catalog",
+                "young_router.core.model_catalog.load_native_catalog",
                 return_value=[native_profile],
             ):
                 model = catalog_payload(["native-agent"], registry=registry)["models"][0]
@@ -290,7 +290,7 @@ class ModelCatalogTests(unittest.TestCase):
         }
 
         with mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[native_profile],
         ):
             model = catalog_payload(["litellm-sol"])["models"][0]
@@ -313,7 +313,7 @@ class ModelCatalogTests(unittest.TestCase):
         }
 
         with mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[native_profile],
         ):
             model = catalog_payload(["kimi-k3"])["models"][0]
@@ -337,7 +337,7 @@ class ModelCatalogTests(unittest.TestCase):
         }
 
         with mock.patch(
-            "litellm_menu.core.model_catalog.load_native_catalog",
+            "young_router.core.model_catalog.load_native_catalog",
             return_value=[native_profile],
         ):
             model = catalog_payload(["kimi-k3"])["models"][0]
@@ -373,8 +373,8 @@ class ModelCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = Path(directory) / "runtime-settings.env"
             settings.write_text(
-                "LITELLM_MENU_UNKNOWN_MODEL_CONTEXT_WINDOW=300000\n"
-                "LITELLM_MENU_MODEL_CONTEXT_REFRESH_HOURS=0\n",
+                "YOUNG_ROUTER_UNKNOWN_MODEL_CONTEXT_WINDOW=300000\n"
+                "YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS=0\n",
                 encoding="utf-8",
             )
             registry = ModelContextRegistry(runtime_settings_path=settings, refresh_enabled=False)
@@ -520,7 +520,7 @@ class ModelCatalogTests(unittest.TestCase):
                 refresh_enabled=False,
             )
             with mock.patch(
-                "litellm_menu.core.model_catalog.load_native_catalog",
+                "young_router.core.model_catalog.load_native_catalog",
                 return_value=[native_profile],
             ):
                 model = catalog_payload(["gpt-5-test"], registry=registry)["models"][0]
@@ -547,7 +547,7 @@ class ModelCatalogTests(unittest.TestCase):
             )
             registry = ModelContextRegistry(runtime_config_path=runtime, refresh_enabled=False)
             with mock.patch(
-                "litellm_menu.core.model_catalog.load_native_catalog",
+                "young_router.core.model_catalog.load_native_catalog",
                 return_value=[native_profile],
             ):
                 model = catalog_payload(["kimi-k3"], registry=registry)["models"][0]
@@ -595,7 +595,7 @@ class ModelCatalogTests(unittest.TestCase):
                 refresh_enabled=False,
             )
             with mock.patch(
-                "litellm_menu.core.model_catalog.load_native_catalog",
+                "young_router.core.model_catalog.load_native_catalog",
                 return_value=[native_profile],
             ):
                 model = catalog_payload(["gpt-5-test"], registry=registry)["models"][0]
@@ -642,7 +642,7 @@ class ModelCatalogTests(unittest.TestCase):
                 refresh_enabled=False,
             )
             with mock.patch(
-                "litellm_menu.core.model_catalog.load_native_catalog",
+                "young_router.core.model_catalog.load_native_catalog",
                 return_value=[native_profile],
             ):
                 model = catalog_payload(["third-party-alias"], registry=registry)["models"][0]
@@ -675,7 +675,7 @@ class ModelCatalogTests(unittest.TestCase):
             )
             registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
             with mock.patch(
-                "litellm_menu.core.model_catalog.load_native_catalog",
+                "young_router.core.model_catalog.load_native_catalog",
                 return_value=[native_profile],
             ):
                 model = catalog_payload(["unlisted-alias"], registry=registry)["models"][0]
@@ -726,7 +726,7 @@ class ModelCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = root / "runtime-settings.env"
-            settings.write_text("LITELLM_MENU_MODEL_CONTEXT_REFRESH_HOURS=24\n", encoding="utf-8")
+            settings.write_text("YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS=24\n", encoding="utf-8")
             cache = root / "contexts.json"
 
             def fetch(source: str) -> object:
@@ -785,7 +785,7 @@ class ModelCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = root / "runtime-settings.env"
-            settings.write_text("LITELLM_MENU_MODEL_CONTEXT_REFRESH_HOURS=24\n", encoding="utf-8")
+            settings.write_text("YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS=24\n", encoding="utf-8")
             cache = root / "contexts.json"
             cache.write_text(
                 json.dumps(
@@ -833,7 +833,7 @@ class ModelCatalogTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = root / "runtime-settings.env"
-            settings.write_text("LITELLM_MENU_MODEL_CONTEXT_REFRESH_HOURS=24\n", encoding="utf-8")
+            settings.write_text("YOUNG_ROUTER_MODEL_CONTEXT_REFRESH_HOURS=24\n", encoding="utf-8")
             runtime = root / "config.yaml"
             runtime.write_text(
                 "model_list:\n"

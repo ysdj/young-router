@@ -3,7 +3,7 @@
 #include "CoreIPCBridge.h"
 #include <NativeModules.h>
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 struct CoreIPCModule {
   REACT_MODULE(CoreIPCModule, L"LiteLLMCore");
@@ -25,4 +25,4 @@ struct CoreIPCModule {
   winrt::Microsoft::ReactNative::ReactContext context_{nullptr};
 };
 
-}  // namespace LiteLLMMenu
+}  // namespace YoungRouter

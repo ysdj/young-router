@@ -7,9 +7,9 @@ import textwrap
 import unittest
 from unittest import mock
 
-from litellm_menu.core.domains.codex import CodexSettingsDomain
-from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-from litellm_menu.core.service import CoreStore
+from young_router.core.domains.codex import CodexSettingsDomain
+from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.service import CoreStore
 
 
 class CoreServiceReloadTests(unittest.TestCase):
@@ -178,7 +178,7 @@ class CoreServiceReloadTests(unittest.TestCase):
                 "codex_config._local_exposed_models",
                 side_effect=exposed_models,
             ), mock.patch(
-                "litellm_menu.core.model_catalog.load_native_catalog",
+                "young_router.core.model_catalog.load_native_catalog",
                 return_value=[],
             ):
                 providers = ProvidersModelsDomain(config_path)
@@ -226,7 +226,7 @@ class CoreServiceReloadTests(unittest.TestCase):
                 catalog_state = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             catalog = json.loads(
-                (codex_home / "litellm-menu-model-catalog.json").read_text(encoding="utf-8")
+                (codex_home / "young-router-model-catalog.json").read_text(encoding="utf-8")
             )
             self.assertTrue(result["applied"])
             self.assertEqual(["public-b"], [model["slug"] for model in catalog["models"]])

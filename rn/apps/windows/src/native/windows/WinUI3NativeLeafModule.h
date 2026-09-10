@@ -4,7 +4,7 @@
 #include <memory>
 #include <NativeModules.h>
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 struct WinUI3NativeLeafModule {
   REACT_MODULE(WinUI3NativeLeafModule, L"LiteLLMNativeLeaf");

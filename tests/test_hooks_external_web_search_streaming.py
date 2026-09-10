@@ -473,7 +473,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_function_call_is_consumed_before_client(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -708,8 +708,8 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_native_web_search_completed_payload_message_is_terminal(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        hook = hooks.YoungRouterHook()
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         recovery_requests = []
 
@@ -809,8 +809,8 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_native_web_search_closes_after_completed_even_if_upstream_continues(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        hook = hooks.YoungRouterHook()
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         recovery_requests = []
 
@@ -957,7 +957,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_preamble_and_bridge_artifacts_are_hidden(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -1109,7 +1109,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_split_arguments_without_upstream_completed_runs_search(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -1226,7 +1226,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_progress_is_visible_before_search_finishes(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
         search_started = asyncio.Event()
         release_search = asyncio.Event()
@@ -1338,11 +1338,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_route_recovery_after_search_completes(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -1514,11 +1514,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_continuation_recovery_keeps_continuation_request(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -1656,11 +1656,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_missing_answer_preserves_inner_continuation_payload(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -1808,11 +1808,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_continuation_recovery_skips_duplicate_search_call(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         executed_queries = []
@@ -1957,11 +1957,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_continuation_recovery_executes_follow_up_call(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         executed_queries = []
@@ -2111,11 +2111,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_empty_synthesis_stream_enters_route_recovery(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -2291,11 +2291,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_route_recovery_poll_does_not_dump_results(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         original_keepalive_seconds = streaming_module._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS
         streaming_module._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS = 0.0005
@@ -2471,11 +2471,11 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_empty_recovery_fails_without_second_poll(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        web_search_bridge_module = importlib.import_module("litellm_menu.responses_web_search_bridge")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_bridge_run_action = web_search_bridge_module._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -2592,8 +2592,8 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_partial_answer_504_fails_without_retry(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        hook = hooks.YoungRouterHook()
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         recovery_requests = []
 
@@ -2658,9 +2658,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_native_web_search_call_runtime_error_fails_without_external_bridge(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -2761,7 +2761,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_native_web_search_unsupported_stream_error_uses_external_bridge(self) -> None:
         hooks, proxy_server = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         calls = []
 
         class ProviderBadRequest(Exception):
@@ -2846,9 +2846,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_native_web_search_after_visible_text_stream_end_fails_without_recovery(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -2970,9 +2970,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_native_web_search_completed_with_followup_function_call_is_not_missing_answer(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -3088,9 +3088,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_provider_hosted_web_search_completed_with_inline_message_is_terminal(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -3216,7 +3216,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_external_web_search_custom_tool_call_is_consumed_before_client(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
 
         async def fake_run_action(action, page_cache, page_fetch_tasks):
@@ -3333,7 +3333,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_responses_api_with_optional_web_search_keeps_subagent_route(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         deployment = {
             "litellm_params": {
@@ -3374,7 +3374,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_responses_api_with_explicit_web_search_keeps_bridge_candidate(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         deployment = {
             "litellm_params": {
@@ -3416,7 +3416,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_streaming_web_search_stall_timeout_does_not_dump_direct_fallback(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
         run_action_called = False
 
@@ -3479,9 +3479,9 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
 
     async def test_openrouter_native_search_event_never_enters_pi_recovery(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         original_run_action = hooks._external_web_search_run_action
-        streaming_module = importlib.import_module("litellm_menu.streaming")
+        streaming_module = importlib.import_module("young_router.streaming")
         original_route_recovery_poll = streaming_module._stream_route_recovery_poll
         run_action_called = False
         recovery_requests = []
@@ -3628,7 +3628,7 @@ class HookExternalWebSearchStreamingTests(HookTestCase):
         and surfaces the page-open actions to Codex.
         """
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         request_data = {
             "model": "openai/vendor-chat",
             "input": (

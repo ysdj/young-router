@@ -5,7 +5,7 @@ from hook_test_utils import *
 
 class HookComputerFacadeTests(HookTestCase):
     async def test_removed_cua_backend_fails_closed_without_being_selectable(self) -> None:
-        self.set_env("LITELLM_MENU_COMPUTER_FACADE_BACKEND", "cua")
+        self.set_env("YOUNG_ROUTER_COMPUTER_FACADE_BACKEND", "cua")
         hooks, _ = load_hook_module()
 
         self.assertEqual(hooks._computer_facade_backend(), "cua")
@@ -49,7 +49,7 @@ class HookComputerFacadeTests(HookTestCase):
         self.assertEqual(calls[0]["tools"], [{"type": "computer"}])
 
     async def test_generic_response_wrapper_falls_back_to_facade_after_native_error(self) -> None:
-        self.set_env("LITELLM_MENU_COMPUTER_FACADE_BACKEND", "mock")
+        self.set_env("YOUNG_ROUTER_COMPUTER_FACADE_BACKEND", "mock")
         hooks, _ = load_hook_module()
         calls = []
 
@@ -86,7 +86,7 @@ class HookComputerFacadeTests(HookTestCase):
         self.assertEqual(response["output"][0]["actions"], [{"type": "screenshot"}])
 
     async def test_generic_response_wrapper_fallback_ignores_support_metadata_after_error(self) -> None:
-        self.set_env("LITELLM_MENU_COMPUTER_FACADE_BACKEND", "mock")
+        self.set_env("YOUNG_ROUTER_COMPUTER_FACADE_BACKEND", "mock")
         hooks, _ = load_hook_module()
 
         class InvalidTool(Exception):
@@ -185,7 +185,7 @@ class HookComputerFacadeTests(HookTestCase):
         self.assertNotIn("hosted_tool_unsupported", dumped_retry)
 
     async def test_generic_response_wrapper_streams_hosted_computer_use_unsupported(self) -> None:
-        self.set_env("LITELLM_MENU_COMPUTER_FACADE_BACKEND", "mock")
+        self.set_env("YOUNG_ROUTER_COMPUTER_FACADE_BACKEND", "mock")
         hooks, _ = load_hook_module()
         calls = []
 

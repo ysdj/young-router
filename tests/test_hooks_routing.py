@@ -27,7 +27,7 @@ class HookRoutingTests(HookTestCase):
             "_target_order": 2,
         }
 
-        selected = await hooks.LiteLLMMenuHook().async_filter_deployments(
+        selected = await hooks.YoungRouterHook().async_filter_deployments(
             "default-chat",
             deployments,
             messages=None,
@@ -97,7 +97,7 @@ class HookRoutingTests(HookTestCase):
         hooks, _proxy_server = load_hook_module()
         error = RuntimeError("Cannot connect to host api.example.test")
         error.status_code = 500
-        self.set_env("LITELLM_MENU_RECOVERY_POLICY_NETWORK", "recovery_cooldown")
+        self.set_env("YOUNG_ROUTER_RECOVERY_POLICY_NETWORK", "recovery_cooldown")
 
         self.assertEqual(hooks._recovery_policy_for_exception(error), "recovery_cooldown")
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(error))
@@ -229,7 +229,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_filter_deployments_keeps_image_tool_candidates_for_runtime_probe(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         deployments = [
             {
                 "litellm_params": {"model": "openai/dynamic-text"},
@@ -260,7 +260,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_filter_deployments_keeps_candidates_without_current_image_capability(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         deployments = [
             {
                 "litellm_params": {"model": "openai/dynamic-text"},
@@ -283,7 +283,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_filter_deployments_preserves_user_surface_order_for_codex_tools(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         chat_only = {
             "litellm_params": {
                 "model": "openai/default-chat",
@@ -334,7 +334,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_filter_deployments_keeps_chat_surface_when_no_responses_candidate(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         deployments = [
             {
                 "litellm_params": {
@@ -440,7 +440,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_respects_configured_failure_threshold(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "3")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -554,7 +554,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_defaults_to_two_failures(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         deployments = [
             {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
             {"litellm_params": {"model": "openai/x-plus"}, "model_info": {"id": "x-plus"}},
@@ -659,7 +659,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_persists_across_worker_memory(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -737,7 +737,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_success_clears_failure_count(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "3")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -780,7 +780,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_stream_start_does_not_clear_deployment_cooldown(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         request_kwargs = {
@@ -818,7 +818,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_does_not_count_sanitized_wrapper(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "3")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -863,7 +863,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_filters_all_cooled_candidates_globally(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "3")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -892,7 +892,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_route_recovery_does_not_half_open_cooled_candidates(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1102,7 +1102,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_route_recovery_prefers_healthy_peer_over_cooled_candidates(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1135,7 +1135,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_expires_after_ttl(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "0.01")
         deployments = [
@@ -1172,7 +1172,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_does_not_count_rate_limit_or_request_errors_by_default(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1215,7 +1215,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_counts_server_timeouts_but_not_stream_idle_errors(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1254,7 +1254,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_does_not_count_network_connectivity_errors(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1317,7 +1317,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_does_not_count_stream_start_timeout_after_chunks(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1350,7 +1350,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_counts_local_stream_start_timeout(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1380,7 +1380,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_counts_quota_or_auth_failures(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1407,7 +1407,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_counts_long_quota_or_auth_failures(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployments = [
@@ -1435,7 +1435,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_does_not_cross_deployment_ids_with_same_route_key(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         route_key = "compat_provider / openai/default-chat / key=x-plus / order=2"
@@ -1479,7 +1479,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_uses_route_key_when_deployment_id_missing(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         route_key = "legacy / openai/default-chat / key=x-plus / order=2"
@@ -1515,7 +1515,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_applies_to_the_selected_deployment(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployment = {
@@ -1539,7 +1539,7 @@ class HookRoutingTests(HookTestCase):
                 "call_type": "aresponses",
                 "model": "default-chat",
                 "stream": True,
-                "_litellm_menu_upstream_url_surface": "openai/responses",
+                "_young_router_upstream_url_surface": "openai/responses",
                 "litellm_params": deployment["litellm_params"],
                 "model_info": deployment["model_info"],
             },
@@ -1563,7 +1563,7 @@ class HookRoutingTests(HookTestCase):
                 "call_type": "aresponses",
                 "model": "default-chat",
                 "stream": True,
-                "_litellm_menu_upstream_url_surface": "openai/chat",
+                "_young_router_upstream_url_surface": "openai/chat",
             },
         )
 
@@ -1666,9 +1666,9 @@ class HookRoutingTests(HookTestCase):
         request = {
             "call_type": "aresponses",
             "input": "hello",
-            "_litellm_menu_upstream_url_surface": "openai/chat",
-            "_litellm_menu_upstream_url_surface_deployment_id": "fixed-route",
-            "_litellm_menu_surface_target_deployment_id": "fixed-route",
+            "_young_router_upstream_url_surface": "openai/chat",
+            "_young_router_upstream_url_surface_deployment_id": "fixed-route",
+            "_young_router_surface_target_deployment_id": "fixed-route",
         }
 
         self.assertEqual(
@@ -1692,8 +1692,8 @@ class HookRoutingTests(HookTestCase):
                 {"type": "message", "role": "user", "content": "history"},
                 {"type": "compaction_trigger", "id": "compact-now"},
             ],
-            "_litellm_menu_upstream_url_surface": "anthropic",
-            "_litellm_menu_upstream_url_surface_deployment_id": "fixed-anthropic-route",
+            "_young_router_upstream_url_surface": "anthropic",
+            "_young_router_upstream_url_surface_deployment_id": "fixed-anthropic-route",
         }
 
         self.assertEqual(
@@ -1725,9 +1725,9 @@ class HookRoutingTests(HookTestCase):
                 {"type": "compaction_trigger", "id": "compact-now"},
             ],
             "_target_order": 1,
-            "_litellm_menu_upstream_url_surface": "openai/responses",
-            "_litellm_menu_attempted_upstream_url_surfaces": ["openai/responses"],
-            "_litellm_menu_upstream_url_surface_deployment_id": "dual-protocol-route",
+            "_young_router_upstream_url_surface": "openai/responses",
+            "_young_router_attempted_upstream_url_surfaces": ["openai/responses"],
+            "_young_router_upstream_url_surface_deployment_id": "dual-protocol-route",
             "model_info": deployment["model_info"],
             "litellm_params": deployment["litellm_params"],
         }
@@ -1773,9 +1773,9 @@ class HookRoutingTests(HookTestCase):
                 {"type": "compaction_trigger", "id": "compact-now"},
             ],
             "_target_order": 1,
-            "_litellm_menu_upstream_url_surface": "openai/responses",
-            "_litellm_menu_attempted_upstream_url_surfaces": ["openai/responses"],
-            "_litellm_menu_upstream_url_surface_deployment_id": "anthropic-route",
+            "_young_router_upstream_url_surface": "openai/responses",
+            "_young_router_attempted_upstream_url_surfaces": ["openai/responses"],
+            "_young_router_upstream_url_surface_deployment_id": "anthropic-route",
             "model_info": primary["model_info"],
             "litellm_params": primary["litellm_params"],
         }
@@ -1793,7 +1793,7 @@ class HookRoutingTests(HookTestCase):
             entry[hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY],
             ["responses-peer"],
         )
-        self.assertNotIn("_litellm_menu_upstream_url_surface", entry)
+        self.assertNotIn("_young_router_upstream_url_surface", entry)
 
     def test_protocol_fallback_stays_on_the_same_deployment(self) -> None:
         hooks, _ = load_hook_module()
@@ -1817,9 +1817,9 @@ class HookRoutingTests(HookTestCase):
             "call_type": "messages",
             "messages": [{"role": "user", "content": "hello"}],
             "_target_order": 1,
-            "_litellm_menu_upstream_url_surface": "anthropic",
-            "_litellm_menu_attempted_upstream_url_surfaces": ["anthropic"],
-            "_litellm_menu_upstream_url_surface_deployment_id": "kimi-route",
+            "_young_router_upstream_url_surface": "anthropic",
+            "_young_router_attempted_upstream_url_surfaces": ["anthropic"],
+            "_young_router_upstream_url_surface_deployment_id": "kimi-route",
             "model_info": deployment["model_info"],
             "litellm_params": deployment["litellm_params"],
         }
@@ -1831,12 +1831,12 @@ class HookRoutingTests(HookTestCase):
 
         self.assertIsNotNone(entry)
         self.assertEqual(entry["_target_order"], 1)
-        self.assertEqual(entry["_litellm_menu_upstream_url_surface"], "openai/chat")
+        self.assertEqual(entry["_young_router_upstream_url_surface"], "openai/chat")
         self.assertEqual(
-            entry["_litellm_menu_surface_target_deployment_id"], "kimi-route"
+            entry["_young_router_surface_target_deployment_id"], "kimi-route"
         )
         self.assertEqual(
-            request["_litellm_menu_protocol_fallback_from_surface"], "anthropic"
+            request["_young_router_protocol_fallback_from_surface"], "anthropic"
         )
         self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
 
@@ -1862,11 +1862,11 @@ class HookRoutingTests(HookTestCase):
             "call_type": "aresponses",
             "input": "hello",
             "stream": True,
-            "_litellm_menu_upstream_url_surface": "openai/responses",
-            "_litellm_menu_attempted_upstream_url_surfaces": [
+            "_young_router_upstream_url_surface": "openai/responses",
+            "_young_router_attempted_upstream_url_surfaces": [
                 "openai/responses"
             ],
-            "_litellm_menu_upstream_url_surface_deployment_id": (
+            "_young_router_upstream_url_surface_deployment_id": (
                 "dual-protocol-route"
             ),
             "model_info": deployment["model_info"],
@@ -1893,11 +1893,11 @@ class HookRoutingTests(HookTestCase):
 
         self.assertIsNotNone(entry)
         self.assertEqual(
-            entry["_litellm_menu_upstream_url_surface"],
+            entry["_young_router_upstream_url_surface"],
             "openai/chat",
         )
         self.assertEqual(
-            entry["_litellm_menu_surface_target_deployment_id"],
+            entry["_young_router_surface_target_deployment_id"],
             "dual-protocol-route",
         )
         self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
@@ -1916,18 +1916,18 @@ class HookRoutingTests(HookTestCase):
                 "call_type": "aresponses",
                 "input": "hello",
                 "stream": True,
-                "_litellm_menu_upstream_url_surface": "openai/chat",
-                "_litellm_menu_attempted_upstream_url_surfaces": [
+                "_young_router_upstream_url_surface": "openai/chat",
+                "_young_router_attempted_upstream_url_surfaces": [
                     "openai/responses",
                     "openai/chat",
                 ],
-                "_litellm_menu_upstream_url_surface_deployment_id": (
+                "_young_router_upstream_url_surface_deployment_id": (
                     "dual-protocol-route"
                 ),
-                "_litellm_menu_protocol_fallback_from_surface": (
+                "_young_router_protocol_fallback_from_surface": (
                     "openai/responses"
                 ),
-                "_litellm_menu_protocol_fallback_client_surface": (
+                "_young_router_protocol_fallback_client_surface": (
                     "openai/responses"
                 ),
                 "model_info": {
@@ -1969,10 +1969,10 @@ class HookRoutingTests(HookTestCase):
             "call_type": "aresponses",
             "input": "hello",
             "stream": True,
-            "_litellm_menu_upstream_url_surface": "openai/chat",
-            "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
-            "_litellm_menu_protocol_fallback_client_surface": "openai/responses",
-            "_litellm_menu_upstream_url_surface_deployment_id": "dual-protocol-route",
+            "_young_router_upstream_url_surface": "openai/chat",
+            "_young_router_protocol_fallback_from_surface": "openai/responses",
+            "_young_router_protocol_fallback_client_surface": "openai/responses",
+            "_young_router_upstream_url_surface_deployment_id": "dual-protocol-route",
             "model_info": {
                 "id": "dual-protocol-route",
                 "order": 0,
@@ -2002,10 +2002,10 @@ class HookRoutingTests(HookTestCase):
             "call_type": "aresponses",
             "input": "hello",
             "stream": True,
-            "_litellm_menu_upstream_url_surface": "openai/chat",
-            "_litellm_menu_upstream_url_surface_deployment_id": "dual-protocol-route",
-            "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
-            "_litellm_menu_protocol_fallback_client_surface": "openai/responses",
+            "_young_router_upstream_url_surface": "openai/chat",
+            "_young_router_upstream_url_surface_deployment_id": "dual-protocol-route",
+            "_young_router_protocol_fallback_from_surface": "openai/responses",
+            "_young_router_protocol_fallback_client_surface": "openai/responses",
             "model_info": {
                 "id": "dual-protocol-route",
                 "order": 0,
@@ -2040,8 +2040,8 @@ class HookRoutingTests(HookTestCase):
                 "upstream_url_surface": "openai/chat",
             },
             "litellm_params": {"model": "openai/vendor-model"},
-            "_litellm_menu_upstream_url_surface": "openai/chat",
-            "_litellm_menu_protocol_fallback_from_surface": "openai/responses",
+            "_young_router_upstream_url_surface": "openai/chat",
+            "_young_router_protocol_fallback_from_surface": "openai/responses",
         }
         first = RuntimeError("protocol chain failed")
         first.status_code = 400
@@ -2077,8 +2077,8 @@ class HookRoutingTests(HookTestCase):
             self.set_env(hooks._PROTOCOL_FALLBACK_TTL_SECONDS_ENV, "600")
             failed_request = {
                 "model": "default-chat",
-                "_litellm_menu_upstream_url_surface": "anthropic",
-                "_litellm_menu_upstream_url_surface_deployment_id": "kimi-route",
+                "_young_router_upstream_url_surface": "anthropic",
+                "_young_router_upstream_url_surface_deployment_id": "kimi-route",
                 "model_info": deployment["model_info"],
                 "litellm_params": deployment["litellm_params"],
             }
@@ -2094,10 +2094,10 @@ class HookRoutingTests(HookTestCase):
                 "model": "default-chat",
                 "call_type": "messages",
                 "messages": [{"role": "user", "content": "hello"}],
-                "_litellm_menu_upstream_url_surface": "openai/chat",
-                "_litellm_menu_upstream_url_surface_deployment_id": "kimi-route",
-                "_litellm_menu_protocol_fallback_from_surface": "anthropic",
-                "_litellm_menu_protocol_fallback_client_surface": "anthropic",
+                "_young_router_upstream_url_surface": "openai/chat",
+                "_young_router_upstream_url_surface_deployment_id": "kimi-route",
+                "_young_router_protocol_fallback_from_surface": "anthropic",
+                "_young_router_protocol_fallback_client_surface": "anthropic",
                 "model_info": deployment["model_info"],
             }
             hooks._record_protocol_fallback_success(request)
@@ -2140,12 +2140,12 @@ class HookRoutingTests(HookTestCase):
             "call_type": "aresponses",
             "input": "hello",
             "_target_order": 1,
-            "_litellm_menu_upstream_url_surface": "openai/chat",
-            "_litellm_menu_attempted_upstream_url_surfaces": [
+            "_young_router_upstream_url_surface": "openai/chat",
+            "_young_router_attempted_upstream_url_surfaces": [
                 "openai/responses",
                 "openai/chat",
             ],
-            "_litellm_menu_upstream_url_surface_deployment_id": "kimi-route",
+            "_young_router_upstream_url_surface_deployment_id": "kimi-route",
             "model_info": primary["model_info"],
             "litellm_params": primary["litellm_params"],
         }
@@ -2158,7 +2158,7 @@ class HookRoutingTests(HookTestCase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry["_target_order"], 2)
         self.assertEqual(entry["_excluded_deployment_ids"], ["kimi-route"])
-        self.assertNotIn("_litellm_menu_upstream_url_surface", entry)
+        self.assertNotIn("_young_router_upstream_url_surface", entry)
         self.assertEqual(
             hooks._surface_adapter_model("anthropic/vendor/model", "openai/chat"),
             "openai/vendor/model",
@@ -2188,7 +2188,7 @@ class HookRoutingTests(HookTestCase):
         request = {
             "model": "default-chat",
             "_target_order": 1,
-            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_young_router_upstream_url_surface": "openai/responses",
             "model_info": deployment_a["model_info"],
             "litellm_params": deployment_a["litellm_params"],
         }
@@ -2201,15 +2201,15 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(first["_target_order"], 1)
         self.assertEqual(first["_excluded_deployment_ids"], ["route-a"])
         self.assertEqual(
-            first["_litellm_menu_verified_fallback_deployment_ids"],
+            first["_young_router_verified_fallback_deployment_ids"],
             ["route-b"],
         )
-        self.assertNotIn("_litellm_menu_upstream_url_surface", first)
+        self.assertNotIn("_young_router_upstream_url_surface", first)
         self.assertFalse(any("surface_target" in key for key in first))
 
     async def test_deployment_is_filtered_after_its_selected_protocol_fails(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         deployment = {
@@ -2226,7 +2226,7 @@ class HookRoutingTests(HookTestCase):
             error,
             {
                 "model": "default-chat",
-                "_litellm_menu_upstream_url_surface": "anthropic",
+                "_young_router_upstream_url_surface": "anthropic",
                 "litellm_params": deployment["litellm_params"],
                 "model_info": deployment["model_info"],
             },
@@ -2241,7 +2241,7 @@ class HookRoutingTests(HookTestCase):
 
     def test_current_surface_incompatibility_is_narrowly_classified(self) -> None:
         hooks, _ = load_hook_module()
-        request = {"_litellm_menu_upstream_url_surface": "openai/responses"}
+        request = {"_young_router_upstream_url_surface": "openai/responses"}
         endpoint_error = RuntimeError("endpoint not found")
         endpoint_error.status_code = 404
         schema_error = RuntimeError(
@@ -2267,7 +2267,7 @@ class HookRoutingTests(HookTestCase):
             "model": "default-chat",
             "call_type": "aresponses",
             "tool_choice": {"type": "function", "name": "inspect"},
-            "_litellm_menu_upstream_url_surface": "openai/responses",
+            "_young_router_upstream_url_surface": "openai/responses",
             "model_info": {
                 "id": "dual-protocol-route",
                 "upstream_url_surface": "openai/chat",
@@ -2403,7 +2403,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_deployment_cooldown_deployment_id_does_not_cross_api_base_hosts(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         old_route_key = "compat_provider / openai/default-chat / key=x-plus / order=2"
@@ -2467,7 +2467,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_responses_api_does_not_apply_order_before_router(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         def aresponses():
             pass
@@ -2507,7 +2507,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_responses_api_fallback_target_order_is_honored(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         def aresponses():
             pass
@@ -2543,7 +2543,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_filter_deployments_honors_weighted_failover_exclusions_before_preferences(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
 
         def aresponses():
             pass
@@ -2579,7 +2579,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_filter_deployments_ignores_prompt_without_structured_tool(self) -> None:
         hooks, _ = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         deployments = [
             {"model_info": {"supports_responses_image_generation_tool": False}},
             {"model_info": {"supports_responses_image_generation_tool": True}},
@@ -2637,7 +2637,7 @@ class HookRoutingTests(HookTestCase):
                 raise AssertionError(f"unexpected target order: {payload.get('_target_order')}")
 
         proxy_server.llm_router = FakeRouter()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
         request_data = {
@@ -2859,7 +2859,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_image_tool_capability_rejection_is_cached_across_workers(self) -> None:
         hooks, _proxy_server = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         self.set_env(hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED_TTL_SECONDS_ENV, "600")
         hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED.clear()
         self.addCleanup(hooks._IMAGE_GENERATION_TOOL_UNSUPPORTED.clear)
@@ -3061,7 +3061,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_compaction_capability_probe_is_history_free_and_cached_on_success(self) -> None:
         hooks, proxy_server = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         calls = []
         hooks._CODEX_COMPACTION_CAPABILITIES.clear()
         self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
@@ -3100,7 +3100,7 @@ class HookRoutingTests(HookTestCase):
             [
                 {
                     "type": "compaction_trigger",
-                    "id": "litellm-menu-compaction-capability-probe",
+                    "id": "young-router-compaction-capability-probe",
                 }
             ],
         )
@@ -3120,7 +3120,7 @@ class HookRoutingTests(HookTestCase):
 
     async def test_unsupported_compaction_uses_cached_summary_fallback_signal(self) -> None:
         hooks, proxy_server = load_hook_module()
-        hook = hooks.LiteLLMMenuHook()
+        hook = hooks.YoungRouterHook()
         calls = []
         hooks._CODEX_COMPACTION_CAPABILITIES.clear()
         self.addCleanup(hooks._CODEX_COMPACTION_CAPABILITIES.clear)
@@ -3286,7 +3286,7 @@ class HookRoutingTests(HookTestCase):
         hooks, _proxy_server = load_hook_module()
 
         start_timeout = TimeoutError(
-            "LiteLLM Menu stream start timeout after 120s without the first stream event"
+            "Young Router stream start timeout after 120s without the first stream event"
         )
         start_timeout.status_code = 504
         start_timeout.body = {
@@ -3301,7 +3301,7 @@ class HookRoutingTests(HookTestCase):
         )
 
         idle_timeout = TimeoutError(
-            "LiteLLM Menu stream idle timeout after 120s without a new chunk"
+            "Young Router stream idle timeout after 120s without a new chunk"
         )
         idle_timeout.status_code = 504
         idle_timeout.body = {"reason": "stream_idle_timeout", "saw_chunk": True}

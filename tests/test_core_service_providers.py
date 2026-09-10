@@ -5,12 +5,12 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from litellm_menu.core.domains import DomainError
-from litellm_menu.core.domains.providers_models import ProvidersModelsDomain
-from litellm_menu.core.domains.relay_accounts import RelayAccountsDomain
-from litellm_menu.core.persistence import atomic_write_json
-from litellm_menu.core.provider_auth import ProviderAuthManager
-from litellm_menu.core.service import CoreStore
+from young_router.core.domains import DomainError
+from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.domains.relay_accounts import RelayAccountsDomain
+from young_router.core.persistence import atomic_write_json
+from young_router.core.provider_auth import ProviderAuthManager
+from young_router.core.service import CoreStore
 
 
 class ServiceProviderBoundaryTests(unittest.TestCase):
@@ -529,7 +529,7 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                     "auth_kind": "openai_login",
                     "auth_credential_ref": "chatgpt-account",
                     "extra": {
-                        "x-litellm-menu-provider-auth": {
+                        "x-young-router-provider-auth": {
                             "kind": "openai_login",
                             "credential_ref": "chatgpt-account",
                         }

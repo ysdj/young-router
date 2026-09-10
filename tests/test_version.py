@@ -17,13 +17,13 @@ class VersionScriptTests(unittest.TestCase):
     @staticmethod
     def _write_fixture(root: Path) -> None:
         (root / "Casks").mkdir()
-        (root / "rn" / "apps" / "macos" / "macos" / "LiteLLMMenu-macOS").mkdir(
+        (root / "rn" / "apps" / "macos" / "macos" / "YoungRouter-macOS").mkdir(
             parents=True
         )
-        (root / "rn" / "apps" / "macos" / "macos" / "LiteLLMMenu.xcodeproj").mkdir(
+        (root / "rn" / "apps" / "macos" / "macos" / "YoungRouter.xcodeproj").mkdir(
             parents=True
         )
-        (root / "rn" / "apps" / "windows" / "windows" / "LiteLLMMenu").mkdir(
+        (root / "rn" / "apps" / "windows" / "windows" / "YoungRouter").mkdir(
             parents=True
         )
         (
@@ -32,7 +32,7 @@ class VersionScriptTests(unittest.TestCase):
             / "apps"
             / "windows"
             / "windows"
-            / "LiteLLMMenu.Package"
+            / "YoungRouter.Package"
         ).mkdir(parents=True)
         (root / "VERSION").write_text("1.0.0\n", encoding="utf-8")
         (root / "BUILD_NUMBER").write_text("1\n", encoding="utf-8")
@@ -42,7 +42,7 @@ class VersionScriptTests(unittest.TestCase):
             / "apps"
             / "macos"
             / "macos"
-            / "LiteLLMMenu-macOS"
+            / "YoungRouter-macOS"
             / "Info.plist"
         )
         with info_path.open("wb") as handle:
@@ -59,7 +59,7 @@ class VersionScriptTests(unittest.TestCase):
             / "apps"
             / "macos"
             / "macos"
-            / "LiteLLMMenu.xcodeproj"
+            / "YoungRouter.xcodeproj"
             / "project.pbxproj"
         ).write_text(
             "\t\t\t\tCURRENT_PROJECT_VERSION = 1;\n",
@@ -71,19 +71,19 @@ class VersionScriptTests(unittest.TestCase):
             / "apps"
             / "windows"
             / "windows"
-            / "LiteLLMMenu"
+            / "YoungRouter"
             / "Package.appxmanifest",
             root
             / "rn"
             / "apps"
             / "windows"
             / "windows"
-            / "LiteLLMMenu.Package"
+            / "YoungRouter.Package"
             / "Package.appxmanifest",
         )
         manifest_text = (
             '<?xml version="1.0" encoding="utf-8"?>\r\n'
-            '<Package><Identity Name="LiteLLMMenu" Publisher="CN=Development" '
+            '<Package><Identity Name="YoungRouter" Publisher="CN=Development" '
             'Version="1.0.0.0" /></Package>\r\n'
         ).encode("utf-8")
         manifest_paths[0].write_bytes(codecs.BOM_UTF8 + manifest_text)
@@ -93,12 +93,12 @@ class VersionScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self._write_fixture(root)
-            cask = root / "Casks" / "litellm-menu.rb"
+            cask = root / "Casks" / "young-router.rb"
             cask.write_text(
-                'cask "litellm-menu" do\n'
+                'cask "young-router" do\n'
                 '  version "1.0.0,1"\n'
-                '  url "https://github.com/example/litellm-menu/releases/download/'
-                'v#{version.csv.first}/litellm-menu-#{version.csv.first}-'
+                '  url "https://github.com/example/young-router/releases/download/'
+                'v#{version.csv.first}/young-router-#{version.csv.first}-'
                 '#{version.csv.second}-macos-arm64.tar.zst"\n'
                 'end\n',
                 encoding="utf-8",
@@ -109,7 +109,7 @@ class VersionScriptTests(unittest.TestCase):
                 / "apps"
                 / "macos"
                 / "macos"
-                / "LiteLLMMenu-macOS"
+                / "YoungRouter-macOS"
                 / "Info.plist"
             )
             rn_plist_before = rn_plist_path.read_bytes()
@@ -141,7 +141,7 @@ class VersionScriptTests(unittest.TestCase):
                 / "apps"
                 / "macos"
                 / "macos"
-                / "LiteLLMMenu.xcodeproj"
+                / "YoungRouter.xcodeproj"
                 / "project.pbxproj"
             ).read_text(encoding="utf-8")
             self.assertIn("CURRENT_PROJECT_VERSION = 2;", xcode_project)
@@ -153,14 +153,14 @@ class VersionScriptTests(unittest.TestCase):
                 / "apps"
                 / "windows"
                 / "windows"
-                / "LiteLLMMenu"
+                / "YoungRouter"
                 / "Package.appxmanifest",
                 root
                 / "rn"
                 / "apps"
                 / "windows"
                 / "windows"
-                / "LiteLLMMenu.Package"
+                / "YoungRouter.Package"
                 / "Package.appxmanifest",
             )
             for manifest_path in manifest_paths:
@@ -177,8 +177,8 @@ class VersionScriptTests(unittest.TestCase):
             root = Path(temp_dir)
             self._write_fixture(root)
             (root / "BUILD_NUMBER").write_text("65536\n", encoding="utf-8")
-            (root / "Casks" / "litellm-menu.rb").write_text(
-                'cask "litellm-menu" do\n  version "1.0.0,1"\nend\n',
+            (root / "Casks" / "young-router.rb").write_text(
+                'cask "young-router" do\n  version "1.0.0,1"\nend\n',
                 encoding="utf-8",
             )
 
@@ -198,7 +198,7 @@ class VersionScriptTests(unittest.TestCase):
                 / "apps"
                 / "macos"
                 / "macos"
-                / "LiteLLMMenu-macOS"
+                / "YoungRouter-macOS"
                 / "Info.plist"
             )
             with rn_plist_path.open("rb") as handle:

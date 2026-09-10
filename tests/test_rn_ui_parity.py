@@ -7,10 +7,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-UI_SOURCE = ROOT / "rn/packages/shared/src/ui/LiteLLMMenuApp.tsx"
+UI_SOURCE = ROOT / "rn/packages/shared/src/ui/YoungRouterApp.tsx"
 NATIVE_CONTROLS = ROOT / "rn/packages/shared/src/ui/NativeControls.tsx"
 MACOS_LEAF = ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift"
-MACOS_PROJECT = ROOT / "rn/apps/macos/macos/LiteLLMMenu.xcodeproj/project.pbxproj"
+MACOS_PROJECT = ROOT / "rn/apps/macos/macos/YoungRouter.xcodeproj/project.pbxproj"
 PLATFORM_ENTRY = ROOT / "rn/packages/shared/src/platformEntry.ts"
 RELAY_MANAGER = ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx"
 RELAY_ORIGIN = ROOT / "rn/packages/shared/src/ui/relayOrigin.ts"
@@ -65,16 +65,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const bootstrapTranslate = createTranslator("system", systemLocale);', self.platform_entry)
         self.assertIn('import { routeMenuActions } from "./routes";', self.platform_entry)
         self.assertIn('routeMenuActions(bootstrapTranslate)', self.platform_entry)
-        self.assertIn('{ id: "logs", titleKey: "menu.logs" }', routes)
+        self.assertIn('{ id: "logs", titleKey: "status.logs" }', routes)
         self.assertIn('id !== "claude-settings" && id !== "provider-wizard"', routes)
 
     def test_status_menu_uses_one_localized_recovery_logs_action(self) -> None:
         self.assertIn('function recoveryLogMenuTitle(', self.ui)
-        self.assertIn('translate("menu.logsSummary", { recovering, cooldown })', self.ui)
-        self.assertIn('autoStart: translate("menu.autoStart")', self.ui)
+        self.assertIn('translate("status.logsSummary", { recovering, cooldown })', self.ui)
+        self.assertIn('autoStart: translate("status.autoStart")', self.ui)
         self.assertIn('{ id: "open-logs", title: recoveryLogMenuTitle(snapshot.service, translate), enabled: true },', self.ui)
-        self.assertNotIn('{ id: "open-claude-settings", title: translate("menu.claude"), enabled: true },', self.ui)
-        self.assertNotIn('{ id: "open-recovery", title: translate("menu.recovery"), enabled: true },', self.ui)
+        self.assertNotIn('{ id: "open-claude-settings", title: translate("status.claude"), enabled: true },', self.ui)
+        self.assertNotIn('{ id: "open-recovery", title: translate("status.recovery"), enabled: true },', self.ui)
         self.assertIn('checked: snapshot.service.auto_start_state === "enabled"', self.ui)
         self.assertNotIn('{ id: "webdav-toggle",', self.ui)
         self.assertNotIn('action === "webdav-toggle"', self.ui)
@@ -98,7 +98,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_non_sentence_chinese_ui_copy_uses_ascii_punctuation(self) -> None:
         chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
         for marker in (
-            '"menu.logsSummary": "日志 (路由恢复 {recovering}, 冷却 {cooldown})"',
+            '"status.logsSummary": "日志 (路由恢复 {recovering}, 冷却 {cooldown})"',
             '"claude.permission.unknown": "其他 ({value})"',
             '"logs.duration": "耗时(s)"',
             '"logs.tokenCountK": "令牌数(k)"',
@@ -728,11 +728,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('dataManagementToolbarButtons', workspace)
         self.assertNotIn('dataManagementFooter', workspace)
         self.assertNotIn('<DialogFooter', workspace)
-        self.assertNotIn('title={translate("menu.close")}', workspace)
+        self.assertNotIn('title={translate("status.close")}', workspace)
         self.assertNotIn('onClose:', workspace)
         # Immediate apply: neither the imported sections nor WebDAV keep an
         # in-pane Apply button.
-        self.assertNotIn('title={translate("menu.apply")}', workspace)
+        self.assertNotIn('title={translate("status.apply")}', workspace)
         self.assertNotIn('title={translate("common.saveAndApply")}', workspace)
         webdav = self.ui.split("function WebDavWorkspace(", 1)[1].split("function RuntimeField(", 1)[0]
         self.assertIn('title={translate("dataManagement.testConnection")}', webdav)
@@ -813,8 +813,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             ('symbol: "list.bullet.rectangle", color: "#FF9F0A", image: "SidebarLogs"', "logs", "SidebarLogs"),
         ):
             self.assertIn(symbol, routes, color)
-            self.assertTrue((ROOT / "rn/apps/macos/macos/LiteLLMMenu-macOS/Assets.xcassets" / f"{image}.imageset" / "Contents.json").exists(), image)
-            self.assertTrue((ROOT / "rn/apps/windows/windows/LiteLLMMenu/Assets/Sidebar" / f"{image}.png").exists(), image)
+            self.assertTrue((ROOT / "rn/apps/macos/macos/YoungRouter-macOS/Assets.xcassets" / f"{image}.imageset" / "Contents.json").exists(), image)
+            self.assertTrue((ROOT / "rn/apps/windows/windows/YoungRouter/Assets/Sidebar" / f"{image}.png").exists(), image)
         # The native About panel is already exported by both hosts.
         self.assertIn('showVersion: () => call("showVersion"),', self.platform_entry)
         self.assertIn('showVersion: () => bridge.showVersion?.(),', (ROOT / "rn/packages/shared/src/platform/nativeBridge.ts").read_text(encoding="utf-8"))
@@ -900,7 +900,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_native_menu_actions_append_local_diagnostics_after_success(self) -> None:
         self.assert_ui_has('type: "logs.record_menu_action"')
-        self.assert_ui_has('payload: { tab: "menu", menu_action: action }')
+        self.assert_ui_has('payload: { tab: "actions", menu_action: action }')
         self.assert_ui_has('runServiceOperation(serviceOperation).then(() => recordMenuAction(action))')
 
     def test_data_management_copy_names_unified_sections_and_actions(self) -> None:
@@ -908,7 +908,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
         for text in (english, chinese):
             for key in (
-                "menu.dataManagement",
+                "status.dataManagement",
                 "dataManagement.tab.import",
                 "dataManagement.tab.export",
                 "dataManagement.tab.webdav",
@@ -932,7 +932,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             ):
                 self.assertIn(f'"{key}":', text)
         for value in (
-            '"menu.dataManagement": "Backup & Sync"',
+            '"status.dataManagement": "Backup & Sync"',
             '"dataManagement.tab.import": "Import"',
             '"dataManagement.tab.export": "Export"',
             '"dataManagement.tab.webdav": "WebDAV Sync"',
@@ -944,7 +944,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(value, english)
         for value in (
-            '"menu.dataManagement": "备份与同步"',
+            '"status.dataManagement": "备份与同步"',
             '"dataManagement.tab.import": "导入"',
             '"dataManagement.tab.export": "导出"',
             '"dataManagement.tab.webdav": "WebDAV 同步"',
@@ -1226,9 +1226,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The shared settings shell has no route-level Apply/Close footer; the
         # provider wizard sheet keeps its own explicit Close/Next actions.
         self.assertNotIn("function DialogFooter(", self.ui)
-        self.assertNotIn('route === "runtime-settings" ? translate("common.saveAndApply") : translate("menu.apply")', self.ui)
+        self.assertNotIn('route === "runtime-settings" ? translate("common.saveAndApply") : translate("status.apply")', self.ui)
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        self.assertIn('<NativeButton title={translate("menu.close")} disabled={processing} onPress={onClose} />', wizard)
+        self.assertIn('<NativeButton title={translate("status.close")} disabled={processing} onPress={onClose} />', wizard)
 
     def test_runtime_save_and_apply_reloads_the_running_proxy(self) -> None:
         self.assert_ui_has(
@@ -1488,17 +1488,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assert_ui_has(marker)
 
     def test_dsh_router_keeps_advanced_json_below_native_quick_controls(self) -> None:
-        schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
+        schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         quick_keys = (
-            "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED",
-            "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND",
-            "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK",
-            "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
-            "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS",
-            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
-            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_FREE_FALLBACK",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
         )
-        advanced = schema.index("LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON")
+        advanced = schema.index("YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON")
         for key in quick_keys:
             self.assertLess(schema.index(key), advanced)
         self.assertIn("<NativeCheckbox", self.ui)
@@ -1507,7 +1507,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("<NativeSecretInputControl", self.ui)
 
     def test_runtime_metadata_has_complete_chinese_projection(self) -> None:
-        schema = (ROOT / "litellm_menu/core/runtime_settings_schema.py").read_text(encoding="utf-8")
+        schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
         self.assertEqual(71, len(keys))
@@ -1517,15 +1517,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "Computer Facade", "MCP", "Logs", "Network", "Service", "Relay"):
             self.assertIn(f'  "{category}":', localized)
         self.assertNotIn("Vision Bridge", localized)
-        self.assertNotIn("LITELLM_MENU_VISION_BRIDGE_", schema)
+        self.assertNotIn("YOUNG_ROUTER_VISION_BRIDGE_", schema)
         for key in (
-            "LITELLM_MENU_DSH_VISION_ROUTER_ENABLED",
-            "LITELLM_MENU_DSH_VISION_ROUTER_BACKEND",
-            "LITELLM_MENU_DSH_VISION_ROUTER_FREE_FALLBACK",
-            "LITELLM_MENU_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
-            "LITELLM_MENU_DSH_VISION_ROUTER_MAX_TOKENS",
-            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
-            "LITELLM_MENU_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_FREE_FALLBACK",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED",
+            "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
         ):
             self.assertIn(f"  {key}: {{ label:", localized)
         self.assertIn("const optionValues = stringList(item.options);", self.ui)
@@ -2246,7 +2246,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_menu_logs_do_not_repeat_actions_as_detail(self) -> None:
         self.assertIn(
-            'if (tab === "menu") return [\n'
+            'if (tab === "actions") return [\n'
             '    time,\n'
             '    { label: translate("logs.action"), width: 180, flex: true, value: (row) => row.action },\n'
             '    status,\n'
@@ -2471,7 +2471,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("await dispatchQueue.current;", apply_body)
         # Relay/provider drafts are committed by the shell's immediate apply;
         # the removed footer no longer renders a route-level Apply button.
-        self.assertNotIn('title={translate("menu.apply")}', self.ui)
+        self.assertNotIn('title={translate("status.apply")}', self.ui)
 
     def test_provided_keys_panel_groups_station_keys_with_staged_crud(self) -> None:
         ui = self.ui
@@ -3028,7 +3028,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Settings panes share one window, so its title is the app name and the
         # sidebar selection names the active pane.
         self.assertIn('if Self.settingsPaneRoutes.contains(canonicalRoute(route)) {', self.macos_leaf)
-        self.assertIn('return localized("appTitle", fallback: "LiteLLM Menu")', self.macos_leaf)
+        self.assertIn('return localized("appTitle", fallback: "Young Router")', self.macos_leaf)
         self.assertIn('case "provider-wizard": return "LiteLLM " + localized("routeProviderWizard", fallback: "Add Provider")', self.macos_leaf)
         self.assertIn("private static let statusMenuOrder", self.macos_leaf)
         for ordered_item in (
@@ -3043,14 +3043,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_data_management_route_replaces_standalone_webdav_route_everywhere(self) -> None:
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
-        macos_app = (ROOT / "rn/apps/macos/macos/LiteLLMMenu-macOS/AppDelegate.mm").read_text(encoding="utf-8")
-        windows_app = (ROOT / "rn/apps/windows/windows/LiteLLMMenu/LiteLLMMenu.cpp").read_text(encoding="utf-8")
+        macos_app = (ROOT / "rn/apps/macos/macos/YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
+        windows_app = (ROOT / "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp").read_text(encoding="utf-8")
         for source in (self.ui, routes, types, self.macos_leaf, self.platform_entry, self.windows_leaf, macos_app, windows_app):
             self.assertNotIn('"webdav-settings"', source)
             self.assertNotIn('"open-webdav-settings"', source)
             self.assertNotIn("routeWebdavSettings", source)
-        self.assertIn('{ id: "general-settings", titleKey: "menu.general" }', routes)
-        self.assertIn('{ id: "data-management", titleKey: "menu.dataManagement" }', routes)
+        self.assertIn('{ id: "general-settings", titleKey: "status.general" }', routes)
+        self.assertIn('{ id: "data-management", titleKey: "status.dataManagement" }', routes)
         self.assertIn('| "data-management"', types)
         self.assertIn("routeDataManagement: string;", types)
         for source in (self.ui, self.macos_leaf, self.windows_leaf):
@@ -3062,7 +3062,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_language_uses_the_native_application_menu_without_a_dedicated_screen(self) -> None:
         for marker in (
-            '{ id: "language-menu", title: translate("menu.language"), enabled: true }',
+            '{ id: "language-picker", title: translate("status.language"), enabled: true }',
             'id: "set-language-system"',
             'id: "set-language-en"',
             'id: "set-language-zh-Hans"',

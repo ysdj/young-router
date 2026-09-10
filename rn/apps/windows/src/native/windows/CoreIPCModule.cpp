@@ -1,7 +1,7 @@
 #include "pch.h"
 #include "CoreIPCModule.h"
 
-namespace LiteLLMMenu {
+namespace YoungRouter {
 
 void CoreIPCModule::Initialize(winrt::Microsoft::ReactNative::ReactContext const& context) noexcept {
   try {
@@ -43,4 +43,4 @@ void CoreIPCModule::Shutdown() noexcept {
 void CoreIPCModule::AddListener(std::string const&) noexcept {}
 void CoreIPCModule::RemoveListeners(double) noexcept {}
 
-}  // namespace LiteLLMMenu
+}  // namespace YoungRouter

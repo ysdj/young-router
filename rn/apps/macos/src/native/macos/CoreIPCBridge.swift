@@ -458,8 +458,8 @@ import Foundation
         try readSecret(
             createSecretReadCapability(domain: domain, field: field, target: target).token,
             allowMultiline: domain == "runtime" && field == "setting" &&
-                (target == "LITELLM_MENU_PI_WEB_ACCESS_CONFIG_JSON" ||
-                 target == "LITELLM_MENU_DSH_VISION_ROUTER_CONFIG_JSON")
+                (target == "YOUNG_ROUTER_PI_WEB_ACCESS_CONFIG_JSON" ||
+                 target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON")
         )
     }
 
@@ -649,7 +649,7 @@ import Foundation
     private func startCoreLocked() throws -> Endpoint {
         if let endpoint { return endpoint }
         let fileManager = FileManager.default
-        let directory = fileManager.temporaryDirectory.appendingPathComponent("litellm-menu-core-\(UUID().uuidString)", isDirectory: true)
+        let directory = fileManager.temporaryDirectory.appendingPathComponent("young-router-core-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let endpointFile = directory.appendingPathComponent("endpoint.json")
 
@@ -658,7 +658,7 @@ import Foundation
         let process = Process()
         let bundledPython = coreRoot?.appendingPathComponent("runtime/bin/python").path
         let pythonCandidates = [
-            environment["LITELLM_MENU_CORE_PYTHON"],
+            environment["YOUNG_ROUTER_CORE_PYTHON"],
             bundledPython,
         ].compactMap { $0 }
         guard let python = pythonCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
@@ -667,7 +667,7 @@ import Foundation
         process.executableURL = URL(fileURLWithPath: python)
         let arguments = [
             "-m",
-            "litellm_menu.core",
+            "young_router.core",
             "--endpoint-file",
             endpointFile.path,
             "--parent-pid",
@@ -719,7 +719,7 @@ import Foundation
     }
 
     private func previewProfileEnvironment(from inherited: [String: String]) -> [String: String] {
-        guard let rawRoot = Bundle.main.object(forInfoDictionaryKey: "LiteLLMMenuPreviewProfileRoot") as? String,
+        guard let rawRoot = Bundle.main.object(forInfoDictionaryKey: "YoungRouterPreviewProfileRoot") as? String,
               rawRoot.hasPrefix("/") else {
             return inherited
         }
@@ -732,11 +732,11 @@ import Foundation
         var environment = inherited
         environment["HOME"] = home.path
         environment["LITELLM_RUNTIME_ROOT"] = root.path
-        environment["LITELLM_MENU_HOME"] = root.path
+        environment["YOUNG_ROUTER_HOME"] = root.path
         environment["LITELLM_CONFIG_FILE"] = root.appendingPathComponent("config.yaml").path
         environment["LITELLM_RUNTIME_CONFIG"] = runtime.appendingPathComponent("config.yaml").path
-        environment["LITELLM_MENU_RUNTIME_SETTINGS_FILE"] = root.appendingPathComponent("runtime-settings.env").path
-        if let rawPort = Bundle.main.object(forInfoDictionaryKey: "LiteLLMMenuPreviewPort") as? String,
+        environment["YOUNG_ROUTER_RUNTIME_SETTINGS_FILE"] = root.appendingPathComponent("runtime-settings.env").path
+        if let rawPort = Bundle.main.object(forInfoDictionaryKey: "YoungRouterPreviewPort") as? String,
            let port = Int(rawPort),
            (1...65_535).contains(port) {
             environment["LITELLM_PORT"] = String(port)
@@ -744,7 +744,7 @@ import Foundation
         environment["CODEX_HOME"] = codex.path
         environment["CLAUDE_CONFIG_DIR"] = claude.path
         environment["CLAUDE_SETTINGS_PATH"] = claude.appendingPathComponent("settings.json").path
-        environment["LITELLM_MENU_LANGUAGE_FILE"] = root.appendingPathComponent("language.json").path
+        environment["YOUNG_ROUTER_LANGUAGE_FILE"] = root.appendingPathComponent("language.json").path
         environment["LITELLM_WEBDAV_SYNC_SETTINGS"] = root.appendingPathComponent("webdav-sync.json").path
         environment["LITELLM_WEBDAV_SYNC_ENABLED_FILE"] = runtime.appendingPathComponent("webdav-sync.enabled").path
         environment["LITELLM_WEBDAV_SYNC_STATUS_FILE"] = runtime.appendingPathComponent("webdav-sync-status.json").path
@@ -753,10 +753,10 @@ import Foundation
         environment["LITELLM_NATIVE_PID_FILE"] = runtime.appendingPathComponent("litellm.pid").path
         environment["LITELLM_NATIVE_OWNER_FILE"] = runtime.appendingPathComponent("litellm.owner").path
         environment["LITELLM_AUTOSTART_STATE_FILE"] = runtime.appendingPathComponent("autostart.enabled").path
-        environment["LITELLM_MENU_ROUTE_RECOVERY_STATE_FILE"] = runtime.appendingPathComponent("route-recovery-state.json").path
-        environment["LITELLM_MENU_DEPLOYMENT_COOLDOWN_FILE"] = runtime.appendingPathComponent("deployment-cooldowns.json").path
-        environment["LITELLM_MENU_SESSION_DEPLOYMENT_AFFINITY_FILE"] = runtime.appendingPathComponent("session-deployment-affinity.json").path
-        environment["LITELLM_MENU_SEARCH_STATE_FILE"] = runtime.appendingPathComponent("web-search-references.json").path
+        environment["YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"] = runtime.appendingPathComponent("route-recovery-state.json").path
+        environment["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE"] = runtime.appendingPathComponent("deployment-cooldowns.json").path
+        environment["YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY_FILE"] = runtime.appendingPathComponent("session-deployment-affinity.json").path
+        environment["YOUNG_ROUTER_SEARCH_STATE_FILE"] = runtime.appendingPathComponent("web-search-references.json").path
         environment["LITELLM_RUNTIME_DIR"] = runtime.path
         environment["LITELLM_RECENT_REQUESTS_LOG"] = root.appendingPathComponent("recent-requests.jsonl").path
         return environment
@@ -765,11 +765,11 @@ import Foundation
     private func resolveCoreRoot(environment: [String: String]) -> URL? {
         let fileManager = FileManager.default
         let explicitRoots = [
-            environment["LITELLM_MENU_CORE_ROOT"],
+            environment["YOUNG_ROUTER_CORE_ROOT"],
             Bundle.main.resourceURL?.appendingPathComponent("Core").path,
         ].compactMap { $0 }.map(URL.init(fileURLWithPath:))
         if let root = explicitRoots.first(where: {
-            fileManager.fileExists(atPath: $0.appendingPathComponent("litellm_menu/core/__main__.py").path)
+            fileManager.fileExists(atPath: $0.appendingPathComponent("young_router/core/__main__.py").path)
                 && fileManager.fileExists(atPath: $0.appendingPathComponent("sitecustomize.py").path)
         }) {
             return root

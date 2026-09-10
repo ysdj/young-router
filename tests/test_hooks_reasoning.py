@@ -10,7 +10,7 @@ class HookReasoningMappingTests(HookTestCase):
     def _configure_pi_cache(self, root: Path, records: dict) -> None:
         codex_home = root / "codex"
         codex_home.mkdir()
-        (codex_home / "litellm-menu-model-contexts.json").write_text(
+        (codex_home / "young-router-model-contexts.json").write_text(
             json.dumps({"records": records}),
             encoding="utf-8",
         )
@@ -142,7 +142,7 @@ class HookReasoningMappingTests(HookTestCase):
             "reasoning": {"effort": "xhigh"},
         }
 
-        mapped = await hooks.LiteLLMMenuHook().async_pre_call_deployment_hook(
+        mapped = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             request,
             call_type="aresponses",
         )
