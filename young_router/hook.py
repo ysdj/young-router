@@ -37,7 +37,15 @@ class YoungRouterHook(CustomLogger):
         # callbacks replace this progress row.  Do not emit an unjoinable
         # pending row that would remain as a duplicate legacy request entry.
         if record.get("request_id"):
-            _state_module._append_recent_request(record)
+            if _state_module._append_recent_request(record) is not None:
+                # Pin this row on the selected route marker so the stream that
+                # carries the attempt can refresh it, and close it if the
+                # attempt ends without any terminal callback (client
+                # disconnect, failover teardown, worker exit).
+                _routing_module._remember_pending_request_log_id(
+                    record.get("request_id")
+                )
+                _state_module._schedule_recent_request_settlement(record)
 
     async def async_log_success_event(
         self,

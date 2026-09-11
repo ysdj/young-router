@@ -100,6 +100,12 @@ def run(argv: list[str] | None = None) -> int:
     uvicorn_subprocess.spawn = multiprocessing.get_context("forkserver")
     uvicorn = importlib.import_module("uvicorn")
     from .base import _websocket_max_frame_bytes
+    from .state import settle_stale_recent_requests
+
+    # Every new proxy process starts with an empty in-flight registry, so any
+    # request row an earlier process left unfinished can never receive its
+    # terminal callback.  Close those rows before the workers start serving.
+    settle_stale_recent_requests()
 
     uvicorn.run(
         PROXY_APP,

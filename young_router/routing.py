@@ -173,12 +173,19 @@ _FIRST_STREAM_OUTPUT_TIMES_TTL_SECONDS = 600.0
 # early without emitting any function call.  See the trace event
 # ``responses_completed_text_only_after_buffered_stream``.
 _TEXT_ONLY_COMPLETION_MIN_DURATION_MS = 4000
+# Set by the deployment pre-call hook on the selected-deployment marker so the
+# wrapper that carries that attempt's stream can refresh its request-log row.
+_PENDING_REQUEST_LOG_ID_KEY = "_young_router_pending_request_log_id"
 
 
 class _SelectedDeploymentMarkerStream:
     """Carry the route selected before a streaming iterator is consumed."""
 
-    def __init__(self, response: Any, marker: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        response: Any,
+        marker: dict[str, Any],
+    ) -> None:
         self._response = response
         self._iterator = response.__aiter__()
         self._young_router_selected_deployment_marker = marker
@@ -187,7 +194,16 @@ class _SelectedDeploymentMarkerStream:
         return self
 
     async def __anext__(self) -> Any:
-        return await self._iterator.__anext__()
+        chunk = await self._iterator.__anext__()
+        # The pre-call hook pinned this attempt's request-log row on the same
+        # marker object, so delivering chunks proves that row is still
+        # progressing and must not look abandoned while a long response streams.
+        _state_module._touch_recent_request(
+            self._young_router_selected_deployment_marker.get(
+                _PENDING_REQUEST_LOG_ID_KEY
+            )
+        )
+        return chunk
 
     async def aclose(self) -> None:
         close = getattr(self._iterator, "aclose", None)
@@ -231,6 +247,24 @@ def _merge_request_routing_state_into_selected_deployment_marker(
     )
     if excluded_ids:
         marker["_excluded_deployment_ids"] = sorted(excluded_ids)
+
+
+def _remember_pending_request_log_id(request_id: Any) -> None:
+    """Pin one attempt's request-log row to the selected route marker.
+
+    ``async_pre_call_deployment_hook`` and the response wrapper that carries
+    that attempt's stream share the same selected-deployment marker object,
+    while LiteLLM itself rebuilds the callback kwargs and assigns a fresh
+    ``litellm_call_id`` per deployment call.  Storing the pending row's join key
+    on the marker is therefore the only exact link between the attempt's
+    progress row and its stream.
+    """
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        return
+    marker = _selected_deployment_marker_from_box()
+    if isinstance(marker, dict):
+        marker[_PENDING_REQUEST_LOG_ID_KEY] = request_id.strip()
 
 
 def _remember_request_time(

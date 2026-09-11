@@ -58,11 +58,13 @@ struct GroupManagerLabels {
   std::wstring remove_label;
   std::wstring name_label;
   std::wstring group_label;
+  std::wstring multiplier_label;
   std::wstring enabled_label;
   std::wstring new_key_name;
   std::wstring draft_label;
   std::wstring deleted_label;
   std::wstring auto_grouping_label;
+  std::wstring ungrouped_label;
   std::wstring close_label;
   std::wstring apply_label;
   std::wstring hint;

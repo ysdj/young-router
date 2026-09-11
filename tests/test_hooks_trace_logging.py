@@ -422,6 +422,183 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertNotIn("SECRET_PROMPT_BODY", log_path.read_text(encoding="utf-8"))
             self.assertNotIn("SECRET_API_KEY", log_path.read_text(encoding="utf-8"))
 
+    async def test_pre_call_settles_an_abandoned_pending_request(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            self.set_env("YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS", "0.05")
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "litellm_call_id": "abandoned-call",
+            }
+
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+            await asyncio.sleep(0.2)
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(["pending", "aborted"], [record["status"] for record in records])
+            self.assertEqual("abandoned-call", records[-1]["request_id"])
+            self.assertEqual(
+                "no_terminal_callback",
+                records[-1]["aborted"]["reason"],
+            )
+            # The closed row keeps the attempt's own timestamp so it stays in
+            # its chronological place instead of jumping to the newest rows.
+            self.assertEqual(records[0]["ts"], records[-1]["ts"])
+            self.assertIn("settled_at", records[-1]["aborted"])
+
+    async def test_terminal_callback_keeps_its_pending_row_open(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            self.set_env("YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS", "0.05")
+            start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "litellm_call_id": "settled-call",
+            }
+
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+            await hook.async_log_failure_event(
+                kwargs,
+                RuntimeError("upstream failed"),
+                start,
+                start + timedelta(milliseconds=10),
+            )
+            await asyncio.sleep(0.2)
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(["pending", "failure"], [record["status"] for record in records])
+
+    async def test_stream_progress_refreshes_the_pending_row(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "litellm_call_id": "streaming-call",
+            }
+
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+            hooks._touch_recent_request("streaming-call", interval_seconds=0)
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(["pending", "stream"], [record["status"] for record in records])
+            self.assertEqual("streaming-call", records[-1]["request_id"])
+            self.assertIs(records[-1]["heartbeat"], True)
+
+    async def test_selected_deployment_marker_carries_the_pending_request_row(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            marker = {"model_info": {"id": "deployment-1"}}
+            hooks._CURRENT_SELECTED_DEPLOYMENT.set(marker)
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "litellm_call_id": "marked-call",
+            }
+
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+
+            self.assertEqual(
+                "marked-call",
+                marker.get("_young_router_pending_request_log_id"),
+            )
+
+    async def test_selected_deployment_stream_refreshes_its_pending_row(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "litellm_call_id": "marked-call",
+            }
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+
+            class _Chunks:
+                def __init__(self) -> None:
+                    self._chunks = [{"type": "response.output_text.delta"}]
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if not self._chunks:
+                        raise StopAsyncIteration
+                    return self._chunks.pop(0)
+
+            touched: list[str] = []
+            hooks._touch_recent_request = lambda request_id, **kwargs: touched.append(request_id)
+            wrapped = hooks._wrap_response_with_selected_deployment_marker(
+                _Chunks(),
+                {
+                    "model_info": {"id": "deployment-1"},
+                    "_young_router_pending_request_log_id": "marked-call",
+                },
+            )
+
+            chunk = await wrapped.__anext__()
+
+            self.assertEqual({"type": "response.output_text.delta"}, chunk)
+            self.assertEqual(["marked-call"], touched)
+
+    def test_boot_settlement_closes_previous_pending_rows(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            records = [
+                {"ts": "2026-06-09T12:00:00Z", "request_id": "gone", "status": "pending"},
+                {"ts": "2026-06-09T12:00:01Z", "request_id": "finished", "status": "success"},
+                {"ts": "2026-06-09T12:00:02Z", "request_id": "joined", "status": "pending"},
+                {"ts": "2026-06-09T12:00:03Z", "request_id": "joined", "status": "success"},
+            ]
+            log_path.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            settled = hooks.settle_stale_recent_requests(reason="service_restart")
+
+            self.assertEqual(1, settled)
+            written = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(5, len(written))
+            self.assertEqual("gone", written[-1]["request_id"])
+            self.assertEqual("aborted", written[-1]["status"])
+            self.assertEqual("service_restart", written[-1]["aborted"]["reason"])
+            self.assertEqual("2026-06-09T12:00:00Z", written[-1]["ts"])
+
     async def test_stream_request_log_advances_to_terminal_status(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()

@@ -60,6 +60,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(removed_shell, self.ui, removed_shell)
 
+    def test_pane_status_bar_stays_mounted_and_falls_back_to_ready(self) -> None:
+        # The pane status bar is a permanent strip: a pane window always shows
+        # it, and an idle pane shows the localized Ready label instead of an
+        # empty row that appears and disappears with each action.
+        self.assert_ui_has('{shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{result ?? translate("common.ready")}</Text></View> : null}')
+        self.assertNotIn("{shell && result ? <View style={styles.routeStatusBar}>", self.ui)
+        self.assertIn('"common.ready": "Ready"', self.en)
+        self.assertIn('"common.ready": "就绪"', self.zh)
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        self.assertIn('| "common.ready"', translation_keys)
+        # The strip is a tip surface: one type step below body text.
+        self.assert_ui_has('routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }')
+
     def test_bootstrap_menu_uses_the_system_language_before_core_snapshot(self) -> None:
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
         self.assertIn('const bootstrapTranslate = createTranslator("system", systemLocale);', self.platform_entry)
@@ -304,7 +317,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const currentSurface = stringValue(currentModel.upstream_url_surface, "openai/responses");',
             'if (currentSurface === nextSurface) return;',
             'await enqueueDispatch("model.patch", {',
-            'await ipc.apply("providers_models", staged.revision, confirmations);',
+            'const applyStagedSurface = (nextRevision: number): Promise<IpcResults["apply"]> => (',
+            'result = await applyStagedSurface(staged.revision);',
+            'result = current.drafts.providers_models?.dirty === true',
+            '? await applyStagedSurface(current.revision)',
             'upstream_url_surface: nextSurface,',
             'const nextSurface = stringValue(result.recommended_surface);',
             'isProbeSurface(nextSurface)',
@@ -401,7 +417,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }')
         self.assert_ui_has('return <PersistentScrollView style={styles.providerEditorContent} contentContainerStyle={styles.providerEditorScrollContent} showsVerticalScrollIndicator nestedScrollEnabled onViewportHeightChange={setEditorViewportHeight} onContentHeightChange={setEditorContentHeight}>')
         self.assert_ui_has('{kind === "apiKey" || (kind === "relay" && !station) ? <ProviderSourceFields')
-        self.assert_ui_has('{scrollable ? <NativePersistentScrollIndicator style={styles.persistentScrollIndicator} /> : null}')
+        self.assert_ui_has("<NativePersistentScrollIndicator style={styles.persistentScrollIndicator} />")
         self.assert_ui_has('showsHorizontalScrollIndicator={false}\n    onLayout=')
         self.assert_ui_has('<PersistentScrollView style={styles.providerWizardModelScroll} contentContainerStyle={styles.providerWizardModelScrollContent} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">')
         self.assert_ui_has('providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }')
@@ -496,7 +512,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'setTab(next);',
             'void pending.catch((reason: unknown) => {',
             'onTabSwitchError(previous, reason);',
-            '{tab === "import" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
+            '{tab === "import" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
             '{tab === "export" ? <View style={styles.dataManagementPane}>',
             '{tab === "webdav" ? <View style={[styles.dataManagementWebDavPane, styles.dataManagementWebDavContent, dataManagementPolishStyles.webDavContent]}>',
         ):
@@ -626,11 +642,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             1,
         )[0]
         self.assertIn('<View style={styles.dataManagementPane}>', export_pane)
-        self.assertIn('<ScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>', export_pane)
+        self.assertIn('<PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>', export_pane)
         self.assertIn('<View style={[styles.dataManagementBottomActions, dataManagementPolishStyles.bottomActions]}>', export_pane)
         self.assertGreater(
             export_pane.index('<View style={[styles.dataManagementBottomActions, dataManagementPolishStyles.bottomActions]}>'),
-            export_pane.index('</ScrollView>'),
+            export_pane.index('</PersistentScrollView>'),
         )
         self.assertIn('<View style={styles.dataManagementBottomMessage}>', export_pane)
         self.assertIn('title={translate("dataManagement.exportSelected")}', export_pane)
@@ -1214,7 +1230,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("MIN(_requestedColumnWidths[index], minimumWidths[index])", mac_native)
         self.assertIn("_userResizedColumns.size() == columnCount && !_userResizedColumns.back()", mac_native)
         self.assertIn("_measuredColumnWidths.back() + trailingContentInset", mac_native)
+        # Short columns keep the requested width and ellipsize longer values;
+        # only the trailing detail column grows to its measured content and the
+        # table scrolls horizontally for it.
         self.assertNotIn("laidOutColumnWidths[index] = MAX(laidOutColumnWidths[index], _measuredColumnWidths[index]);", mac_native)
+        self.assertIn("LiteLLMTableMeasuredRowLimit", mac_native)
         self.assertIn("const CGFloat availableColumnWidth = NSWidth(visibleBounds);", mac_native)
         self.assertIn("MAX(NSWidth(visibleBounds), laidOutContentWidth)", mac_native)
         self.assertIn("std::max(88.0, static_cast<double>(widths[index]))", windows_native)
@@ -1267,7 +1287,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('<NativeToggle value={booleanValue(item.value)} disabled={busy} accessibilityLabel={label}', self.ui)
         self.assertIn('<TooltipText numberOfLines={1} tooltip={label} style={styles.runtimeFieldLabel}', self.ui)
         self.assertIn('styles.runtimeMultilineEditor', self.ui)
-        self.assertIn('runtimeBooleanControl: { width: 40, minWidth: 40, height: 24', self.ui)
+        # The compact AppKit switch is 44 x 20 pt, so the slot that centres it
+        # has to reserve that width or the control overflows the row.
+        self.assertIn('runtimeBooleanControl: { width: 44, minWidth: 44, height: 24', self.ui)
         self.assertNotIn("runtimeBooleanSlot", self.ui)
         self.assertNotIn("runtimeBooleanHelpSlot", self.ui)
 
@@ -1336,9 +1358,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
             for marker in markers:
                 self.assert_ui_has(marker)
 
+    def test_every_settings_pane_scrolls_through_the_shared_scroll_surface(self) -> None:
+        # One scrolling surface per pane: the native indicator gives it the app's
+        # persistent translucent scroller instead of AppKit's overlay bar, so a
+        # pane never mixes scrollbar appearances with the tables beside it.
+        for marker in (
+            '<PersistentScrollView style={styles.generalScroll}',
+            '<PersistentScrollView ref={scrollRef} style={styles.runtimeScrollSurface}',
+            '<PersistentScrollView style={styles.assistantSettingsScroll}',
+            '<PersistentScrollView style={styles.dataManagementPane}',
+            '<PersistentScrollView\n            ref={timelineScrollRef}',
+        ):
+            self.assert_ui_has(marker)
+        self.assertNotIn("<ScrollView style={styles.", self.ui)
+
     def test_assistant_settings_have_one_outer_scroll_surface_without_tabs(self) -> None:
         for marker in (
-            '<ScrollView style={styles.assistantSettingsScroll}',
+            '<PersistentScrollView style={styles.assistantSettingsScroll}',
             "assistantSettingsScrollContent",
             "assistantQuickSection",
             "assistantFileSurfaceStyles.filesSection",
@@ -1510,7 +1546,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
         localized = (ROOT / "rn/packages/shared/src/i18n/runtimeSettingsI18n.ts").read_text(encoding="utf-8")
         keys = re.findall(r"'key': '([^']+)'", schema)
-        self.assertEqual(71, len(keys))
+        self.assertEqual(72, len(keys))
         self.assertEqual(len(keys), len(set(keys)))
         for key in keys:
             self.assertIn(f"  {key}: {{ label:", localized)
@@ -2159,6 +2195,28 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("normalized === \"service_provider_add\"", self.ui)
         self.assertIn("normalized === \"api_key_set_auto_grouping\"", self.ui)
 
+    def test_editor_mutations_rebase_one_live_projection_revision_conflict(self) -> None:
+        """Core checks the caller revision only after the store lock frees.
+
+        A provider Apply rewrites the configuration and reloads the managed
+        proxy while holding that lock, so a control that reads Core's shared
+        revision before such an operation is accepted can never match it. The
+        buffered dispatch rebases once on the authoritative snapshot instead of
+        discarding the user's edit and reporting a conflict.
+        """
+
+        retryable = self.ui.split("function isRevisionRetryableAction(type: string): boolean", 1)[1].split(
+            "\n}",
+            1,
+        )[0]
+        self.assertIn('normalized.startsWith("model_") || normalized.startsWith("provider_")', retryable)
+        # Wildcarding the editor families must not swallow the import actions:
+        # their file capability is a one-time lease that a retry cannot reuse.
+        self.assertIn('normalized.startsWith("model_")', retryable)
+        self.assertNotIn('startsWith("providers_import_"', retryable)
+        dispatch = self.ui.split("const enqueueDispatch =", 1)[1].split("const dispatch: Dispatch", 1)[0]
+        self.assertIn("if (!isRevisionConflict(reason) || !isRevisionRetryableAction(type)) throw reason;", dispatch)
+
     def test_request_log_display_formats_duration_and_tokens_without_changing_records(self) -> None:
         """Units convert at display time only; recorded values stay raw."""
 
@@ -2169,8 +2227,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "Math.round(tokens / 100) / 10",
             "const duration = formatLogDuration(compactLogValue(value.duration_ms));",
             "`${formatLogTokens(sentTokens)} / ${formatLogTokens(receivedTokens)}`",
-            "{ label: translate(\"logs.duration\"), width: 64, value: (row) => row.duration }",
-            "{ label: translate(\"logs.tokenCountK\"), width: 96, value: (row) => row.tokens }",
+            "{ label: translate(\"logs.duration\"), width: 62, value: (row) => row.duration }",
+            "{ label: translate(\"logs.tokenCountK\"), width: 79, value: (row) => row.tokens }",
         ):
             self.assertIn(marker, self.ui)
 
@@ -2188,8 +2246,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function logColumns(",
             '<NativeTable columns={nativeTableColumns} rows={nativeTableRows}',
             "translate(\"logs.failed\")",
-            'translate("logs.sending")',
-            'translate("logs.streaming")',
+            "function requestStatusLabel(",
+            'pending: "logs.sending"',
+            'stream: "logs.streaming"',
+            'success: "logs.success"',
+            'failure: "logs.failed"',
+            'stuck: "logs.stuck"',
+            'aborted: "logs.aborted"',
+            "function requestErrorReasonLabel(",
+            "function logLevelLabel(",
+            "function menuActionLabel(",
             'const keyTime = tab === "requests" && requestId ? "" : time;',
             "const proxyPrefix = detail.match",
             'translate("logs.duration")',
@@ -2212,6 +2278,53 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "logInfoBar: { height: 21, minHeight: 21",
             'logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row"',
             'logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 },',
+        ):
+            self.assert_ui_has(marker)
+
+    def test_log_vocabulary_is_localized_in_both_languages(self) -> None:
+        english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
+        chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        # Every fixed log vocabulary the viewer renders must resolve through
+        # i18n instead of printing the raw runtime token.
+        for marker in (
+            "function requestStatusLabel(",
+            "function logLevelLabel(",
+            "function menuActionLabel(",
+            "function requestErrorReasonLabel(",
+            "function routeTraceReasonLabel(",
+            'const action = tab === "actions" ? menuActionLabel(',
+            "status = logLevelLabel(servicePrefix[2], translate);",
+            "status = logLevelLabel(proxyPrefix[2] || \"\", translate);",
+            ": logErrorDetail(value.error, translate);",
+        ):
+            self.assert_ui_has(marker)
+        for key, zh, en in (
+            ("logs.success", "成功", "Success"),
+            ("logs.stuck", "停滞", "Stalled"),
+            ("logs.level.debug", "调试", "Debug"),
+            ("logs.level.info", "信息", "Info"),
+            ("logs.level.warning", "警告", "Warning"),
+            ("logs.level.error", "错误", "Error"),
+            ("logs.level.critical", "严重", "Critical"),
+            ("logs.routeTrace.reasonStreamIncomplete", "上游流未完整结束", "Upstream stream ended before completion"),
+            ("logs.routeTrace.reasonBodyCapacity", "上游请求体容量不足", "Upstream rejected the request body size"),
+            ("logs.routeTrace.reasonImageUnsupported", "所有路由都不支持图像工具", "No route supports the image tool"),
+            ("logs.routeTrace.reasonCompactionUnsupported", "上游不支持 Codex 压缩", "Upstream does not support Codex compaction"),
+            ("logs.routeTrace.reasonImageFallback", "图像工具运行时回退", "Image tool runtime fallback"),
+        ):
+            self.assertIn(f'"{key}": "{en}",', english)
+            self.assertIn(f'"{key}": "{zh}",', chinese)
+            self.assertIn(f'| "{key}"', translation_keys)
+        # The unmapped upstream reason stays readable in request details and
+        # reusable menu actions keep their pane/service labels.
+        for marker in (
+            "return upstreamStatusReasonLabel(normalized, translate) ?? (key ? translate(key) : normalized);",
+            '"open-providers-models": "status.providers",',
+            '"service-restart": "service.restart",',
+            '"set-language-zh-Hans": "language.simplified_chinese",',
+            '"no-available-deployment": "logs.noAvailableRoute",',
+            '"model-not-configured": "logs.modelNotConfigured",',
         ):
             self.assert_ui_has(marker)
 
@@ -2415,6 +2528,55 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("func resultOnEnd() -> NativeGroupManagerResult?", mac_leaf)
         self.assertIn("let autoGrouping: Bool\n    let creates: [Create]\n    let updates: [Update]\n    let deletes: [String]", mac_leaf)
         self.assertIn("table.usesAlternatingRowBackgroundColors = true", mac_leaf)
+        # The sheet list heads its columns with the same 名称 / 分组 / 倍率
+        # labels the shared keys table used, on both hosts.
+        self.assertIn('multiplierLabel: translate("relay.apiKeyMultiplier")', relay)
+        self.assertIn("multiplierLabel: string;", types)
+        self.assertIn("table.headerView = NSTableHeaderView(frame: NSRect(x: 0, y: 0, width: 0, height: headerHeight))", mac_leaf)
+        self.assertIn('nameColumn.title = label("nameLabel")', mac_leaf)
+        self.assertIn('groupColumn.title = label("groupLabel")', mac_leaf)
+        self.assertIn('multiplierColumn.title = label("multiplierLabel")', mac_leaf)
+        self.assertIn("nameColumn.headerCell.attributedStringValue = groupManagerHeaderTitle(nameColumn.title)", mac_leaf)
+        self.assertIn('labels.multiplier_label = read("multiplierLabel");', windows_module)
+        self.assertIn("append_column_label(0, labels.name_label);", windows_leaf)
+        self.assertIn("append_column_label(1, labels.group_label);", windows_leaf)
+        self.assertIn("append_column_label(2, labels.multiplier_label);", windows_leaf)
+        self.assertIn("list_frame.Child(list_body);", windows_leaf)
+        # The footer saves and closes, and its button stays disabled until the
+        # draft would change something: no no-op verification round-trip.
+        self.assertIn('applyLabel: translate("status.saveAndClose")', relay)
+        self.assertIn('"status.saveAndClose": "保存并关闭"', self.zh)
+        self.assertIn('"status.saveAndClose": "Save and Close"', self.en)
+        self.assertIn("applyButton.isEnabled = false", mac_leaf)
+        self.assertIn("private func refreshApplyButton() {", mac_leaf)
+        self.assertIn("guard applied, hasStagedChanges else { return nil }", mac_leaf)
+        self.assertIn("guard hasStagedChanges else { return }", mac_leaf)
+        self.assertIn("apply.IsEnabled(false);", windows_leaf)
+        self.assertIn("auto refresh_apply = ", windows_leaf)
+        self.assertIn("if (!*applied || !has_staged_changes()) return;", windows_leaf)
+        # 自动分组 only reports what the store already holds: no dimmed rows and
+        # no staged pending pills in the key list while it is on.
+        self.assertIn("private func presentation(for row: KeyRow) -> (value: String, isStaged: Bool) {", mac_leaf)
+        self.assertIn('if autoGroupingOn { return (value: "", isStaged: false) }', mac_leaf)
+        self.assertIn("text?.textColor = staged ? .tertiaryLabelColor", mac_leaf)
+        self.assertIn("auto presentation = ", windows_leaf)
+        self.assertIn("if (toggle_on()) return {std::wstring{}, false};", windows_leaf)
+        self.assertIn("name.Foreground(row.deleted && !toggle_on()", windows_leaf)
+        # The frame fits all three columns inside the pane, and both hosts floor
+        # the trailing 未分组 text instead of clipping the multiplier column.
+        self.assertIn("listFrame.widthAnchor.constraint(equalToConstant: 344),", mac_leaf)
+        self.assertIn("multiplierColumn.width = 74", mac_leaf)
+        self.assertIn("constexpr double kMultiplierColumnWidth = 74;", windows_leaf)
+        # 自动分组 follows the store: 未分组 for a stale or missing group, and no
+        # stale group name or id echoed in the group column.
+        self.assertIn('ungroupedLabel: translate("relay.apiKeyUngrouped")', relay)
+        self.assertIn("ungroupedLabel: string;", types)
+        self.assertIn('labels.ungrouped_label = read("ungroupedLabel");', windows_module)
+        self.assertIn("private func currentGroupText(for row: KeyRow) -> String {", mac_leaf)
+        self.assertIn("private func multiplierText(for row: KeyRow) -> String {", mac_leaf)
+        self.assertIn("private lazy var currentGroupNames: [String: String] = {", mac_leaf)
+        self.assertIn("auto current_group_text = ", windows_leaf)
+        self.assertIn("auto multiplier_text = ", windows_leaf)
         self.assertIn("private final class NativeListFrameView: NSView", mac_leaf)
         self.assertIn("struct GroupManagerResult {", (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeaf.h").read_text(encoding="utf-8"))
         self.assertIn("grid.Background(index % 2 == 1", windows_leaf)

@@ -739,6 +739,55 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual("backup", reloaded_model["provider"])
             self.assertEqual("backup-first", reloaded_model["api_key_name"])
 
+    def test_model_move_provider_prefers_a_same_named_destination_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "backup",
+                        "enabled": True,
+                        "api_base": "https://backup.example.test/v1",
+                        "api_key": "replace-me-backup-secret",
+                        "api_keys": [
+                            {"name": "backup-first", "value": "replace-me-backup-secret"},
+                            {"name": "default", "value": "replace-me-default-secret"},
+                        ],
+                        "models": [],
+                    }
+                },
+            )
+
+            snapshot = domain.dispatch(
+                "model.move_provider",
+                {
+                    "provider_id": "primary",
+                    "model_id": "00000071",
+                    "destination_provider_id": "backup",
+                },
+            )
+            providers = {provider["name"]: provider for provider in snapshot["providers"]}
+            moved = providers["backup"]["models"][0]
+            # The destination offers a ProviderKey with the moved model's own
+            # key name, so the move keeps the route identity instead of
+            # silently re-pointing the model at another credential.
+            self.assertEqual("default", moved["api_key_name"])
+            destination_slot = next(
+                slot
+                for slot in providers["backup"]["key_states"]
+                if slot["name"] == "default"
+            )
+            self.assertEqual(destination_slot["id"], moved["provider_key_id"])
+            self.assertNotIn("replace-me-default-secret", json.dumps(snapshot))
+
+            domain.apply()
+            reloaded = ProvidersModelsDomain(path).snapshot()
+            reloaded_providers = {provider["name"]: provider for provider in reloaded["providers"]}
+            self.assertEqual("default", reloaded_providers["backup"]["models"][0]["api_key_name"])
+
     def test_provider_key_actions_stage_values_only_through_named_secret_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"

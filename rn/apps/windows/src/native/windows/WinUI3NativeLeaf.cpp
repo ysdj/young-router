@@ -1085,6 +1085,43 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       L"ControlStrokeColorDefaultBrush", winrt::Windows::UI::Color{255, 140, 140, 140}));
   list_frame.Background(theme_brush(
       L"ControlFillColorDefaultBrush", winrt::Windows::UI::Color{255, 255, 255, 255}));
+  // Column labels head the list so 名称 / 分组 / 倍率 stay readable while
+  // 自动分组 disables the detail pane.  The group and multiplier columns keep
+  // fixed widths in the header and in every row so both stay aligned.
+  constexpr double kNameColumnWidth = 160;
+  constexpr double kGroupColumnWidth = 110;
+  constexpr double kMultiplierColumnWidth = 74;
+  controls::Grid list_body;
+  controls::RowDefinition list_columns_row;
+  list_columns_row.Height(xaml::GridLengthHelper::Auto());
+  list_body.RowDefinitions().Append(list_columns_row);
+  list_body.RowDefinitions().Append(controls::RowDefinition());
+  controls::Grid list_columns;
+  controls::ColumnDefinition columns_name;
+  controls::ColumnDefinition columns_group;
+  controls::ColumnDefinition columns_multiplier;
+  columns_name.Width(xaml::GridLengthHelper::FromPixels(kNameColumnWidth));
+  columns_group.Width(xaml::GridLengthHelper::FromPixels(kGroupColumnWidth));
+  columns_multiplier.Width(xaml::GridLengthHelper::FromPixels(kMultiplierColumnWidth));
+  list_columns.ColumnDefinitions().Append(columns_name);
+  list_columns.ColumnDefinitions().Append(columns_group);
+  list_columns.ColumnDefinitions().Append(columns_multiplier);
+  auto append_column_label = [&](int32_t column, std::wstring const& text) {
+    controls::TextBlock label;
+    label.FontSize(kUIFontSize);
+    label.VerticalAlignment(xaml::VerticalAlignment::Center);
+    label.Text(winrt::hstring(text));
+    label.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+    label.Margin(column == 0 ? xaml::Thickness{8, 4, 8, 4} : xaml::Thickness{0, 4, 8, 4});
+    label.Foreground(theme_brush(
+        L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+    controls::Grid::SetColumn(label, column);
+    list_columns.Children().Append(label);
+  };
+  append_column_label(0, labels.name_label);
+  append_column_label(1, labels.group_label);
+  append_column_label(2, labels.multiplier_label);
+  list_body.Children().Append(list_columns);
   controls::ListView list;
   list.SelectionMode(controls::ListViewSelectionMode::Single);
   list.IsItemClickEnabled(true);
@@ -1095,7 +1132,9 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       L"ControlFillColorDefaultBrush", winrt::Windows::UI::Color{255, 255, 255, 255}));
   controls::ScrollViewer::SetVerticalScrollBarVisibility(list, controls::ScrollBarVisibility::Auto);
   controls::ScrollViewer::SetHorizontalScrollBarVisibility(list, controls::ScrollBarVisibility::Disabled);
-  list_frame.Child(list);
+  controls::Grid::SetRow(list, 1);
+  list_body.Children().Append(list);
+  list_frame.Child(list_body);
   controls::Grid::SetRow(list_frame, 1);
   left.Children().Append(list_frame);
   controls::Grid::SetColumn(left, 0);
@@ -1178,6 +1217,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   controls::Button apply;
   apply.FontSize(kUIFontSize);
   apply.Content(winrt::box_value(winrt::hstring(labels.apply_label)));
+  apply.IsEnabled(false);
   actions.Children().Append(close);
   actions.Children().Append(apply);
   controls::Grid::SetColumn(actions, 1);
@@ -1190,6 +1230,47 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   dialog.Content(root);
 
   auto selected_index = [&list]() -> int32_t { return list.SelectedIndex(); };
+
+  // Save and Close stays disabled until the draft would change the account:
+  // the auto-grouping switch, a staged create, update, or delete.
+  auto staged_deletes = std::make_shared<size_t>(0);
+  auto has_staged_changes = [&rows, &toggle_on, initial_auto_grouping = auto_grouping, staged_deletes]() {
+    if (toggle_on() != initial_auto_grouping) return true;
+    if (*staged_deletes > 0) return true;
+    for (auto const& row : *rows) {
+      if (row.draft) {
+        if (!row.name.empty()) return true;
+        continue;
+      }
+      if (row.name != row.original_name || row.group_id != row.original_group_id || row.enabled != row.original_enabled) return true;
+    }
+    return false;
+  };
+  auto refresh_apply = [&apply, &has_staged_changes]() { apply.IsEnabled(has_staged_changes()); };
+  // Group names the account still offers, keyed by group id, so a key that
+  // points at a dropped group reports 未分组 instead of a stale name.
+  auto current_group_text = [&groups](SheetRow const& row, GroupManagerLabels const& labels) -> std::wstring {
+    if (row.group_id.empty()) return labels.ungrouped_label;
+    for (auto const& entry : groups) {
+      if (entry.first == row.group_id) return entry.second;
+    }
+    return row.group_label.empty() ? labels.ungrouped_label : row.group_label;
+  };
+  auto multiplier_text = [&groups](SheetRow const& row, GroupManagerLabels const& labels) -> std::wstring {
+    if (row.group_id.empty()) return labels.ungrouped_label;
+    for (auto const& entry : groups) {
+      if (entry.first == row.group_id) return row.multiplier;
+    }
+    return labels.ungrouped_label;
+  };
+  // 自动分组 keeps the multiplier column empty: the group name already carries
+  // the rate and the alignment step owns every key.
+  auto presentation = [&toggle_on, &multiplier_text](SheetRow const& row, GroupManagerLabels const& labels) -> std::pair<std::wstring, bool> {
+    if (toggle_on()) return {std::wstring{}, false};
+    if (row.deleted) return {labels.deleted_label, true};
+    if (row.draft) return {labels.draft_label, true};
+    return {multiplier_text(row, labels), false};
+  };
 
   auto load_detail = [&]() {
     const int32_t selected = selected_index();
@@ -1228,8 +1309,8 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       controls::ColumnDefinition row_name;
       controls::ColumnDefinition row_group;
       controls::ColumnDefinition row_detail;
-      row_group.Width(xaml::GridLengthHelper::Auto());
-      row_detail.Width(xaml::GridLengthHelper::Auto());
+      row_group.Width(xaml::GridLengthHelper::FromPixels(kGroupColumnWidth));
+      row_detail.Width(xaml::GridLengthHelper::FromPixels(kMultiplierColumnWidth));
       grid.ColumnDefinitions().Append(row_name);
       grid.ColumnDefinitions().Append(row_group);
       grid.ColumnDefinitions().Append(row_detail);
@@ -1239,7 +1320,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       name.VerticalAlignment(xaml::VerticalAlignment::Center);
       name.Text(winrt::hstring(row.name));
       name.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-      name.Foreground(row.deleted
+      name.Foreground(row.deleted && !toggle_on()
           ? theme_brush(L"TextFillColorTertiaryBrush", winrt::Windows::UI::Color{255, 150, 150, 150})
           : theme_brush(L"TextFillColorPrimaryBrush", winrt::Windows::UI::Color{255, 30, 30, 30}));
       controls::Grid::SetColumn(name, 0);
@@ -1248,7 +1329,8 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       group.FontSize(kUIFontSize);
       group.Margin(xaml::Thickness{0, 0, 8, 0});
       group.VerticalAlignment(xaml::VerticalAlignment::Center);
-      group.Text(winrt::hstring(row.group_label));
+      group.Text(winrt::hstring(current_group_text(row, labels)));
+      group.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
       group.Foreground(theme_brush(
           L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
       controls::Grid::SetColumn(group, 1);
@@ -1257,9 +1339,14 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       detail_text.FontSize(kUIFontSize);
       detail_text.Margin(xaml::Thickness{0, 0, 8, 0});
       detail_text.VerticalAlignment(xaml::VerticalAlignment::Center);
-      detail_text.Text(winrt::hstring(row.deleted ? labels.deleted_label : (row.draft ? labels.draft_label : row.multiplier)));
-      detail_text.Foreground(theme_brush(
-          L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+      auto const detail_presentation = presentation(row, labels);
+      detail_text.FontSize(kUIFontSize);
+      detail_text.Margin(xaml::Thickness{0, 0, 8, 0});
+      detail_text.VerticalAlignment(xaml::VerticalAlignment::Center);
+      detail_text.Text(winrt::hstring(detail_presentation.first));
+      detail_text.Foreground(detail_presentation.second
+          ? theme_brush(L"TextFillColorTertiaryBrush", winrt::Windows::UI::Color{255, 150, 150, 150})
+          : theme_brush(L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
       controls::Grid::SetColumn(detail_text, 2);
       grid.Children().Append(detail_text);
       list.Items().Append(grid);
@@ -1271,6 +1358,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     }
     *syncing = false;
     load_detail();
+    refresh_apply();
   };
 
   auto commit_name = [&]() {
@@ -1332,6 +1420,10 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       load_detail();
     } else {
       (*rows)[static_cast<size_t>(selected)].deleted = !(*rows)[static_cast<size_t>(selected)].deleted;
+      *staged_deletes = 0;
+      for (auto const& row : *rows) {
+        if (!row.draft && row.deleted) ++*staged_deletes;
+      }
       rebuild();
       list.SelectedIndex(selected);
       load_detail();
@@ -1365,12 +1457,23 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     if (args.Key() != winrt::Windows::System::VirtualKey::Enter) return;
     commit_name();
   });
-  toggle.Click([&](auto const&, auto const&) { load_detail(); });
+  toggle.Click([&](auto const&, auto const&) {
+    // Returning to 自动分组 restores the staged deletes the automatic layout had
+    // marked, so the list never shows them while it is on.
+    if (toggle_on() && *staged_deletes > 0) {
+      for (auto& row : *rows) row.deleted = false;
+      *staged_deletes = 0;
+      rebuild();
+    }
+    load_detail();
+    refresh_apply();
+  });
   close.Click([&](auto const&, auto const&) {
     *applied = false;
     dialog.Close();
   });
   apply.Click([&](auto const&, auto const&) {
+    if (!has_staged_changes()) return;
     commit_name();
     *applied = true;
     dialog.Close();
@@ -1380,7 +1483,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   bool finished = false;
   dialog.Closed([&](auto const&, auto const&) {
     finished = true;
-    if (!*applied) return;
+    if (!*applied || !has_staged_changes()) return;
     GroupManagerResult result;
     auto checked = toggle.IsChecked();
     result.auto_grouping = checked && checked.Value();
@@ -1402,6 +1505,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
 
   rebuild();
   load_detail();
+  refresh_apply();
   if (!RunOwnedModalWindow(dialog, window_handle_, {780, 480}, finished)) return std::nullopt;
   return outcome;
 }

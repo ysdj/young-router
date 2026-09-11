@@ -504,11 +504,14 @@ export type RelayGroupManagerLabels = {
   removeLabel: string;
   nameLabel: string;
   groupLabel: string;
+  multiplierLabel: string;
   enabledLabel: string;
   newKeyName: string;
   draftLabel: string;
   deletedLabel: string;
   autoGroupingLabel: string;
+  /** The label for a key whose group the station no longer offers. */
+  ungroupedLabel: string;
   closeLabel: string;
   applyLabel: string;
   hint: string;

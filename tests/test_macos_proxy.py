@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -75,6 +76,8 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         uvicorn = SimpleNamespace(run=mock.Mock())
         uvicorn_subprocess = SimpleNamespace(spawn=None)
         forkserver = object()
+        settle = mock.Mock()
+        state_module = SimpleNamespace(settle_stale_recent_requests=settle)
 
         def import_module(name: str) -> object:
             if name == "uvicorn":
@@ -83,7 +86,9 @@ class MacOSProxyLauncherTests(unittest.TestCase):
                 return uvicorn_subprocess
             raise AssertionError(name)
 
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
+            sys.modules, {"young_router.state": state_module}
+        ), mock.patch.object(
             multiprocessing, "set_forkserver_preload", create=True
         ) as set_preload, mock.patch.object(
             multiprocessing, "get_context", return_value=forkserver
@@ -119,6 +124,9 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         set_preload.assert_called_once_with(["litellm.proxy.proxy_server"])
         get_context.assert_called_once_with("forkserver")
         self.assertIs(forkserver, uvicorn_subprocess.spawn)
+        # A new proxy process owns no in-flight requests, so it closes rows an
+        # earlier process left unfinished before the workers start serving.
+        settle.assert_called_once_with()
         uvicorn.run.assert_called_once_with(
             "litellm.proxy.proxy_server:app",
             host="127.0.0.1",
