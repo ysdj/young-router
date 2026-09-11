@@ -34,6 +34,10 @@ namespace {
 constexpr CGFloat LiteLLMUIFontSize = 13.0;
 constexpr CGFloat LiteLLMTableMinimumHorizontalPadding = 8.0;
 constexpr CGFloat LiteLLMTableHeaderHorizontalPadding = 6.0;
+// Content-sized log tables can hold thousands of rows.  Measuring every cell on
+// each refresh would stall the main thread, so the width scan that sizes the
+// trailing column is bounded to the newest rows the table shows first.
+constexpr NSUInteger LiteLLMTableMeasuredRowLimit = 200;
 
 NSDictionary<NSString *, id> *ImmediateLayerActions()
 {
@@ -986,6 +990,39 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 }
 
 @end
+
+// `LiteLLMPersistentScroller` (declared in AppKitNativeLeaf.swift, visible here
+// through the generated Swift header) draws the scroller this app keeps on
+// screen as the system draws its overlay scroller: one translucent capsule knob
+// and no track, instead of AppKit's opaque legacy bar with a visible track.
+// AppKit rebuilds a scroller whenever a scroller flag flips back on and leaves a
+// scroller it hid while idle hidden until the next scroll event, so every site
+// that keeps a scroller visible re-runs this from its layout path.
+static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal, BOOL vertical)
+{
+  BOOL installed = NO;
+  if (horizontal && scrollView.hasHorizontalScroller &&
+      ![scrollView.horizontalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {
+    scrollView.horizontalScroller = [[LiteLLMPersistentScroller alloc] initWithFrame:NSZeroRect];
+    installed = YES;
+  }
+  if (vertical && scrollView.hasVerticalScroller &&
+      ![scrollView.verticalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {
+    scrollView.verticalScroller = [[LiteLLMPersistentScroller alloc] initWithFrame:NSZeroRect];
+    installed = YES;
+  }
+  if (installed) {
+    [scrollView tile];
+  }
+  if (horizontal && scrollView.hasHorizontalScroller) {
+    scrollView.horizontalScroller.hidden = NO;
+    scrollView.horizontalScroller.alphaValue = 1;
+  }
+  if (vertical && scrollView.hasVerticalScroller) {
+    scrollView.verticalScroller.hidden = NO;
+    scrollView.verticalScroller.alphaValue = 1;
+  }
+}
 
 @interface LiteLLMNavigationLinkButton : LiteLLMTabButton
 @property(nonatomic) BOOL linkMode;
@@ -1974,7 +2011,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitTextFieldCls(void)
     // same on/off control the system Settings panes use.
     _switch = [[NSSwitch alloc] initWithFrame:NSZeroRect];
     _switch.identifier = LiteLLMTabStopIdentifier;
-    _switch.controlSize = NSControlSizeRegular;
+    // Every switch in this app labels a 13 pt value in a 26 pt settings row.
+    // The system's regular switch now measures 54 x 24 pt, which swallows that
+    // row and overflows the 44 pt slot the row reserves for it, so the compact
+    // size (44 x 20 pt) is the one that matches the surrounding text.
+    _switch.controlSize = NSControlSizeSmall;
     _switch.target = self;
     _switch.action = @selector(changed:);
     _host = [[LiteLLMAppKitControlHostView alloc] initWithFrame:NSZeroRect];
@@ -2091,6 +2132,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 @interface LiteLLMAppKitTableComponentView () <NSTableViewDataSource, NSTableViewDelegate, RCTLiteLLMAppKitTableViewProtocol>
 - (void)applySourceListChrome:(BOOL)sourceList;
 - (void)updateColumnMinimumWidths;
+- (BOOL)applyPersistentTableScrollerChrome;
+- (void)installPersistentTableScrollers;
 - (void)updateScrollerVisibility;
 - (void)tableColumnDidResize:(NSNotification *)notification;
 - (BOOL)isSpanningRow:(NSInteger)row;
@@ -2390,11 +2433,15 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
 
   CGFloat spanningWidth = 0;
-  for (NSUInteger row = 0; row < viewProps.rowKeys.size(); row++) {
+  const size_t rowCount = viewProps.rowKeys.size();
+  const size_t firstMeasuredRow = rowCount > LiteLLMTableMeasuredRowLimit
+      ? rowCount - LiteLLMTableMeasuredRowLimit
+      : 0;
+  for (size_t row = firstMeasuredRow; row < rowCount; row++) {
     const BOOL spanning = [self isSpanningRow:static_cast<NSInteger>(row)];
     for (NSUInteger column = 0; column < columnCount; column++) {
       if (spanning && column > 0) break;
-      const size_t cellIndex = static_cast<size_t>(row) * columnCount + column;
+      const size_t cellIndex = row * columnCount + column;
       NSString *value = cellIndex < viewProps.cells.size() ? StringFromStdString(viewProps.cells[cellIndex]) : @"";
       const CGFloat columnPadding = column == 0 ? firstColumnHorizontalPadding : horizontalPadding;
       const CGFloat textWidth = ceil([value sizeWithAttributes:@{NSFontAttributeName: TableCellFont()}].width) +
@@ -2418,6 +2465,42 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
         MIN(_requestedColumnWidths[index], minimumWidths[index]));
   }
   _settingColumnWidths = NO;
+}
+
+// A scroller the table actually needs has to stay on screen.  AppKit's overlay
+// scrollers fade out again as soon as scrolling stops, so a table that clips a
+// trailing column or holds rows past its viewport would hide the only
+// affordance for them until the user scrolls.  Pin such a scroller with the
+// legacy style and auto-hide off, and restore the platform default chrome as
+// soon as the table fits again so a content-sized table keeps its whole
+// viewport.  Returns YES when the chrome changed: the chrome decides how much
+// viewport the table keeps, so the overflow decision must be measured again.
+- (BOOL)applyPersistentTableScrollerChrome
+{
+  const BOOL usesScrollers = _scrollView.hasHorizontalScroller || _scrollView.hasVerticalScroller;
+  const NSScrollerStyle scrollerStyle = usesScrollers ? NSScrollerStyleLegacy : NSScrollerStyleOverlay;
+  const BOOL autohidesScrollers = !usesScrollers;
+  const BOOL chromeChanged =
+      _scrollView.scrollerStyle != scrollerStyle || _scrollView.autohidesScrollers != autohidesScrollers;
+  if (chromeChanged) {
+    _scrollView.scrollerStyle = scrollerStyle;
+    _scrollView.autohidesScrollers = autohidesScrollers;
+    [_scrollView tile];
+  }
+  return chromeChanged;
+}
+
+// Draw a pinned scroller with LiteLLMPersistentScroller so it stays translucent
+// instead of covering the row it sits on, and unhide it: a scroller AppKit hid
+// while idle stays hidden until the next scroll event.  AppKit rebuilds a
+// scroller whenever the matching flag flips back on, so this runs from the
+// layout path on every pass.
+- (void)installPersistentTableScrollers
+{
+  InstallPersistentScrollers(
+      _scrollView,
+      _scrollView.hasHorizontalScroller,
+      _scrollView.hasVerticalScroller);
 }
 
 - (void)updateScrollerVisibility
@@ -2445,6 +2528,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     for (CGFloat columnWidth : _requestedColumnWidths) width += columnWidth;
     return width;
   };
+  // A table keeps the requested widths (short columns stay readable and long
+  // values ellipsize) and only the trailing column grows to the width its
+  // measured content needs, so a long detail cell stays readable through the
+  // horizontal scroller.  Columns the user resized keep their width.
   const auto trailingOverflowWidth = [&]() {
     if (!viewProps.scrollTrailingColumnOverflow || _measuredColumnWidths.size() != columnCount ||
         _userResizedColumns.size() != columnCount || _userResizedColumns.back()) {
@@ -2458,7 +2545,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     });
   };
 
-  for (NSUInteger index = 0; index < 4; index++) {
+  for (NSUInteger index = 0; index < 6; index++) {
     const NSRect visibleBounds = _scrollView.contentView.bounds;
     const CGFloat availableColumnWidth = NSWidth(visibleBounds);
     const CGFloat preferredContentWidth = requestedContentWidth() + trailingOverflowWidth();
@@ -2477,8 +2564,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       [_scrollView tile];
       continue;
     }
+    if ([self applyPersistentTableScrollerChrome]) continue;
     break;
   }
+  [self installPersistentTableScrollers];
 
   const NSRect visibleBounds = _scrollView.contentView.bounds;
   std::vector<CGFloat> laidOutColumnWidths = _requestedColumnWidths;
@@ -3348,7 +3437,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCodeWebViewCls(void)
   }
   return self;
 }
-
 - (NSScrollView *)nearestScrollView
 {
   for (NSView *view = self.superview; view != nil; view = view.superview) {
@@ -3381,22 +3469,29 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCodeWebViewCls(void)
   if (scrollView == nil) {
     return;
   }
-  BOOL needsTile = NO;
+  // The pane keeps a scroller only while its content actually overflows: the
+  // overlay scroller AppKit shows in the fitting case fades out after a scroll,
+  // and a pinned scroller would paint a full-length bar over content that fits.
+  NSView *documentView = scrollView.documentView;
+  const BOOL overflows = documentView != nil &&
+      NSHeight(documentView.frame) > NSHeight(scrollView.contentView.bounds) + 0.5;
+  const NSScrollerStyle scrollerStyle = overflows ? NSScrollerStyleLegacy : NSScrollerStyleOverlay;
+  const BOOL autohidesScrollers = !overflows;
+  const BOOL chromeChanged =
+      scrollView.scrollerStyle != scrollerStyle || scrollView.autohidesScrollers != autohidesScrollers;
+  if (chromeChanged) {
+    scrollView.scrollerStyle = scrollerStyle;
+    scrollView.autohidesScrollers = autohidesScrollers;
+    [scrollView tile];
+  }
+  if (!overflows) {
+    return;
+  }
   if (!scrollView.hasVerticalScroller) {
     scrollView.hasVerticalScroller = YES;
-    needsTile = YES;
+    [scrollView tile];
   }
-  if (scrollView.scrollerStyle != NSScrollerStyleLegacy) {
-    scrollView.scrollerStyle = NSScrollerStyleLegacy;
-    needsTile = YES;
-  }
-  if (scrollView.autohidesScrollers) {
-    scrollView.autohidesScrollers = NO;
-    needsTile = YES;
-  }
-  if (needsTile) [scrollView tile];
-  scrollView.verticalScroller.hidden = NO;
-  scrollView.verticalScroller.alphaValue = 1;
+  InstallPersistentScrollers(scrollView, NO, YES);
 }
 
 - (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps

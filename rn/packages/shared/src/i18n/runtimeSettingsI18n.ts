@@ -103,6 +103,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_MCP_AUTO_APPROVE: { label: "自动同意 MCP 工具", help: "启用后将 Responses API 的 MCP 工具设置为 require_approval=never，使上游服务不再暂停等待交互式批准。默认关闭，因为这会绕过 MCP 安全审核。" },
   YOUNG_ROUTER_LOG_MAX_BYTES: { label: "本地日志文件上限", help: "本地日志单个文件的容量上限，包括最近请求、服务标准输出 / 错误和状态项操作。每份日志保留一个包含此前末尾内容的 .1 备份。" },
   YOUNG_ROUTER_LOG_VIEW_LIMIT: { label: "日志视图行数", help: "每个日志标签最多显示的行数。此设置只改变视图，不会删除本地日志数据。" },
+  YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS: { label: "请求行中断窗口", help: "请求行在多长时间内没有进展后会被标记为已中断。客户端断开、故障转移拆连或服务重启都可能让上游尝试没有终态回调；此窗口会结束这些行，而不是一直显示“发送中”。设为 0 则保持未完成行不结束。" },
   YOUNG_ROUTER_ROUTE_TRACE_PREVIEW_CHARS: { label: "跟踪预览字符数", help: "始终开启的本地路由跟踪中保留的最大请求预览字符数。" },
   LITELLM_USE_SYSTEM_PROXIES: { label: "使用系统代理", help: "允许上游 HTTP 客户端使用 macOS 系统代理设置。关闭会让 LiteLLM 与系统代理自动发现隔离。" },
   LITELLM_PORT: { label: "本地端口", help: "LiteLLM 代理的本地 HTTP 端口。修改后会更新健康检查，且需要重启服务。" },

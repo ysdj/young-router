@@ -1936,6 +1936,21 @@ struct NativeGroupManagerResult {
     let deletes: [String]
 }
 
+/// Column headers inside the group manager sheet reuse the shared table's
+/// header title style so the sheet list reads like every other native table.
+private func groupManagerHeaderTitle(_ title: String) -> NSAttributedString {
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.lineBreakMode = .byTruncatingTail
+    paragraph.firstLineHeadIndent = 8
+    paragraph.headIndent = 8
+    paragraph.tailIndent = -8
+    return NSAttributedString(string: title, attributes: [
+        .font: NSFont.systemFont(ofSize: nativeUIFontSize, weight: .medium),
+        .foregroundColor: NSColor.labelColor,
+        .paragraphStyle: paragraph,
+    ])
+}
+
 /// The group manager sheet: the pre-refactor master-detail editor.  The left
 /// list carries the keys with their group and rate plus the ＋/－ toolbar, the
 /// right pane edits the selected key, and the bottom bar applies or discards
@@ -1979,6 +1994,61 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     private weak var groupPopUp: NSPopUpButton?
     private weak var toggle: NSButton?
 
+    /// Save and Close stays disabled until the draft would change the account:
+    /// the auto-grouping switch, a staged create, update, or delete.
+    private var applyButton: NSButton?
+    private var stagedDeleteCount = 0
+
+    private var autoGroupingOn: Bool {
+        (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on
+    }
+
+    private var hasStagedChanges: Bool {
+        guard autoGroupingOn == initialAutoGrouping else { return true }
+        if stagedDeleteCount > 0 { return true }
+        return rows.contains { row in
+            if row.isDraft { return !row.name.isEmpty }
+            return row.name != row.originalName
+                || row.groupID != row.originalGroupID
+                || row.enabled != row.originalEnabled
+        }
+    }
+
+    /// Group names the account still offers, keyed by group id, so a key that
+    /// points at a dropped group reports 未分组 instead of echoing a stale name.
+    private lazy var currentGroupNames: [String: String] = {
+        var names: [String: String] = [:]
+        for group in groups where !group.id.isEmpty { names[group.id] = group.label }
+        return names
+    }()
+
+    /// The multiplier column follows the group the key belongs to right now.
+    /// It stays empty while 自动分组 owns the layout: the group name already
+    /// carries the rate, and the alignment step owns every key anyway.
+    private func presentation(for row: KeyRow) -> (value: String, isStaged: Bool) {
+        // The switch gates every manual write, so a draft delete or create can
+        // only be staged while it is off.
+        if autoGroupingOn { return (value: "", isStaged: false) }
+        if row.deleted { return (label("deletedLabel"), true) }
+        if row.isDraft { return (label("draftLabel"), true) }
+        return (multiplierText(for: row), false)
+    }
+
+    /// 未分组 when the key has no group the store still offers; otherwise the
+    /// group's current name, falling back to the label a station sent.
+    private func currentGroupText(for row: KeyRow) -> String {
+        if row.groupID.isEmpty { return label("ungroupedLabel") }
+        if let name = currentGroupNames[row.groupID] { return name }
+        return row.groupLabel.isEmpty ? label("ungroupedLabel") : row.groupLabel
+    }
+
+    private func multiplierText(for row: KeyRow) -> String {
+        guard !row.groupID.isEmpty, currentGroupNames[row.groupID] != nil else {
+            return label("ungroupedLabel")
+        }
+        return row.multiplier
+    }
+
     init(title: String, accountLabel: String, groups: [GroupOption], rows: [KeyRow], labels: [String: String], autoGrouping: Bool) {
         self.title = title
         self.accountLabel = accountLabel
@@ -2008,7 +2078,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
 
     func makeSheet() -> NSPanel? {
         let rowHeight: CGFloat = 22
-        let listHeight = min(360, max(120, CGFloat(rows.count + 1) * rowHeight + 2))
+        let headerHeight: CGFloat = 24
+        let listHeight = min(360, max(120, CGFloat(rows.count + 1) * rowHeight + 2 + headerHeight))
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 780, height: 172 + listHeight),
             styleMask: [.titled],
@@ -2056,15 +2127,35 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         scrollView.scrollerStyle = .legacy
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
+        scrollView.usePersistentScrollers(horizontal: false, vertical: true)
         let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("key-name"))
-        nameColumn.width = 170
+        nameColumn.width = 160
+        nameColumn.minWidth = 120
+        nameColumn.title = label("nameLabel")
+        nameColumn.headerCell.attributedStringValue = groupManagerHeaderTitle(nameColumn.title)
+        nameColumn.headerCell.isBordered = false
+        nameColumn.headerCell.isBezeled = false
         let groupColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("key-group"))
         groupColumn.width = 110
+        groupColumn.minWidth = 110
+        groupColumn.maxWidth = 110
+        groupColumn.title = label("groupLabel")
+        groupColumn.headerCell.attributedStringValue = groupManagerHeaderTitle(groupColumn.title)
+        groupColumn.headerCell.isBordered = false
+        groupColumn.headerCell.isBezeled = false
         let multiplierColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("key-multiplier"))
-        multiplierColumn.width = 56
+        multiplierColumn.width = 74
+        multiplierColumn.minWidth = 74
+        multiplierColumn.maxWidth = 74
+        multiplierColumn.title = label("multiplierLabel")
+        multiplierColumn.headerCell.attributedStringValue = groupManagerHeaderTitle(multiplierColumn.title)
+        multiplierColumn.headerCell.isBordered = false
+        multiplierColumn.headerCell.isBezeled = false
         let table = NSTableView()
-        table.headerView = nil
         table.style = .plain
+        // The sheet list labels its columns like every other native table so
+        // 名称 / 分组 / 倍率 stay readable while 自动分组 disables the detail pane.
+        table.headerView = NSTableHeaderView(frame: NSRect(x: 0, y: 0, width: 0, height: headerHeight))
         table.addTableColumn(nameColumn)
         table.addTableColumn(groupColumn)
         table.addTableColumn(multiplierColumn)
@@ -2125,6 +2216,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         applyButton.font = NSFont.systemFont(ofSize: nativeUIFontSize)
         applyButton.keyEquivalent = "\r"
         applyButton.keyEquivalentModifierMask = []
+        applyButton.isEnabled = false
+        self.applyButton = applyButton
 
         [titleLabel, accountField, listTitle, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, hint, toggle, closeButton, applyButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
@@ -2147,7 +2240,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             addButton.widthAnchor.constraint(equalToConstant: 26),
             listFrame.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             listFrame.topAnchor.constraint(equalTo: listTitle.bottomAnchor, constant: 6),
-            listFrame.widthAnchor.constraint(equalToConstant: 360),
+            listFrame.widthAnchor.constraint(equalToConstant: 344),
             listFrame.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),
             scrollView.leadingAnchor.constraint(equalTo: listFrame.leadingAnchor, constant: 1),
             scrollView.trailingAnchor.constraint(equalTo: listFrame.trailingAnchor, constant: -1),
@@ -2178,6 +2271,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             closeButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
         ])
         loadDetail()
+        refreshApplyButton()
         return panel
     }
 
@@ -2220,6 +2314,11 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             table?.deselectAll(nil)
         }
         loadDetail()
+        refreshApplyButton()
+    }
+
+    private func refreshApplyButton() {
+        applyButton?.isEnabled = hasStagedChanges
     }
 
     private func commitNameField() {
@@ -2276,6 +2375,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             return
         }
         rows[index].deleted.toggle()
+        stagedDeleteCount = rows.filter { !$0.isDraft && $0.deleted }.count
         reloadAndSelect(index)
     }
 
@@ -2296,9 +2396,19 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     @objc private func toggleAutoGrouping(_ sender: NSButton) {
+        // Leaving the switch off restores the staged deletes the automatic
+        // layout had marked, so the list never shows them while it is on.
+        if sender.state == .on, stagedDeleteCount > 0 {
+            for index in rows.indices where rows[index].deleted { rows[index].deleted = false }
+            stagedDeleteCount = 0
+            table?.reloadData()
+        }
         loadDetail()
+        refreshApplyButton()
     }
 
+    /// Close discards the draft, but a sheet the user never touched closes
+    /// without a pointless verification round-trip in the shared UI.
     @objc private func closeSheet(_ sender: NSButton) {
         applied = false
         if let panel, let parent = panel.sheetParent {
@@ -2307,6 +2417,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     @objc private func applySheet(_ sender: NSButton) {
+        guard hasStagedChanges else { return }
         commitNameField()
         applied = true
         if let panel, let parent = panel.sheetParent {
@@ -2314,9 +2425,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         }
     }
 
-    /// The staged edits, or nil when the user closed the sheet without applying.
+    /// The staged edits, or nil when the draft would not change the account.
     func resultOnEnd() -> NativeGroupManagerResult? {
-        guard applied else { return nil }
+        guard applied, hasStagedChanges else { return nil }
         return NativeGroupManagerResult(
             autoGrouping: (toggle?.state ?? (initialAutoGrouping ? .on : .off)) == .on,
             creates: rows.filter { $0.isDraft && !$0.deleted && !$0.name.isEmpty }.map {
@@ -2341,12 +2452,15 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let columnID = tableColumn?.identifier.rawValue ?? "key-name"
         let isName = columnID == "key-name"
         let value: String
+        var staged = false
         if isName {
             value = entry.name
         } else if columnID == "key-group" {
-            value = entry.groupLabel
+            // A key can point at a group the station no longer offers; report it
+            // the same way the rest of the window does.
+            value = currentGroupText(for: entry)
         } else {
-            value = entry.deleted ? label("deletedLabel") : (entry.isDraft ? label("draftLabel") : entry.multiplier)
+            (value, staged) = presentation(for: entry)
         }
         let identifier = NSUserInterfaceItemIdentifier("group-manager-\(columnID)")
         let cell: NSTableCellView
@@ -2359,7 +2473,10 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             label.translatesAutoresizingMaskIntoConstraints = false
             label.font = NSFont.systemFont(ofSize: nativeUIFontSize)
             label.lineBreakMode = .byTruncatingTail
+            label.cell?.truncatesLastVisibleLine = true
             label.maximumNumberOfLines = 1
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            label.setContentHuggingPriority(.defaultLow, for: .horizontal)
             cell.addSubview(label)
             cell.textField = label
             NSLayoutConstraint.activate([
@@ -2371,7 +2488,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let text = cell.textField
         text?.stringValue = value
         text?.toolTip = value
-        text?.textColor = entry.deleted ? .tertiaryLabelColor : (isName ? .labelColor : .secondaryLabelColor)
+        // Only a staged draft edit dims a row; 自动分组 keeps the list at full
+        // label colors because it reports what the store already holds.
+        text?.textColor = staged ? .tertiaryLabelColor : (isName ? .labelColor : .secondaryLabelColor)
         cell.setAccessibilityLabel(value)
         return cell
     }
@@ -2399,6 +2518,73 @@ final class NativeSplitView: NSSplitView {
     }
 }
 
+/// A scroller this app keeps on screen while its content overflows, drawn the
+/// way the system draws its overlay scroller: one translucent capsule knob and
+/// no track, so the row or cell underneath stays readable.  AppKit's legacy
+/// scroller is an opaque bar with a visible track, and the overlay scroller
+/// fades out again as soon as scrolling stops, so the persistent scroller needs
+/// its own drawing.  ObjC hosts (`AppKitControlViews.mm`) instantiate this class
+/// through the Swift header; only the parts-drawing methods are customized, so
+/// AppKit keeps owning the knob tracking and the scroll view keeps owning the
+/// scroller's target/action wiring.
+/// The ObjC hosts instantiate this class through the generated Swift header,
+/// so it must be public to appear in `YoungRouter-Swift.h`.
+@objc(LiteLLMPersistentScroller)
+public final class LiteLLMPersistentScroller: NSScroller {
+    private static let knobThickness: CGFloat = 6
+    private static let idleKnobAlpha: CGFloat = 0.35
+    private static let pressedKnobAlpha: CGFloat = 0.5
+
+    public override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
+        // Deliberately empty: no track is drawn over the content.
+    }
+
+    public override func drawKnob() {
+        let knobRect = rect(for: .knob)
+        guard !knobRect.isEmpty else { return }
+        let thickness = min(LiteLLMPersistentScroller.knobThickness, min(knobRect.width, knobRect.height))
+        let fillRect = knobRect.width > knobRect.height
+            ? knobRect.insetBy(dx: 0, dy: (knobRect.height - thickness) / 2)
+            : knobRect.insetBy(dx: (knobRect.width - thickness) / 2, dy: 0)
+        let radius = min(thickness, min(fillRect.width, fillRect.height)) / 2
+        let alpha = hitPart == .knob
+            ? LiteLLMPersistentScroller.pressedKnobAlpha
+            : LiteLLMPersistentScroller.idleKnobAlpha
+        NSColor.labelColor.withAlphaComponent(alpha).setFill()
+        NSBezierPath(roundedRect: fillRect, xRadius: radius, yRadius: radius).fill()
+    }
+}
+
+extension NSScrollView {
+    /// Draw the scrollers this scroll view keeps visible with
+    /// `LiteLLMPersistentScroller` instead of AppKit's opaque legacy bar, and
+    /// unhide them (AppKit leaves a scroller it hid while idle hidden until the
+    /// next scroll event).  AppKit rebuilds a scroller whenever a scroller flag
+    /// flips back on, so callers run this from their layout path.
+    func usePersistentScrollers(horizontal: Bool, vertical: Bool) {
+        var installed = false
+        if horizontal, hasHorizontalScroller, !(horizontalScroller is LiteLLMPersistentScroller) {
+            horizontalScroller = LiteLLMPersistentScroller(frame: .zero)
+            installed = true
+        }
+        if vertical, hasVerticalScroller, !(verticalScroller is LiteLLMPersistentScroller) {
+            verticalScroller = LiteLLMPersistentScroller(frame: .zero)
+            installed = true
+        }
+        if installed {
+            tile()
+        }
+        if horizontal, hasHorizontalScroller {
+            horizontalScroller?.isHidden = false
+            horizontalScroller?.alphaValue = 1
+        }
+        if vertical, hasVerticalScroller {
+            verticalScroller?.isHidden = false
+            verticalScroller?.alphaValue = 1
+        }
+    }
+}
+
 final class NativeTextEditor: NSScrollView {
     let textView: NSTextView
 
@@ -2422,6 +2608,12 @@ final class NativeTextEditor: NSScrollView {
         textView.textContainer?.widthTracksTextView = false
         textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         documentView = textView
+        usePersistentScrollers(horizontal: true, vertical: true)
+    }
+
+    override func layout() {
+        super.layout()
+        usePersistentScrollers(horizontal: true, vertical: true)
     }
 
     required init?(coder: NSCoder) {
@@ -2538,6 +2730,7 @@ private final class NativeModelChooserScrollView: NSScrollView {
 
     override func layout() {
         super.layout()
+        usePersistentScrollers(horizontal: false, vertical: true)
         guard let listView = (documentView as? NativeModelChooserListView) ?? modelListView else { return }
         let viewportWidth = contentView.bounds.width
         if viewportWidth > 0, abs(listView.frame.width - viewportWidth) > 0.5 {

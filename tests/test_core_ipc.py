@@ -620,6 +620,61 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         self.assertTrue(imported["preview"]["language"]["will_replace_draft"])
         self.assertFalse(imported["preview"]["runtime"]["will_replace_draft"])
 
+    def test_a_dispatch_waiting_on_an_in_flight_apply_reports_a_stale_revision(self) -> None:
+        """The revision a client captured can expire while the store lock is busy.
+
+        ``CoreStore.dispatch`` checks the caller revision only once it owns the
+        store lock, and a provider Apply holds that lock while it rewrites the
+        configuration and reloads the managed proxy. A buffered editor action
+        therefore has to rebase once on the authoritative snapshot (see
+        ``isRevisionRetryableAction`` in the shared UI) instead of dropping the
+        user's edit and reporting a conflict.
+        """
+
+        applied = threading.Event()
+        release = threading.Event()
+
+        class BlockingApplyDomain(MemoryDomain):
+            def apply(self, payload: object | None = None) -> dict[str, object]:
+                applied.set()
+                release.wait(timeout=5)
+                return super().apply(payload)
+
+        providers = BlockingApplyDomain("providers_models", {"value": "staged"})
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "en"}), providers])
+        core.dispatch({"domain": "providers_models", "type": "set", "payload": {"value": "staged"}})
+        captured_revision = core.revision
+        failures: list[Exception] = []
+
+        def apply_staged() -> None:
+            try:
+                core.apply("providers_models", revision=captured_revision)
+            except Exception as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        applier = threading.Thread(target=apply_staged, name="synthetic-apply")
+        applier.start()
+        self.assertTrue(applied.wait(timeout=5))
+
+        def dispatch_buffered_edit() -> None:
+            try:
+                core.dispatch(
+                    {"domain": "providers_models", "type": "patch", "payload": {"value": "edited"}},
+                    expected_revision=captured_revision,
+                )
+            except Exception as exc:
+                failures.append(exc)
+
+        editor = threading.Thread(target=dispatch_buffered_edit, name="synthetic-editor")
+        editor.start()
+        editor.join(timeout=0.2)
+        release.set()
+        applier.join(timeout=5)
+        editor.join(timeout=5)
+
+        self.assertEqual(["revision_conflict"], [getattr(failure, "code", "") for failure in failures])
+        self.assertEqual(captured_revision + 1, core.revision)
+
     def test_import_rejects_a_stale_revision_before_staging(self) -> None:
         language = MemoryDomain("language", {"choice": "en"})
         core = CoreStore(domains=[language])
