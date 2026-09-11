@@ -473,10 +473,34 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             1,
         )[0]
         self.assertIn("[view isKindOfClass:NSScrollView.class]", component)
-        self.assertIn("scrollView.scrollerStyle = NSScrollerStyleLegacy;", component)
-        self.assertIn("scrollView.autohidesScrollers = NO;", component)
+        # The pane keeps a scroller only while its content overflows, and draws it
+        # with the app's persistent translucent scroller.
+        self.assertIn("const BOOL overflows = documentView != nil &&", component)
+        self.assertIn("NSHeight(documentView.frame) > NSHeight(scrollView.contentView.bounds) + 0.5;", component)
+        self.assertIn("const NSScrollerStyle scrollerStyle = overflows ? NSScrollerStyleLegacy : NSScrollerStyleOverlay;", component)
+        self.assertIn("const BOOL autohidesScrollers = !overflows;", component)
+        self.assertIn("scrollView.scrollerStyle = scrollerStyle;", component)
+        self.assertIn("scrollView.autohidesScrollers = autohidesScrollers;", component)
         self.assertIn("scrollView.scrollerStyle = NSScrollerStyleOverlay;", component)
         self.assertIn("scrollView.autohidesScrollers = YES;", component)
+        # The pane scroller is the same persistent translucent scroller the
+        # native tables use, not AppKit's opaque legacy bar.
+        self.assertIn("InstallPersistentScrollers(scrollView, NO, YES);", component)
+        self.assertIn("InstallPersistentScrollers(", controls)
+        self.assertIn("![scrollView.verticalScroller isKindOfClass:LiteLLMPersistentScroller.class]", controls)
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        self.assertIn("@objc(LiteLLMPersistentScroller)", leaf)
+        self.assertIn("final class LiteLLMPersistentScroller: NSScroller", leaf)
+        self.assertIn("override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool)", leaf)
+        self.assertIn("let alpha = hitPart == .knob", leaf)
+        self.assertIn("func usePersistentScrollers(horizontal: Bool, vertical: Bool)", leaf)
+        # Every native scroll view that keeps a scroller on screen draws it with
+        # that class: the declaration plus the model chooser, the read-only text
+        # editor (install and layout pass), and the key list the group manager
+        # sheet hosts.
+        self.assertEqual(5, leaf.count("usePersistentScrollers("))
+        self.assertIn("scrollView.usePersistentScrollers(horizontal: false, vertical: true)", leaf)
+        self.assertIn("usePersistentScrollers(horizontal: true, vertical: true)", leaf)
 
     def test_native_login_item_registration_follows_core_target_state(self) -> None:
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
@@ -1797,6 +1821,31 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_scrollView.scrollerStyle = NSScrollerStyleLegacy", controls)
         self.assertIn("_scrollView.hasHorizontalScroller = NO", controls)
         self.assertIn("_scrollView.hasVerticalScroller = NO", controls)
+        # A scroller the table actually needs stays on screen: the table pins it
+        # with the legacy style and auto-hide off and releases it again once the
+        # table fits, instead of letting AppKit fade the bar out while idle.
+        self.assertIn(
+            "const BOOL usesScrollers = _scrollView.hasHorizontalScroller || _scrollView.hasVerticalScroller;",
+            controls,
+        )
+        self.assertIn(
+            "const NSScrollerStyle scrollerStyle = usesScrollers ? NSScrollerStyleLegacy : NSScrollerStyleOverlay;",
+            controls,
+        )
+        self.assertIn("const BOOL autohidesScrollers = !usesScrollers;", controls)
+        self.assertIn("if ([self applyPersistentTableScrollerChrome]) continue;", controls)
+        self.assertIn("scrollView.horizontalScroller.hidden = NO;", controls)
+        self.assertIn("scrollView.verticalScroller.hidden = NO;", controls)
+        # The pinned scroller is drawn like the system overlay scroller - one
+        # translucent knob and no track - so it does not cover the row or the
+        # trailing cell it sits on.  The drawing lives in the Swift scroller that
+        # every native scroll view shares; the ObjC hosts only install it.
+        self.assertIn("static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal, BOOL vertical)", controls)
+        self.assertIn(
+            "scrollView.horizontalScroller = [[LiteLLMPersistentScroller alloc] initWithFrame:NSZeroRect];",
+            controls,
+        )
+        self.assertIn("[self installPersistentTableScrollers];", controls)
         self.assertIn("_scrollView.horizontalScrollElasticity = NSScrollElasticityNone", controls)
         self.assertIn("_scrollView.verticalScrollElasticity = NSScrollElasticityNone", controls)
         self.assertIn("@interface LiteLLMTableScrollView : NSScrollView", controls)
@@ -1866,11 +1915,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("firstColumnHorizontalPadding={0}", (SHARED / "ui" / "YoungRouterApp.tsx").read_text(encoding="utf-8"))
         logs_ui = (SHARED / "ui" / "YoungRouterApp.tsx").read_text(encoding="utf-8")
         logs_workspace = logs_ui.split("function LogsWorkspace", 1)[1].split("function Section", 1)[0]
+        # The log table keeps content-sized columns (short columns never lose
+        # text to an ellipsis) and scrolls trailing overflow horizontally, so a
+        # long detail cell stays readable instead of being clipped.
         self.assertIn(
-            "columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths",
+            "columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow",
             logs_workspace,
         )
-        self.assertNotIn("scrollTrailingColumnOverflow", logs_workspace)
+        # Short columns keep their requested width (long model names ellipsize);
+        # only the trailing detail column grows to its measured content, and the
+        # measurement scan is bounded so a large log does not stall a refresh.
+        self.assertIn("if (newViewProps.scrollTrailingColumnOverflow) {\n      [self updateColumnMinimumWidths];", controls)
+        self.assertIn("LiteLLMTableMeasuredRowLimit", controls)
         self.assertIn(
             "((viewProps.preserveColumnWidths || viewProps.scrollTrailingColumnOverflow || hasUserColumnResize())",
             controls,
@@ -1941,6 +1997,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;", checkbox)
         self.assertIn("if (labelChanged || labelVisibilityChanged || compactChanged) {\n    [_host setNeedsLayout:YES];\n  }", checkbox)
         self.assertNotIn("[_host setNeedsLayout:YES];", switch)
+
+    def test_macos_switch_stays_at_the_compact_size_its_slot_reserves(self) -> None:
+        controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        switch = controls.split("@implementation LiteLLMAppKitSwitchComponentView", 1)[1].split(
+            "Class<RCTComponentViewProtocol> LiteLLMAppKitSwitchCls", 1
+        )[0]
+
+        # The system's regular NSSwitch is 54 x 24 pt, which is taller than the
+        # 26 pt rows this app labels with 13 pt text.  The compact size
+        # (44 x 20 pt) is the one the 44 pt slot is sized for.
+        self.assertIn("_switch.controlSize = NSControlSizeSmall;", switch)
+        self.assertNotIn("NSControlSizeRegular", switch)
 
     def test_macos_choice_controls_keep_the_native_selection_until_react_confirms_it(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")

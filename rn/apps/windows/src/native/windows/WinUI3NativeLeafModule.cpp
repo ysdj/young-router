@@ -610,11 +610,13 @@ void WinUI3NativeLeafModule::ShowGroupManager(
       labels.remove_label = read("removeLabel");
       labels.name_label = read("nameLabel");
       labels.group_label = read("groupLabel");
+      labels.multiplier_label = read("multiplierLabel");
       labels.enabled_label = read("enabledLabel");
       labels.new_key_name = read("newKeyName");
       labels.draft_label = read("draftLabel");
       labels.deleted_label = read("deletedLabel");
       labels.auto_grouping_label = read("autoGroupingLabel");
+      labels.ungrouped_label = read("ungroupedLabel");
       labels.close_label = read("closeLabel");
       labels.apply_label = read("applyLabel");
       labels.hint = read("hint");

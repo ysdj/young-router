@@ -286,6 +286,97 @@ model_list:
             self.assertEqual("public-chat", record["public_model"])
             self.assertEqual("upstream-chat", record["upstream_model"])
 
+    def test_request_rows_resolve_the_public_model_by_route_when_the_id_is_dynamic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.yaml").write_text(
+                """providers:
+  provider-a:
+    api_base: https://provider-a.example/v1
+    api_keys:
+      - name: key-a
+        value: key-a
+model_list:
+  - model_name: public-chat
+    litellm_params:
+      model: openai/upstream-chat
+      api_base: https://provider-a.example/v1
+      api_key: key-a
+    model_info:
+      id: abcdef12
+      order: 0.08
+""",
+                encoding="utf-8",
+            )
+            records = [
+                # LiteLLM hashes the deployment id for client-side-credential
+                # and rebuilt-fallback calls; the route identity still names
+                # the configured public model instead of the upstream spelling.
+                {
+                    "ts": "2026-08-01T04:10:00Z",
+                    "request_id": "dynamic-id",
+                    "status": "failure",
+                    "deployment_id": "a" * 64,
+                    "provider": "provider-a",
+                    "upstream_model": "openai/upstream-chat",
+                    "api_key_name": "key-a",
+                    "route_key": (
+                        "model=openai/upstream-chat / provider=provider-a / "
+                        "upstream=openai/upstream-chat / host=relay.example / "
+                        "key=key-a / order=1"
+                    ),
+                },
+                # A recorded order that differs from the staged default still
+                # resolves through the orderless route index.
+                {
+                    "ts": "2026-08-01T04:10:01Z",
+                    "request_id": "dynamic-id-other-order",
+                    "status": "failure",
+                    "deployment_id": "c" * 64,
+                    "provider": "provider-a",
+                    "upstream_model": "openai/upstream-chat",
+                    "api_key_name": "key-a",
+                    "route_key": (
+                        "model=openai/upstream-chat / provider=provider-a / "
+                        "upstream=openai/upstream-chat / host=relay.example / "
+                        "key=key-a / order=0.08"
+                    ),
+                },
+                # A route the configuration does not contain keeps its own name.
+                {
+                    "ts": "2026-08-01T04:10:02Z",
+                    "request_id": "unknown-route",
+                    "status": "failure",
+                    "deployment_id": "b" * 64,
+                    "provider": "provider-b",
+                    "upstream_model": "openai/upstream-chat",
+                    "api_key_name": "key-b",
+                    "route_key": (
+                        "model=openai/upstream-chat / provider=provider-b / "
+                        "upstream=openai/upstream-chat / host=relay.example / "
+                        "key=key-b / order=0.08"
+                    ),
+                },
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+
+            self.assertEqual(
+                {
+                    "dynamic-id": "public-chat",
+                    "dynamic-id-other-order": "public-chat",
+                    "unknown-route": "openai/upstream-chat",
+                },
+                {
+                    record["request_id"]: record["public_model"]
+                    for record in projected
+                },
+            )
+
     def test_route_trace_projects_failed_route_into_recovery_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -771,14 +862,21 @@ model_list:
     def test_request_records_project_each_live_lifecycle_to_one_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            # Live lifecycle rows stay fresh so the projection only exercises
+            # the one-row-per-request collapse, not the stale-row fallback.
+            base = datetime.now(timezone.utc).replace(microsecond=0)
+
+            def stamp(offset: int) -> str:
+                return (base + timedelta(seconds=offset)).isoformat()
+
             records = [
-                {"ts": "2026-08-01T04:10:10Z", "request_id": "completed", "status": "pending"},
-                {"ts": "2026-08-01T04:10:11Z", "request_id": "completed", "status": "stream"},
-                {"ts": "2026-08-01T04:10:12Z", "request_id": "completed", "status": "success"},
-                {"ts": "2026-08-01T04:10:13Z", "request_id": "completed", "status": "stream"},
-                {"ts": "2026-08-01T04:10:20Z", "request_id": "retried", "status": "failure"},
-                {"ts": "2026-08-01T04:10:21Z", "request_id": "retried", "status": "pending"},
-                {"ts": "2026-08-01T04:10:22Z", "request_id": "retried", "status": "stream"},
+                {"ts": stamp(0), "request_id": "completed", "status": "pending"},
+                {"ts": stamp(1), "request_id": "completed", "status": "stream"},
+                {"ts": stamp(2), "request_id": "completed", "status": "success"},
+                {"ts": stamp(3), "request_id": "completed", "status": "stream"},
+                {"ts": stamp(4), "request_id": "retried", "status": "failure"},
+                {"ts": stamp(5), "request_id": "retried", "status": "pending"},
+                {"ts": stamp(6), "request_id": "retried", "status": "stream"},
             ]
             (root / "recent-requests.jsonl").write_text(
                 "\n".join(json.dumps(record) for record in records) + "\n",
@@ -808,6 +906,117 @@ model_list:
             projected = LogsDomain(root).view("requests")["log"]["records"]
 
             self.assertEqual(["older", "newer"], [record["request_id"] for record in projected])
+
+    def test_request_rows_without_progress_are_reported_as_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = datetime.now(timezone.utc)
+            stale = (now - timedelta(hours=7)).replace(microsecond=0).isoformat()
+            fresh = (now - timedelta(seconds=5)).replace(microsecond=0).isoformat()
+            records = [
+                {"ts": stale, "request_id": "abandoned", "status": "pending"},
+                {"ts": stale, "request_id": "abandoned-stream", "status": "stream"},
+                {"ts": stale, "request_id": "finished", "status": "success"},
+                {"ts": fresh, "request_id": "active", "status": "pending"},
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+
+            statuses = {record["request_id"]: record["status"] for record in projected}
+            self.assertEqual(
+                {
+                    "abandoned": "aborted",
+                    "abandoned-stream": "aborted",
+                    "finished": "success",
+                    "active": "pending",
+                },
+                statuses,
+            )
+            aborted = next(
+                record for record in projected if record["request_id"] == "abandoned"
+            )
+            self.assertEqual("stale", aborted["aborted"]["reason"])
+
+    def test_request_stale_window_follows_runtime_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "runtime-settings.env"
+            settings.write_text(
+                "YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS=0\n",
+                encoding="utf-8",
+            )
+            stale = (
+                datetime.now(timezone.utc) - timedelta(hours=7)
+            ).replace(microsecond=0).isoformat()
+            (root / "recent-requests.jsonl").write_text(
+                json.dumps({"ts": stale, "request_id": "open", "status": "pending"})
+                + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(
+                root, runtime_settings_path=settings
+            ).view("requests")["log"]["records"]
+
+            self.assertEqual("pending", projected[-1]["status"])
+
+    def test_request_rows_follow_a_configured_stale_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "runtime-settings.env"
+            settings.write_text(
+                "YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS=60\n",
+                encoding="utf-8",
+            )
+            observed = (
+                datetime.now(timezone.utc) - timedelta(seconds=61)
+            ).replace(microsecond=0).isoformat()
+            (root / "recent-requests.jsonl").write_text(
+                json.dumps({"ts": observed, "request_id": "slow", "status": "pending"})
+                + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(
+                root, runtime_settings_path=settings
+            ).view("requests")["log"]["records"]
+
+            self.assertEqual("aborted", projected[-1]["status"])
+
+    def test_request_rows_keep_the_aborted_reason_and_drop_unknown_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recent-requests.jsonl").write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-08-01T04:10:00Z",
+                        "request_id": "closed",
+                        "status": "aborted",
+                        "public_model": "public-chat",
+                        "aborted": {
+                            "reason": "service_restart",
+                            "api_key": "sk-synthetic-secret",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            raw = (root / "recent-requests.jsonl").read_text(encoding="utf-8")
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+
+            self.assertEqual("aborted", projected[-1]["status"])
+            self.assertEqual(
+                {"reason": "service_restart"},
+                projected[-1]["aborted"],
+            )
+            self.assertNotIn("sk-synthetic-secret", json.dumps(projected))
+            self.assertIn("sk-synthetic-secret", raw)
 
     def test_recovery_records_are_sorted_by_updated_at(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

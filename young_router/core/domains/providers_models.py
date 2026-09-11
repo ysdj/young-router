@@ -3774,13 +3774,33 @@ class ProvidersModelsDomain:
             if isinstance(destination_keys, Sequence) and not isinstance(
                 destination_keys, (str, bytes, bytearray)
             ):
-                for item in destination_keys:
-                    if not isinstance(item, Mapping):
-                        continue
-                    destination_key_name = str(item.get("name", "")).strip()
-                    if destination_key_name:
-                        destination_provider_key_id = str(item.get("id", "")).strip()
-                        break
+                usable_keys = [item for item in destination_keys if isinstance(item, Mapping)]
+                source_key_name = str(model.get("api_key_name", "")).strip()
+                # A moved model keeps its route identity when the destination
+                # already offers a ProviderKey with the same name: providers on
+                # the same relay station commonly reuse key names (r-pro,
+                # x-image, ...), and silently re-pointing the model at another
+                # key would change which credential and multiplier it uses.
+                chosen = next(
+                    (
+                        item
+                        for item in usable_keys
+                        if str(item.get("name", "")).strip() == source_key_name
+                    ),
+                    None,
+                ) if source_key_name else None
+                if chosen is None:
+                    chosen = next(
+                        (
+                            item
+                            for item in usable_keys
+                            if str(item.get("name", "")).strip()
+                        ),
+                        None,
+                    )
+                if chosen is not None:
+                    destination_key_name = str(chosen.get("name", "")).strip()
+                    destination_provider_key_id = str(chosen.get("id", "")).strip()
             model.update(
                 {
                     "provider": str(destination_provider.get("name", "")).strip(),

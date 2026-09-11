@@ -541,7 +541,19 @@ function isRevisionConflict(reason: unknown): boolean {
 
 function isRevisionRetryableAction(type: string): boolean {
   const normalized = type.replace(/[.-]/g, "_").toLowerCase();
-  return normalized === "service_provider_add"
+  // Provider/model editor actions address their target by a stable editor id
+  // and set absolute values, so they never depend on the revision they were
+  // queued with. Core checks that revision only after the request acquires the
+  // store lock, and a provider Apply holds it while it rewrites the config and
+  // reloads the managed proxy. A control therefore reads Core's shared
+  // revision before an in-flight operation (this pane's own immediate Apply,
+  // a probe, a relay refresh, another window, or a host menu dispatch) has
+  // released it and finished bumping it. Rebasing once on the authoritative
+  // snapshot keeps the user's edit instead of reporting a conflict for a
+  // change that never happened.
+  const editorMutation = normalized.startsWith("model_") || normalized.startsWith("provider_");
+  return editorMutation
+    || normalized === "service_provider_add"
     || normalized.startsWith("service_provider_auth_")
     || normalized.startsWith("provider_auth_")
     || normalized === "account_add"
@@ -1882,7 +1894,27 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       revision.current = staged.revision;
       onSnapshot(staged);
       const confirmations = staged.disk.providers_models?.changed ? ["overwrite_external_providers_models"] : undefined;
-      const result = await ipc.apply("providers_models", staged.revision, confirmations);
+      const applyStagedSurface = (nextRevision: number): Promise<IpcResults["apply"]> => (
+        ipc.apply("providers_models", nextRevision, confirmations)
+      );
+      let result: IpcResults["apply"];
+      try {
+        result = await applyStagedSurface(staged.revision);
+      } catch (reason: unknown) {
+        if (!isRevisionConflict(reason)) throw reason;
+        // The staged surface edit above dirties the draft, so this pane's own
+        // immediate Apply can commit it (and advance Core's shared revision)
+        // before this apply is accepted. Rebase once on the authoritative
+        // snapshot; a still-staged draft means the surface was not committed
+        // yet, and a clean one already has this exact surface applied.
+        const current = await ipc.snapshot();
+        revision.current = current.revision;
+        latestSnapshot.current = current;
+        onSnapshot(current);
+        result = current.drafts.providers_models?.dirty === true
+          ? await applyStagedSurface(current.revision)
+          : { revision: current.revision, applied: true, status: "applied", domains: ["providers_models"], completed_operations: 0, pending_operations: 0, issues: [] };
+      }
       revision.current = result.revision;
       await refresh();
       setResult(translate("common.applied"));
@@ -2113,7 +2145,10 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} busy={busy} webDavOperationBusy={webDavOperationBusy} statuses={dataManagementStatuses} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} /> : null}
     {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
     </View> : null}
-    {shell && result ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{result}</Text></View> : null}
+    {/* One permanent status bar per pane window: the last result replaces the
+        idle Ready label, so the strip never appears or disappears mid-action
+        and the pane below it keeps a stable height. */}
+    {shell ? <View style={styles.routeStatusBar}><Text numberOfLines={2} style={styles.routeStatusText}>{result ?? translate("common.ready")}</Text></View> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -3897,32 +3932,26 @@ function TablePane({ title, actions, wide, style, children }: { title: string; a
 }
 
 /**
- * A ScrollView that shows its macOS scroller whenever the content actually
- * overflows and no scroller at all when the content fits.  The native
- * indicator switches AppKit to a legacy scroller so the bar stays visible
- * instead of fading out; horizontal scrolling is disabled because that
- * legacy scroller narrows the clip view, which is not a real overflow.
+ * The scrolling surface every settings pane uses.  The native indicator keeps a
+ * scroller on the pane only while its content actually overflows, drawn as the
+ * app's persistent translucent scroller instead of AppKit's overlay bar that
+ * fades out after a scroll, and horizontal scrolling is left to scroll views
+ * that own their own horizontal affordance.
  */
-function PersistentScrollView({ style, contentContainerStyle, children, onViewportHeightChange, onContentHeightChange, ...props }: ScrollViewProps & { onViewportHeightChange?: (height: number) => void; onContentHeightChange?: (height: number) => void }): React.JSX.Element {
-  const viewportHeight = useRef(0);
-  const contentHeight = useRef(0);
-  const [scrollable, setScrollable] = useState(false);
-  const syncScrollable = (): void => {
-    const next = contentHeight.current > viewportHeight.current + 0.5;
-    setScrollable((current) => (current === next ? current : next));
-  };
+const PersistentScrollView = React.forwardRef<ScrollView, ScrollViewProps & { onViewportHeightChange?: (height: number) => void; onContentHeightChange?: (height: number) => void }>(function PersistentScrollView({ style, contentContainerStyle, children, onViewportHeightChange, onContentHeightChange, onLayout, onContentSizeChange, ...props }, ref): React.JSX.Element {
   return <ScrollView
     {...props}
+    ref={ref}
     style={style}
     contentContainerStyle={contentContainerStyle}
     showsHorizontalScrollIndicator={false}
-    onLayout={(event) => { viewportHeight.current = event.nativeEvent.layout.height; onViewportHeightChange?.(viewportHeight.current); syncScrollable(); }}
-    onContentSizeChange={(_contentWidth, height) => { contentHeight.current = height; onContentHeightChange?.(height); syncScrollable(); }}
+    onLayout={(event) => { onViewportHeightChange?.(event.nativeEvent.layout.height); onLayout?.(event); }}
+    onContentSizeChange={(width, height) => { onContentHeightChange?.(height); onContentSizeChange?.(width, height); }}
   >
     {children}
-    {scrollable ? <NativePersistentScrollIndicator style={styles.persistentScrollIndicator} /> : null}
+    <NativePersistentScrollIndicator style={styles.persistentScrollIndicator} />
   </ScrollView>;
-}
+});
 
 function ModelInspector({ providers, providerLabels, provider, providerId, model, modelName, relaySources, native, busy, translate, dispatch, probe, probing, probeResult, onNameDraftChange, onProviderClick, onProviderChange }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; modelName: string; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"]; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void }): React.JSX.Element {
   const id = editorIdentifier(model);
@@ -4459,7 +4488,7 @@ function SettingsWorkspace({ validationStatus, validationStatusStyle, translate,
   return <View style={styles.codexWorkspaceFrame}>
     {validationStatus ? <Text style={[styles.codexValidationStatus, validationStatusStyle]}>{validationStatus}</Text> : null}
     {missingMessage ? <Text style={styles.settingsMissingMessage}>{missingMessage}</Text> : null}
-    <ScrollView style={styles.assistantSettingsScroll} contentContainerStyle={[styles.assistantSettingsScrollContent, assistantSettingsLayoutStyles.boundedContent]} horizontal={false} showsVerticalScrollIndicator showsHorizontalScrollIndicator={false}>
+    <PersistentScrollView style={styles.assistantSettingsScroll} contentContainerStyle={[styles.assistantSettingsScrollContent, assistantSettingsLayoutStyles.boundedContent]} horizontal={false} showsVerticalScrollIndicator>
       <View style={[styles.assistantQuickSection, assistantSettingsLayoutStyles.boundedSection]}>
         <View style={[styles.assistantSectionHeader, assistantSettingsLayoutStyles.boundedSection]}>
           <Text style={styles.paneHeading}>{translate("settings.structured")}</Text>
@@ -4474,7 +4503,7 @@ function SettingsWorkspace({ validationStatus, validationStatusStyle, translate,
         </View>
         {files}
       </View>
-    </ScrollView>
+    </PersistentScrollView>
   </View>;
 }
 
@@ -4632,7 +4661,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, translate, on
       setAutoStartBusy(false);
     }
   };
-  return <ScrollView style={styles.generalScroll} contentContainerStyle={styles.generalContent}>
+  return <PersistentScrollView style={styles.generalScroll} contentContainerStyle={styles.generalContent}>
     <View style={styles.generalSection}>
       <Text style={styles.generalSectionTitle}>{translate("general.startup")}</Text>
       <View style={styles.generalRow}>
@@ -4655,7 +4684,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, translate, on
       <Text style={styles.generalRowHint}>{translate("general.portHint", { default: portDefault })}</Text>
     </View>
     {status ? <Text style={styles.generalStatus}>{status}</Text> : null}
-  </ScrollView>;
+  </PersistentScrollView>;
 }
 
 function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear }): React.JSX.Element {
@@ -4708,12 +4737,12 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
           style={styles.runtimeTocList}
         />
       </View>
-      <ScrollView ref={scrollRef} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace} showsHorizontalScrollIndicator={false} onScroll={trackScroll} scrollEventThrottle={32}>
+      <PersistentScrollView ref={scrollRef} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace} onScroll={trackScroll} scrollEventThrottle={32}>
         {categories.length === 0 ? <EmptyState translate={translate} /> : categories.map((name) => <View key={name} style={styles.runtimeSection} onLayout={({ nativeEvent }) => { setSectionOffsets((current) => current[name] === nativeEvent.layout.y ? current : { ...current, [name]: nativeEvent.layout.y }); }}>
           <Text style={styles.runtimeSectionTitle}>{runtimeCategoryLabel(name, translate)}</Text>
           <View style={styles.runtimeFieldList}>{(groups[name] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} />)}</View>
         </View>)}
-      </ScrollView>
+      </PersistentScrollView>
     </View>
   </View>;
 }
@@ -4817,7 +4846,7 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
       />
     </View>
     <View style={styles.dataManagementDetail}>
-    {tab === "import" ? <ScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>
+    {tab === "import" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>
       {!importPreview ? <View style={[styles.dataManagementImportIntro, dataManagementPolishStyles.importIntro]}><View style={styles.dataManagementImportFileRow}><Text style={styles.dataManagementImportFileLabel}>{translate("dataManagement.importFile")}</Text><View style={styles.dataManagementImportFileValue}><Text numberOfLines={1} style={styles.dataManagementImportFilePlaceholder}>{translate("dataManagement.noImportFile")}</Text></View><ActionButton title={translate("dataManagement.chooseImportFile")} disabled={busy} onPress={() => { void chooseImportFile(); }} /></View><Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.importHint")}</Text></View> : null}
       {importReviewReady ? <>
         <View style={dataManagementPolishStyles.paneIntro}><Text style={dataManagementPolishStyles.paneHeading}>{translate("dataManagement.importContent")}</Text><Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.importRecognizedHint")}</Text></View>
@@ -4832,15 +4861,15 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
           {sectionList(stagedSections, stagedSections, true, () => undefined)}
       </DataManagementGroup> : null}
       {statuses.import ? <Text style={[styles.dataManagementStatus, dataManagementPolishStyles.compactText]}>{statuses.import}</Text> : null}
-    </ScrollView> : null}
+    </PersistentScrollView> : null}
     {tab === "export" ? <View style={styles.dataManagementPane}>
-      <ScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>
+      <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>
         <View style={dataManagementPolishStyles.paneIntro}><Text style={dataManagementPolishStyles.paneHeading}>{translate("dataManagement.exportContent")}</Text><Text style={dataManagementPolishStyles.paneHint}>{translate("dataManagement.exportHint")}</Text></View>
         <DataManagementGroup>
           <View style={styles.dataManagementSelectionBar}><Text style={[styles.dataManagementSelectionCount, dataManagementPolishStyles.compactText]}>{translate("dataManagement.selectedCount", { count: exportSections.length })}</Text><View style={styles.dataManagementToolbarButtons}>{selectionTool(exportSections.length, DATA_PACKAGE_DOMAINS.length, () => setExportSections([...DATA_PACKAGE_DOMAINS]), () => setExportSections([]))}</View></View>
           {sectionList(DATA_PACKAGE_DOMAINS, exportSections, busy, (domain, enabled) => toggleSection(setExportSections, domain, enabled))}
         </DataManagementGroup>
-      </ScrollView>
+      </PersistentScrollView>
       <View style={[styles.dataManagementBottomActions, dataManagementPolishStyles.bottomActions]}>
         <View style={styles.dataManagementBottomMessage}>
           <Text numberOfLines={2} style={[styles.dataManagementSensitiveNote, dataManagementPolishStyles.compactText]}>{translate("dataManagement.sensitiveHint")}</Text>
@@ -5376,25 +5405,102 @@ function routeTraceProtocolLabel(value: string, translate: Translate): string {
   return translate("logs.routeTrace.protocolOther");
 }
 
-function routeTraceReasonLabel(value: string, translate: Translate): string {
-  const labels: Record<string, Parameters<Translate>[0]> = {
-    "upstream-auth-or-balance": "logs.routeTrace.reasonAuth",
-    "upstream-compatible-bad-request": "logs.routeTrace.reasonCompatibility",
-    "upstream-gateway-bad-request": "logs.routeTrace.reasonGateway",
-    "responses-schema-unsupported": "logs.routeTrace.reasonResponses",
-    "image-parameter-or-capability-bad-request": "logs.routeTrace.reasonResponses",
-    "upstream-network-connectivity": "logs.routeTrace.reasonNetwork",
-    "upstream-temporary-class": "logs.routeTrace.reasonTemporary",
-    "upstream-temporary-text": "logs.routeTrace.reasonTemporary",
-    "terminal-prompt-or-policy": "logs.routeTrace.reasonTerminal",
-    "stream_start_timeout": "logs.routeTrace.reasonStreamStartTimeout",
-    "stream_idle_timeout": "logs.routeTrace.reasonStreamIdleTimeout",
-    "responses_endpoint_unsupported": "logs.routeTrace.reasonResponsesUnsupported",
-    "malformed_web_search_function_call": "logs.routeTrace.reasonWebSearchFormat",
-  };
+const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
+  "upstream-auth-or-balance": "logs.routeTrace.reasonAuth",
+  "upstream-compatible-bad-request": "logs.routeTrace.reasonCompatibility",
+  "upstream-gateway-bad-request": "logs.routeTrace.reasonGateway",
+  "responses-schema-unsupported": "logs.routeTrace.reasonResponses",
+  "image-parameter-or-capability-bad-request": "logs.routeTrace.reasonResponses",
+  "upstream-network-connectivity": "logs.routeTrace.reasonNetwork",
+  "upstream-temporary-class": "logs.routeTrace.reasonTemporary",
+  "upstream-temporary-text": "logs.routeTrace.reasonTemporary",
+  "terminal-prompt-or-policy": "logs.routeTrace.reasonTerminal",
+  "stream_start_timeout": "logs.routeTrace.reasonStreamStartTimeout",
+  "stream_idle_timeout": "logs.routeTrace.reasonStreamIdleTimeout",
+  "responses_endpoint_unsupported": "logs.routeTrace.reasonResponsesUnsupported",
+  "malformed_web_search_function_call": "logs.routeTrace.reasonWebSearchFormat",
+  "upstream-stream-incomplete": "logs.routeTrace.reasonStreamIncomplete",
+  "upstream-request-body-capacity": "logs.routeTrace.reasonBodyCapacity",
+  "image-generation-tool-all-deployments-unsupported": "logs.routeTrace.reasonImageUnsupported",
+  "codex-compaction-unsupported": "logs.routeTrace.reasonCompactionUnsupported",
+  "image-generation-tool-runtime-fallback": "logs.routeTrace.reasonImageFallback",
+  "no-available-deployment": "logs.noAvailableRoute",
+  "model-not-configured": "logs.modelNotConfigured",
+  other: "logs.routeTrace.reasonUnknown",
+};
+
+function upstreamStatusReasonLabel(value: string, translate: Translate): string | undefined {
   const upstreamStatus = value.match(/^upstream-status-(\d+)$/);
-  if (upstreamStatus?.[1]) return translate("logs.routeTrace.upstreamStatus", { status: upstreamStatus[1] });
-  return translate(labels[value.trim().toLowerCase()] ?? "logs.routeTrace.reasonUnknown");
+  return upstreamStatus?.[1]
+    ? translate("logs.routeTrace.upstreamStatus", { status: upstreamStatus[1] })
+    : undefined;
+}
+
+function routeTraceReasonLabel(value: string, translate: Translate): string {
+  const normalized = value.trim();
+  return upstreamStatusReasonLabel(normalized, translate)
+    ?? translate(ROUTE_REASON_KEYS[normalized.toLowerCase()] ?? "logs.routeTrace.reasonUnknown");
+}
+
+function requestErrorReasonLabel(value: string, translate: Translate): string {
+  const normalized = value.trim();
+  const key = ROUTE_REASON_KEYS[normalized.toLowerCase()];
+  // An unmapped upstream reason stays readable instead of collapsing into the
+  // generic upstream-error label.
+  return upstreamStatusReasonLabel(normalized, translate) ?? (key ? translate(key) : normalized);
+}
+
+function requestStatusLabel(value: string, translate: Translate): string {
+  const labels: Record<string, Parameters<Translate>[0]> = {
+    pending: "logs.sending",
+    sending: "logs.sending",
+    stream: "logs.streaming",
+    success: "logs.success",
+    succeeded: "logs.success",
+    failure: "logs.failed",
+    failed: "logs.failed",
+    error: "logs.failed",
+    stuck: "logs.stuck",
+    aborted: "logs.aborted",
+  };
+  const key = labels[value.trim().toLowerCase()];
+  return key ? translate(key) : value;
+}
+
+function logLevelLabel(value: string, translate: Translate): string {
+  const labels: Record<string, Parameters<Translate>[0]> = {
+    DEBUG: "logs.level.debug",
+    INFO: "logs.level.info",
+    WARNING: "logs.level.warning",
+    ERROR: "logs.level.error",
+    CRITICAL: "logs.level.critical",
+  };
+  const key = labels[value.trim().toUpperCase()];
+  return key ? translate(key) : value;
+}
+
+function menuActionLabel(value: string, translate: Translate): string {
+  const normalized = value.trim();
+  const labels: Record<string, Parameters<Translate>[0]> = {
+    "open-providers-models": "status.providers",
+    "open-runtime-settings": "status.runtime",
+    "open-codex-settings": "status.codex",
+    "open-claude-settings": "status.claude",
+    "open-relay-accounts": "relay.relayAccounts",
+    "open-data-management": "status.dataManagement",
+    "open-logs": "status.logs",
+    "toggle-autostart": "status.autoStart",
+    "service-start": "service.start",
+    "service-stop": "service.stop",
+    "service-restart": "service.restart",
+    "service-reload": "service.reload",
+    "service-health": "service.health",
+    "set-language-system": "language.system",
+    "set-language-en": "language.english",
+    "set-language-zh-Hans": "language.simplified_chinese",
+  };
+  const key = labels[normalized] ?? (normalized.startsWith("open-logs?tab=") ? "status.logs" : undefined);
+  return key ? translate(key) : normalized;
 }
 
 function routeTraceDetailPartLabel(value: string, translate: Translate): string {
@@ -5527,14 +5633,27 @@ function recoveryDetailLabel(value: string, translate: Translate): string {
   }).filter(Boolean).join(" | ");
 }
 
-function logErrorDetail(value: unknown): string {
+function requestAbortedDetail(value: unknown, translate: Translate): string {
+  const aborted = asRecord(value);
+  const reason = compactLogValue(aborted.reason);
+  if (!reason) return "";
+  switch (reason) {
+    case "no_terminal_callback": return translate("logs.aborted.reasonNoTerminalCallback");
+    case "service_restart": return translate("logs.aborted.reasonServiceRestart");
+    case "stale": return translate("logs.aborted.reasonStale");
+    default: return reason;
+  }
+}
+
+function logErrorDetail(value: unknown, translate: Translate): string {
   const error = asRecord(value);
   if (Object.keys(error).length === 0) return compactLogValue(value);
+  const reason = compactLogValue(error.reason);
   const parts = [
     error.status_code === undefined ? "" : `HTTP ${compactLogValue(error.status_code)}`,
     compactLogValue(error.type),
     compactLogValue(error.code),
-    compactLogValue(error.reason),
+    reason ? requestErrorReasonLabel(reason, translate) : "",
     error.failed_deployment_order === undefined ? "" : `order=${compactLogValue(error.failed_deployment_order)}`,
     error.failed_route_key === undefined ? "" : `route=${compactLogValue(error.failed_route_key)}`,
     error.failed_deployment_id === undefined ? "" : `deployment=${compactLogValue(error.failed_deployment_id)}`,
@@ -5592,17 +5711,17 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
   const servicePrefix = detail.match(/^\[(\d+)\]\s+\[([A-Z]+)\]\s*(.*)$/);
   if (servicePrefix) {
     if (tab !== "service") source = `PID ${servicePrefix[1]}`;
-    status = servicePrefix[2];
+    status = logLevelLabel(servicePrefix[2], translate);
     detail = servicePrefix[3].trim();
   } else {
     const proxyPrefix = detail.match(/^(?:\d{2}:\d{2}:\d{2}\s+-\s+)?([^:]+):(DEBUG|INFO|WARNING|ERROR|CRITICAL):\s*(.*)$/);
     const levelPrefix = detail.match(/^(?:\[([A-Z]+)\]|(DEBUG|INFO|WARNING|ERROR|CRITICAL):)\s*(.*)$/);
     if (proxyPrefix) {
       if (tab !== "service") source = proxyPrefix[1]?.trim() || source;
-      status = proxyPrefix[2] || "";
+      status = logLevelLabel(proxyPrefix[2] || "", translate);
       detail = (proxyPrefix[3] ?? "").trim();
     } else if (levelPrefix) {
-      status = levelPrefix[1] || levelPrefix[2] || "";
+      status = logLevelLabel(levelPrefix[1] || levelPrefix[2] || "", translate);
       detail = (levelPrefix[3] ?? "").trim();
       const process = detail.match(/\bprocess \[(\d+)\]/i);
       if (process?.[1] && tab !== "service") source = `PID ${process[1]}`;
@@ -5620,7 +5739,7 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
       detail = fields.join(" | ");
     }
   }
-  const action = tab === "actions" ? detail.split(/[:;,]/, 1)[0]?.trim() ?? "" : "";
+  const action = tab === "actions" ? menuActionLabel(detail.split(/[:;,]/, 1)[0]?.trim() ?? "", translate) : "";
   const requestKey = `${tab}:${time || "un-timed"}:${source}`;
   return {
     key: logRecordBaseKey(tab, time, requestKey, "", action, record),
@@ -5667,14 +5786,12 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const rawStatus = compactLogValue(value.status ?? value.result);
   const status = tab === "recovery"
     ? recoveryStatusLabel(rawStatus, translate)
-    : tab === "requests" && rawStatus === "pending"
-      ? translate("logs.sending")
-      : tab === "requests" && rawStatus === "stream"
-        ? translate("logs.streaming")
-        : rawStatus || (value.error ? translate("logs.failed") : "");
+    : tab === "requests"
+      ? requestStatusLabel(rawStatus, translate) || (value.error ? translate("logs.failed") : "")
+      : rawStatus || (value.error ? translate("logs.failed") : "");
   const rawEvent = compactLogValue(value.event);
   const event = tab === "route-trace" ? routeTraceEventLabel(rawEvent, translate) : rawEvent;
-  const action = compactLogValue(value.action);
+  const action = tab === "actions" ? menuActionLabel(compactLogValue(value.action), translate) : compactLogValue(value.action);
   const duration = formatLogDuration(compactLogValue(value.duration_ms));
   const usage = asRecord(value.usage);
   const sentTokens = compactLogValue(usage.input_tokens ?? usage.prompt_tokens ?? value.input_tokens ?? value.prompt_tokens);
@@ -5684,15 +5801,17 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     ? `${formatLogTokens(sentTokens)} / ${formatLogTokens(receivedTokens)}`
     : formatLogTokens(totalTokens);
   const details: string[] = [];
+  const abortedDetail = tab === "requests" ? requestAbortedDetail(value.aborted, translate) : "";
+  if (abortedDetail) details.push(abortedDetail);
   const directDetail = value.error === undefined
     ? compactLogValue(value.detail ?? value.message)
-    : logErrorDetail(value.error);
+    : logErrorDetail(value.error, translate);
   if (directDetail) details.push(
     tab === "route-trace"
       ? routeTraceDetailLabel(directDetail, translate)
       : tab === "recovery" ? recoveryDetailLabel(directDetail, translate) : directDetail,
   );
-  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "upstream_model", "model", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments"]);
+  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "aborted", "heartbeat", "upstream_model", "model", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments"]);
   for (const [key, item] of Object.entries(value)) {
     if (used.has(key)) continue;
     const display = compactLogValue(item);
@@ -5837,20 +5956,22 @@ function routeTraceOutcomeLabel(outcome: RouteTraceRequest["outcome"], translate
   return translate("logs.routeTrace.direct");
 }
 
+const LOG_DETAIL_COLUMN_FLOOR = 240;
+
 function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
   const time = { label: translate("logs.localTime"), width: 164, value: (row: RenderedLogRecord) => row.time };
-  const status = { label: translate("common.status"), width: 88, value: (row: RenderedLogRecord) => row.status };
+  const status = { label: translate("common.status"), width: 68, value: (row: RenderedLogRecord) => row.status };
   const detail = { label: translate("logs.detail"), width: 260, flex: true, value: (row: RenderedLogRecord) => row.detail };
   if (tab === "requests") return [
-    { ...time, width: 170 },
-    { label: translate("providers.publicModel"), width: 108, value: (row) => row.model },
-    { label: translate("providers.upstream"), width: 108, value: (row) => row.upstreamModel },
-    { label: translate("common.provider"), width: 88, value: (row) => row.provider },
-    { label: translate("logs.apiKeyName"), width: 96, value: (row) => row.apiKeyName },
-    { ...status, width: 72 },
-    { label: translate("logs.duration"), width: 64, value: (row) => row.duration },
-    { label: translate("logs.tokenCountK"), width: 96, value: (row) => row.tokens },
-    { ...detail, width: 200 },
+    { ...time, width: 148 },
+    { label: translate("providers.publicModel"), width: 106, value: (row) => row.model },
+    { label: translate("providers.upstream"), width: 106, value: (row) => row.upstreamModel },
+    { label: translate("common.provider"), width: 78, value: (row) => row.provider },
+    { label: translate("logs.apiKeyName"), width: 64, value: (row) => row.apiKeyName },
+    { ...status, width: 68 },
+    { label: translate("logs.duration"), width: 62, value: (row) => row.duration },
+    { label: translate("logs.tokenCountK"), width: 79, value: (row) => row.tokens },
+    { ...detail, width: 240 },
   ];
   if (tab === "actions") return [
     time,
@@ -5863,7 +5984,7 @@ function logColumns(tab: LogTab, translate: Translate): LogColumn[] {
     { label: translate("providers.upstream"), width: 142, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 104, value: (row) => row.provider },
     { label: translate("logs.apiKeyName"), width: 120, value: (row) => row.apiKeyName },
-    { ...status, width: 76 },
+    { ...status, width: 68 },
     { ...detail, width: 300 },
   ];
   if (tab === "online-usage") return [
@@ -5886,21 +6007,16 @@ function fitLogColumns(columns: LogColumn[], availableWidth: number): LogColumn[
   const flexible = columns.filter((column) => column.flex);
   if (flexible.length === 0) return columns;
   const fixedWidth = columns.reduce((total, column) => (column.flex ? total : total + column.width), 0);
-  // Fixed columns keep their content-sized widths so timestamps, model
-  // names, and the sent/received token pair stay fully visible. The long
-  // detail column absorbs the remainder; only when the window is so narrow
-  // that even its floor cannot fit are the fixed columns compressed.
-  const flexFloor = 72;
+  // Fixed columns keep their content-sized widths so timestamps, model names,
+  // provider, key name, status, and the sent/received token pair stay fully
+  // visible. The detail column takes the remaining width, and anything that
+  // still does not fit stays reachable through the table's horizontal scroller
+  // instead of being squeezed into an ellipsis.
+  const flexFloor = LOG_DETAIL_COLUMN_FLOOR;
   const remaining = usableWidth - fixedWidth;
-  if (remaining >= flexFloor * flexible.length) {
-    const share = Math.floor(remaining / flexible.length);
-    return columns.map((column) => column.flex ? { ...column, width: share } : column);
-  }
-  const fixedBudget = Math.max(1, usableWidth - flexFloor * flexible.length);
-  const scale = Math.min(1, fixedWidth > 0 ? fixedBudget / fixedWidth : 1);
   return columns.map((column) => column.flex
-    ? { ...column, width: flexFloor }
-    : { ...column, width: Math.max(40, Math.floor(column.width * scale)) });
+    ? { ...column, width: Math.max(flexFloor, remaining) }
+    : column);
 }
 
 function routeTraceAttemptLabel(state: RouteTraceAttempt["state"], translate: Translate): string {
@@ -6044,12 +6160,11 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
         </View>
         <Text numberOfLines={2} style={styles.routeTracePathSummary}>{selected.routePath || translate("logs.routeTrace.noRoute")}</Text>
         <View style={styles.routeTraceTimelineFrame}>
-          <ScrollView
+          <PersistentScrollView
             ref={timelineScrollRef}
             style={styles.routeTraceTimelineScroll}
             contentContainerStyle={[styles.routeTraceTimeline, hasTimelineHorizontalOverflow && styles.routeTraceTimelineWithHorizontalScrollbar]}
             alwaysBounceHorizontal={false}
-            showsHorizontalScrollIndicator={false}
             showsVerticalScrollIndicator
             onLayout={({ nativeEvent }) => setTimelineViewportWidth(nativeEvent.layout.width)}
             onContentSizeChange={(width) => setTimelineContentWidth(width)}
@@ -6097,7 +6212,7 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
             </View>;
           })}
           {selected.attempts.length === 0 ? <View style={styles.routeTraceNoPath}><Text style={styles.routeTraceNoPathText}>{translate("logs.routeTrace.noPathRecorded")}</Text></View> : null}
-          </ScrollView>
+          </PersistentScrollView>
           {hasTimelineHorizontalOverflow ? <View
             style={styles.routeTraceTimelineHorizontalScrollbarTrack}
             onLayout={({ nativeEvent }) => setTimelineScrollbarTrackWidth(nativeEvent.layout.width)}
@@ -6354,7 +6469,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     }} style={styles.logsTabs} />
     {rows.length > 0 ? selected === "route-trace"
       ? <RouteTraceWorkspace requests={routeTraceRequests} selectedKey={selectedKey} native={native} translate={translate} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} />
-      : <View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
+      : <View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
         const row = rows[index];
         if (!row) return;
         void native.showReadOnlyText({ title: translate("logs.originalRecord"), text: row.original, closeLabel: translate("status.close"), language: "json", html: CODE_EDITOR_HTML });
@@ -7086,8 +7201,8 @@ const styles = StyleSheet.create({
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 16, paddingTop: 6, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
   // Settings window: a native source-list sidebar next to the active pane.
-  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: 20, height: 20, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsSidebarDivider: { height: 1, flexShrink: 0, marginHorizontal: 12, backgroundColor: systemColors.separator }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" }, settingsPaneDivider: { height: 1, flexShrink: 0, backgroundColor: systemColors.separator },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, generalRowLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { width: 40, minWidth: 40, height: 24, marginLeft: 6 }, generalRowHint: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, generalStatus: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: 20, height: 20, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsSidebarDivider: { height: 1, flexShrink: 0, marginHorizontal: 12, backgroundColor: systemColors.separator }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" }, settingsPaneDivider: { height: 1, flexShrink: 0, backgroundColor: systemColors.separator },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, generalRowLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { width: 44, minWidth: 44, height: 24, marginLeft: 6 }, generalRowHint: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, generalStatus: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },
@@ -7120,7 +7235,7 @@ const styles = StyleSheet.create({
   providerAuthStatusValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerThreePane: { flex: 1, minHeight: 0 }, providerListPane: { width: 140, minWidth: 140, maxWidth: 140, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, providerInspectorPane: { minWidth: 280 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, iconButtonText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, tableHeader: { height: 24, flexDirection: "row", alignItems: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window }, tableHeaderText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6, fontWeight: "500" }, tableScroll: { flex: 1, minHeight: 0, borderWidth: 1, borderTopWidth: 0, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, tableRows: { flexGrow: 1 }, tableRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, tableRowSelected: { backgroundColor: systemColors.control }, tableCellText: { color: systemColors.label, fontSize: UI_FONT_SIZE, paddingHorizontal: 6 }, providerNameColumn: { flex: 1 }, countColumn: { width: 48, textAlign: "right" }, modelNameColumn: { width: 96 }, modelUpstreamColumn: { flex: 1, minWidth: 112 }, routeModelColumn: { width: 136 }, routeOrderColumn: { width: 48, textAlign: "right" }, routeProviderColumn: { width: 112 }, routeUpstreamColumn: { flex: 1, minWidth: 136 }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 290, minWidth: 290, maxWidth: 290, flexGrow: 0, flexShrink: 0 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingTop: 3, paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, probeSummaryTrigger: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, probeSummaryTriggerPressed: { opacity: 0.65 }, probeSummary: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, protocolSettings: { gap: 4 }, protocolHint: { marginLeft: 62, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 15 }, providerKeysEditor: { gap: 4 }, providerKeysHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerKeysHeading: { flex: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerKeyActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 }, providerKeyTable: { width: "100%", height: 112, minHeight: 112, flexShrink: 0 }, providerKeyFields: { minWidth: 0, gap: 4 },
   codexWorkspace: { flex: 1, minHeight: 0 }, codexWorkspaceFrame: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexValidationStatus: { flexShrink: 0, marginHorizontal: 8, fontSize: UI_FONT_SIZE }, settingsMissingMessage: { flexShrink: 0, marginHorizontal: 8, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, codexValidationWarning: { color: systemColors.brown }, codexValidationError: { color: systemColors.red }, assistantSettingsScroll: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground, borderWidth: 1, borderColor: systemColors.separator }, assistantSettingsScrollContent: { flexGrow: 1, paddingHorizontal: 14, paddingTop: 10, paddingBottom: 14, gap: 14 }, assistantQuickSection: { gap: 8 }, assistantSectionHeader: { flexDirection: "row", alignItems: "baseline", justifyContent: "space-between", gap: 12 }, assistantSectionHint: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right" }, assistantQuickGrid: { flexDirection: "column", gap: 10 }, assistantRawSection: { gap: 10, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, assistantRawGrid: { flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, assistantRawEditor: { flex: 0, flexGrow: 1, flexShrink: 1, flexBasis: 480, minWidth: 360, height: 286, minHeight: 240 }, codexStructuredPane: { flex: 1, minWidth: 0, paddingHorizontal: 8 }, codexStructuredScroll: { flex: 1, minWidth: 0, marginTop: 7 }, codexStructuredScrollIndicator: { position: "absolute", width: 0, height: 0 }, codexStructured: { flexGrow: 1, flexShrink: 0, minWidth: SETTINGS_STRUCTURED_CONTENT_MIN_WIDTH, alignSelf: "stretch", gap: 14, paddingLeft: 16, paddingRight: 16 + SETTINGS_STRUCTURED_SCROLLBAR_GUTTER, paddingTop: 10, paddingBottom: 16 }, codexStructuredWithHorizontalScrollbar: { paddingBottom: 32 }, codexRawPane: { flex: 1, flexShrink: 1, minWidth: 320, minHeight: 0, gap: 8, paddingHorizontal: 8, overflow: "hidden" }, codexRawEditors: { flex: 1, minWidth: 0, minHeight: 0, gap: 8 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditor: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 }, paneHeading: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, sectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderEditor: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, overflow: "hidden" }, codexProviderToolbar: { minHeight: 42, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12, paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, codexProviderToolbarTitle: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, codexProviderActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, codexProviderActionButton: { width: 30, minWidth: 30, height: 30, paddingHorizontal: 0 }, codexProviderSplit: { borderWidth: 0, borderRadius: 0 }, split: { flexDirection: "row", flexWrap: "wrap", borderWidth: 1, borderColor: systemColors.separator, minHeight: 150, backgroundColor: systemColors.textBackground }, codexListTable: { flex: 1, minWidth: 260, minHeight: 150 }, pluginEditor: { minHeight: 128, flexDirection: "row", flexWrap: "wrap", alignItems: "flex-start", gap: 12 }, pluginTable: { flex: 1, minWidth: 260, minHeight: 128 }, pluginFields: { flex: 1, minWidth: 220, gap: 7 }, masterPane: { width: "36%", minWidth: 220, borderRightWidth: 1, borderColor: systemColors.separator, padding: 8 }, detailPane: { flex: 1, minWidth: 240, padding: 12 }, listRow: { minHeight: 28, paddingHorizontal: 8, paddingVertical: 5 }, listRowSelected: { backgroundColor: systemColors.control }, listText: { flex: 1 },
-  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeToc: { width: 156, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }, runtimeTocList: { flex: 1, minHeight: 0 }, runtimeWorkspace: { width: "100%", padding: 14, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeSection: { gap: 6 }, runtimeSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeFieldList: { gap: 10 }, runtimeField: { minWidth: 0, alignSelf: "stretch", gap: 2 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeModifiedBar: { width: 2, alignSelf: "stretch", marginRight: 6, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { alignSelf: "center", height: 16, marginRight: 6 }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: 142, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 160, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 160, minWidth: 160, height: 26 }, runtimeBooleanControl: { width: 40, minWidth: 40, height: 24, alignSelf: "flex-start", marginLeft: 8 }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { paddingLeft: 142, paddingTop: 1, minWidth: 0, alignSelf: "stretch" }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, minWidth: 0, flexShrink: 1 }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
+  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeToc: { width: 156, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }, runtimeTocList: { flex: 1, minHeight: 0 }, runtimeWorkspace: { width: "100%", padding: 14, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeSection: { gap: 6 }, runtimeSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeFieldList: { gap: 10 }, runtimeField: { minWidth: 0, alignSelf: "stretch", gap: 2 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeModifiedBar: { width: 2, alignSelf: "stretch", marginRight: 6, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { alignSelf: "center", height: 16, marginRight: 6 }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: 142, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 160, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 160, minWidth: 160, height: 26 }, runtimeBooleanControl: { width: 44, minWidth: 44, height: 24, alignSelf: "flex-start", marginLeft: 8 }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { paddingLeft: 142, paddingTop: 1, minWidth: 0, alignSelf: "stretch" }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, minWidth: 0, flexShrink: 1 }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementRail: { width: 140, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }, dataManagementRailList: { flex: 1, minHeight: 0 }, dataManagementDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, paddingHorizontal: 12, justifyContent: "flex-start", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, dataManagementTabs: { width: 272, height: 24, alignSelf: "flex-start", flexShrink: 0 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: 10, paddingHorizontal: 4, paddingBottom: 14 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementImportFileLabel: { width: 72, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSyncScopeLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementDirectionLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementDirectionPicker: { width: 210, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   webDavForm: { flexGrow: 0, paddingHorizontal: 2 }, webdavFormBody: { gap: 6 }, webdavStateRow: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "flex-start" }, webdavSyncArea: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionRow: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: "flex-start" }, webdavStateSpacer: { flex: 1 }, webdavStateStatus: { maxWidth: 180, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right", lineHeight: 15 }, webdavFormRows: { width: "60%", gap: 5 }, webdavPasswordInput: { width: "100%", minHeight: 26 },
   logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },

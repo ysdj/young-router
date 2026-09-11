@@ -116,12 +116,110 @@ def _matches_upstream_model(public_model: object, upstream_model: object) -> boo
     )
 
 
-def _configured_public_models(config_path: Path) -> dict[str, str]:
+def _configured_public_models_from(
+    configured: Mapping[str, Mapping[str, str]],
+) -> dict[str, str]:
     return {
         deployment_id: deployment["public_model"]
-        for deployment_id, deployment in _configured_deployments(config_path).items()
+        for deployment_id, deployment in configured.items()
         if deployment["public_model"]
     }
+
+
+def _normalized_order(value: object) -> str:
+    text = _string_record_value(value)
+    if not text:
+        return ""
+    try:
+        return repr(float(text))
+    except ValueError:
+        return ""
+
+
+def _request_route_identity(record: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    """Route identity every request row carries, independent of its id."""
+
+    route_key = record.get("route_key")
+    provider = _string_record_value(record.get("provider")) or _route_key_value(
+        route_key, "provider"
+    )
+    upstream_model = _string_record_value(
+        record.get("upstream_model")
+    ) or _route_key_value(route_key, "upstream")
+    api_key_name = _string_record_value(record.get("api_key_name")) or _route_key_value(
+        route_key, "key"
+    )
+    return (
+        provider.casefold(),
+        _upstream_model_name(upstream_model),
+        api_key_name,
+        _normalized_order(_route_key_value(route_key, "order")),
+    )
+
+
+def _configured_route_public_models_from(
+    configured: Mapping[str, Mapping[str, str]],
+) -> tuple[dict[tuple[str, str, str, str], str], dict[tuple[str, str, str], str]]:
+    """Index configured public names by the route a request actually used.
+
+    LiteLLM replaces a deployment id with a per-call hash for client-side
+    credential and dynamic routes, so the id alone cannot always resolve the
+    configured public model.  The route identity -- provider, upstream model,
+    key name, order -- survives that rewrite.  The second index drops the order
+    for rows whose recorded order differs from the staged default, and routes
+    that map to more than one configured public name stay unresolved instead of
+    guessing.
+    """
+
+    by_route: dict[tuple[str, str, str, str], str] = {}
+    by_route_without_order: dict[tuple[str, str, str], str] = {}
+    ambiguous_routes: set[tuple[str, str, str, str]] = set()
+    ambiguous_route_prefixes: set[tuple[str, str, str]] = set()
+    for deployment in configured.values():
+        public_model = deployment.get("public_model", "")
+        provider = deployment.get("provider", "")
+        upstream_model = deployment.get("upstream_model", "")
+        if not (public_model and provider and upstream_model):
+            continue
+        route_prefix = (provider.casefold(), upstream_model, deployment.get("api_key_name", ""))
+        route = (*route_prefix, _normalized_order(deployment.get("order")))
+        known = by_route.get(route)
+        if known is not None and known != public_model:
+            ambiguous_routes.add(route)
+        else:
+            by_route[route] = public_model
+        known_prefix = by_route_without_order.get(route_prefix)
+        if known_prefix is not None and known_prefix != public_model:
+            ambiguous_route_prefixes.add(route_prefix)
+        else:
+            by_route_without_order[route_prefix] = public_model
+    for route in ambiguous_routes:
+        by_route.pop(route, None)
+    for route_prefix in ambiguous_route_prefixes:
+        by_route_without_order.pop(route_prefix, None)
+    return by_route, by_route_without_order
+
+
+def _configured_route_public_model(
+    configured_route_models: object,
+    record: Mapping[str, Any],
+) -> str:
+    """Resolve a public model from the route identity of one request row."""
+
+    if not (
+        isinstance(configured_route_models, tuple)
+        and len(configured_route_models) == 2
+    ):
+        return ""
+    by_route, by_route_without_order = configured_route_models
+    if not isinstance(by_route, Mapping) or not isinstance(by_route_without_order, Mapping):
+        return ""
+    provider, upstream_model, api_key_name, order = _request_route_identity(record)
+    return (
+        by_route.get((provider, upstream_model, api_key_name, order))
+        or by_route_without_order.get((provider, upstream_model, api_key_name))
+        or ""
+    )
 
 
 def _string_record_value(value: object) -> str:
@@ -175,6 +273,8 @@ def _configured_deployments(config_path: Path) -> dict[str, dict[str, str]]:
                 "upstream_model": _upstream_model_name(model.get("litellm_model")),
                 "provider": _string_record_value(model.get("provider")) or provider_name,
                 "api_key_name": _string_record_value(model.get("api_key_name")),
+                "order": _string_record_value(model.get("order"))
+                or _string_record_value(model.get("effective_order")),
             }
     return configured
 
@@ -691,6 +791,7 @@ def _safe_route_candidates(
 def _safe_route_trace_record(
     raw: Mapping[str, Any],
     configured_public_models: Mapping[str, str] | None = None,
+    configured_route_models: object = None,
 ) -> dict[str, Any]:
     request = _mapping_value(raw.get("request"))
     deployment = _mapping_value(raw.get("deployment"))
@@ -733,13 +834,6 @@ def _safe_route_trace_record(
         and deployment_id.strip()
         else None
     )
-    if configured_public_model and (
-        not route_public_model
-        or _matches_upstream_model(
-            route_public_model, _route_key_value(route_key, "upstream")
-        )
-    ):
-        public_model = configured_public_model
     upstream_model = _upstream_model_name(
         _route_key_value(route_key, "upstream")
         or raw.get("upstream_model")
@@ -754,6 +848,29 @@ def _safe_route_trace_record(
         or _string_record_value(request.get("provider"))
         or _string_record_value(exception.get("provider"))
     )
+    if configured_public_model is None and configured_route_models:
+        configured_public_model = (
+            _configured_route_public_model(
+                configured_route_models,
+                {
+                    "provider": provider,
+                    "upstream_model": upstream_model,
+                    "api_key_name": _route_key_value(route_key, "key")
+                    or _string_record_value(raw.get("api_key_name"))
+                    or _string_record_value(deployment.get("api_key_name"))
+                    or _string_record_value(request.get("api_key_name")),
+                    "route_key": route_key,
+                },
+            )
+            or None
+        )
+    if configured_public_model and (
+        not route_public_model
+        or _matches_upstream_model(
+            route_public_model, _route_key_value(route_key, "upstream")
+        )
+    ):
+        public_model = configured_public_model
     status = _string_record_value(raw.get("status") or raw.get("result"))
     if not status and (raw.get("exception") is not None or raw.get("error") is not None):
         status = "error"
@@ -837,6 +954,7 @@ def _safe_route_trace_record(
 def _safe_request_record(
     raw: Mapping[str, Any],
     configured_public_models: Mapping[str, str] | None = None,
+    configured_route_models: object = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key in (
@@ -888,6 +1006,12 @@ def _safe_request_record(
         and deployment_id.strip()
         else None
     )
+    if configured_public_model is None and configured_route_models:
+        # A dynamic id (client-side credentials, rebuilt fallback kwargs) is
+        # not in the configuration; the route identity still is.
+        configured_public_model = (
+            _configured_route_public_model(configured_route_models, result) or None
+        )
     if configured_public_model and (
         not route_public_model
         or _matches_upstream_model(
@@ -931,10 +1055,65 @@ def _safe_request_record(
         result["error"] = projected_error or {"reason": "request-failed"}
     elif error not in (None, ""):
         result["error"] = {"reason": "request-failed"}
+    aborted = raw.get("aborted")
+    if isinstance(aborted, Mapping):
+        # Keep the runtime's own reason for a closed attempt (client
+        # disconnect, service restart) instead of showing a bare status.
+        projected_aborted = {
+            key: value
+            for key in ("reason",)
+            if (value := _safe_scalar(aborted.get(key), limit=160)) not in (None, "")
+        }
+        if projected_aborted:
+            result["aborted"] = projected_aborted
     return result
 
 
 _REQUEST_PENDING_STATUSES = frozenset({"pending", "sending"})
+# A request attempt that stops progressing without a terminal callback (client
+# disconnect, failover teardown, worker exit) must not stay "sending" forever.
+# The runtime closes those rows itself; this window is the viewer's fallback for
+# rows written by an earlier runtime or by a process that died mid-flight.
+_REQUEST_PROGRESS_STATUSES = _REQUEST_PENDING_STATUSES | {"stream"}
+REQUEST_STALE_SECONDS_KEY = "YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS"
+DEFAULT_REQUEST_STALE_SECONDS = 900.0
+MAX_REQUEST_STALE_SECONDS = 86400.0
+
+
+def _request_stale_seconds_value(value: object) -> float:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_REQUEST_STALE_SECONDS
+    if not math.isfinite(parsed) or parsed <= 0:
+        return 0.0
+    return min(parsed, MAX_REQUEST_STALE_SECONDS)
+
+
+def _close_stale_request_record(
+    record: dict[str, Any],
+    *,
+    stale_seconds: float,
+    now: float,
+) -> dict[str, Any]:
+    """Project an unfinished row that stopped progressing as interrupted."""
+
+    if stale_seconds <= 0:
+        return record
+    if _request_record_status(record) not in _REQUEST_PROGRESS_STATUSES:
+        return record
+    observed = _timestamp_number(
+        record.get("ts")
+        or record.get("timestamp")
+        or record.get("started_at")
+        or record.get("updated_at")
+    )
+    if observed is None or now - observed < stale_seconds:
+        return record
+    settled = dict(record)
+    settled["status"] = "aborted"
+    settled["aborted"] = {"reason": "stale"}
+    return settled
 
 
 def _request_projection_key(record: Mapping[str, Any]) -> str:
@@ -1232,6 +1411,7 @@ class LogsDomain:
             self.runtime_settings_path = Path(runtime_settings_path).expanduser()
         self._runtime_settings_signature: tuple[int, int] | None = None
         self._runtime_line_limit = max(1, min(int(maximum_lines), MAX_LINES))
+        self._request_stale_seconds = DEFAULT_REQUEST_STALE_SECONDS
         self._online_usage_records: list[str] = []
         self._online_usage_refreshed = False
         self._online_usage_revision = 0
@@ -1267,14 +1447,16 @@ class LogsDomain:
             "limit": self._line_limit(tab),
         }
 
-    def _default_line_limit(self) -> int:
+    def _refresh_runtime_settings(self) -> None:
+        """Reload cached Runtime Settings values when their file changes."""
+
         try:
             details = self.runtime_settings_path.stat()
             signature = (details.st_mtime_ns, details.st_size)
         except OSError:
             signature = (-1, -1)
         if signature == self._runtime_settings_signature:
-            return self._runtime_line_limit
+            return
         self._runtime_settings_signature = signature
         try:
             from runtime_settings_io import load_specs, read_settings_file
@@ -1282,12 +1464,16 @@ class LogsDomain:
             values = read_settings_file(self.runtime_settings_path, load_specs())
             configured = int(values.get("YOUNG_ROUTER_LOG_VIEW_LIMIT", DEFAULT_LINES))
             self._runtime_line_limit = max(1, min(configured, MAX_LINES))
+            self._request_stale_seconds = _request_stale_seconds_value(
+                values.get(REQUEST_STALE_SECONDS_KEY, DEFAULT_REQUEST_STALE_SECONDS)
+            )
         except (OSError, TypeError, ValueError):
             self._runtime_line_limit = self.maximum_lines
-        return self._runtime_line_limit
+            self._request_stale_seconds = DEFAULT_REQUEST_STALE_SECONDS
 
     def _line_limit(self, tab: str) -> int:
-        return self._limits.get(tab, self._default_line_limit())
+        self._refresh_runtime_settings()
+        return self._limits.get(tab, self._runtime_line_limit)
 
     def _path(self, tab: str) -> Path | None:
         names = {
@@ -1364,11 +1550,12 @@ class LogsDomain:
         except OSError:
             raise LogsDomainError("Log source is unavailable") from None
         lines = data.decode("utf-8", errors="replace").splitlines()
-        return (
-            lines
-            if complete_document or all_lines
-            else lines[-(line_limit or self._default_line_limit()) :]
-        )
+        if complete_document or all_lines:
+            return lines
+        if line_limit is None:
+            self._refresh_runtime_settings()
+            line_limit = self._runtime_line_limit
+        return lines[-line_limit:]
 
     def _read_current_and_previous_lines(self, path: Path) -> list[str]:
         """Read the bounded current and immediately previous log segments.
@@ -1616,10 +1803,14 @@ class LogsDomain:
                 if "litellm_route_trace" not in line and not _is_service_noise(line)
             ]
             lines = _group_service_lines(lines)
-        configured_public_models = (
-            _configured_public_models(self.config_path)
+        configured_deployments = (
+            _configured_deployments(self.config_path)
             if tab in {"requests", "route-trace"}
             else {}
+        )
+        configured_public_models = _configured_public_models_from(configured_deployments)
+        configured_route_models = _configured_route_public_models_from(
+            configured_deployments
         )
         records: list[object] = []
         for line in lines:
@@ -1652,9 +1843,17 @@ class LogsDomain:
                     if timestamp:
                         parsed = {**parsed, "timestamp": timestamp}
                 record = (
-                    _safe_request_record(parsed, configured_public_models)
+                    _safe_request_record(
+                        parsed,
+                        configured_public_models,
+                        configured_route_models,
+                    )
                     if tab == "requests"
-                    else _safe_route_trace_record(parsed, configured_public_models)
+                    else _safe_route_trace_record(
+                        parsed,
+                        configured_public_models,
+                        configured_route_models,
+                    )
                 )
                 if record:
                     records.append(record)
@@ -1662,6 +1861,18 @@ class LogsDomain:
                 records.append(REDACT_TEXT(ANSI_CONTROL_SEQUENCE.sub("", line))[:512])
         if tab == "requests":
             records = _collapse_request_records(records)
+            self._refresh_runtime_settings()
+            stale_seconds = self._request_stale_seconds
+            if stale_seconds > 0:
+                now = time.time()
+                records = [
+                    _close_stale_request_record(
+                        record,
+                        stale_seconds=stale_seconds,
+                        now=now,
+                    )
+                    for record in records
+                ]
         needle = self._filters.get(tab, "").casefold()
         if needle:
             records = [
