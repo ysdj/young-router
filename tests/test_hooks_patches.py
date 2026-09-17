@@ -925,7 +925,7 @@ class HookPatchTests(HookTestCase):
         )
         self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
 
-    async def test_failed_protocol_fallback_is_counted_once_and_returns_terminal_failure(self) -> None:
+    async def test_failed_protocol_fallback_returns_terminal_failure_without_cooldown(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
         router_module = types.ModuleType("litellm.router")
@@ -1004,9 +1004,9 @@ class HookPatchTests(HookTestCase):
 
         self.assertTrue(hooks._is_failed_responses_stream_response(response))
         self.assertEqual(attempts, ["openai/responses", "openai/chat"])
-        state = hooks._DEPLOYMENT_COOLDOWNS["id:dual-protocol-route"]
-        self.assertEqual(state["failures"], 1)
-        self.assertEqual(state.get("cooldown_until", 0), 0)
+        # A deterministic request error records neither a deployment failure
+        # nor a cooldown for the completed protocol pair.
+        self.assertNotIn("id:dual-protocol-route", hooks._DEPLOYMENT_COOLDOWNS)
         self.assertFalse(hooks._is_route_recovery_poll_error(response.exception))
 
     async def test_generic_helper_preserves_historical_tool_item_ids(self) -> None:

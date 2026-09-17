@@ -42,13 +42,28 @@ POINT FrameTrackSizeForContentDips(HWND window, LONG width, LONG height);
 // window, including future route and modal windows.
 void DisableWindowTransitions(HWND window) noexcept;
 
-// One relay API key as the group manager sheet sees it.
+// One relay group offered by the station: the picker title carries the rate,
+// the list's group column shows the name alone because 倍率 has its own column,
+// and `rate` reports the group's 倍率 on its own.
+struct GroupManagerGroup {
+  std::wstring id;
+  std::wstring label;
+  std::wstring name;
+  std::wstring rate;
+};
+
+// One relay API key as the group manager sheet sees it: its rate, the
+// station's credential-presence sentinel, and the models the station reports
+// for it.  The plaintext value never crosses this boundary; the sheet reads it
+// through Core's native capability and shows it in place.
 struct GroupManagerKey {
   std::wstring id;
   std::wstring name;
   std::wstring group_id;
   std::wstring group_label;
   std::wstring multiplier;
+  std::wstring hint;
+  std::wstring models;
 };
 
 // Localized labels for the native group manager sheet.
@@ -59,15 +74,24 @@ struct GroupManagerLabels {
   std::wstring name_label;
   std::wstring group_label;
   std::wstring multiplier_label;
+  std::wstring value_label;
+  std::wstring copy_action_label;
+  std::wstring copy_label;
+  std::wstring copied_label;
+  std::wstring failed_label;
+  std::wstring models_label;
+  std::wstring empty_label;
+  std::wstring saved_label;
   std::wstring enabled_label;
   std::wstring new_key_name;
-  std::wstring draft_label;
-  std::wstring deleted_label;
   std::wstring auto_grouping_label;
   std::wstring ungrouped_label;
   std::wstring close_label;
   std::wstring apply_label;
-  std::wstring hint;
+  // The Close confirmation shown while the draft would lose edits.
+  std::wstring discard_title;
+  std::wstring discard_body;
+  std::wstring discard_confirm;
 };
 
 // One staged edit of an existing key.
@@ -129,7 +153,8 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
   std::optional<GroupManagerResult> ShowGroupManager(
       std::wstring title,
       std::wstring account_label,
-      std::vector<std::pair<std::wstring, std::wstring>> groups,
+      std::wstring account_id,
+      std::vector<GroupManagerGroup> groups,
       std::vector<GroupManagerKey> keys,
       GroupManagerLabels labels,
       bool auto_grouping);

@@ -78,6 +78,10 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         forkserver = object()
         settle = mock.Mock()
         state_module = SimpleNamespace(settle_stale_recent_requests=settle)
+        # Stub the launcher's base import so the assertion below pins the
+        # default WebSocket frame limit without importing the real LiteLLM
+        # runtime in this unit test.
+        base_module = SimpleNamespace(_websocket_max_frame_bytes=lambda: 67108864)
 
         def import_module(name: str) -> object:
             if name == "uvicorn":
@@ -87,7 +91,8 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             raise AssertionError(name)
 
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
-            sys.modules, {"young_router.state": state_module}
+            sys.modules,
+            {"young_router.state": state_module, "young_router.base": base_module},
         ), mock.patch.object(
             multiprocessing, "set_forkserver_preload", create=True
         ) as set_preload, mock.patch.object(
@@ -133,6 +138,7 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             port=4000,
             workers=16,
             loop="uvloop",
+            ws_max_size=67108864,
         )
 
 

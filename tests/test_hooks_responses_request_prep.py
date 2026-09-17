@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import base64
 from unittest import mock
 
 from hook_test_utils import *
 
 
 class HookResponsesRequestPrepTests(HookTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Replay-image reference copies stay inside a per-test directory so a
+        # test never reads or writes the real runtime cache.
+        self.use_replay_image_cache()
+
     def test_mcp_auto_approval_is_disabled_by_default(self) -> None:
         hooks, _ = load_hook_module()
         request = {
@@ -1610,6 +1617,27 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIn("/tmp/mutable.png", mutable_parts[0]["text"])
         self.assertEqual(mutable_parts[1], mutable_output["output"][0])
 
+    def use_replay_image_cache(self) -> Path:
+        """Point the durable replay-image cache at a per-test directory."""
+
+        directory = tempfile.TemporaryDirectory(prefix="young-router-replay-images-")
+        self.addCleanup(directory.cleanup)
+        cache_dir = Path(directory.name)
+        self.set_env("YOUNG_ROUTER_IMAGE_CACHE_DIR", str(cache_dir))
+        return cache_dir
+
+    @staticmethod
+    def reference_paths(text: str) -> list[str]:
+        """Return the ``1. /local/path`` reference lines of one marker text."""
+
+        paths: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            number, separator, path = stripped.partition(". ")
+            if separator and number.isdigit():
+                paths.append(path.strip())
+        return paths
+
     def _prefix_preview_request(self) -> dict:
         oversized_url = "data:image/png;base64," + ("A" * 200_000)
         call = {
@@ -1641,6 +1669,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_previews_replace_oversized_frozen_view_image_outputs(self) -> None:
         hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         original = self._prefix_preview_request()
@@ -1672,7 +1701,17 @@ class HookResponsesRequestPrepTests(HookTestCase):
         reference = updated["output"][0]
         self.assertEqual("input_text", reference["type"])
         self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, reference["text"])
-        self.assertIn("/tmp/scan/frozen.png", reference["text"])
+        # The client's temp path cannot be reopened later: the advertised
+        # reference is a durable copy of the same bytes instead.
+        advertised = self.reference_paths(reference["text"])
+        self.assertEqual(len(advertised), 1)
+        self.assertNotIn("/tmp/scan/frozen.png", reference["text"])
+        self.assertTrue(advertised[0].startswith(str(cache_dir)))
+        self.assertTrue(advertised[0].endswith(".png"))
+        self.assertEqual(
+            base64.b64decode("A" * 200_000),
+            Path(advertised[0]).read_bytes(),
+        )
         self.assertEqual(updated["output"][1], frozen_output["output"][0])
         self.assertEqual(
             updated["output"][2]["image_url"], "data:image/jpeg;base64,c2hydW5r"
@@ -1779,6 +1818,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_previews_handle_wire_function_call_shape(self) -> None:
         hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         # 真实线格式：arguments 是 JSON 对象，脚本嵌在 input 字段、引号被转义
@@ -1824,7 +1864,13 @@ class HookResponsesRequestPrepTests(HookTestCase):
         updated = modified["input"][1]
         self.assertEqual(updated["id"], "fco_wire")
         self.assertEqual("input_text", updated["output"][0]["type"])
-        self.assertIn("/tmp/wire.png", updated["output"][0]["text"])
+        advertised = self.reference_paths(updated["output"][0]["text"])
+        self.assertEqual(len(advertised), 1)
+        self.assertTrue(advertised[0].startswith(str(cache_dir)))
+        self.assertEqual(
+            base64.b64decode("W" * 150_000),
+            Path(advertised[0]).read_bytes(),
+        )
         self.assertEqual(
             "data:image/jpeg;base64,wire-preview",
             updated["output"][1]["image_url"],
@@ -1837,6 +1883,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_path_recent_mode_keeps_recent_previews_and_paths_older(self) -> None:
         hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
@@ -1880,22 +1927,39 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNotNone(modified)
         assert modified is not None
-        # 老的输出 -> 纯路径：图片 part 全部移除，引用文本带路径
+        # 老的输出 -> 纯路径：图片 part 全部移除，引用文本带可重开的本地副本
         out0 = modified["input"][1]["output"]
         self.assertEqual([p.get("type") for p in out0], ["input_text", "input_text"])
-        self.assertIn("/tmp/old1.png", out0[0]["text"])
         self.assertIn("replaced by local-path", out0[0]["text"])
         out1 = modified["input"][3]["output"]
         self.assertEqual([p.get("type") for p in out1], ["input_text", "input_text"])
-        self.assertIn("/tmp/old2.png", out1[0]["text"])
+        for output, client_path in ((out0, "/tmp/old1.png"), (out1, "/tmp/old2.png")):
+            advertised = self.reference_paths(output[0]["text"])
+            self.assertEqual(len(advertised), 1)
+            self.assertNotEqual(client_path, advertised[0])
+            self.assertTrue(advertised[0].startswith(str(cache_dir)))
+            self.assertTrue(Path(advertised[0]).is_file())
         # 最近的输出 -> 预览 + 路径引用
         out2 = modified["input"][5]["output"]
-        self.assertIn("/tmp/recent.png", out2[0]["text"])
+        advertised_recent = self.reference_paths(out2[0]["text"])
+        self.assertEqual(len(advertised_recent), 1)
+        self.assertTrue(advertised_recent[0].startswith(str(cache_dir)))
+        self.assertTrue(Path(advertised_recent[0]).is_file())
         image_parts2 = [p for p in out2 if p.get("type") == "input_image"]
         self.assertEqual(len(image_parts2), 1)
         self.assertEqual("data:image/jpeg;base64,preview", image_parts2[0]["image_url"])
         # 加密项逐字节不变
         self.assertEqual(modified["input"][6], request["input"][6])
+
+        # 保留张数为 0 时所有超大输出都转成路径引用（不是全部保留）
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "0")
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        modified_zero = hooks._with_prefix_image_previews(build())
+        assert modified_zero is not None
+        for idx in (1, 3, 5):
+            output = modified_zero["input"][idx]["output"]
+            self.assertEqual([p.get("type") for p in output], ["input_text", "input_text"])
+            self.assertIn("replaced by local-path", output[0]["text"])
 
         # off 模式完全不碰
         self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "off")
@@ -1920,6 +1984,122 @@ class HookResponsesRequestPrepTests(HookTestCase):
             image_parts = [p for p in output if p.get("type") == "input_image"]
             self.assertEqual(len(image_parts), 1)
             self.assertEqual("data:image/jpeg;base64,preview", image_parts[0]["image_url"])
+
+    def _single_aged_prefix_output_request(self, path: str, *, payload_char: str = "D") -> dict:
+        """One oversized frozen ``view_image`` output that is never recent."""
+
+        call = {
+            "type": "custom_tool_call",
+            "call_id": "call-aged",
+            "name": "exec",
+            "input": 'await tools.view_image({path:"%s"});' % path,
+        }
+        output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-aged",
+            "id": "ctco_aged",
+            "output": [
+                {"type": "input_text", "text": "Script completed"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64," + (payload_char * 150_000),
+                },
+            ],
+        }
+        return {
+            "call_type": "aresponses",
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+            "input": [
+                call,
+                output,
+                {"type": "reasoning", "encrypted_content": "opaque"},
+            ],
+        }
+
+    def test_prefix_image_path_reference_keeps_a_durable_client_path(self) -> None:
+        hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "0")
+
+        # A workspace file the client owns keeps its own path: no copy needed.
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix="young-router-durable-") as durable:
+            durable_path = Path(durable) / "sheet.png"
+            durable_path.write_bytes(b"durable sheet bytes")
+            modified = hooks._with_prefix_image_previews(
+                self._single_aged_prefix_output_request(str(durable_path))
+            )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        output = modified["input"][1]["output"]
+        self.assertEqual([p.get("type") for p in output], ["input_text", "input_text"])
+        self.assertEqual(self.reference_paths(output[0]["text"]), [str(durable_path)])
+        self.assertEqual(list(cache_dir.iterdir()), [])
+
+    def test_prefix_image_path_reference_survives_temporary_file_cleanup(self) -> None:
+        hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "0")
+
+        # A clipboard paste or an intermediate crop lives in OS temp storage;
+        # the reference must survive the client's later cleanup of it.
+        with tempfile.TemporaryDirectory(prefix="young-router-crop-") as temporary:
+            crop_path = Path(temporary) / "crop.png"
+            crop_path.write_bytes(b"crop bytes")
+            modified = hooks._with_prefix_image_previews(
+                self._single_aged_prefix_output_request(str(crop_path))
+            )
+            self.assertIsNotNone(modified)
+            assert modified is not None
+            advertised = self.reference_paths(modified["input"][1]["output"][0]["text"])
+            self.assertEqual(len(advertised), 1)
+            self.assertNotEqual(advertised[0], str(crop_path))
+            self.assertTrue(advertised[0].startswith(str(cache_dir)))
+            crop_path.unlink()
+            self.assertEqual(
+                base64.b64decode("D" * 150_000),
+                Path(advertised[0]).read_bytes(),
+            )
+
+    def test_prefix_image_path_reference_falls_back_to_inline_preview(self) -> None:
+        hooks, _ = load_hook_module()
+        blocker = tempfile.NamedTemporaryFile(prefix="young-router-cache-blocker-")
+        self.addCleanup(blocker.close)
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "0")
+        # A cache root that cannot be created must never cost the model its
+        # only copy of the image: the aged output keeps the reduced preview
+        # instead of a path the client cannot open.
+        self.set_env(hooks._PREFIX_IMAGE_CACHE_DIR_ENV, blocker.name)
+
+        hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+        with mock.patch.object(
+            hooks._image_inputs_module,
+            "_resize_data_url",
+            side_effect=lambda value, *, target_bytes, max_edge: "data:image/jpeg;base64,preview",
+        ):
+            modified = hooks._with_prefix_image_previews(
+                self._single_aged_prefix_output_request("/tmp/lost-crop.png")
+            )
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        output = modified["input"][1]["output"]
+        self.assertNotIn(
+            hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER,
+            json.dumps(output),
+        )
+        image_parts = [p for p in output if p.get("type") == "input_image"]
+        self.assertEqual(len(image_parts), 1)
+        self.assertEqual("data:image/jpeg;base64,preview", image_parts[0]["image_url"])
 
     def test_prefix_image_previews_pair_split_identifier_wire_shapes(self) -> None:
         hooks, _ = load_hook_module()
@@ -1981,6 +2161,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
     def test_prefix_image_original_path_converts_aged_original_outputs_by_default(self) -> None:
         hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
         self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
         self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
@@ -2026,7 +2207,14 @@ class HookResponsesRequestPrepTests(HookTestCase):
             output = modified["input"][idx]["output"]
             self.assertEqual([p.get("type") for p in output], ["input_text", "input_text"])
             self.assertIn("replaced by local-path", output[0]["text"])
-            self.assertIn("/tmp/orig-old1.png" if idx == 1 else "/tmp/orig-old2.png", output[0]["text"])
+            advertised = self.reference_paths(output[0]["text"])
+            self.assertEqual(len(advertised), 1)
+            self.assertTrue(advertised[0].startswith(str(cache_dir)))
+            self.assertTrue(Path(advertised[0]).is_file())
+            self.assertEqual(
+                base64.b64decode("O" * 150_000),
+                Path(advertised[0]).read_bytes(),
+            )
         # 保留窗口内的原图输出 -> 原始字节原样内联
         self.assertEqual(modified["input"][5], request["input"][5])
         self.assertEqual(modified["input"][6], request["input"][6])

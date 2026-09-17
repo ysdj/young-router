@@ -66,6 +66,25 @@ std::wstring PrivateRuntimeDirectory() {
   return temporary;
 }
 
+// Core keeps its private revision/service metadata in this file. Without it a
+// host-driven replacement (a failed session renewal, or a crash recovery)
+// restarts Core's shared revision at zero while every open window still holds
+// the older, larger revision, so those windows drop every later snapshot and
+// report conflicts the user never caused.
+std::wstring CoreMetadataPath() {
+  std::wstring root = Environment(L"YOUNG_ROUTER_HOME");
+  if (root.empty()) root = Environment(L"LITELLM_RUNTIME_ROOT");
+  if (root.empty()) {
+    std::wstring home = Environment(L"USERPROFILE");
+    if (home.empty()) {
+      home = Environment(L"HOMEDRIVE") + Environment(L"HOMEPATH");
+    }
+    if (home.empty()) return {};
+    root = home + L"\\.young-router";
+  }
+  return root + L"\\.litellm-runtime\\core-state.json";
+}
+
 std::string ReadSmallFile(std::wstring const& path) {
   std::ifstream stream(path, std::ios::binary);
   if (!stream) return {};
@@ -189,9 +208,16 @@ CoreIPCBridge::~CoreIPCBridge() {
   Stop();
 }
 
-void CoreIPCBridge::SetEventHandler(std::function<void(std::string const&)> handler) {
+int CoreIPCBridge::AddEventHandler(std::function<void(std::string const&)> handler) {
   std::lock_guard guard(mutex_);
-  event_handler_ = std::move(handler);
+  next_event_handler_token_ += 1;
+  event_handlers_[next_event_handler_token_] = std::move(handler);
+  return next_event_handler_token_;
+}
+
+void CoreIPCBridge::RemoveEventHandler(int token) {
+  std::lock_guard guard(mutex_);
+  event_handlers_.erase(token);
 }
 
 std::string CoreIPCBridge::Send(std::string const& request_json) {
@@ -704,6 +730,10 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
   }
   std::wstring command = Quote(python) + L" -m young_router.core --endpoint-file " + Quote(descriptor) +
       L" --parent-pid " + std::to_wstring(GetCurrentProcessId());
+  std::wstring metadata = CoreMetadataPath();
+  if (!metadata.empty()) {
+    command += L" --metadata " + Quote(metadata);
+  }
   std::vector<wchar_t> mutable_command(command.begin(), command.end());
   mutable_command.push_back(L'\0');
 
@@ -862,13 +892,16 @@ void CoreIPCBridge::PollEvents(std::string subscription) {
       auto outer = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(result.body));
       // A missing/null event is the expected quiet heartbeat.
       auto event = outer.GetNamedObject(L"event", nullptr);
-      std::function<void(std::string const&)> handler;
+      std::vector<std::function<void(std::string const&)>> handlers;
       {
         std::lock_guard guard(mutex_);
         if (core_generation_ != generation || subscription_id_ != subscription) return;
-        handler = event_handler_;
+        for (auto const& entry : event_handlers_) handlers.push_back(entry.second);
       }
-      if (event && handler) handler(WideToUtf8(event.Stringify().c_str()));
+      if (event) {
+        std::string text = WideToUtf8(event.Stringify().c_str());
+        for (auto const& handler : handlers) handler(text);
+      }
     } catch (...) {
       InvalidateCoreIfGeneration(generation, true);
       return;

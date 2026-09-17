@@ -496,11 +496,49 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("func usePersistentScrollers(horizontal: Bool, vertical: Bool)", leaf)
         # Every native scroll view that keeps a scroller on screen draws it with
         # that class: the declaration plus the model chooser, the read-only text
-        # editor (install and layout pass), and the key list the group manager
-        # sheet hosts.
-        self.assertEqual(5, leaf.count("usePersistentScrollers("))
+        # editor (install and layout pass), the key list the group manager sheet
+        # hosts, and that sheet's 模型列表 list (install and layout pass).
+        self.assertEqual(7, leaf.count("usePersistentScrollers("))
         self.assertIn("scrollView.usePersistentScrollers(horizontal: false, vertical: true)", leaf)
         self.assertIn("usePersistentScrollers(horizontal: true, vertical: true)", leaf)
+
+    def test_native_group_manager_hides_unusable_add_remove_controls(self) -> None:
+        # The sheet's ＋ / － follow the shared pane rule: hide a control the
+        # current state cannot use instead of greying it out.
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        self.assertIn("let canAddKey = editingEnabled && !groups.isEmpty", leaf)
+        self.assertIn("addButton?.isHidden = !canAddKey", leaf)
+        self.assertIn("removeButton?.isHidden = !editable", leaf)
+        self.assertIn("const bool can_add_key = !groups.empty() && !toggle_on();", windows)
+        self.assertIn(
+            "add_button.Visibility(can_add_key ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);",
+            windows,
+        )
+        self.assertIn(
+            "remove_button.Visibility(editable ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);",
+            windows,
+        )
+
+    def test_native_tables_report_a_cleared_selection(self) -> None:
+        # A click below the rows clears the list selection, but the shared view
+        # still holds the item its + / − header and editor act on.  Both hosts
+        # report that cleared selection so the panes drop it instead of leaving
+        # a stale selection the list no longer highlights.
+        mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        mac_table = mac.split(
+            "- (void)tableViewSelectionDidChange:", 1
+        )[1].split("- (void)handleRowClick:", 1)[0]
+        windows_table = windows.split(
+            "list_.SelectionChanged([this](auto const&, auto const&) {", 1
+        )[1].split("list_.ItemClick([this]", 1)[0]
+        self.assertIn("if (selectedRow < 0 && !viewProps.selectedKey.empty()) {", mac_table)
+        self.assertIn('LiteLLMAppKitTableEventEmitter::OnSelectionChange event{"", -1};', mac_table)
+        self.assertIn("if (index < 0) {", windows_table)
+        self.assertIn("if (!Props()->selectedKey.empty()) {", windows_table)
+        self.assertIn("args.index = -1;", windows_table)
+        self.assertIn('args.key = "";', windows_table)
 
     def test_native_login_item_registration_follows_core_target_state(self) -> None:
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
@@ -1821,36 +1859,78 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_scrollView.scrollerStyle = NSScrollerStyleLegacy", controls)
         self.assertIn("_scrollView.hasHorizontalScroller = NO", controls)
         self.assertIn("_scrollView.hasVerticalScroller = NO", controls)
-        # A scroller the table actually needs stays on screen: the table pins it
-        # with the legacy style and auto-hide off and releases it again once the
-        # table fits, instead of letting AppKit fade the bar out while idle.
+        # A scroller the table actually needs stays on screen: the table keeps it
+        # with auto-hide off and releases it again once the table fits, instead
+        # of letting AppKit fade the bar out while idle.
         self.assertIn(
             "const BOOL usesScrollers = _scrollView.hasHorizontalScroller || _scrollView.hasVerticalScroller;",
             controls,
         )
-        self.assertIn(
-            "const NSScrollerStyle scrollerStyle = usesScrollers ? NSScrollerStyleLegacy : NSScrollerStyleOverlay;",
-            controls,
-        )
+        self.assertIn("const NSScrollerStyle scrollerStyle = usesScrollers ? NSScrollerStyleLegacy : NSScrollerStyleOverlay;", controls)
         self.assertIn("const BOOL autohidesScrollers = !usesScrollers;", controls)
         self.assertIn("if ([self applyPersistentTableScrollerChrome]) continue;", controls)
         self.assertIn("scrollView.horizontalScroller.hidden = NO;", controls)
         self.assertIn("scrollView.verticalScroller.hidden = NO;", controls)
-        # The pinned scroller is drawn like the system overlay scroller - one
-        # translucent knob and no track - so it does not cover the row or the
-        # trailing cell it sits on.  The drawing lives in the Swift scroller that
-        # every native scroll view shares; the ObjC hosts only install it.
+        # The scroller the app keeps on screen is its own translucent capsule in
+        # the legacy slot, and the legacy gutter is removed by floating the clip
+        # view over the full width with the scroller on top of the trailing edge.
         self.assertIn("static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal, BOOL vertical)", controls)
         self.assertIn(
             "scrollView.horizontalScroller = [[LiteLLMPersistentScroller alloc] initWithFrame:NSZeroRect];",
             controls,
         )
+        self.assertIn("void FloatPersistentScrollerOverContent(NSScrollView *scrollView)", controls)
+        self.assertIn("frame.origin.x = NSMaxX(bounds) - verticalStrip;", controls)
+        self.assertIn("const NSRect clipFrame = NSMakeRect(NSMinX(bounds), NSMinY(bounds), NSWidth(bounds), NSHeight(bounds));", controls)
+        self.assertIn("FloatPersistentScrollerOverContent(scrollView);", controls)
+        # AppKit leaves the scroller view it supersedes in the scroll view's view
+        # tree, and that leftover draws its own full-length knob next to the live
+        # capsule - a second bar on the table's trailing edge.  Every tiling pass
+        # drops the scrollers the scroll view no longer uses.
+        self.assertIn("void DiscardStaleScrollerSubviews(NSScrollView *scrollView)", controls)
+        self.assertIn("for (NSView *subview in [scrollView.subviews copy]) {", controls)
+        self.assertIn("if (subview == scrollView.verticalScroller || subview == scrollView.horizontalScroller) continue;", controls)
+        self.assertIn("DiscardStaleScrollerSubviews(self);", controls)
+        self.assertIn("DiscardStaleScrollerSubviews(scrollView);", controls)
+        # AppKit rebuilds a scroller whenever a flag flips, so the tile override
+        # re-installs the app capsule as well as the floating placement.
+        self.assertIn("if (self.hasVerticalScroller && ![self.verticalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {", controls)
+        self.assertIn("if (self.hasHorizontalScroller && ![self.horizontalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {", controls)
+        self.assertIn("FloatPersistentScrollerOverContent(self);", controls)
+        mac_leaf_scrollers = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        self.assertIn("func floatOverContent()", mac_leaf_scrollers)
         self.assertIn("[self installPersistentTableScrollers];", controls)
         self.assertIn("_scrollView.horizontalScrollElasticity = NSScrollElasticityNone", controls)
         self.assertIn("_scrollView.verticalScrollElasticity = NSScrollElasticityNone", controls)
         self.assertIn("@interface LiteLLMTableScrollView : NSScrollView", controls)
         self.assertIn("- (void)scrollWheel:(NSEvent *)event", controls)
+        # A two-finger trackpad gesture is claimed by the window's responsive
+        # scrolling machinery, which routes the whole gesture to the outermost
+        # compatible scroll view - the RN pane - so a nested native table never
+        # saw it (a mouse wheel takes the classic path, which is why only
+        # trackpads looked dead).  The panes stay on the classic path.
+        self.assertIn("void UseClassicScrollingForPaneScrollViews(void)", controls)
+        self.assertIn('Class paneScrollViewClass = NSClassFromString(@"RCTCustomScrollView");', controls)
+        self.assertIn("SEL selector = @selector(isCompatibleWithResponsiveScrolling);", controls)
+        self.assertIn("method_setImplementation(method, imp_implementationWithBlock(^BOOL(__unused id receiver) {", controls)
+        # AppKit re-tiles the RN panes into a legacy gutter; the shared tile
+        # hook floats any scroll view that carries the app capsule.
+        self.assertIn("void FloatPersistentScrollersFromEveryTilingPass(void)", controls)
+        self.assertIn("method_setImplementation(method, (IMP)LiteLLMScrollViewTile);", controls)
+        self.assertIn("FloatPersistentScrollersFromEveryTilingPass();", controls)
+        self.assertIn("UseClassicScrollingForPaneScrollViews();", controls)
         self.assertIn("BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL acceptsVerticalScroll, BOOL acceptsHorizontalScroll);", controls)
+        # A wheel event belongs to the table while its dominant axis can still
+        # move.  A two-finger swipe carries sideways drift with it, and handing
+        # that event to the ancestor pane gives the pane the whole gesture (one
+        # scroll view per gesture), which made the list dead to trackpads.
+        self.assertIn("BOOL TableScrollViewCanScrollVertically(NSScrollView *scrollView, NSEvent *event)", controls)
+        self.assertIn("BOOL TableScrollViewCanScrollHorizontally(NSScrollView *scrollView, NSEvent *event)", controls)
+        self.assertIn("const BOOL wantsVertical = fabs(deltaY) >= 0.01;", controls)
+        self.assertIn("const BOOL wantsHorizontal = fabs(deltaX) >= 0.01;", controls)
+        self.assertIn("wantsVertical && acceptsVerticalScroll && TableScrollViewCanScrollVertically(scrollView, event);", controls)
+        self.assertIn("wantsHorizontal && acceptsHorizontalScroll && TableScrollViewCanScrollHorizontally(scrollView, event);", controls)
+        self.assertIn("return fabs(deltaY) >= fabs(deltaX) ? canScrollVertically : canScrollHorizontally;", controls)
         self.assertIn("BOOL ForwardWheelToParent(NSView *view, NSEvent *event);", controls)
         self.assertIn("if (TableScrollViewCanConsume(self, event, _acceptsVerticalScroll, _acceptsHorizontalScroll))", controls)
         self.assertIn("if (ForwardWheelToParent(self, event)) return;", controls)
@@ -1860,9 +1940,15 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("_scrollView.contentView = _clipView;", controls)
         self.assertIn("_clipView.acceptsVerticalScroll = needsVerticalScroller;", controls)
         self.assertIn("- (NSRect)constrainBoundsRect:(NSRect)proposedBounds", controls)
-        self.assertIn("constrained.origin.y = -NSHeight(tableView.headerView.frame);", controls)
+        # The parked position is the clip view's real top: only movement above it
+        # is clamped, so the first wheel notch and a scroller drag that ends
+        # inside the header strip are not swallowed.
+        self.assertIn("const CGFloat restingOrigin = -NSHeight(tableView.headerView.frame);", controls)
+        self.assertIn("if (NSMinY(proposedBounds) <= restingOrigin + 0.5) {", controls)
+        self.assertIn("constrained.origin.y = restingOrigin;", controls)
+        self.assertIn("if (tableView.headerView != nil) minimumY = -NSHeight(tableView.headerView.frame);", controls)
         self.assertIn("clipBounds.origin.y = restingOrigin;", controls)
-        self.assertIn("if (originY >= 0 && originY < -restingOrigin) {", controls)
+        self.assertIn("if (fabs(originY) < 0.5) {", controls)
         self.assertIn("@interface LiteLLMTableView : NSTableView", controls)
         self.assertIn("_tableView.acceptsVerticalScroll = NO", controls)
         self.assertIn("NSScrollView *owner = ParentScrollView(self);", controls)
@@ -2323,6 +2409,50 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("const nativeTableColumns = useMemo(", ui)
         self.assertIn("<NativeTable columns={nativeTableColumns}", ui)
         self.assertIn("REACT_FIELD(documentKey)", windows_codegen)
+
+    def test_every_react_root_receives_core_events(self) -> None:
+        """One React root per window observes Core; a single handler slot does not."""
+
+        mac_bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
+        mac_module = (MAC_NATIVE / "CoreIPCModule.swift").read_text(encoding="utf-8")
+        windows_bridge = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
+        windows_bridge_header = (WIN_NATIVE / "CoreIPCBridge.h").read_text(encoding="utf-8")
+        windows_module = (WIN_NATIVE / "CoreIPCModule.cpp").read_text(encoding="utf-8")
+        windows_module_header = (WIN_NATIVE / "CoreIPCModule.h").read_text(encoding="utf-8")
+
+        for source in (mac_bridge, windows_bridge, windows_bridge_header):
+            self.assertNotIn("setEventHandler", source)
+            self.assertNotIn("SetEventHandler", source)
+        # macOS: one observer per React root, fanned out by the shared bridge.
+        self.assertIn("func addEventHandler(_ handler: @escaping (String) -> Void) -> Int", mac_bridge)
+        self.assertIn("private var eventHandlers: [Int: (String) -> Void] = [:]", mac_bridge)
+        self.assertIn("for handler in handlers { handler(eventText) }", mac_bridge)
+        self.assertIn("eventHandlerToken = core.addEventHandler", mac_module)
+        self.assertIn("override func stopObserving()", mac_module)
+        self.assertIn("core.removeEventHandler(token)", mac_module)
+        # Windows: the same contract through the module's listener lifecycle.
+        self.assertIn("int AddEventHandler(std::function<void(std::string const&)> handler);", windows_bridge_header)
+        self.assertIn("std::map<int, std::function<void(std::string const&)>> event_handlers_;", windows_bridge_header)
+        self.assertIn("for (auto const& handler : handlers) handler(text);", windows_bridge)
+        self.assertIn("event_handler_token_ = CoreIPCBridge::Shared().AddEventHandler(", windows_module)
+        self.assertIn("void CoreIPCModule::AddListener(std::string const&) noexcept {\n  RegisterEventHandler();", windows_module)
+        self.assertIn("void CoreIPCModule::RemoveListeners(double count) noexcept {\n  if (count > 0) return;\n  UnregisterEventHandler();", windows_module)
+        self.assertIn("void RegisterEventHandler() noexcept;", windows_module_header)
+
+    def test_hosts_keep_the_core_revision_monotonic_across_a_replacement(self) -> None:
+        """A host-driven Core replacement must resume Core's own revision."""
+
+        mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
+
+        for source in (mac, windows):
+            self.assertIn("--metadata", source)
+            self.assertIn(".litellm-runtime", source)
+            self.assertIn("core-state.json", source)
+        self.assertIn('arguments.append(contentsOf: ["--metadata", metadataPath])', mac)
+        self.assertIn('environment["YOUNG_ROUTER_HOME"] ?? environment["LITELLM_RUNTIME_ROOT"]', mac)
+        self.assertIn('command += L" --metadata " + Quote(metadata);', windows)
+        self.assertIn('std::wstring root = Environment(L"YOUNG_ROUTER_HOME");', windows)
 
 
 if __name__ == "__main__":

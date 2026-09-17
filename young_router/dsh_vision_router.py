@@ -7,6 +7,10 @@ providers, and the optional anonymous OVH chain).  It is deliberately a
 fallback adapter: the selected LiteLLM deployment remains the source of the
 answer, and this module is entered only after that deployment rejects image
 input.
+
+Mirror reviewed against upstream dsh-vision-router 2.1.6; re-check the latest
+upstream release and adapt this module before artifact builds (AGENTS.md,
+Runtime And Compatibility).
 """
 
 from __future__ import annotations

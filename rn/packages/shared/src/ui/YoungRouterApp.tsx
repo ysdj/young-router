@@ -11,7 +11,6 @@ import {
   accountsFromSnapshot,
   ApiKeyCreateDialog,
   DependencyPolicyDialog,
-  groupLabel,
   NativeFormRow,
   NativeWizardProgress,
   normalizeRelayOrigin,
@@ -288,6 +287,13 @@ function stringValue(value: unknown, fallback = ""): string {
   return fallback;
 }
 
+// A provider, model, or key that was created but not named yet stores an empty
+// string.  Treat that exactly like a missing value so the row shows the
+// localized placeholder instead of rendering blank.
+function displayLabel(value: unknown, fallback: string): string {
+  return stringValue(value).trim() || fallback;
+}
+
 function booleanValue(value: unknown, fallback = false): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "number" && Number.isFinite(value)) return value !== 0;
@@ -484,8 +490,14 @@ function modelEffectiveOrder(model: UnknownRecord): number {
 }
 
 function modelProviderKeyLabel(model: UnknownRecord, provider: UnknownRecord, translate: Translate, keyName?: (keyID: string, name: string) => string): string {
-  const key = providerKeyStates(provider).find((entry) => entry.id === stringValue(model.provider_key_id));
-  return key ? keyName?.(key.id, key.name) ?? key.name : stringValue(model.api_key_name, translate("common.default"));
+  // Match the key the way the model editor does: by slot id first, then by the
+  // key name the model carries.  A stored id can move (Core re-derives a
+  // renamed key's slot when it reads the document back), and matching by id
+  // alone left the list under "undefined key" while the editor showed the key.
+  const keyStates = providerKeyStates(provider);
+  const key = keyStates.find((entry) => entry.id === stringValue(model.provider_key_id))
+    ?? keyStates.find((entry) => entry.name === stringValue(model.api_key_name));
+  return key ? keyName?.(key.id, key.name) ?? key.name : displayLabel(model.api_key_name, translate("providers.undefinedKey"));
 }
 
 function isApplyResult(value: unknown): value is IpcResults["apply"] {
@@ -568,7 +580,14 @@ function isRevisionRetryableAction(type: string): boolean {
     // Station rebinding is idempotent and Core keeps a no-op rebind clean,
     // so the automatic base-URL match may safely retry after a snapshot
     // refresh instead of surfacing a transient revision conflict.
-    || normalized === "provider_select_relay_station";
+    || normalized === "provider_select_relay_station"
+    // Launch-at-login is an absolute Core preference written immediately, not
+    // a staged draft, and the shared revision also advances for work this
+    // window never saw (a clean-draft external settings reload while the pane's
+    // snapshot was catching up). Rebasing once keeps the switch honest instead
+    // of claiming the user changed settings outside the window.
+    || normalized === "service_autostart_enable"
+    || normalized === "service_autostart_disable";
 }
 
 function domainState(snapshot: CoreSnapshot | undefined, domain: ConfigDomain): UnknownRecord {
@@ -1328,6 +1347,17 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       if (refreshAfter) await refresh();
     } catch (reason: unknown) {
       publishResult(errorMessage(reason, translate));
+      // A rejected Apply only says the draft is invalid. Ask the domain which
+      // entries failed so the pane can name them instead of leaving the user
+      // with a message that points at nothing.
+      if (stringValue(asRecord(reason).code) === "validation_failed" && (domain === "providers_models" || route === "providers-models")) {
+        try {
+          const summary = await ipc.validate("providers_models");
+          setIssues(summary.issues);
+        } catch {
+          // Keep the Apply failure; naming the issues is best-effort.
+        }
+      }
     } finally {
       activeRuns.current -= 1;
       if (!keepControlsEnabled && activeRuns.current === 0) setBusy(false);
@@ -1347,12 +1377,16 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       setWebDavOperationBusy(false);
     }
   };
-  const enqueueDispatch = (type: string, payload: UnknownRecord = {}, targetDomain = domain): Promise<IpcResults["dispatch"]> => {
-    const actionDomain = targetDomain;
-    if (!actionDomain) return Promise.reject(new Error("A settings domain is required"));
+  // An ordinary route action carries its settings domain. A Core-level service
+  // action (the launch-at-login preference) has none, so `null` explicitly
+  // requests a domain-less action envelope; an omitted argument still means
+  // "this route's domain" and stays an error when the route has none.
+  const enqueueDispatch = (type: string, payload: UnknownRecord = {}, targetDomain: ConfigDomain | null | undefined = domain): Promise<IpcResults["dispatch"]> => {
+    const actionDomain = targetDomain ?? undefined;
+    if (!actionDomain && targetDomain !== null) return Promise.reject(new Error("A settings domain is required"));
     const queued = dispatchQueue.current.catch(() => undefined).then(async () => {
       if (revision.current === undefined) await refresh();
-      const action = { domain: actionDomain, type, payload };
+      const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };
       let staged: IpcResults["dispatch"];
       try {
         staged = await ipc.dispatch(action, revision.current);
@@ -1375,6 +1409,10 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     dispatchQueue.current = queued.then(() => undefined, () => undefined);
     return queued;
   };
+  // The General pane's service actions share the buffered queue, the live route
+  // revision, and that one rebase, so they never fail because another surface
+  // advanced the shared revision first.
+  const enqueueServiceDispatch = (type: string, payload: UnknownRecord = {}): Promise<IpcResults["dispatch"]> => enqueueDispatch(type, payload, null);
   const dispatch: Dispatch = (type, payload = {}, targetDomain = domain) => run(async () => {
     const staged = await enqueueDispatch(type, payload, targetDomain);
     if (targetDomain === "codex" || targetDomain === "claude") {
@@ -1684,14 +1722,9 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       if (domains.includes("codex") || domains.includes("claude")) {
         setSettingsRawBaselineToken((current) => current + 1);
       }
-      if (!result.domains?.includes("relay_accounts") && result.status === "applied" && (domains.includes("providers_models") || domains.includes("runtime")) && (refreshed.service.state === "running" || refreshed.service.state === "unhealthy")) {
-        // Provider Apply reloads the managed proxy in CoreStore. Runtime-only
-        // changes still use the existing UI lifecycle operation.
-        if (!domains.includes("providers_models")) {
-          const reloaded = await ipc.dispatch({ type: "service.reload" }, result.revision);
-          revision.current = reloaded.revision;
-        }
-      }
+      // Core restarts the managed proxy for providers_models and runtime
+      // applies on its own thread, so the pane never waits for the restart
+      // and a later edit is not stuck behind it.
       if (diskConflicts.length > 0) setKeptDiskGeneration({});
       return result;
     }, options?.silent ? null : (options?.message ?? "common.applied"), options?.keepControlsEnabled === true);
@@ -1779,12 +1812,9 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       }
       const applied = await ipc.applyDomains(["providers_models"], refreshed.revision, diskChanged ? ["overwrite_external_providers_models"] : undefined);
       revision.current = applied.revision;
-      const afterApply = await refresh();
-      if (applied.status === "applied" && ["running", "unhealthy", "starting"].includes(afterApply.service.state)) {
-        const restarted = await ipc.dispatch({ type: "service.restart" }, revision.current ?? afterApply.revision);
-        revision.current = restarted.revision;
-        await refresh();
-      }
+      // Core restarts the managed proxy in the background for this apply, so
+      // activation must not wait for or race a second explicit restart here.
+      await refresh();
       completed = applied.status === "applied";
       return applied;
     }, null, false, false);
@@ -2042,7 +2072,9 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   const refreshRelayResources = useCallback(async (accountId: string): Promise<"ready" | "unavailable"> => {
     const staged = await enqueueDispatch("resources.refresh", { account_id: accountId }, "relay_accounts");
     revision.current = staged.revision;
-    return asRecord(staged).resource_status === "ready" ? "ready" : "unavailable";
+    // The refresh reports its own projection as the action summary; the
+    // dispatch result itself only carries the revision and that summary.
+    return asRecord(staged.action_summary).resource_status === "ready" ? "ready" : "unavailable";
   }, [enqueueDispatch]);
   const relayApiKeyActions = useMemo<RelayApiKeyActions>(() => ({
     create: async (accountId, options) => {
@@ -2139,8 +2171,8 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") onNavigate("provider-wizard"); native.window.open("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} onActivateAndRestart={activateProviderAndRestart} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onOpenFile={openAssistantFile} /> : null}
-    {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
-    {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} translate={translate} onSnapshot={onSnapshot} /> : null}
+    {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
+    {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} /> : null}
     {route === "data-management" ? <DataManagementWorkspace snapshot={snapshot} busy={busy} webDavOperationBusy={webDavOperationBusy} statuses={dataManagementStatuses} translate={translate} dispatch={dispatchDataManagement} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onTabSwitchError={(tab, reason) => setDataManagementStatuses((current) => ({ ...current, [tab]: errorMessage(reason, translate) }))} onInspectImport={inspectImportDataManagement} onImport={importDataManagement} onConfirmImportReplace={confirmImportDraftReplacement} onExport={exportDataManagement} onProbeWebDav={probeWebDav} onSyncWebDav={syncWebDav} /> : null}
     {issues.length > 0 ? <IssueList issues={issues} translate={translate} /> : null}
@@ -3140,8 +3172,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
   }, [busy, dispatch, providers, relayStations]);
   const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);
+  // The list owns the selection: an explicitly cleared one (a click below the
+  // rows) leaves the panes empty instead of acting on a provider the list no
+  // longer highlights, while the first provider still opens the pane on load.
   const provider = useMemo(
-    () => providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0],
+    () => providers.find((item) => editorIdentifier(item) === selectedProvider)
+      ?? (selectedProvider === undefined ? providers[0] : undefined),
     [providers, selectedProvider],
   );
   const providerId = provider ? editorIdentifier(provider) : "";
@@ -3152,6 +3188,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const [selectedModel, setSelectedModel] = useState<string>();
   const [providerSourceModel, setProviderSourceModel] = useState<string>();
+  // Adding a provider from the list header selects it as soon as the snapshot
+  // carries it, so the editor below opens on the provider that was just made.
+  const pendingProviderIds = useRef<Set<string> | undefined>(undefined);
   const model = useMemo(
     () => models.find((item) => editorIdentifier(item) === selectedModel),
     [models, selectedModel],
@@ -3223,6 +3262,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       if (selectedProvider !== undefined) setSelectedProvider(undefined);
       return;
     }
+    // A cleared selection stays cleared: the provider list, the + / − headers,
+    // and the editor all read the one selection the user can see.
+    if (selectedProvider === "") return;
     if (!providers.some((item) => editorIdentifier(item) === selectedProvider)) {
       setSelectedProvider(editorIdentifier(providers[0]));
     }
@@ -3244,11 +3286,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
   }, [models, providerId, selectedModel]);
   useEffect(() => {
+    const pending = pendingProviderIds.current;
+    if (!pending) return;
+    const added = providers.find((item) => !pending.has(editorIdentifier(item)));
+    if (!added) return;
+    pendingProviderIds.current = undefined;
+    setSelectedProvider(editorIdentifier(added));
+  }, [providers]);
+  useEffect(() => {
     if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) setFetchKeyID(fetchKeyChoices[0]?.id);
   }, [fetchKeyChoices, fetchKeyID, providerId]);
   const handleFetchedModels = (summary: UnknownRecord): void => {
     const summaryProviderId = stringValue(summary.provider_id);
-    const providerIdentity = identifier(provider);
+    const providerIdentity = provider ? identifier(provider) : "";
     if (stringValue(summary.operation) !== "fetch_models" || (summaryProviderId !== providerId && summaryProviderId !== providerIdentity)) return;
     const candidates = stringList(summary.models);
     if (summary.available === false) {
@@ -3314,7 +3364,25 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (!provider) return;
     const knownModelIds = new Set(models.map(editorIdentifier));
     pendingModelIds.current = { providerId, ids: knownModelIds };
-    void dispatch("model.add", { provider_id: providerId, model: { name: "", upstream_model: "", enabled: true, order: 0 } });
+    // The pane commits every edit, so a new model is valid the moment it
+    // exists: it carries the localized placeholder name (and that name as its
+    // upstream route) that the user renames afterwards, instead of an empty
+    // name that blocks the commit with a validation error nobody can act on.
+    const base = translate("providers.newModel");
+    const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);
+    void dispatch("model.add", { provider_id: providerId, model: { name, upstream_model: name, enabled: true, order: 0 } });
+  };
+  const addProvider = (): void => {
+    // The pane commits every edit, so a new provider is valid the moment it
+    // exists: a placeholder name and no key or model yet, with the editor
+    // below collecting the URL, key, and models.  The wizard keeps its own
+    // button.
+    const base = translate("providers.newProvider");
+    const name = uniquePlaceholderName(providers.map((item) => providerDisplayName(item)), base);
+    pendingProviderIds.current = new Set(providers.map(editorIdentifier));
+    setSelectedModel(undefined);
+    setProviderSourceModel(undefined);
+    void dispatch("provider.add", { provider: { name, models: [] } });
   };
   const duplicateModel = (): void => {
     if (!model) return;
@@ -3324,14 +3392,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const entryID = editorIdentifier(entry);
     return providerNameDrafts[entryID] !== undefined
       ? providerNameDrafts[entryID]
-      : stringValue(entry.display_name, stringValue(entry.name, translate("providers.newProvider")));
+      : displayLabel(entry.display_name, displayLabel(entry.name, translate("providers.newProvider")));
   }, [providerNameDrafts, translate]);
   const modelDisplayName = useCallback((entryProviderID: string, entryModel: UnknownRecord): string => {
     const entryModelID = editorIdentifier(entryModel);
     const draft = modelNameDrafts[providerModelDraftKey(entryProviderID, entryModelID)];
     return draft !== undefined
       ? draft
-      : stringValue(entryModel.display_name, stringValue(entryModel.name, translate("providers.newModel")));
+      : displayLabel(entryModel.display_name, displayLabel(entryModel.model_name ?? entryModel.name, translate("providers.unnamedModel")));
   }, [modelNameDrafts, translate]);
   const modelUpstreamDisplay = useCallback((entryProviderID: string, entryModel: UnknownRecord): string => {
     const entryModelID = editorIdentifier(entryModel);
@@ -3416,7 +3484,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const canMoveRouteUp = !activeRouteUsesMultiplier && activeRouteIndex > 0;
   const canMoveRouteDown = !activeRouteUsesMultiplier && activeRouteIndex >= 0 && activeRouteIndex < activeRouteGroup.length - 1;
   useEffect(() => {
-    if (viewMode !== "routes" || routes.length === 0 || routes.some((entry) => entry.key === selectedRoute)) return;
+    // A cleared route selection stays cleared; the first route only fills in
+    // when the selected one is gone from the list.
+    if (viewMode !== "routes" || routes.length === 0 || selectedRoute === "" || routes.some((entry) => entry.key === selectedRoute)) return;
     setSelectedRoute(routes[0].key);
   }, [routes, selectedRoute, viewMode]);
   const moveRoute = (direction: "up" | "down"): void => {
@@ -3514,6 +3584,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     () => models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier),
     [models, provider?.enabled],
   );
+  // Rows that cannot materialize a route keep the pane honest about what
+  // blocks Apply: Core rejects a model without a public name, so the row that
+  // needs the name is marked where it is edited.
+  const alertModelKeys = useMemo(() => models.filter(modelNeedsAttention).map(editorIdentifier), [models]);
+  const alertProviderKeys = useMemo(
+    () => providers.filter((item) => asRecords(item.models).some(modelNeedsAttention)).map(editorIdentifier),
+    [providers],
+  );
   const routeRows = useMemo(() => {
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
     let previousPublicModel = "";
@@ -3539,6 +3617,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     [routes],
   );
   const selectRoute = useCallback((routeId: string): void => {
+    if (!routeId) {
+      // A click below the route rows clears the selection: the inspector
+      // empties instead of keeping a route active without a highlighted row.
+      setSelectedRoute("");
+      setProviderSourceModel(undefined);
+      return;
+    }
     const selected = routes.find((entry) => entry.key === routeId);
     if (!selected) return;
     setSelectedRoute(routeId);
@@ -3598,12 +3683,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         </TablePane>
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
-          <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={onOpenWizard} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !provider} onPress={confirmDeleteProvider} /></>}>
-            <NativeTable columns={[{ label: translate("providers.provider"), width: 132 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
+          <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}</>}>
+            <NativeTable columns={[{ label: translate("providers.provider"), width: 132 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
           <View style={styles.providerMiddlePane}>
-            <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<><IconButton label="+" title={translate("providers.newModel")} disabled={busy || !provider || providerKindSelected === "openai" || providerKindSelected === "claude"} onPress={addModel} /><IconButton label="⧉" title={translate("common.copy")} disabled={busy || !model} onPress={duplicateModel} /><IconButton label="−" title={translate("common.delete")} disabled={busy || !model} onPress={confirmDeleteModel} /></>}>
-              <NativeTable columns={[{ label: translate("providers.keyModelColumn"), width: 124 }, { label: translate("providers.model"), width: 108 }, { label: translate("common.order"), width: 48 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
+            <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
+              <NativeTable columns={[{ label: translate("providers.upstream"), width: 120 }, { label: translate("providers.publicModel"), width: 100 }, { label: translate("common.order"), width: 60 }]} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModel ?? ""} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedModel(key); setProviderSourceModel(undefined); }} style={styles.nativeModelTable} />
               {provider && providerKindSelected !== "openai" && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}><NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy || fetchKeyChoices.length === 0} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /><ActionButton title={translate("providers.fetch")} disabled={busy || !selectedFetchKey} onPress={fetchModels} /></View> : null}
             </TablePane>
           </View>
@@ -3632,6 +3717,10 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const providedRows = useMemo(() => providedKeyRows(stationAccounts, translate), [stationAccounts, translate]);
   const firstSelectable = customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : "";
   const [selectedKey, setSelectedKey] = useState<string>(firstSelectable);
+  // A cleared key selection (a click below the key rows) survives the repair
+  // below: the panel keeps no key selected, hides the −, and leaves its editor
+  // empty instead of quietly editing the first key again.
+  const [selectionCleared, setSelectionCleared] = useState(false);
   const pendingCustomKeyName = useRef<string | undefined>(undefined);
   const [providedNameDrafts, setProvidedNameDrafts] = useState<Record<string, string>>({});
   const [formBusy, setFormBusy] = useState(false);
@@ -3713,12 +3802,13 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     };
   }, [autoGrouping, autoGroupingAccounts, controlsBusy, relay]);
   useEffect(() => {
+    if (selectionCleared) return;
     // tableRows keys already carry the custom:/provided: prefix; compare the
     // selection verbatim or every click would snap back to the first row.
     const valid = new Set(tableRows.filter((row) => !row.spanning).map((row) => row.key));
     if (valid.has(selectedKey)) return;
     setSelectedKey(customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : "");
-  }, [customKeys, providedRows, selectedKey, tableRows]);
+  }, [customKeys, providedRows, selectedKey, selectionCleared, tableRows]);
   const addKey = (): void => {
     if (selectedGroup === "provided" && isRelay) {
       if (autoGrouping || stationAccounts.length === 0) return;
@@ -3735,6 +3825,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     const added = customKeys.find((key) => key.name === pending);
     if (added) {
       pendingCustomKeyName.current = undefined;
+      setSelectionCleared(false);
       setSelectedKey(`custom:${added.id}`);
     }
   }, [customKeys]);
@@ -3750,7 +3841,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     const affectedModelLines = asRecords(provider?.models)
       .filter((model) => stringValue(model.api_key_name).trim() === selectedKeyName)
       .map((model, index) => {
-        const publicName = stringValue(model.name, translate("providers.newModel")).trim();
+        const publicName = displayLabel(model.model_name ?? model.name, translate("providers.unnamedModel")).trim();
         const upstreamName = upstreamModelLabel(model).trim();
         const label = upstreamName && upstreamName !== publicName ? `${publicName} (${upstreamName})` : publicName;
         return `${index + 1}. ${label}`;
@@ -3766,9 +3857,13 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       return dispatch("provider.key_delete", { provider_id: providerId, name: selectedKeyName });
     });
   };
+  // A + / − the current state cannot use is hidden instead of greyed out: the
+  // list header keeps only the actions that apply to what is selected.
+  const canAddKey = !(selectedGroup === "provided" && (autoGrouping || stationAccounts.length === 0 || !relay.apiKeyActions.create));
+  const canDeleteKey = Boolean(selectedCustom) || Boolean(selectedProvided && !autoGrouping);
   const toolbar = <>
-    <IconButton label="+" title={translate("providers.addKey")} disabled={controlsBusy || (selectedGroup === "provided" && (autoGrouping || stationAccounts.length === 0 || !relay.apiKeyActions.create))} onPress={addKey} />
-    <IconButton label="−" title={translate("common.delete")} disabled={controlsBusy || (!selectedCustom && !selectedProvided) || (Boolean(selectedProvided) && autoGrouping)} onPress={deleteSelected} />
+    {canAddKey ? <IconButton label="+" title={translate("providers.addKey")} disabled={controlsBusy} onPress={addKey} /> : null}
+    {canDeleteKey ? <IconButton label="−" title={translate("common.delete")} disabled={controlsBusy} onPress={deleteSelected} /> : null}
   </>;
   const selectedProvidedName = selectedProvided ? providedNameDrafts[selectedProvided.key] ?? selectedProvided.keyName : "";
   // The inline keys list sizes to the pane instead of a fixed row budget:
@@ -3806,7 +3901,11 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       cellHorizontalPadding={6}
       firstColumnHorizontalPadding={6}
       scrollTrailingColumnOverflow={false}
-      onSelectionChange={(key) => { if (!key.startsWith("group:") && !key.startsWith("account:")) setSelectedKey(key); }}
+      onSelectionChange={(key) => {
+        if (key.startsWith("group:") || key.startsWith("account:")) return;
+        setSelectionCleared(key === "");
+        setSelectedKey(key);
+      }}
       style={variant === "inline" ? [styles.keysTableInline, { height: keysTableInlineHeight, minHeight: keysTableInlineHeight }] : styles.keysTable}
     />;
   const keysEditorView = <View style={styles.keysEditor}>
@@ -3865,7 +3964,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
             })();
           }} style={styles.panelActionButton} />
         </View>
-      </> : <Text style={styles.keysHint}>{isRelay && stationAccounts.length === 0 ? translate("providers.providedKeysNeedAccount") : translate("providers.keyListHint")}</Text>}
+      </> : null}
     </View>;
   const dialogs = <>
       <ApiKeyCreateDialog
@@ -3915,13 +4014,13 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         <Text style={styles.panelTitle}>{translate("providers.keys")}</Text>
         <View style={styles.panelActions}>{toolbar}</View>
       </View>
-      {keysTable}
+      {tableRows.length > 0 ? keysTable : null}
       {keysEditorView}
       {dialogs}
     </View>;
   }
   return <TablePane style={[styles.keysPane]} title={translate("providers.keys")} actions={toolbar}>
-    {keysTable}
+    {tableRows.length > 0 ? keysTable : null}
     {keysEditorView}
     {dialogs}
   </TablePane>;
@@ -3961,6 +4060,10 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const upstreamName = drafts?.modelUpstreamDisplay(providerId, model) ?? upstreamModelLabel(model);
   const upstreamFieldValue = upstreamName;
   const providerBaseUrl = drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
+  // The editable field shows the model's real value: the localized placeholder
+  // only labels the list row and the breadcrumb, so the pane never looks like a
+  // name is set while validation still reports it missing.
+  const modelFieldName = stringValue(model.model_name, stringValue(model.name));
   const keyStates = providerAuthKind(provider) === "api_key" ? providerKeyStates(provider) : [];
   const selectedProviderKey = keyStates.find((key) => key.id === stringValue(model.provider_key_id))
     ?? keyStates.find((key) => key.name === stringValue(model.api_key_name));
@@ -3998,6 +4101,12 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     }).catch(() => undefined);
   };
   const selectProviderKey = (providerKeyID: string): void => {
+    if (!providerKeyID) {
+      // Back to the provider's default key: drop the model's own binding
+      // instead of pinning it to whichever key happens to be first.
+      void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { provider_key_id: "", api_key_name: "" } });
+      return;
+    }
     if (providerKeyID.startsWith("relay:")) {
       const sourceID = providerKeyID.slice("relay:".length);
       const source = matchingRelaySources.find((candidate) => relaySourceSelectionID(candidate) === sourceID);
@@ -4021,13 +4130,13 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     });
   };
   return <View style={styles.inspectorContent}>
-    <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{modelName}</Text></View>
+    <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(modelName, translate("providers.unnamedModel"))}</Text></View>
     <View style={styles.inspectorDivider} />
     <View style={styles.inspectorBody}>
       <View style={styles.inspectorEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} style={styles.inspectorEnableControl} /><ActionButton title={probing ? translate("providers.probing") : translate("providers.probe")} disabled={busy || probing || !probeReady} onPress={probe} />{probePresentation.compact ? <Pressable accessibilityRole="button" accessibilityLabel={probePresentation.compact} accessibilityHint={probeDetailHint} onPress={openProbeDetails} style={({ pressed }) => [styles.probeSummaryTrigger, pressed && styles.probeSummaryTriggerPressed]}><TooltipText numberOfLines={2} tooltip={probeDetailHint} style={styles.probeSummary}>{probePresentation.compact}</TooltipText></Pressable> : null}</View>
-      <TextField label={translate("providers.publicModel")} labelWidth={60} value={modelName} onDraftChange={onNameDraftChange} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} />
+      <TextField label={translate("providers.publicModel")} labelWidth={60} value={modelFieldName} onDraftChange={onNameDraftChange} onCommit={(name) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { name } })} />
       <PickerField label={translate("providers.provider")} labelWidth={60} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers[providerLabels.indexOf(label)]; if (next) onProviderChange(editorIdentifier(next)); }} />
-      {providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")} labelWidth={60} allowShrink value={selectedProviderKey?.id ?? providerKeyOptions[0]?.value ?? ""} values={providerKeyOptions} disabled={busy || providerKeyOptions.length <= 1} onSelect={selectProviderKey} /> : null}
+      {providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")} labelWidth={60} allowShrink value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey} /> : null}
       <TextField label={translate("providers.upstream")} labelWidth={60} value={upstreamFieldValue} onDraftChange={(value) => drafts?.setModelUpstreamDraft(providerId, id, value)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} />
       <View style={styles.orderEditorRow}>
         <TextField label={translate("providers.order")} labelWidth={60} controlWidth={64} value={String(displayedOrder)} keyboardType="numeric" disabled={busy || followsMultiplier} onDraftChange={(value) => drafts?.setModelOrderDraft(providerId, id, value)} onCommit={(nextOrder) => {
@@ -4106,6 +4215,16 @@ function modelRecord(model: UnknownRecord): UnknownRecord {
   };
 }
 
+// A staged model that cannot materialize a route yet.  Without a public name
+// (or an upstream model) Core rejects Apply, so the shared pane marks the row
+// where the model is edited instead of only reporting that the draft is invalid.
+function modelNeedsAttention(model: UnknownRecord): boolean {
+  if (!booleanValue(model.model_enabled, booleanValue(model.enabled, true))) return false;
+  const name = stringValue(model.model_name).trim() || stringValue(model.name).trim();
+  if (!name) return true;
+  return !(stringValue(model.litellm_model).trim() || stringValue(model.upstream_model).trim());
+}
+
 function isProbeSurface(value: string): value is "openai/responses" | "openai/chat" | "anthropic" {
   return value === "openai/responses" || value === "openai/chat" || value === "anthropic";
 }
@@ -4146,13 +4265,26 @@ function providerNameExists(providers: UnknownRecord[], name: string, excludeID 
     && stringValue(entry.display_name, stringValue(entry.name)).trim().toLocaleLowerCase() === normalized);
 }
 
+// A name derived from a provider's URL must not collide with an existing
+// provider: Core rejects the duplicate, so the suffix walks up 2, 3, … until
+// the name is free.
+function uniqueProviderName(providers: UnknownRecord[], name: string, excludeID = ""): string {
+  let candidate: string = name;
+  let suffix = 2;
+  while (providerNameExists(providers, candidate, excludeID)) {
+    candidate = `${name}${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
+}
+
 function ProviderSourceFields({ provider, providerID, relayStations, busy, translate, dispatch, onBaseUrlDraftChange, onNameDraftChange }: { provider: UnknownRecord; providerID: string; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatch: Dispatch; onBaseUrlDraftChange?: (baseURL: string) => void; onNameDraftChange?: (name: string) => void }): React.JSX.Element {
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const [sourceResetToken, setSourceResetToken] = useState(0);
   const providerName = drafts?.providerDisplayName(provider) ?? stringValue(provider.name, stringValue(provider.display_name));
   const providerBaseURL = drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base));
   // There is no explicit source switcher: a base URL that matches a station
-  // binds to it automatically, and the always-present 中转站账号关联
+  // binds to it automatically, and the always-present 中转站关联
   // section carries the account workflow.
   const commitBaseURL = (endpoint: string): void | Promise<void> => {
     const station = relayStationForBaseUrl(endpoint, relayStations);
@@ -4168,7 +4300,20 @@ function ProviderSourceFields({ provider, providerID, relayStations, busy, trans
     // A relay provider whose station is gone keeps its dangling source, and
     // the Core rejects direct URL/name edits on relay providers.  Editing the
     // address therefore turns it back into a plain custom provider.
-    return dispatch("provider.patch", { provider_id: providerID, changes: providerKind(provider) === "relay" ? { provider_type: "custom", endpoint } : { endpoint } });
+    const changes: UnknownRecord = providerKind(provider) === "relay" ? { provider_type: "custom", endpoint } : { endpoint };
+    // The name follows the first URL the provider is given: derive it from the
+    // host while the provider still has no address, and leave it alone after
+    // that so a later edit cannot overwrite a name the user chose.
+    const previousBaseURL = stringValue(provider.endpoint, stringValue(provider.api_base));
+    if (!previousBaseURL.trim() && endpoint.trim()) {
+      const suggested = suggestedProviderName(endpoint);
+      if (suggested && suggested.toLocaleLowerCase() !== providerName.trim().toLocaleLowerCase()) {
+        const name = uniqueProviderName(drafts?.providers ?? [], suggested, providerID);
+        changes.name = name;
+        onNameDraftChange?.(name);
+      }
+    }
+    return dispatch("provider.patch", { provider_id: providerID, changes });
   };
   return <View style={styles.providerSourceFields}>
     <TextField key={"provider-base-url:" + sourceResetToken} label={translate("providers.baseUrl")} labelWidth={88} value={providerBaseURL} disabled={busy} onDraftChange={onBaseUrlDraftChange} onCommit={commitBaseURL} />
@@ -4212,7 +4357,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   };
   const shownChallenge = useRef<Record<string, string>>({});
   const providerName = drafts?.providerDisplayName(provider) ?? stringValue(provider.display_name, stringValue(provider.name, translate("providers.newProvider")));
-  const sourceModelLabel = sourceModel ? drafts?.modelDisplayName(id, sourceModel) ?? stringValue(sourceModel.name, translate("providers.newModel")) : "";
+  const sourceModelLabel = sourceModel ? drafts?.modelDisplayName(id, sourceModel) ?? displayLabel(sourceModel.model_name ?? sourceModel.name, translate("providers.unnamedModel")) : "";
   const authStatus = providerAuthStatus(provider);
   const authActive = booleanValue(provider.auth_active);
   const statusLabels: Record<ProviderAuthStatus, string> = {
@@ -4283,6 +4428,9 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   // station away from its bound provider. After success the workspace
   // auto-binds the provider by origin so the vendor picks up the
   // station's provided keys.
+  // The relay sign-in needs the vendor URL first: without one the + has nothing
+  // to do, so the header hides it instead of showing it greyed out.
+  const vendorBaseURL = (drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base))).trim();
   const addRelayAccountToVendor = async (): Promise<void> => {
     const origin = normalizeRelayOrigin(drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base)));
     if (!origin) return;
@@ -4409,8 +4557,8 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     {kind !== "openai" && kind !== "claude" && !station ? <View style={styles.providerAccountsHeader}>
       <View style={styles.panelHeader}>
         <Text style={styles.panelTitle}>{translate("providers.accounts")}</Text>
-        <View style={styles.providerKeyActions}>
-          <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")} accessibilityLabel={translate("providers.addRelayAccount")} disabled={busy || relayAddBusy || !(drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base))).trim()} onPress={() => { void addRelayAccountToVendor(); }} style={styles.iconButton} />
+        <View style={styles.panelActions}>
+          {vendorBaseURL ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")} accessibilityLabel={translate("providers.addRelayAccount")} disabled={busy || relayAddBusy} onPress={() => { void addRelayAccountToVendor(); }} style={styles.iconButton} /> : null}
         </View>
       </View>
     </View> : null}
@@ -4622,10 +4770,17 @@ function AssistantSettingsWorkspace({ snapshot, busy, translate, dispatch, onSec
   </View>} />;
 }
 
-function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, translate, onSnapshot }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; dispatch: Dispatch; translate: Translate; onSnapshot: (next: CoreSnapshot) => void }): React.JSX.Element {
+function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServiceAction, translate, onStatus, onSnapshot }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; dispatch: Dispatch; dispatchServiceAction: (type: string) => Promise<unknown>; translate: Translate; onStatus: (message?: string) => void; onSnapshot: (next: CoreSnapshot) => void }): React.JSX.Element {
   const [autoStartBusy, setAutoStartBusy] = useState(false);
-  const [status, setStatus] = useState<string>();
+  const [requestedAutoStart, setRequestedAutoStart] = useState<boolean>();
   const autoStartEnabled = snapshot?.service.auto_start_state === "enabled";
+  // The switch shows Core's stored preference, plus the value the user just
+  // requested until Core confirms it. A rejected dispatch must not leave the
+  // native switch claiming a preference Core never accepted.
+  const autoStartValue = requestedAutoStart ?? autoStartEnabled;
+  useEffect(() => {
+    if (requestedAutoStart !== undefined && requestedAutoStart === autoStartEnabled) setRequestedAutoStart(undefined);
+  }, [autoStartEnabled, requestedAutoStart]);
   const serviceState = snapshot?.service.state ?? "unknown";
   const runtimeSettings = asRecords(domainState(snapshot, "runtime").settings);
   const portItem = runtimeSettings.find((item) => identifier(item) === "LITELLM_PORT");
@@ -4647,16 +4802,24 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, translate, on
   const setAutoStart = async (enabled: boolean): Promise<void> => {
     if (!snapshot || autoStartBusy) return;
     setAutoStartBusy(true);
-    setStatus(undefined);
+    setRequestedAutoStart(enabled);
+    // Pane results belong to the window's one permanent status strip, exactly
+    // like every other settings pane; the pane body never grows a message row.
+    onStatus(undefined);
     try {
       // Launch-at-login is two-sided: Core records the preference and the host
-      // registers or removes the login item.
-      await ipc.dispatch({ type: enabled ? "service.autostart_enable" : "service.autostart_disable" }, snapshot.revision);
+      // registers or removes the login item. The Core write takes the same
+      // buffered service dispatch as the rest of the app, so this pane's
+      // snapshot revision may rebase once instead of reporting a conflict the
+      // switch never caused.
+      await dispatchServiceAction(enabled ? "service.autostart_enable" : "service.autostart_disable");
       await native.setLaunchAtLogin(enabled);
       onSnapshot(await ipc.snapshot());
-      setStatus(translate("common.saved"));
+      onStatus(translate("common.saved"));
     } catch (reason: unknown) {
-      setStatus(errorMessage(reason, translate));
+      // Hand the switch back to the preference Core actually kept.
+      setRequestedAutoStart(undefined);
+      onStatus(errorMessage(reason, translate));
     } finally {
       setAutoStartBusy(false);
     }
@@ -4666,7 +4829,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, translate, on
       <Text style={styles.generalSectionTitle}>{translate("general.startup")}</Text>
       <View style={styles.generalRow}>
         <Text style={styles.generalRowLabel}>{translate("general.autoStart")}</Text>
-        <NativeToggle value={autoStartEnabled} disabled={autoStartBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
+        <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
       </View>
       <Text style={styles.generalRowHint}>{translate("general.autoStartHint")}</Text>
     </View>
@@ -4683,7 +4846,6 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, translate, on
       </View>
       <Text style={styles.generalRowHint}>{translate("general.portHint", { default: portDefault })}</Text>
     </View>
-    {status ? <Text style={styles.generalStatus}>{status}</Text> : null}
   </PersistentScrollView>;
 }
 
@@ -4705,6 +4867,9 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
   const tocRows = useMemo(() => categories.map((name) => ({ key: name, cells: [runtimeCategoryLabel(name, translate)] })), [categories, translate]);
   const dshSyncToken = DSH_VISION_ROUTER_QUICK_KEYS.map((key) => `${key}:${stringValue(settings.find((item) => identifier(item) === key)?.value)}`).join("|");
   const jumpToCategory = (name: string): void => {
+    // The table of contents always tracks the pane's scrolling surface, so a
+    // cleared click keeps the current category instead of untracking it.
+    if (!name) return;
     setActiveCategory(name);
     const offset = sectionOffsets[name];
     // Position instantly: a table-of-contents jump should land exactly on the
@@ -4841,7 +5006,7 @@ function DataManagementWorkspace({ snapshot, busy, webDavOperationBusy, statuses
         sourceList
         cellHorizontalPadding={8}
         firstColumnHorizontalPadding={8}
-        onSelectionChange={(key) => switchDataManagementTab(key as DataManagementTab)}
+        onSelectionChange={(key) => { if (key) switchDataManagementTab(key as DataManagementTab); }}
         style={styles.dataManagementRailList}
       />
     </View>
@@ -6228,7 +6393,7 @@ function RouteTraceWorkspace({ requests, selectedKey, native, translate, onSelec
   </View>;
 }
 
-function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, requestedTab, requestedTabKey = 0 }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; requestedTab?: typeof LOG_TABS[number]; requestedTabKey?: number }): React.JSX.Element {
+function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, requestedTab, requestedTabKey = 0, onStatus }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; requestedTab?: typeof LOG_TABS[number]; requestedTabKey?: number; onStatus?: (status?: string) => void }): React.JSX.Element {
   type PauseIntent = { tab: typeof LOG_TABS[number]; paused: boolean; token: number };
   type ClearIntent = { tab: typeof LOG_TABS[number]; token: number };
   const [selected, setSelected] = useState<typeof LOG_TABS[number]>(() => requestedTab ?? "requests");
@@ -6384,10 +6549,13 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   };
   const tabOptions = LOG_TABS.map((tab) => ({ id: tab, title: logTitle(tab, translate) }));
   const lineCount = clearing ? 0 : active?.line_count ?? rows.length;
-  const statusParts = [
+  // The window keeps one permanent bottom status strip: the line count and the
+  // pause state are that strip's idle text, never a second bar of their own.
+  const statusLine = [
     translate(active && lineCount >= active.limit ? "logs.latestLinesAtLimit" : "common.lines", { count: lineCount }),
     paused ? translate("logs.paused") : "",
-  ].filter(Boolean);
+  ].filter(Boolean).join(" | ");
+  useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);
   const openRelayUsageLogs = (): void => {
     const relayDomain = asRecord(snapshot?.domains.relay_accounts);
     const relayState = Object.keys(asRecord(relayDomain.state)).length > 0 ? asRecord(relayDomain.state) : relayDomain;
@@ -6475,7 +6643,6 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         void native.showReadOnlyText({ title: translate("logs.originalRecord"), text: row.original, closeLabel: translate("status.close"), language: "json", html: CODE_EDITOR_HTML });
       }} style={styles.logTable} /></View>
       : <View style={styles.logEmptySurface}><Text style={styles.logEmptyText}>{clearing || active ? translate("logs.empty") : translate("logs.loading")}</Text></View>}
-    <View style={styles.logInfoBar}><Text numberOfLines={1} style={[styles.cardHint, selected === "route-trace" && styles.routeTraceInfoText]}>{statusParts.join(" | ")}</Text></View>
   </View>;
 }
 
@@ -6996,6 +7163,8 @@ function IssueList({ issues, translate }: { issues: ValidationSummary["issues"];
     confirmation_required: "error.confirmationRequired",
     invalid_language: "validation.invalid_language",
     invalid_settings: "validation.invalid_settings",
+    model_name_required: "validation.modelNameRequired",
+    model_upstream_required: "validation.modelUpstreamRequired",
     revision_conflict: "error.revisionConflict",
   };
   return <View style={styles.issueBox}><Text style={styles.sectionTitle}>{translate("common.validationIssues")}</Text>{issues.map((issue, index) => {
@@ -7029,6 +7198,18 @@ function apiKeyDisplayName(value: unknown, translate: Translate): string {
   const name = stringValue(value);
   if (!name) return translate("common.notAvailable");
   return name === "default" ? translate("providers.defaultKey") : name;
+}
+// A placeholder name every entry starts under until the user replaces it: a
+// name already in use gets the next free numeric suffix ("新建供应商2").
+function uniquePlaceholderName(existing: string[], base: string): string {
+  const taken = new Set(existing.map((value) => value.trim().toLocaleLowerCase()));
+  let candidate: string = base;
+  let suffix = 2;
+  while (taken.has(candidate.toLocaleLowerCase())) {
+    candidate = `${base}${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
 }
 function uniqueKeyName(existing: string[]): string { let suffix = 1; let value = `key-${suffix}`; while (existing.includes(value)) { suffix += 1; value = `key-${suffix}`; } return value; }
 const RANDOM_KEY_NAME_WORDS = ["coral", "maple", "cedar", "orbit", "nova", "pixel", "delta", "ember", "falcon", "grove", "harbor", "ivy", "jade", "lumen", "meadow", "nimbus", "oasis", "pebble", "quartz", "raven", "sable", "tide", "umber", "willow"] as const;
@@ -7202,8 +7383,7 @@ const styles = StyleSheet.create({
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 16, paddingTop: 6, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: 20, height: 20, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsSidebarDivider: { height: 1, flexShrink: 0, marginHorizontal: 12, backgroundColor: systemColors.separator }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" }, settingsPaneDivider: { height: 1, flexShrink: 0, backgroundColor: systemColors.separator },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, generalRowLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { width: 44, minWidth: 44, height: 24, marginLeft: 6 }, generalRowHint: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, generalStatus: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, generalRowLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { width: 44, minWidth: 44, height: 24, marginLeft: 6 }, generalRowHint: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },
   keysSection: { flex: 3, minHeight: 170 }, keysSectionContent: { paddingBottom: 4, gap: 4 }, keysSectionLogin: { flex: 0, minHeight: 40 }, modelPane: { flex: 1, minWidth: 0, minHeight: 130, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },
@@ -7238,7 +7418,7 @@ const styles = StyleSheet.create({
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeToc: { width: 156, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }, runtimeTocList: { flex: 1, minHeight: 0 }, runtimeWorkspace: { width: "100%", padding: 14, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeSection: { gap: 6 }, runtimeSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeFieldList: { gap: 10 }, runtimeField: { minWidth: 0, alignSelf: "stretch", gap: 2 }, runtimeInputRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, runtimeModifiedBar: { width: 2, alignSelf: "stretch", marginRight: 6, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { alignSelf: "center", height: 16, marginRight: 6 }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: 142, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, runtimeValueSlot: { width: 160, height: 26, flexShrink: 0, justifyContent: "center" }, runtimeValueControl: { width: 160, minWidth: 160, height: 26 }, runtimeBooleanControl: { width: 44, minWidth: 44, height: 24, alignSelf: "flex-start", marginLeft: 8 }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { paddingLeft: 142, paddingTop: 1, minWidth: 0, alignSelf: "stretch" }, runtimeHelpText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, minWidth: 0, flexShrink: 1 }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementRail: { width: 140, flexShrink: 0, minHeight: 0, paddingTop: 6, borderRightWidth: 1, borderRightColor: systemColors.separator }, dataManagementRailList: { flex: 1, minHeight: 0 }, dataManagementDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, dataManagementTabBar: { height: 34, minHeight: 34, flexShrink: 0, paddingHorizontal: 12, justifyContent: "flex-start", borderBottomWidth: 1, borderBottomColor: systemColors.separator }, dataManagementTabs: { width: 272, height: 24, alignSelf: "flex-start", flexShrink: 0 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 10, paddingHorizontal: 4, paddingBottom: 4, gap: 10 }, dataManagementWebDavPane: { flex: 1, minHeight: 0 }, dataManagementWebDavContent: { gap: 10, paddingTop: 10, paddingHorizontal: 4, paddingBottom: 14 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementImportFileLabel: { width: 72, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementGroup: { gap: 6 }, dataManagementGroupBody: { gap: 5 }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementBottomActions: { minHeight: 26, flexDirection: "row", alignItems: "flex-end", justifyContent: "flex-end", gap: 8 }, dataManagementBottomMessage: { flex: 1, minWidth: 0, gap: 2 }, dataManagementSectionPicker: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 14, rowGap: 2, paddingVertical: 2 }, dataManagementSectionControl: { minWidth: 150, minHeight: 22, justifyContent: "center" }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSensitiveNote: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementSyncContent: { gap: 6 }, dataManagementSyncScope: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSyncScopeLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirection: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementDirectionLabel: { width: WEBDAV_FORM_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, dataManagementDirectionPicker: { width: 210, height: 24, flexGrow: 0, flexShrink: 0 }, dataManagementStatus: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   webDavForm: { flexGrow: 0, paddingHorizontal: 2 }, webdavFormBody: { gap: 6 }, webdavStateRow: { minHeight: 24, flexDirection: "row", alignItems: "center", justifyContent: "flex-start" }, webdavSyncArea: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionRow: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 8, borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 8, marginTop: 2 }, webdavActionStatus: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavEnabledControl: { flexGrow: 0, flexShrink: 0, alignSelf: "flex-start" }, webdavStateSpacer: { flex: 1 }, webdavStateStatus: { maxWidth: 180, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, textAlign: "right", lineHeight: 15 }, webdavFormRows: { width: "60%", gap: 5 }, webdavPasswordInput: { width: "100%", minHeight: 26 },
-  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 }, logInfoBar: { height: 21, minHeight: 21, flexShrink: 0, borderTopWidth: 1, borderColor: systemColors.separator, justifyContent: "center", paddingHorizontal: 4 },
+  logsWindow: { flex: 1, minHeight: 0, gap: 4 }, logsToolbar: { height: 28, minHeight: 28, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, logFilterRow: { width: 360, minWidth: 220, maxWidth: 360, height: 26, flexDirection: "row", alignItems: "center", gap: 8 }, logToolbarSpacer: { flex: 1, minWidth: 0 }, logActionsRow: { height: 26, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8 }, clearCooldownButton: { minWidth: 96, height: 22 }, toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 }, logFilterInput: { flex: 1, minWidth: 0, height: 26 }, logsTabs: { width: 640, maxWidth: "100%", minWidth: 0, height: 28, flexShrink: 0 }, logTableFrame: { flex: 1, minHeight: 0, minWidth: 0 }, logTable: { flex: 1, minHeight: 0 }, logEmptySurface: { flex: 1, minHeight: 0, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, logEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textAlign: "center", paddingHorizontal: 20 },
   form: { gap: 6 }, structuredForm: { gap: 6 }, featureGrid: { flexDirection: "row", flexWrap: "wrap", columnGap: 12, rowGap: 4 }, featureGridItem: { flexGrow: 1, flexBasis: 180, minWidth: 180 }, field: { gap: 5, minWidth: 220, flexGrow: 1, flexBasis: 300 }, fieldLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, input: { width: "100%", minHeight: 26, color: systemColors.label, fontSize: UI_FONT_SIZE }, textArea: { minHeight: 108, textAlignVertical: "top", fontFamily: "Menlo" }, compactTextArea: { minHeight: 56, maxHeight: 56 }, inputWithAction: { flexDirection: "row", alignItems: "center", gap: 6 }, inputFlex: { flex: 1 }, toggleRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, toggleControl: { flex: 1, minWidth: 0, minHeight: 22, justifyContent: "center" }, toggleNativeControl: { width: "100%", minWidth: 220, minHeight: 22 }, actions: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 4 }, secretFieldActions: { flexDirection: "row", alignItems: "center", gap: 6 }, secretFieldButtons: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 }, secretFieldButton: { flex: 1, minWidth: 0, height: 26 }, nativeSecretControl: { flex: 1, minWidth: 0, minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, nativeSecretInput: { flex: 1, minWidth: 86, minHeight: 26 }, nativeSecretSetButton: { minWidth: 42, height: 26 }, action: {}, actionPrimary: {}, actionDanger: {}, actionDisabled: {}, actionText: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, actionTextPrimary: {}, actionTextDanger: {}, tabStrip: { flexDirection: "row", flexWrap: "wrap", gap: 6 }, tab: {}, tabSelected: {}, inlineMeta: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 6 }, rawEditor: { flex: 1, minHeight: 180, gap: 4 }, rawEditorHeader: { minHeight: 28, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, rawNativeEditorFrame: { flex: 1, minHeight: 160, position: "relative" }, rawNativeEditor: { flex: 1, minHeight: 160 }, rawEditorOverlay: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, justifyContent: "center", alignItems: "center", gap: 8, paddingHorizontal: 12, backgroundColor: systemColors.textBackground }, rawEditorLoading: { flex: 1, minHeight: 160, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground }, infoPair: { gap: 2, minWidth: 160 }, rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6 }, logRecords: { borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, maxHeight: 360, overflow: "scroll", padding: 10, gap: 6 }, logRecord: { color: systemColors.label, fontFamily: "Menlo", fontSize: UI_FONT_SIZE }, empty: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, paddingVertical: 12 }, result: { color: systemColors.green, fontSize: UI_FONT_SIZE }, warning: { color: systemColors.brown, fontSize: UI_FONT_SIZE, backgroundColor: systemColors.control, padding: 8, borderRadius: 4 }, issueBox: { borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.control, padding: 12, gap: 5 }, issue: { color: systemColors.red, fontSize: UI_FONT_SIZE }, cardTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "500" }, cardHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, marginTop: 2 },
   nativeSecretMultilineControl: { alignItems: "flex-start", minHeight: 108 },
   nativeSecretTextArea: { minHeight: 108, height: 108, alignSelf: "stretch" },

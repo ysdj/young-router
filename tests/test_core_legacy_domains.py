@@ -2016,11 +2016,21 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             projected = next(item for item in domain.snapshot()["settings"] if item["key"] == key)
             self.assertEqual("integer", projected["kind"])
             self.assertEqual("optional_int", projected["storage_kind"])
-            self.assertEqual("", projected["value"])
+            # The quick control projects the advanced vision-router JSON,
+            # whose default fallback timeout is 45 seconds.
+            self.assertEqual("45", projected["value"])
 
-            domain.dispatch("set_setting", {"key": key, "value": "45"})
-            self.assertEqual("45", domain.draft_state()[key])
+            def projection() -> str:
+                item = next(entry for entry in domain.snapshot()["settings"] if entry["key"] == key)
+                return str(item["value"])
+
+            domain.dispatch("set_setting", {"key": key, "value": "27"})
+            self.assertEqual("27", projection())
+            # Quick fields are a JSON projection, so their storage marker stays
+            # empty instead of duplicating the override.
+            self.assertEqual("", domain.draft_state()[key])
             domain.dispatch("set_setting", {"key": key, "value": ""})
+            self.assertEqual("45", projection())
             self.assertEqual("", domain.draft_state()[key])
             with self.assertRaisesRegex(DomainError, "invalid"):
                 domain.dispatch("set_setting", {"key": key, "value": "0"})
@@ -2054,7 +2064,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
 
             loaded = module.load_specs()
             self.assertGreater(len(loaded), 20)
-            self.assertEqual("4000", loaded["LITELLM_PORT"].default)
+            self.assertEqual("12389", loaded["LITELLM_PORT"].default)
             self.assertEqual("0", loaded["YOUNG_ROUTER_MCP_AUTO_APPROVE"].default)
 
     def test_bool_auto_uses_checkbox_projection_and_auto_off_storage(self) -> None:
@@ -2165,6 +2175,81 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
             saved = path.read_text(encoding="utf-8")
             self.assertIn("LITELLM_PORT=4100", saved)
             self.assertNotIn("LITELLM_CONFIG_WATCH", saved)
+
+    def test_retired_shell_service_settings_load_once_and_are_removed_on_apply(self) -> None:
+        from runtime_settings_io import RETIRED_PERSISTED_SETTINGS
+
+        retired = (
+            "LITELLM_MAX_REQUESTS_BEFORE_RESTART",
+            "LITELLM_STATE_TTL_SECONDS",
+            "LITELLM_RUNTIME_VERIFY_WAIT_SECONDS",
+            "LITELLM_SERVICE_LIFECYCLE_LOCK_WAIT_SECONDS",
+            "YOUNG_ROUTER_RELAY_AUTO_GROUP_INTERVAL_MINUTES",
+        )
+        for key in retired:
+            self.assertIn(key, RETIRED_PERSISTED_SETTINGS)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime-settings.env"
+            path.write_text(
+                "LITELLM_PORT=4100\n" + "".join(f"{key}=10\n" for key in retired),
+                encoding="utf-8",
+            )
+
+            domain = RuntimeSettingsDomain(path)
+
+            settings = {item["key"]: item for item in domain.snapshot()["settings"]}
+            self.assertEqual("4100", settings["LITELLM_PORT"]["value"])
+            for key in retired:
+                self.assertNotIn(key, settings)
+            domain.apply()
+            saved = path.read_text(encoding="utf-8")
+            self.assertIn("LITELLM_PORT=4100", saved)
+            for key in retired:
+                self.assertNotIn(key, saved)
+
+    def test_runtime_schema_exposes_keepalive_affinity_and_log_backup_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime-settings.env"
+            domain = RuntimeSettingsDomain(path)
+            settings = {item["key"]: item for item in domain.snapshot()["settings"]}
+
+            keepalive = settings["YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS"]
+            self.assertEqual("float", keepalive["storage_kind"])
+            self.assertEqual("number", keepalive["kind"])
+            self.assertEqual("15", keepalive["value"])
+            self.assertEqual(0, keepalive["minimum"])
+            self.assertEqual(3600, keepalive["maximum"])
+
+            affinity = settings["YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY"]
+            self.assertEqual("bool", affinity["storage_kind"])
+            self.assertEqual("toggle", affinity["kind"])
+            self.assertEqual("1", affinity["value"])
+
+            backups = settings["YOUNG_ROUTER_LOG_BACKUP_SEGMENTS"]
+            self.assertEqual("int", backups["storage_kind"])
+            self.assertEqual("integer", backups["kind"])
+            self.assertEqual("2", backups["value"])
+            self.assertEqual(1, backups["minimum"])
+            self.assertEqual(8, backups["maximum"])
+
+            domain.dispatch(
+                "set_setting",
+                {"key": "YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS", "value": "30"},
+            )
+            domain.dispatch(
+                "set_setting",
+                {"key": "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY", "value": False},
+            )
+            domain.dispatch(
+                "set_setting",
+                {"key": "YOUNG_ROUTER_LOG_BACKUP_SEGMENTS", "value": "4"},
+            )
+            domain.apply()
+
+            saved = path.read_text(encoding="utf-8")
+            self.assertIn("YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS=30", saved)
+            self.assertIn("YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY=0", saved)
+            self.assertIn("YOUNG_ROUTER_LOG_BACKUP_SEGMENTS=4", saved)
 
     def test_retired_vision_bridge_settings_are_removed_on_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
