@@ -29,6 +29,8 @@ export type RelayResource = {
   groupName: string;
   linkedModelCount: number;
   pendingOperationCount: number;
+  /** Core already staged this key for deletion; Apply removes it remotely. */
+  pendingDelete: boolean;
 };
 export type RelayAccount = {
   id: string;
@@ -89,6 +91,14 @@ type ResourceRefreshTarget = { id: string; resources?: RelayResource[] };
 export type StationDraft = Partial<Pick<RelayStation, "name" | "origin" | "type">>;
 type PolicyOption<T extends string> = { value: T; label: string; hint: string };
 const INLINE_MODEL_LIMIT = 5;
+/**
+ * How many model names the 分组管理 sheet lays out for one key, and how much
+ * text those names may take.  The sheet shows the whole list, so these are
+ * sanity bounds for a station that reports hundreds of models rather than a
+ * display truncation; a list that hits one states the rest with an ellipsis.
+ */
+const GROUP_MANAGER_MODEL_LIMIT = 256;
+const GROUP_MANAGER_MODEL_LIST_CHARS = 12000;
 
 function record(value: unknown): UnknownRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? { ...value } as UnknownRecord : {};
@@ -107,10 +117,9 @@ function groupMultiplierLabel(multiplier: number | null, translate: Translate): 
   return multiplier === null ? translate("relay.apiKeyUngrouped") : `×${multiplier}`;
 }
 
+/** The 分组 field: the group's name alone; 倍率 has its own row and column. */
 export function groupLabel(group: RelayGroup, translate: Translate): string {
-  const multiplier = groupMultiplier(group.multiplier);
-  const name = group.name || translate("relay.apiKeyUngrouped");
-  return multiplier === null ? name : `${name} ×${multiplier}`;
+  return group.name || translate("relay.apiKeyUngrouped");
 }
 
 function resourceGroup(resource: RelayResource, groups: RelayGroup[]): RelayGroup | undefined {
@@ -122,13 +131,27 @@ function resourceGroupName(resource: RelayResource, groups: RelayGroup[], transl
   return group?.name || resource.groupName || (resource.groupID ? resource.groupID : translate("relay.apiKeyUngrouped"));
 }
 
-function resourceGroupMultiplier(resource: RelayResource, groups: RelayGroup[], translate: Translate): string {
-  const group = resourceGroup(resource, groups);
-  return groupMultiplierLabel(group ? group.multiplier : null, translate);
+/** The 倍率 value: the group's rate, or nothing when it has none. */
+function groupRateLabel(group: RelayGroup | undefined): string {
+  const multiplier = group ? groupMultiplier(group.multiplier) : null;
+  return multiplier === null ? "" : `×${multiplier}`;
 }
 
-function resourceGroupLabel(resource: RelayResource, groups: RelayGroup[], translate: Translate): string {
-  return `${resourceGroupName(resource, groups, translate)} ${resourceGroupMultiplier(resource, groups, translate)}`.trim();
+/**
+ * The 模型列表: every model the station reports for one key, in the station's
+ * own order.  The sheet lays the names out itself, so the list travels as names
+ * rather than a pre-joined sentence.
+ */
+function resourceModelList(resource: RelayResource): string[] {
+  const names: string[] = [];
+  let length = 0;
+  for (const model of resource.models) {
+    if (names.length >= GROUP_MANAGER_MODEL_LIMIT || length + model.length > GROUP_MANAGER_MODEL_LIST_CHARS) break;
+    names.push(model);
+    length += model.length + 1;
+  }
+  if (names.length < resource.models.length) names.push("…");
+  return names;
 }
 
 function resourceGroupUnavailable(resource: RelayResource, groups: RelayGroup[]): boolean {
@@ -189,6 +212,7 @@ export function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
           groupName: text(entry.group_name),
           linkedModelCount: count(entry.linked_model_count),
           pendingOperationCount: count(entry.pending_operation_count),
+          pendingDelete: entry.pending_delete === true,
         }];
       }),
     }];
@@ -444,6 +468,7 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
               </View>
               <View style={styles.apiKeyPreviewRows}>
                 <View style={styles.apiKeyPreviewRow}><Text style={styles.apiKeyPreviewLabel}>{translate("relay.apiKeyGroup")}</Text><Text numberOfLines={1} style={styles.apiKeyPreviewValue}>{groupLabel(selectedGroup, translate)}</Text></View>
+                <View style={styles.apiKeyPreviewRow}><Text style={styles.apiKeyPreviewLabel}>{translate("relay.apiKeyMultiplier")}</Text><Text numberOfLines={1} style={styles.apiKeyPreviewValue}>{groupRateLabel(selectedGroup) || translate("common.none")}</Text></View>
                 <View style={styles.apiKeyPreviewRow}><Text style={styles.apiKeyPreviewLabel}>{translate("relay.apiKeyEnabledField")}</Text><Text style={styles.apiKeyPreviewValue}>{enabled ? translate("common.enable") : translate("common.disable")}</Text></View>
               </View>
               <Text style={styles.apiKeyPreviewHint}>{translate("relay.apiKeyPreviewHint")}</Text>
@@ -560,7 +585,12 @@ export function StationAccountsPanel({
   const [feedback, setFeedback] = useState<string>();
   const accountsRef = useRef(stationAccounts);
   accountsRef.current = stationAccounts;
-  const selected = stationAccounts.find((account) => account.id === selectedID) ?? stationAccounts[0];
+  // The account list owns the selection: an explicitly cleared one (a click
+  // below the rows) leaves the editor and its − empty instead of acting on an
+  // account the list no longer highlights, while the first account still
+  // opens the pane on load.
+  const selected = stationAccounts.find((account) => account.id === selectedID)
+    ?? (selectedID === undefined ? stationAccounts[0] : undefined);
   const controlsBusy = busy || formBusy || stationBusy;
   const publish = (message: string): void => {
     setFeedback(undefined);
@@ -571,6 +601,13 @@ export function StationAccountsPanel({
     if (localSignedIn.has(account.id)) return "signed_in";
     if (account.loginStatus === "signed_in" || account.loginStatus === "signed_out" || account.loginStatus === "expired") return account.loginStatus;
     return "unknown";
+  };
+  // The status column and both account actions read this one state: 已登录,
+  // 登录中 while this account's sign-in is in flight, and 未登录 for every
+  // other case (signed out, expired, not probed yet).
+  const relayLoginState = (account: RelayAccount): "signed_in" | "signing_in" | "signed_out" => {
+    if (loading[account.id]?.session) return "signing_in";
+    return effectiveLoginStatus(account) === "signed_in" ? "signed_in" : "signed_out";
   };
   const updateLoading = (accountID: string, kind: keyof AccountLoading, value: boolean): void => {
     const current = loadingRef.current;
@@ -587,6 +624,7 @@ export function StationAccountsPanel({
     return Boolean(state?.session || state?.resources);
   };
   useEffect(() => {
+    if (selectedID === "") return;
     if (selected && selected.id === selectedID) return;
     setSelectedID(selected?.id);
   }, [selected, selectedID]);
@@ -825,47 +863,93 @@ export function StationAccountsPanel({
   const openGroupManager = async (): Promise<void> => {
     const account = selected;
     if (!account || !native.showGroupManager) return;
-    const groups = account.groups
-      .filter((group) => group.id !== "")
-      .map((group) => ({ id: group.id, label: groupLabel(group, translate) }));
-    if (account.type === "newapi") groups.unshift({ id: "", label: translate("relay.apiKeyUngrouped") });
-    // A key can point at a group the station no longer offers; keep it
-    // selectable so the picker never shows a different group than the row.
-    for (const resource of account.resources) {
-      if (resource.groupID && !groups.some((group) => group.id === resource.groupID)) {
-        groups.push({ id: resource.groupID, label: resourceGroupName(resource, account.groups, translate) });
+    // 自动分组 owns the key layout, so the sheet opens on the aligned draft:
+    // refresh the station facts, let Core stage its one-key-per-group layout,
+    // then read the account back so the list never shows keys the switch is
+    // already replacing.  Without a group list there is no 1:1 layout to build,
+    // so the keys stay as the station last reported them.
+    let current = account;
+    if (account.autoGrouping && account.groups.length > 0 && apiKeyActions?.alignAutoGrouping) {
+      setFormBusy(true);
+      try {
+        if (await refreshResources(account.id) === "ready") {
+          await apiKeyActions.alignAutoGrouping(account.id);
+          const snapshot = await refreshAccounts();
+          current = (snapshot ? accountsFromSnapshot(snapshot) : []).find((entry) => entry.id === account.id) ?? account;
+        }
+      } catch {
+        // A station that cannot be refreshed keeps the keys it last reported.
+      } finally {
+        setFormBusy(false);
       }
     }
+    // The picker keeps the rate so a group is identifiable while it is chosen;
+    // the list column shows the name alone because 倍率 has its own column.
+    const groups = current.groups
+      .filter((group) => group.id !== "")
+      .map((group) => ({ id: group.id, label: groupLabel(group, translate), name: group.name || translate("relay.apiKeyUngrouped"), rate: groupRateLabel(group) }));
+    // Nothing is left without a group while 自动分组 owns the layout, so the
+    // ungrouped item only exists while the switch is off.
+    if (current.type === "newapi" && !current.autoGrouping) {
+      groups.unshift({ id: "", label: translate("relay.apiKeyUngrouped"), name: translate("relay.apiKeyUngrouped"), rate: "" });
+    }
+    // A key can point at a group the station no longer offers; keep it
+    // selectable so the picker never shows a different group than the row.
+    for (const resource of current.resources) {
+      if (resource.groupID && !groups.some((group) => group.id === resource.groupID)) {
+        const name = resourceGroupName(resource, current.groups, translate);
+        groups.push({ id: resource.groupID, label: name, name, rate: "" });
+      }
+    }
+    // While 自动分组 is on, the list is the layout that switch owns: one key
+    // per group, so a dropped group or a key Core already replaced is never
+    // listed as an ungrouped row.
+    const keyResources = current.autoGrouping && current.groups.length > 0
+      ? current.resources.filter((resource) => !resource.pendingDelete && resourceGroup(resource, current.groups) !== undefined)
+      : current.resources;
     const result = await native.showGroupManager({
       title: translate("relay.groupManager"),
-      accountLabel: accountDisplayName(account, translate),
+      accountLabel: accountDisplayName(current, translate),
+      accountId: current.id,
       groups,
-      keys: account.resources.map((resource) => ({
+      keys: keyResources.map((resource) => ({
         id: resource.id,
         name: resource.apiName || resource.name,
         groupID: resource.groupID,
-        groupLabel: resourceGroupName(resource, account.groups, translate),
-        multiplier: resourceGroupMultiplier(resource, account.groups, translate),
+        groupLabel: resourceGroupName(resource, current.groups, translate),
+        multiplier: groupRateLabel(resourceGroup(resource, current.groups)),
+        // Core reports only whether a credential exists; the sheet reads the
+        // real value through the native capability and shows it in place.
+        hint: resource.keyHint,
+        models: resourceModelList(resource),
         enabled: resource.enabled,
       })),
       labels: {
         listLabel: translate("providers.keys"),
         addLabel: translate("common.add"),
         removeLabel: translate("common.delete"),
-        nameLabel: translate("common.name"),
+        nameLabel: translate("providers.keyName"),
         groupLabel: translate("relay.apiKeyGroup"),
         multiplierLabel: translate("relay.apiKeyMultiplier"),
+        valueLabel: translate("providers.keyValue"),
+        copyActionLabel: translate("common.copy"),
+        copyLabel: translate("relay.apiKeyCopy"),
+        copiedLabel: translate("relay.apiKeyCopied"),
+        failedLabel: translate("relay.operationFailed"),
+        modelsLabel: translate("relay.apiKeyModelList"),
+        emptyLabel: translate("common.none"),
+        savedLabel: translate("relay.resourceKeyConfigured"),
         enabledLabel: translate("common.enable"),
         newKeyName: translate("relay.apiKeyNewName"),
-        draftLabel: translate("relay.apiKeyDraftLabel"),
-        deletedLabel: translate("relay.apiKeyDeletedLabel"),
         autoGroupingLabel: translate("relay.apiKeyAutoGrouping"),
         ungroupedLabel: translate("relay.apiKeyUngrouped"),
         closeLabel: translate("status.close"),
         applyLabel: translate("status.saveAndClose"),
-        hint: translate("relay.groupManagerHint"),
+        discardTitle: translate("relay.groupManagerDiscardTitle"),
+        discardBody: translate("relay.groupManagerDiscardBody"),
+        discardConfirm: translate("common.discard"),
       },
-      autoGrouping: account.autoGrouping,
+      autoGrouping: current.autoGrouping,
     });
     if (!result) return;
     setFormBusy(true);
@@ -873,12 +957,12 @@ export function StationAccountsPanel({
     try {
       // Manual key writes are rejected while auto-grouping owns the layout, so
       // turning it off is staged first and turning it on is staged last.
-      if (account.autoGrouping && !result.autoGrouping) await apiKeyActions?.setAutoGrouping?.(account.id, false);
+      if (current.autoGrouping && !result.autoGrouping) await apiKeyActions?.setAutoGrouping?.(account.id, false);
       for (const create of result.creates) {
         await apiKeyActions?.create?.(account.id, { name: create.name, groupID: create.groupID, enabled: true });
       }
       for (const update of result.updates) {
-        const resource = account.resources.find((item) => item.id === update.keyID);
+        const resource = current.resources.find((item) => item.id === update.keyID);
         if (!resource) continue;
         if (update.name !== (resource.apiName || resource.name)) await apiKeyActions?.update?.(account.id, update.keyID, update.name);
         if (update.groupID !== resource.groupID) await apiKeyActions?.setGroup?.(account.id, update.keyID, update.groupID);
@@ -887,7 +971,7 @@ export function StationAccountsPanel({
       for (const keyID of result.deletes) {
         await apiKeyActions?.remove?.(account.id, keyID, "detach_disabled");
       }
-      if (!account.autoGrouping && result.autoGrouping) await apiKeyActions?.setAutoGrouping?.(account.id, true);
+      if (!current.autoGrouping && result.autoGrouping) await apiKeyActions?.setAutoGrouping?.(account.id, true);
       await refreshAccounts();
       onStatus?.(translate("relay.apiKeyGroupStaged"));
     } catch {
@@ -896,13 +980,12 @@ export function StationAccountsPanel({
       setFormBusy(false);
     }
   };
-  const selectedStatus = selected ? effectiveLoginStatus(selected) : "unknown";
-  const selectedSignedIn = selectedStatus === "signed_in";
+  const selectedLoginState = selected ? relayLoginState(selected) : "signed_out";
   const accountRows = stationAccounts.map((account) => ({
     key: account.id,
     cells: [
       accountDisplayName(account, translate),
-      translate(`relay.status.${effectiveLoginStatus(account)}`),
+      translate(`relay.status.${relayLoginState(account)}`),
       account.balance === null ? translate("common.none") : balanceLabel(account, translate),
     ],
   }));
@@ -933,8 +1016,8 @@ export function StationAccountsPanel({
     <View style={styles.panelHeader}>
       <Text style={styles.panelTitle}>{translate("providers.accounts")}</Text>
       <View style={styles.panelActions}>
-        <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} disabled={controlsBusy || stationAccounts.length >= 8} onPress={() => { void beginAddLogin(); }} style={styles.panelActionButton} />
-        <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} disabled={controlsBusy || !selected} onPress={() => { if (selected) { setRemovalPolicy("detach"); setRemoval({ account: selected }); } }} style={styles.panelActionButton} />
+        {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} disabled={controlsBusy} onPress={() => { void beginAddLogin(); }} style={styles.panelActionButton} /> : null}
+        {selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} disabled={controlsBusy} onPress={() => { setRemovalPolicy("detach"); setRemoval({ account: selected }); }} style={styles.panelActionButton} /> : null}
       </View>
     </View>
     {accountRows.length > 0 ? <NativeTable
@@ -952,10 +1035,10 @@ export function StationAccountsPanel({
       <View style={styles.fieldRow}>
         <Text style={[styles.fieldLabel, { width: 44 }]}>{translate("relay.accountField")}</Text>
         <Text numberOfLines={1} style={styles.accountNameValue}>{accountDisplayName(selected, translate)}</Text>
-        {!selectedSignedIn ? <NativeButton title={translate("relay.goLogin")} compact disabled={controlsBusy || isAccountLoading(selected.id)} onPress={() => { void loginSelected(); }} /> : null}
+        {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact onPress={() => { void loginSelected(); }} /> : null}
       </View>
       <View style={styles.accountActionsRow}>
-        <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} />
+        <NativeButton title={translate("relay.groupManager")} compact disabled={controlsBusy || !native.showGroupManager || selectedLoginState !== "signed_in"} onPress={() => { void openGroupManager(); }} />
       </View>
     </View> : null}
     <DependencyPolicyDialog
@@ -1022,9 +1105,9 @@ export function providedKeyRows(accounts: RelayAccount[], translate: Translate):
     resource,
     keyName: resource.apiName || resource.name,
     // Relay keys display uniformly as 账号名（邮箱取前缀）/分组名.
-    label: `${accountKeyPrefix(account, translate)}/${resourceGroupLabel(resource, account.groups, translate)}`,
+    label: `${accountKeyPrefix(account, translate)}/${resourceGroupName(resource, account.groups, translate)}`,
     accountLabel: accountDisplayName(account, translate),
-    group: resourceGroupLabel(resource, account.groups, translate),
+    group: resourceGroupName(resource, account.groups, translate),
     unavailable: resourceGroupUnavailable(resource, account.groups),
   })));
 }

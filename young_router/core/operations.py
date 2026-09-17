@@ -53,6 +53,10 @@ OWNER_TOKEN_BYTES = 32
 MACOS_DEFAULT_WORKERS = "16"
 PROXY_STOP_GRACE_SECONDS = 2.0
 SERVICE_STATUS_CACHE_SECONDS = 10.0
+# Upper bound for the configurable start/restart health wait. The Runtime
+# Settings schema documents the same 1..600 second range; a larger host
+# environment value must not hold a failed start open indefinitely.
+MAX_SERVICE_HEALTH_WAIT_SECONDS = 600.0
 _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
     {
         "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP",
@@ -916,7 +920,7 @@ class CoreServiceController:
                 self._stop_process_group(process.pid)
             self._remove_owner_files()
             raise RuntimeError("LiteLLM service could not start") from exc
-        deadline = time.monotonic() + min(max(float(environment.get("LITELLM_HEALTH_WAIT_SECONDS", "60")), 1), 60)
+        deadline = time.monotonic() + min(max(float(environment.get("LITELLM_HEALTH_WAIT_SECONDS", "60")), 1), MAX_SERVICE_HEALTH_WAIT_SECONDS)
         while time.monotonic() < deadline:
             if self._health():
                 return self.status(force=True)

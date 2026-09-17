@@ -373,6 +373,13 @@ def _entry_from_editor(
         if provider_key_id
         else _api_key_by_name(provider, key_name)
     )
+    if api_key_item is None and not provider_key_id and not key_name:
+        # A model that names no key follows the provider's default key.  The
+        # model itself stays unbound in the editor (it never claims a key the
+        # user did not choose), so the materialized entry has to resolve that
+        # default here.
+        default_keys = _normalized_api_keys(provider)
+        api_key_item = default_keys[0] if default_keys else None
     if provider_key_id and api_key_item is None:
         raise ValueError(
             f"Provider key for model {model_name or f'#{index + 1}'} is unavailable"

@@ -48,7 +48,12 @@ import Foundation
     private var sessionExpiresAt: Date?
     private var process: Process?
     private var coreDirectory: URL?
-    private var eventHandler: ((String) -> Void)?
+    // Every React root (the primary host and each route window) observes Core
+    // itself. One shared subscription serves them all, but a single handler
+    // slot would deliver every event to whichever root registered last and
+    // leave the other windows' snapshots frozen behind Core's shared revision.
+    private var eventHandlers: [Int: (String) -> Void] = [:]
+    private var nextEventHandlerToken = 0
     private var subscriptionID: String?
     private var subscriptionRequest: String?
     private var recoveryScheduled = false
@@ -80,9 +85,19 @@ import Foundation
         }
     }
 
-    func setEventHandler(_ handler: ((String) -> Void)?) {
+    /// Register one observer for Core events. Each native leaf passes a token
+    /// back so its module can detach when the window stops listening.
+    func addEventHandler(_ handler: @escaping (String) -> Void) -> Int {
         lock.lock()
-        eventHandler = handler
+        defer { lock.unlock() }
+        nextEventHandlerToken += 1
+        eventHandlers[nextEventHandlerToken] = handler
+        return nextEventHandlerToken
+    }
+
+    func removeEventHandler(_ token: Int) {
+        lock.lock()
+        eventHandlers.removeValue(forKey: token)
         lock.unlock()
     }
 
@@ -665,7 +680,7 @@ import Foundation
             throw BridgeError.unavailable
         }
         process.executableURL = URL(fileURLWithPath: python)
-        let arguments = [
+        var arguments = [
             "-m",
             "young_router.core",
             "--endpoint-file",
@@ -673,9 +688,17 @@ import Foundation
             "--parent-pid",
             String(ProcessInfo.processInfo.processIdentifier),
         ]
-        process.arguments = arguments
 
         var childEnvironment = previewProfileEnvironment(from: environment)
+        // Core keeps its private revision/service metadata in this file. Without
+        // it a host-driven replacement (a failed session renewal, or a crash
+        // recovery) restarts Core's shared revision at zero while every open
+        // window still holds the older, larger revision, so those windows drop
+        // every later snapshot and report conflicts the user never caused.
+        if let metadataPath = coreMetadataPath(environment: childEnvironment) {
+            arguments.append(contentsOf: ["--metadata", metadataPath])
+        }
+        process.arguments = arguments
         // An explicitly isolated Preview must never fall back to the user's
         // production configuration, assistant state, or LiteLLM service. The
         // profile marker is independent of the app identity, while the native
@@ -716,6 +739,20 @@ import Foundation
         }
         stopCoreProcess(process, directory: directory)
         throw BridgeError.unavailable
+    }
+
+    /// Resolve the same private runtime root Core derives from its environment.
+    private func coreMetadataPath(environment: [String: String]) -> String? {
+        let configured = environment["YOUNG_ROUTER_HOME"] ?? environment["LITELLM_RUNTIME_ROOT"]
+        let root: String
+        if let configured, !configured.isEmpty {
+            root = (configured as NSString).expandingTildeInPath
+        } else if let home = environment["HOME"], !home.isEmpty {
+            root = "\(home)/.young-router"
+        } else {
+            root = "\(NSHomeDirectory())/.young-router"
+        }
+        return "\(root)/.litellm-runtime/core-state.json"
     }
 
     private func previewProfileEnvironment(from inherited: [String: String]) -> [String: String] {
@@ -838,7 +875,7 @@ import Foundation
             let cancelled = pollCancelled || subscriptionID != subscription || self.generation != generation
             let endpoint = self.endpoint
             let token = sessionToken
-            let handler = eventHandler
+            let handlers = Array(eventHandlers.values)
             lock.unlock()
             guard !cancelled, let endpoint, let token else { return }
             do {
@@ -858,7 +895,7 @@ import Foundation
                       let eventText = String(data: eventData, encoding: .utf8) else {
                     throw BridgeError.invalidResponse
                 }
-                handler?(eventText)
+                for handler in handlers { handler(eventText) }
             } catch {
                 lock.lock()
                 let retry = !pollCancelled

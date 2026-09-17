@@ -689,6 +689,44 @@ def _sub2api_channel_models(payload: object) -> list[str]:
     return _model_names(flattened)
 
 
+def _sub2api_group_models(payload: object) -> dict[str, list[str]]:
+    """Map each group to the models its channels serve.
+
+    The channel page names the group every platform belongs to alongside the
+    models it supports, so one read describes each group's own model list.  A
+    per-key catalog read is then only needed for a group this page omits.
+    """
+
+    channels = _json_data(payload)
+    if not isinstance(channels, Sequence) or isinstance(channels, (str, bytes, bytearray)):
+        return {}
+    mapping: dict[str, list[str]] = {}
+    for channel in channels:
+        if not isinstance(channel, Mapping):
+            continue
+        platforms = channel.get("platforms", [])
+        if not isinstance(platforms, Sequence) or isinstance(platforms, (str, bytes, bytearray)):
+            continue
+        for platform in platforms:
+            if not isinstance(platform, Mapping):
+                continue
+            models = _model_names(platform.get("supported_models", []))
+            groups = platform.get("groups", [])
+            if not models or not isinstance(groups, Sequence) or isinstance(groups, (str, bytes, bytearray)):
+                continue
+            for group in groups:
+                if not isinstance(group, Mapping):
+                    continue
+                group_id = _group_id(group.get("id"))
+                if not group_id:
+                    continue
+                selected = mapping.setdefault(group_id, [])
+                for model in models:
+                    if model not in selected:
+                        selected.append(model)
+    return mapping
+
+
 class RelayHTTPClient:
     """Small redirect-free client for authenticated relay requests."""
 
@@ -3171,7 +3209,15 @@ class RelayAccountsDomain:
             )
         return resources
 
-    def _sub2api_resources(self, account: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _sub2api_resources(self, account: Mapping[str, Any], *, for_apply: bool = False) -> list[dict[str, Any]]:
+        """Load the key list and each group's models.
+
+        The channel page answers for every group it describes, so the
+        ordinary read costs one page per concern.  A group it omits keeps the
+        list that key read earlier; an Apply-time read (``for_apply``) still
+        re-reads that key so materialization never uses a stale catalog.
+        """
+
         headers = self._headers(account)
         with ThreadPoolExecutor(max_workers=2) as executor:
             keys_future = executor.submit(
@@ -3189,6 +3235,7 @@ class RelayAccountsDomain:
             keys = _json_data(keys_future.result())
             try:
                 channels = channels_future.result()
+                group_models = _sub2api_group_models(channels)
                 models = _sub2api_channel_models(channels)
             except RelayAccountsError:
                 # The key list above is the dashboard-session authentication
@@ -3196,6 +3243,7 @@ class RelayAccountsDomain:
                 # dashboard-only channel catalog while its OpenAI-compatible
                 # gateway remains usable; discover models from each active key
                 # below instead of falsely expiring the account.
+                group_models = {}
                 models = []
         if isinstance(keys, Mapping):
             keys = keys.get("items", [])
@@ -3218,7 +3266,34 @@ class RelayAccountsDomain:
             key_items.append((index, normalized_key, enabled, resource_id, name, group_id, group_name))
 
         gateway_models: dict[int, list[str]] = {}
-        gateway_items = [entry for entry in key_items if entry[2] and not models]
+        # Each group's models come from the channel page above.  A key whose
+        # group that page omits keeps the list its own catalog returned before
+        # (or the page's catalog while it has none), so opening the group
+        # manager never fans out one gateway read per key.
+        previous_models: dict[str, list[str]] = {}
+        stored_resources = account.get("resources")
+        if isinstance(stored_resources, Sequence) and not isinstance(stored_resources, (str, bytes, bytearray)):
+            for resource in stored_resources:
+                if not isinstance(resource, Mapping):
+                    continue
+                stored = resource.get("models")
+                if not isinstance(stored, Sequence) or isinstance(stored, (str, bytes, bytearray)):
+                    continue
+                names = [str(name) for name in stored if isinstance(name, str) and name]
+                # A list that is only this page's whole catalog is not the
+                # key's own: read the key once to learn what its group serves.
+                if names and names != models:
+                    previous_models[_resource_id(resource.get("id"))] = names
+        # A station whose page described no group at all publishes no group
+        # catalog, so its keys keep being read individually (the long-standing
+        # fallback); once a page describes groups, only a group it omits and a
+        # key with no list of its own needs a read.
+        stable_group_catalog = bool(group_models) and not for_apply
+        gateway_items = [
+            entry for entry in key_items
+            if entry[2] and entry[5] not in group_models
+            and (not stable_group_catalog or entry[3] not in previous_models)
+        ]
         if gateway_items:
             def fetch_gateway_models(entry: tuple[int, str, bool, str, str, str, str]) -> tuple[int, list[str]]:
                 index, key, _enabled, _resource_id, _name, _group_id_value, _group_name = entry
@@ -3233,6 +3308,11 @@ class RelayAccountsDomain:
                     # API key, not by the dashboard session. A rejected key
                     # must not clear a valid dashboard login.
                     return index, []
+                except Exception:
+                    # One key's catalog is optional: a station that breaks this
+                    # probe still reports its keys, and the dashboard catalog
+                    # covers the models for them.
+                    return index, []
                 try:
                     return index, _model_names(payload)
                 except RelayAccountsError:
@@ -3245,7 +3325,20 @@ class RelayAccountsDomain:
 
         resources: list[dict[str, Any]] = []
         for index, key, enabled, resource_id, name, group_id, group_name in key_items:
-            resource_models = models if models else gateway_models.get(index, [])
+            group_list = group_models.get(group_id, [])
+            gateway_list = gateway_models.get(index, [])
+            stored_list = previous_models.get(resource_id, [])
+            if group_list:
+                resource_models = group_list
+            elif gateway_list:
+                resource_models = gateway_list
+            elif for_apply:
+                # Materialization never keeps a stale catalog: the page's own
+                # list wins, and only a station that reports none keeps the
+                # list this key read earlier.
+                resource_models = models or stored_list
+            else:
+                resource_models = stored_list or models
             resources.append(
                 {
                     "id": resource_id,
@@ -3351,8 +3444,9 @@ class RelayAccountsDomain:
                     account,
                 )
                 resources_future = executor.submit(
-                    self._newapi_resources if account["type"] == "newapi" else self._sub2api_resources,
-                    account,
+                    lambda: self._newapi_resources(account)
+                    if account["type"] == "newapi"
+                    else self._sub2api_resources(account, for_apply=_for_apply)
                 )
                 try:
                     account["balance"] = balance_future.result()
@@ -3729,6 +3823,10 @@ class RelayAccountsDomain:
         for deletion. Keys without a current group are not useful to the
         automatic one-key-per-group layout either, so they are staged for
         deletion at the same time.
+
+        An account with no current group list has no layout to align to: every
+        key would look ungrouped and be staged for deletion, so alignment waits
+        for a resource refresh that reports groups instead.
         """
 
         index = self._index(account_id)
@@ -3739,6 +3837,8 @@ class RelayAccountsDomain:
             group for group in account.get("groups", [])
             if isinstance(group, Mapping) and str(group.get("id", ""))
         ]
+        if not groups:
+            return _public_account(account)
         resources = [
             resource for resource in account.get("resources", [])
             if isinstance(resource, Mapping)

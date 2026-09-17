@@ -1491,6 +1491,31 @@ model_list:
                         {"tab": "actions", "menu_action": removed_or_invalid_action},
                     )
 
+    def test_menu_action_log_honors_runtime_log_cap_and_backup_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "runtime-settings.env"
+            settings.write_text(
+                "YOUNG_ROUTER_LOG_MAX_BYTES=262144\n"
+                "YOUNG_ROUTER_LOG_BACKUP_SEGMENTS=1\n",
+                encoding="utf-8",
+            )
+            action_log = root / "actions.log"
+            action_log.write_bytes(b"x" * (300 * 1024))
+            domain = LogsDomain(root, runtime_settings_path=settings)
+
+            domain.dispatch(
+                "logs.record_menu_action",
+                {"tab": "actions", "menu_action": "open-logs"},
+            )
+
+            # The Core writes this log itself, so the configured cap and
+            # backup count must apply without the proxy environment.
+            self.assertTrue((root / "actions.log.1").exists())
+            self.assertFalse((root / "actions.log.2").exists())
+            self.assertLessEqual(action_log.stat().st_size, 262144)
+            self.assertIn("open-logs", action_log.read_text(encoding="utf-8"))
+
     def test_menu_action_recording_is_not_a_configuration_draft(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             core = CoreStore(domains=[LogsDomain(directory)])

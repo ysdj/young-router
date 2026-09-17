@@ -6,14 +6,18 @@
 #include <dwmapi.h>
 #include <shlobj.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <thread>
 #include <winreg.h>
 #include <winver.h>
 #include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.ApplicationModel.DataTransfer.h>
 #include <winrt/Windows.UI.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.Data.Json.h>
@@ -148,6 +152,30 @@ std::wstring Utf8ToWide(std::string const& value) {
   std::wstring result(static_cast<size_t>(count), L'\0');
   MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(), count);
   return result;
+}
+
+// The sheet receives one line per model, so a name may never contain a line
+// break of its own; Core rejects control characters in model names.
+std::vector<std::wstring> SplitLines(std::wstring const& value) {
+  std::vector<std::wstring> lines;
+  size_t start = 0;
+  while (start <= value.size()) {
+    auto end = value.find(L'\n', start);
+    if (end == std::wstring::npos) end = value.size();
+    if (end > start) lines.push_back(value.substr(start, end - start));
+    if (end == value.size()) break;
+    start = end + 1;
+  }
+  return lines;
+}
+
+// 密钥值 shows one line: keep the head and the tail that identify the key.
+// The value behind it stays whole, and the copy action hands over all of it.
+std::wstring EllipsizeMiddle(std::wstring const& value) {
+  constexpr size_t kHead = 14;
+  constexpr size_t kTail = 10;
+  if (value.size() <= kHead + kTail + 1) return value;
+  return value.substr(0, kHead) + L"\u2026" + value.substr(value.size() - kTail);
 }
 
 std::string WideToUtf8(std::wstring const& value) {
@@ -958,7 +986,8 @@ std::optional<NativeSecretEditResult> WinUI3NativeLeaf::EditSecret(
 std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     std::wstring title,
     std::wstring account_label,
-    std::vector<std::pair<std::wstring, std::wstring>> groups,
+    std::wstring account_id,
+    std::vector<GroupManagerGroup> groups,
     std::vector<GroupManagerKey> keys,
     GroupManagerLabels labels,
     bool auto_grouping) {
@@ -971,6 +1000,10 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     std::wstring group_id;
     std::wstring group_label;
     std::wstring multiplier;
+    // The station's credential-presence sentinel and the models it reports for
+    // the key; the plaintext value stays behind Core's capability.
+    std::wstring hint;
+    std::vector<std::wstring> models;
     std::wstring original_name;
     std::wstring original_group_id;
     bool original_enabled = true;
@@ -987,6 +1020,8 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     row.group_id = key.group_id;
     row.group_label = key.group_label;
     row.multiplier = key.multiplier;
+    row.hint = key.hint;
+    row.models = SplitLines(key.models);
     row.original_name = key.name;
     row.original_group_id = key.group_id;
     rows->push_back(std::move(row));
@@ -1005,15 +1040,9 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   };
   auto group_index_for = [&groups](std::wstring const& id) -> int32_t {
     for (size_t index = 0; index < groups.size(); ++index) {
-      if (groups[index].first == id) return static_cast<int32_t>(index);
+      if (groups[index].id == id) return static_cast<int32_t>(index);
     }
     return -1;
-  };
-  auto group_label_for = [&groups](std::wstring const& id) {
-    for (auto const& entry : groups) {
-      if (entry.first == id) return entry.second;
-    }
-    return id;
   };
 
   xaml::Window dialog;
@@ -1063,19 +1092,24 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   list_title.VerticalAlignment(xaml::VerticalAlignment::Center);
   controls::Grid::SetColumn(list_title, 0);
   list_header.Children().Append(list_title);
+  // ± ride the list header as the app's compact icon buttons do: one square
+  // small control each, four points apart.
   controls::Button add_button;
   add_button.FontSize(kUIFontSize);
   add_button.Content(winrt::box_value(winrt::hstring(L"+")));
-  add_button.MinWidth(26);
-  add_button.Margin(xaml::Thickness{6, 0, 0, 0});
-  controls::Grid::SetColumn(add_button, 2);
+  add_button.MinWidth(22);
+  add_button.Width(22);
+  add_button.Margin(xaml::Thickness{4, 0, 0, 0});
+  // ＋ sits left of － at the key list's top-right, like the macOS sheet.
+  controls::Grid::SetColumn(add_button, 1);
   list_header.Children().Append(add_button);
   controls::Button remove_button;
   remove_button.FontSize(kUIFontSize);
   remove_button.Content(winrt::box_value(winrt::hstring(L"\u2212")));
-  remove_button.MinWidth(26);
-  remove_button.Margin(xaml::Thickness{6, 0, 0, 0});
-  controls::Grid::SetColumn(remove_button, 1);
+  remove_button.MinWidth(22);
+  remove_button.Width(22);
+  remove_button.Margin(xaml::Thickness{4, 0, 0, 0});
+  controls::Grid::SetColumn(remove_button, 2);
   list_header.Children().Append(remove_button);
   left.Children().Append(list_header);
 
@@ -1140,53 +1174,127 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   controls::Grid::SetColumn(left, 0);
   layout.Children().Append(left);
 
+  // The detail column reports one fact per row, so the selected key is never
+  // a half-filled form: the group's rate, the station's key with its copy
+  // action, and the models the key provides.  The captions share one width,
+  // which fits every localized label.
+  constexpr double kDetailCaptionWidth = 90;
   controls::StackPanel detail;
-  detail.Spacing(8);
-  detail.Margin(xaml::Thickness{18, 0, 0, 0});
+  detail.Spacing(6);
+  auto detail_row = [&detail, &theme_brush](std::wstring_view caption) -> controls::Grid {
+    controls::Grid row;
+    controls::ColumnDefinition caption_column;
+    caption_column.Width(xaml::GridLengthHelper::FromPixels(kDetailCaptionWidth));
+    row.ColumnDefinitions().Append(caption_column);
+    row.ColumnDefinitions().Append(controls::ColumnDefinition());
+    controls::TextBlock caption_text;
+    caption_text.FontSize(kUIFontSize);
+    caption_text.Text(winrt::hstring(caption));
+    caption_text.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+    caption_text.VerticalAlignment(xaml::VerticalAlignment::Center);
+    caption_text.Foreground(theme_brush(
+        L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+    controls::Grid::SetColumn(caption_text, 0);
+    row.Children().Append(caption_text);
+    detail.Children().Append(row);
+    return row;
+  };
+  auto detail_value = [&theme_brush](controls::Grid const& row) -> controls::TextBlock {
+    controls::TextBlock value;
+    value.FontSize(kUIFontSize);
+    value.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+    value.VerticalAlignment(xaml::VerticalAlignment::Center);
+    value.Foreground(theme_brush(L"TextFillColorPrimaryBrush", winrt::Windows::UI::Color{255, 30, 30, 30}));
+    controls::Grid::SetColumn(value, 1);
+    row.Children().Append(value);
+    return value;
+  };
+  // 模型列表 sits in the detail column under the key's own facts: one aligned
+  // line per model, sized for the longest list any key carries so switching
+  // groups never resizes the window.  Longer lists scroll.
+  constexpr double kModelRowHeight = 17;
+  controls::TextBlock models_title;
+  models_title.FontSize(kUIFontSize);
+  models_title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+  models_title.Text(winrt::hstring(labels.models_label));
+  controls::ScrollViewer models_scroll;
+  controls::ScrollViewer::SetVerticalScrollBarVisibility(models_scroll, controls::ScrollBarVisibility::Auto);
+  controls::ScrollViewer::SetHorizontalScrollBarVisibility(models_scroll, controls::ScrollBarVisibility::Disabled);
+  models_scroll.BorderThickness(xaml::Thickness{0, 0, 0, 0});
+  models_scroll.Background(nullptr);
+  controls::StackPanel models_stack;
+  models_scroll.Content(models_stack);
+  auto rebuild_models = [&models_stack, &theme_brush, &labels](std::vector<std::wstring> const& models) {
+    models_stack.Children().Clear();
+    if (models.empty()) {
+      controls::TextBlock empty;
+      empty.FontSize(kUIFontSize);
+      empty.Text(winrt::hstring(labels.empty_label));
+      empty.Foreground(theme_brush(
+          L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+      models_stack.Children().Append(empty);
+      return;
+    }
+    for (auto const& name : models) {
+      controls::TextBlock field;
+      field.FontSize(kUIFontSize);
+      field.Text(winrt::hstring(name));
+      field.TextWrapping(xaml::TextWrapping::Wrap);
+      field.Foreground(theme_brush(L"TextFillColorPrimaryBrush", winrt::Windows::UI::Color{255, 30, 30, 30}));
+      controls::ToolTipService::SetToolTip(field, winrt::box_value(winrt::hstring(name)));
+      models_stack.Children().Append(field);
+    }
+  };
+
   controls::CheckBox enabled_box;
   enabled_box.FontSize(kUIFontSize);
   enabled_box.Content(winrt::box_value(winrt::hstring(labels.enabled_label)));
   detail.Children().Append(enabled_box);
-  controls::Grid name_row;
-  controls::ColumnDefinition name_caption;
-  name_caption.Width(xaml::GridLengthHelper::FromPixels(44));
-  name_row.ColumnDefinitions().Append(name_caption);
-  name_row.ColumnDefinitions().Append(controls::ColumnDefinition());
-  controls::TextBlock name_caption_text;
-  name_caption_text.FontSize(kUIFontSize);
-  name_caption_text.Text(winrt::hstring(labels.name_label));
-  name_caption_text.VerticalAlignment(xaml::VerticalAlignment::Center);
-  controls::Grid::SetColumn(name_caption_text, 0);
-  name_row.Children().Append(name_caption_text);
+  controls::Grid name_row = detail_row(labels.name_label);
   controls::TextBox name_box;
   name_box.FontSize(kUIFontSize);
   controls::Grid::SetColumn(name_box, 1);
   name_row.Children().Append(name_box);
-  detail.Children().Append(name_row);
-  controls::Grid group_row;
-  controls::ColumnDefinition group_caption;
-  group_caption.Width(xaml::GridLengthHelper::FromPixels(44));
-  group_row.ColumnDefinitions().Append(group_caption);
-  group_row.ColumnDefinitions().Append(controls::ColumnDefinition());
-  controls::TextBlock group_caption_text;
-  group_caption_text.FontSize(kUIFontSize);
-  group_caption_text.Text(winrt::hstring(labels.group_label));
-  group_caption_text.VerticalAlignment(xaml::VerticalAlignment::Center);
-  controls::Grid::SetColumn(group_caption_text, 0);
-  group_row.Children().Append(group_caption_text);
+  controls::Grid group_row = detail_row(labels.group_label);
   controls::ComboBox group_picker;
   group_picker.FontSize(kUIFontSize);
-  for (auto const& entry : groups) group_picker.Items().Append(winrt::box_value(winrt::hstring(entry.second)));
+  for (auto const& entry : groups) group_picker.Items().Append(winrt::box_value(winrt::hstring(entry.label)));
   controls::Grid::SetColumn(group_picker, 1);
   group_row.Children().Append(group_picker);
-  detail.Children().Append(group_row);
-  controls::TextBlock hint;
-  hint.FontSize(kUIFontSize);
-  hint.Text(winrt::hstring(labels.hint));
-  hint.TextWrapping(xaml::TextWrapping::Wrap);
-  hint.Foreground(theme_brush(
+  controls::Grid multiplier_row = detail_row(labels.multiplier_label);
+  controls::TextBlock multiplier_value = detail_value(multiplier_row);
+  controls::Grid value_row = detail_row(labels.value_label);
+  controls::Grid value_field;
+  controls::ColumnDefinition value_column;
+  controls::ColumnDefinition copy_column;
+  copy_column.Width(xaml::GridLengthHelper::Auto());
+  value_field.ColumnDefinitions().Append(value_column);
+  value_field.ColumnDefinitions().Append(copy_column);
+  controls::TextBlock value_text = detail_value(value_field);
+  // 密钥值 keeps one line and shows the head, an ellipsis, and the tail of the
+  // key; selecting a shortened line would hand over a broken key, so the copy
+  // action stays the one way to take the whole value.
+  // The value shares its row with the copy action, so it takes the leading
+  // column of the inner grid instead of the row's value column.
+  controls::Grid::SetColumn(value_text, 0);
+  controls::Button copy_button;
+  copy_button.FontSize(kUIFontSize);
+  copy_button.Margin(xaml::Thickness{6, 0, 0, 0});
+  copy_button.Content(winrt::box_value(winrt::hstring(labels.copy_action_label)));
+  controls::ToolTipService::SetToolTip(copy_button, winrt::box_value(winrt::hstring(labels.copy_label)));
+  winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(copy_button, winrt::hstring(labels.copy_label));
+  controls::Grid::SetColumn(copy_button, 1);
+  value_field.Children().Append(copy_button);
+  controls::Grid::SetColumn(value_field, 1);
+  value_row.Children().Append(value_field);
+  detail.Children().Append(models_title);
+  detail.Children().Append(models_scroll);
+  controls::TextBlock copy_status;
+  copy_status.FontSize(kUIFontSize);
+  copy_status.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
+  copy_status.Foreground(theme_brush(
       L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
-  detail.Children().Append(hint);
+  detail.Children().Append(copy_status);
   controls::Grid::SetColumn(detail, 1);
   layout.Children().Append(detail);
 
@@ -1247,37 +1355,163 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     return false;
   };
   auto refresh_apply = [&apply, &has_staged_changes]() { apply.IsEnabled(has_staged_changes()); };
-  // Group names the account still offers, keyed by group id, so a key that
-  // points at a dropped group reports 未分组 instead of a stale name.
+  // Group names the account still offers, keyed by group id, so the list's
+  // group column names the group while its 倍率 column carries the rate.
   auto current_group_text = [&groups](SheetRow const& row, GroupManagerLabels const& labels) -> std::wstring {
     if (row.group_id.empty()) return labels.ungrouped_label;
     for (auto const& entry : groups) {
-      if (entry.first == row.group_id) return entry.second;
+      if (entry.id == row.group_id) return entry.name;
     }
     return row.group_label.empty() ? labels.ungrouped_label : row.group_label;
   };
-  auto multiplier_text = [&groups](SheetRow const& row, GroupManagerLabels const& labels) -> std::wstring {
-    if (row.group_id.empty()) return labels.ungrouped_label;
+  // The key's rate while it belongs to a group the store still offers.  An
+  // ungrouped key has no rate to report, and the group column already names
+  // it, so the cell stays empty instead of repeating 未分组.
+  auto multiplier_text = [&groups](SheetRow const& row, GroupManagerLabels const&) -> std::wstring {
+    if (row.group_id.empty()) return std::wstring{};
     for (auto const& entry : groups) {
-      if (entry.first == row.group_id) return row.multiplier;
+      if (entry.id == row.group_id) return row.multiplier;
     }
-    return labels.ungrouped_label;
+    return std::wstring{};
   };
-  // 自动分组 keeps the multiplier column empty: the group name already carries
-  // the rate and the alignment step owns every key.
-  auto presentation = [&toggle_on, &multiplier_text](SheetRow const& row, GroupManagerLabels const& labels) -> std::pair<std::wstring, bool> {
-    if (toggle_on()) return {std::wstring{}, false};
-    if (row.deleted) return {labels.deleted_label, true};
-    if (row.draft) return {labels.draft_label, true};
-    return {multiplier_text(row, labels), false};
+  // The 倍率 column reports the rate the row costs right now, on the same
+  // terms whether or not 自动分组 owns the layout; 倍率 carries a rate and
+  // nothing else, so a staged create or delete dims the row instead.
+  auto presentation = [&multiplier_text](SheetRow const& row, GroupManagerLabels const& labels) -> std::wstring {
+    return multiplier_text(row, labels);
+  };
+  // A row the draft will create or delete; the list shows it dimmed.
+  auto is_staged = [](SheetRow const& row) { return row.deleted || row.draft; };
+
+  // The station's presence sentinel is the only key material the descriptor
+  // carries, and a draft key has no key on the station yet.
+  auto can_copy = [](SheetRow const& row) { return !row.hint.empty() && !row.draft && !row.id.empty(); };
+  // Plaintext keys the sheet already revealed while it is open, keyed by key
+  // id.  Core's lease is read-once, so a re-selection reuses what the sheet
+  // already read instead of asking for another one, and the values are dropped
+  // with the window.
+  auto revealed_values = std::make_shared<std::map<std::wstring, std::wstring>>();
+  // Distinguishes the newest reveal from a reply for an earlier selection.
+  auto reveal_token = std::make_shared<uint64_t>(0);
+  // One transient status line: every message restarts the same timer, and only
+  // the newest one clears it.  The XAML objects are captured by value so a
+  // reply that arrives after the sheet closes cannot touch freed stack state.
+  auto status_timer = std::make_shared<xaml::DispatcherTimer>();
+  status_timer->Interval(std::chrono::milliseconds(4000));
+  status_timer->Tick([status_timer, copy_status](auto const&, auto const&) {
+    status_timer->Stop();
+    copy_status.Text(L"");
+  });
+  auto show_copy_status = [copy_status, status_timer](std::wstring const& message) {
+    copy_status.Text(winrt::hstring(message));
+    status_timer->Stop();
+    if (!message.empty()) status_timer->Start();
+  };
+  copy_button.Click([rows, list, account_id, copy_button, show_copy_status, can_copy, revealed_values,
+                     copied_label = labels.copied_label, failed_label = labels.failed_label](auto const&, auto const&) {
+    const int32_t selected = list.SelectedIndex();
+    if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
+    auto row = std::make_shared<SheetRow>((*rows)[static_cast<size_t>(selected)]);
+    if (!can_copy(*row)) return;
+    // A key the sheet already revealed copies from what it holds, so the
+    // read-once lease is not spent twice on the same key.
+    auto revealed = revealed_values->find(row->id);
+    if (revealed != revealed_values->end()) {
+      try {
+        using namespace winrt::Windows::ApplicationModel::DataTransfer;
+        DataPackage package;
+        package.SetText(winrt::hstring(revealed->second));
+        Clipboard::SetContent(package);
+        Clipboard::Flush();
+        show_copy_status(copied_label);
+      } catch (...) {
+        show_copy_status(failed_label);
+      }
+      return;
+    }
+    copy_button.IsEnabled(false);
+    show_copy_status(L"");
+    auto target = std::make_shared<std::wstring>(account_id + L":" + row->id);
+    auto dispatcher = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    if (!dispatcher) {
+      copy_button.IsEnabled(true);
+      return;
+    }
+    // Core owns the plaintext; read it off the UI thread through the same
+    // capability the provider workspace uses, then copy it back on the UI
+    // thread because WinUI's clipboard requires it.
+    std::thread([target, row, dispatcher, copy_button, show_copy_status, can_copy, copied_label, failed_label] {
+      auto value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
+      bool copied = false;
+      if (value && !value->empty()) {
+        try {
+          using namespace winrt::Windows::ApplicationModel::DataTransfer;
+          DataPackage package;
+          package.SetText(winrt::hstring(*value));
+          Clipboard::SetContent(package);
+          Clipboard::Flush();
+          copied = true;
+        } catch (...) {
+        }
+        value->clear();
+      }
+      dispatcher.TryEnqueue([row, copy_button, show_copy_status, can_copy,
+                             message = copied ? copied_label : failed_label] {
+        copy_button.IsEnabled(can_copy(*row));
+        show_copy_status(message);
+      });
+    }).detach();
+  });
+
+  // Show the selected key in plaintext: the value is read through Core's native
+  // capability and stays in this window.  A draft key has no key on the station
+  // yet, and a key whose read fails keeps stating the presence the descriptor
+  // reports.
+  auto reveal_value = [rows, list, value_text, account_id, revealed_values, reveal_token, can_copy,
+                       empty_label = labels.empty_label, saved_label = labels.saved_label](SheetRow const& row) {
+    const std::wstring key_id = row.id;
+    if (!can_copy(row)) {
+      value_text.Text(winrt::hstring(row.hint.empty() ? empty_label : saved_label));
+      return;
+    }
+    auto revealed = revealed_values->find(key_id);
+    if (revealed != revealed_values->end()) {
+      value_text.Text(winrt::hstring(EllipsizeMiddle(revealed->second)));
+      return;
+    }
+    // The row states the key's presence until Core answers with the value.
+    value_text.Text(winrt::hstring(saved_label));
+    const uint64_t token = ++(*reveal_token);
+    auto target = std::make_shared<std::wstring>(account_id + L":" + key_id);
+    auto dispatcher = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
+    if (!dispatcher) return;
+    std::thread([target, key_id, dispatcher, value_text, revealed_values, reveal_token, token, rows, list] {
+      auto value = CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key", winrt::to_string(*target));
+      if (!value || value->empty()) return;
+      auto revealed_value = std::make_shared<std::wstring>(*value);
+      value->clear();
+      dispatcher.TryEnqueue([value_text, revealed_values, reveal_token, token, key_id, revealed_value, rows, list] {
+        (*revealed_values)[key_id] = *revealed_value;
+        if (*reveal_token != token) return;
+        const int32_t selected = list.SelectedIndex();
+        if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
+        if ((*rows)[static_cast<size_t>(selected)].id != key_id) return;
+        value_text.Text(winrt::hstring(EllipsizeMiddle(*revealed_value)));
+      });
+    }).detach();
   };
 
   auto load_detail = [&]() {
     const int32_t selected = selected_index();
     const bool has_row = selected >= 0 && static_cast<size_t>(selected) < rows->size();
     const bool editable = !toggle_on() && has_row;
-    add_button.IsEnabled(!groups.empty() && !toggle_on());
+    // The list header keeps only the +/- it can perform: no group to place a
+    // key in, or no selected key, hides the control instead of greying it out.
+    const bool can_add_key = !groups.empty() && !toggle_on();
+    add_button.IsEnabled(can_add_key);
+    add_button.Visibility(can_add_key ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);
     remove_button.IsEnabled(editable);
+    remove_button.Visibility(editable ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);
     enabled_box.IsEnabled(editable);
     name_box.IsEnabled(editable);
     group_picker.IsEnabled(editable && !groups.empty());
@@ -1286,11 +1520,24 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       enabled_box.IsChecked(false);
       name_box.Text(L"");
       group_picker.SelectedIndex(-1);
+      multiplier_value.Text(winrt::hstring(labels.empty_label));
+      // A reply for the previous selection must not land on an empty row.
+      ++(*reveal_token);
+      value_text.Text(winrt::hstring(labels.empty_label));
+      rebuild_models({});
+      copy_button.IsEnabled(false);
+      show_copy_status(L"");
     } else {
       auto const& row = (*rows)[static_cast<size_t>(selected)];
       enabled_box.IsChecked(row.enabled);
       name_box.Text(winrt::hstring(row.name));
       group_picker.SelectedIndex(group_index_for(row.group_id));
+      multiplier_value.Text(winrt::hstring(row.multiplier.empty() ? labels.empty_label : row.multiplier));
+      // Core reports only whether a credential exists; the value row shows the
+      // real key, which the sheet reads through Core's native capability.
+      reveal_value(row);
+      rebuild_models(row.models);
+      copy_button.IsEnabled(can_copy(row));
     }
     *syncing = false;
   };
@@ -1320,8 +1567,11 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       name.VerticalAlignment(xaml::VerticalAlignment::Center);
       name.Text(winrt::hstring(row.name));
       name.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-      name.Foreground(row.deleted && !toggle_on()
-          ? theme_brush(L"TextFillColorTertiaryBrush", winrt::Windows::UI::Color{255, 150, 150, 150})
+      // The list reports the store as it stands: a column keeps its own value,
+      // and a row the draft will create or delete is dimmed instead of carrying
+      // status text in 倍率.
+      name.Foreground(is_staged(row)
+          ? theme_brush(L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115})
           : theme_brush(L"TextFillColorPrimaryBrush", winrt::Windows::UI::Color{255, 30, 30, 30}));
       controls::Grid::SetColumn(name, 0);
       grid.Children().Append(name);
@@ -1331,8 +1581,9 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       group.VerticalAlignment(xaml::VerticalAlignment::Center);
       group.Text(winrt::hstring(current_group_text(row, labels)));
       group.TextTrimming(winrt::Microsoft::UI::Xaml::TextTrimming::CharacterEllipsis);
-      group.Foreground(theme_brush(
-          L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+      group.Foreground(is_staged(row)
+          ? theme_brush(L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115})
+          : theme_brush(L"TextFillColorPrimaryBrush", winrt::Windows::UI::Color{255, 30, 30, 30}));
       controls::Grid::SetColumn(group, 1);
       grid.Children().Append(group);
       controls::TextBlock detail_text;
@@ -1343,10 +1594,10 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       detail_text.FontSize(kUIFontSize);
       detail_text.Margin(xaml::Thickness{0, 0, 8, 0});
       detail_text.VerticalAlignment(xaml::VerticalAlignment::Center);
-      detail_text.Text(winrt::hstring(detail_presentation.first));
-      detail_text.Foreground(detail_presentation.second
-          ? theme_brush(L"TextFillColorTertiaryBrush", winrt::Windows::UI::Color{255, 150, 150, 150})
-          : theme_brush(L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115}));
+      detail_text.Text(winrt::hstring(detail_presentation));
+      detail_text.Foreground(is_staged(row)
+          ? theme_brush(L"TextFillColorSecondaryBrush", winrt::Windows::UI::Color{255, 110, 110, 115})
+          : theme_brush(L"TextFillColorPrimaryBrush", winrt::Windows::UI::Color{255, 30, 30, 30}));
       controls::Grid::SetColumn(detail_text, 2);
       grid.Children().Append(detail_text);
       list.Items().Append(grid);
@@ -1401,8 +1652,9 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     SheetRow row;
     row.id = L"draft";
     row.name = name;
-    row.group_id = groups.front().first;
-    row.group_label = groups.front().second;
+    row.group_id = groups.front().id;
+    row.group_label = groups.front().name;
+    row.multiplier = groups.front().rate;
     row.original_group_id = row.group_id;
     row.draft = true;
     rows->push_back(std::move(row));
@@ -1444,8 +1696,10 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     const auto group_index = group_picker.SelectedIndex();
     if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
     if (group_index < 0 || static_cast<size_t>(group_index) >= groups.size()) return;
-    (*rows)[static_cast<size_t>(selected)].group_id = groups[static_cast<size_t>(group_index)].first;
-    (*rows)[static_cast<size_t>(selected)].group_label = groups[static_cast<size_t>(group_index)].second;
+    (*rows)[static_cast<size_t>(selected)].group_id = groups[static_cast<size_t>(group_index)].id;
+    (*rows)[static_cast<size_t>(selected)].group_label = groups[static_cast<size_t>(group_index)].name;
+    // Re-grouping changes what the key costs, so 倍率 follows the choice.
+    (*rows)[static_cast<size_t>(selected)].multiplier = groups[static_cast<size_t>(group_index)].rate;
     rebuild();
     list.SelectedIndex(selected);
   });
@@ -1469,6 +1723,8 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     refresh_apply();
   });
   close.Click([&](auto const&, auto const&) {
+    // Close drops the staged draft, so a sheet that would lose edits asks first.
+    if (has_staged_changes() && !Confirm(labels.discard_title, labels.discard_body, labels.discard_confirm)) return;
     *applied = false;
     dialog.Close();
   });
@@ -1504,9 +1760,21 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   });
 
   rebuild();
+  // The selection drives the detail column, so the sheet opens on the first
+  // key instead of a blank form.
+  if (!rows->empty()) list.SelectedIndex(0);
   load_detail();
   refresh_apply();
-  if (!RunOwnedModalWindow(dialog, window_handle_, {780, 480}, finished)) return std::nullopt;
+  // The list is sized for the longest model list any key carries (bounded to
+  // what the sheet shows at once), so switching groups scrolls instead of
+  // resizing the window under the pointer.
+  size_t longest_models = 0;
+  for (auto const& row : *rows) longest_models = std::max(longest_models, row.models.size());
+  const double models_height = static_cast<double>(std::max<size_t>(3, std::min<size_t>(12, longest_models))) * kModelRowHeight;
+  models_scroll.Height(models_height);
+  const double detail_height = 256.0 + models_height;
+  const double window_height = 560 + std::max(0.0, detail_height - 300.0);
+  if (!RunOwnedModalWindow(dialog, window_handle_, {780, window_height}, finished)) return std::nullopt;
   return outcome;
 }
 

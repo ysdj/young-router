@@ -339,6 +339,54 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             self.assertEqual(applied["resources"], disabled["resources"])
             self.assertEqual(applied["groups"], disabled["groups"])
 
+    def test_auto_grouping_without_station_groups_keeps_every_key(self) -> None:
+        """An unknown group list is not a layout, so nothing is staged to delete."""
+
+        client = RelayMutationHTTPClient(
+            {
+                "/api/v1/user/profile": {"data": {"balance": 4.5}},
+                "/api/v1/keys?page=1&page_size=100": {
+                    "data": {
+                        "items": [
+                            {
+                                "id": "key-ungrouped",
+                                "name": "old-ungrouped",
+                                "status": "active",
+                                "key": "replace-ungrouped",
+                            }
+                        ]
+                    }
+                },
+                "/api/v1/groups/available": {"data": []},
+                "/api/v1/groups/rates": {"data": {}},
+                "/api/v1/channels/available": {"data": [{"platforms": [{"supported_models": ["model-test"]}]}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person@example.test", cookie="session=fixture")
+            domain.refresh_resources(account["id"])
+            self.assertEqual([], domain.snapshot()["accounts"][0]["groups"])
+
+            snapshot = domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": True},
+            )["accounts"][0]
+            # The switch still applies, but a key list without groups keeps
+            # every key instead of reading the missing groups as "ungrouped".
+            self.assertTrue(snapshot["auto_grouping"])
+            self.assertEqual(["sub2api-key-ungrouped"], [resource["id"] for resource in snapshot["resources"]])
+            self.assertEqual([], domain.prepare_apply()["destructive"])
+            self.assertEqual([], client.calls)
+
+            aligned = domain.dispatch("api_key.auto_group_align", {"account_id": account["id"]})["accounts"][0]
+            self.assertEqual(["sub2api-key-ungrouped"], [resource["id"] for resource in aligned["resources"]])
+            self.assertEqual([], domain.prepare_apply()["destructive"])
+
     def test_disabled_keys_remain_visible_but_cannot_be_imported(self) -> None:
         client = RelayMutationHTTPClient(
             {

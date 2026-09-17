@@ -70,6 +70,20 @@ class LogRotationTests(unittest.TestCase):
         self.assertTrue(os.path.exists(self.log_path + ".3"))
         self.assertFalse(os.path.exists(self.log_path + ".4"))
 
+    def test_backup_segment_argument_overrides_environment(self) -> None:
+        os.environ[log_rotation.LOG_BACKUP_SEGMENTS_ENV] = "1"
+        maximum = 400
+        payload = "x" * 300
+        for index in range(6):
+            log_rotation.append_bounded_log(
+                self.log_path,
+                f"tail-{index}\n".encode("utf-8") + payload.encode("utf-8"),
+                maximum_bytes=maximum,
+                backup_segments=4,
+            )
+        self.assertTrue(os.path.exists(self.log_path + ".4"))
+        self.assertFalse(os.path.exists(self.log_path + ".5"))
+
     def test_write_bounded_stream_rotates_managed_log(self) -> None:
         os.environ["YOUNG_ROUTER_SERVICE_LOG"] = self.log_path
         maximum = 400

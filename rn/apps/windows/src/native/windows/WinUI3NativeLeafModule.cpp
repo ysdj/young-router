@@ -510,13 +510,14 @@ void WinUI3NativeLeafModule::ShowGroupManager(
   };
   auto title = string_field("title");
   auto account_label = string_field("accountLabel");
+  auto account_id = string_field("accountId");
   auto grouping_entry = options.find("autoGrouping");
   std::optional<bool> auto_grouping;
   if (grouping_entry != options.end()) {
     if (auto const* checked = grouping_entry->second.TryGetBoolean()) auto_grouping = *checked;
   }
   bool valid = true;
-  std::vector<std::pair<std::wstring, std::wstring>> groups;
+  std::vector<YoungRouter::GroupManagerGroup> groups;
   auto groups_entry = options.find("groups");
   if (groups_entry == options.end()) {
     valid = false;
@@ -533,18 +534,27 @@ void WinUI3NativeLeafModule::ShowGroupManager(
         }
         std::optional<std::string> id;
         std::optional<std::string> label;
+        std::optional<std::string> name;
+        std::optional<std::string> rate;
         for (auto const& [key, value] : *object) {
           if (key == "id") {
             if (auto const* text = value.TryGetString()) id = *text;
           } else if (key == "label") {
             if (auto const* text = value.TryGetString()) label = *text;
+          } else if (key == "name") {
+            if (auto const* text = value.TryGetString()) name = *text;
+          } else if (key == "rate") {
+            if (auto const* text = value.TryGetString()) rate = *text;
           }
         }
-        if (!id || id->size() > 256 || !label || label->empty() || label->size() > 256) {
+        if (!id || id->size() > 256 || !label || label->empty() || label->size() > 256
+            || (name && name->size() > 256) || (rate && rate->size() > 64)) {
           valid = false;
           break;
         }
-        groups.emplace_back(Utf8ToWide(*id), Utf8ToWide(*label));
+        std::string column_name = name && !name->empty() ? *name : *label;
+        groups.push_back(YoungRouter::GroupManagerGroup{
+            Utf8ToWide(*id), Utf8ToWide(*label), Utf8ToWide(column_name), Utf8ToWide(rate.value_or(""))});
       }
     }
   }
@@ -568,7 +578,33 @@ void WinUI3NativeLeafModule::ShowGroupManager(
         std::optional<std::string> group_id;
         std::optional<std::string> group_label;
         std::optional<std::string> multiplier;
+        std::optional<std::string> hint;
+        std::optional<std::string> models;
         for (auto const& [key, value] : *object) {
+          // The key's models travel as a list so the sheet can lay them out in
+          // aligned columns; they are joined into the newline-separated text
+          // the sheet's own API carries.
+          if (key == "models") {
+            auto const* array = value.TryGetArray();
+            if (array != nullptr && array->size() <= 512) {
+              std::string joined;
+              for (auto const& entry : *array) {
+                auto const* model = entry.TryGetString();
+                if (model == nullptr || model->empty() || model->size() > 256) {
+                  joined.clear();
+                  break;
+                }
+                if (!joined.empty()) joined.push_back('\n');
+                joined.append(*model);
+                if (joined.size() > 16384) {
+                  joined.clear();
+                  break;
+                }
+              }
+              models = joined;
+            }
+            continue;
+          }
           auto const* text = value.TryGetString();
           if (!text) continue;
           if (key == "id") id = *text;
@@ -576,8 +612,10 @@ void WinUI3NativeLeafModule::ShowGroupManager(
           else if (key == "groupID") group_id = *text;
           else if (key == "groupLabel") group_label = *text;
           else if (key == "multiplier") multiplier = *text;
+          else if (key == "hint") hint = *text;
         }
-        if (!id || id->size() > 256 || !name || name->empty() || name->size() > 256) {
+        if (!id || id->size() > 256 || !name || name->empty() || name->size() > 256
+            || (hint && hint->size() > 256) || (models && models->size() > 16384)) {
           valid = false;
           break;
         }
@@ -586,7 +624,9 @@ void WinUI3NativeLeafModule::ShowGroupManager(
             Utf8ToWide(*name),
             Utf8ToWide(group_id.value_or("")),
             Utf8ToWide(group_label.value_or("")),
-            Utf8ToWide(multiplier.value_or(""))});
+            Utf8ToWide(multiplier.value_or("")),
+            Utf8ToWide(hint.value_or("")),
+            Utf8ToWide(models.value_or(""))});
       }
     }
   }
@@ -611,20 +651,29 @@ void WinUI3NativeLeafModule::ShowGroupManager(
       labels.name_label = read("nameLabel");
       labels.group_label = read("groupLabel");
       labels.multiplier_label = read("multiplierLabel");
+      labels.value_label = read("valueLabel");
+      labels.copy_action_label = read("copyActionLabel");
+      labels.copy_label = read("copyLabel");
+      labels.copied_label = read("copiedLabel");
+      labels.failed_label = read("failedLabel");
+      labels.models_label = read("modelsLabel");
+      labels.empty_label = read("emptyLabel");
+      labels.saved_label = read("savedLabel");
       labels.enabled_label = read("enabledLabel");
       labels.new_key_name = read("newKeyName");
-      labels.draft_label = read("draftLabel");
-      labels.deleted_label = read("deletedLabel");
       labels.auto_grouping_label = read("autoGroupingLabel");
       labels.ungrouped_label = read("ungroupedLabel");
       labels.close_label = read("closeLabel");
       labels.apply_label = read("applyLabel");
-      labels.hint = read("hint");
+      labels.discard_title = read("discardTitle");
+      labels.discard_body = read("discardBody");
+      labels.discard_confirm = read("discardConfirm");
       if (labels.add_label.empty() || labels.remove_label.empty() || labels.close_label.empty() || labels.apply_label.empty()) valid = false;
     }
   }
   if (!title || title->empty() || title->size() > 320 ||
       !account_label || account_label->size() > 320 ||
+      !account_id || account_id->empty() || account_id->size() > 256 ||
       !auto_grouping || !valid) {
     promise.Reject("The group manager input is invalid.");
     return;
@@ -636,6 +685,7 @@ void WinUI3NativeLeafModule::ShowGroupManager(
     ui_dispatcher.Post([leaf,
                         title = Utf8ToWide(*title),
                         account_label = Utf8ToWide(*account_label),
+                        account_id = Utf8ToWide(*account_id),
                         groups = std::move(groups),
                         keys = std::move(keys),
                         labels,
@@ -644,8 +694,8 @@ void WinUI3NativeLeafModule::ShowGroupManager(
                         js_dispatcher]() mutable {
       std::optional<YoungRouter::GroupManagerResult> result;
       try {
-        result = leaf->ShowGroupManager(std::move(title), std::move(account_label), std::move(groups),
-                                        std::move(keys), labels, auto_grouping);
+        result = leaf->ShowGroupManager(std::move(title), std::move(account_label), std::move(account_id),
+                                        std::move(groups), std::move(keys), labels, auto_grouping);
       } catch (...) {
       }
       js_dispatcher.Post([promise, result = std::move(result)]() mutable {

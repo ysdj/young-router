@@ -36,6 +36,7 @@ type NativeModule = {
   showGroupManager?: (options: {
     title: string;
     accountLabel: string;
+    accountId: string;
     groups: RelayGroupManagerGroup[];
     keys: RelayGroupManagerKey[];
     labels: RelayGroupManagerLabels;

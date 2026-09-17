@@ -38,11 +38,20 @@ class ModelCatalogTests(unittest.TestCase):
 
     def test_runtime_schema_defaults_match_proxy_defaults(self) -> None:
         from young_router import base as base_module
+        from young_router.log_rotation import DEFAULT_LOG_BACKUP_SEGMENTS
 
         defaults_by_key = {
             str(item.get("key")): str(item.get("default"))
             for item in runtime_settings_metadata()
         }
+        self.assertEqual(
+            _number_text_for_schema(base_module._STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS),
+            defaults_by_key["YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS"],
+        )
+        self.assertEqual(
+            str(DEFAULT_LOG_BACKUP_SEGMENTS),
+            defaults_by_key["YOUNG_ROUTER_LOG_BACKUP_SEGMENTS"],
+        )
         self.assertEqual(
             str(int(base_module._WEBSOCKET_MAX_FRAME_DEFAULT_BYTES)),
             defaults_by_key["YOUNG_ROUTER_WEBSOCKET_MAX_FRAME_BYTES"],

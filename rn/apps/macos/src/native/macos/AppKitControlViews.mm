@@ -12,9 +12,10 @@
 #import <react/renderer/components/LiteLLMMacControls/Props.h>
 #import <react/renderer/components/LiteLLMMacControls/RCTComponentViewHelpers.h>
 
-#include <algorithm>
+#import <algorithm>
 #include <cmath>
 #include <memory>
+#include <objc/runtime.h>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,10 @@ namespace {
 constexpr CGFloat LiteLLMUIFontSize = 13.0;
 constexpr CGFloat LiteLLMTableMinimumHorizontalPadding = 8.0;
 constexpr CGFloat LiteLLMTableHeaderHorizontalPadding = 6.0;
+// One leading tab in a cell steps the row hierarchy in.  AppKit's default tab
+// interval is 28 pt, which eats the first column's room for its own text, so
+// the indent uses one narrow stop instead.
+constexpr CGFloat LiteLLMTableRowIndentWidth = 16.0;
 // Content-sized log tables can hold thousands of rows.  Measuring every cell on
 // each refresh would stall the main thread, so the width scan that sizes the
 // trailing column is bounded to the newest rows the table shows first.
@@ -175,6 +180,10 @@ NSAttributedString *TableCellTitle(NSString *title, NSColor *color)
 {
   NSMutableParagraphStyle *paragraph = [NSMutableParagraphStyle new];
   paragraph.lineBreakMode = NSLineBreakByTruncatingTail;
+  paragraph.defaultTabInterval = LiteLLMTableRowIndentWidth;
+  paragraph.tabStops = @[[[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentLeft
+                                                        location:LiteLLMTableRowIndentWidth
+                                                         options:@{}]];
 
   return [[NSAttributedString alloc] initWithString:title attributes:@{
     NSFontAttributeName: TableCellFont(),
@@ -716,8 +725,12 @@ static void LayoutAppKitControlInBounds(NSView *control, NSRect bounds, BOOL fil
 // settings ScrollView, so a wheel event must continue to that ancestor when
 // the table has no overflow or is already at the relevant edge.
 NSScrollView *ParentScrollView(NSView *view);
+BOOL TableScrollViewCanScrollVertically(NSScrollView *scrollView, NSEvent *event);
+BOOL TableScrollViewCanScrollHorizontally(NSScrollView *scrollView, NSEvent *event);
 BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL acceptsVerticalScroll, BOOL acceptsHorizontalScroll);
 BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
+void FloatPersistentScrollerOverContent(NSScrollView *scrollView);
+void DiscardStaleScrollerSubviews(NSScrollView *scrollView);
 
 
 @interface LiteLLMTableScrollView : NSScrollView
@@ -726,6 +739,30 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 @end
 
 @implementation LiteLLMTableScrollView
+
+// AppKit re-tiles on scroller flag/style changes and always reserves the legacy
+// gutter for the custom capsule scroller; re-assert both the capsule and its
+// floating placement.  AppKit also rebuilds a scroller whenever a flag flips
+// back on, which replaces the capsule with its own legacy bar, so this
+// re-installs it as well.
+- (void)tile
+{
+  [super tile];
+  BOOL reinstalled = NO;
+  if (self.hasVerticalScroller && ![self.verticalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {
+    self.verticalScroller = [[LiteLLMPersistentScroller alloc] initWithFrame:NSZeroRect];
+    reinstalled = YES;
+  }
+  if (self.hasHorizontalScroller && ![self.horizontalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {
+    self.horizontalScroller = [[LiteLLMPersistentScroller alloc] initWithFrame:NSZeroRect];
+    reinstalled = YES;
+  }
+  if (reinstalled) {
+    [super tile];
+  }
+  DiscardStaleScrollerSubviews(self);
+  FloatPersistentScrollerOverContent(self);
+}
 
 - (void)scrollWheel:(NSEvent *)event
 {
@@ -762,8 +799,13 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
   if (![tableView isKindOfClass:NSTableView.class] || tableView.headerView == nil) {
     return constrained;
   }
-  if (NSMinY(proposedBounds) <= 0.5) {
-    constrained.origin.y = -NSHeight(tableView.headerView.frame);
+  // The parked position (first row just below the floating header) is this
+  // clip view's real top.  Only clamp movement *above* that position: clamping
+  // every proposed origin inside the header strip also swallowed the table's
+  // first wheel notch and every scroller drag that ended inside the strip.
+  const CGFloat restingOrigin = -NSHeight(tableView.headerView.frame);
+  if (NSMinY(proposedBounds) <= restingOrigin + 0.5) {
+    constrained.origin.y = restingOrigin;
   }
   return constrained;
 }
@@ -991,13 +1033,60 @@ BOOL ForwardWheelToParent(NSView *view, NSEvent *event);
 
 @end
 
-// `LiteLLMPersistentScroller` (declared in AppKitNativeLeaf.swift, visible here
-// through the generated Swift header) draws the scroller this app keeps on
-// screen as the system draws its overlay scroller: one translucent capsule knob
-// and no track, instead of AppKit's opaque legacy bar with a visible track.
-// AppKit rebuilds a scroller whenever a scroller flag flips back on and leaves a
-// scroller it hid while idle hidden until the next scroll event, so every site
-// that keeps a scroller visible re-runs this from its layout path.
+// A scroller the app keeps on screen has to stay visible while its content
+// overflows: AppKit's own overlay scroller fades out again as soon as scrolling
+// stops, so the app draws its own translucent capsule (`LiteLLMPersistentScroller`
+// in AppKitNativeLeaf.swift, visible here through the generated Swift header)
+// with the legacy style.  Legacy tiling reserves a gutter for that scroller,
+// which took 15 pt off the list, so FloatPersistentScrollerOverContent below
+// lets the clip view span the full width and floats the scroller over the
+// content's trailing edge instead.  AppKit rebuilds a scroller whenever a
+// scroller flag flips back on and leaves a scroller it hid while idle hidden
+// until the next scroll event, so every site that keeps a scroller visible
+// re-runs this from its layout path.
+void FloatPersistentScrollerOverContent(NSScrollView *scrollView)
+{
+  if (scrollView == nil || scrollView.scrollerStyle != NSScrollerStyleLegacy) return;
+  NSClipView *clipView = scrollView.contentView;
+  if (clipView == nil) return;
+  const NSRect bounds = scrollView.bounds;
+  CGFloat verticalStrip = 0;
+  if (scrollView.hasVerticalScroller && scrollView.verticalScroller != nil) {
+    verticalStrip = MAX(11, NSWidth(scrollView.verticalScroller.frame));
+    NSRect frame = scrollView.verticalScroller.frame;
+    frame.origin.x = NSMaxX(bounds) - verticalStrip;
+    scrollView.verticalScroller.frame = frame;
+  }
+  CGFloat horizontalStrip = 0;
+  if (scrollView.hasHorizontalScroller && scrollView.horizontalScroller != nil) {
+    horizontalStrip = MAX(11, NSHeight(scrollView.horizontalScroller.frame));
+    NSRect frame = scrollView.horizontalScroller.frame;
+    frame.origin.y = scrollView.isFlipped ? NSMaxY(bounds) - horizontalStrip : NSMinY(bounds);
+    scrollView.horizontalScroller.frame = frame;
+  }
+  const NSRect clipFrame = NSMakeRect(NSMinX(bounds), NSMinY(bounds), NSWidth(bounds), NSHeight(bounds));
+  if (!NSEqualRects(clipView.frame, clipFrame)) {
+    clipView.frame = clipFrame;
+  }
+  (void)verticalStrip;
+  (void)horizontalStrip;
+}
+
+void DiscardStaleScrollerSubviews(NSScrollView *scrollView)
+{
+  if (scrollView == nil) return;
+  // AppKit rebuilds a scroller whenever the scroller flags or the effective
+  // style change, and the view it supersedes can stay in the view tree: the
+  // leftover draws its own full-length knob beside the live one, which is what
+  // put a second bar on the trailing edge of a table.  Only the scrollers this
+  // scroll view currently uses belong in its view tree.
+  for (NSView *subview in [scrollView.subviews copy]) {
+    if (![subview isKindOfClass:NSScroller.class]) continue;
+    if (subview == scrollView.verticalScroller || subview == scrollView.horizontalScroller) continue;
+    [subview removeFromSuperview];
+  }
+}
+
 static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal, BOOL vertical)
 {
   BOOL installed = NO;
@@ -1022,6 +1111,7 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
     scrollView.verticalScroller.hidden = NO;
     scrollView.verticalScroller.alphaValue = 1;
   }
+  FloatPersistentScrollerOverContent(scrollView);
 }
 
 @interface LiteLLMNavigationLinkButton : LiteLLMTabButton
@@ -1616,6 +1706,104 @@ NSScrollView *ParentScrollView(NSView *view)
   return nil;
 }
 
+// Trackpad (precise) scroll gestures are claimed by the window's responsive
+// scrolling machinery, which routes one whole gesture to the outermost
+// compatible scroll view: the RN pane.  The pane's NSScrollView subclass opts
+// into responsive scrolling, so a two-finger gesture over a nested native table
+// scrolled the pane and the table's own wheel handling never ran.  A mouse
+// wheel takes the classic responder path, which is why only trackpads looked
+// dead.  Keep the panes on that classic path so the scroll view under the
+// pointer consults its own overflow first, exactly like a wheel event does.
+static IMP gLiteLLMOriginalScrollViewTile = NULL;
+
+// AppKit re-tiles a scroll view whenever its scroller flags or its effective
+// style change, and that tiling always puts a legacy scroller back into its own
+// gutter.  The RN panes (and the Swift leaf scroll views) are not the app's own
+// NSScrollView subclass, so their capsule scroller would drift back into a
+// gutter after such a pass and the pane content would lose 15 pt.  Re-assert the
+// floating placement for any scroll view that carries the app's capsule.
+static void LiteLLMScrollViewTile(NSScrollView *scrollView, SEL _cmd)
+{
+  ((void (*)(id, SEL))gLiteLLMOriginalScrollViewTile)(scrollView, _cmd);
+  const BOOL carriesCapsule =
+      (scrollView.hasVerticalScroller && [scrollView.verticalScroller isKindOfClass:LiteLLMPersistentScroller.class]) ||
+      (scrollView.hasHorizontalScroller && [scrollView.horizontalScroller isKindOfClass:LiteLLMPersistentScroller.class]);
+  if (carriesCapsule) {
+    DiscardStaleScrollerSubviews(scrollView);
+    FloatPersistentScrollerOverContent(scrollView);
+  }
+}
+
+void FloatPersistentScrollersFromEveryTilingPass(void)
+{
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    Method method = class_getInstanceMethod(NSScrollView.class, @selector(tile));
+    if (method == NULL) return;
+    gLiteLLMOriginalScrollViewTile = method_getImplementation(method);
+    method_setImplementation(method, (IMP)LiteLLMScrollViewTile);
+  });
+}
+
+void UseClassicScrollingForPaneScrollViews(void)
+{
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    Class paneScrollViewClass = NSClassFromString(@"RCTCustomScrollView");
+    if (paneScrollViewClass == Nil) return;
+    SEL selector = @selector(isCompatibleWithResponsiveScrolling);
+    Method method = class_getClassMethod(paneScrollViewClass, selector);
+    if (method == NULL) return;
+    method_setImplementation(method, imp_implementationWithBlock(^BOOL(__unused id receiver) {
+      return NO;
+    }));
+  });
+}
+
+// A table's document is taller (or wider) than its viewport exactly when it has
+// somewhere to go, and the parked position of its clip view sits one header
+// height above the document top, so that offset is its real top edge for
+// chaining to an ancestor.
+BOOL TableScrollViewCanScrollVertically(NSScrollView *scrollView, NSEvent *event)
+{
+  const NSRect visible = [scrollView.documentView convertRect:scrollView.contentView.bounds fromView:scrollView.contentView];
+  const NSRect document = scrollView.documentView.bounds;
+  const CGFloat deltaY = event.scrollingDeltaY;
+  CGFloat minimumY = NSMinY(document);
+  if ([scrollView.documentView isKindOfClass:NSTableView.class]) {
+    NSTableView *tableView = (NSTableView *)scrollView.documentView;
+    if (tableView.headerView != nil) minimumY = -NSHeight(tableView.headerView.frame);
+  }
+  const CGFloat maximumY = NSMaxY(document) - NSHeight(visible);
+  if (maximumY <= minimumY + 0.5) return NO;
+  const CGFloat offsetY = NSMinY(visible);
+  const BOOL atTop = offsetY <= minimumY + 0.5;
+  const BOOL atBottom = offsetY >= maximumY - 0.5;
+  const BOOL movingUp = deltaY > 0;
+  return !(movingUp ? atTop : atBottom);
+}
+
+BOOL TableScrollViewCanScrollHorizontally(NSScrollView *scrollView, NSEvent *event)
+{
+  const NSRect visible = [scrollView.documentView convertRect:scrollView.contentView.bounds fromView:scrollView.contentView];
+  const NSRect document = scrollView.documentView.bounds;
+  const CGFloat deltaX = event.scrollingDeltaX;
+  const CGFloat minimumX = NSMinX(document);
+  const CGFloat maximumX = NSMaxX(document) - NSWidth(visible);
+  if (maximumX <= minimumX + 0.5) return NO;
+  const CGFloat offsetX = NSMinX(visible);
+  const BOOL atLeft = offsetX <= minimumX + 0.5;
+  const BOOL atRight = offsetX >= maximumX - 0.5;
+  const BOOL movingLeft = deltaX > 0;
+  return !(movingLeft ? atLeft : atRight);
+}
+
+// One wheel event belongs to the table only while its dominant axis still has
+// somewhere to go.  A two-finger gesture always carries a little sideways drift
+// with its vertical motion, and giving such an event to the ancestor pane hands
+// the pane the whole gesture (AppKit keeps one scroll view per gesture), so the
+// table went dead for the rest of the swipe: the list could not be scrolled
+// with a trackpad even though a mouse wheel worked.
 BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL acceptsVerticalScroll, BOOL acceptsHorizontalScroll)
 {
   if (scrollView == nil || scrollView.documentView == nil || scrollView.contentView == nil) {
@@ -1624,34 +1812,16 @@ BOOL TableScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event, BOOL ac
 
   const CGFloat deltaY = event.scrollingDeltaY;
   const CGFloat deltaX = event.scrollingDeltaX;
-  const NSRect visible = [scrollView.documentView convertRect:scrollView.contentView.bounds fromView:scrollView.contentView];
-  const NSRect document = scrollView.documentView.bounds;
-
-  if (fabs(deltaY) >= 0.01) {
-    if (!acceptsVerticalScroll) return NO;
-    const CGFloat minimumY = NSMinY(document);
-    const CGFloat maximumY = NSMaxY(document) - NSHeight(visible);
-    if (maximumY <= minimumY + 0.5) return NO;
-    const CGFloat offsetY = NSMinY(visible);
-    const BOOL atTop = offsetY <= minimumY + 0.5;
-    const BOOL atBottom = offsetY >= maximumY - 0.5;
-    const BOOL movingUp = deltaY > 0;
-    if (movingUp ? atTop : atBottom) return NO;
-  }
-
-  if (fabs(deltaX) >= 0.01) {
-    if (!acceptsHorizontalScroll) return NO;
-    const CGFloat minimumX = NSMinX(document);
-    const CGFloat maximumX = NSMaxX(document) - NSWidth(visible);
-    if (maximumX <= minimumX + 0.5) return NO;
-    const CGFloat offsetX = NSMinX(visible);
-    const BOOL atLeft = offsetX <= minimumX + 0.5;
-    const BOOL atRight = offsetX >= maximumX - 0.5;
-    const BOOL movingLeft = deltaX > 0;
-    if (movingLeft ? atLeft : atRight) return NO;
-  }
-
-  return YES;
+  const BOOL wantsVertical = fabs(deltaY) >= 0.01;
+  const BOOL wantsHorizontal = fabs(deltaX) >= 0.01;
+  if (!wantsVertical && !wantsHorizontal) return YES;
+  const BOOL canScrollVertically =
+      wantsVertical && acceptsVerticalScroll && TableScrollViewCanScrollVertically(scrollView, event);
+  const BOOL canScrollHorizontally =
+      wantsHorizontal && acceptsHorizontalScroll && TableScrollViewCanScrollHorizontally(scrollView, event);
+  if (!wantsHorizontal) return canScrollVertically;
+  if (!wantsVertical) return canScrollHorizontally;
+  return fabs(deltaY) >= fabs(deltaX) ? canScrollVertically : canScrollHorizontally;
 }
 
 BOOL ForwardWheelToParent(NSView *view, NSEvent *event)
@@ -2163,6 +2333,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   if (self = [super initWithFrame:frame]) {
     static const auto defaultProps = std::make_shared<const LiteLLMAppKitTableProps>();
     _props = defaultProps;
+    UseClassicScrollingForPaneScrollViews();
+    FloatPersistentScrollersFromEveryTilingPass();
 
     _tableView = [[LiteLLMTableView alloc] initWithFrame:NSZeroRect];
     _tableView.delegate = self;
@@ -2470,14 +2642,18 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 // A scroller the table actually needs has to stay on screen.  AppKit's overlay
 // scrollers fade out again as soon as scrolling stops, so a table that clips a
 // trailing column or holds rows past its viewport would hide the only
-// affordance for them until the user scrolls.  Pin such a scroller with the
-// legacy style and auto-hide off, and restore the platform default chrome as
-// soon as the table fits again so a content-sized table keeps its whole
-// viewport.  Returns YES when the chrome changed: the chrome decides how much
-// viewport the table keeps, so the overflow decision must be measured again.
+// affordance for them until the user scrolls.  Keep that scroller on screen
+// with auto-hide off, but keep the overlay style: it floats translucent over
+// the list and reserves no gutter, so the columns keep the pane's full width
+// (the legacy bar took 16 pt and squeezed the trailing column into an
+// ellipsis).  A table that fits keeps the platform chrome.  Returns YES when
+// the chrome changed: the chrome decides how much viewport the table keeps, so
+// the overflow decision must be measured again.
 - (BOOL)applyPersistentTableScrollerChrome
 {
   const BOOL usesScrollers = _scrollView.hasHorizontalScroller || _scrollView.hasVerticalScroller;
+  // The app's own capsule scroller can only be drawn with the legacy style;
+  // FloatPersistentScrollerOverContent keeps that style from taking a gutter.
   const NSScrollerStyle scrollerStyle = usesScrollers ? NSScrollerStyleLegacy : NSScrollerStyleOverlay;
   const BOOL autohidesScrollers = !usesScrollers;
   const BOOL chromeChanged =
@@ -2490,11 +2666,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   return chromeChanged;
 }
 
-// Draw a pinned scroller with LiteLLMPersistentScroller so it stays translucent
-// instead of covering the row it sits on, and unhide it: a scroller AppKit hid
-// while idle stays hidden until the next scroll event.  AppKit rebuilds a
-// scroller whenever the matching flag flips back on, so this runs from the
-// layout path on every pass.
+// Keep the scroller the table needs on screen: an overlay scroller floats over
+// the rows, and AppKit leaves a scroller it hid while idle hidden until the next
+// scroll event.  AppKit rebuilds a scroller whenever the matching flag flips
+// back on, so this runs from the layout path on every pass.
 - (void)installPersistentTableScrollers
 {
   InstallPersistentScrollers(
@@ -2626,13 +2801,15 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     _tableView.frame = NSMakeRect(0, 0, documentSize.width, documentSize.height);
   }
   // A fresh table starts at origin zero, which parks its first row behind the
-  // floating header.  Normalise any resting position inside that header strip
-  // to one header height higher, the same place AppKit uses for tables that
-  // never scrolled, so the first row is readable without a nudge.
+  // floating header.  Normalise that untouched resting position to one header
+  // height higher, the same place AppKit uses for tables that never scrolled,
+  // so the first row is readable without a nudge.  A scrolled clip view may
+  // legitimately sit inside the header strip, and re-parking it here undid the
+  // first wheel notch over a table whose overflow is only a few points.
   if (_tableView.headerView != nil) {
     const CGFloat restingOrigin = -NSHeight(_tableView.headerView.frame);
     const CGFloat originY = NSMinY(_clipView.bounds);
-    if (originY >= 0 && originY < -restingOrigin) {
+    if (fabs(originY) < 0.5) {
       NSRect clipBounds = _clipView.bounds;
       clipBounds.origin.y = restingOrigin;
       _clipView.bounds = clipBounds;
@@ -2874,6 +3051,14 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const NSInteger selectedRow = _tableView.selectedRow;
   if (selectedRow < 0 || static_cast<size_t>(selectedRow) >= viewProps.rowKeys.size() ||
       [self isSpanningRow:selectedRow]) {
+    // A click on the empty space below the rows clears the native selection.
+    // Report the cleared state so the shared view drops the item its + / −
+    // header and editor were acting on instead of keeping a selection the
+    // list no longer highlights.
+    if (selectedRow < 0 && !viewProps.selectedKey.empty()) {
+      LiteLLMAppKitTableEventEmitter::OnSelectionChange event{"", -1};
+      std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
+    }
     return;
   }
   LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
@@ -3470,8 +3655,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCodeWebViewCls(void)
     return;
   }
   // The pane keeps a scroller only while its content actually overflows: the
-  // overlay scroller AppKit shows in the fitting case fades out after a scroll,
-  // and a pinned scroller would paint a full-length bar over content that fits.
+  // overlay scroller AppKit shows in the fitting case fades out after a scroll.
+  // An overflowing pane keeps the app's translucent capsule scroller instead,
+  // floated over the content so it reserves no gutter - a legacy bar took 16 pt
+  // of the pane width and clipped the right frame border of the full-width
+  // tables inside it.
   NSView *documentView = scrollView.documentView;
   const BOOL overflows = documentView != nil &&
       NSHeight(documentView.frame) > NSHeight(scrollView.contentView.bounds) + 0.5;

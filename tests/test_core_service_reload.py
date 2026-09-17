@@ -4,6 +4,8 @@ from pathlib import Path
 import json
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -68,6 +70,9 @@ class CoreServiceReloadTests(unittest.TestCase):
             result = core.apply("providers_models", revision=staged["revision"])
 
             self.assertTrue(result["applied"])
+            # The proxy restart runs in the background; wait for it before
+            # observing the controller calls it made.
+            self.assertTrue(core.wait_for_service_reload(5.0))
             self.assertEqual(["reload"], reload_calls)
             self.assertIn("model: openai/new-chat", config_path.read_text(encoding="utf-8"))
 
@@ -218,6 +223,7 @@ class CoreServiceReloadTests(unittest.TestCase):
                 )
 
                 result = core.apply("providers_models", revision=staged["revision"])
+                self.assertTrue(core.wait_for_service_reload(5.0))
                 # Endpoint-backed repairs require two fresh observations so a
                 # transient post-reload worker view cannot manufacture a
                 # restart prompt. The apply's forced refresh is the first;
@@ -233,6 +239,148 @@ class CoreServiceReloadTests(unittest.TestCase):
             self.assertEqual(["public-b"], catalog_state["public_models"])
             self.assertTrue(catalog_state["restart_required"])
             self.assertEqual("catalog_repaired", catalog_state["change_reason"])
+
+
+    def test_provider_apply_returns_before_the_background_restart_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  primary:\n"
+                "    api_base: https://example.test/v1\n"
+                "    api_keys:\n"
+                "      - name: default\n"
+                "        value: replace-me\n"
+                "model_list:\n"
+                "  - model_name: public-chat\n"
+                "    litellm_params:\n"
+                "      model: openai/old-chat\n"
+                "      api_base: https://example.test/v1\n"
+                "      api_key: replace-me\n"
+                "    model_info:\n"
+                "      id: deadbeef\n"
+                "      provider: primary\n"
+                "      upstream_url_surface: openai/responses\n"
+                "litellm_settings:\n"
+                "  public_model_groups: [public-chat]\n",
+                encoding="utf-8",
+            )
+            restart_started = threading.Event()
+            restart_release = threading.Event()
+            reload_calls: list[str] = []
+
+            def reload_service(operation: str) -> dict[str, str]:
+                reload_calls.append(operation)
+                restart_started.set()
+                self.assertTrue(restart_release.wait(5.0))
+                return {"state": "running"}
+
+            core = CoreStore(
+                domains=[ProvidersModelsDomain(config_path)],
+                service_handlers={
+                    "status": lambda _operation: {"state": "running"},
+                    "reload": reload_service,
+                },
+            )
+            core.snapshot()
+            staged = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.patch",
+                    "payload": {
+                        "provider_id": "primary",
+                        "model_id": "deadbeef",
+                        "changes": {"upstream_model": "openai/new-chat"},
+                    },
+                },
+                expected_revision=core.revision,
+            )
+
+            started = time.monotonic()
+            result = core.apply("providers_models", revision=staged["revision"])
+            elapsed = time.monotonic() - started
+
+            self.assertTrue(result["applied"])
+            # A committed edit must not wait for the seconds-long restart.
+            self.assertLess(elapsed, 2.0)
+            self.assertTrue(restart_started.wait(5.0))
+            # While the planned restart runs, snapshots keep the transitional
+            # state instead of a cached controller status.
+            self.assertEqual("starting", core.snapshot()["service"]["state"])
+            restart_release.set()
+            self.assertTrue(core.wait_for_service_reload(5.0))
+            self.assertEqual("running", core.snapshot()["service"]["state"])
+            self.assertEqual(["reload"], reload_calls)
+
+    def test_provider_apply_coalesces_a_burst_of_edits_into_one_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  primary:\n"
+                "    api_base: https://example.test/v1\n"
+                "    api_keys:\n"
+                "      - name: default\n"
+                "        value: replace-me\n"
+                "model_list:\n"
+                "  - model_name: public-chat\n"
+                "    litellm_params:\n"
+                "      model: openai/old-chat\n"
+                "      api_base: https://example.test/v1\n"
+                "      api_key: replace-me\n"
+                "    model_info:\n"
+                "      id: deadbeef\n"
+                "      provider: primary\n"
+                "      upstream_url_surface: openai/responses\n"
+                "litellm_settings:\n"
+                "  public_model_groups: [public-chat]\n",
+                encoding="utf-8",
+            )
+            restart_started = threading.Event()
+            restart_release = threading.Event()
+            reload_calls: list[str] = []
+
+            def reload_service(operation: str) -> dict[str, str]:
+                reload_calls.append(operation)
+                if len(reload_calls) == 1:
+                    restart_started.set()
+                    self.assertTrue(restart_release.wait(5.0))
+                return {"state": "running"}
+
+            core = CoreStore(
+                domains=[ProvidersModelsDomain(config_path)],
+                service_handlers={
+                    "status": lambda _operation: {"state": "running"},
+                    "reload": reload_service,
+                },
+            )
+            core.snapshot()
+
+            def stage(name: str) -> int:
+                staged = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "model.patch",
+                        "payload": {
+                            "provider_id": "primary",
+                            "model_id": "deadbeef",
+                            "changes": {"name": name},
+                        },
+                    },
+                    expected_revision=core.revision,
+                )
+                return staged["revision"]
+
+            core.apply("providers_models", revision=stage("public-first"))
+            self.assertTrue(restart_started.wait(5.0))
+            # Two more edits land while the first restart is in flight; both
+            # answer immediately and fold into one follow-up restart.
+            core.apply("providers_models", revision=stage("public-second"))
+            core.apply("providers_models", revision=stage("public-third"))
+            restart_release.set()
+            self.assertTrue(core.wait_for_service_reload(5.0))
+            self.assertEqual(["reload", "reload"], reload_calls)
+            self.assertIn("public-third", config_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

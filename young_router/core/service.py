@@ -362,6 +362,23 @@ def _mapping_contains_key(value: object, keys: set[str]) -> bool:
     return False
 
 
+def _relay_transient_dispatch_result(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Wrap a relay refresh/import projection in the dispatch result envelope.
+
+    The dispatch contract is a revision plus an optional action-scoped
+    summary, while those helpers report their own projection (resource status
+    and counts).  Returning that projection as the whole result adds top-level
+    fields the IPC contract rejects, so it travels as the action summary and
+    the caller reads the status from there.
+    """
+
+    revision = summary.get("revision")
+    return {
+        "revision": revision if type(revision) is int else 0,
+        "action_summary": {key: value for key, value in summary.items() if key != "revision"},
+    }
+
+
 def _checkpoint_adapter(adapter: DomainAdapter, *, error_code: str = "import_failed") -> dict[str, Any]:
     """Capture one adapter before a transaction mutates it."""
 
@@ -654,6 +671,10 @@ class UnavailableDomain:
 class CoreStore:
     """One thread-safe, versioned state source for native shells."""
 
+    # A quit must not wait for a full proxy restart: the worker stops whatever
+    # it started as soon as it observes the stopping flag.
+    _SERVICE_RELOAD_SHUTDOWN_JOIN_SECONDS = 1.0
+
     def __init__(
         self,
         *,
@@ -673,6 +694,15 @@ class CoreStore:
         self._subscribers: dict[str, Callable[[dict[str, Any]], None]] = {}
         self._revision = 0
         self._service: dict[str, Any] = {"state": "unknown"}
+        # Post-apply proxy restarts take several seconds; they run on their own
+        # thread so the committed edit and every later IPC request stay fast.
+        self._service_reload_guard = threading.Lock()
+        self._service_reload_thread: threading.Thread | None = None
+        self._service_reload_pending = False
+        self._service_reload_stopping = False
+        # Manual lifecycle operations and the background post-apply restart
+        # replace the same proxy, so they take turns on one transition guard.
+        self._service_transition_guard = threading.Lock()
         self._last_actions: dict[str, dict[str, Any]] = {}
         self._disk: dict[str, dict[str, Any]] = {}
         self._disk_identities: dict[str, str | None] = {}
@@ -812,6 +842,14 @@ class CoreStore:
     def shutdown(self) -> dict[str, Any]:
         """Stop only the proxy owned by this Core before the native host exits."""
 
+        with self._service_reload_guard:
+            self._service_reload_stopping = True
+            reload_thread = self._service_reload_thread
+        if reload_thread is not None and reload_thread is not threading.current_thread():
+            # A restart may already be replacing the proxy. Give it a bounded
+            # moment to settle; the worker stops whatever it started once it
+            # observes the stopping flag, so no proxy outlives this Core.
+            reload_thread.join(timeout=self._SERVICE_RELOAD_SHUTDOWN_JOIN_SECONDS)
         with self._lock:
             handler = self._shutdown_handler
             if handler is None:
@@ -831,15 +869,21 @@ class CoreStore:
         assert self._metadata_store is not None
         try:
             payload = self._metadata_store.read(default={})
-        except PersistenceError as exc:
-            raise CoreError("state_unavailable", safe_exception_message(exc)) from None
+        except PersistenceError:
+            # The host passes this private file so the shared revision and
+            # service projection survive a host-driven Core replacement. It is
+            # optional local state: an unreadable or malformed file must never
+            # prevent Core from starting, because the app would then have no
+            # working Core at all. Starting fresh only risks one missed
+            # revision comparison, never a wrong mutation.
+            return
         if not payload:
             return
         if payload.get("version") != CORE_METADATA_VERSION:
-            raise CoreError("state_unavailable", "Core state version is unsupported")
+            return
         revision = payload.get("revision", 0)
         if type(revision) is not int or revision < 0:
-            raise CoreError("state_unavailable", "Core state is invalid")
+            return
         self._revision = revision
         service = payload.get("service")
         if isinstance(service, Mapping) and service.get("state") in SERVICE_STATES:
@@ -990,12 +1034,21 @@ class CoreStore:
             # This read-only projection deliberately neither persists nor
             # emits: snapshot callers need the live status without creating a
             # synthetic Core state transition.
-            status_handler = self._service_handlers.get("status")
-            if status_handler is not None:
-                result = status_handler("status")
-                if not isinstance(result, Mapping):
-                    raise CoreError("service_error", "LiteLLM service returned invalid status")
-                self._set_service_from_result(result, increment=False)
+            reload_thread = self._service_reload_thread
+            planned_restart = reload_thread is not None and reload_thread.is_alive()
+            if planned_restart and self._service.get("state") == "starting":
+                # A background post-apply restart owns the transitional state:
+                # the controller reports stopped/unhealthy while its proxy is
+                # replaced, and a cached status must not hide the planned
+                # restart from the menu or the settings panes.
+                pass
+            else:
+                status_handler = self._service_handlers.get("status")
+                if status_handler is not None:
+                    result = status_handler("status")
+                    if not isinstance(result, Mapping):
+                        raise CoreError("service_error", "LiteLLM service returned invalid status")
+                    self._set_service_from_result(result, increment=False)
             self._refresh_external_disk_state()
             # Relay snapshots display reverse dependency counts, while the
             # provider/model domain remains the sole source of binding truth.
@@ -1126,6 +1179,16 @@ class CoreStore:
                     self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
                     self._revision += 1
                     changed = False
+                    # This reload advances the shared revision without an event,
+                    # so windows learn it from their own responses. Record it for
+                    # the same reason every other bump does: a replacement Core
+                    # must resume at or above every revision a window has seen.
+                    try:
+                        self._persist_metadata()
+                    except PersistenceError:
+                        # The reload itself succeeded; only the ordering record is
+                        # optional. Never fail a disk probe over it.
+                        pass
                 except Exception:
                     pass
             record["changed"] = changed
@@ -2024,7 +2087,15 @@ class CoreStore:
                     raise
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
             self._emit()
-            return {"revision": self._revision, "result": _safe_public(result)}
+            # The dispatch envelope is a revision plus an optional action-scoped
+            # summary.  Returning the catalog projection as the whole result
+            # adds a top-level field the IPC contract rejects, which fails the
+            # call before the switch is reported as applied.
+            summary = _safe_public(result)
+            return {
+                "revision": self._revision,
+                "action_summary": dict(summary) if isinstance(summary, Mapping) else {},
+            }
 
     @staticmethod
     def _webdav_sync_sections(payload: object) -> tuple[str, str]:
@@ -2298,11 +2369,13 @@ class CoreStore:
                     "account_resources_import",
                 }:
                     resource_data = _as_mapping(payload)
-                    return self.import_relay_resources(
-                        resource_data.get("id", resource_data.get("account_id")),
-                        resource_data.get("resource_ids"),
-                        revision=self._revision,
-                        mode=resource_data.get("import_mode", resource_data.get("mode", "linked")),
+                    return _relay_transient_dispatch_result(
+                        self.import_relay_resources(
+                            resource_data.get("id", resource_data.get("account_id")),
+                            resource_data.get("resource_ids"),
+                            revision=self._revision,
+                            mode=resource_data.get("import_mode", resource_data.get("mode", "linked")),
+                        )
                     )
                 if name == "relay_accounts" and normalized_action in {
                     "resources_refresh",
@@ -2310,9 +2383,11 @@ class CoreStore:
                     "account_resources_refresh",
                 }:
                     resource_data = _as_mapping(payload)
-                    return self.refresh_relay_resources(
-                        resource_data.get("id", resource_data.get("account_id")),
-                        revision=self._revision,
+                    return _relay_transient_dispatch_result(
+                        self.refresh_relay_resources(
+                            resource_data.get("id", resource_data.get("account_id")),
+                            revision=self._revision,
+                        )
                     )
                 if name == "providers_models" and normalized_action == "provider_select_relay_station":
                     station_data = _as_mapping(payload)
@@ -2595,7 +2670,10 @@ class CoreStore:
         handler = self._service_handlers.get(operation)
         if handler is not None:
             try:
-                result = handler(operation)
+                # A manual restart and a background post-apply restart must
+                # never replace the proxy at the same time.
+                with self._service_transition_guard:
+                    result = handler(operation)
             except Exception as exc:
                 raise CoreError("service_error", safe_exception_message(exc)) from None
             if isinstance(result, Mapping):
@@ -2638,24 +2716,145 @@ class CoreStore:
         if increment:
             self._revision += 1
 
-    def _reload_service_after_provider_apply(self) -> None:
-        """Reload LiteLLM after the provider source configuration is committed."""
+    def _schedule_service_reload_after_apply(self) -> None:
+        """Queue the post-apply LiteLLM restart without blocking the commit.
 
-        if self._service.get("state") not in {"running", "unhealthy"}:
+        Replacing the proxy takes seconds, so the restart runs on its own
+        thread: the committed edit answers immediately and every later IPC
+        request stays fast.  A burst of edits coalesces into one final restart
+        against the newest configuration.
+        """
+
+        if self._service_handlers.get("reload") is None:
             return
-        reloader = self._service_handlers.get("reload")
-        if reloader is None:
+        with self._service_reload_guard:
+            if self._service_reload_stopping:
+                return
+            thread = self._service_reload_thread
+            if thread is not None and thread.is_alive():
+                # A restart is already replacing the proxy; it will pick up
+                # this commit as its follow-up pass.
+                self._service_reload_pending = True
+                return
+            if self._service.get("state") not in {"running", "unhealthy"}:
+                return
+            thread = threading.Thread(
+                target=self._service_reload_worker,
+                name="litellm-core-service-reload",
+                daemon=True,
+            )
+            self._service_reload_thread = thread
+        thread.start()
+
+    def wait_for_service_reload(self, timeout: float = 10.0) -> bool:
+        """Wait for a background post-apply restart to finish.
+
+        The native hosts and focused tests use this to observe the restart
+        that Apply now performs off the request path.
+        """
+
+        thread = self._service_reload_thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    def _service_reload_worker(self) -> None:
+        while True:
+            try:
+                self._reload_service_after_apply()
+            except Exception:
+                # A failed background restart must not kill the worker before
+                # the controller's real state is projected.
+                self._project_service_reload_failure()
+            with self._service_reload_guard:
+                if self._service_reload_stopping or not self._service_reload_pending:
+                    self._service_reload_thread = None
+                    return
+                self._service_reload_pending = False
+
+    def _reload_service_after_apply(self) -> None:
+        """Reload LiteLLM after settings that shape the proxy are committed.
+
+        Runs only on the reload worker: the controller restart takes seconds,
+        and holding the Core lock across it would freeze every other request.
+        """
+
+        with self._lock:
+            if self._service_reload_stopping:
+                return
+            if self._service.get("state") not in {"running", "unhealthy"}:
+                return
+            reloader = self._service_handlers.get("reload")
+            if reloader is None:
+                return
+            # Project the restart so every open window sees the service leave
+            # the running state while the proxy is replaced.
+            self._set_service_from_result({"state": "starting"}, increment=False)
+            self._emit()
+        try:
+            with self._service_transition_guard:
+                if self._service_reload_stopping:
+                    return
+                service_result = reloader("reload")
+        except Exception:
+            self._project_service_reload_failure()
             return
-        service_result = reloader("reload")
         if not isinstance(service_result, Mapping):
-            raise RuntimeError("service_reload_failed")
-        self._set_service_from_result(service_result, increment=False)
-        if service_result.get("state") not in {"running", "starting"}:
-            raise RuntimeError("service_reload_failed")
-        codex = self._domains.get("codex")
-        refresh_catalog = getattr(codex, "refresh_model_catalog", None)
-        if callable(refresh_catalog) and service_result.get("state") == "running":
-            refresh_catalog()
+            self._project_service_reload_failure()
+            return
+        with self._lock:
+            self._set_service_from_result(service_result, increment=False)
+            if service_result.get("state") == "running":
+                codex = self._domains.get("codex")
+                refresh_catalog = getattr(codex, "refresh_model_catalog", None)
+                if callable(refresh_catalog):
+                    try:
+                        refresh_catalog()
+                    except Exception:
+                        pass
+            stopping = self._service_reload_stopping
+            self._emit()
+        if stopping:
+            # The host quit while this restart was in flight; shutdown() may
+            # have stopped the previous proxy before this one started.
+            self._stop_service_after_reload_shutdown()
+
+    def _project_service_reload_failure(self) -> None:
+        """Project the controller's real state after a failed background restart."""
+
+        with self._lock:
+            result: Mapping[str, Any] | None = None
+            for operation in ("health", "status"):
+                handler = self._service_handlers.get(operation)
+                if handler is None:
+                    continue
+                try:
+                    candidate = handler(operation)
+                except Exception:
+                    continue
+                if isinstance(candidate, Mapping):
+                    result = candidate
+                    break
+            self._set_service_from_result(
+                result if result is not None else {"state": "unhealthy"},
+                increment=False,
+            )
+            self._emit()
+
+    def _stop_service_after_reload_shutdown(self) -> None:
+        stopper = self._shutdown_handler
+        if stopper is not None:
+            try:
+                with self._service_transition_guard:
+                    result = stopper("stop")
+                if isinstance(result, Mapping):
+                    with self._lock:
+                        self._set_service_from_result(result, increment=False)
+            except Exception:
+                pass
+        with self._lock:
+            self._emit()
 
     def validate(self, domain: str | None = None, *, revision: int | None = None, payload: object | None = None) -> dict[str, Any]:
         with self._lock:
@@ -2949,7 +3148,7 @@ class CoreStore:
             applied.append("relay_accounts")
 
             if provider_locally_applied:
-                self._reload_service_after_provider_apply()
+                self._schedule_service_reload_after_apply()
 
             destructive = [
                 operation
@@ -3193,8 +3392,11 @@ class CoreStore:
                     }
                     self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
                     applied.append(name)
-                if "providers_models" in applied:
-                    self._reload_service_after_provider_apply()
+                if "providers_models" in applied or "runtime" in applied:
+                    # The restart takes seconds; hand it to the background so
+                    # the committed edit stays fast and the next request is
+                    # not stuck behind the Core lock.
+                    self._schedule_service_reload_after_apply()
                 self._revision += 1
                 self._persist_metadata()
             except Exception as exc:

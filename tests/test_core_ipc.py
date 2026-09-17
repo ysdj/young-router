@@ -479,6 +479,85 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertFalse(core.snapshot()["drafts"]["language"]["dirty"])
             self.assertEqual(2, AtomicJSONStore(state_file).read()["revision"])
 
+    def test_unreadable_core_metadata_still_starts_a_fresh_store(self) -> None:
+        """Host-passed Core metadata is optional local state, not a boot gate."""
+
+        cases = {
+            "corrupt": "{not json",
+            "not-an-object": "[]",
+            "wrong-version": json.dumps({"version": 999, "revision": 12}),
+            "invalid-revision": json.dumps({"version": 1, "revision": "many"}),
+        }
+        for label, text in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                state_file = Path(directory) / "core-state.json"
+                state_file.write_text(text, encoding="utf-8")
+                core = CoreStore(metadata_path=state_file, domains=[MemoryDomain("language", {"choice": "system"})])
+                self.assertEqual(0, core.revision)
+                self.assertEqual(0, core.snapshot()["revision"])
+                self.assertEqual(1, core.dispatch({"domain": "language", "type": "set", "payload": {"choice": "en"}})["revision"])
+                self.assertEqual(1, AtomicJSONStore(state_file).read()["revision"])
+
+    def test_silent_external_reload_records_its_revision_for_a_replacement_core(self) -> None:
+        """A clean-draft external reload bumps the revision without an event.
+
+        The reload is silent, so windows learn that revision from their own
+        responses. It must still be recorded, because a replacement Core has to
+        resume at or above every revision a window has already observed.
+        """
+
+        class DiskDomain(MemoryDomain):
+            def __init__(self, path: Path):
+                super().__init__("language", {"choice": "system"})
+                self.path = path
+                self.baseline = path.read_text(encoding="utf-8")
+
+            def external_disk_state(self) -> dict[str, bool]:
+                return {"changed": self.path.read_text(encoding="utf-8") != self.baseline, "exists": True}
+
+            def external_disk_identity(self) -> str:
+                return "test-disk-domain"
+
+            def reload(self) -> dict[str, object]:
+                self.baseline = self.path.read_text(encoding="utf-8")
+                self.revision += 1
+                return self.snapshot()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_file = root / "core-state.json"
+            source = root / "language.json"
+            source.write_text('{"choice": "system"}', encoding="utf-8")
+            core = CoreStore(metadata_path=state_file, domains=[DiskDomain(source)])
+            self.assertEqual(0, core.revision)
+
+            source.write_text('{"choice": "en"}', encoding="utf-8")
+            core.snapshot()
+
+            revision = core.revision
+            self.assertEqual(1, revision)
+            self.assertEqual(revision, AtomicJSONStore(state_file).read()["revision"])
+            replacement = CoreStore(metadata_path=state_file, domains=[MemoryDomain("language", {"choice": "en"})])
+            self.assertEqual(revision, replacement.revision)
+
+    def test_core_metadata_keeps_the_revision_monotonic_for_a_replacement_core(self) -> None:
+        """A host-driven Core replacement must not restart the shared revision."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "core-state.json"
+            first = CoreStore(metadata_path=state_file, domains=[MemoryDomain("language", {"choice": "system"})])
+            first.dispatch({"domain": "language", "type": "set", "payload": {"choice": "en"}})
+            first.apply("language", revision=first.revision)
+            revision = first.revision
+            self.assertGreater(revision, 0)
+
+            replacement = CoreStore(metadata_path=state_file, domains=[MemoryDomain("language", {"choice": "en"})])
+            self.assertEqual(revision, replacement.revision)
+            # The replacement keeps answering with the continued revision, so a
+            # window that observed the previous Core still sees newer snapshots.
+            self.assertEqual(revision, replacement.snapshot()["revision"])
+            self.assertEqual(revision + 1, replacement.dispatch({"domain": "language", "type": "set", "payload": {"choice": "system"}})["revision"])
+
     def test_reverting_a_draft_to_its_baseline_clears_dirty_state(self) -> None:
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
 
@@ -1778,6 +1857,9 @@ class CoreIPCTests(unittest.TestCase):
 
             self.assertTrue(result["applied"])
             self.assertEqual("applied", result["status"])
+            # The restart is a background task now; wait for it so the
+            # controller call list is complete.
+            self.assertTrue(core.wait_for_service_reload(5.0))
             self.assertEqual(["reload"], reloads)
             self.assertIn("renamed", config_path.read_text(encoding="utf-8"))
 

@@ -574,6 +574,7 @@ private enum NativeRelayOriginPolicy {
     func showGroupManager(
         title: String,
         accountLabel: String,
+        accountID: String,
         groups: [[String: String]],
         keys: [[String: String]],
         labels: [String: String],
@@ -585,6 +586,7 @@ private enum NativeRelayOriginPolicy {
                 self?.showGroupManager(
                     title: title,
                     accountLabel: accountLabel,
+                    accountID: accountID,
                     groups: groups,
                     keys: keys,
                     labels: labels,
@@ -596,7 +598,9 @@ private enum NativeRelayOriginPolicy {
         }
         let options = groups.compactMap { entry -> NativeGroupManagerController.GroupOption? in
             guard let id = entry["id"], let label = entry["label"], !label.isEmpty else { return nil }
-            return NativeGroupManagerController.GroupOption(id: id, label: label)
+            let name = entry["name"].flatMap { $0.isEmpty ? nil : $0 } ?? label
+            let rate = entry["rate"] ?? ""
+            return NativeGroupManagerController.GroupOption(id: id, label: label, name: name, rate: rate)
         }
         let rows = keys.compactMap { entry -> NativeGroupManagerController.KeyRow? in
             guard let id = entry["id"], let name = entry["name"] else { return nil }
@@ -608,6 +612,8 @@ private enum NativeRelayOriginPolicy {
                 groupID: groupID,
                 groupLabel: entry["groupLabel"] ?? groupID,
                 multiplier: entry["multiplier"] ?? "",
+                hint: entry["hint"] ?? "",
+                modelNames: (entry["models"] ?? "").split(separator: "\n").map(String.init),
                 originalName: name,
                 originalGroupID: groupID,
                 originalEnabled: enabled,
@@ -623,6 +629,7 @@ private enum NativeRelayOriginPolicy {
         let controller = NativeGroupManagerController(
             title: title,
             accountLabel: accountLabel,
+            accountID: accountID,
             groups: options,
             rows: rows,
             labels: labels,
@@ -1915,6 +1922,79 @@ private final class NativeListFrameView: NSView {
     }
 }
 
+/// The 模型列表 view: the selected key's models, one aligned line each, in the
+/// detail column.  The sheet sizes it for the longest list it shows, and the
+/// persistent scroller takes over when the list is taller than that.
+private final class NativeModelsListView: NSScrollView {
+    private let textView = NSTextView(frame: .zero)
+    private let emptyText: String
+    private var models: [String] = []
+
+    init(font: NSFont, emptyText: String) {
+        self.emptyText = emptyText
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        drawsBackground = false
+        borderType = .noBorder
+        hasVerticalScroller = true
+        autohidesScrollers = true
+        // Overlay: the scroller floats over the list instead of reserving a
+        // gutter, so rows keep the full list width.
+        scrollerStyle = .overlay
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.isRichText = false
+        textView.usesFontPanel = false
+        textView.usesFindPanel = false
+        textView.font = font
+        textView.textColor = .labelColor
+        textView.textContainerInset = NSSize(width: 0, height: 0)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        documentView = textView
+        usePersistentScrollers(horizontal: false, vertical: true)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    /// One model per line, in the station's order; an empty list states that
+    /// the key provides none.
+    func setModels(_ names: [String]) {
+        models = names
+        textView.string = names.isEmpty ? emptyText : names.joined(separator: "\n")
+        textView.textColor = names.isEmpty ? .secondaryLabelColor : .labelColor
+        refitDocument()
+    }
+
+    /// The text view grows with its text so the scroll view scrolls the list
+    /// instead of clipping it.
+    private func refitDocument() {
+        guard let container = textView.textContainer, let layout = textView.layoutManager else { return }
+        layout.ensureLayout(for: container)
+        let used = layout.usedRect(for: container).height
+        textView.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: max(1, contentSize.width),
+            height: max(used + textView.textContainerInset.height * 2, contentSize.height)
+        )
+    }
+
+    override func layout() {
+        super.layout()
+        usePersistentScrollers(horizontal: false, vertical: true)
+        if abs(textView.frame.width - contentSize.width) > 0.5 { refitDocument() }
+    }
+}
+
 /// Result of the native group manager sheet: the auto-grouping switch plus the
 /// key edits the user staged in the master-detail editor.
 struct NativeGroupManagerResult {
@@ -1959,7 +2039,12 @@ private func groupManagerHeaderTitle(_ title: String) -> NSAttributedString {
 private final class NativeGroupManagerController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     struct GroupOption {
         let id: String
+        /// Picker title: the group name alone.
         let label: String
+        /// List column title: the group name alone.
+        let name: String
+        /// The group's rate, as the shared UI formats it (倍率, or empty).
+        let rate: String
     }
 
     struct KeyRow {
@@ -1968,6 +2053,10 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         var groupID: String
         var groupLabel: String
         var multiplier: String
+        /// Core's credential-presence sentinel: non-empty means the key exists.
+        let hint: String
+        /// The models the station reports for the key, in its own order.
+        let modelNames: [String]
         let originalName: String
         let originalGroupID: String
         let originalEnabled: Bool
@@ -1978,12 +2067,23 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
 
     private let title: String
     private let accountLabel: String
+    /// The account that owns the keys; the copy action names it as the secret target.
+    private let accountID: String
     private let groups: [GroupOption]
     private var rows: [KeyRow]
     private let labels: [String: String]
     private let initialAutoGrouping: Bool
     private var syncingSelection = false
     private var applied = false
+    private var copyStatusToken = 0
+    ///
+    /// Plaintext keys the sheet already revealed while it is open, keyed by
+    /// key id.  Core's lease is read-once, so a re-selection reuses what the
+    /// sheet already read instead of asking for another one, and the values
+    /// are dropped with the controller when the sheet ends.
+    private var revealedKeys: [String: String] = [:]
+    /// Distinguishes the newest reveal from a reply for an earlier selection.
+    private var revealToken = 0
 
     private weak var panel: NSPanel?
     private weak var table: NSTableView?
@@ -1992,6 +2092,11 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     private weak var enabledCheckbox: NSButton?
     private weak var nameField: NSTextField?
     private weak var groupPopUp: NSPopUpButton?
+    private weak var multiplierField: NSTextField?
+    private weak var valueField: NSTextField?
+    private weak var modelsList: NativeModelsListView?
+    private weak var copyButton: NSButton?
+    private weak var copyStatusField: NSTextField?
     private weak var toggle: NSButton?
 
     /// Save and Close stays disabled until the draft would change the account:
@@ -2014,24 +2119,24 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         }
     }
 
-    /// Group names the account still offers, keyed by group id, so a key that
-    /// points at a dropped group reports 未分组 instead of echoing a stale name.
+    /// Group names the account still offers, keyed by group id, so the list's
+    /// group column names the group while its 倍率 column carries the rate.
     private lazy var currentGroupNames: [String: String] = {
         var names: [String: String] = [:]
-        for group in groups where !group.id.isEmpty { names[group.id] = group.label }
+        for group in groups where !group.id.isEmpty { names[group.id] = group.name }
         return names
     }()
 
-    /// The multiplier column follows the group the key belongs to right now.
-    /// It stays empty while 自动分组 owns the layout: the group name already
-    /// carries the rate, and the alignment step owns every key anyway.
-    private func presentation(for row: KeyRow) -> (value: String, isStaged: Bool) {
-        // The switch gates every manual write, so a draft delete or create can
-        // only be staged while it is off.
-        if autoGroupingOn { return (value: "", isStaged: false) }
-        if row.deleted { return (label("deletedLabel"), true) }
-        if row.isDraft { return (label("draftLabel"), true) }
-        return (multiplierText(for: row), false)
+    /// The 倍率 column reports the rate the row costs right now, on the same
+    /// terms whether or not 自动分组 owns the layout; 倍率 carries a rate and
+    /// nothing else, so a staged create or delete dims the row instead.
+    private func presentation(for row: KeyRow) -> String {
+        multiplierText(for: row)
+    }
+
+    /// A row the draft will create or delete; the list shows it dimmed.
+    private func isStaged(_ row: KeyRow) -> Bool {
+        row.deleted || row.isDraft
     }
 
     /// 未分组 when the key has no group the store still offers; otherwise the
@@ -2042,16 +2147,18 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         return row.groupLabel.isEmpty ? label("ungroupedLabel") : row.groupLabel
     }
 
+    /// The key's rate while it belongs to a group the store still offers.  An
+    /// ungrouped key has no rate to report, and the group column already names
+    /// it, so the cell stays empty instead of repeating 未分组.
     private func multiplierText(for row: KeyRow) -> String {
-        guard !row.groupID.isEmpty, currentGroupNames[row.groupID] != nil else {
-            return label("ungroupedLabel")
-        }
+        guard !row.groupID.isEmpty, currentGroupNames[row.groupID] != nil else { return "" }
         return row.multiplier
     }
 
-    init(title: String, accountLabel: String, groups: [GroupOption], rows: [KeyRow], labels: [String: String], autoGrouping: Bool) {
+    init(title: String, accountLabel: String, accountID: String, groups: [GroupOption], rows: [KeyRow], labels: [String: String], autoGrouping: Bool) {
         self.title = title
         self.accountLabel = accountLabel
+        self.accountID = accountID
         self.groups = groups
         self.rows = rows
         self.labels = labels
@@ -2063,8 +2170,15 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         return value.isEmpty ? fallback : value
     }
 
+    /// The name-only group label a list row falls back to (the picker title in
+    /// `groupLabel(_:)` above is the same group with its rate appended).
     private func groupLabel(for groupID: String) -> String {
-        groups.first(where: { $0.id == groupID })?.label ?? groupID
+        groups.first(where: { $0.id == groupID })?.name ?? groupID
+    }
+
+    /// The group's rate, so a re-grouped key reports the rate it now costs.
+    private func groupRate(for groupID: String) -> String {
+        groups.first(where: { $0.id == groupID })?.rate ?? ""
     }
 
     private func selectedGroupID(from popUp: NSPopUpButton?) -> String? {
@@ -2104,8 +2218,11 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // Left column: the key list with the ＋ / － toolbar.
         let listTitle = NSTextField(labelWithString: label("listLabel"))
         listTitle.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        // ± ride the list header as the app's compact icon buttons do: one
+        // square small control each, four points apart.
         let removeButton = NSButton(title: "", target: self, action: #selector(removeSelectedKey(_:)))
         removeButton.bezelStyle = .rounded
+        removeButton.controlSize = .small
         removeButton.image = NSImage(named: NSImage.removeTemplateName)
         removeButton.imagePosition = .imageOnly
         removeButton.toolTip = label("removeLabel")
@@ -2113,6 +2230,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         self.removeButton = removeButton
         let addButton = NSButton(title: "", target: self, action: #selector(addDraftKey(_:)))
         addButton.bezelStyle = .rounded
+        addButton.controlSize = .small
         addButton.image = NSImage(named: NSImage.addTemplateName)
         addButton.imagePosition = .imageOnly
         addButton.toolTip = label("addLabel")
@@ -2124,7 +2242,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
-        scrollView.scrollerStyle = .legacy
+        // Overlay: the shared capsule floats over the key list instead of
+        // reserving a legacy gutter.
+        scrollView.scrollerStyle = .overlay
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
         scrollView.usePersistentScrollers(horizontal: false, vertical: true)
@@ -2174,35 +2294,93 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         listFrame.addSubview(scrollView)
 
-        // Right column: the selected key.
+        // Right column: the selected key reports one fact per row, so the
+        // detail pane is never a half-filled form: the group's rate, the
+        // station's key with its copy action, and the models the key provides.
+        let detailFont = NSFont.systemFont(ofSize: nativeUIFontSize)
+        let detailCaptions = [label("nameLabel"), label("groupLabel"), label("multiplierLabel"), label("valueLabel")]
+        let detailCaptionWidth = max(44, detailCaptions.map {
+            ($0 as NSString).size(withAttributes: [.font: detailFont]).width.rounded(.up) + 2
+        }.max() ?? 44)
+        func detailCaption(_ text: String) -> NSTextField {
+            let field = NSTextField(labelWithString: text)
+            field.font = detailFont
+            field.textColor = .secondaryLabelColor
+            field.lineBreakMode = .byTruncatingTail
+            field.maximumNumberOfLines = 1
+            return field
+        }
+        func detailValue() -> NSTextField {
+            let field = NSTextField(labelWithString: "")
+            field.font = detailFont
+            field.textColor = .labelColor
+            field.lineBreakMode = .byTruncatingMiddle
+            field.maximumNumberOfLines = 1
+            return field
+        }
         let enabledCheckbox = NSButton(checkboxWithTitle: label("enabledLabel"), target: self, action: #selector(toggleSelectedEnabled(_:)))
-        enabledCheckbox.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        enabledCheckbox.font = detailFont
         self.enabledCheckbox = enabledCheckbox
-        let nameLabel = NSTextField(labelWithString: label("nameLabel"))
-        nameLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize)
-        nameLabel.textColor = .secondaryLabelColor
+        let nameLabel = detailCaption(label("nameLabel"))
         let nameField = NSTextField(string: "")
-        nameField.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        nameField.font = detailFont
         nameField.delegate = self
         nameField.target = self
         nameField.action = #selector(commitNameField(_:))
         nameField.setAccessibilityLabel(label("nameLabel"))
         self.nameField = nameField
-        let groupFieldLabel = NSTextField(labelWithString: label("groupLabel"))
-        groupFieldLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize)
-        groupFieldLabel.textColor = .secondaryLabelColor
+        let groupFieldLabel = detailCaption(label("groupLabel"))
         let groupPopUp = NSPopUpButton(frame: .zero, pullsDown: false)
-        groupPopUp.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        groupPopUp.font = detailFont
         groupPopUp.addItems(withTitles: groups.map { $0.label })
         groupPopUp.target = self
         groupPopUp.action = #selector(changeSelectedGroup(_:))
         groupPopUp.setAccessibilityLabel(label("groupLabel"))
         self.groupPopUp = groupPopUp
-        let hint = NSTextField(labelWithString: label("hint"))
-        hint.font = NSFont.systemFont(ofSize: nativeUIFontSize)
-        hint.textColor = .secondaryLabelColor
-        hint.lineBreakMode = .byWordWrapping
-        hint.maximumNumberOfLines = 3
+        let multiplierLabel = detailCaption(label("multiplierLabel"))
+        let multiplierField = detailValue()
+        multiplierField.setAccessibilityLabel(label("multiplierLabel"))
+        self.multiplierField = multiplierField
+        let valueLabel = detailCaption(label("valueLabel"))
+        let valueField = detailValue()
+        // 密钥值 stays one line: a station key is one long token, so it shows
+        // its head, an ellipsis, and its tail instead of reflowing the rows
+        // below it.  The field still holds the whole value, so selecting it or
+        // pressing 复制 hands over the key itself.
+        valueField.lineBreakMode = .byTruncatingMiddle
+        valueField.maximumNumberOfLines = 1
+        valueField.isSelectable = true
+        valueField.setAccessibilityLabel(label("valueLabel"))
+        self.valueField = valueField
+        let copyButton = NSButton(title: label("copyActionLabel"), target: self, action: #selector(copySelectedKey(_:)))
+        copyButton.bezelStyle = .rounded
+        copyButton.font = detailFont
+        copyButton.controlSize = .small
+        copyButton.toolTip = label("copyLabel")
+        copyButton.setAccessibilityLabel(label("copyLabel"))
+        self.copyButton = copyButton
+        // The copy action owns a fixed slice of its row, so the key (and the
+        // models) always wrap beside it instead of squeezing it to nothing.
+        copyButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        copyButton.setContentHuggingPriority(.required, for: .horizontal)
+        for field in [valueField] {
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        }
+        // 模型列表 sits in the detail column under the key's own facts: one
+        // aligned line per model, sized for the longest list any key carries so
+        // switching groups never resizes the sheet.
+        let modelRows = max(3, min(12, rows.map { $0.modelNames.count }.max() ?? 0))
+        let modelsTitle = NSTextField(labelWithString: label("modelsLabel"))
+        modelsTitle.font = NSFont.systemFont(ofSize: nativeUIFontSize, weight: .semibold)
+        let modelsList = NativeModelsListView(font: detailFont, emptyText: label("emptyLabel"))
+        self.modelsList = modelsList
+        let copyStatus = NSTextField(labelWithString: "")
+        copyStatus.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        copyStatus.textColor = .secondaryLabelColor
+        copyStatus.lineBreakMode = .byTruncatingTail
+        copyStatus.maximumNumberOfLines = 1
+        self.copyStatusField = copyStatus
 
         let toggle = NSButton(checkboxWithTitle: label("autoGroupingLabel"), target: self, action: #selector(toggleAutoGrouping(_:)))
         toggle.font = NSFont.systemFont(ofSize: nativeUIFontSize)
@@ -2219,11 +2397,14 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         applyButton.isEnabled = false
         self.applyButton = applyButton
 
-        [titleLabel, accountField, listTitle, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, hint, toggle, closeButton, applyButton].forEach {
+        [titleLabel, accountField, listTitle, addButton, removeButton, listFrame, enabledCheckbox, nameLabel, nameField, groupFieldLabel, groupPopUp, multiplierLabel, multiplierField, valueLabel, valueField, copyButton, copyStatus, modelsTitle, modelsList, toggle, closeButton, applyButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview($0)
         }
         NSLayoutConstraint.activate([
+            // The sheet keeps its own width: a long key or model list wraps in
+            // its row instead of stretching the window to fit the text.
+            content.widthAnchor.constraint(equalToConstant: 780),
             titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             titleLabel.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
@@ -2232,12 +2413,14 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             accountField.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 4),
             listTitle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             listTitle.topAnchor.constraint(equalTo: accountField.bottomAnchor, constant: 12),
-            removeButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            // 密钥's ＋ / － actions belong to the key list, so they end at the
+            // list's own edge instead of the sheet's.
+            removeButton.trailingAnchor.constraint(equalTo: listFrame.trailingAnchor),
             removeButton.centerYAnchor.constraint(equalTo: listTitle.centerYAnchor),
-            removeButton.widthAnchor.constraint(equalToConstant: 26),
-            addButton.trailingAnchor.constraint(equalTo: removeButton.leadingAnchor, constant: -6),
+            removeButton.widthAnchor.constraint(equalToConstant: 22),
+            addButton.trailingAnchor.constraint(equalTo: removeButton.leadingAnchor, constant: -4),
             addButton.centerYAnchor.constraint(equalTo: listTitle.centerYAnchor),
-            addButton.widthAnchor.constraint(equalToConstant: 26),
+            addButton.widthAnchor.constraint(equalToConstant: 22),
             listFrame.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             listFrame.topAnchor.constraint(equalTo: listTitle.bottomAnchor, constant: 6),
             listFrame.widthAnchor.constraint(equalToConstant: 344),
@@ -2250,19 +2433,49 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             enabledCheckbox.topAnchor.constraint(equalTo: listFrame.topAnchor),
             nameLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             nameLabel.topAnchor.constraint(equalTo: enabledCheckbox.bottomAnchor, constant: 12),
-            nameLabel.widthAnchor.constraint(equalToConstant: 44),
+            nameLabel.widthAnchor.constraint(equalToConstant: detailCaptionWidth),
             nameField.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 8),
             nameField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             nameField.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
             groupFieldLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
             groupFieldLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 10),
-            groupFieldLabel.widthAnchor.constraint(equalToConstant: 44),
+            groupFieldLabel.widthAnchor.constraint(equalToConstant: detailCaptionWidth),
             groupPopUp.leadingAnchor.constraint(equalTo: groupFieldLabel.trailingAnchor, constant: 8),
             groupPopUp.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             groupPopUp.centerYAnchor.constraint(equalTo: groupFieldLabel.centerYAnchor),
-            hint.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
-            hint.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            hint.topAnchor.constraint(equalTo: groupFieldLabel.bottomAnchor, constant: 14),
+            multiplierLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
+            multiplierLabel.topAnchor.constraint(equalTo: groupFieldLabel.bottomAnchor, constant: 10),
+            multiplierLabel.widthAnchor.constraint(equalToConstant: detailCaptionWidth),
+            multiplierField.leadingAnchor.constraint(equalTo: multiplierLabel.trailingAnchor, constant: 8),
+            multiplierField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            multiplierField.centerYAnchor.constraint(equalTo: multiplierLabel.centerYAnchor),
+            valueLabel.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
+            valueLabel.topAnchor.constraint(equalTo: multiplierLabel.bottomAnchor, constant: 10),
+            valueLabel.widthAnchor.constraint(equalToConstant: detailCaptionWidth),
+            valueField.leadingAnchor.constraint(equalTo: valueLabel.trailingAnchor, constant: 8),
+            // Both detail lists wrap from their caption's top line, so each row
+            // grows down and the rows below it stay clear of the text.
+            valueField.topAnchor.constraint(equalTo: valueLabel.topAnchor, constant: 1),
+            copyButton.leadingAnchor.constraint(equalTo: valueField.trailingAnchor, constant: 6),
+            copyButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            copyButton.centerYAnchor.constraint(equalTo: valueField.centerYAnchor),
+            // 模型列表 takes the detail column's width under the key's facts;
+            // the list scrolls when the station reports more models than the
+            // sheet shows at once.
+            modelsTitle.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
+            modelsTitle.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            modelsTitle.topAnchor.constraint(equalTo: valueField.bottomAnchor, constant: 10),
+            modelsList.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
+            modelsList.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            modelsList.topAnchor.constraint(equalTo: modelsTitle.bottomAnchor, constant: 6),
+            modelsList.heightAnchor.constraint(equalToConstant: CGFloat(modelRows) * 17),
+            copyStatus.leadingAnchor.constraint(equalTo: enabledCheckbox.leadingAnchor),
+            copyStatus.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            copyStatus.topAnchor.constraint(equalTo: modelsList.bottomAnchor, constant: 12),
+            // The detail column's last line is the copy result; it ends above
+            // the footer, and the sheet grows to fit the rows it carries (the
+            // key list stretches with it).
+            copyStatus.bottomAnchor.constraint(equalTo: toggle.topAnchor, constant: -14),
             toggle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             toggle.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
             applyButton.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
@@ -2270,9 +2483,29 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             closeButton.trailingAnchor.constraint(equalTo: applyButton.leadingAnchor, constant: -8),
             closeButton.centerYAnchor.constraint(equalTo: toggle.centerYAnchor),
         ])
+        // The sheet fits the longer of the key list and the detail column, so
+        // a three-key account still shows every detail row.  The fit is
+        // reapplied once a selection loads its wrapped rows.
+        fitSheetToContent()
+        // The selection drives the detail column, so the sheet opens on the
+        // first key instead of a blank form.
+        if !rows.isEmpty {
+            table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        }
         loadDetail()
         refreshApplyButton()
         return panel
+    }
+
+    /// The sheet fits the longer of the key list and the detail column, so a
+    /// short key list still shows every detail row.  A loaded selection adds
+    /// the 模型列表 grid, so the fit is reapplied whenever the rows load.
+    private func fitSheetToContent() {
+        guard let panel, let content = panel.contentView else { return }
+        let minimumHeight = min(content.fittingSize.height, 900)
+        if minimumHeight > content.frame.height {
+            panel.setContentSize(NSSize(width: content.frame.width, height: minimumHeight))
+        }
     }
 
     /// The detail pane follows the list selection and the auto-grouping switch.
@@ -2281,14 +2514,29 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let index = table.selectedRow
         let hasRow = index >= 0 && index < rows.count
         let editable = editingEnabled && hasRow
-        addButton?.isEnabled = editingEnabled && !groups.isEmpty
+        // The list header keeps only the ＋ / － it can perform: no group to
+        // place a key in, or no selected key, hides the control instead of
+        // greying it out.
+        let canAddKey = editingEnabled && !groups.isEmpty
+        addButton?.isEnabled = canAddKey
+        addButton?.isHidden = !canAddKey
         removeButton?.isEnabled = editable
+        removeButton?.isHidden = !editable
         enabledCheckbox?.isEnabled = editable
         nameField?.isEnabled = editable
         groupPopUp?.isEnabled = editable && !groups.isEmpty
+        let empty = label("emptyLabel")
         guard hasRow else {
             enabledCheckbox?.state = .off
             nameField?.stringValue = ""
+            multiplierField?.stringValue = empty
+            // A reply for the previous selection must not land on an empty row.
+            revealToken += 1
+            valueField?.stringValue = empty
+            valueField?.toolTip = nil
+            modelsList?.setModels([])
+            copyButton?.isEnabled = false
+            showCopyStatus("")
             syncingSelection = true
             groupPopUp?.selectItem(at: -1)
             syncingSelection = false
@@ -2296,6 +2544,11 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         }
         let row = rows[index]
         enabledCheckbox?.state = row.enabled ? .on : .off
+        multiplierField?.stringValue = row.multiplier.isEmpty ? empty : row.multiplier
+        multiplierField?.toolTip = row.multiplier.isEmpty ? nil : row.multiplier
+        revealSelectedKey(row)
+        modelsList?.setModels(row.modelNames)
+        copyButton?.isEnabled = canCopy(row)
         nameField?.stringValue = row.name
         syncingSelection = true
         if let groupIndex = groups.firstIndex(where: { $0.id == row.groupID }) {
@@ -2304,6 +2557,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             groupPopUp?.selectItem(at: -1)
         }
         syncingSelection = false
+        fitSheetToContent()
     }
 
     private func reloadAndSelect(_ index: Int) {
@@ -2352,7 +2606,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             name: name,
             groupID: groupID,
             groupLabel: groupLabel(for: groupID),
-            multiplier: "",
+            multiplier: groupRate(for: groupID),
+            hint: "",
+            modelNames: [],
             originalName: "",
             originalGroupID: groupID,
             originalEnabled: true,
@@ -2392,7 +2648,113 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         guard let groupID = selectedGroupID(from: sender) else { return }
         rows[index].groupID = groupID
         rows[index].groupLabel = groupLabel(for: groupID)
+        // Re-grouping changes what the key costs, so 倍率 follows the choice.
+        rows[index].multiplier = groupRate(for: groupID)
         reloadAndSelect(index)
+    }
+
+    /// The key id of the current selection, or nil while nothing is selected.
+    private var selectedRowID: String? {
+        guard let table else { return nil }
+        let index = table.selectedRow
+        guard index >= 0, index < rows.count else { return nil }
+        return rows[index].id
+    }
+
+    /// Show the selected key in plaintext.  The value is read through Core's
+    /// native capability and stays in this sheet: React never receives it.  A
+    /// draft key has no key on the station yet, and a key whose read fails
+    /// keeps stating the state the presence sentinel reports.
+    private func revealSelectedKey(_ row: KeyRow) {
+        valueField?.toolTip = nil
+        guard canCopy(row) else {
+            valueField?.stringValue = row.hint.isEmpty ? label("emptyLabel") : label("savedLabel")
+            return
+        }
+        if let revealed = revealedKeys[row.id] {
+            valueField?.stringValue = revealed
+            return
+        }
+        // The row states the key's presence until Core answers with the value.
+        valueField?.stringValue = label("savedLabel")
+        revealToken += 1
+        let token = revealToken
+        let keyID = row.id
+        let target = "\(accountID):\(keyID)"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let value = try? CoreIPCBridge.shared.readPlainTextSecret(
+                domain: "relay_accounts",
+                field: "api_key",
+                target: target
+            )
+            DispatchQueue.main.async {
+                guard let self, let value, !value.isEmpty else { return }
+                self.revealedKeys[keyID] = value
+                guard self.revealToken == token, self.selectedRowID == keyID else { return }
+                self.valueField?.stringValue = value
+                // A wrapped key makes the detail column taller than the panel
+                // was sized for, so the sheet takes the height it now needs.
+                self.fitSheetToContent()
+            }
+        }
+    }
+
+    /// A key can only be revealed or copied while the station still holds it.
+    private func canCopy(_ row: KeyRow) -> Bool {
+        !row.hint.isEmpty && !row.isDraft && !row.id.isEmpty
+    }
+
+    /// Copy the selected key through Core's plaintext capability — the same
+    /// target the provider workspace uses — and report the outcome in place.
+    @objc private func copySelectedKey(_ sender: NSButton) {
+        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
+        let row = rows[index]
+        guard canCopy(row) else { return }
+        // A key the sheet already revealed copies from what it holds, so the
+        // read-once lease is not spent twice on the same key.
+        if let revealed = revealedKeys[row.id] {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            let copied = pasteboard.setString(revealed, forType: .string)
+            copyButton?.isEnabled = canCopy(row)
+            showCopyStatus(copied ? label("copiedLabel") : label("failedLabel"))
+            return
+        }
+        let target = "\(accountID):\(row.id)"
+        copyButton?.isEnabled = false
+        showCopyStatus("")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let value = try? CoreIPCBridge.shared.readPlainTextSecret(
+                domain: "relay_accounts",
+                field: "api_key",
+                target: target
+            )
+            DispatchQueue.main.async {
+                guard let self else { return }
+                var copied = false
+                if let value, !value.isEmpty {
+                    self.revealedKeys[row.id] = value
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    copied = pasteboard.setString(value, forType: .string)
+                }
+                self.copyButton?.isEnabled = self.canCopy(row)
+                self.showCopyStatus(copied ? self.label("copiedLabel") : self.label("failedLabel"))
+            }
+        }
+    }
+
+    /// Show one transient line under the detail rows; a later action replaces
+    /// it and only the newest message clears itself.
+    private func showCopyStatus(_ message: String) {
+        copyStatusField?.stringValue = message
+        copyStatusToken += 1
+        guard !message.isEmpty else { return }
+        let token = copyStatusToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.copyStatusToken == token else { return }
+            self.copyStatusField?.stringValue = ""
+        }
     }
 
     @objc private func toggleAutoGrouping(_ sender: NSButton) {
@@ -2407,13 +2769,27 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         refreshApplyButton()
     }
 
-    /// Close discards the draft, but a sheet the user never touched closes
-    /// without a pointless verification round-trip in the shared UI.
+    /// Close discards the draft, so a sheet that would lose edits asks first; a
+    /// sheet the user never touched closes straight away.
     @objc private func closeSheet(_ sender: NSButton) {
+        guard confirmDiscardIfNeeded() else { return }
         applied = false
         if let panel, let parent = panel.sheetParent {
             parent.endSheet(panel)
         }
+    }
+
+    /// Confirm a Close that would drop staged edits.  The native alert owns the
+    /// copy so the decision is visible regardless of the shared UI's state.
+    private func confirmDiscardIfNeeded() -> Bool {
+        guard hasStagedChanges else { return true }
+        let title = label("discardTitle")
+        let message = label("discardBody")
+        return AppKitNativeLeaf.shared.confirm(
+            title: title,
+            message: message,
+            confirmTitle: label("discardConfirm")
+        )
     }
 
     @objc private func applySheet(_ sender: NSButton) {
@@ -2450,17 +2826,15 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         guard row >= 0 && row < rows.count else { return nil }
         let entry = rows[row]
         let columnID = tableColumn?.identifier.rawValue ?? "key-name"
-        let isName = columnID == "key-name"
         let value: String
-        var staged = false
-        if isName {
+        if columnID == "key-name" {
             value = entry.name
         } else if columnID == "key-group" {
             // A key can point at a group the station no longer offers; report it
             // the same way the rest of the window does.
             value = currentGroupText(for: entry)
         } else {
-            (value, staged) = presentation(for: entry)
+            value = presentation(for: entry)
         }
         let identifier = NSUserInterfaceItemIdentifier("group-manager-\(columnID)")
         let cell: NSTableCellView
@@ -2488,9 +2862,10 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         let text = cell.textField
         text?.stringValue = value
         text?.toolTip = value
-        // Only a staged draft edit dims a row; 自动分组 keeps the list at full
-        // label colors because it reports what the store already holds.
-        text?.textColor = staged ? .tertiaryLabelColor : (isName ? .labelColor : .secondaryLabelColor)
+        // The list reports the store as it stands: every column keeps the full
+        // label color, and a row the draft will create or delete is dimmed —
+        // no column carries status text.
+        text?.textColor = isStaged(entry) ? .secondaryLabelColor : .labelColor
         cell.setAccessibilityLabel(value)
         return cell
     }
@@ -2520,15 +2895,18 @@ final class NativeSplitView: NSSplitView {
 
 /// A scroller this app keeps on screen while its content overflows, drawn the
 /// way the system draws its overlay scroller: one translucent capsule knob and
-/// no track, so the row or cell underneath stays readable.  AppKit's legacy
-/// scroller is an opaque bar with a visible track, and the overlay scroller
-/// fades out again as soon as scrolling stops, so the persistent scroller needs
-/// its own drawing.  ObjC hosts (`AppKitControlViews.mm`) instantiate this class
-/// through the Swift header; only the parts-drawing methods are customized, so
-/// AppKit keeps owning the knob tracking and the scroll view keeps owning the
-/// scroller's target/action wiring.
-/// The ObjC hosts instantiate this class through the generated Swift header,
-/// so it must be public to appear in `YoungRouter-Swift.h`.
+/// no track, so the row or cell underneath stays readable.
+///
+/// AppKit's own overlay scroller fades out as soon as scrolling stops, and a
+/// custom `NSScroller` subclass cannot take the overlay style at all - AppKit
+/// tiles such a scroller as a legacy bar in its own gutter.  The hosts
+/// therefore keep the legacy style (so this class draws the knob) and float the
+/// scroller over the content themselves
+/// (`FloatPersistentScrollerOverContent` in `AppKitControlViews.mm` and
+/// `floatOverContent()` below), which is what removes the gutter.
+///
+/// The ObjC hosts instantiate this class through the generated Swift header, so
+/// it must be public to appear in `YoungRouter-Swift.h`.
 @objc(LiteLLMPersistentScroller)
 public final class LiteLLMPersistentScroller: NSScroller {
     private static let knobThickness: CGFloat = 6
@@ -2555,24 +2933,24 @@ public final class LiteLLMPersistentScroller: NSScroller {
     }
 }
 
+/// Keep the platform overlay scroller on screen while the content overflows.
+/// A custom NSScroller subclass cannot take the overlay style - AppKit tiles it
+/// as a legacy bar in its own gutter - so the floating, translucent platform
+/// scroller is what the app keeps.
 extension NSScrollView {
     /// Draw the scrollers this scroll view keeps visible with
-    /// `LiteLLMPersistentScroller` instead of AppKit's opaque legacy bar, and
-    /// unhide them (AppKit leaves a scroller it hid while idle hidden until the
-    /// next scroll event).  AppKit rebuilds a scroller whenever a scroller flag
-    /// flips back on, so callers run this from their layout path.
+    /// `LiteLLMPersistentScroller` instead of AppKit's opaque legacy bar, unhide
+    /// them (AppKit leaves a scroller it hid while idle hidden until the next
+    /// scroll event), and float them over the content instead of the gutter
+    /// AppKit tiles for a legacy scroller.  AppKit rebuilds a scroller whenever
+    /// a scroller flag flips back on, so callers run this from their layout
+    /// path.
     func usePersistentScrollers(horizontal: Bool, vertical: Bool) {
-        var installed = false
         if horizontal, hasHorizontalScroller, !(horizontalScroller is LiteLLMPersistentScroller) {
             horizontalScroller = LiteLLMPersistentScroller(frame: .zero)
-            installed = true
         }
         if vertical, hasVerticalScroller, !(verticalScroller is LiteLLMPersistentScroller) {
             verticalScroller = LiteLLMPersistentScroller(frame: .zero)
-            installed = true
-        }
-        if installed {
-            tile()
         }
         if horizontal, hasHorizontalScroller {
             horizontalScroller?.isHidden = false
@@ -2581,6 +2959,34 @@ extension NSScrollView {
         if vertical, hasVerticalScroller {
             verticalScroller?.isHidden = false
             verticalScroller?.alphaValue = 1
+        }
+        floatOverContent()
+    }
+
+    /// Let the clip view span the full scroll view and place the legacy
+    /// scrollers over the content's trailing edges: AppKit's legacy tiling
+    /// reserved a gutter for them, which took 15 pt off the list.
+    func floatOverContent() {
+        guard scrollerStyle == .legacy else { return }
+        let bounds = self.bounds
+        var verticalStrip: CGFloat = 0
+        if hasVerticalScroller, let scroller = verticalScroller {
+            verticalStrip = max(11, scroller.frame.width)
+            var frame = scroller.frame
+            frame.origin.x = bounds.maxX - verticalStrip
+            scroller.frame = frame
+        }
+        var horizontalStrip: CGFloat = 0
+        if hasHorizontalScroller, let scroller = horizontalScroller {
+            horizontalStrip = max(11, scroller.frame.height)
+            var frame = scroller.frame
+            frame.origin.y = isFlipped ? bounds.maxY - horizontalStrip : bounds.minY
+            scroller.frame = frame
+        }
+        let clipFrame = NSRect(x: bounds.minX, y: bounds.minY,
+                               width: bounds.width, height: bounds.height)
+        if contentView.frame != clipFrame {
+            contentView.frame = clipFrame
         }
     }
 }

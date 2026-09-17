@@ -36,7 +36,7 @@ from config_editor_core.schema import (
 
 from ...api_base import isolated_http_opener, service_root
 from ..persistence import atomic_write_text
-from ..security import REDACT_TEXT, redact
+from ..security import REDACT_TEXT, redact, safe_error_message
 from ._shared import (
     DomainError,
     _action_name,
@@ -149,6 +149,12 @@ class ProvidersModelsDomain:
         self._exists = False
         self._provider_editor_ids: dict[int, str] = {}
         self._model_editor_ids: dict[int, str] = {}
+        # Editor ids must survive every rebuild of the draft: Core reloads,
+        # rollback restores, and copies replace the mapping objects, and a
+        # regenerated id strands the RN pane (a stale provider id made deleting
+        # a new model fail with "The selected provider is unavailable").
+        self._provider_editor_keys: dict[str, str] = {}
+        self._model_editor_keys: dict[str, str] = {}
         self._cosmetic_binding = False
         self.revision = 0
         self.reload()
@@ -196,9 +202,22 @@ class ProvidersModelsDomain:
     def _editor_id(self, item: Mapping[str, Any], *, model: bool = False) -> str:
         registry = self._model_editor_ids if model else self._provider_editor_ids
         identity = id(item)
-        if identity not in registry:
-            registry[identity] = ("model-" if model else "provider-") + uuid.uuid4().hex
-        return registry[identity]
+        cached = registry.get(identity)
+        if cached is not None:
+            return cached
+        keyed = self._model_editor_keys if model else self._provider_editor_keys
+        stable_key = (
+            str(item.get("deployment_id", "")).strip().lower()
+            if model
+            else str(item.get("name", "")).strip()
+        )
+        editor_id = keyed.get(stable_key) if stable_key else None
+        if editor_id is None:
+            editor_id = ("model-" if model else "provider-") + uuid.uuid4().hex
+            if stable_key:
+                keyed[stable_key] = editor_id
+        registry[identity] = editor_id
+        return editor_id
 
     @staticmethod
     def _provider_editor_key(provider: Mapping[str, Any], index: int) -> str:
@@ -562,6 +581,8 @@ class ProvidersModelsDomain:
             "exists": self._exists,
             "provider_editor_ids": copy.deepcopy(self._provider_editor_ids),
             "model_editor_ids": copy.deepcopy(self._model_editor_ids),
+            "provider_editor_keys": copy.deepcopy(self._provider_editor_keys),
+            "model_editor_keys": copy.deepcopy(self._model_editor_keys),
             "revision": self.revision,
             "has_last_operation": has_last_operation,
             "last_operation": copy.deepcopy(getattr(self, "_last_operation", None)),
@@ -577,6 +598,8 @@ class ProvidersModelsDomain:
         self._exists = bool(checkpoint["exists"])
         self._provider_editor_ids = copy.deepcopy(checkpoint["provider_editor_ids"])
         self._model_editor_ids = copy.deepcopy(checkpoint["model_editor_ids"])
+        self._provider_editor_keys = copy.deepcopy(checkpoint.get("provider_editor_keys", {}))
+        self._model_editor_keys = copy.deepcopy(checkpoint.get("model_editor_keys", {}))
         self.revision = int(checkpoint["revision"])
         if checkpoint.get("has_last_operation"):
             self._last_operation = copy.deepcopy(checkpoint.get("last_operation"))
@@ -1719,12 +1742,16 @@ class ProvidersModelsDomain:
     ) -> dict[str, Any] | None:
         keys = self._provider_api_keys(provider)
         provider_key_id = str(model.get("provider_key_id", "")).strip()
+        key_name = str(model.get("api_key_name", "")).strip()
         if provider_key_id:
+            # A slot id can move without the user changing anything in the pane
+            # (a renamed key re-derives it when the document is read back), while
+            # the model keeps the key name.  Fall through to the name so the
+            # binding heals instead of dropping to "no key" and leaving the list
+            # out of step with the editor.
             for item in keys:
                 if item["id"] == provider_key_id:
                     return item
-            return None
-        key_name = str(model.get("api_key_name", "")).strip()
         if key_name:
             for item in keys:
                 if item["name"] == key_name:
@@ -1740,8 +1767,14 @@ class ProvidersModelsDomain:
         order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
         if order_mode not in MODEL_ORDER_MODES:
             raise DomainError("Order mode must be manual or relay_multiplier")
+        explicit_key_id = str(model.get("provider_key_id", "")).strip()
+        explicit_key_name = str(model.get("api_key_name", "")).strip()
         key = self._model_provider_key(provider, model)
-        if key is not None:
+        if key is not None and (explicit_key_id or explicit_key_name):
+            # Only a binding the editor chose is stored.  A model without one
+            # follows the provider's default key when the configuration is
+            # materialized, so a newly added model never claims a key the user
+            # did not select.
             model["provider_key_id"] = key["id"]
             model["api_key_name"] = key["name"]
         relay_selected = (
@@ -4292,6 +4325,9 @@ class ProvidersModelsDomain:
                             label="Manual route order",
                         )
                         model["order"] = model["effective_order"]
+        entry_issues = self._entry_issues(candidate_providers)
+        if entry_issues:
+            return {"valid": False, "issues": entry_issues}
         try:
             with tempfile.TemporaryDirectory(prefix="litellm-core-provider-validate-") as directory:
                 target = Path(directory) / "config.yaml"
@@ -4306,9 +4342,72 @@ class ProvidersModelsDomain:
                 config_api.save_config(candidate_providers, target, document=source)
         except DomainError:
             raise
+        except ValueError as error:
+            # ``config_editor_core.dump`` names the first unusable entry
+            # ("Model #3 is enabled but has no model_name").  Keep that detail
+            # instead of replacing it with an opaque failure.
+            detail = safe_error_message(str(error)) or "Provider/model configuration is invalid"
+            return {"valid": False, "issues": [{"path": "", "code": "invalid_settings", "message": detail, "severity": "error"}]}
         except Exception:
             return {"valid": False, "errors": ["Provider/model configuration is invalid"]}
         return {"valid": True, "errors": []}
+
+    @staticmethod
+    def _entry_issues(providers: object) -> list[dict[str, Any]]:
+        """Report every staged model that cannot produce a route entry.
+
+        The config dumper reports the first unusable entry by its position inside
+        its provider ("Model #3 is enabled but has no model_name"), which does not
+        tell the pane which provider row to open.  Report each offending model with
+        its provider label and position so the shared pane can point at the row
+        instead of only reporting that the draft is invalid.
+        """
+        issues: list[dict[str, Any]] = []
+        if not isinstance(providers, list):
+            return issues
+        for provider in providers:
+            if not isinstance(provider, Mapping):
+                continue
+            models = provider.get("models")
+            if not isinstance(models, list):
+                continue
+            provider_label = str(
+                provider.get("display_name") or provider.get("name") or ""
+            ).strip()
+            provider_enabled = bool(provider.get("enabled", True))
+            for index, model in enumerate(models):
+                if not isinstance(model, Mapping):
+                    continue
+                model_enabled = bool(
+                    model.get("model_enabled", model.get("enabled", True))
+                )
+                if not (provider_enabled and model_enabled):
+                    continue
+                location = "providers_models.{}.models[{}]".format(
+                    re.sub(r"[^A-Za-z0-9_-]+", "-", provider_label).strip("-") or "provider",
+                    index + 1,
+                )
+                if not str(model.get("model_name") or model.get("name") or "").strip():
+                    issues.append(
+                        {
+                            "path": location,
+                            "code": "model_name_required",
+                            "message": "Model needs a public model name",
+                            "severity": "error",
+                        }
+                    )
+                elif not str(
+                    model.get("litellm_model") or model.get("upstream_model") or ""
+                ).strip():
+                    issues.append(
+                        {
+                            "path": location,
+                            "code": "model_upstream_required",
+                            "message": "Model needs an upstream model",
+                            "severity": "error",
+                        }
+                    )
+        return issues
 
     def validate_relay_preflight(self, payload: object | None = None) -> dict[str, Any]:
         """Validate a linked draft before Core fetches its private key material."""

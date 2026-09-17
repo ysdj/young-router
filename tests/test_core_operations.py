@@ -956,6 +956,19 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertFalse(controller.paths.pid.exists())
             self.assertFalse(controller.paths.owner.exists())
 
+    def test_health_wait_upper_bound_matches_the_runtime_settings_schema(self) -> None:
+        from young_router.core.operations import MAX_SERVICE_HEALTH_WAIT_SECONDS
+        from young_router.core.runtime_settings_schema import runtime_settings_metadata
+
+        setting = next(
+            item
+            for item in runtime_settings_metadata()
+            if item["key"] == "LITELLM_HEALTH_WAIT_SECONDS"
+        )
+        # The start/restart health loop must honor the documented range; a
+        # narrower hardcoded cap made every value above the cap redundant.
+        self.assertEqual(float(setting["maximum"]), MAX_SERVICE_HEALTH_WAIT_SECONDS)
+
     def test_start_recovers_a_recorded_zombie_proxy_without_a_listener(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)

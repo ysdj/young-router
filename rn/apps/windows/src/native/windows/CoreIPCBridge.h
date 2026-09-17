@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -88,7 +89,8 @@ class CoreIPCBridge {
       std::optional<std::string> const& cookie,
       std::optional<std::string> const& access_token,
       std::optional<std::string> const& refresh_token);
-  void SetEventHandler(std::function<void(std::string const&)> handler);
+  int AddEventHandler(std::function<void(std::string const&)> handler);
+  void RemoveEventHandler(int token);
   void Stop();
 
  private:
@@ -153,7 +155,12 @@ class CoreIPCBridge {
   bool establishing_session_ = false;
   std::exception_ptr session_error_;
   unsigned long core_generation_ = 0;
-  std::function<void(std::string const&)> event_handler_;
+  // Every React root (the menu host and each route window) observes Core
+  // itself. One shared subscription serves them all, but a single handler
+  // slot would deliver every event to whichever root registered last and
+  // leave the other windows' snapshots frozen behind Core's shared revision.
+  std::map<int, std::function<void(std::string const&)>> event_handlers_;
+  int next_event_handler_token_ = 0;
   std::atomic<bool> stopping_{false};
   std::mutex poll_mutex_;
   std::thread poll_thread_;

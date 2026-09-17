@@ -493,10 +493,30 @@ export interface NativeLocalization {
   fileFilterAll: string;
 }
 
-/** One relay group offered by the station, as the group manager sheet sees it. */
-export type RelayGroupManagerGroup = { id: string; label: string };
-/** One relay API key with the group it currently belongs to. */
-export type RelayGroupManagerKey = { id: string; name: string; groupID: string; groupLabel: string; multiplier: string; enabled: boolean };
+/**
+ * One relay group offered by the station, as the group manager sheet sees it:
+ * `label` heads the picker with its rate, `name` fills the list's group column,
+ * and `rate` reports the group's 倍率 on its own.
+ */
+export type RelayGroupManagerGroup = { id: string; label: string; name: string; rate: string };
+/**
+ * One relay API key with the group it currently belongs to: its rate, whether
+ * Core holds a credential for it, and the models the station reports for it.
+ * Even a masked prefix/suffix is credential material, so `hint` is only Core's
+ * presence sentinel; the sheet reads the real value through Core's native
+ * capability and shows it in the key-value row.
+ */
+export type RelayGroupManagerKey = {
+  id: string;
+  name: string;
+  groupID: string;
+  groupLabel: string;
+  multiplier: string;
+  hint: string;
+  /** The station's model list for the key, in its own order (模型列表). */
+  models: string[];
+  enabled: boolean;
+};
 /** Localized labels for the native group manager sheet. */
 export type RelayGroupManagerLabels = {
   listLabel: string;
@@ -505,16 +525,35 @@ export type RelayGroupManagerLabels = {
   nameLabel: string;
   groupLabel: string;
   multiplierLabel: string;
+  /**
+   * The plaintext value row, which the sheet fills through Core's native
+   * capability; the value never crosses this boundary.
+   */
+  valueLabel: string;
+  /** The copy button's own title (`common.copy`), e.g. 复制 / Copy. */
+  copyActionLabel: string;
+  /** The copy action's tooltip and accessibility name. */
+  copyLabel: string;
+  copiedLabel: string;
+  failedLabel: string;
+  /** The selected key's model list section title (模型列表). */
+  modelsLabel: string;
+  /** `common.none`: the placeholder for an empty detail value. */
+  emptyLabel: string;
+  /** `relay.resourceKeyConfigured`: the key value row when the key exists. */
+  savedLabel: string;
   enabledLabel: string;
   newKeyName: string;
-  draftLabel: string;
-  deletedLabel: string;
   autoGroupingLabel: string;
   /** The label for a key whose group the station no longer offers. */
   ungroupedLabel: string;
   closeLabel: string;
   applyLabel: string;
-  hint: string;
+  /** The Close confirmation shown while the draft would lose edits. */
+  discardTitle: string;
+  discardBody: string;
+  /** The confirmation's own action label, e.g. 放弃更改. */
+  discardConfirm: string;
 };
 /**
  * What the sheet returns: the auto-grouping switch plus the key edits the user
@@ -561,6 +600,8 @@ export interface NativeLeafAdapter {
   showGroupManager(options: {
     title: string;
     accountLabel: string;
+    /** The account that owns the keys; names the copy action's secret target. */
+    accountId: string;
     groups: RelayGroupManagerGroup[];
     keys: RelayGroupManagerKey[];
     labels: RelayGroupManagerLabels;

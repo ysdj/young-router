@@ -21,15 +21,19 @@ MAX_LOG_BACKUP_SEGMENTS = 8
 _LOCAL_LOCK = threading.RLock()
 
 
+def _bounded_backup_segments(value: object) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_LOG_BACKUP_SEGMENTS
+    return max(MIN_LOG_BACKUP_SEGMENTS, min(parsed, MAX_LOG_BACKUP_SEGMENTS))
+
+
 def log_backup_segments() -> int:
     value = os.getenv(LOG_BACKUP_SEGMENTS_ENV, "").strip()
     if not value:
         return DEFAULT_LOG_BACKUP_SEGMENTS
-    try:
-        parsed = int(value)
-    except ValueError:
-        return DEFAULT_LOG_BACKUP_SEGMENTS
-    return max(MIN_LOG_BACKUP_SEGMENTS, min(parsed, MAX_LOG_BACKUP_SEGMENTS))
+    return _bounded_backup_segments(value)
 
 
 def log_max_bytes() -> int:
@@ -87,14 +91,26 @@ def _shift_backup_segments(path: str, segments: int) -> None:
             pass
 
 
-def _write_backup(descriptor: int, path: str, size: int, maximum: int) -> None:
+def _write_backup(
+    descriptor: int,
+    path: str,
+    size: int,
+    maximum: int,
+    *,
+    backup_segments: int | None = None,
+) -> None:
     with open(path, "rb") as source:
         source.seek(max(0, size - maximum))
         tail = source.read(maximum)
     backup = f"{path}.1"
     temporary = f"{backup}.rotate.{os.getpid()}.tmp"
     try:
-        _shift_backup_segments(path, log_backup_segments())
+        segments = (
+            log_backup_segments()
+            if backup_segments is None
+            else _bounded_backup_segments(backup_segments)
+        )
+        _shift_backup_segments(path, segments)
         with open(temporary, "wb") as target:
             target.write(tail)
         os.chmod(temporary, 0o600)
@@ -155,7 +171,13 @@ def write_bounded_stream(stream: object, text: str, *, maximum_bytes: int | None
         return int(_with_rotation_lock(path, write))
 
 
-def append_bounded_log(path: str, data: bytes, *, maximum_bytes: int | None = None) -> None:
+def append_bounded_log(
+    path: str,
+    data: bytes,
+    *,
+    maximum_bytes: int | None = None,
+    backup_segments: int | None = None,
+) -> None:
     """Append one record and rotate the previous segment under a process lock."""
 
     maximum = maximum_bytes if maximum_bytes is not None else log_max_bytes()
@@ -168,7 +190,13 @@ def append_bounded_log(path: str, data: bytes, *, maximum_bytes: int | None = No
         try:
             size = os.fstat(descriptor).st_size
             if size + len(data) > maximum:
-                _write_backup(descriptor, path, size, maximum)
+                _write_backup(
+                    descriptor,
+                    path,
+                    size,
+                    maximum,
+                    backup_segments=backup_segments,
+                )
                 os.ftruncate(descriptor, 0)
             os.lseek(descriptor, 0, os.SEEK_END)
             os.write(descriptor, data)

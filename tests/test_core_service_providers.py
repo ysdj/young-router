@@ -508,6 +508,244 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertTrue(domain.draft_state()["providers"][0]["enabled"])
             self.assertFalse(domain.draft_state()["providers"][1]["enabled"])
 
+    def test_a_new_model_never_claims_a_provider_key_by_itself(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            config = Path(directory.name) / "config.yaml"
+            added = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "novai",
+                        "api_base": "https://novai.test/v1",
+                        "create_default_api_key": True,
+                        "initial_api_key_name": "x",
+                        "models": [],
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            domain.dispatch(
+                "provider.patch",
+                {
+                    "provider_id": provider_id,
+                    "changes": {"api_keys": [{"name": "x", "value": "test-secret-placeholder"}]},
+                },
+            )
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "novai-model", "upstream_model": "novai-model", "enabled": True, "order": 0},
+                },
+            )
+
+            model = domain.snapshot()["providers"][0]["models"][0]
+            # The editor must not pick a key for the user: a model that was
+            # never bound stays unbound.
+            self.assertEqual("", model["provider_key_id"])
+            self.assertEqual("", model["api_key_name"])
+
+            domain.apply()
+            # Materialization still routes the model through the provider's
+            # default key, so an unbound draft keeps working at runtime.
+            document = config.read_text(encoding="utf-8")
+            self.assertIn("api_key: *novai_api_key_x", document)
+            self.assertIn("api_key_name: x", document)
+
+            # Binding a key explicitly still sticks, and going back to the
+            # default drops the model's own binding again.
+            bound = domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": model["editor_id"],
+                    "changes": {"api_key_name": "x"},
+                },
+            )["providers"][0]["models"][0]
+            self.assertEqual("x", bound["api_key_name"])
+
+            unbound = domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": model["editor_id"],
+                    "changes": {"provider_key_id": "", "api_key_name": ""},
+                },
+            )["providers"][0]["models"][0]
+            self.assertEqual("", unbound["provider_key_id"])
+            self.assertEqual("", unbound["api_key_name"])
+
+    def test_validation_names_an_enabled_model_without_a_public_name(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            added = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "Example",
+                        "api_base": "https://example.test/v1",
+                        "create_default_api_key": True,
+                        "models": [
+                            {"model_name": "model-one", "litellm_model": "model-one"},
+                            {"model_name": "", "litellm_model": "", "enabled": True, "order": 0},
+                            {"model_name": "", "litellm_model": "", "enabled": False},
+                        ],
+                    }
+                },
+            )
+            domain.dispatch(
+                "provider.patch",
+                {
+                    "provider_id": added["providers"][0]["id"],
+                    "changes": {"api_keys": [{"name": "default", "value": "test-secret-placeholder"}]},
+                },
+            )
+
+            # The shared pane needs the provider and the row: the validation
+            # result names both instead of reporting one opaque failure, and an
+            # entry that never materializes a route stays out of the result.
+            validation = domain.validate()
+            self.assertFalse(validation["valid"])
+            self.assertEqual(
+                ["model_name_required"],
+                [issue["code"] for issue in validation["issues"]],
+            )
+            # The path survives the shared issue sanitizer, which drops any
+            # location that is not a plain identifier.
+            self.assertEqual("providers_models.Example.models[2]", validation["issues"][0]["path"])
+
+            blank_model_id = domain.snapshot()["providers"][0]["models"][1]["editor_id"]
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": added["providers"][0]["id"],
+                    "model_id": blank_model_id,
+                    "changes": {"name": "model-two"},
+                },
+            )
+            self.assertTrue(domain.validate()["valid"])
+
+    def test_validation_issue_paths_survive_the_shared_sanitizer(self) -> None:
+        # A rejected Apply shows the location from this path; the shared
+        # sanitizer keeps it only while it reads as a plain identifier.
+        from young_router.core.service import _safe_issue_path
+
+        self.assertEqual(
+            "providers_models.Example.models[2]",
+            _safe_issue_path("providers_models.Example.models[2]"),
+        )
+        self.assertEqual("configuration", _safe_issue_path("/Users/example/config.yaml"))
+        self.assertEqual("configuration", _safe_issue_path("Example / #2"))
+
+    def test_a_stale_slot_id_heals_through_the_key_name(self) -> None:
+        directory, domain = self._domain()
+        with directory:
+            added = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "novai",
+                        "api_base": "https://novai.test/v1",
+                        "create_default_api_key": True,
+                        "initial_api_key_name": "x",
+                        "models": [],
+                    }
+                },
+            )
+            provider_id = added["providers"][0]["id"]
+            domain.dispatch(
+                "provider.patch",
+                {
+                    "provider_id": provider_id,
+                    "changes": {"api_keys": [{"name": "x", "value": "test-secret-placeholder"}]},
+                },
+            )
+            domain.dispatch(
+                "model.add",
+                {"provider_id": provider_id, "model": {"model_name": "m", "litellm_model": "m"}},
+            )
+            provider = domain._draft["providers"][0]
+            key_id = domain._provider_api_keys(provider)[0]["id"]
+            # A slot id can move while the model keeps the key name; the binding
+            # must heal through the name instead of dropping to "no key".
+            provider["models"][0]["provider_key_id"] = "provider-slot-00000000000000000000000000000000"
+            provider["models"][0]["api_key_name"] = "x"
+
+            domain._normalize_provider_model_bindings(domain._draft["providers"])
+
+            model = domain.snapshot()["providers"][0]["models"][0]
+            self.assertEqual(key_id, model["provider_key_id"])
+            self.assertEqual("x", model["api_key_name"])
+
+    def test_editor_ids_survive_a_failed_apply(self) -> None:
+        # A rejected Apply rolls the draft back from a deep copy.  The editor
+        # ids are the pane's handles: regenerating them stranded every
+        # provider-scoped action (deleting a new model answered "The selected
+        # provider is unavailable").
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+
+        from young_router.core.service import CoreStore
+
+        with _tempfile.TemporaryDirectory() as directory:
+            config = _Path(directory) / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            domain = ProvidersModelsDomain(config, auth_manager=ProviderAuthManager(_Path(directory)))
+            core = CoreStore(domains=[domain])
+
+            def provider() -> dict:
+                return core.snapshot()["domains"]["providers_models"]["providers"][0]
+
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {
+                        "provider": {
+                            "name": "novai",
+                            "api_base": "https://novai.test/v1",
+                            "create_default_api_key": True,
+                            "initial_api_key_name": "x",
+                            "models": [],
+                        }
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            provider_id = provider()["id"]
+            core.stage_secret(
+                "providers_models",
+                "api_key",
+                f"{provider_id}\u001fx",
+                "test-secret-placeholder",
+                revision=core.revision,
+            )
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.add",
+                    "payload": {"provider_id": provider_id, "model": {"name": "", "upstream_model": "", "enabled": True, "order": 0}},
+                },
+                expected_revision=core.revision,
+            )
+            before_editor = provider()["editor_id"]
+            model_id = provider()["models"][0]["id"]
+
+            with self.assertRaises(Exception):
+                core.apply(domains=["providers_models"], revision=core.revision)
+
+            self.assertEqual(before_editor, provider()["editor_id"])
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.delete",
+                    "payload": {"provider_id": before_editor, "model_id": model_id},
+                },
+                expected_revision=core.revision,
+            )
+            self.assertEqual([], provider()["models"])
+
     def test_validation_rejects_legacy_multiple_enabled_openai_accounts(self) -> None:
         directory, domain = self._domain()
         with directory:

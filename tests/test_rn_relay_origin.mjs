@@ -7,6 +7,7 @@ assert.equal(normalizeRelayOrigin("https://x.bbb.com/login"), "https://x.bbb.com
 
 assert.equal(suggestedRelayStationName("aaa.com"), "aaa");
 assert.equal(suggestedRelayStationName("x.bbb.com"), "bbb");
+assert.equal(suggestedRelayStationName("aaa.bb.cc"), "bb");
 assert.equal(suggestedRelayStationName("https://api.example.co.uk/login"), "example");
 assert.equal(suggestedRelayStationName("http://localhost:4000"), "localhost");
 
@@ -19,6 +20,10 @@ assert.equal(suggestedProviderName("https://a.b"), "");
 assert.equal(suggestedProviderName("https://api.openai.com/v1"), "openai");
 assert.equal(suggestedProviderName("api.gamma.example/v1"), "gamma");
 assert.equal(suggestedProviderName("https://atlas.example/v1"), "atlas");
+assert.equal(suggestedProviderName("aaa.bb.cc"), "bb");
+assert.equal(suggestedProviderName("https://aaa.cc/v1"), "aaa");
+assert.equal(suggestedProviderName("https://api.example.co.uk/login"), "example");
 assert.equal(suggestedProviderName("http://localhost:4000"), "");
+assert.equal(suggestedProviderName("http://127.0.0.1:4000"), "");
 
 console.log("RN relay origin regression tests OK (normalization, station-name and provider-name suggestion)");
