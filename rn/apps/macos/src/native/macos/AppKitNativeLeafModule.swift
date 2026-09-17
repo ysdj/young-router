@@ -120,15 +120,19 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["title", "accountLabel", "groups", "keys", "labels", "autoGrouping"]),
+        guard Set(options.keys).isSubset(of: ["title", "accountLabel", "accountId", "groups", "keys", "labels", "autoGrouping"]),
               let title = options["title"] as? String,
               let accountLabel = options["accountLabel"] as? String,
+              let accountID = options["accountId"] as? String,
+              !accountID.isEmpty,
+              accountID.count <= 256,
               let labels = options["labels"] as? [String: String],
               let autoGrouping = options["autoGrouping"] as? Bool,
               let groupEntries = options["groups"] as? [[String: String]],
               groupEntries.count <= 512,
               groupEntries.allSatisfy({
                   !($0["label"] ?? "").isEmpty && ($0["label"]?.count ?? 0) <= 256 && ($0["id"]?.count ?? 0) <= 256
+                      && ($0["name"]?.count ?? 0) <= 256 && ($0["rate"]?.count ?? 0) <= 64
               }),
               let keyEntries = options["keys"] as? [[String: Any]],
               keyEntries.count <= 512,
@@ -140,14 +144,21 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
             reject("E_NATIVE_GROUP_INPUT", "The group manager input is invalid.", nil)
             return
         }
-        let groups = groupEntries.map { ["id": $0["id"] ?? "", "label": $0["label"] ?? ""] }
+        let groups = groupEntries.map {
+            ["id": $0["id"] ?? "", "label": $0["label"] ?? "", "name": $0["name"] ?? "", "rate": $0["rate"] ?? ""]
+        }
         let keys: [[String: String]] = keyEntries.map {
-            [
+            let models = ($0["models"] as? [String]) ?? []
+            return [
                 "id": ($0["id"] as? String) ?? "",
                 "name": ($0["name"] as? String) ?? "",
                 "groupID": ($0["groupID"] as? String) ?? "",
                 "groupLabel": ($0["groupLabel"] as? String) ?? "",
                 "multiplier": ($0["multiplier"] as? String) ?? "",
+                "hint": ($0["hint"] as? String) ?? "",
+                // The sheet lays the models out itself, so a long list travels
+                // as one name per line and is bounded like every other field.
+                "models": models.prefix(256).joined(separator: "\n"),
                 "enabled": (($0["enabled"] as? Bool) ?? true) ? "1" : "0",
             ]
         }
@@ -155,6 +166,7 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
             self.leaf.showGroupManager(
                 title: title,
                 accountLabel: accountLabel,
+                accountID: accountID,
                 groups: groups,
                 keys: keys,
                 labels: labels,

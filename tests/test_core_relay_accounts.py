@@ -13,6 +13,7 @@ from young_router.core.domains.relay_accounts import (
     RelayAccountsError,
     RelayHTTPClient,
 )
+from young_router.core.protocol import validate_method_result
 from young_router.core.service import CoreError, CoreStore
 
 
@@ -540,6 +541,75 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual("signed_in", result["login_status"])
             self.assertTrue(relay.secret_present("session", account["id"]))
             self.assertFalse(providers.snapshot()["providers"])
+
+    def test_core_relay_resource_dispatch_reports_its_status_in_the_action_summary(self) -> None:
+        """Refresh and import answer in the dispatch envelope, not their projection.
+
+        The dispatch result is a revision plus an optional action summary.
+        Returning the relay projection itself (account_id/resource_status/...)
+        adds fields the IPC contract rejects, so every caller of
+        `resources.refresh` sees a protocol error instead of a resource status.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/user/models": {"success": True, "data": ["model-a"]},
+                "/api/token/?p=1&size=100": {
+                    "success": True,
+                    "data": {"items": [{"id": 7, "status": 1}]},
+                },
+                "/api/token/7/key": {"success": True, "data": {"key": "replace-relay-key"}},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=fake)
+            account = relay.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, providers],
+            )
+            core.accept_relay_login(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="sample-user",
+                cookie="session=replace-cookie",
+                access_token="replace-dashboard-token",
+            )
+
+            refreshed = core.dispatch(
+                {"domain": "relay_accounts", "type": "resources.refresh", "payload": {"account_id": account["id"]}},
+                expected_revision=core.revision,
+            )
+            validate_method_result("dispatch", refreshed)
+            self.assertEqual(
+                {"account_id", "resource_status", "resource_count"},
+                set(refreshed["action_summary"]),
+            )
+            self.assertEqual("ready", refreshed["action_summary"]["resource_status"])
+            self.assertEqual(core.revision, refreshed["revision"])
+
+            resources = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["resources"]
+            imported = core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "resources.import",
+                    "payload": {"account_id": account["id"], "resource_ids": [resources[0]["id"]]},
+                },
+                expected_revision=core.revision,
+            )
+            validate_method_result("dispatch", imported)
+            self.assertEqual(
+                {"imported", "import_mode", "resource_count", "model_count"},
+                set(imported["action_summary"]),
+            )
+            self.assertTrue(imported["action_summary"]["imported"])
 
     def test_core_pending_login_creates_account_without_reserving_cancelled_slot(self) -> None:
         fake = FakeRelayHTTPClient(
@@ -1368,7 +1438,13 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 ["model-a", "model-b"],
                 [model["model_name"] for model in providers.snapshot()["providers"][0]["models"]],
             )
-            self.assertTrue(all(headers == {"Authorization": "Bearer replace-access-token"} for _, _, headers in fake.requests))
+            # Dashboard reads keep the session token; only the key's own catalog
+            # probe authenticates with that key.
+            self.assertTrue(all(headers == {"Authorization": "Bearer replace-access-token"} for _, path, headers in fake.requests if path != "/v1/models"))
+            self.assertEqual(
+                [{"Authorization": "Bearer sk-replace-sub-key"}],
+                [headers for _, path, headers in fake.requests if path == "/v1/models"],
+            )
 
     def test_sub2api_import_discovers_models_from_each_gateway_key_when_channels_are_unavailable(self) -> None:
         fake = FakeRelayHTTPClient(
@@ -1465,6 +1541,184 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 [headers for _, path, headers in fake.requests if path == "/v1/models"],
             )
 
+    def test_sub2api_channel_page_supplies_each_groups_models_without_per_key_reads(self) -> None:
+        """One channel read describes every group, so no key is probed.
+
+        The channel page names each group beside the models it serves; opening
+        the group manager must not fan out one gateway read per key when that
+        page already answered.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Plus", "status": "active", "key": "sk-replace-plus-key", "group_id": 21},
+                            {"id": 5, "name": "Pro", "status": "active", "key": "sk-replace-pro-key", "group_id": 22},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {
+                    "code": 0,
+                    "data": [
+                        {
+                            "name": "plus",
+                            "platforms": [
+                                {
+                                    "platform": "openai",
+                                    "groups": [{"id": 21, "name": "Plus分组"}],
+                                    "supported_models": [{"name": "model-a"}, {"name": "model-b"}],
+                                }
+                            ],
+                        },
+                        {
+                            "name": "pro",
+                            "platforms": [
+                                {
+                                    "platform": "anthropic",
+                                    "groups": [{"id": 22, "name": "Pro分组"}],
+                                    "supported_models": [{"name": "model-b"}, {"name": "model-c"}],
+                                }
+                            ],
+                        },
+                    ],
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+
+            resources = domain.refresh_resources(account_id)["resources"]
+
+            # Each key reports its own group's models, in the page's order.
+            self.assertEqual([["model-a", "model-b"], ["model-b", "model-c"]], [resource["models"] for resource in resources])
+            self.assertEqual([], [path for _, path, _ in fake.requests if path == "/v1/models"])
+            self.assertEqual(
+                1,
+                len([path for _, path, _ in fake.requests if path == "/api/v1/keys?page=1&page_size=100"]),
+            )
+
+    def test_sub2api_keeps_a_stored_group_list_instead_of_reading_the_key_again(self) -> None:
+        """A group the channel page omits is read once, then served from the key.
+
+        Opening the group manager reloads the station facts; the models must not
+        cost a request per key on every open.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {"items": [{"id": 7, "name": "Fallback", "status": "active", "key": "sk-replace-fallback-key", "group_id": 70}]},
+                },
+                "/api/v1/channels/available": {
+                    "code": 0,
+                    "data": [
+                        {
+                            "name": "plus",
+                            "platforms": [
+                                {
+                                    "platform": "openai",
+                                    "groups": [{"id": 21, "name": "Plus分组"}],
+                                    "supported_models": [{"name": "model-plus"}],
+                                }
+                            ],
+                        }
+                    ],
+                },
+                "/v1/models": {"object": "list", "data": [{"id": "model-own"}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+
+            first = domain.refresh_resources(account_id)["resources"]
+            self.assertEqual([["model-own"]], [resource["models"] for resource in first])
+            self.assertEqual(1, len([path for _, path, _ in fake.requests if path == "/v1/models"]))
+
+            second = domain.refresh_resources(account_id)["resources"]
+
+            self.assertEqual([["model-own"]], [resource["models"] for resource in second])
+            self.assertEqual(1, len([path for _, path, _ in fake.requests if path == "/v1/models"]))
+
+    def test_sub2api_each_key_keeps_its_own_gateway_model_list(self) -> None:
+        """A key's group models are its own; the channel catalog is only a fallback.
+
+        The dashboard catalog is one union across the deployment, so reading it
+        for every key made every group show the same model list.
+        """
+
+        class PerKeyGatewayClient(FakeRelayHTTPClient):
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/v1/models":
+                    self.requests.append((origin, path, dict(headers)))
+                    key = headers.get("Authorization", "")
+                    if key.endswith("sk-replace-silent-key"):
+                        raise RelayAccountsError("Gateway catalog unavailable")
+                    suffix = key.rsplit("-", 2)[-2]
+                    return {"object": "list", "data": [{"id": f"model-{suffix}"}]}
+                return super().json(origin, path, headers=headers)
+
+        fake = PerKeyGatewayClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Alpha", "status": "active", "key": "sk-replace-alpha-key"},
+                            {"id": 5, "name": "Beta", "status": "active", "key": "sk-replace-beta-key"},
+                            {"id": 6, "name": "Silent", "status": "active", "key": "sk-replace-silent-key"},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {
+                    "code": 0,
+                    "data": [{"name": "channel", "platforms": [{"platform": "openai", "supported_models": [{"name": "union-model"}]}]}],
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample@example.test",
+                access_token="replace-dashboard-token",
+            )
+
+            resources = domain.refresh_resources(account_id)["resources"]
+
+            self.assertEqual(
+                [["model-alpha"], ["model-beta"], ["union-model"]],
+                [resource["models"] for resource in resources],
+            )
+            self.assertEqual(
+                [
+                    {"Authorization": "Bearer sk-replace-alpha-key"},
+                    {"Authorization": "Bearer sk-replace-beta-key"},
+                    {"Authorization": "Bearer sk-replace-silent-key"},
+                ],
+                sorted(
+                    [headers for _, path, headers in fake.requests if path == "/v1/models"],
+                    key=lambda headers: headers["Authorization"],
+                ),
+            )
+
     def test_sub2api_cookie_only_session_can_import_models(self) -> None:
         fake = FakeRelayHTTPClient(
             {
@@ -1501,7 +1755,11 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
 
             self.assertEqual(1, result["model_count"])
-            self.assertTrue(all(headers == {"Cookie": "session=replace-cookie"} for _, _, headers in fake.requests))
+            self.assertTrue(all(headers == {"Cookie": "session=replace-cookie"} for _, path, headers in fake.requests if path != "/v1/models"))
+            self.assertEqual(
+                [{"Authorization": "Bearer sk-replace-sub-key"}],
+                [headers for _, path, headers in fake.requests if path == "/v1/models"],
+            )
 
     def test_sub2api_import_uses_the_selected_key_id_when_names_repeat(self) -> None:
         fake = FakeRelayHTTPClient(

@@ -16,7 +16,12 @@ from typing import Any
 from ..log_tabs import LOG_TABS
 from ..persistence import PersistenceError, atomic_write_json, read_json
 from ..security import REDACT_TEXT
-from ...log_rotation import append_bounded_log
+from ...log_rotation import (
+    LOG_BACKUP_SEGMENTS_ENV,
+    LOG_MAX_BYTES_ENV,
+    MIN_LOG_MAX_BYTES,
+    append_bounded_log,
+)
 
 try:
     import fcntl
@@ -1412,6 +1417,11 @@ class LogsDomain:
         self._runtime_settings_signature: tuple[int, int] | None = None
         self._runtime_line_limit = max(1, min(int(maximum_lines), MAX_LINES))
         self._request_stale_seconds = DEFAULT_REQUEST_STALE_SECONDS
+        # The Core writes the menu-action log itself, so it does not inherit
+        # the configured runtime settings through the proxy environment.
+        # Cache the values here and pass them to the rotation writer.
+        self._runtime_log_max_bytes: int | None = None
+        self._runtime_log_backup_segments: int | None = None
         self._online_usage_records: list[str] = []
         self._online_usage_refreshed = False
         self._online_usage_revision = 0
@@ -1467,9 +1477,16 @@ class LogsDomain:
             self._request_stale_seconds = _request_stale_seconds_value(
                 values.get(REQUEST_STALE_SECONDS_KEY, DEFAULT_REQUEST_STALE_SECONDS)
             )
+            # ``read_settings_file`` reports an ``mb`` kind in megabytes.
+            megabytes = float(values.get(LOG_MAX_BYTES_ENV, "") or "")
+            self._runtime_log_max_bytes = max(MIN_LOG_MAX_BYTES, round(megabytes * 1024 * 1024))
+            raw_segments = str(values.get(LOG_BACKUP_SEGMENTS_ENV, "") or "").strip()
+            self._runtime_log_backup_segments = int(raw_segments) if raw_segments else None
         except (OSError, TypeError, ValueError):
             self._runtime_line_limit = self.maximum_lines
             self._request_stale_seconds = DEFAULT_REQUEST_STALE_SECONDS
+            self._runtime_log_max_bytes = None
+            self._runtime_log_backup_segments = None
 
     def _line_limit(self, tab: str) -> int:
         self._refresh_runtime_settings()
@@ -1709,7 +1726,13 @@ class LogsDomain:
         stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         line = f"[{stamp}] [INFO] {action}\n".encode("utf-8")
         try:
-            append_bounded_log(str(path), line)
+            self._refresh_runtime_settings()
+            append_bounded_log(
+                str(path),
+                line,
+                maximum_bytes=self._runtime_log_max_bytes,
+                backup_segments=self._runtime_log_backup_segments,
+            )
         except OSError:
             raise LogsDomainError("Log source is unavailable") from None
 

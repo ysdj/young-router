@@ -6,11 +6,31 @@ namespace YoungRouter {
 void CoreIPCModule::Initialize(winrt::Microsoft::ReactNative::ReactContext const& context) noexcept {
   try {
     context_ = context;
+  } catch (...) {
+  }
+}
+
+void CoreIPCModule::RegisterEventHandler() noexcept {
+  try {
+    if (event_handler_token_ != 0) return;
     auto dispatcher = context_.JSDispatcher();
     auto emitter = CoreEvent;
-    CoreIPCBridge::Shared().SetEventHandler([dispatcher, emitter](std::string const& event) {
-      dispatcher.Post([emitter, event] { emitter(event); });
-    });
+    // One observer per React root: the menu host and every route window each
+    // hold their own lifecycle, so the bridge fans Core events out instead of
+    // delivering them to whichever root registered last.
+    event_handler_token_ = CoreIPCBridge::Shared().AddEventHandler(
+        [dispatcher, emitter](std::string const& event) {
+          dispatcher.Post([emitter, event] { emitter(event); });
+        });
+  } catch (...) {
+  }
+}
+
+void CoreIPCModule::UnregisterEventHandler() noexcept {
+  try {
+    if (event_handler_token_ == 0) return;
+    CoreIPCBridge::Shared().RemoveEventHandler(event_handler_token_);
+    event_handler_token_ = 0;
   } catch (...) {
   }
 }
@@ -35,12 +55,19 @@ void CoreIPCModule::Send(
 
 void CoreIPCModule::Shutdown() noexcept {
   try {
+    UnregisterEventHandler();
     CoreIPCBridge::Shared().Stop();
   } catch (...) {
   }
 }
 
-void CoreIPCModule::AddListener(std::string const&) noexcept {}
-void CoreIPCModule::RemoveListeners(double) noexcept {}
+void CoreIPCModule::AddListener(std::string const&) noexcept {
+  RegisterEventHandler();
+}
+
+void CoreIPCModule::RemoveListeners(double count) noexcept {
+  if (count > 0) return;
+  UnregisterEventHandler();
+}
 
 }  // namespace YoungRouter

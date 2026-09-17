@@ -11,6 +11,15 @@ export function normalizeRelayOrigin(value: string): string {
   return normalized;
 }
 
+// A country-code domain can carry a second-level suffix label
+// ("example.co.uk"), but only a known registry prefix does: a short middle
+// label that is not one of them is the registrable domain itself, so
+// "aaa.bb.cc" names "bb" and not the subdomain in front of it.
+const TWO_PART_SUFFIX_LABELS = new Set([
+  "ac", "ad", "co", "com", "ed", "edu", "firm", "gen", "go", "gov", "govt", "gr",
+  "ind", "lg", "ltd", "me", "mil", "ne", "net", "nhs", "or", "org", "plc", "sch", "web",
+]);
+
 export function suggestedRelayStationName(value: string): string {
   const normalized = normalizeRelayOrigin(value);
   if (!normalized) return "";
@@ -26,10 +35,10 @@ export function suggestedRelayStationName(value: string): string {
   }
   const labels = unwrapped.split(".").filter(Boolean);
   if (labels.length < 2) return labels[0] ?? "";
-  const countryCodeSuffix = labels.length >= 3
+  const twoPartSuffix = labels.length >= 3
     && labels[labels.length - 1].length === 2
-    && labels[labels.length - 2].length <= 3;
-  return labels[countryCodeSuffix ? labels.length - 3 : labels.length - 2] ?? labels[0] ?? "";
+    && TWO_PART_SUFFIX_LABELS.has(labels[labels.length - 2]);
+  return labels[twoPartSuffix ? labels.length - 3 : labels.length - 2] ?? labels[0] ?? "";
 }
 
 export function suggestedProviderName(value: string): string {
@@ -46,6 +55,9 @@ export function suggestedProviderName(value: string): string {
     return "";
   }
   if (!hostname.includes(".")) return "";
+  // An IP address is not a name: leave the field to the user instead of
+  // suggesting "127.0.0.1".
+  if (hostname.replace(/^\[|\]$/gu, "").includes(":") || /^\d{1,3}(?:\.\d{1,3}){3}$/u.test(hostname)) return "";
   const suggestion = suggestedRelayStationName(normalized);
   return suggestion.length > 1 ? suggestion : "";
 }

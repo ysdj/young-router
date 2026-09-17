@@ -8,6 +8,7 @@ from unittest import mock
 
 from young_router.core.domains.codex import CodexSettingsDomain
 from young_router.core.model_catalog import catalog_model_names
+from young_router.core.protocol import validate_method_result
 from young_router.core.service import CoreStore
 
 
@@ -87,6 +88,11 @@ class CodexRestartPromptTests(unittest.TestCase):
                 {"domain": "codex", "type": "codex.model_catalog.set", "payload": {"enabled": True}},
                 expected_revision=core.revision,
             )
+            # The catalog switch answers in the dispatch envelope: a revision and
+            # an action-scoped summary, never extra top-level fields.
+            validate_method_result("dispatch", enabled)
+            self.assertEqual({"revision", "action_summary"}, set(enabled))
+            self.assertIsInstance(enabled["action_summary"], dict)
             first = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertTrue(first["restart_required"])
             core.dispatch(

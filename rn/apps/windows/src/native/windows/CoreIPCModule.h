@@ -22,7 +22,11 @@ struct CoreIPCModule {
   std::function<void(std::string const&)> CoreEvent;
 
  private:
+  void RegisterEventHandler() noexcept;
+  void UnregisterEventHandler() noexcept;
+
   winrt::Microsoft::ReactNative::ReactContext context_{nullptr};
+  int event_handler_token_ = 0;
 };
 
 }  // namespace YoungRouter

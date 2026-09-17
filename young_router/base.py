@@ -326,6 +326,17 @@ _PREFIX_IMAGE_RECENT_COUNT_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_RECENT_COUNT"
 _PREFIX_IMAGE_RECENT_COUNT_DEFAULT = 6
 _PREFIX_IMAGE_ORIGINAL_PATH_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"
 _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT = True
+# A replayed image may only be replaced by a path reference when the client can
+# still open that path later.  Originals kept in OS temporary storage (a
+# clipboard paste, an intermediate crop) are copied into this durable cache
+# first, so the promise to re-open the original stays true for the whole task.
+_PREFIX_IMAGE_CACHE_DIR_NAME = "image-cache"
+_PREFIX_IMAGE_CACHE_DIR_ENV = "YOUNG_ROUTER_IMAGE_CACHE_DIR"
+_PREFIX_IMAGE_CACHE_MAX_FILES_ENV = "YOUNG_ROUTER_IMAGE_CACHE_MAX_FILES"
+_PREFIX_IMAGE_CACHE_MAX_FILES_DEFAULT = 2048
+_PREFIX_IMAGE_CACHE_MAX_BYTES_ENV = "YOUNG_ROUTER_IMAGE_CACHE_MAX_BYTES"
+_PREFIX_IMAGE_CACHE_MAX_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024
+_PREFIX_IMAGE_CACHE_GRACE_SECONDS = 900
 # Keep the old name as the public upper-bound constant used by diagnostics and
 # tests.  It is intentionally the maximum, not a fixed per-image size.
 _CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES = _CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
+import tempfile
 import threading
+import time
 from collections import OrderedDict
+from pathlib import Path
 
 from . import request_context as _request_context_module
 from . import routing as _routing_module
@@ -34,6 +39,13 @@ from .base import (
     _PREFIX_IMAGE_RECENT_COUNT_ENV,
     _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT,
     _PREFIX_IMAGE_ORIGINAL_PATH_ENV,
+    _PREFIX_IMAGE_CACHE_DIR_ENV,
+    _PREFIX_IMAGE_CACHE_DIR_NAME,
+    _PREFIX_IMAGE_CACHE_GRACE_SECONDS,
+    _PREFIX_IMAGE_CACHE_MAX_BYTES_DEFAULT,
+    _PREFIX_IMAGE_CACHE_MAX_BYTES_ENV,
+    _PREFIX_IMAGE_CACHE_MAX_FILES_DEFAULT,
+    _PREFIX_IMAGE_CACHE_MAX_FILES_ENV,
     _CHAT_COMPAT_REASONING_EFFORT,
     _FALLBACK_BROWSER_USER_AGENT,
     _MAX_COMPAT_REASONING_EFFORT,
@@ -2233,6 +2245,254 @@ def _prefix_image_preview_resized(image_url: str) -> str:
     return resized
 
 
+_REPLAY_IMAGE_CACHE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+}
+
+
+def _prefix_image_cache_root() -> Path:
+    """Return the durable directory that backs replay-image path references."""
+
+    configured = os.getenv(_PREFIX_IMAGE_CACHE_DIR_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    root = os.getenv("LITELLM_RUNTIME_ROOT", "").strip() or os.getenv(
+        "YOUNG_ROUTER_HOME", ""
+    ).strip()
+    base = Path(root).expanduser() if root else Path.home() / ".young-router"
+    return base / _PREFIX_IMAGE_CACHE_DIR_NAME
+
+
+def _prefix_image_cache_max_files() -> int:
+    raw = os.getenv(_PREFIX_IMAGE_CACHE_MAX_FILES_ENV, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed > 0:
+            return parsed
+    return _PREFIX_IMAGE_CACHE_MAX_FILES_DEFAULT
+
+
+def _prefix_image_cache_max_bytes() -> int:
+    raw = os.getenv(_PREFIX_IMAGE_CACHE_MAX_BYTES_ENV, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed > 0:
+            return parsed
+    return _PREFIX_IMAGE_CACHE_MAX_BYTES_DEFAULT
+
+
+def _temporary_path_roots() -> List[Path]:
+    roots: List[Path] = []
+    for candidate in (
+        tempfile.gettempdir(),
+        os.getenv("TMPDIR", "").strip(),
+        "/tmp",
+        "/var/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+    ):
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _path_lives_in_temporary_storage(path: Path) -> bool:
+    """True when the OS owns the file's lifetime, not the user's task."""
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    for root in _temporary_path_roots():
+        if resolved == root or root in resolved.parents:
+            return True
+    # macOS per-user temp trees: /var/folders/<xx>/<yyy>/T/...
+    parts = resolved.parts
+    return any(
+        parts[index] == "var" and parts[index + 1] == "folders"
+        for index in range(len(parts) - 1)
+    )
+
+
+def _replay_image_path_is_reopenable(path: Any) -> bool:
+    """True when the client can still open this path for the whole task."""
+
+    if not isinstance(path, str) or not path.strip():
+        return False
+    candidate = Path(path.strip())
+    if not candidate.is_absolute():
+        return False
+    try:
+        if not candidate.is_file():
+            return False
+        if candidate.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+    return not _path_lives_in_temporary_storage(candidate)
+
+
+def _replay_image_cache_target(image_url: Any) -> Optional[tuple[Path, bytes]]:
+    parsed = _image_inputs_module._split_image_data_url(image_url)
+    if parsed is None:
+        return None
+    header, encoded = parsed
+    media_type = header[len("data:") :].split(";", 1)[0].strip().lower()
+    extension = _REPLAY_IMAGE_CACHE_EXTENSIONS.get(media_type)
+    if extension is None:
+        return None
+    try:
+        raw = base64.b64decode(encoded, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    if not raw:
+        return None
+    digest = hashlib.sha256(raw).hexdigest()[:32]
+    return _prefix_image_cache_root() / f"{digest}{extension}", raw
+
+
+def _materialize_replay_image(image_url: Any) -> Optional[str]:
+    """Persist one replay image and return a path the client can reopen later."""
+
+    target = _replay_image_cache_target(image_url)
+    if target is None:
+        return None
+    path, raw = target
+    try:
+        directory = path.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+        try:
+            existing_size: Optional[int] = path.stat().st_size if path.exists() else None
+        except OSError:
+            existing_size = None
+        if existing_size != len(raw):
+            tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+            with open(tmp_path, "wb") as handle:
+                handle.write(raw)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, path)
+        os.utime(path, None)
+    except OSError:
+        return None
+    return str(path)
+
+
+def _prune_replay_image_cache(directory: Path, *, keep: set[str]) -> None:
+    """Bound the durable replay-image cache by file count and total bytes."""
+
+    max_files = _prefix_image_cache_max_files()
+    max_bytes = _prefix_image_cache_max_bytes()
+    try:
+        entries: List[tuple[float, int, Path]] = []
+        total_bytes = 0
+        for entry in directory.iterdir():
+            if not entry.is_file() or entry.name.startswith("."):
+                continue
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            entries.append((stat.st_mtime, stat.st_size, entry))
+            total_bytes += stat.st_size
+    except OSError:
+        return
+    remaining_files = len(entries)
+    if remaining_files <= max_files and total_bytes <= max_bytes:
+        return
+    entries.sort(key=lambda item: item[0])
+    deadline = time.time() - _PREFIX_IMAGE_CACHE_GRACE_SECONDS
+    for modified, size, entry in entries:
+        if remaining_files <= max_files and total_bytes <= max_bytes:
+            break
+        if entry.name in keep or modified > deadline:
+            continue
+        try:
+            entry.unlink()
+        except OSError:
+            continue
+        remaining_files -= 1
+        total_bytes -= size
+
+
+def _reopenable_replay_image_references(
+    paths: List[str],
+    image_parts: List[dict],
+) -> tuple[List[str], List[str], bool]:
+    """Return the reference paths a replayed output may advertise.
+
+    A path the client can no longer open (a deleted clipboard paste, an
+    expired temp crop) is replaced by a durable copy of the same bytes.  The
+    third value reports whether every image has a reopenable reference; when
+    it is false the caller must keep the inline image instead of deleting the
+    model's only view of it.
+    """
+
+    references: List[str] = []
+    materialized: List[str] = []
+    reopenable = True
+    for path, part in zip(paths, image_parts):
+        if _replay_image_path_is_reopenable(path):
+            references.append(path)
+            continue
+        cached = _materialize_replay_image(part.get("image_url"))
+        if cached is None:
+            references.append(path)
+            reopenable = False
+            continue
+        references.append(cached)
+        materialized.append(cached)
+    return references, materialized, reopenable
+
+
+def _trace_prefix_image_reference_paths(
+    request_kwargs: Optional[dict],
+    *,
+    materialized: List[str],
+    kept_inline: int,
+) -> None:
+    """Record that a replay path reference needed a durable copy, or could not
+    be honored at all (the inline image stayed)."""
+
+    from . import responses_execution as _responses_execution_module
+
+    _trace_module._route_trace(
+        "prefix_image_reference_paths",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        materialized=len(materialized),
+        kept_inline=kept_inline,
+        cache_dir=str(_prefix_image_cache_root()),
+        names=sorted(Path(path).name for path in materialized)[:8],
+    )
+
+
 def _trace_prefix_image_preview_gate(
     request_kwargs: Optional[dict],
     gate: str,
@@ -2339,6 +2599,13 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
     carries more images than the call's path literals), the images are still
     previewed but no path-reference text is added; the paths remain visible in
     the matching call item's script text.
+
+    A path reference is a promise that the original can be re-opened, so a
+    candidate whose local file is gone (or only lives in OS temporary storage
+    the client will clean up) is backed by a durable copy in the replay-image
+    cache instead of the client's path.  When even that copy cannot be written
+    the inline image is kept: replay history must never trade the model's only
+    view of an image for a path it cannot open.
 
     ``YOUNG_ROUTER_PREFIX_IMAGE_MODE`` selects the treatment: ``preview``
     keeps previews for every oversized paired output, ``path-recent`` keeps
@@ -2517,18 +2784,37 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
     # The most recent image outputs keep their preview treatment so the model
     # retains visual continuity near the current turn; older ones fall back to
     # pure path references (path-recent mode) and can still be re-opened at
-    # full resolution with one view_image call.
-    recent_candidates = set(candidate_indices[-recent_count:])
+    # full resolution with one view_image call.  A zero recent count means
+    # every aged output converts, so it never resolves to the whole list.
+    recent_candidates = (
+        set(candidate_indices[-recent_count:]) if recent_count > 0 else set()
+    )
     updated_items = list(input_items)
     changed = False
+    materialized_paths: List[str] = []
+    kept_inline_candidates = 0
     for index in candidate_indices:
         item = input_items[index]
         output = item["output"]
-        paths = candidate_paths[index]
+        image_parts = _codex_view_image_output_parts(output)
+        paired = len(candidate_paths[index]) == len(image_parts)
+        reference_paths: List[str] = []
+        reopenable = False
+        if paired:
+            reference_paths, materialized, reopenable = (
+                _reopenable_replay_image_references(
+                    candidate_paths[index], image_parts
+                )
+            )
+            if materialized:
+                materialized_paths.extend(materialized)
+        if not reopenable:
+            kept_inline_candidates += 1
         references = "\n".join(
-            f"{number}. {path}" for number, path in enumerate(paths, start=1)
+            f"{number}. {path}"
+            for number, path in enumerate(reference_paths, start=1)
         )
-        if mode == "path-recent" and index not in recent_candidates:
+        if mode == "path-recent" and index not in recent_candidates and reopenable:
             reference_part = {
                 "type": "input_text",
                 "text": (
@@ -2552,14 +2838,14 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
             changed = True
             continue
 
-        if candidate_original[index]:
+        if candidate_original[index] and (
+            mode != "path-recent" or index in recent_candidates
+        ):
             # An explicit original-resolution request inside the recent window
             # keeps its original bytes inline; it converts to a path reference
             # only once it ages out of the window.
             continue
 
-        image_parts = _codex_view_image_output_parts(output)
-        paired = len(paths) == len(image_parts)
         oversized = [
             part
             for part in image_parts
@@ -2584,7 +2870,7 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
         if not resized_any:
             continue
         updated_item = item.copy()
-        if paired:
+        if paired and reopenable:
             reference_part = {
                 "type": "input_text",
                 "text": (
@@ -2596,12 +2882,24 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
             }
             updated_item["output"] = [reference_part, *new_parts]
         else:
-            # The call exposes reopenable paths but the one-to-one mapping is
-            # unknown, so shrink the bytes without claiming a correspondence;
-            # the paths stay visible in the matching call item's script text.
+            # The call exposes no reopenable one-to-one path mapping, so shrink
+            # the bytes without claiming a correspondence; the paths stay
+            # visible in the matching call item's script text.
             updated_item["output"] = new_parts
         updated_items[index] = updated_item
         changed = True
+
+    if materialized_paths:
+        _prune_replay_image_cache(
+            _prefix_image_cache_root(),
+            keep={Path(path).name for path in materialized_paths},
+        )
+    if materialized_paths or kept_inline_candidates:
+        _trace_prefix_image_reference_paths(
+            request_kwargs,
+            materialized=materialized_paths,
+            kept_inline=kept_inline_candidates,
+        )
 
     if not changed:
         _trace_prefix_image_preview_gate(

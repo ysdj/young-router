@@ -50,6 +50,8 @@ export interface NativeLeafBridge {
   showGroupManager(options: {
     title: string;
     accountLabel: string;
+    /** The account that owns the keys; names the copy action's secret target. */
+    accountId: string;
     groups: RelayGroupManagerGroup[];
     keys: RelayGroupManagerKey[];
     labels: RelayGroupManagerLabels;

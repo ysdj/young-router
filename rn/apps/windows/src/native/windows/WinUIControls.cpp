@@ -643,7 +643,21 @@ struct TableComponentView final
     list_.SelectionChanged([this](auto const&, auto const&) {
       if (syncing_ || !Props()) return;
       const auto index = list_.SelectedIndex();
-      if (index < 0 || index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
+      if (index < 0) {
+        // A cleared list selection reaches the shared view so its + / − header
+        // and editor drop the item the list no longer highlights instead of
+        // keeping a selection nothing is showing.
+        if (!Props()->selectedKey.empty()) {
+          if (auto emitter = EventEmitter()) {
+            winrt::YoungRouter::Codegen::LiteLLMWinUITableEventEmitter::OnSelectionChange args;
+            args.index = -1;
+            args.key = "";
+            emitter->onSelectionChange(std::move(args));
+          }
+        }
+        return;
+      }
+      if (index >= static_cast<int32_t>(Props()->rowKeys.size())) return;
       if (IsSpanningKey(Props()->rowKeys[static_cast<size_t>(index)])) {
         RestoreControlledSelection();
         return;
