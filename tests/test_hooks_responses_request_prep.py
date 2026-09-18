@@ -3912,6 +3912,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(root.name, hooks._PREFIX_IMAGE_CACHE_DIR_NAME)
         self.assertTrue(root.is_absolute())
         text = str(root)
+        self.assertNotIn(" ", text)
         for forbidden in (
             "young-router",
             "young_router",
@@ -3989,3 +3990,166 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertTrue(str(references[0]).startswith(str(cache_dir)))
         self.assertTrue(Path(references[0]).is_file())
         self.assertEqual(Path(references[0]).read_bytes(), b"original photo bytes")
+
+    def test_neutral_attachment_paths_move_router_literals_out_of_replay(self) -> None:
+        """A replayed tool call never keeps naming the router's own storage.
+
+        The model reads its own past commands back, so a router-owned path in
+        its history keeps it reading and writing inside the router even after
+        every advertised path became neutral.
+        """
+
+        hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
+        legacy_root = tempfile.TemporaryDirectory(prefix="young-router-legacy-")
+        self.addCleanup(legacy_root.cleanup)
+        self.set_env("YOUNG_ROUTER_HOME", legacy_root.name)
+        legacy_cache = Path(legacy_root.name) / "image-cache"
+        legacy_cache.mkdir(parents=True, exist_ok=True)
+        source = legacy_cache / "6984af2576d7c2ebf38f2033f4ba258e.jpg"
+        source.write_bytes(b"original photo bytes")
+        derived = legacy_cache / "derived_B_top.png"
+        derived.write_bytes(b"model crop")
+        hidden = legacy_cache / "notes.txt"
+        hidden.write_bytes(b"not an image")
+        crop_output = legacy_cache / "scale.png"
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-view",
+                    "name": "exec",
+                    "input": (
+                        "const r = await tools.view_image({"
+                        f'path:"{source}", detail:"original"}}); '
+                        "image(r.image_url)"
+                    ),
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-crop",
+                    "name": "exec",
+                    "input": (
+                        f"sips -c 2100 2200 '{derived}' --out '{crop_output}'"
+                    ),
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-read",
+                    "name": "exec",
+                    "input": f"cat {hidden}",
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-other",
+                    "name": "exec",
+                    "input": "sips -c 10 10 '/tmp/elsewhere/photo.jpg' --out '/tmp/elsewhere/out.png'",
+                },
+            ],
+        }
+
+        modified = hooks._with_neutral_attachment_paths(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        view_script = modified["input"][0]["input"]
+        self.assertNotIn(str(legacy_root.name), view_script)
+        self.assertIn(str(cache_dir), view_script)
+        self.assertIn("6984af2576d7c2ebf38f2033f4ba258e.jpg", view_script)
+        self.assertEqual(
+            (cache_dir / "6984af2576d7c2ebf38f2033f4ba258e.jpg").read_bytes(),
+            b"original photo bytes",
+        )
+        crop_script = modified["input"][1]["input"]
+        self.assertNotIn(str(legacy_root.name), crop_script)
+        self.assertIn(f"{cache_dir}/derived_B_top.png", crop_script)
+        self.assertEqual(
+            (cache_dir / "derived_B_top.png").read_bytes(),
+            b"model crop",
+        )
+        # The crop command's own output path follows the same substitution, so
+        # new files land in the neutral directory as well.
+        self.assertIn(f"{cache_dir}/scale.png", crop_script)
+        # A non-image router file is never copied into a model-visible place,
+        # a client-owned path is left alone, and the client history is intact.
+        self.assertIn(str(hidden), modified["input"][2]["input"])
+        self.assertEqual(modified["input"][3], original["input"][3])
+        self.assertEqual(original["input"][0]["input"], original["input"][0]["input"])
+        self.assertIn(str(legacy_root.name), original["input"][0]["input"])
+        self.assertFalse((cache_dir / "notes.txt").exists())
+
+    def test_neutral_attachment_paths_rewrite_unquoted_and_note_paths(self) -> None:
+        """Command substitutions, output echoes, and notes follow the same rule."""
+
+        hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
+        legacy_root = tempfile.TemporaryDirectory(prefix="young-router-legacy-")
+        self.addCleanup(legacy_root.cleanup)
+        self.set_env("YOUNG_ROUTER_HOME", legacy_root.name)
+        legacy_cache = Path(legacy_root.name) / "image-cache"
+        legacy_cache.mkdir(parents=True, exist_ok=True)
+        photo = legacy_cache / "crop.png"
+        photo.write_bytes(b"crop bytes")
+        config = Path(legacy_root.name) / "config.yaml"
+        config.write_bytes(b"secret: keep-me")
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-cmd",
+                    "name": "exec",
+                    "input": f"sips -g pixelWidth {photo} && echo done",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-cmd",
+                    "output": [
+                        {"type": "input_text", "text": f"Warning: wrote {photo}! `{photo}`"},
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"Only reopen these durable paths: {photo}",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"Never read {config} or {legacy_cache / 'notes.txt'}",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        modified = hooks._with_neutral_attachment_paths(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        original_text = json.dumps(original_input := request["input"])
+        self.assertIn(str(legacy_root.name), original_text)
+        forwarded_text = json.dumps(modified["input"])
+        self.assertNotIn(str(photo), forwarded_text)
+        self.assertIn(f"{cache_dir}/crop.png", forwarded_text)
+        self.assertEqual((cache_dir / "crop.png").read_bytes(), b"crop bytes")
+        # Non-image router files are never copied into a model-visible place.
+        self.assertIn(str(config), modified["input"][3]["content"][0]["text"])
+        self.assertIn(str(legacy_cache / "notes.txt"), modified["input"][3]["content"][0]["text"])
+        self.assertFalse((cache_dir / "notes.txt").exists())
+        self.assertFalse((cache_dir / "config.yaml").exists())

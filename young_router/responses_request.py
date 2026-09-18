@@ -2276,7 +2276,9 @@ def _default_replay_image_attachment_root() -> Path:
     name = _PREFIX_IMAGE_CACHE_DIR_NAME
     home = Path.home()
     if sys.platform == "darwin":
-        return home / "Library" / "Application Support" / name
+        # No space in the path: the model passes it to shell commands, where an
+        # unquoted substitution would split at the space.
+        return home / "Library" / name
     if os.name == "nt":
         base = os.getenv("LOCALAPPDATA", "").strip()
         return (Path(base).expanduser() if base else home / "AppData" / "Local") / name
@@ -2415,6 +2417,12 @@ def _path_lives_in_router_storage(path: Path) -> bool:
     it inside the router's runtime root.
     """
 
+    return _router_storage_relative_path(path) is not None
+
+
+def _router_storage_relative_path(path: Path) -> Optional[Path]:
+    """Return a router-owned path's position below its storage root."""
+
     try:
         resolved = path.resolve()
     except OSError:
@@ -2425,11 +2433,13 @@ def _path_lives_in_router_storage(path: Path) -> bool:
     except OSError:
         pass
     if resolved == attachment_root or attachment_root in resolved.parents:
-        return False
+        return None
     for root in _router_storage_roots():
-        if resolved == root or root in resolved.parents:
-            return True
-    return False
+        if resolved == root:
+            return Path(resolved.name)
+        if root in resolved.parents:
+            return resolved.relative_to(root)
+    return None
 
 
 def _replay_image_cache_target(image_url: Any) -> Optional[tuple[Path, bytes]]:
@@ -2538,6 +2548,200 @@ def _prune_replay_image_cache(directory: Path, *, keep: set[str]) -> None:
             continue
         remaining_files -= 1
         total_bytes -= size
+
+
+# Any absolute path token in a replayed script or tool output: quoted,
+# backticked, or bare. A trailing glob character ends a token without
+# rewriting it, because a glob is not the file a command will open.
+_ROUTER_PATH_TOKEN = re.compile(r"/(?:[^\s'\"`|&;<>()\[\]{},:?*!$\\]+)")
+
+
+def _neutral_attachment_copy(source_text: str) -> Optional[str]:
+    """Return the neutral attachment path that replaces one router-owned path.
+
+    The model reads its own past commands back, so a router-owned literal keeps
+    pulling the model -- and every crop it derives -- into the router's storage.
+    The replacement keeps the same relative name, and the bytes are copied
+    first: a literal the model will re-open must stay true. A literal that names
+    a file which does not exist yet (a crop the command is about to write) maps
+    to the same neutral directory, so new files land there as well.
+    """
+
+    candidate = Path(source_text)
+    if not candidate.is_absolute():
+        return None
+    if candidate.suffix.lower() not in _CODEX_VIEW_IMAGE_EXTENSIONS:
+        return None
+    relative = _router_storage_relative_path(candidate)
+    if relative is None:
+        return None
+    root = _prefix_image_cache_root()
+    # A flat attachment directory: the model's own file names stay meaningful
+    # without repeating the router's internal layout.
+    target = root / relative.name
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(target.parent, 0o700)
+        except OSError:
+            pass
+    except OSError:
+        return None
+    try:
+        exists = candidate.is_file()
+    except OSError:
+        exists = False
+    if not exists:
+        return str(target)
+    try:
+        raw = candidate.read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        target_has_other_bytes = (
+            target.is_file() and target.read_bytes() != raw
+        )
+    except OSError:
+        target_has_other_bytes = False
+    if target_has_other_bytes:
+        # Never overwrite content this cache did not create (the model's crops
+        # and the user's files live here too): fall back to the digest name.
+        target = root / f"{hashlib.sha256(raw).hexdigest()[:32]}{candidate.suffix.lower()}"
+    try:
+        if not target.is_file() or target.read_bytes() != raw:
+            tmp_path = target.with_name(f".{target.name}.tmp.{os.getpid()}.{time.time_ns()}")
+            with open(tmp_path, "wb") as handle:
+                handle.write(raw)
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, target)
+    except OSError:
+        return None
+    return str(target)
+
+
+def _with_neutral_attachment_paths(request_kwargs: dict) -> Optional[dict]:
+    """Replay the model's own image paths from the neutral attachment directory.
+
+    Advertising neutral paths is not enough while the model's own history still
+    names the router's storage: the model reads those commands and notes back,
+    re-opens the router's copies, and writes its derived crops next to them,
+    which the user then sees in the transcript. Every router-owned image path
+    token in a replayed tool call, tool output, or message is replaced by its
+    neutral attachment copy (the bytes are copied first), so the whole
+    read/crop/write workflow moves out of the router's storage without breaking
+    a single path. Only the router's own image files are affected: a path that is
+    not an existing image below the router's storage stays untouched.
+    """
+
+    if not _request_has_responses_shape(request_kwargs) or not _request_has_codex_client_evidence(
+        request_kwargs
+    ):
+        return None
+    input_items = request_kwargs.get("input")
+    if not isinstance(input_items, list):
+        return None
+
+    updated_items = list(input_items)
+    rewritten_paths: set[str] = set()
+
+    def rewrite_path_tokens(text: str) -> str:
+        def replace(match: "re.Match[str]") -> str:
+            end = match.end()
+            if end < len(text) and text[end] in "*?":
+                return match.group(0)
+            neutral = _neutral_attachment_copy(match.group(0))
+            if neutral is None:
+                return match.group(0)
+            rewritten_paths.add(match.group(0))
+            return neutral
+
+        return _ROUTER_PATH_TOKEN.sub(replace, text)
+
+    changed = False
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        updates: dict[str, Any] = {}
+        if item_type in {"custom_tool_call", "function_call"}:
+            for key in ("input", "arguments"):
+                source = item.get(key)
+                if not isinstance(source, str) or not source:
+                    continue
+                candidate = rewrite_path_tokens(source)
+                if candidate != source:
+                    updates[key] = candidate
+        elif item_type in {"custom_tool_call_output", "function_call_output"}:
+            output = item.get("output")
+            if isinstance(output, str) and output:
+                candidate = rewrite_path_tokens(output)
+                if candidate != output:
+                    updates["output"] = candidate
+            elif isinstance(output, list):
+                updated_parts = list(output)
+                parts_changed = False
+                for part_index, part in enumerate(output):
+                    if not isinstance(part, dict):
+                        continue
+                    text = part.get("text")
+                    if not isinstance(text, str) or not text:
+                        continue
+                    candidate = rewrite_path_tokens(text)
+                    if candidate == text:
+                        continue
+                    updated_part = part.copy()
+                    updated_part["text"] = candidate
+                    updated_parts[part_index] = updated_part
+                    parts_changed = True
+                if parts_changed:
+                    updates["output"] = updated_parts
+        elif item_type == "message":
+            content = item.get("content")
+            if isinstance(content, str) and content:
+                candidate = rewrite_path_tokens(content)
+                if candidate != content:
+                    updates["content"] = candidate
+            elif isinstance(content, list):
+                updated_parts = list(content)
+                parts_changed = False
+                for part_index, part in enumerate(content):
+                    if not isinstance(part, dict):
+                        continue
+                    text = part.get("text")
+                    if not isinstance(text, str) or not text:
+                        continue
+                    candidate = rewrite_path_tokens(text)
+                    if candidate == text:
+                        continue
+                    updated_part = part.copy()
+                    updated_part["text"] = candidate
+                    updated_parts[part_index] = updated_part
+                    parts_changed = True
+                if parts_changed:
+                    updates["content"] = updated_parts
+        if not updates:
+            continue
+        updated_item = item.copy()
+        updated_item.update(updates)
+        updated_items[index] = updated_item
+        changed = True
+    if not changed:
+        return None
+    _trace_module._route_trace(
+        "router_path_literals_normalized",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        attachment_root=str(_prefix_image_cache_root()),
+        path_count=len(rewritten_paths),
+    )
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = updated_items
+    return modified_kwargs
 
 
 def _reopenable_replay_image_references(
