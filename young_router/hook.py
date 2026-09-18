@@ -125,6 +125,7 @@ class YoungRouterHook(CustomLogger):
             _reasoning_module._with_model_reasoning_mapping,
             _responses_request_module._with_plaintext_agent_message_content_restored,
             _responses_request_module._with_codex_function_call_arguments_repaired,
+            _responses_request_module._with_neutral_attachment_paths,
             _responses_request_module._with_prefix_image_previews,
             _responses_request_module._with_codex_view_image_output_paths,
             _responses_request_module._with_codex_function_call_output_text,
