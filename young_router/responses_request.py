@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -2261,17 +2262,41 @@ _REPLAY_IMAGE_CACHE_EXTENSIONS = {
 }
 
 
+def _default_replay_image_attachment_root() -> Path:
+    """Return the neutral directory that durable replay copies are advertised from.
+
+    Every advertised path is read by the client model and printed in the user's
+    transcript, so it must never name Young Router or point inside its storage:
+    ``<runtime root>/image-cache`` told the model the router exists, where it
+    keeps state, and gave it a directory to crop images into, which the router's
+    own pruning then deleted.  Copies therefore live in an ordinary attachment
+    directory outside the router's storage.
+    """
+
+    name = _PREFIX_IMAGE_CACHE_DIR_NAME
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / name
+    if os.name == "nt":
+        base = os.getenv("LOCALAPPDATA", "").strip()
+        return (Path(base).expanduser() if base else home / "AppData" / "Local") / name
+    xdg_data_home = os.getenv("XDG_DATA_HOME", "").strip()
+    base = Path(xdg_data_home).expanduser() if xdg_data_home else home / ".local" / "share"
+    return base / name
+
+
 def _prefix_image_cache_root() -> Path:
-    """Return the durable directory that backs replay-image path references."""
+    """Return the durable directory that backs replay-image path references.
+
+    A path handed to the client model must stay openable for the whole task and
+    must not expose the router: the default is the neutral attachment root, and
+    an operator-configured ``YOUNG_ROUTER_IMAGE_CACHE_DIR`` overrides it.
+    """
 
     configured = os.getenv(_PREFIX_IMAGE_CACHE_DIR_ENV, "").strip()
     if configured:
         return Path(configured).expanduser()
-    root = os.getenv("LITELLM_RUNTIME_ROOT", "").strip() or os.getenv(
-        "YOUNG_ROUTER_HOME", ""
-    ).strip()
-    base = Path(root).expanduser() if root else Path.home() / ".young-router"
-    return base / _PREFIX_IMAGE_CACHE_DIR_NAME
+    return _default_replay_image_attachment_root()
 
 
 def _prefix_image_cache_max_files() -> int:
@@ -2356,6 +2381,57 @@ def _replay_image_path_is_reopenable(path: Any) -> bool:
     return not _path_lives_in_temporary_storage(candidate)
 
 
+def _router_storage_roots() -> List[Path]:
+    """Return the directories that belong to the router, not to the client.
+
+    A file inside them exists, but advertising it tells the client model that
+    the router exists, where it keeps its configuration and caches, and gives
+    it a directory to read, crop, and rewrite while the user watches.
+    """
+
+    roots: List[Path] = []
+    for candidate in (
+        os.getenv("LITELLM_RUNTIME_ROOT", "").strip(),
+        os.getenv("YOUNG_ROUTER_HOME", "").strip(),
+        str(Path.home() / ".young-router"),
+    ):
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _path_lives_in_router_storage(path: Path) -> bool:
+    """True when this path belongs to the router rather than to the client.
+
+    The attachment directory this module advertises from is excluded: a copy it
+    materialized is a client-facing attachment even when an operator configured
+    it inside the router's runtime root.
+    """
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    attachment_root = _prefix_image_cache_root()
+    try:
+        attachment_root = attachment_root.resolve()
+    except OSError:
+        pass
+    if resolved == attachment_root or attachment_root in resolved.parents:
+        return False
+    for root in _router_storage_roots():
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
 def _replay_image_cache_target(image_url: Any) -> Optional[tuple[Path, bytes]]:
     parsed = _image_inputs_module._split_image_data_url(image_url)
     if parsed is None:
@@ -2408,6 +2484,23 @@ def _materialize_replay_image(image_url: Any) -> Optional[str]:
     return str(path)
 
 
+_REPLAY_IMAGE_CACHE_FILE_PATTERN = re.compile(
+    r"^[0-9a-f]{32}\.(?:jpg|png|webp|gif|bmp|tiff)$"
+)
+
+
+def _is_managed_replay_image_file(name: str) -> bool:
+    """True for a copy this cache created; every other file is left alone.
+
+    The advertised directory is an ordinary attachment location: the client
+    model writes the crops it derives next to the image it reads, and the user
+    may keep files there too.  Pruning may only ever remove this cache's own
+    digest-named copies, never what the model or the user put there.
+    """
+
+    return bool(_REPLAY_IMAGE_CACHE_FILE_PATTERN.match(name))
+
+
 def _prune_replay_image_cache(directory: Path, *, keep: set[str]) -> None:
     """Bound the durable replay-image cache by file count and total bytes."""
 
@@ -2418,6 +2511,8 @@ def _prune_replay_image_cache(directory: Path, *, keep: set[str]) -> None:
         total_bytes = 0
         for entry in directory.iterdir():
             if not entry.is_file() or entry.name.startswith("."):
+                continue
+            if not _is_managed_replay_image_file(entry.name):
                 continue
             try:
                 stat = entry.stat()
@@ -2462,7 +2557,10 @@ def _reopenable_replay_image_references(
     materialized: List[str] = []
     reopenable = True
     for path, part in zip(paths, image_parts):
-        if _replay_image_path_is_reopenable(path):
+        if _replay_image_path_is_reopenable(path) and not (
+            Path(path.strip()).is_absolute()
+            and _path_lives_in_router_storage(Path(path.strip()))
+        ):
             references.append(path)
             continue
         cached = _materialize_replay_image(part.get("image_url"))
