@@ -482,6 +482,7 @@ def _bound_codex_view_image_previews(
     value: Any,
     *,
     target_bytes: int = _CODEX_VIEW_IMAGE_PREVIEW_TARGET_BYTES,
+    max_edge: int = _INLINE_IMAGE_SINGLE_MAX_EDGE,
 ) -> tuple[Any, bool]:
     """Keep a medium inline preview while retaining a full-resolution path reference."""
 
@@ -492,6 +493,7 @@ def _bound_codex_view_image_previews(
             updated_item, item_changed = _bound_codex_view_image_previews(
                 item,
                 target_bytes=target_bytes,
+                max_edge=max_edge,
             )
             updated_items.append(updated_item)
             changed = changed or item_changed
@@ -507,7 +509,7 @@ def _bound_codex_view_image_previews(
         updated_output, changed = _bound_image_data_urls(
             value["output"],
             target_bytes=target_bytes,
-            max_edge=_INLINE_IMAGE_MANY_MAX_EDGE,
+            max_edge=max_edge,
         )
         if not changed:
             return value, False
@@ -611,6 +613,7 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
         bounded_suffix, preview_changed = _bound_codex_view_image_previews(
             original_suffix,
             target_bytes=codex_preview_target,
+            max_edge=_INLINE_IMAGE_SINGLE_MAX_EDGE,
         )
         bounded_suffixes[key] = bounded_suffix
         preview_changed_by_key[key] = preview_changed
@@ -621,7 +624,12 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
     total_image_count = encrypted_prefix_image_count + len(sizes)
     many_images = total_image_count > 1
     target_bytes = _INLINE_IMAGE_SINGLE_TARGET_BYTES
-    if many_images and sizes:
+    if len(sizes) == 1:
+        # The single fresh image of this turn is the one the model is reading:
+        # forward it at the single-image representation even while older
+        # previews share the request.
+        target_bytes = _INLINE_IMAGE_SINGLE_TARGET_BYTES
+    elif many_images and sizes:
         remaining_history_bytes = max(
             0,
             _INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES
@@ -648,7 +656,13 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
     ):
         return None
 
-    max_edge = _INLINE_IMAGE_MANY_MAX_EDGE if many_images else _INLINE_IMAGE_SINGLE_MAX_EDGE
+    # Fresh (mutable-suffix) images are bounded by bytes, never by the shared
+    # preview edge: the model routinely crops a region at several thousand
+    # pixels to read handwriting, and replaying that crop at 1400 px destroyed
+    # the zoom and sent it back to crop again. The 2200 px single-image edge
+    # keeps one crop readable at the same byte budget; older history images
+    # still replay as their deterministic previews.
+    max_edge = _INLINE_IMAGE_SINGLE_MAX_EDGE
 
     modified_kwargs = copy.copy(request_kwargs)
     changed = False
