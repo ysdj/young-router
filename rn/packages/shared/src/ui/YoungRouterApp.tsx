@@ -5778,6 +5778,7 @@ function recoveryDetailLabel(value: string, translate: Translate): string {
     authentication: "logs.recoveryReason.authentication",
     network: "logs.recoveryReason.network",
     rate_limit: "logs.recoveryReason.rateLimit",
+    request_size: "logs.recoveryReason.requestSize",
     timeout: "logs.recoveryReason.timeout",
     unknown: "logs.recoveryReason.unknown",
   };

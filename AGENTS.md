@@ -43,6 +43,14 @@
 
 ## Known Runtime Failure Modes
 
+### Observed Unbounded Original-Resolution Replay Incident (2026-09-18)
+
+- The same Codex thread as the signed-prefix incident kept re-opening its own derived crops with `view_image(detail: "original")`. Its replay reached 23 inline images (147.9 MB as sent by the client, 94.9 MB of them ahead of the encrypted boundary), and the proxy still forwarded 45.2 MB per turn: the prefix pass deliberately kept the most recent original-resolution outputs at their original bytes (6 images, 44.9 MB), and the suffix pass exempted `[young-router original image]` outputs from the inline-image budget entirely, so the very exception meant to preserve one explicit re-open became an unbounded inline history.
+- `api.gamma.example` answered that body with HTTP 413 in ~2.6 s while peer routes exhausted their 300 s stream-start budget. The 413 was classified `upstream-temporary-class`, so each rejection cooled its route down, the pool emptied, and the request entered the shared route-recovery poll: the identical bytes were replayed every ~5 s for up to the 4 h recovery window while the client waited, and the client's own retries started competing polls. The thread wrote no rollout events for hours.
+- The implemented fix keeps the replay free of unframed original bytes: an explicit original-resolution output replays as the same deterministic preview plus its local path inside the frozen prefix, and as the single-image representation (≤900 KB, max edge 2200) in the mutable suffix, so one re-open still returns a visibly larger, sharper view than the shared preview while a task full of re-opens stays inside the request budget. Replaying the incident request now forwards 2.9 MB instead of 45.2 MB and every replayed image keeps its re-openable path.
+- An explicit upstream body-size rejection (HTTP 413 without the gateway storage-capacity marker) is a request error, not a route error: it is remembered per request, no longer cools a healthy route down, still advances to a peer route once because gateway body limits are local, and can never enter or continue the route-recovery poll. The client receives the rejection itself (`413`, message naming the oversized body) instead of a multi-hour wait; a structured-compaction gateway capacity rejection keeps its existing failover treatment.
+- Keep the earlier rules: compress new oversized images to an accepted representation, keep the replay inside the inline-image budget, and never let a preservation rule become an unbounded inline history.
+
 ### Observed Signed-Prefix Image Path-Rewrite Incident (2026-09-17)
 
 - Codex thread `01a09b90-3ce8-76d2-88af-27e676b7e9dc` was asked to total the daily drainage volumes of four pasted photos of handwritten flow sheets. It spent about nine hours cropping, upscaling, and OCR-ing those photos, was interrupted once, and its final turns could only retry `view_image` and Swift-Vision OCR against files that no longer existed.

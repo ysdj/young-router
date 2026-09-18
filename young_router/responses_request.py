@@ -2127,7 +2127,9 @@ def _with_codex_view_image_output_paths(request_kwargs: dict) -> Optional[dict]:
             reference_text = (
                 f"{_CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER}\n"
                 "Original-resolution image requested for this explicit re-open; "
-                "the inline image below is intentionally not reduced.\n"
+                "the inline image below carries the highest resolution this "
+                "route forwards. For the original file, call view_image on the "
+                "matching local path:\n"
                 f"{_CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
                 f"{references}"
             )
@@ -2190,10 +2192,13 @@ def _prefix_image_original_path_enabled() -> bool:
     """Whether original-resolution outputs join the path-recent conversion.
 
     When enabled (default), view_image outputs explicitly requested at
-    ``detail: original`` keep their original bytes inline only while they stay
-    inside the recent window; older ones become pure local-path references like
-    every other historical output.  Disable to replay explicit
-    original-resolution requests unchanged forever.
+    ``detail: original`` are replayed like every other historical output: a
+    deterministic preview plus the matching local path inside the recent
+    window, and a pure local-path reference once they age out.  The original
+    bytes are never replayed inline, because one task that re-opens several
+    crops at ``detail: original`` would otherwise carry tens of megabytes of
+    history on every turn.  Disable to replay explicit original-resolution
+    requests unchanged forever.
     """
 
     value = os.getenv(_PREFIX_IMAGE_ORIGINAL_PATH_ENV, "").strip().lower()
@@ -2607,6 +2612,15 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
     the inline image is kept: replay history must never trade the model's only
     view of an image for a path it cannot open.
 
+    The replay never carries a multi-megabyte original: a crop re-opened at
+    ``detail: original`` is routinely 2-12 MB, so a task that keeps several of
+    them in its frozen prefix makes every turn larger than the upstream gateway
+    accepts instead of just larger than the model needs.  An explicit
+    original-resolution output is therefore replayed as the same deterministic
+    preview as every other oversized history image, and only the matching local
+    path (always part of the same preview reference text) is left to reach the
+    original bytes.
+
     ``YOUNG_ROUTER_PREFIX_IMAGE_MODE`` selects the treatment: ``preview``
     keeps previews for every oversized paired output, ``path-recent`` keeps
     previews only for the most recent image outputs (count from
@@ -2730,7 +2744,6 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
     recent_count = _prefix_image_recent_count() if mode == "path-recent" else 0
     candidate_indices: list[int] = []
     candidate_paths: dict[int, list[str]] = {}
-    candidate_original: dict[int, bool] = {}
     claimed_call_ids: set[str] = set()
     skipped_referenced = 0
     skipped_original = 0
@@ -2779,7 +2792,6 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
             continue
         candidate_indices.append(index)
         candidate_paths[index] = paths
-        candidate_original[index] = is_original
 
     # The most recent image outputs keep their preview treatment so the model
     # retains visual continuity near the current turn; older ones fall back to
@@ -2836,14 +2848,6 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
             updated_item["output"] = [reference_part, *kept_parts]
             updated_items[index] = updated_item
             changed = True
-            continue
-
-        if candidate_original[index] and (
-            mode != "path-recent" or index in recent_candidates
-        ):
-            # An explicit original-resolution request inside the recent window
-            # keeps its original bytes inline; it converts to a path reference
-            # only once it ages out of the window.
             continue
 
         oversized = [

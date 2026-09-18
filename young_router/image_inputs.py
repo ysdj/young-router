@@ -536,12 +536,58 @@ def _collect_compressible_image_data_url_sizes(value: Any, sizes: List[int]) -> 
     _collect_image_data_url_sizes(value, sizes)
 
 
+def _bound_codex_view_image_originals(value: Any) -> tuple[Any, bool]:
+    """Bound an explicit original-resolution replay to its accepted size.
+
+    A ``detail: original`` re-open asks for the largest view of that file the
+    route can carry, not for an exemption from the request budget: the original
+    bytes of a crop are routinely 2-12 MB each, and a task that replays several
+    of them makes every turn exceed what an upstream gateway accepts (observed:
+    HTTP 413 follow-the-same-body retries that cannot succeed). Each such output
+    is therefore bounded to the single-image representation, which is larger and
+    higher resolution than the shared preview target, and its reference text
+    keeps the matching local path so the model can still re-open the file.
+    """
+
+    if isinstance(value, list):
+        changed = False
+        updated_items: List[Any] = []
+        for item in value:
+            updated_item, item_changed = _bound_codex_view_image_originals(item)
+            updated_items.append(updated_item)
+            changed = changed or item_changed
+        return (updated_items if changed else value), changed
+    if not isinstance(value, dict):
+        return value, False
+    if value.get("type") == "custom_tool_call_output" and (
+        _output_has_codex_view_image_original_references(value.get("output"))
+    ):
+        updated_output, changed = _bound_image_data_urls(
+            value["output"],
+            target_bytes=_INLINE_IMAGE_SINGLE_TARGET_BYTES,
+            max_edge=_INLINE_IMAGE_SINGLE_MAX_EDGE,
+        )
+        if not changed:
+            return value, False
+        updated_value = value.copy()
+        updated_value["output"] = updated_output
+        return updated_value, True
+    changed = False
+    updated_value: Dict[Any, Any] = {}
+    for key, item in value.items():
+        updated_item, item_changed = _bound_codex_view_image_originals(item)
+        updated_value[key] = updated_item
+        changed = changed or item_changed
+    return (updated_value if changed else value), changed
+
+
 def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
     sizes: List[int] = []
     encrypted_prefix_image_count = 0
     encrypted_prefix_inline_image_bytes = 0
     bounded_suffixes: Dict[str, Any] = {}
     preview_changed_by_key: Dict[str, bool] = {}
+    original_changed_by_key: Dict[str, bool] = {}
     codex_preview_count = 0
     for key in ("input", "messages"):
         value = request_kwargs.get(key)
@@ -549,6 +595,7 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
         codex_preview_count += _codex_view_image_preview_count(suffix)
         bounded_suffixes[key] = suffix
         preview_changed_by_key[key] = False
+        original_changed_by_key[key] = False
         if isinstance(value, list):
             prefix = value[: len(value) - len(suffix)]
             prefix_stats = _image_input_stats(prefix)
@@ -559,20 +606,22 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
     for key in ("input", "messages"):
         value = request_kwargs.get(key)
         suffix = bounded_suffixes[key]
+        original_suffix, original_changed = _bound_codex_view_image_originals(suffix)
+        original_changed_by_key[key] = original_changed
         bounded_suffix, preview_changed = _bound_codex_view_image_previews(
-            suffix,
+            original_suffix,
             target_bytes=codex_preview_target,
         )
         bounded_suffixes[key] = bounded_suffix
         preview_changed_by_key[key] = preview_changed
         _collect_compressible_image_data_url_sizes(bounded_suffix, sizes)
-    if not sizes:
+    if not sizes and not any(original_changed_by_key.values()):
         return None
 
     total_image_count = encrypted_prefix_image_count + len(sizes)
     many_images = total_image_count > 1
     target_bytes = _INLINE_IMAGE_SINGLE_TARGET_BYTES
-    if many_images:
+    if many_images and sizes:
         remaining_history_bytes = max(
             0,
             _INLINE_IMAGE_MANY_TOTAL_TARGET_BYTES
@@ -592,8 +641,10 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
                 remaining_per_image_bytes,
             ),
         )
-    if all(size <= target_bytes for size in sizes) and not any(
-        preview_changed_by_key.values()
+    if (
+        all(size <= target_bytes for size in sizes)
+        and not any(preview_changed_by_key.values())
+        and not any(original_changed_by_key.values())
     ):
         return None
 
@@ -605,12 +656,19 @@ def _with_bounded_image_inputs(request_kwargs: dict) -> Optional[dict]:
         value = request_kwargs.get(key)
         suffix = _image_bounding_suffix(value)
         bounded_suffix = bounded_suffixes[key]
-        updated_suffix, value_changed = _bound_image_data_urls(
-            bounded_suffix,
-            target_bytes=target_bytes,
-            max_edge=max_edge,
-        )
-        if value_changed or preview_changed_by_key[key]:
+        if sizes:
+            updated_suffix, value_changed = _bound_image_data_urls(
+                bounded_suffix,
+                target_bytes=target_bytes,
+                max_edge=max_edge,
+            )
+        else:
+            updated_suffix, value_changed = bounded_suffix, False
+        if (
+            value_changed
+            or preview_changed_by_key[key]
+            or original_changed_by_key[key]
+        ):
             if isinstance(value, list):
                 modified_kwargs[key] = value[: len(value) - len(suffix)] + updated_suffix
             else:

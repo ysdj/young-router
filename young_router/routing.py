@@ -97,6 +97,8 @@ from .base import (
     _RECOVERY_MAX_SECONDS_ENV,
     _REQUEST_TIMEOUT_DEFAULT_SECONDS,
     _REQUEST_TIMEOUT_SECONDS_ENV,
+    _REQUEST_BODY_SIZE_REJECTED_METADATA_KEY,
+    _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE,
     _ROUTE_RECOVERY_POLL_METADATA_KEY,
     _ROUTE_FAILURE_POLICY_ATTR,
     _RouteOrder,
@@ -758,6 +760,7 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         )
     if (
         _is_context_size_error(exception)
+        or _is_request_body_size_rejection_error(exception)
         or _is_terminal_prompt_or_policy_error(exception)
         or _is_ssl_verification_error(exception)
         or _is_upstream_model_not_found_error(exception)
@@ -948,6 +951,11 @@ def _should_return_route_recovery_stream(
     if _is_route_recovery_poll_payload(request_kwargs):
         return False
     if request_kwargs.get("stream") is not True:
+        return False
+    # A body an upstream already refused by size will not fit any later: the
+    # poll would replay identical bytes for the whole recovery window while the
+    # client waits. Surface the explicit rejection instead.
+    if _request_body_size_rejected(request_kwargs):
         return False
     # Route recovery is a routing decision.  The stream adapter selects the
     # wire method later, but the recovery/cooldown policy must not depend on
@@ -4240,6 +4248,8 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "upstream-gateway-bad-request"
     elif _is_upstream_request_body_storage_capacity_error(exception):
         reason = "upstream-request-body-capacity"
+    elif _is_request_body_size_rejection_error(exception):
+        reason = "upstream-request-body-too-large"
     elif _is_responses_schema_unsupported_error(exception):
         reason = "responses-schema-unsupported"
     elif _is_image_parameter_or_capability_bad_request_error(exception):
@@ -4284,6 +4294,15 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "kind": "billing",
             "title": "Billing or credit limit",
             "detail": "The upstream reported insufficient balance, quota, or credits.",
+        }
+    elif _is_request_body_size_rejection_error(exception):
+        result = {
+            "kind": "request_size",
+            "title": "Request body too large",
+            "detail": (
+                "An upstream refused this request body by size. Start a new task, "
+                "or remove images from the conversation."
+            ),
         }
     elif status_code in (401, 403) or any(
         marker in text
@@ -4994,6 +5013,83 @@ def _is_request_scoped_priority_deployment_failover_error(
     )
 
 
+def _is_request_body_size_rejection_error(exception: Exception) -> bool:
+    """Whether an upstream explicitly refused this request body by size.
+
+    HTTP 413 is the route's own, explicit answer that this body cannot fit
+    through it.  The same bytes will not fit later, and no cooldown or recovery
+    wait can shrink them, so the failure belongs to the request rather than to
+    the route.  A gateway that reports its own storage-capacity failure keeps
+    the existing failover treatment (a structured compaction body may fit
+    another gateway), and a structured compaction transport error is never
+    inferred as a size limit.
+    """
+
+    if _exception_status_code(exception) != _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE:
+        return False
+    return not _is_upstream_request_body_storage_capacity_error(exception)
+
+
+def _remember_request_body_size_rejection(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> None:
+    """Record on the request that a route refused its body by size.
+
+    Route failover must still be able to reach a gateway with a larger body
+    limit, so the rejection is remembered per request instead of ending the
+    turn: once every candidate has answered the same way, the request is
+    unservable and the route recovery poll must not hold the client open for
+    the configured recovery window retrying identical bytes.
+    """
+
+    if not _is_request_body_size_rejection_error(exception):
+        return
+    if not isinstance(request_kwargs, dict):
+        return
+    # The same marking path also receives a raw deployment marker; only a real
+    # request dict may carry the sticky flag.
+    if not any(
+        key in request_kwargs for key in ("input", "messages", "model", "call_type")
+    ):
+        return
+    metadata = (
+        _request_context_module._request_metadata_dict(
+            request_kwargs,
+            "litellm_metadata",
+        )
+        or {}
+    )
+    if metadata.get(_REQUEST_BODY_SIZE_REJECTED_METADATA_KEY) is True:
+        return
+    updated_metadata = metadata.copy()
+    updated_metadata[_REQUEST_BODY_SIZE_REJECTED_METADATA_KEY] = True
+    request_kwargs["litellm_metadata"] = updated_metadata
+
+
+def _request_body_size_rejected(request_kwargs: Optional[dict]) -> bool:
+    """Whether this request already hit an explicit upstream size rejection."""
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    containers: List[Any] = [request_kwargs]
+    litellm_params = request_kwargs.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        containers.append(litellm_params)
+    for container in containers:
+        for metadata_key in ("litellm_metadata", "metadata"):
+            metadata = _request_context_module._request_metadata_dict(
+                container,
+                metadata_key,
+            )
+            if (
+                isinstance(metadata, dict)
+                and metadata.get(_REQUEST_BODY_SIZE_REJECTED_METADATA_KEY) is True
+            ):
+                return True
+    return False
+
+
 def _is_context_size_error(exception: Exception) -> bool:
     text = _exception_text(exception)
     if not text:
@@ -5219,6 +5315,7 @@ def _mark_exception_for_deployment_failover(
         )
     except Exception:
         pass
+    _remember_request_body_size_rejection(exception, request_kwargs)
     _apply_current_selected_deployment_to_request(request_kwargs)
     deployment_id = _deployment_id_from_request(request_kwargs)
     route_key = _deployment_route_key_from_request(request_kwargs)
@@ -5412,6 +5509,11 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         # contract. That is this deployment's capability failure: advance to
         # another candidate deployment when one exists instead of treating the
         # whole request as a terminal client error.
+        return True
+    if _is_request_body_size_rejection_error(exception):
+        # Body limits are gateway-local: the same bytes may fit another
+        # candidate route, so an explicit size rejection advances the request
+        # instead of ending the turn on the first gateway.
         return True
     if _is_context_size_error(exception):
         return False
@@ -5983,6 +6085,14 @@ def _sanitized_upstream_route_failure_message(
     request_kwargs: Optional[dict],
 ) -> str:
     model_group = model or _responses_execution_module._request_model_group(request_kwargs) or "requested model"
+    if _request_body_size_rejected(request_kwargs):
+        # The replay itself was refused, not the route. Naming the cause keeps
+        # the client from waiting for a route that cannot ever accept it.
+        return (
+            f"Upstream rejected this request body as too large for {model_group} "
+            "on every candidate route. Start a new task, or remove images from "
+            "the conversation so the replay fits the upstream limit."
+        )
     status_code = _exception_status_code(exception)
     relay_message = _upstream_relay_capacity_message(exception)
     if _is_upstream_deployment_failover_error(exception):
@@ -6067,7 +6177,11 @@ def _sanitized_upstream_route_exception(
     except Exception:
         pass
     try:
-        sanitized.status_code = _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE  # type: ignore[attr-defined]
+        sanitized.status_code = (  # type: ignore[attr-defined]
+            _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE
+            if _request_body_size_rejected(request_kwargs)
+            else _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE
+        )
     except Exception:
         pass
     for attr in (
