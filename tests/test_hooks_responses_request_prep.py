@@ -4153,3 +4153,96 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIn(str(legacy_cache / "notes.txt"), modified["input"][3]["content"][0]["text"])
         self.assertFalse((cache_dir / "notes.txt").exists())
         self.assertFalse((cache_dir / "config.yaml").exists())
+
+    def test_fresh_crops_keep_their_zoom_while_history_keeps_previews(self) -> None:
+        """The model's own crop keeps up to 2200 px; history replays as previews.
+
+        Cropping a region at several thousand pixels is how the model reads
+        handwriting. Replaying that crop at the shared 1400 px preview edge threw
+        the zoom away, so the model cropped the same region again and again.
+        """
+
+        import base64
+        import io
+        import os
+
+        from PIL import Image
+
+        hooks, _ = load_hook_module()
+        image = Image.frombytes("RGB", (4000, 2500), os.urandom(4000 * 2500 * 3))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=95)
+        fresh_url = (
+            "data:image/jpeg;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii")
+        )
+        self.assertGreater(
+            hooks._image_data_url_size(fresh_url),
+            hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
+        )
+        crop_call = {
+            "type": "custom_tool_call",
+            "call_id": "call-crop",
+            "name": "exec",
+            "input": "sips -c 2400 3900 --cropOffset 0 0 photo.jpg --out crop.png",
+        }
+        crop_output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-crop",
+            "output": [
+                {"type": "input_text", "text": "Script completed"},
+                {"type": "input_image", "image_url": fresh_url},
+            ],
+        }
+        encrypted = {"type": "reasoning", "encrypted_content": "opaque"}
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+            "input": [encrypted, crop_call, crop_output],
+        }
+
+        modified = hooks._with_bounded_image_inputs(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        image_url = modified["input"][2]["output"][1]["image_url"]
+        self.assertLessEqual(
+            hooks._image_data_url_size(image_url),
+            hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
+        )
+        with Image.open(
+            io.BytesIO(base64.b64decode(image_url.split(",", 1)[1]))
+        ) as resized:
+            # Above the shared preview edge even for this worst-case noisy image
+            # (a real crop lands at the full 2200 px), so the zoom survives.
+            self.assertGreater(resized.size[0], hooks._INLINE_IMAGE_MANY_MAX_EDGE)
+        # The client's own bytes are untouched.
+        self.assertEqual(request["input"][2]["output"][1]["image_url"], fresh_url)
+
+    def test_history_previews_still_use_the_shared_preview_edge(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        seen: list[tuple[int, int]] = []
+
+        def fake_resize(value: str, *, target_bytes: int, max_edge: int) -> str:
+            seen.append((target_bytes, max_edge))
+            return "data:image/jpeg;base64,cHJldmlldw=="
+
+        request = self._prefix_preview_request()
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url", side_effect=fake_resize
+        ):
+            hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+            modified = hooks._with_prefix_image_previews(request)
+
+        self.assertIsNotNone(modified)
+        self.assertEqual(
+            seen,
+            [
+                (
+                    hooks._CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+                    hooks._INLINE_IMAGE_MANY_MAX_EDGE,
+                )
+            ],
+        )
