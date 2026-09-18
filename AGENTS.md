@@ -46,9 +46,10 @@
 ### Observed Router-Path Exposure Incident (2026-09-18)
 
 - Advertised durable copies lived in `<runtime root>/image-cache`, so the client model learned the router's storage, read it (`sips … /Users/mba/.young-router/image-cache/<digest>.jpg`), wrote derived crops back into it, and lost them when `_prune_replay_image_cache` deleted them.
-- Fix: advertised copies live in a neutral attachment directory outside the router's storage (`<user data>/ImageAttachments`, `YOUNG_ROUTER_IMAGE_CACHE_DIR` overrides); an existing client path inside the router's runtime root or home directory is re-materialized there instead of echoed back.
+- Fix: advertised copies live in a neutral attachment directory outside the router's storage (`<user data>/ImageAttachments`, no spaces because scripts use the path unquoted; `YOUNG_ROUTER_IMAGE_CACHE_DIR` overrides).
+- Fix: `_with_neutral_attachment_paths` rewrites every router-owned image path token in a replayed tool call, tool output, or message — quoted, backticked, or bare — to its neutral copy (bytes copied first, digest name when the plain name is taken), because the model reads its own history back and otherwise keeps working inside the router's storage. Non-image router files are never copied into a model-visible place; a trailing glob character skips the token.
 - Fix: pruning only considers this cache's own digest-named copies (`^[0-9a-f]{32}\.(jpg|png|webp|gif|bmp|tiff)$`); model-derived crops and user files in that directory are never deleted.
-- Every advertised path is user-visible in the transcript: keep it neutral, durable, and writable, and never delete files the router did not create.
+- Every path handed to the client model is user-visible in the transcript: keep it neutral, durable, writable, and free of spaces; never advertise a path inside the router's own storage, never rewrite a path the router cannot back with an existing file, and never let cache maintenance delete files the router did not create.
 
 ### Observed Unbounded Original-Resolution Replay Incident (2026-09-18)
 
