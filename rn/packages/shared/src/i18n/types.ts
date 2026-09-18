@@ -229,6 +229,7 @@ export type TranslationKey =
   | "logs.recoveryReason.network"
   | "logs.recoveryReason.rateLimit"
   | "logs.recoveryReason.timeout"
+  | "logs.recoveryReason.requestSize"
   | "logs.recoveryReason.unknown"
   | "logs.action"
   | "logs.duration"

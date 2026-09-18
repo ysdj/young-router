@@ -228,6 +228,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.recoveryReason.network": "Network connection failed",
   "logs.recoveryReason.rateLimit": "Rate limited",
   "logs.recoveryReason.timeout": "Upstream timed out",
+  "logs.recoveryReason.requestSize": "Request body too large",
   "logs.recoveryReason.unknown": "Recovery is retrying",
   "logs.action": "ACTION",
   "logs.duration": "DURATION (S)",
