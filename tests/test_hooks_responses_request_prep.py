@@ -3894,3 +3894,98 @@ class HookResponsesRequestPrepTests(HookTestCase):
         request = {"call_type": "aresponses", "input": [output_item]}
 
         self.assertIsNone(hooks._with_bounded_image_inputs(request))
+
+    def test_replay_image_default_attachment_root_is_neutral(self) -> None:
+        """Advertised paths must not expose or point inside the router.
+
+        The reference text is read by the client model and printed in the
+        user's transcript, so the default attachment directory is a neutral
+        location outside Young Router's own storage.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env("YOUNG_ROUTER_IMAGE_CACHE_DIR", None)
+        self.set_env("LITELLM_RUNTIME_ROOT", "/tmp/fake-router-runtime-root")
+        self.set_env("YOUNG_ROUTER_HOME", "/tmp/fake-young-router-home")
+
+        root = hooks._prefix_image_cache_root()
+        self.assertEqual(root.name, hooks._PREFIX_IMAGE_CACHE_DIR_NAME)
+        self.assertTrue(root.is_absolute())
+        text = str(root)
+        for forbidden in (
+            "young-router",
+            "young_router",
+            "fake-router-runtime-root",
+            "fake-young-router-home",
+        ):
+            self.assertNotIn(forbidden, text)
+
+        configured = self.use_replay_image_cache()
+        self.assertEqual(hooks._prefix_image_cache_root(), configured)
+
+    def test_replay_image_cache_prunes_only_its_own_copies(self) -> None:
+        hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
+        self.set_env(hooks._PREFIX_IMAGE_CACHE_MAX_FILES_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_CACHE_MAX_BYTES_ENV, "1000000")
+        model_crop = cache_dir / "derived_B_top.png"
+        model_crop.write_bytes(b"the model's own crop")
+        user_file = cache_dir / "flow-sheet.jpg"
+        user_file.write_bytes(b"a file the user keeps here")
+        stale_copy = cache_dir / ("a" * 32 + ".png")
+        stale_copy.write_bytes(b"x" * 16)
+        recent_copy = cache_dir / ("b" * 32 + ".jpg")
+        recent_copy.write_bytes(b"y" * 16)
+        stale = time.time() - hooks._PREFIX_IMAGE_CACHE_GRACE_SECONDS - 60
+        os.utime(stale_copy, (stale, stale))
+
+        hooks._prune_replay_image_cache(cache_dir, keep=set())
+
+        # Only this cache's own digest-named copies are candidates: a crop the
+        # model derived from a replayed image and the user's own file survive.
+        self.assertFalse(stale_copy.exists())
+        self.assertTrue(recent_copy.exists())
+        self.assertTrue(model_crop.exists())
+        self.assertTrue(user_file.exists())
+        self.assertFalse(hooks._is_managed_replay_image_file("derived_B_top.png"))
+        self.assertFalse(hooks._is_managed_replay_image_file("flow-sheet.jpg"))
+        self.assertFalse(hooks._is_managed_replay_image_file("a" * 31 + ".png"))
+        self.assertTrue(hooks._is_managed_replay_image_file("b" * 32 + ".jpg"))
+
+    def test_replay_image_reference_moves_a_router_owned_path_out_of_view(self) -> None:
+        """A router-internal path is copied into the neutral attachment root.
+
+        An existing file inside the router's own storage is still not something
+        the client model should be pointed at, so its bytes are re-materialized
+        where the model may safely read and crop them.
+        """
+
+        hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
+        legacy_root = tempfile.TemporaryDirectory(prefix="young-router-legacy-")
+        self.addCleanup(legacy_root.cleanup)
+        self.set_env("YOUNG_ROUTER_HOME", legacy_root.name)
+        branded = Path(legacy_root.name) / "image-cache" / "6984af2576d7c2ebf38f2033f4ba258e.jpg"
+        branded.parent.mkdir(parents=True, exist_ok=True)
+        branded.write_bytes(b"original photo bytes")
+        image_part = {
+            "type": "input_image",
+            "image_url": (
+                "data:image/jpeg;base64,"
+                + base64.b64encode(b"original photo bytes").decode("ascii")
+            ),
+        }
+
+        references, materialized, reopenable = (
+            hooks._reopenable_replay_image_references(
+                [str(branded)],
+                [image_part],
+            )
+        )
+
+        self.assertTrue(reopenable)
+        self.assertEqual(len(materialized), 1)
+        self.assertFalse(str(references[0]).startswith(legacy_root.name))
+        self.assertTrue(str(references[0]).startswith(str(cache_dir)))
+        self.assertTrue(Path(references[0]).is_file())
+        self.assertEqual(Path(references[0]).read_bytes(), b"original photo bytes")
