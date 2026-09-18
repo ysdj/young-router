@@ -3799,6 +3799,11 @@ async def _stream_native_route_recovery_poll_attempt(
 def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     if _routing_module._is_upstream_model_not_found_error(exception):
         return False
+    # A route that refuses this body by size will refuse it on every later
+    # attempt too, so an explicit rejection ends the poll instead of replaying
+    # identical bytes for the rest of the recovery window.
+    if _routing_module._is_request_body_size_rejection_error(exception):
+        return False
     if _external_web_search_exception_has_recovery_request(exception):
         return True
     return _routing_module._is_route_recovery_poll_error(exception)
@@ -4206,6 +4211,18 @@ async def _stream_route_recovery_poll(
         return
     max_poll_seconds = _routing_module._recovery_max_seconds_for_request(request_data)
     if max_poll_seconds <= 0:
+        return
+    # The request body was already refused by size on this request: another
+    # attempt forwards the same bytes, so the poll cannot make progress and
+    # must not hold the client open until the recovery window expires.
+    if _routing_module._request_body_size_rejected(request_data):
+        _trace_module._route_trace(
+            "route_recovery_poll_body_size_rejected",
+            request_id=_routing_module._trace_request_id(request_data),
+            session=_routing_module._trace_session_context(request_data),
+            model_group=_responses_execution_module._request_model_group(request_data),
+            exception=_routing_module._trace_exception(exception),
+        )
         return
     if not _external_web_search_recovery_poll_error(exception):
         return

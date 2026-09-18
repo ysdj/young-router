@@ -228,6 +228,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.recoveryReason.network": "网络连接失败",
   "logs.recoveryReason.rateLimit": "触发速率限制",
   "logs.recoveryReason.timeout": "上游响应超时",
+  "logs.recoveryReason.requestSize": "请求体过大",
   "logs.recoveryReason.unknown": "正在重试",
   "logs.action": "动作",
   "logs.duration": "耗时(s)",

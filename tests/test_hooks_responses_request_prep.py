@@ -1804,8 +1804,24 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER,
             json.dumps(updated_multi["output"]),
         )
-        # Explicit original-resolution output stays byte-identical.
-        self.assertEqual(modified["input"][3], original_output)
+        # An explicit original-resolution reopen is replayed at the same bounded
+        # preview fidelity as every other history image, together with the
+        # matching path reference that keeps the original openable.
+        updated_original = modified["input"][3]
+        self.assertEqual(updated_original["call_id"], "call-original")
+        self.assertEqual(updated_original["id"], "ctco_orig")
+        self.assertEqual(
+            [part.get("type") for part in updated_original["output"]],
+            ["input_text", "input_image"],
+        )
+        self.assertIn(
+            hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER,
+            updated_original["output"][0]["text"],
+        )
+        self.assertEqual(
+            updated_original["output"][1]["image_url"],
+            "data:image/jpeg;base64,shrunk",
+        )
         self.assertEqual(modified["input"][4], encrypted)
 
         # Disabled by setting -> untouched.
@@ -2195,10 +2211,12 @@ class HookResponsesRequestPrepTests(HookTestCase):
         request = build()
         hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
         with mock.patch.object(
-            hooks._image_inputs_module, "_resize_data_url"
+            hooks._image_inputs_module,
+            "_resize_data_url",
+            side_effect=lambda value, *, target_bytes, max_edge: "data:image/jpeg;base64,preview",
         ) as resize_mock:
             modified = hooks._with_prefix_image_previews(request)
-            resize_mock.assert_not_called()
+            self.assertEqual(resize_mock.call_count, 1)
 
         self.assertIsNotNone(modified)
         assert modified is not None
@@ -2215,8 +2233,15 @@ class HookResponsesRequestPrepTests(HookTestCase):
                 base64.b64decode("O" * 150_000),
                 Path(advertised[0]).read_bytes(),
             )
-        # 保留窗口内的原图输出 -> 原始字节原样内联
-        self.assertEqual(modified["input"][5], request["input"][5])
+        # 保留窗口内的原图输出 -> 预览 + 路径引用（不再内联原始字节）
+        recent_output = modified["input"][5]["output"]
+        recent_images = [p for p in recent_output if p.get("type") == "input_image"]
+        self.assertEqual(len(recent_images), 1)
+        self.assertEqual(recent_images[0]["image_url"], "data:image/jpeg;base64,preview")
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, recent_output[0]["text"])
+        advertised = self.reference_paths(recent_output[0]["text"])
+        self.assertEqual(len(advertised), 1)
+        self.assertTrue(Path(advertised[0]).is_file())
         self.assertEqual(modified["input"][6], request["input"][6])
 
     def test_prefix_image_original_path_switch_off_preserves_original_outputs(self) -> None:
@@ -2507,7 +2532,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertEqual(original["input"][1]["output"][0]["image_url"], original_url)
 
-    async def test_pre_call_explicit_reopen_preserves_original_resolution(self) -> None:
+    async def test_pre_call_explicit_reopen_is_bounded_to_the_largest_forwarded_view(self) -> None:
         import base64
         import io
         import os
@@ -2515,6 +2540,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        self.use_replay_image_cache()
         path = "/Users/example/project/qa/original.png"
         image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
         buffer = io.BytesIO()
@@ -2575,9 +2601,22 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER,
             output[0]["text"],
         )
-        self.assertEqual(output[1]["image_url"], original_url)
+        # An explicit original-resolution reopen is not an exemption from the
+        # request budget: it keeps the single-image representation (larger and
+        # higher resolution than the shared preview) and its local path.
+        self.assertNotEqual(output[1]["image_url"], original_url)
+        self.assertLessEqual(
+            hooks._image_data_url_size(output[1]["image_url"]),
+            hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
+        )
+        self.assertGreater(
+            hooks._image_data_url_size(output[1]["image_url"]),
+            16_384,
+        )
+        self.assertIn(path, output[0]["text"])
+        self.assertEqual(original["input"][2]["output"][0]["image_url"], original_url)
 
-    async def test_iterative_original_image_becomes_immutable_after_encrypted_boundary(self) -> None:
+    async def test_iterative_original_image_is_bounded_after_encrypted_boundary(self) -> None:
         import base64
         import io
         import os
@@ -2585,6 +2624,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         from PIL import Image
 
         hooks, _ = load_hook_module()
+        self.use_replay_image_cache()
         path = "/Users/example/project/qa/iterative-original.png"
         image = Image.frombytes("RGB", (1400, 1400), os.urandom(1400 * 1400 * 3))
         buffer = io.BytesIO()
@@ -2593,30 +2633,49 @@ class HookResponsesRequestPrepTests(HookTestCase):
             "data:image/jpeg;base64,"
             + base64.b64encode(buffer.getvalue()).decode("ascii")
         )
+        # The client re-sends its own history unchanged on every turn.
+        client_items = [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call-first",
+                "name": "exec",
+                "input": (
+                    "const preview = await tools.view_image({path:"
+                    f'"{path}", detail:"high"}}); '
+                    "image(preview.image_url);"
+                ),
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-first",
+                "output": [
+                    {"type": "input_image", "image_url": original_url},
+                ],
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call-original",
+                "name": "exec",
+                "input": (
+                    "const original = await tools.view_image({path:"
+                    f'"{path}", detail:"original"}}); '
+                    "image(original.image_url);"
+                ),
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-original",
+                "output": [
+                    {"type": "input_image", "image_url": original_url},
+                ],
+            },
+        ]
         first_request = {
             "call_type": "aresponses",
             "client_metadata": {
                 "x-codex-turn-metadata": '{"request_kind":"turn"}',
             },
-            "input": [
-                {
-                    "type": "custom_tool_call",
-                    "call_id": "call-first",
-                    "name": "exec",
-                    "input": (
-                        "const preview = await tools.view_image({path:"
-                        f'"{path}", detail:"high"}}); '
-                        "image(preview.image_url);"
-                    ),
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call-first",
-                    "output": [
-                        {"type": "input_image", "image_url": original_url},
-                    ],
-                },
-            ],
+            "input": [dict(item) for item in client_items],
         }
         first = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
             first_request,
@@ -2629,26 +2688,33 @@ class HookResponsesRequestPrepTests(HookTestCase):
             hooks._image_data_url_size(first_preview),
             hooks._CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES,
         )
+        # The explicit reopen keeps the larger single-image representation while
+        # it is the current turn's tool result.
+        first_original = first["input"][3]["output"]
+        self.assertIn(
+            hooks._CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER,
+            first_original[0]["text"],
+        )
+        self.assertLessEqual(
+            hooks._image_data_url_size(first_original[1]["image_url"]),
+            hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
+        )
+
+        # Once a later item carries encrypted_content both outputs replay from
+        # the frozen prefix: each one is a bounded preview plus its local path
+        # instead of multi-megabyte original bytes.
         second_request = {
-            **first,
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
             "input": [
-                *first["input"],
+                *[dict(item) for item in client_items],
+                {"type": "reasoning", "encrypted_content": "opaque-history"},
                 {
-                    "type": "custom_tool_call",
-                    "call_id": "call-original",
-                    "name": "exec",
-                    "input": (
-                        "const original = await tools.view_image({path:"
-                        f'"{path}", detail:"original"}}); '
-                        "image(original.image_url);"
-                    ),
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call-original",
-                    "output": [
-                        {"type": "input_image", "image_url": original_url},
-                    ],
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue."}],
                 },
             ],
         }
@@ -2658,38 +2724,34 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertIsNotNone(second)
         assert second is not None
-        second_output = next(
-            item
-            for item in second["input"]
-            if item.get("call_id") == "call-original"
-            and item.get("type") == "custom_tool_call_output"
+        for call_id in ("call-first", "call-original"):
+            frozen = next(
+                item
+                for item in second["input"]
+                if item.get("call_id") == call_id
+                and item.get("type") == "custom_tool_call_output"
+            )
+            self.assertIn(
+                hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER,
+                frozen["output"][0]["text"],
+            )
+            images = [
+                part
+                for part in frozen["output"]
+                if part.get("type") == "input_image"
+            ]
+            self.assertEqual(len(images), 1)
+            self.assertLessEqual(
+                hooks._image_data_url_size(images[0]["image_url"]),
+                hooks._CODEX_VIEW_IMAGE_PREVIEW_MAX_TARGET_BYTES,
+            )
+        # Both replayed outputs advertise a durable path for the original file.
+        self.assertIn(path, json.dumps(second["input"]))
+        # The client's own history is never mutated.
+        self.assertEqual(
+            client_items[3]["output"][0]["image_url"],
+            original_url,
         )
-        self.assertEqual(second_output["output"][1]["image_url"], original_url)
-
-        third_request = {
-            **second,
-            "input": [
-                *second["input"],
-                {"type": "reasoning", "encrypted_content": "opaque-history"},
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "Continue."}],
-                },
-            ],
-        }
-        third = await hooks.YoungRouterHook().async_pre_call_deployment_hook(
-            third_request,
-            call_type="aresponses",
-        )
-        third_input = third["input"] if third is not None else third_request["input"]
-        third_output = next(
-            item
-            for item in third_input
-            if item.get("call_id") == "call-original"
-            and item.get("type") == "custom_tool_call_output"
-        )
-        self.assertEqual(third_output["output"][1]["image_url"], original_url)
 
     async def test_pre_call_does_not_inject_truncation_for_oversized_signed_image_history(self) -> None:
         import base64
@@ -3652,3 +3714,183 @@ class HookResponsesRequestPrepTests(HookTestCase):
         )
         self.assertEqual(calls[1]["model_info"], {"id": "chat-only-route"})
         self.assertFalse(hasattr(error, "failed_deployment_id"))
+
+    def test_prefix_image_previews_bound_recent_original_resolution_outputs(self) -> None:
+        """A recent ``detail: original`` output no longer replays its raw bytes.
+
+        Re-opening several crops at original resolution kept tens of megabytes
+        of history inline, which made every turn too large for the upstream
+        gateways; the preview plus its durable path keeps the replay small
+        while the model can still re-open the original file.
+        """
+
+        hooks, _ = load_hook_module()
+        cache_dir = self.use_replay_image_cache()
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_ENABLED_ENV, "1")
+        self.set_env(hooks._PREFIX_IMAGE_PREVIEW_MIN_BYTES_ENV, "1000")
+        self.set_env(hooks._PREFIX_IMAGE_MODE_ENV, "path-recent")
+        self.set_env(hooks._PREFIX_IMAGE_RECENT_COUNT_ENV, "6")
+        durable_path = Path(cache_dir) / "derived_crop.png"
+        durable_path.write_bytes(b"the original crop bytes")
+        oversized_url = "data:image/png;base64," + ("A" * 200_000)
+        call = {
+            "type": "custom_tool_call",
+            "call_id": "call-original",
+            "name": "exec",
+            "input": (
+                "const r = await tools.view_image({path:\"" + str(durable_path)
+                + "\", detail:\"original\"}); image(r.image_url,\"original\");"
+            ),
+        }
+        output = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-original",
+            "output": [
+                {"type": "input_text", "text": "Script completed"},
+                {"type": "input_image", "image_url": oversized_url, "detail": "original"},
+            ],
+        }
+        encrypted = {
+            "type": "reasoning",
+            "encrypted_content": "opaque-signed-history",
+        }
+        original = {
+            "call_type": "aresponses",
+            "client_metadata": {
+                "x-codex-turn-metadata": '{"request_kind":"turn"}',
+            },
+            "input": [call, output, encrypted],
+        }
+
+        resize_calls: list[tuple[int, int]] = []
+
+        def fake_resize(value: str, *, target_bytes: int, max_edge: int) -> str:
+            resize_calls.append((target_bytes, max_edge))
+            return "data:image/jpeg;base64,cHJldmlldw=="
+
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url", side_effect=fake_resize
+        ):
+            hooks._PREFIX_IMAGE_PREVIEW_CACHE.clear()
+            modified = hooks._with_prefix_image_previews(original)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        updated = modified["input"][1]
+        reference = updated["output"][0]
+        # The explicit original-resolution request is replayed at the shared
+        # preview fidelity instead of its original bytes.
+        self.assertEqual(
+            resize_calls,
+            [
+                (
+                    hooks._CODEX_VIEW_IMAGE_PREVIEW_MIN_TARGET_BYTES,
+                    hooks._INLINE_IMAGE_MANY_MAX_EDGE,
+                )
+            ],
+        )
+        self.assertEqual(
+            updated["output"][2]["image_url"],
+            "data:image/jpeg;base64,cHJldmlldw==",
+        )
+        self.assertEqual(updated["output"][2]["detail"], "original")
+        self.assertIn(hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER, reference["text"])
+        # The advertised reference is a durable copy of the same bytes: the
+        # client's file lives in temporary storage, so a replay must never
+        # promise a path the system may clean up later.
+        advertised = self.reference_paths(reference["text"])
+        self.assertEqual(len(advertised), 1)
+        self.assertTrue(advertised[0].startswith(str(cache_dir)))
+        self.assertEqual(
+            base64.b64decode("A" * 200_000),
+            Path(advertised[0]).read_bytes(),
+        )
+        # The call item and the signed item stay byte-identical, and the
+        # client's own history is never mutated.
+        self.assertEqual(modified["input"][0], call)
+        self.assertEqual(modified["input"][2], encrypted)
+        self.assertEqual(original["input"][1]["output"][1]["image_url"], oversized_url)
+
+    def test_bounded_image_inputs_bound_original_resolution_outputs(self) -> None:
+        """A ``detail: original`` output keeps the highest forwarded resolution.
+
+        The marker text still promises the model its original view, so the
+        bytes are bounded to the single-image representation instead of being
+        exempt from the request budget.
+        """
+
+        hooks, _ = load_hook_module()
+        oversized_url = "data:image/png;base64," + ("D" * 1_400_000)
+        reference_text = (
+            f"{hooks._CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER}\n"
+            "Original-resolution image requested for this explicit re-open.\n"
+            f"{hooks._CODEX_VIEW_IMAGE_REFERENCE_MARKER}\n"
+            "1. /tmp/original.png"
+        )
+        output_item = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-original",
+            "output": [
+                {"type": "input_text", "text": reference_text},
+                {"type": "input_image", "image_url": oversized_url, "detail": "original"},
+            ],
+        }
+        encrypted = {
+            "type": "reasoning",
+            "encrypted_content": "opaque-signed-history",
+        }
+        request = {
+            "call_type": "aresponses",
+            "input": [encrypted, output_item],
+        }
+
+        resize_calls: list[tuple[int, int]] = []
+
+        def fake_resize(value: str, *, target_bytes: int, max_edge: int) -> str:
+            resize_calls.append((target_bytes, max_edge))
+            return "data:image/jpeg;base64,Ym91bmRlZA=="
+
+        with mock.patch.object(
+            hooks._image_inputs_module, "_resize_data_url", side_effect=fake_resize
+        ):
+            modified = hooks._with_bounded_image_inputs(request)
+
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(
+            resize_calls,
+            [
+                (
+                    hooks._INLINE_IMAGE_SINGLE_TARGET_BYTES,
+                    hooks._INLINE_IMAGE_SINGLE_MAX_EDGE,
+                )
+            ],
+        )
+        updated = modified["input"][1]
+        self.assertEqual(updated["output"][0], output_item["output"][0])
+        self.assertEqual(
+            updated["output"][1]["image_url"],
+            "data:image/jpeg;base64,Ym91bmRlZA==",
+        )
+        self.assertEqual(updated["output"][1]["detail"], "original")
+        # The client's own history keeps its original bytes.
+        self.assertEqual(request["input"][1]["output"][1]["image_url"], oversized_url)
+        self.assertEqual(modified["input"][0], encrypted)
+
+    def test_bounded_image_inputs_leave_small_original_outputs_untouched(self) -> None:
+        hooks, _ = load_hook_module()
+        small_url = "data:image/png;base64," + ("E" * 400)
+        output_item = {
+            "type": "custom_tool_call_output",
+            "call_id": "call-original",
+            "output": [
+                {
+                    "type": "input_text",
+                    "text": hooks._CODEX_VIEW_IMAGE_ORIGINAL_REFERENCE_MARKER,
+                },
+                {"type": "input_image", "image_url": small_url, "detail": "original"},
+            ],
+        }
+        request = {"call_type": "aresponses", "input": [output_item]}
+
+        self.assertIsNone(hooks._with_bounded_image_inputs(request))

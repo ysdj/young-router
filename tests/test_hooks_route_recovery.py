@@ -2541,3 +2541,132 @@ class HookRouteRecoveryTests(HookTestCase):
                 "total_tokens": 16,
             },
         )
+
+    def test_request_body_size_rejection_is_terminal_for_the_same_body(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class APIError(Exception):
+            status_code = 413
+
+        exc = APIError("Request body is too large")
+        exc.failed_deployment_id = "order1-a"
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        self.assertTrue(hooks._is_request_body_size_rejection_error(exc))
+        # Another gateway may accept a larger body, so the peer/next-hop
+        # fallback still runs before the request is declared unservable.
+        self.assertTrue(hooks._is_priority_deployment_failover_error(exc))
+        # The identical bytes never fit this route, so it is a request error:
+        # no same-route retry, no deployment cooldown, no recovery poll.
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_ERROR,
+        )
+        self.assertFalse(hooks._is_route_recovery_poll_error(exc))
+        self.assertFalse(hooks._should_return_route_recovery_stream(exc, request_data))
+        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(exc))
+
+    def test_request_body_size_rejection_is_remembered_and_skips_later_polling(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class APIError(Exception):
+            status_code = 413
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+        self.assertFalse(hooks._request_body_size_rejected(request_data))
+
+        hooks._remember_request_body_size_rejection(
+            APIError("Request body is too large"),
+            request_data,
+        )
+        self.assertTrue(hooks._request_body_size_rejected(request_data))
+
+        # Every route was tried: the router now reports the cooled-down pool,
+        # which is normally a pollable condition. A size rejection already
+        # proved the body cannot be served, so the client is not held open.
+        no_routes = RuntimeError(
+            "You passed in model=default-chat. There are no healthy deployments "
+            "for this model"
+        )
+        no_routes.status_code = 400
+        self.assertTrue(hooks._is_no_deployments_available_error(no_routes))
+        self.assertFalse(
+            hooks._should_return_route_recovery_stream(no_routes, request_data)
+        )
+
+        sanitized = hooks._sanitized_upstream_route_exception(
+            None,
+            no_routes,
+            request_data,
+        )
+        self.assertEqual(sanitized.status_code, 413)
+        self.assertIn("too large", str(sanitized))
+        self.assertNotIn("Retry later", str(sanitized))
+
+    def test_structured_compaction_body_capacity_rejection_keeps_route_failover(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class APIError(Exception):
+            status_code = 413
+
+        exc = APIError("request body storage capacity exhausted")
+        request_data = {
+            "model": "default-chat",
+            "input": [
+                {"type": "compaction_trigger"},
+                {"type": "message", "role": "user", "content": "Continue."},
+            ],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        # A gateway-local capacity failure is not this request's size limit:
+        # another candidate route may still accept the signed body.
+        self.assertFalse(hooks._is_request_body_size_rejection_error(exc))
+        self.assertTrue(
+            hooks._is_request_scoped_priority_deployment_failover_error(
+                exc,
+                request_data,
+            )
+        )
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+
+    async def test_route_recovery_poll_refuses_a_size_rejected_request(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class GatewayTimeout(Exception):
+            status_code = 504
+
+        request_data = {
+            "model": "legacy-chat",
+            "input": "Continue.",
+            "stream": True,
+            "model_info": {"id": "chatroute", "order": 1},
+            "litellm_metadata": {
+                hooks._REQUEST_BODY_SIZE_REJECTED_METADATA_KEY: True,
+            },
+        }
+
+        self.assertEqual(
+            [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    GatewayTimeout("upstream timed out"),
+                )
+            ],
+            [],
+        )
