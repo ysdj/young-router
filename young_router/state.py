@@ -314,6 +314,10 @@ def _session_deployment_affinity_file_path() -> Optional[str]:
     return os.path.join(runtime_root, ".litellm-runtime", "session-deployment-affinity.json")
 
 
+def _canonical_json(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
 def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
     directory = os.path.dirname(path)
     if directory:
@@ -341,15 +345,24 @@ def _locked_json_state_update(path: str, callback: Any) -> Any:
         except OSError:
             pass
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        missing = False
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (OSError, json.JSONDecodeError):
             payload = {}
+            missing = True
         if not isinstance(payload, dict):
             payload = {}
+        # Most updates only read the shared state (the cooldown and
+        # protocol-fallback filters run on every attempt).  Rewriting an
+        # unchanged document churned the file on disk thousands of times a
+        # day, so compare the revision the callback produced with the one that
+        # was read and only replace the file when it actually changed.
+        before = _canonical_json(payload)
         result = callback(payload)
-        _atomic_write_json(path, payload)
+        if missing or _canonical_json(payload) != before:
+            _atomic_write_json(path, payload)
         return result
     finally:
         try:
