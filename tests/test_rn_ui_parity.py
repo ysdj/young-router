@@ -2295,6 +2295,34 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('if (!actionDomain && targetDomain !== null) return Promise.reject(new Error("A settings domain is required"));', dispatch)
         self.assertIn("const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };", dispatch)
 
+    def test_general_pane_offers_a_start_control_and_launch_start_retries(self) -> None:
+        """A launch-time start that lost its race stays recoverable.
+
+        The proxy follows the app, so a start that failed while spawning its
+        workers at login (a login-time launch competes with every other
+        start-up item) left 已停止 with no control in the pane. The launch start
+        now retries on a bounded backoff, and the pane keeps one recovery button
+        for a stopped or unhealthy service.
+        """
+
+        general = self.ui.split("function GeneralWorkspace", 1)[1].split("function RuntimeWorkspace", 1)[0]
+        self.assertIn("const SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5_000, 20_000, 60_000];", self.ui)
+        self.assertIn("startupAttempts.current = attempt + 1;", self.ui)
+        self.assertIn('const timer = setTimeout(() => { void runServiceOperation("start"); }, delay);', self.ui)
+        self.assertNotIn("startupAttempted", self.ui)
+        self.assertIn('const serviceRestart = serviceState === "unhealthy";', general)
+        self.assertIn('const serviceActionAvailable = serviceState === "stopped" || serviceRestart;', general)
+        self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', general)
+        self.assertIn('onStatus(translate("service.running"));', general)
+        self.assertIn("onStatus(errorMessage(reason, translate));", general)
+        self.assertIn('title={serviceBusy ? translate("service.starting") : serviceRestart ? translate("service.restart") : translate("service.start")}', general)
+        self.assertIn("{serviceActionAvailable ? <NativeButton", general)
+        self.assertIn("generalServiceAction: { minWidth: 96 }", self.ui)
+        # The control is part of the 服务 row inside the pane, never of the
+        # window's bottom action bar (which stays Close/Apply only).
+        service_row = general.split('translate("general.serviceState")', 1)[1].split('translate("general.port")', 1)[0]
+        self.assertIn("{serviceActionAvailable ? <NativeButton", service_row)
+
     def test_request_log_display_formats_duration_and_tokens_without_changing_records(self) -> None:
         """Units convert at display time only; recorded values stay raw."""
 
