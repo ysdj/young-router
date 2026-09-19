@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import threading
 import time
 from datetime import datetime, timezone
 from collections.abc import Mapping
@@ -247,7 +248,48 @@ def _upstream_model_name(value: object) -> str:
     return model.partition("/")[2] or model
 
 
+_CONFIGURATION_CACHE_LOCK = threading.Lock()
+_CONFIGURATION_CACHE: dict[str, tuple[tuple[object, ...], dict[str, dict[str, str]]]] = {}
+
+
+def _configuration_signature(config_path: Path) -> tuple[object, ...]:
+    """Cheap identity for one configuration file revision."""
+
+    try:
+        details = config_path.stat()
+    except OSError:
+        return (str(config_path), None, None, None, None)
+    return (
+        str(config_path),
+        details.st_dev,
+        details.st_ino,
+        details.st_mtime_ns,
+        details.st_size,
+    )
+
+
 def _configured_deployments(config_path: Path) -> dict[str, dict[str, str]]:
+    """Configured deployment metadata for the request and route projections.
+
+    Every log refresh needs this index, and re-parsing the staged YAML
+    document on each append cost more than projecting the rows themselves, so
+    one revision is parsed once and reused until the file changes.  The
+    returned mapping is shared: callers only ever read it.
+    """
+
+    signature = _configuration_signature(config_path)
+    key = str(config_path)
+    with _CONFIGURATION_CACHE_LOCK:
+        cached = _CONFIGURATION_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+    configured = _load_configured_deployments(config_path)
+    with _CONFIGURATION_CACHE_LOCK:
+        _CONFIGURATION_CACHE[key] = (signature, configured)
+    return configured
+
+
+def _load_configured_deployments(config_path: Path) -> dict[str, dict[str, str]]:
     from config_editor_core import load as config_load
 
     try:
@@ -1085,6 +1127,10 @@ DEFAULT_REQUEST_STALE_SECONDS = 900.0
 MAX_REQUEST_STALE_SECONDS = 86400.0
 
 
+def _line_byte_size(line: str) -> int:
+    return len(line.encode("utf-8")) + 1
+
+
 def _request_stale_seconds_value(value: object) -> float:
     try:
         parsed = float(value)  # type: ignore[arg-type]
@@ -1445,6 +1491,166 @@ class LogsDomain:
         self._tabs: dict[str, dict[str, Any]] = {
             tab: self._empty_tab(tab) for tab in LOG_TABS
         }
+        # The request log is appended many times per turn while its tab polls
+        # once a second.  Reparse and reproject only what an append added, and
+        # keep the already projected window for the lines before it.
+        self._request_tail_lock = threading.Lock()
+        self._request_tail: dict[str, Any] = {}
+
+    def _project_request_line(
+        self,
+        line: str,
+        configured_public_models: Mapping[str, str],
+        configured_route_models: object,
+    ) -> dict[str, Any] | None:
+        if not line.strip():
+            return None
+        try:
+            parsed = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed, Mapping):
+            return None
+        return _safe_request_record(
+            parsed,
+            configured_public_models,
+            configured_route_models,
+        )
+
+    @staticmethod
+    def _request_tail_boundary_reached(path: Path, offset: int) -> bool:
+        """Whether a cached read ended exactly on a line boundary.
+
+        A read that stopped inside a line cannot be extended: the partial line
+        is already part of the cached window, so the tail is rebuilt from the
+        file instead of resumed.
+        """
+
+        if offset <= 0:
+            return True
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset - 1)
+                return handle.read(1) == b"\n"
+        except OSError:
+            return False
+
+    def _read_appended_lines(self, path: Path, offset: int) -> tuple[list[str], int]:
+        """Read the complete lines appended after ``offset``.
+
+        A line still being written stays for the next refresh: it can never
+        project a record, and resuming exactly at the last newline keeps the
+        cached window aligned with the file.
+        """
+
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            data = handle.read(self.maximum_read_bytes)
+        end = data.rfind(b"\n")
+        if end < 0:
+            return [], 0
+        consumed = end + 1
+        return data[:consumed].decode("utf-8", errors="replace").splitlines(), consumed
+
+    def _trim_request_tail(
+        self,
+        entries: list[tuple[dict[str, Any] | None, int]],
+        line_limit: int,
+    ) -> tuple[list[tuple[dict[str, Any] | None, int]], int]:
+        total = sum(size for _record, size in entries)
+        start = 0
+        while start < len(entries) and (
+            len(entries) - start > line_limit or total > self.maximum_read_bytes
+        ):
+            total -= entries[start][1]
+            start += 1
+        return (entries[start:], total) if start else (entries, total)
+
+    def _requests_records(
+        self,
+        path: Path,
+        configured_public_models: Mapping[str, str],
+        configured_route_models: object,
+    ) -> list[dict[str, Any]]:
+        """Project the newest request lines, reusing the parsed tail."""
+
+        line_limit = self._line_limit("requests")
+        signature = _configuration_signature(self.config_path)
+        try:
+            details = path.lstat()
+        except OSError:
+            details = None
+        regular = (
+            details is not None
+            and not stat.S_ISLNK(details.st_mode)
+            and stat.S_ISREG(details.st_mode)
+        )
+        with self._request_tail_lock:
+            cache = self._request_tail
+            offset = cache.get("offset")
+            usable = (
+                regular
+                and cache.get("dev") == details.st_dev
+                and cache.get("ino") == details.st_ino
+                and cache.get("signature") == signature
+                and isinstance(offset, int)
+                and 0 <= offset <= details.st_size
+                and cache.get("line_limit", 0) >= line_limit
+                and details.st_size - offset <= self.maximum_read_bytes
+                and self._request_tail_boundary_reached(path, offset)
+            )
+            if usable:
+                entries = list(cache.get("entries") or [])
+                if details.st_size > offset:
+                    appended, consumed = self._read_appended_lines(path, offset)
+                    if consumed > 0:
+                        for line in appended:
+                            entries.append(
+                                (
+                                    self._project_request_line(
+                                        line,
+                                        configured_public_models,
+                                        configured_route_models,
+                                    ),
+                                    _line_byte_size(line),
+                                )
+                            )
+                        entries, total = self._trim_request_tail(entries, line_limit)
+                        cache.update(
+                            {
+                                "entries": entries,
+                                "bytes": total,
+                                "offset": offset + consumed,
+                                "line_limit": line_limit,
+                            }
+                        )
+                return [record for record, _size in entries if record is not None]
+            self._request_tail = {}
+        lines = self._read_lines(path, line_limit=line_limit)
+        entries = [
+            (
+                self._project_request_line(
+                    line,
+                    configured_public_models,
+                    configured_route_models,
+                ),
+                _line_byte_size(line),
+            )
+            for line in lines
+        ]
+        entries, total = self._trim_request_tail(entries, line_limit)
+        if regular:
+            with self._request_tail_lock:
+                self._request_tail = {
+                    "dev": details.st_dev,
+                    "ino": details.st_ino,
+                    "offset": details.st_size,
+                    "line_limit": line_limit,
+                    "signature": signature,
+                    "bytes": total,
+                    "entries": entries,
+                }
+        return [record for record, _size in entries if record is not None]
 
     def _empty_tab(self, tab: str) -> dict[str, Any]:
         return {
@@ -1751,6 +1957,35 @@ class LogsDomain:
         path = self._path(tab)
         if path is None:
             return False, []
+        if tab == "requests" and tab not in self._cleared:
+            configured_deployments = _configured_deployments(self.config_path)
+            records = self._requests_records(
+                path,
+                _configured_public_models_from(configured_deployments),
+                _configured_route_public_models_from(configured_deployments),
+            )
+            records = _collapse_request_records(records)
+            self._refresh_runtime_settings()
+            stale_seconds = self._request_stale_seconds
+            if stale_seconds > 0:
+                now = time.time()
+                records = [
+                    _close_stale_request_record(
+                        record,
+                        stale_seconds=stale_seconds,
+                        now=now,
+                    )
+                    for record in records
+                ]
+            needle = self._filters.get(tab, "").casefold()
+            if needle:
+                records = [
+                    record
+                    for record in records
+                    if needle
+                    in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
+                ]
+            return path.exists(), _sort_records_by_time(records)[-self._line_limit(tab) :]
         if tab == "recovery":
             source_cursor = self._source_cursor(tab)
             clear_cursor = self._clear_cursors.get(tab)
@@ -2034,6 +2269,12 @@ class LogsDomain:
         if tab not in LOG_TABS:
             raise LogsDomainError("Log tab is invalid")
         operation = action.removeprefix("logs.").replace("-", "_")
+        if tab == "requests":
+            # A view action can change what the tab shows (filter, limit,
+            # pause, clear) — never serve it from a window parsed under the
+            # previous intent.
+            with self._request_tail_lock:
+                self._request_tail = {}
         if operation == "record_menu_action":
             if tab != "actions":
                 raise LogsDomainError("Log tab is invalid")
@@ -2101,6 +2342,8 @@ class LogsDomain:
         self._cleared.clear()
         self._clear_cursors.clear()
         self._source_signatures.clear()
+        with self._request_tail_lock:
+            self._request_tail = {}
         self._view_revisions = {
             tab: self._view_revisions.get(tab, 0) + 1 for tab in LOG_TABS
         }
