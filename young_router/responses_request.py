@@ -41,7 +41,6 @@ from .base import (
     _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT,
     _PREFIX_IMAGE_ORIGINAL_PATH_ENV,
     _PREFIX_IMAGE_CACHE_DIR_ENV,
-    _PREFIX_IMAGE_CACHE_DIR_NAME,
     _PREFIX_IMAGE_CACHE_GRACE_SECONDS,
     _PREFIX_IMAGE_CACHE_MAX_BYTES_DEFAULT,
     _PREFIX_IMAGE_CACHE_MAX_BYTES_ENV,
@@ -2262,43 +2261,65 @@ _REPLAY_IMAGE_CACHE_EXTENSIONS = {
 }
 
 
-def _default_replay_image_attachment_root() -> Path:
-    """Return the neutral directory that durable replay copies are advertised from.
-
-    Every advertised path is read by the client model and printed in the user's
-    transcript, so it must never name Young Router or point inside its storage:
-    ``<runtime root>/image-cache`` told the model the router exists, where it
-    keeps state, and gave it a directory to crop images into, which the router's
-    own pruning then deleted.  Copies therefore live in an ordinary attachment
-    directory outside the router's storage.
-    """
-
-    name = _PREFIX_IMAGE_CACHE_DIR_NAME
-    home = Path.home()
-    if sys.platform == "darwin":
-        # No space in the path: the model passes it to shell commands, where an
-        # unquoted substitution would split at the space.
-        return home / "Library" / name
-    if os.name == "nt":
-        base = os.getenv("LOCALAPPDATA", "").strip()
-        return (Path(base).expanduser() if base else home / "AppData" / "Local") / name
-    xdg_data_home = os.getenv("XDG_DATA_HOME", "").strip()
-    base = Path(xdg_data_home).expanduser() if xdg_data_home else home / ".local" / "share"
-    return base / name
-
-
-def _prefix_image_cache_root() -> Path:
-    """Return the durable directory that backs replay-image path references.
-
-    A path handed to the client model must stay openable for the whole task and
-    must not expose the router: the default is the neutral attachment root, and
-    an operator-configured ``YOUNG_ROUTER_IMAGE_CACHE_DIR`` overrides it.
-    """
+def _configured_replay_image_cache_root() -> Optional[Path]:
+    """Return the operator-configured copy directory, when one is set."""
 
     configured = os.getenv(_PREFIX_IMAGE_CACHE_DIR_ENV, "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return _default_replay_image_attachment_root()
+    return Path(configured).expanduser() if configured else None
+
+
+def _replay_image_copy_root(source: Optional[Path]) -> Path:
+    """Return the directory an advertised replay copy belongs in.
+
+    A copy belongs next to the file it was made from, in that file's own
+    directory: the model derives every crop path from the path it reads, so
+    keeping the copy there leaves its whole read/crop/write workflow where the
+    source lives instead of moving it into a router-created folder. A source
+    inside the router's storage (or with no usable directory) maps to OS
+    temporary storage, which is where a clipboard paste came from anyway; an
+    operator-configured ``YOUNG_ROUTER_IMAGE_CACHE_DIR`` overrides both.
+    """
+
+    configured = _configured_replay_image_cache_root()
+    if configured is not None:
+        return configured
+    if source is not None:
+        parent = source.parent
+        if str(parent) not in {"", "."} and _router_storage_relative_path(parent) is None:
+            try:
+                if parent.is_dir():
+                    return parent
+                if not parent.exists():
+                    parent.mkdir(parents=True, exist_ok=True)
+                    return parent
+            except OSError:
+                pass
+    return Path(tempfile.gettempdir())
+
+
+def _replay_image_copy_name(raw: bytes, source: Optional[Path], extension: str) -> str:
+    """Name one copy after its digest and, when known, its source file."""
+
+    digest = hashlib.sha256(raw).hexdigest()[:32]
+    stem = ""
+    if source is not None:
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source.stem).strip("._-")[:32]
+    return f"{digest}.{stem}{extension}" if stem else f"{digest}{extension}"
+
+
+def _future_replay_image_copy_path(source: Path) -> str:
+    """Return where a file a command is about to write would be kept."""
+
+    digest = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:32]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source.stem).strip("._-")[:32]
+    extension = source.suffix.lower()
+    root = _replay_image_copy_root(source)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    name = f"{digest}.{stem}{extension}" if stem else f"{digest}{extension}"
+    return str(root / name)
 
 
 def _prefix_image_cache_max_files() -> int:
@@ -2388,15 +2409,32 @@ def _router_storage_roots() -> List[Path]:
 
     A file inside them exists, but advertising it tells the client model that
     the router exists, where it keeps its configuration and caches, and gives
-    it a directory to read, crop, and rewrite while the user watches.
+    it a directory to read, crop, and rewrite while the user watches. The
+    attachment folders earlier releases copied into belong here too: a reference
+    that points at one of them keeps the model working inside a router-created
+    folder instead of the source file's own directory.
     """
 
-    roots: List[Path] = []
+    home = Path.home()
+    candidates = [
+        os.getenv("LITELLM_RUNTIME_ROOT", "").strip(),
+        os.getenv("YOUNG_ROUTER_HOME", "").strip(),
+        str(home / ".young-router"),
+        str(home / "Library" / "ImageAttachments"),
+        str(home / ".local" / "share" / "ImageAttachments"),
+    ]
+    local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        candidates.append(str(Path(local_app_data).expanduser() / "ImageAttachments"))
     for candidate in (
         os.getenv("LITELLM_RUNTIME_ROOT", "").strip(),
         os.getenv("YOUNG_ROUTER_HOME", "").strip(),
-        str(Path.home() / ".young-router"),
+        str(home / ".young-router"),
     ):
+        if candidate:
+            candidates.append(str(Path(candidate).expanduser() / "image-cache"))
+    roots: List[Path] = []
+    for candidate in candidates:
         if not candidate:
             continue
         path = Path(candidate).expanduser()
@@ -2427,13 +2465,14 @@ def _router_storage_relative_path(path: Path) -> Optional[Path]:
         resolved = path.resolve()
     except OSError:
         resolved = path
-    attachment_root = _prefix_image_cache_root()
-    try:
-        attachment_root = attachment_root.resolve()
-    except OSError:
-        pass
-    if resolved == attachment_root or attachment_root in resolved.parents:
-        return None
+    configured_root = _configured_replay_image_cache_root()
+    if configured_root is not None:
+        try:
+            configured_root = configured_root.resolve()
+        except OSError:
+            pass
+        if resolved == configured_root or configured_root in resolved.parents:
+            return None
     for root in _router_storage_roots():
         if resolved == root:
             return Path(resolved.name)
@@ -2442,7 +2481,10 @@ def _router_storage_relative_path(path: Path) -> Optional[Path]:
     return None
 
 
-def _replay_image_cache_target(image_url: Any) -> Optional[tuple[Path, bytes]]:
+def _replay_image_cache_target(
+    image_url: Any,
+    source: Optional[Path] = None,
+) -> Optional[tuple[Path, bytes]]:
     parsed = _image_inputs_module._split_image_data_url(image_url)
     if parsed is None:
         return None
@@ -2457,14 +2499,16 @@ def _replay_image_cache_target(image_url: Any) -> Optional[tuple[Path, bytes]]:
         return None
     if not raw:
         return None
-    digest = hashlib.sha256(raw).hexdigest()[:32]
-    return _prefix_image_cache_root() / f"{digest}{extension}", raw
+    return (
+        _replay_image_copy_root(source) / _replay_image_copy_name(raw, source, extension),
+        raw,
+    )
 
 
-def _materialize_replay_image(image_url: Any) -> Optional[str]:
-    """Persist one replay image and return a path the client can reopen later."""
+def _materialize_replay_image(image_url: Any, source: Optional[Path] = None) -> Optional[str]:
+    """Persist one replay image next to its source and return that path."""
 
-    target = _replay_image_cache_target(image_url)
+    target = _replay_image_cache_target(image_url, source)
     if target is None:
         return None
     path, raw = target
@@ -2495,7 +2539,7 @@ def _materialize_replay_image(image_url: Any) -> Optional[str]:
 
 
 _REPLAY_IMAGE_CACHE_FILE_PATTERN = re.compile(
-    r"^[0-9a-f]{32}\.(?:jpg|png|webp|gif|bmp|tiff)$"
+    r"^(?:[0-9a-f]{32}|.+\.[0-9a-f]{32})\.(?:jpg|png|webp|gif|bmp|tiff)$"
 )
 
 
@@ -2556,15 +2600,105 @@ def _prune_replay_image_cache(directory: Path, *, keep: set[str]) -> None:
 _ROUTER_PATH_TOKEN = re.compile(r"/(?:[^\s'\"`|&;<>()\[\]{},:?*!$\\]+)")
 
 
+def _restore_missing_replay_paths(input_items: list[Any]) -> int:
+    """Rewrite a vanished client image file from the bytes the client resends.
+
+    A clipboard paste or an intermediate crop the client has since deleted is
+    still part of the replayed history, and a re-open against it fails with "no
+    such file" -- which sends the model back to crop and view the same region
+    again. The bytes are still in the same request (the client resends its whole
+    history every turn), so the file is restored at the exact path the replay
+    names and the call reads what it always read.
+    """
+
+    images_by_call: dict[str, list[str]] = {}
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {"custom_tool_call_output", "function_call_output"}:
+            continue
+        call_id = item.get("call_id") or item.get("id")
+        output = item.get("output")
+        if not isinstance(call_id, str) or not isinstance(output, list):
+            continue
+        images = [
+            part["image_url"]
+            for part in output
+            if isinstance(part, dict)
+            and part.get("type") == "input_image"
+            and isinstance(part.get("image_url"), str)
+            and part["image_url"].startswith("data:image/")
+        ]
+        if images:
+            images_by_call.setdefault(call_id, []).extend(images)
+
+    restored = 0
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("type") not in {
+            "custom_tool_call",
+            "function_call",
+        }:
+            continue
+        call_id = item.get("call_id") or item.get("id")
+        images = images_by_call.get(call_id) if isinstance(call_id, str) else None
+        if not images:
+            continue
+        source = item.get("input") if isinstance(item.get("input"), str) else item.get("arguments")
+        if not isinstance(source, str) or not source:
+            continue
+        index = 0
+        for match in _ROUTER_PATH_TOKEN.finditer(source):
+            candidate = Path(match.group(0))
+            if candidate.suffix.lower() not in _CODEX_VIEW_IMAGE_EXTENSIONS:
+                continue
+            if _router_storage_relative_path(candidate) is not None:
+                # A router-owned source is copied and rewritten by the caller;
+                # it never consumes the output's image slots.
+                continue
+            try:
+                if candidate.is_file():
+                    continue
+            except OSError:
+                pass
+            image_url = images[index] if index < len(images) else None
+            index += 1
+            if image_url is None:
+                continue
+            parsed = _image_inputs_module._split_image_data_url(image_url)
+            if parsed is None:
+                continue
+            try:
+                raw = base64.b64decode(parsed[1], validate=False)
+            except (binascii.Error, ValueError):
+                continue
+            if not raw:
+                continue
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = candidate.with_name(f".{candidate.name}.tmp.{os.getpid()}.{time.time_ns()}")
+                with open(tmp_path, "wb") as handle:
+                    handle.write(raw)
+                try:
+                    os.chmod(tmp_path, 0o600)
+                except OSError:
+                    pass
+                os.replace(tmp_path, candidate)
+            except OSError:
+                continue
+            restored += 1
+    return restored
+
+
 def _neutral_attachment_copy(source_text: str) -> Optional[str]:
-    """Return the neutral attachment path that replaces one router-owned path.
+    """Return the neutral path that replaces one router-owned image path.
 
     The model reads its own past commands back, so a router-owned literal keeps
     pulling the model -- and every crop it derives -- into the router's storage.
-    The replacement keeps the same relative name, and the bytes are copied
-    first: a literal the model will re-open must stay true. A literal that names
-    a file which does not exist yet (a crop the command is about to write) maps
-    to the same neutral directory, so new files land there as well.
+    The replacement is written where the copy policy puts it (next to its
+    source, or OS temporary storage for a router-owned source), and the bytes
+    are copied first: a literal the model will re-open must stay true. A literal
+    that names a file which does not exist yet (a crop the command is about to
+    write) maps the same way, so new files never land in the router's storage.
     """
 
     candidate = Path(source_text)
@@ -2572,43 +2706,29 @@ def _neutral_attachment_copy(source_text: str) -> Optional[str]:
         return None
     if candidate.suffix.lower() not in _CODEX_VIEW_IMAGE_EXTENSIONS:
         return None
-    relative = _router_storage_relative_path(candidate)
-    if relative is None:
-        return None
-    root = _prefix_image_cache_root()
-    # A flat attachment directory: the model's own file names stay meaningful
-    # without repeating the router's internal layout.
-    target = root / relative.name
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(target.parent, 0o700)
-        except OSError:
-            pass
-    except OSError:
+    if _router_storage_relative_path(candidate) is None:
         return None
     try:
         exists = candidate.is_file()
     except OSError:
         exists = False
     if not exists:
-        return str(target)
+        # A path a command is about to write: point the write at the directory
+        # this file's own copy would use, so later crops stay with their source.
+        return _future_replay_image_copy_path(candidate)
     try:
         raw = candidate.read_bytes()
     except OSError:
         return None
     if not raw:
         return None
+    target = _replay_image_copy_root(candidate) / _replay_image_copy_name(
+        raw, None, candidate.suffix.lower()
+    )
     try:
-        target_has_other_bytes = (
-            target.is_file() and target.read_bytes() != raw
-        )
+        target.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
-        target_has_other_bytes = False
-    if target_has_other_bytes:
-        # Never overwrite content this cache did not create (the model's crops
-        # and the user's files live here too): fall back to the digest name.
-        target = root / f"{hashlib.sha256(raw).hexdigest()[:32]}{candidate.suffix.lower()}"
+        return None
     try:
         if not target.is_file() or target.read_bytes() != raw:
             tmp_path = target.with_name(f".{target.name}.tmp.{os.getpid()}.{time.time_ns()}")
@@ -2648,6 +2768,7 @@ def _with_neutral_attachment_paths(request_kwargs: dict) -> Optional[dict]:
 
     updated_items = list(input_items)
     rewritten_paths: set[str] = set()
+    restored_paths = _restore_missing_replay_paths(input_items)
 
     def rewrite_path_tokens(text: str) -> str:
         def replace(match: "re.Match[str]") -> str:
@@ -2730,17 +2851,21 @@ def _with_neutral_attachment_paths(request_kwargs: dict) -> Optional[dict]:
         updated_item.update(updates)
         updated_items[index] = updated_item
         changed = True
-    if not changed:
+    if not changed and not restored_paths:
         return None
+    if changed:
+        modified_kwargs = request_kwargs.copy()
+        modified_kwargs["input"] = updated_items
+    else:
+        modified_kwargs = request_kwargs
     _trace_module._route_trace(
         "router_path_literals_normalized",
         request_id=_routing_module._trace_request_id(request_kwargs),
         session=_routing_module._trace_session_context(request_kwargs),
-        attachment_root=str(_prefix_image_cache_root()),
+        copy_root=str(_configured_replay_image_cache_root() or Path(tempfile.gettempdir())),
         path_count=len(rewritten_paths),
+        restored_paths=restored_paths,
     )
-    modified_kwargs = request_kwargs.copy()
-    modified_kwargs["input"] = updated_items
     return modified_kwargs
 
 
@@ -2761,13 +2886,19 @@ def _reopenable_replay_image_references(
     materialized: List[str] = []
     reopenable = True
     for path, part in zip(paths, image_parts):
-        if _replay_image_path_is_reopenable(path) and not (
-            Path(path.strip()).is_absolute()
-            and _path_lives_in_router_storage(Path(path.strip()))
+        source: Optional[Path] = None
+        if isinstance(path, str) and path.strip():
+            candidate = Path(path.strip())
+            if candidate.is_absolute():
+                source = candidate
+        if (
+            _replay_image_path_is_reopenable(path)
+            and source is not None
+            and not _path_lives_in_router_storage(source)
         ):
             references.append(path)
             continue
-        cached = _materialize_replay_image(part.get("image_url"))
+        cached = _materialize_replay_image(part.get("image_url"), source)
         if cached is None:
             references.append(path)
             reopenable = False
@@ -2795,7 +2926,7 @@ def _trace_prefix_image_reference_paths(
         model_group=_responses_execution_module._request_model_group(request_kwargs),
         materialized=len(materialized),
         kept_inline=kept_inline,
-        cache_dir=str(_prefix_image_cache_root()),
+        copy_root=str(_configured_replay_image_cache_root() or Path(tempfile.gettempdir())),
         names=sorted(Path(path).name for path in materialized)[:8],
     )
 
@@ -3195,9 +3326,12 @@ def _with_prefix_image_previews(request_kwargs: dict) -> Optional[dict]:
         updated_items[index] = updated_item
         changed = True
 
-    if materialized_paths:
+    configured_root = _configured_replay_image_cache_root()
+    if materialized_paths and configured_root is not None:
+        # Copies that live next to their sources belong to those directories;
+        # only an operator-configured cache directory is bounded by this code.
         _prune_replay_image_cache(
-            _prefix_image_cache_root(),
+            configured_root,
             keep={Path(path).name for path in materialized_paths},
         )
     if materialized_paths or kept_inline_candidates:

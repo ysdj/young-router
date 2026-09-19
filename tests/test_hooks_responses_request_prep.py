@@ -3895,34 +3895,80 @@ class HookResponsesRequestPrepTests(HookTestCase):
 
         self.assertIsNone(hooks._with_bounded_image_inputs(request))
 
-    def test_replay_image_default_attachment_root_is_neutral(self) -> None:
-        """Advertised paths must not expose or point inside the router.
+    def test_replay_image_copies_beside_their_source(self) -> None:
+        """Advertised copies live with the file they came from.
 
-        The reference text is read by the client model and printed in the
-        user's transcript, so the default attachment directory is a neutral
-        location outside Young Router's own storage.
+        The model derives its crop paths from the path it reads, so a copy
+        belongs in that file's own directory; a router-owned source (or one with
+        no directory) falls back to OS temporary storage, never to a
+        router-created folder or the router's own storage.
         """
 
         hooks, _ = load_hook_module()
         self.set_env("YOUNG_ROUTER_IMAGE_CACHE_DIR", None)
-        self.set_env("LITELLM_RUNTIME_ROOT", "/tmp/fake-router-runtime-root")
-        self.set_env("YOUNG_ROUTER_HOME", "/tmp/fake-young-router-home")
+        self.set_env("LITELLM_RUNTIME_ROOT", None)
+        self.set_env("YOUNG_ROUTER_HOME", None)
+        workspace = tempfile.TemporaryDirectory(prefix="image-copy-source-")
+        self.addCleanup(workspace.cleanup)
+        # A deleted source keeps its directory: the copy still belongs there.
+        source = Path(workspace.name) / "sub" / "flow-sheet.jpg"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        image_part = {
+            "type": "input_image",
+            "image_url": (
+                "data:image/jpeg;base64,"
+                + base64.b64encode(b"photo bytes").decode("ascii")
+            ),
+        }
 
-        root = hooks._prefix_image_cache_root()
-        self.assertEqual(root.name, hooks._PREFIX_IMAGE_CACHE_DIR_NAME)
-        self.assertTrue(root.is_absolute())
-        text = str(root)
-        self.assertNotIn(" ", text)
-        for forbidden in (
-            "young-router",
-            "young_router",
-            "fake-router-runtime-root",
-            "fake-young-router-home",
-        ):
-            self.assertNotIn(forbidden, text)
+        references, materialized, reopenable = (
+            hooks._reopenable_replay_image_references(
+                [str(source)],
+                [image_part],
+            )
+        )
+
+        self.assertTrue(reopenable)
+        self.assertEqual(len(materialized), 1)
+        self.assertEqual(Path(references[0]).parent, source.parent)
+        self.assertEqual(Path(references[0]).read_bytes(), b"photo bytes")
+        self.assertIn("flow-sheet", Path(references[0]).name)
+        self.assertNotIn("router-home", str(references[0]))
+        self.assertNotIn(" ", str(references[0]))
+
+        # A router-owned source cannot advertise its own directory, so its copy
+        # lands in OS temporary storage instead of a router-created folder.
+        router_copy = Path(tempfile.gettempdir()) / "young-router-owned.jpg"
+        router_root = tempfile.TemporaryDirectory(prefix="router-home-")
+        self.addCleanup(router_root.cleanup)
+        self.set_env("YOUNG_ROUTER_HOME", router_root.name)
+        owned = Path(router_root.name) / "image-cache" / "owned.jpg"
+        owned.parent.mkdir(parents=True, exist_ok=True)
+        owned.write_bytes(b"owned bytes")
+        owned_part = {
+            "type": "input_image",
+            "image_url": (
+                "data:image/jpeg;base64,"
+                + base64.b64encode(b"owned bytes").decode("ascii")
+            ),
+        }
+        owned_refs, owned_materialized, owned_reopenable = (
+            hooks._reopenable_replay_image_references(
+                [str(owned)],
+                [owned_part],
+            )
+        )
+        self.assertTrue(owned_reopenable)
+        self.assertEqual(len(owned_materialized), 1)
+        self.assertEqual(Path(owned_refs[0]).parent, Path(tempfile.gettempdir()))
+        self.assertNotIn(router_root.name, str(owned_refs[0]))
+        del router_copy
 
         configured = self.use_replay_image_cache()
-        self.assertEqual(hooks._prefix_image_cache_root(), configured)
+        self.assertEqual(
+            hooks._configured_replay_image_cache_root(),
+            configured,
+        )
 
     def test_replay_image_cache_prunes_only_its_own_copies(self) -> None:
         hooks, _ = load_hook_module()
@@ -3954,7 +4000,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertTrue(hooks._is_managed_replay_image_file("b" * 32 + ".jpg"))
 
     def test_replay_image_reference_moves_a_router_owned_path_out_of_view(self) -> None:
-        """A router-internal path is copied into the neutral attachment root.
+        """A router-internal path is copied somewhere the model may read.
 
         An existing file inside the router's own storage is still not something
         the client model should be pointed at, so its bytes are re-materialized
@@ -4059,21 +4105,19 @@ class HookResponsesRequestPrepTests(HookTestCase):
         view_script = modified["input"][0]["input"]
         self.assertNotIn(str(legacy_root.name), view_script)
         self.assertIn(str(cache_dir), view_script)
-        self.assertIn("6984af2576d7c2ebf38f2033f4ba258e.jpg", view_script)
-        self.assertEqual(
-            (cache_dir / "6984af2576d7c2ebf38f2033f4ba258e.jpg").read_bytes(),
-            b"original photo bytes",
-        )
+        view_copy = Path(view_script.split('path:"', 1)[1].split('"', 1)[0])
+        self.assertEqual(view_copy.parent, cache_dir)
+        self.assertEqual(view_copy.read_bytes(), b"original photo bytes")
         crop_script = modified["input"][1]["input"]
         self.assertNotIn(str(legacy_root.name), crop_script)
-        self.assertIn(f"{cache_dir}/derived_B_top.png", crop_script)
-        self.assertEqual(
-            (cache_dir / "derived_B_top.png").read_bytes(),
-            b"model crop",
-        )
+        crop_copy = Path(crop_script.split("'", 1)[1].split("'", 1)[0])
+        self.assertEqual(crop_copy.parent, cache_dir)
+        self.assertEqual(crop_copy.read_bytes(), b"model crop")
         # The crop command's own output path follows the same substitution, so
-        # new files land in the neutral directory as well.
-        self.assertIn(f"{cache_dir}/scale.png", crop_script)
+        # new files land beside the same source directory.
+        crop_output = Path(crop_script.split("--out '", 1)[1].split("'", 1)[0])
+        self.assertEqual(crop_output.parent, cache_dir)
+        self.assertIn("scale", crop_output.name)
         # A non-image router file is never copied into a model-visible place,
         # a client-owned path is left alone, and the client history is intact.
         self.assertIn(str(hidden), modified["input"][2]["input"])
@@ -4081,6 +4125,69 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertEqual(original["input"][0]["input"], original["input"][0]["input"])
         self.assertIn(str(legacy_root.name), original["input"][0]["input"])
         self.assertFalse((cache_dir / "notes.txt").exists())
+
+    def test_replay_restores_a_client_image_the_client_deleted(self) -> None:
+        """A vanished client image file is restored at the path the replay names.
+
+        A clipboard paste or an intermediate crop the client has since deleted
+        still appears in the replayed history, and a re-open against it fails
+        with "no such file" -- which sends the model back to crop and view the
+        same region again. The bytes are still in the request, so the file is
+        restored where the call reads it.
+        """
+
+        hooks, _ = load_hook_module()
+        temporary = tempfile.TemporaryDirectory(prefix="image-client-path-")
+        self.addCleanup(temporary.cleanup)
+        vanished = Path(temporary.name) / "codex-clipboard-1234.jpg"
+        payload = b"pasted photo bytes"
+        request = {
+            "call_type": "aresponses",
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-paste",
+                    "name": "exec",
+                    "input": f'await tools.view_image({{path:"{vanished}", detail:"original"}});',
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-paste",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/jpeg;base64,"
+                            + base64.b64encode(payload).decode("ascii"),
+                        }
+                    ],
+                },
+            ],
+        }
+        self.assertFalse(vanished.exists())
+
+        modified = hooks._with_neutral_attachment_paths(request)
+
+        self.assertIsNotNone(modified)
+        self.assertTrue(vanished.is_file())
+        self.assertEqual(vanished.read_bytes(), payload)
+        # An existing file is never rewritten, and a path without paired image
+        # bytes (a command's own future output) stays untouched.
+        assert modified is not None
+        second = {
+            "call_type": "aresponses",
+            "client_metadata": {"x-codex-turn-metadata": '{"request_kind":"turn"}'},
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call-crop",
+                    "name": "exec",
+                    "input": f"sips -c 10 10 '{vanished}' --out '{temporary.name}/new.png'",
+                }
+            ],
+        }
+        hooks._with_neutral_attachment_paths(second)
+        self.assertEqual(vanished.read_bytes(), payload)
 
     def test_neutral_attachment_paths_rewrite_unquoted_and_note_paths(self) -> None:
         """Command substitutions, output echoes, and notes follow the same rule."""
@@ -4146,8 +4253,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
         self.assertIn(str(legacy_root.name), original_text)
         forwarded_text = json.dumps(modified["input"])
         self.assertNotIn(str(photo), forwarded_text)
-        self.assertIn(f"{cache_dir}/crop.png", forwarded_text)
-        self.assertEqual((cache_dir / "crop.png").read_bytes(), b"crop bytes")
+        copies = sorted(cache_dir.glob("*.png"))
+        self.assertEqual(len(copies), 1)
+        self.assertIn(str(copies[0]), forwarded_text)
+        self.assertEqual(copies[0].read_bytes(), b"crop bytes")
         # Non-image router files are never copied into a model-visible place.
         self.assertIn(str(config), modified["input"][3]["content"][0]["text"])
         self.assertIn(str(legacy_cache / "notes.txt"), modified["input"][3]["content"][0]["text"])

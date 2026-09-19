@@ -329,13 +329,11 @@ _PREFIX_IMAGE_RECENT_COUNT_DEFAULT = 6
 _PREFIX_IMAGE_ORIGINAL_PATH_ENV = "YOUNG_ROUTER_PREFIX_IMAGE_ORIGINAL_PATH"
 _PREFIX_IMAGE_ORIGINAL_PATH_DEFAULT = True
 # A replayed image may only be replaced by a path reference when the client can
-# still open that path later.  Originals kept in OS temporary storage (a
-# clipboard paste, an intermediate crop) are copied into this durable
-# attachment directory first, so the promise to re-open the original stays true
-# for the whole task.  The directory is neutral on purpose: the advertised path
-# is read by the client model and shown in the user's transcript, so it must not
-# name the router or point inside the router's own storage.
-_PREFIX_IMAGE_CACHE_DIR_NAME = "ImageAttachments"
+# still open that path later.  When it cannot, the same bytes are copied next to
+# the file they came from: the model derives its crop paths from the path it
+# reads, so a copy belongs in that file's own directory.  Only a source inside
+# the router's own storage (or one with no usable directory) falls back to OS
+# temporary storage; the router never advertises a path inside its own storage.
 _PREFIX_IMAGE_CACHE_DIR_ENV = "YOUNG_ROUTER_IMAGE_CACHE_DIR"
 _PREFIX_IMAGE_CACHE_MAX_FILES_ENV = "YOUNG_ROUTER_IMAGE_CACHE_MAX_FILES"
 _PREFIX_IMAGE_CACHE_MAX_FILES_DEFAULT = 2048
