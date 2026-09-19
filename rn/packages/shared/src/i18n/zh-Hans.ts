@@ -566,7 +566,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "general.autoStartHint": "登录系统后自动启动漾路由，并常驻状态栏。",
   "general.service": "服务",
   "general.serviceState": "代理服务",
-  "general.serviceHint": "本地代理随应用启动。",
+  "general.serviceHint": "本地代理随应用启动；启动失败时可在此重试。",
   "general.port": "本地端口",
   "general.portHint": "默认值: {default} · 端口被占用时自动顺延到下一个可用端口；修改后会自动重启服务。",
   "runtime.invalidNumber": "请输入数字",

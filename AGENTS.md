@@ -43,6 +43,12 @@
 
 ## Known Runtime Failure Modes
 
+### Observed Login-Start Proxy Failure Incident (2026-09-19)
+
+- After a login-time launch the proxy died while uvicorn spawned its workers (`forkserver` fd handshake: `RuntimeError: did not receive acknowledgement of fd`) under the boot load, and Core's single launch start had already been spent: the General pane showed 已停止 with no way to start it from the window (the lifecycle items live only in the status menu), so the user had to relaunch the app.
+- Fix: the launch start retries on a bounded backoff (`SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5s, 20s, 60s]`, reset once the service runs, cancelled by an explicit Stop), and the General pane's 服务 row keeps one recovery control — 启动服务 when stopped, 重启服务 when unhealthy — reporting its result in the pane's permanent status strip.
+- A launch-time start that fails must stay recoverable from the window itself; never leave a stopped service with no control outside the status menu.
+
 ### Observed Router-Path Exposure Incident (2026-09-18)
 
 - Advertised durable copies lived in `<runtime root>/image-cache`, so the client model learned the router's storage, read it (`sips … /Users/mba/.young-router/image-cache/<digest>.jpg`), wrote derived crops back into it, and lost them when `_prune_replay_image_cache` deleted them.
