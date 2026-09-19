@@ -618,12 +618,17 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn('await ipc.dispatch({ type: `service.${operation}` });', ui)
         self.assertIn("return await refreshSnapshot();", ui)
-        self.assertIn('if (snapshot.service.state === "stopped") void runServiceOperation("start");', ui)
+        self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', ui)
         self.assertIn('if (operation === "stop") serviceShouldBeRunning.current = false;', ui)
+        # The launch start retries on a bounded backoff: a login-time launch
+        # competes with every other start-up item, so a start that failed while
+        # the proxy spawned its workers must recover without a relaunch.
+        self.assertIn("const SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5_000, 20_000, 60_000];", ui)
+        self.assertIn("if (attempt >= SERVICE_STARTUP_RETRY_DELAYS_MS.length) return;", ui)
+        self.assertIn('void runServiceOperation("start");', ui)
         self.assertNotIn("SERVICE_HEALTH_POLL_MS", ui)
         self.assertNotIn("SERVICE_RECOVERY_RETRY_MS", ui)
         self.assertNotIn("pollServiceHealth", ui)
-        self.assertIn('void runServiceOperation("start");', ui)
 
         bridge = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
         app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")

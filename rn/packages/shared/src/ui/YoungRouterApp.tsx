@@ -82,6 +82,10 @@ type ProviderWorkspaceDraftProjection = {
   setProviderKeyNameDraft: (providerID: string, keyID: string, value: string) => void;
 };
 type ServiceOperation = "start" | "stop" | "restart" | "reload" | "health";
+// Launch-time service starts are retried on this backoff: a login-time launch
+// competes with every other start-up item, and a proxy whose workers failed to
+// spawn then must come back without the user relaunching the app.
+const SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5_000, 20_000, 60_000];
 type EditableDiskDomain = "codex" | "claude" | "providers_models" | "runtime" | "webdav";
 type RawEditorConflictResolution = "reload" | "keep";
 type AssistantSettingsDomain = "codex" | "claude";
@@ -694,7 +698,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   // The desktop host starts its service once while opening, except after an
   // explicit Stop issued before that startup attempt completes.
   const serviceShouldBeRunning = useRef(true);
-  const startupAttempted = useRef(false);
+  const startupAttempts = useRef(0);
   const serviceOperationQueue = useRef<Promise<void>>(Promise.resolve());
   const acceptedSnapshotRevision = useRef<number>(initialSnapshot?.revision ?? -1);
   // Core can be recreated after an IPC/subscription recovery, so its local
@@ -830,9 +834,27 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   }, [hostTranslate, initialSnapshot, ipc, isPrimaryHost, native, receiveSnapshot, refreshSnapshot]);
 
   useEffect(() => {
-    if (!isPrimaryHost || !snapshot || startupAttempted.current || !serviceShouldBeRunning.current) return;
-    startupAttempted.current = true;
-    if (snapshot.service.state === "stopped") void runServiceOperation("start");
+    if (!isPrimaryHost || !snapshot || !serviceShouldBeRunning.current) return;
+    const serviceState = snapshot.service.state;
+    if (serviceState === "running") {
+      // A healthy service restores the launch budget for a later stop.
+      startupAttempts.current = 0;
+      return;
+    }
+    if (serviceState !== "stopped") return;
+    // A login-time launch races every other start-up item on the machine, so
+    // the proxy can fail while spawning its workers. Retry the launch start on
+    // a backoff instead of leaving the app stopped with no way back.
+    const attempt = startupAttempts.current;
+    if (attempt >= SERVICE_STARTUP_RETRY_DELAYS_MS.length) return;
+    startupAttempts.current = attempt + 1;
+    const delay = SERVICE_STARTUP_RETRY_DELAYS_MS[attempt];
+    if (delay <= 0) {
+      void runServiceOperation("start");
+      return;
+    }
+    const timer = setTimeout(() => { void runServiceOperation("start"); }, delay);
+    return () => clearTimeout(timer);
   }, [isPrimaryHost, runServiceOperation, snapshot?.service.state]);
 
   useEffect(() => {
@@ -4772,6 +4794,7 @@ function AssistantSettingsWorkspace({ snapshot, busy, translate, dispatch, onSec
 
 function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServiceAction, translate, onStatus, onSnapshot }: { snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; busy: boolean; dispatch: Dispatch; dispatchServiceAction: (type: string) => Promise<unknown>; translate: Translate; onStatus: (message?: string) => void; onSnapshot: (next: CoreSnapshot) => void }): React.JSX.Element {
   const [autoStartBusy, setAutoStartBusy] = useState(false);
+  const [serviceBusy, setServiceBusy] = useState(false);
   const [requestedAutoStart, setRequestedAutoStart] = useState<boolean>();
   const autoStartEnabled = snapshot?.service.auto_start_state === "enabled";
   // The switch shows Core's stored preference, plus the value the user just
@@ -4799,6 +4822,26 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
       : serviceState === "unhealthy" ? translate("service.unhealthy")
         : serviceState === "stopped" ? translate("service.stopped")
           : translate("service.unknown");
+  // The proxy follows the app, and a launch-time start can lose its race with
+  // the rest of the login session, so a stopped or unhealthy service keeps one
+  // recovery control in this pane instead of only in the status menu.
+  const serviceRestart = serviceState === "unhealthy";
+  const serviceActionAvailable = serviceState === "stopped" || serviceRestart;
+  const runServiceAction = async (): Promise<void> => {
+    if (!snapshot || serviceBusy) return;
+    setServiceBusy(true);
+    // Pane results belong to the window's one permanent status strip.
+    onStatus(undefined);
+    try {
+      await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");
+      onSnapshot(await ipc.snapshot());
+      onStatus(translate("service.running"));
+    } catch (reason: unknown) {
+      onStatus(errorMessage(reason, translate));
+    } finally {
+      setServiceBusy(false);
+    }
+  };
   const setAutoStart = async (enabled: boolean): Promise<void> => {
     if (!snapshot || autoStartBusy) return;
     setAutoStartBusy(true);
@@ -4838,6 +4881,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
       <View style={styles.generalRow}>
         <Text style={styles.generalRowLabel}>{translate("general.serviceState")}</Text>
         <Text numberOfLines={1} style={styles.generalRowValue}>{serviceLabel}</Text>
+        {serviceActionAvailable ? <NativeButton compact primary={!serviceRestart} disabled={serviceBusy || busy || snapshot === undefined} title={serviceBusy ? translate("service.starting") : serviceRestart ? translate("service.restart") : translate("service.start")} accessibilityLabel={serviceRestart ? translate("service.restart") : translate("service.start")} onPress={() => { void runServiceAction(); }} style={styles.generalServiceAction} /> : null}
       </View>
       <Text style={styles.generalRowHint}>{translate("general.serviceHint")}</Text>
       <View style={styles.generalRow}>
@@ -7384,7 +7428,7 @@ const styles = StyleSheet.create({
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsContent: { paddingHorizontal: 16, paddingTop: 6, paddingBottom: 0, gap: 6 }, logsContent: { paddingHorizontal: 12, paddingTop: 8, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, validationText: { color: systemColors.red, fontSize: UI_FONT_SIZE },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, flexShrink: 0, minHeight: 0, borderRightWidth: 1, borderRightColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarAppIcon: { width: 20, height: 20, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsSidebarDivider: { height: 1, flexShrink: 0, marginHorizontal: 12, backgroundColor: systemColors.separator }, settingsSidebarSpacer: { flex: 1, minHeight: 8 }, settingsSidebarList: { flex: 1, minHeight: 0 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600" }, settingsPaneDivider: { height: 1, flexShrink: 0, backgroundColor: systemColors.separator },  routeStatusBar: { minHeight: 24, flexShrink: 0, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 4, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, generalRowLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { width: 44, minWidth: 44, height: 24, marginLeft: 6 }, generalRowHint: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingHorizontal: 20, paddingTop: 14, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 8 }, generalRowLabel: { width: 128, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "right" }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { width: 44, minWidth: 44, height: 24, marginLeft: 6 }, generalRowHint: { marginLeft: 136, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, generalServiceAction: { minWidth: 96 }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardToolbarButton: { minWidth: 104 }, toolbarSpacer: { flex: 1 }, windowTabs: { width: 224, height: 24 }, windowTab: {}, windowTabSelected: {}, windowTabText: {},
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 },
   keysSection: { flex: 3, minHeight: 170 }, keysSectionContent: { paddingBottom: 4, gap: 4 }, keysSectionLogin: { flex: 0, minHeight: 40 }, modelPane: { flex: 1, minWidth: 0, minHeight: 130, paddingTop: 2, borderTopWidth: 1, borderTopColor: systemColors.separator },

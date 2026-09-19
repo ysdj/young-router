@@ -566,7 +566,7 @@ export const en: Record<TranslationKey, string> = {
   "general.autoStartHint": "Start Young Router automatically after you log in and keep it in the menu bar.",
   "general.service": "Service",
   "general.serviceState": "Proxy service",
-  "general.serviceHint": "The local proxy follows the app.",
+  "general.serviceHint": "The local proxy starts with the app; retry here if it fails to start.",
   "general.port": "Local port",
   "general.portHint": "Default: {default} · An occupied port steps forward to the next free one; changing it restarts the service.",
   "runtime.invalidNumber": "Enter a number",
