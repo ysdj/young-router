@@ -735,6 +735,61 @@ class HookRoutingTests(HookTestCase):
             )
             self.assertEqual(filtered, [deployments[1]])
 
+    async def test_read_only_cooldown_reads_do_not_rewrite_the_shared_file(self) -> None:
+        """Reading the shared pool never churns its file; a real change still writes."""
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "deployment-cooldowns.json"
+            self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(path))
+            deployment = {
+                "litellm_params": {
+                    "model": "openai/default-chat",
+                    "api_base": "https://api.backup.example/v1",
+                    "order": 2,
+                },
+                "model_info": {
+                    "id": "stable-backup_provider",
+                    "provider": "backup_provider",
+                    "api_key_name": "x-plus",
+                },
+            }
+            request_kwargs = {
+                "model": "default-chat",
+                "litellm_params": deployment["litellm_params"],
+                "model_info": deployment["model_info"],
+            }
+
+            available, cooled, filtered = hooks._with_active_deployment_cooldowns(
+                [deployment],
+                request_kwargs=request_kwargs,
+            )
+            self.assertEqual([deployment], available)
+            self.assertEqual([], cooled)
+            self.assertFalse(filtered)
+            written = path.stat().st_mtime_ns
+
+            for _ in range(3):
+                hooks._with_active_deployment_cooldowns(
+                    [deployment],
+                    request_kwargs=request_kwargs,
+                )
+
+            self.assertEqual(written, path.stat().st_mtime_ns)
+
+            error = RuntimeError("insufficient account balance")
+            error.status_code = 403
+            hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+
+            self.assertNotEqual(written, path.stat().st_mtime_ns)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                1,
+                payload["cooldowns"]["id:stable-backup_provider"]["failures"],
+            )
+
     async def test_deployment_cooldown_success_clears_failure_count(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
