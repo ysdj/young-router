@@ -19,6 +19,7 @@ from typing import Any
 import urllib.request
 from urllib.parse import urlparse
 
+from ..browser_identity import browser_request_headers
 from .persistence import PersistenceError, atomic_write_json, read_json
 
 
@@ -527,6 +528,12 @@ class ModelContextRegistry:
         self._clock = clock or time.time
         self._records: dict[str, dict[str, Any]] = {}
         self._cache_loaded = False
+        # Every catalog entry resolves the same runtime configuration (route
+        # deployments, model ids, search capability).  Parsing that document
+        # once per file generation replaces the per-model re-reads that made a
+        # single catalog build parse a 33 KB YAML three dozen times.
+        self._route_index_key: tuple[int, int] | None = None
+        self._route_index_cache: dict[str, list[dict[str, Any]]] = {}
         self._cache_fetched_at: float | None = None
         self._last_refresh_attempt: float | None = None
 
@@ -534,7 +541,7 @@ class ModelContextRegistry:
     def _fetch_json(url: str) -> object:
         request = urllib.request.Request(
             url,
-            headers={"Accept": "application/json", "User-Agent": "Young-Router model-context updater"},
+            headers=browser_request_headers(),
         )
         with urllib.request.urlopen(request, timeout=8) as response:
             payload = response.read(_UPSTREAM_MAX_BYTES + 1)
@@ -597,27 +604,53 @@ class ModelContextRegistry:
             pass
         return max(1, unknown), max(0, refresh_hours)
 
-    def _load_route_deployments(self, public_name: str) -> list[dict[str, Any]]:
-        """Return full deployment mappings for every route of a public model."""
+    def _route_index(self) -> dict[str, list[dict[str, Any]]]:
+        """Return the parsed ``model_list`` of the provider config, by name.
+
+        The index is keyed by the configuration file's (mtime, size) so an
+        edited file is picked up immediately while repeated lookups inside one
+        catalog build reuse a single parse.
+        """
 
         if self.runtime_config_path is None:
-            return []
+            return {}
+        try:
+            details = self.runtime_config_path.stat()
+            key: tuple[int, int] | None = (details.st_mtime_ns, details.st_size)
+        except OSError:
+            key = None
+        if key is not None and key == self._route_index_key:
+            return self._route_index_cache
+        index: dict[str, list[dict[str, Any]]] = {}
         try:
             text = self.runtime_config_path.read_text(encoding="utf-8")
             from config_editor_core.schema import safe_load_yaml_text
 
             data = safe_load_yaml_text(text, self.runtime_config_path.name)
         except Exception:
+            data = None
+        if isinstance(data, Mapping) and isinstance(data.get("model_list"), list):
+            for deployment in data["model_list"]:
+                if not isinstance(deployment, Mapping):
+                    continue
+                if not isinstance(deployment.get("litellm_params"), Mapping):
+                    continue
+                name = str(deployment.get("model_name", "")).strip()
+                if name:
+                    index.setdefault(name, []).append(dict(deployment))
+        self._route_index_key = key
+        self._route_index_cache = index
+        return index
+
+    def _load_route_deployments(self, public_name: str) -> list[dict[str, Any]]:
+        """Return full deployment mappings for every route of a public model."""
+
+        deployments = self._route_index().get(public_name)
+        if not deployments:
             return []
-        if not isinstance(data, Mapping) or not isinstance(data.get("model_list"), list):
-            return []
-        result: list[dict[str, Any]] = []
-        for deployment in data["model_list"]:
-            if not isinstance(deployment, Mapping) or str(deployment.get("model_name", "")).strip() != public_name:
-                continue
-            if isinstance(deployment.get("litellm_params"), Mapping):
-                result.append(dict(deployment))
-        return result
+        # Copy per call like the previous per-call parse did, so a caller can
+        # never mutate the cached deployment mappings.
+        return [dict(deployment) for deployment in deployments]
 
     def search_tool_capability_for(self, public_name: str) -> bool | None:
         """Resolve the route's hosted web-search capability for the catalog.

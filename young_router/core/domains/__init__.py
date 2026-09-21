@@ -8,6 +8,7 @@ from .claude import (
     apply_litellm_deployment,
     risk_confirmation_codes,
 )
+from .clients import ClientSettingsDomain
 from .language import (
     LANGUAGE_OPTIONS,
     LanguageSettingsDomain,
@@ -35,6 +36,7 @@ __all__ = [
     "create_translator",
     "resolve_language",
     "CodexSettingsDomain",
+    "ClientSettingsDomain",
     "DomainError",
     "ProvidersModelsDomain",
     "RuntimeSettingsDomain",

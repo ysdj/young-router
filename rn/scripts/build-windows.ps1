@@ -11,6 +11,7 @@ if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
 $PiWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-pi-web-access-" + [guid]::NewGuid().ToString("N"))
 $PiPackage = Join-Path $PiWork "package"
 $PiNode = Join-Path $PiWork "node"
+$TraceOneWork = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-traceone-" + [guid]::NewGuid().ToString("N"))
 
 function Copy-CoreSource {
   param([string]$Source, [string]$Destination)
@@ -33,6 +34,12 @@ try {
     --output $PiPackage `
     --node-output $PiNode
   if ($LASTEXITCODE -ne 0) { throw "Could not update pi-web-access and the bundled Node.js runtime." }
+  # The degradation deep test runs the latest upstream TraceOne, so every
+  # artifact build re-checks its default branch instead of packaging a stale
+  # classifier copy.
+  $TraceOneUpdater = Join-Path $ProjectRoot "scripts\update_traceone.py"
+  & uv run --no-project --python 3.12 $TraceOneUpdater --output $TraceOneWork
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled TraceOne degradation engine." }
   if (-not (Test-Path (Join-Path $AppRoot "windows"))) {
     throw "React Native Windows host project is missing at rn/apps/windows/windows."
   }
@@ -54,6 +61,7 @@ try {
     Copy-CoreSource (Join-Path $ProjectRoot $Name) (Join-Path $Core $Name)
   }
   Copy-CoreSource $PiPackage (Join-Path $Core "young_router\pi-web-access")
+  Copy-CoreSource $TraceOneWork (Join-Path $Core "young_router\traceone")
   Get-ChildItem -LiteralPath $Core -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
   Get-ChildItem -LiteralPath $Core -Recurse -File -Include "*.pyc", "*.pyo" | Remove-Item -Force
 
@@ -89,6 +97,12 @@ set "RUNTIME_ROOT=%~dp0"
   Copy-Item -LiteralPath (Join-Path $ProjectRoot "LITELLM_VERSION") -Destination (Join-Path $Core "runtime\LITELLM_VERSION") -Force
   if (-not (Test-Path (Join-Path $Core "young_router\pi-web-access\index.ts"))) {
     throw "The bundled pi-web-access package is missing."
+  }
+  if (-not (Test-Path (Join-Path $Core "young_router\traceone\traceone.js"))) {
+    throw "The bundled TraceOne degradation engine is missing."
+  }
+  if (-not (Test-Path (Join-Path $Core "young_router\traceone\prompt.txt"))) {
+    throw "The bundled TraceOne identity prompt is missing."
   }
   if (-not (Test-Path (Join-Path $RuntimeBin "node.exe"))) {
     throw "The bundled Node.js runtime is missing."

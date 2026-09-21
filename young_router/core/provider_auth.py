@@ -25,6 +25,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from ..browser_identity import browser_request_headers
+
 from .persistence import atomic_write_json, read_json
 
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -607,7 +609,7 @@ class ProviderAuthManager:
         request = Request(
             _CLAUDE_OAUTH_TOKEN_URL,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=browser_request_headers(),
             method="POST",
         )
         try:

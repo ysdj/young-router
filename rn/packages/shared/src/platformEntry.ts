@@ -4,7 +4,7 @@ import { createIpcClient } from "./ipc";
 import { createNativeIpcTransport, createNativeLeafBridgeAdapter, type NativeIpcBridge, type NativeLeafBridge } from "./platform/nativeBridge";
 import { routeMenuActions } from "./routes";
 import { registerYoungRouter } from "./bootstrap";
-import type { LanguagePreference, NativeLocalization, NativeMenuAction, NativeMenuAnchor, RelayGroupManagerGroup, RelayGroupManagerKey, RelayGroupManagerLabels, RelayGroupManagerResult, ServiceStatus } from "./types";
+import type { LanguagePreference, NativeLocalization, NativeMenuAction, NativeMenuAnchor, RelayGroupManagerGroup, RelayGroupManagerKey, RelayGroupManagerLabels, RelayGroupManagerResult, RelayGroupManagerSnapshot, ServiceStatus } from "./types";
 
 type NativeModule = {
   send?: (request: string) => Promise<string>;
@@ -41,7 +41,9 @@ type NativeModule = {
     keys: RelayGroupManagerKey[];
     labels: RelayGroupManagerLabels;
     autoGrouping: boolean;
+    loading?: boolean;
   }) => Promise<RelayGroupManagerResult | undefined>;
+  updateGroupManager?: (options: RelayGroupManagerSnapshot) => Promise<boolean>;
   editSecret?: (
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav",
     field: string,
@@ -87,6 +89,10 @@ type NativeModule = {
   showVersion?: () => void;
   versionInfo?: () => Promise<{ app: string; litellm: string; icon?: string }>;
   openExternalURL?: (url: string) => void;
+  revealFile?: (path: string) => void;
+  openFileEditor?: (target: string) => void;
+  prepareFileEditor?: () => void;
+  pendingFileEditorTarget?: () => string;
   quit?: () => void;
   setShortcuts?: (shortcuts: Record<string, string>) => void;
 };
@@ -153,6 +159,9 @@ const nativeBridge: NativeLeafBridge = {
   showCodexRestartConfirmation: async (title, message, restartLabel, laterLabel) => leaf.showCodexRestartConfirmation?.(title, message, restartLabel, laterLabel),
   chooseModelsToAdd: async (models, providerName, keyName) => leaf.chooseModelsToAdd?.(models, providerName, keyName),
   showGroupManager: async (options) => leaf.showGroupManager?.(options),
+  updateGroupManager: leaf.updateGroupManager
+    ? async (options) => leaf.updateGroupManager!(options)
+    : undefined,
   editSecret: async (domain, field, target, title, allowClear) => leaf.editSecret?.(domain, field, target, title, allowClear),
   clearSecret: async (domain, field, target) => leaf.clearSecret?.(domain, field, target),
   copySecret: async (domain, field, target) => leaf.copySecret?.(domain, field, target) ?? false,
@@ -176,6 +185,10 @@ const nativeBridge: NativeLeafBridge = {
   showVersion: () => call("showVersion"),
   versionInfo: leaf.versionInfo ? () => leaf.versionInfo!() : undefined,
   openExternalURL: (url) => call("openExternalURL", url),
+  revealFile: (path) => call("revealFile", path),
+  openFileEditor: (target) => call("openFileEditor", target),
+  prepareFileEditor: () => call("prepareFileEditor"),
+  pendingFileEditorTarget: () => (typeof leaf.pendingFileEditorTarget === "function" ? leaf.pendingFileEditorTarget() : ""),
   setLocalization: (strings) => {
     nativeStrings = strings;
     call("setLocalization", strings);

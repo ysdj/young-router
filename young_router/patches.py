@@ -12,6 +12,7 @@ from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
 from . import responses_web_search_bridge as _responses_web_search_bridge_module
+from . import reasoning as _reasoning_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import trace as _trace_module
@@ -594,6 +595,91 @@ def _install_routing_constraint_patch() -> None:
     Router.async_get_available_deployment = patched_async_get_available_deployment
 
 
+async def _call_deployment_with_reasoning_parameters_compat(
+    original_make_call: Any,
+    router: Any,
+    original_function: Any,
+    args: tuple,
+    kwargs: dict,
+) -> Any:
+    """Call one deployment, replaying it with a compatible reasoning shape.
+
+    Some OpenAI-chat gateways convert a client reasoning request through their
+    own per-model thinking table and refuse a model name they cannot map (a
+    relay alias, for example a prefixed spelling of a Gemini model).  A
+    Gemini-family upstream still honors the native Google thinking
+    configuration, so that replay keeps the client's requested level; every
+    other route falls back to the same completion without reasoning fields and
+    keeps its provider default thinking behavior.  The successful shape is
+    recorded so later requests are normalized before the upstream call.
+    """
+
+    try:
+        return await original_make_call(router, original_function, *args, **kwargs)
+    except Exception as exc:
+        candidates = (
+            _reasoning_module._reasoning_parameters_compat_retry_candidates(
+                exc,
+                kwargs,
+            )
+        )
+        if not candidates:
+            raise
+        last_exc = exc
+        for mode, retry_kwargs in candidates:
+            _trace_module._route_trace(
+                "reasoning_parameters_compat_retry_start",
+                request_id=_routing_module._trace_request_id(retry_kwargs),
+                session=_routing_module._trace_session_context(retry_kwargs),
+                model_group=_responses_execution_module._request_model_group(
+                    retry_kwargs
+                ),
+                deployment_id=_routing_module._deployment_id_from_request(
+                    retry_kwargs
+                ),
+                route_key=_routing_module._deployment_route_key_from_request(
+                    retry_kwargs
+                ),
+                mode=mode,
+                exception=_routing_module._trace_exception(exc),
+            )
+            # The caller keeps one kwargs dict for the attempt, so each replay
+            # must replace its reasoning fields in place rather than shadow
+            # them; the candidate kwargs were built from the original request.
+            kwargs.clear()
+            kwargs.update(retry_kwargs)
+            try:
+                response = await original_make_call(
+                    router,
+                    original_function,
+                    *args,
+                    **kwargs,
+                )
+            except Exception as retry_exc:
+                last_exc = retry_exc
+                _trace_module._route_trace(
+                    "reasoning_parameters_compat_retry_error",
+                    request_id=_routing_module._trace_request_id(kwargs),
+                    session=_routing_module._trace_session_context(kwargs),
+                    model_group=_responses_execution_module._request_model_group(
+                        kwargs
+                    ),
+                    deployment_id=_routing_module._deployment_id_from_request(
+                        kwargs
+                    ),
+                    route_key=_routing_module._deployment_route_key_from_request(
+                        kwargs
+                    ),
+                    mode=mode,
+                    original_exception=_routing_module._trace_exception(exc),
+                    exception=_routing_module._trace_exception(retry_exc),
+                )
+                continue
+            _routing_module._record_reasoning_parameters_compat(kwargs, mode)
+            return response
+        raise last_exc
+
+
 def _install_selected_deployment_marker_patch() -> None:
     try:
         from litellm.router import Router
@@ -715,7 +801,13 @@ def _install_selected_deployment_marker_patch() -> None:
     async def patched_make_call(self: Any, original_function: Any, *args: Any, **kwargs: Any) -> Any:
         token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
         try:
-            response = await original_make_call(self, original_function, *args, **kwargs)
+            response = await _call_deployment_with_reasoning_parameters_compat(
+                original_make_call,
+                self,
+                original_function,
+                args,
+                kwargs,
+            )
             marker = _CURRENT_SELECTED_DEPLOYMENT.get()
             if _routing_module._is_failed_responses_stream_response(response):
                 failed_request = getattr(response, "request_data", None)

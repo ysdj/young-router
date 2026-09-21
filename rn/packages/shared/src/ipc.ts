@@ -83,6 +83,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     diskState: (domains: ConfigDomain[]): Promise<IpcResults["disk_state"]> => call("disk_state", { domains }),
     logs: async (tab, revision) => call("logs", revision === undefined ? { tab } : { tab, revision }),
     editor: async (domain, document): Promise<IpcResults["editor"]> => call("editor", { domain, document }),
+    files: async (): Promise<IpcResults["files"]> => call("files", {}),
     stageEditor: async (editorToken, text): Promise<IpcResults["editor"]> => call("editor", { editor_token: editorToken, text }),
     dispatch: async (action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]> => call("dispatch", revision === undefined ? { action } : { action, revision }),
     subscribe: (listener: (event: IpcEvent) => void, topics?: string[]): (() => void) => {

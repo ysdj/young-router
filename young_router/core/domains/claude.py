@@ -1205,6 +1205,49 @@ class ClaudeSettingsDomain:
             paths.extend(self._developer.persistence_paths())
         return tuple(dict.fromkeys(paths))
 
+    def client_files(self) -> list[dict[str, Any]]:
+        """Describe the Claude documents for the external-settings listing.
+
+        Claude Desktop keeps its active third-party configuration in a
+        library file named after the applied id; an empty library has no
+        active file yet, so the listing falls back to the library directory
+        that owns the next one.
+        """
+
+        rows: list[dict[str, Any]] = []
+
+        def describe(document: str, path: pathlib.Path, *, client: str, name: str | None = None) -> None:
+            try:
+                details = path.lstat()
+                exists = stat.S_ISREG(details.st_mode)
+            except OSError:
+                exists = False
+            rows.append(
+                {
+                    "id": f"claude.{document}",
+                    "client": client,
+                    "domain": self.name,
+                    "document": document,
+                    "name": name or path.name,
+                    "path": str(path),
+                    "language": "json",
+                    "exists": exists,
+                }
+            )
+
+        # Claude Code and Claude Desktop are separate clients with separate
+        # files: ``~/.claude/settings.json`` belongs to the CLI, while the
+        # Desktop app owns its third-party inference library and developer
+        # settings. The pane groups them apart so an edit never looks like it
+        # belongs to the other app.
+        describe("settings", self.settings_path, client="claudeCode")
+        if self._desktop is not None:
+            active = self._desktop.desktop_config_path
+            describe("desktop", active if active is not None else self._desktop.config_library_path, client="claudeDesktop", name=None if active is not None else "configLibrary")
+        if self._developer is not None:
+            describe("developer", self._developer.path, client="claudeDesktop")
+        return rows
+
     def external_disk_state(self) -> dict[str, bool]:
         """Compare the current settings file with the last reload/apply baseline."""
 

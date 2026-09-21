@@ -12,7 +12,7 @@ export interface DesktopHostDependencies {
 }
 
 export function registerYoungRouter(componentName: string, dependencies: DesktopHostDependencies): void {
-  AppRegistry.registerComponent(componentName, () => function DesktopHost(props: { initialRoute?: AppRoute; initialLogTab?: LogTab; isPrimaryHost?: boolean; isWindowManagerHost?: boolean }): React.JSX.Element {
+  AppRegistry.registerComponent(componentName, () => function DesktopHost(props: { initialRoute?: AppRoute; initialLogTab?: LogTab; initialFileTarget?: string; isPrimaryHost?: boolean; isWindowManagerHost?: boolean }): React.JSX.Element {
     const isPrimaryHost = props.isPrimaryHost !== false;
     // Every route window has its own React root, but all roots in the desktop
     // process share this IPC client. Seed the new root before its first render
@@ -43,6 +43,6 @@ export function registerYoungRouter(componentName: string, dependencies: Desktop
         setRouteRequestSequence((current) => current + 1);
       }
     }, [isPrimaryHost, nativeAction, props.initialRoute]);
-    return <YoungRouterApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} nativeAction={nativeAction} />;
+    return <YoungRouterApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} fileIdRequest={props.initialFileTarget} nativeAction={nativeAction} />;
   });
 }

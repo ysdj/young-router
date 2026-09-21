@@ -26,6 +26,11 @@ export type NativeButtonProps = {
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;
+  /**
+   * The button's own action is running: the control keeps its title, width,
+   * and enabled look and draws a small leading spinner instead.
+   */
+  busy?: boolean;
   primary?: boolean;
   destructive?: boolean;
   compact?: boolean;

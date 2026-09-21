@@ -120,7 +120,7 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["title", "accountLabel", "accountId", "groups", "keys", "labels", "autoGrouping"]),
+        guard Set(options.keys).isSubset(of: ["title", "accountLabel", "accountId", "groups", "keys", "labels", "autoGrouping", "loading"]),
               let title = options["title"] as? String,
               let accountLabel = options["accountLabel"] as? String,
               let accountID = options["accountId"] as? String,
@@ -128,26 +128,71 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
               accountID.count <= 256,
               let labels = options["labels"] as? [String: String],
               let autoGrouping = options["autoGrouping"] as? Bool,
-              let groupEntries = options["groups"] as? [[String: String]],
-              groupEntries.count <= 512,
-              groupEntries.allSatisfy({
-                  !($0["label"] ?? "").isEmpty && ($0["label"]?.count ?? 0) <= 256 && ($0["id"]?.count ?? 0) <= 256
-                      && ($0["name"]?.count ?? 0) <= 256 && ($0["rate"]?.count ?? 0) <= 64
-              }),
-              let keyEntries = options["keys"] as? [[String: Any]],
-              keyEntries.count <= 512,
-              keyEntries.allSatisfy({
-                  let name = ($0["name"] as? String) ?? ""
-                  let id = ($0["id"] as? String) ?? ""
-                  return !name.isEmpty && name.count <= 256 && id.count <= 256
-              }) else {
+              let groups = groupManagerGroups(options),
+              let keys = groupManagerKeys(options) else {
             reject("E_NATIVE_GROUP_INPUT", "The group manager input is invalid.", nil)
             return
         }
-        let groups = groupEntries.map {
+        // The sheet appears before its account facts are loaded: while
+        // `loading` is set it shows the rows it opened on behind its loading
+        // line, and `updateGroupManager` hands it the aligned draft.
+        let loading = (options["loading"] as? Bool) ?? false
+        // The sheet is created in this same main-thread call, so an update the
+        // shared UI pushes right after this request always finds it open.  The
+        // leaf keeps its own main-thread guard for every other caller.
+        self.leaf.showGroupManager(
+            title: title,
+            accountLabel: accountLabel,
+            accountID: accountID,
+            groups: groups,
+            keys: keys,
+            labels: labels,
+            autoGrouping: autoGrouping,
+            loading: loading
+        ) { result in
+            guard let result else {
+                resolve(nil)
+                return
+            }
+            resolve([
+                "autoGrouping": result.autoGrouping,
+                "creates": result.creates.map { ["name": $0.name, "groupID": $0.groupID] },
+                "updates": result.updates.map {
+                    ["keyID": $0.keyID, "name": $0.name, "groupID": $0.groupID, "enabled": $0.enabled]
+                },
+                "deletes": result.deletes,
+            ])
+        }
+    }
+
+    /// The sheet's group entries: the id, the picker label that carries the
+    /// rate, the group name the list column shows, and the rate on its own.
+    /// Every field is bounded like the rest of the native payloads.
+    private func groupManagerGroups(_ options: [String: Any]) -> [[String: String]]? {
+        guard let entries = options["groups"] as? [[String: String]],
+              entries.count <= 512,
+              entries.allSatisfy({
+                  !($0["label"] ?? "").isEmpty && ($0["label"]?.count ?? 0) <= 256 && ($0["id"]?.count ?? 0) <= 256
+                      && ($0["name"]?.count ?? 0) <= 256 && ($0["rate"]?.count ?? 0) <= 64
+              }) else { return nil }
+        return entries.map {
             ["id": $0["id"] ?? "", "label": $0["label"] ?? "", "name": $0["name"] ?? "", "rate": $0["rate"] ?? ""]
         }
-        let keys: [[String: String]] = keyEntries.map {
+    }
+
+    /// The sheet's key entries: one row per station key with the group it
+    /// belongs to, its rate, Core's credential-presence sentinel, and the
+    /// models the station reports for it.  The same rows serve the sheet's
+    /// opening request and its later update.
+    private func groupManagerKeys(_ options: [String: Any]) -> [[String: String]]? {
+        guard let entries = options["keys"] as? [[String: Any]],
+              entries.count <= 512,
+              entries.allSatisfy({
+                  let name = ($0["name"] as? String) ?? ""
+                  let id = ($0["id"] as? String) ?? ""
+                  return !name.isEmpty && name.count <= 256 && id.count <= 256
+              }) else { return nil }
+        return entries.map {
             let models = ($0["models"] as? [String]) ?? []
             return [
                 "id": ($0["id"] as? String) ?? "",
@@ -162,30 +207,33 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 "enabled": (($0["enabled"] as? Bool) ?? true) ? "1" : "0",
             ]
         }
-        DispatchQueue.main.async {
-            self.leaf.showGroupManager(
-                title: title,
-                accountLabel: accountLabel,
-                accountID: accountID,
-                groups: groups,
-                keys: keys,
-                labels: labels,
-                autoGrouping: autoGrouping
-            ) { result in
-                guard let result else {
-                    resolve(nil)
-                    return
-                }
-                resolve([
-                    "autoGrouping": result.autoGrouping,
-                    "creates": result.creates.map { ["name": $0.name, "groupID": $0.groupID] },
-                    "updates": result.updates.map {
-                        ["keyID": $0.keyID, "name": $0.name, "groupID": $0.groupID, "enabled": $0.enabled]
-                    },
-                    "deletes": result.deletes,
-                ])
-            }
+    }
+
+    /// Replace the open sheet's content with a later snapshot of the same
+    /// account and end its loading state, so the sheet never holds the provider
+    /// window closed for the station round trip its rows depend on.  Resolves
+    /// false when no sheet is open: a load that lands after Close changes
+    /// nothing.
+    @objc(updateGroupManager:resolver:rejecter:)
+    func updateGroupManager(
+        _ options: [String: Any],
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: RCTPromiseRejectBlock
+    ) {
+        guard Set(options.keys).isSubset(of: ["accountLabel", "groups", "keys", "autoGrouping"]),
+              let accountLabel = options["accountLabel"] as? String,
+              let autoGrouping = options["autoGrouping"] as? Bool,
+              let groups = groupManagerGroups(options),
+              let keys = groupManagerKeys(options) else {
+            reject("E_NATIVE_GROUP_INPUT", "The group manager input is invalid.", nil)
+            return
         }
+        resolve(self.leaf.updateGroupManager(
+            accountLabel: accountLabel,
+            groups: groups,
+            keys: keys,
+            autoGrouping: autoGrouping
+        ))
     }
 
     @objc(showCodexRestartConfirmation:message:restartLabel:laterLabel:resolver:rejecter:)
@@ -288,7 +336,9 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
             return
         }
         DispatchQueue.main.async {
-            resolve(self.leaf.chooseModelsToAdd(models: models, providerName: providerName, keyName: keyName))
+            self.leaf.chooseModelsToAdd(models: models, providerName: providerName, keyName: keyName) { selection in
+                resolve(selection)
+            }
         }
     }
 
@@ -677,6 +727,22 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
 
     @objc func openExternalURL(_ url: String) {
         leaf.openExternalURL(url)
+    }
+
+    @objc func revealFile(_ path: String) {
+        leaf.revealFile(path)
+    }
+
+    @objc func openFileEditor(_ payload: String) {
+        leaf.openFileEditor(payload)
+    }
+
+    @objc func prepareFileEditor() {
+        leaf.prepareFileEditor()
+    }
+
+    @objc func pendingFileEditorTarget() -> String {
+        leaf.pendingFileEditorTarget()
     }
 
     @objc func quit() {

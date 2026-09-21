@@ -1036,6 +1036,15 @@ void WinUI3NativeLeafModule::OpenExternalURL(std::wstring const& url) noexcept {
   }
 }
 
+void WinUI3NativeLeafModule::RevealFile(std::wstring const& path) noexcept {
+  if (path.empty() || path.size() > 4096) return;
+  try {
+    auto leaf = leaf_;
+    context_.UIDispatcher().Post([leaf, path] { leaf->RevealFile(path); });
+  } catch (...) {
+  }
+}
+
 void WinUI3NativeLeafModule::Quit() noexcept {
   try {
     auto leaf = leaf_;

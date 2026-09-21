@@ -18,6 +18,7 @@ from .pi_web_access import (
 
 from .base import (
     Any,
+    AsyncIterator,
     Optional,
     _EXTERNAL_WEB_FETCH_TIMEOUT_DEFAULT,
     _EXTERNAL_WEB_FETCH_TIMEOUT_ENV,
@@ -33,6 +34,9 @@ from .base import (
     _EXTERNAL_WEB_SEARCH_READ_CHARS_ENV,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _CURRENT_UPSTREAM_URL_SURFACE_KEY,
+    _HOSTED_TOOL_UNSUPPORTED_MESSAGE_KEY,
+    _HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY,
+    _HOSTED_WEB_SEARCH_UNSUPPORTED_MESSAGE,
     _JSONStreamEvent,
     _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
@@ -5354,3 +5358,1264 @@ def _external_web_search_is_timeout_exception(exception: Exception) -> bool:
     ):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Request-level external web search bridge
+#
+# These entry points own a whole request: they stream the web-search round
+# trip, keep SSE keepalives alive, recover through route failures, and finish
+# with the synthesized answer.  The item-level helpers above turn individual
+# tool calls, events and items into their bridged shape.
+# ---------------------------------------------------------------------------
+def _hosted_web_search_unsupported_notice() -> str:
+    return (
+        "WEB_SEARCH_UNSUPPORTED: Codex web_search is not supported by the selected "
+        "LiteLLM route. Hosted Responses web_search requires an upstream Responses "
+        "endpoint with web search support. Do not claim to have searched the web, "
+        "do not answer from memory, and do not use shell/curl/python or other tools "
+        "as a substitute. Tell the user that web_search is unavailable for this route."
+    )
+
+
+def _hosted_tool_unsupported_message(metadata: Optional[dict]) -> Optional[str]:
+    if not isinstance(metadata, dict):
+        return None
+    message = metadata.get(_HOSTED_TOOL_UNSUPPORTED_MESSAGE_KEY)
+    if isinstance(message, str) and message.strip():
+        return message
+    if metadata.get(_HOSTED_WEB_SEARCH_UNSUPPORTED_BRIDGE_KEY) is True:
+        return _HOSTED_WEB_SEARCH_UNSUPPORTED_MESSAGE
+    return None
+
+
+def _hosted_tool_unsupported_response(
+    request_kwargs: Optional[dict],
+    message: str,
+) -> dict[str, Any]:
+    request_kwargs = request_kwargs or {}
+    model = _routing_module._first_not_none(
+        request_kwargs.get("model"),
+        _responses_execution_module._request_model_group(request_kwargs),
+        _routing_module._deployment_route_key_from_request(request_kwargs),
+        "unknown",
+    )
+    response_id = f"resp_hosted_tool_unsupported_{os.getpid()}_{time.time_ns()}"
+    message_id = f"msg_hosted_tool_unsupported_{time.time_ns()}"
+    content = {
+        "type": "output_text",
+        "text": message,
+        "annotations": [],
+    }
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output_text": message,
+        "output": [
+            {
+                "id": message_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [content],
+            }
+        ],
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
+def _hosted_web_search_unsupported_response(request_kwargs: Optional[dict]) -> dict[str, Any]:
+    return _hosted_tool_unsupported_response(
+        request_kwargs,
+        _HOSTED_WEB_SEARCH_UNSUPPORTED_MESSAGE,
+    )
+
+
+async def _hosted_tool_unsupported_stream(
+    response: dict[str, Any],
+) -> AsyncIterator[dict[str, Any]]:
+    output_items = response.get("output")
+    message = output_items[0] if isinstance(output_items, list) and output_items else {}
+    content_items = message.get("content") if isinstance(message, dict) else None
+    content = content_items[0] if isinstance(content_items, list) and content_items else {}
+    message_id = message.get("id") if isinstance(message, dict) else None
+    text = content.get("text") if isinstance(content, dict) else ""
+    text = text if isinstance(text, str) else _HOSTED_WEB_SEARCH_UNSUPPORTED_MESSAGE
+    if not text.strip():
+        text = _responses_output_module._response_text(response)
+    if not text.strip():
+        text = _HOSTED_WEB_SEARCH_UNSUPPORTED_MESSAGE
+
+    created_response = copy.deepcopy(response)
+    created_response["status"] = "in_progress"
+    created_response["output"] = []
+
+    def encode(event: dict[str, Any]) -> dict[str, Any]:
+        return _JSONStreamEvent(event)
+
+    yield encode({"type": "response.created", "response": created_response})
+    yield encode({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "id": message_id,
+            "type": "message",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+        },
+    })
+    yield encode({
+        "type": "response.content_part.added",
+        "item_id": message_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": "", "annotations": []},
+    })
+    yield encode({
+        "type": "response.output_text.delta",
+        "item_id": message_id,
+        "output_index": 0,
+        "content_index": 0,
+        "delta": text,
+    })
+    yield encode({
+        "type": "response.output_text.done",
+        "item_id": message_id,
+        "output_index": 0,
+        "content_index": 0,
+        "text": text,
+    })
+    yield encode({
+        "type": "response.content_part.done",
+        "item_id": message_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": content,
+    })
+    yield encode({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": message,
+    })
+    if isinstance(output_items, list):
+        for output_index, output_item in enumerate(output_items[1:], start=1):
+            item = _streaming_module._jsonable(output_item)
+            if not isinstance(item, dict):
+                continue
+            added_item = copy.deepcopy(item)
+            if added_item.get("status") == "completed":
+                added_item["status"] = "in_progress"
+            yield encode(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": added_item,
+                }
+            )
+            done_item = copy.deepcopy(item)
+            if done_item.get("status") == "in_progress":
+                done_item["status"] = "completed"
+            yield encode(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": done_item,
+                }
+            )
+    yield encode({"type": "response.completed", "response": response})
+
+
+async def _external_web_search_bridge_stream(
+    response: dict[str, Any],
+) -> AsyncIterator[dict[str, Any]]:
+    response = _sanitize_response_web_search_call_items(response)
+    output_items = response.get("output")
+    output = output_items if isinstance(output_items, list) else []
+    created_response = copy.deepcopy(response)
+    created_response["status"] = "in_progress"
+    created_response["output"] = []
+
+    def encode(event: dict[str, Any]) -> dict[str, Any]:
+        return _JSONStreamEvent(event)
+
+    yield encode({"type": "response.created", "response": created_response})
+    sequence_number = 0
+    for index, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "web_search_call":
+            sanitized_item = _sanitize_web_search_call_item(item)
+            if sanitized_item is None:
+                continue
+            item = sanitized_item
+        if item.get("type") == "message":
+            content_items = item.get("content")
+            content = (
+                content_items[0]
+                if isinstance(content_items, list)
+                and content_items
+                and isinstance(content_items[0], dict)
+                else {"type": "output_text", "text": "", "annotations": []}
+            )
+            text = content.get("text") if isinstance(content.get("text"), str) else ""
+            added_message = copy.deepcopy(item)
+            added_message["status"] = "in_progress"
+            added_message["content"] = []
+            yield encode({
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": added_message,
+            })
+            yield encode({
+                "type": "response.content_part.added",
+                "item_id": item.get("id"),
+                "output_index": index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            })
+            if text:
+                yield encode({
+                    "type": "response.output_text.delta",
+                    "item_id": item.get("id"),
+                    "output_index": index,
+                    "content_index": 0,
+                    "delta": text,
+                })
+            yield encode({
+                "type": "response.output_text.done",
+                "item_id": item.get("id"),
+                "output_index": index,
+                "content_index": 0,
+                "text": text,
+            })
+            yield encode({
+                "type": "response.content_part.done",
+                "item_id": item.get("id"),
+                "output_index": index,
+                "content_index": 0,
+                "part": content,
+            })
+            yield encode({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            })
+            continue
+
+        added_item = copy.deepcopy(item)
+        if added_item.get("status") == "completed":
+            added_item["status"] = "in_progress"
+        yield encode({
+            "type": "response.output_item.added",
+            "output_index": index,
+            "item": added_item,
+        })
+        if item.get("type") == "web_search_call":
+            item_id = item.get("id")
+            for event_type in (
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+                "response.web_search_call.completed",
+            ):
+                sequence_number += 1
+                lifecycle_event = {
+                    "type": event_type,
+                    "item_id": item_id,
+                    "output_index": index,
+                    "sequence_number": sequence_number,
+                }
+                action = item.get("action")
+                if isinstance(action, dict):
+                    lifecycle_event["action"] = copy.deepcopy(action)
+                yield encode(lifecycle_event)
+        yield encode({
+            "type": "response.output_item.done",
+            "output_index": index,
+            "item": item,
+        })
+    yield encode({"type": "response.completed", "response": response})
+
+async def _resolve_web_search_function_calls_stream(
+    response: Any,
+    request_kwargs: Optional[dict],
+    original_function: Optional[Any] = None,
+) -> AsyncIterator[dict[str, Any]]:
+    actions = _web_search_actions_for_request(response, request_kwargs)
+    payload = _streaming_module._jsonable(response)
+    if not isinstance(payload, dict):
+        payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
+    if not actions:
+        async for chunk in _external_web_search_bridge_stream(payload):
+            yield chunk
+        return
+
+    def encode(event: dict[str, Any]) -> dict[str, Any]:
+        return _JSONStreamEvent(event)
+
+    created_response = copy.deepcopy(payload)
+    created_response["status"] = "in_progress"
+    created_response["output"] = []
+    yield encode({"type": "response.created", "response": created_response})
+
+    sequence_number = 0
+    search_sections: list[str] = []
+    source_urls: list[str] = []
+    completed_search_items: list[dict[str, Any]] = []
+    page_cache: dict[str, str] = {}
+    page_fetch_tasks: dict[str, asyncio.Task[str]] = {}
+    completed_actions: list[dict[str, str]] = []
+    started_search_items = [
+        (action, search_item)
+        for action in actions
+        for search_item in [_external_web_search_call_item_for_action(action)]
+        if search_item is not None
+    ]
+    for output_index, (_action, search_item) in enumerate(started_search_items):
+        added_item = copy.deepcopy(search_item)
+        added_item["status"] = "in_progress"
+        yield encode(
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": added_item,
+            }
+        )
+        for event_type in (
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+        ):
+            sequence_number += 1
+            yield encode(
+                {
+                    "type": event_type,
+                    "item_id": search_item.get("id"),
+                    "output_index": output_index,
+                    "sequence_number": sequence_number,
+                    "action": copy.deepcopy(added_item.get("action", {})),
+                }
+            )
+
+        action = started_search_items[output_index][0]
+        section, urls, completed_action = await _external_web_search_run_action(
+            action,
+            page_cache,
+            page_fetch_tasks,
+        )
+        search_sections.append(section)
+        completed_actions.append(completed_action)
+        for url in urls:
+            if url not in source_urls:
+                source_urls.append(url)
+        completed_search_item = _external_web_search_call_item_for_action(
+            completed_action,
+            urls,
+        )
+        if completed_search_item is None:
+            continue
+        completed_search_item["id"] = search_item.get("id")
+        completed_search_items.append(completed_search_item)
+        sequence_number += 1
+        yield encode(
+            {
+                "type": "response.web_search_call.completed",
+                "item_id": completed_search_item.get("id"),
+                "output_index": output_index,
+                "sequence_number": sequence_number,
+                "action": copy.deepcopy(completed_search_item.get("action", {})),
+            }
+        )
+        yield encode(
+            {
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": completed_search_item,
+            }
+        )
+
+    search_results = "\n\n".join(section for section in search_sections if section.strip())
+    completed_labels = _external_web_search_action_labels(completed_actions)
+    synthesis_task = asyncio.create_task(
+        _external_web_search_synthesize_or_fallback(
+            request_kwargs=request_kwargs,
+            search_results=search_results,
+            queries=completed_labels,
+            source_urls=source_urls,
+            original_function=original_function,
+        )
+    )
+    try:
+        async for keepalive in _external_web_search_keepalives_until_done(
+            synthesis_task,
+            request_kwargs=request_kwargs,
+            phase="web_search_synthesis",
+        ):
+            yield keepalive
+        synthesized = await synthesis_task
+    finally:
+        if not synthesis_task.done():
+            synthesis_task.cancel()
+
+    synthesized_payload = _streaming_module._jsonable(synthesized)
+    if not isinstance(synthesized_payload, dict):
+        synthesized_payload = _hosted_tool_unsupported_response(
+            request_kwargs,
+            _responses_output_module._response_text(synthesized),
+        )
+    output_items = synthesized_payload.get("output")
+    if not isinstance(output_items, list):
+        output_items = []
+    if not output_items:
+        text = _responses_output_module._response_text(synthesized_payload)
+        if text.strip():
+            output_items = _hosted_tool_unsupported_response(
+                request_kwargs,
+                text,
+            )["output"]
+
+    final_output = list(completed_search_items)
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "web_search_call":
+            continue
+        if _is_web_search_function_call_item(item):
+            continue
+        final_output.append(item)
+        index = len(final_output) - 1
+        if item.get("type") == "message":
+            content_items = item.get("content")
+            content = (
+                content_items[0]
+                if isinstance(content_items, list)
+                and content_items
+                and isinstance(content_items[0], dict)
+                else {"type": "output_text", "text": "", "annotations": []}
+            )
+            text = content.get("text") if isinstance(content.get("text"), str) else ""
+            added_message = copy.deepcopy(item)
+            added_message["status"] = "in_progress"
+            added_message["content"] = []
+            yield encode(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": index,
+                    "item": added_message,
+                }
+            )
+            yield encode(
+                {
+                    "type": "response.content_part.added",
+                    "item_id": item.get("id"),
+                    "output_index": index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                }
+            )
+            if text:
+                yield encode(
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": item.get("id"),
+                        "output_index": index,
+                        "content_index": 0,
+                        "delta": text,
+                    }
+                )
+            yield encode(
+                {
+                    "type": "response.output_text.done",
+                    "item_id": item.get("id"),
+                    "output_index": index,
+                    "content_index": 0,
+                    "text": text,
+                }
+            )
+            yield encode(
+                {
+                    "type": "response.content_part.done",
+                    "item_id": item.get("id"),
+                    "output_index": index,
+                    "content_index": 0,
+                    "part": content,
+                }
+            )
+            yield encode(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": index,
+                    "item": item,
+                }
+            )
+            continue
+
+        added_tool_item = copy.deepcopy(item)
+        if added_tool_item.get("status") == "completed":
+            added_tool_item["status"] = "in_progress"
+        yield encode(
+            {
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": added_tool_item,
+            }
+        )
+        yield encode(
+            {
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            }
+        )
+
+    final_response = copy.deepcopy(synthesized_payload)
+    final_response["status"] = "completed"
+    final_response["output"] = final_output
+    yield encode({"type": "response.completed", "response": final_response})
+
+
+async def _external_web_search_keepalives_until_done(
+    task: "asyncio.Task[Any]",
+    *,
+    request_kwargs: Optional[dict],
+    phase: str,
+) -> AsyncIterator[Any]:
+    try:
+        from .streaming import (
+            _ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS,
+            _route_recovery_sse_keepalive,
+        )
+    except Exception:
+        return
+
+    keepalive_seconds = max(0.001, float(_ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS))
+    while not task.done():
+        done, _pending = await asyncio.wait({task}, timeout=keepalive_seconds)
+        if done:
+            break
+        yield _route_recovery_sse_keepalive(
+            0,
+            request_data=request_kwargs,
+            phase=phase,
+        )
+
+
+def _external_web_search_stream_events_text(events: list[Any]) -> str:
+    from .streaming import _stream_chunk_text_fragment
+
+    parts: list[str] = []
+    done_text: Optional[str] = None
+    for chunk in events:
+        text, is_done = _stream_chunk_text_fragment(chunk)
+        if not text:
+            continue
+        if is_done:
+            done_text = text
+        else:
+            parts.append(text)
+    if isinstance(done_text, str) and done_text.strip():
+        return done_text
+    return "".join(parts)
+
+
+async def _external_web_search_stream_route_recovery_or_fallback(
+    exception: Exception,
+    *,
+    request_kwargs: Optional[dict],
+    search_results: str,
+    queries: list[str],
+) -> Any:
+    has_recovery_context = (
+        _external_web_search_has_recovery_context(
+            request_kwargs,
+            exception,
+        )
+    )
+    if not (
+        _external_web_search_origin_was_streaming(request_kwargs)
+        and (
+            _routing_module._is_route_recovery_poll_error(exception)
+            or has_recovery_context
+        )
+    ):
+        raise exception
+
+    if isinstance(request_kwargs, dict):
+        events: list[Any] = []
+        recovery_request: Optional[dict] = request_kwargs
+        try:
+            from .streaming import (
+                _is_route_recovery_sse_keepalive,
+                _responses_stream_events_to_completed_payload,
+                _stream_route_recovery_poll,
+            )
+
+            recovery_request = _external_web_search_recovery_kwargs(
+                request_kwargs,
+                search_results,
+                exception,
+            )
+            async for chunk in _stream_route_recovery_poll(
+                recovery_request,
+                exception,
+            ):
+                if _is_route_recovery_sse_keepalive(chunk):
+                    continue
+                events.append(chunk)
+        except Exception as recovery_exc:
+            if (
+                isinstance(recovery_request, dict)
+                and _external_web_search_is_recovery_payload(
+                    recovery_request,
+                )
+            ):
+                _external_web_search_set_recovery_request(
+                    exception,
+                    recovery_request,
+                )
+                _external_web_search_set_recovery_request(
+                    recovery_exc,
+                    recovery_request,
+                )
+            _trace_module._route_trace(
+                "external_web_search_stream_route_recovery_error",
+                request_id=_routing_module._trace_request_id(request_kwargs),
+                session=_routing_module._trace_session_context(request_kwargs),
+                model_group=_responses_execution_module._request_model_group(request_kwargs),
+                request=_trace_module._trace_request_summary(request_kwargs),
+                recovery_request=_trace_module._trace_request_summary(recovery_request),
+                recovery_payload_phase=_external_web_search_recovery_payload_phase(
+                    recovery_request
+                    if isinstance(recovery_request, dict)
+                    else None
+                ),
+                original_exception=_routing_module._trace_exception(exception),
+                exception=_routing_module._trace_exception(recovery_exc),
+            )
+        if events:
+            try:
+                recovered_payload = _responses_stream_events_to_completed_payload(
+                    events,
+                    recovery_request,
+                )
+            except Exception as recovery_exc:
+                recovered_payload = None
+                if (
+                    isinstance(recovery_request, dict)
+                    and _external_web_search_is_recovery_payload(
+                        recovery_request,
+                    )
+                ):
+                    _external_web_search_set_recovery_request(
+                        exception,
+                        recovery_request,
+                    )
+                    _external_web_search_set_recovery_request(
+                        recovery_exc,
+                        recovery_request,
+                    )
+                _trace_module._route_trace(
+                    "external_web_search_stream_route_recovery_payload_error",
+                    request_id=_routing_module._trace_request_id(request_kwargs),
+                    session=_routing_module._trace_session_context(request_kwargs),
+                    model_group=_responses_execution_module._request_model_group(request_kwargs),
+                    request=_trace_module._trace_request_summary(request_kwargs),
+                    recovery_request=_trace_module._trace_request_summary(recovery_request),
+                    recovery_payload_phase=_external_web_search_recovery_payload_phase(
+                        recovery_request
+                        if isinstance(recovery_request, dict)
+                        else None
+                    ),
+                    original_exception=_routing_module._trace_exception(exception),
+                    exception=_routing_module._trace_exception(recovery_exc),
+                )
+            if _has_web_search_actions_for_request(
+                recovered_payload,
+                recovery_request,
+            ):
+                return recovered_payload
+            if _responses_output_module._response_text(recovered_payload).strip():
+                return recovered_payload
+            try:
+                recovered_text = _external_web_search_stream_events_text(events)
+            except Exception:
+                recovered_text = ""
+            if not recovered_text.strip():
+                recovered_text = _responses_output_module._response_text(events)
+            if recovered_text.strip():
+                return _hosted_tool_unsupported_response(recovery_request, recovered_text)
+
+    raise exception
+
+
+def _external_web_search_visible_message_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    visible_items: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        if _responses_output_module._response_text(item).strip():
+            visible_items.append(item)
+    return visible_items
+
+
+def _external_web_search_message_stream_events(
+    item: dict[str, Any],
+    index: int,
+) -> list[dict[str, Any]]:
+    item = _final_answer_message_item(item)
+    content_items = item.get("content")
+    content = (
+        content_items[0]
+        if isinstance(content_items, list)
+        and content_items
+        and isinstance(content_items[0], dict)
+        else {"type": "output_text", "text": "", "annotations": []}
+    )
+    text = content.get("text") if isinstance(content.get("text"), str) else ""
+    added_message = copy.deepcopy(item)
+    added_message["status"] = "in_progress"
+    added_message["content"] = []
+    events: list[dict[str, Any]] = [
+        {
+            "type": "response.output_item.added",
+            "output_index": index,
+            "item": added_message,
+        },
+        {
+            "type": "response.content_part.added",
+            "item_id": item.get("id"),
+            "output_index": index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []},
+        },
+    ]
+    if text:
+        events.append(
+            {
+                "type": "response.output_text.delta",
+                "item_id": item.get("id"),
+                "output_index": index,
+                "content_index": 0,
+                "delta": text,
+            }
+        )
+    events.extend(
+        [
+            {
+                "type": "response.output_text.done",
+                "item_id": item.get("id"),
+                "output_index": index,
+                "content_index": 0,
+                "text": text,
+            },
+            {
+                "type": "response.content_part.done",
+                "item_id": item.get("id"),
+                "output_index": index,
+                "content_index": 0,
+                "part": content,
+            },
+            {
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            },
+        ]
+    )
+    return events
+
+
+def _external_web_search_missing_final_answer_exception(
+    request_kwargs: Optional[dict],
+) -> Exception:
+    exception = RuntimeError(
+        "Young Router external web_search completed without a visible assistant answer"
+    )
+    try:
+        exception.status_code = 503  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        exception.body = {  # type: ignore[attr-defined]
+            "reason": "external_web_search_missing_final_answer",
+        }
+    except Exception:
+        pass
+    _routing_module._mark_exception_for_deployment_failover(exception, request_kwargs)
+    return exception
+
+
+def _external_web_search_output_items_from_response(
+    response: Any,
+    request_kwargs: Optional[dict],
+) -> tuple[dict[str, Any], list[Any]]:
+    payload = _streaming_module._jsonable(response)
+    if not isinstance(payload, dict):
+        payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
+    output_items = payload.get("output")
+    if not isinstance(output_items, list):
+        output_items = []
+    if not output_items:
+        text = _responses_output_module._response_text(response)
+        if text.strip():
+            output_items = _hosted_tool_unsupported_response(
+                request_kwargs,
+                text,
+            )["output"]
+    return payload, output_items
+
+
+async def _resolve_web_search_function_calls_stream_rounds(
+    response: Any,
+    request_kwargs: Optional[dict],
+    original_function: Optional[Any] = None,
+) -> AsyncIterator[dict[str, Any]]:
+    payload = _streaming_module._jsonable(response)
+    if not isinstance(payload, dict):
+        payload = _hosted_tool_unsupported_response(request_kwargs, _responses_output_module._response_text(response))
+    initial_actions = _web_search_actions_for_request(response, request_kwargs)
+    if not initial_actions:
+        _external_web_search_raise_if_invalid_initial_no_action_response(
+            response,
+            request_kwargs,
+        )
+        async for chunk in _external_web_search_bridge_stream(payload):
+            yield chunk
+        return
+
+    def encode(event: dict[str, Any]) -> dict[str, Any]:
+        return _JSONStreamEvent(event)
+
+    created_response = copy.deepcopy(payload)
+    created_response["status"] = "in_progress"
+    created_response["output"] = []
+    yield encode({"type": "response.created", "response": created_response})
+
+    max_rounds = _external_web_search_max_rounds()
+    sequence_number = 0
+    next_output_index = 0
+    current_response = response
+    _mark_external_web_search_started(request_kwargs)
+    completed_actions: list[dict[str, str]] = (
+        _external_web_search_completed_actions_metadata(request_kwargs)
+    )
+    existing_search_results = _external_web_search_search_results_metadata(request_kwargs)
+    search_sections: list[str] = [existing_search_results] if existing_search_results.strip() else []
+    source_urls: list[str] = []
+    source_urls_by_action: list[list[str]] = []
+    page_cache: dict[str, str] = {}
+    page_fetch_tasks: dict[str, asyncio.Task[str]] = {}
+    completed_search_items: list[dict[str, Any]] = []
+    final_response: Any = response
+    search_results = "\n\n".join(section for section in search_sections if section.strip())
+    completed_labels = _external_web_search_action_labels(completed_actions)
+    forced_synthesis = False
+    route_recovery_attempted = False
+
+    def collect_action_events(
+        actions: list[dict[str, str]],
+    ) -> tuple[AsyncIterator[dict[str, Any]], dict[str, Any]]:
+        collection: dict[str, Any] = {
+            "message": "",
+            "source_urls": [],
+            "source_urls_by_action": [],
+            "completed_actions": [],
+            "completed_items": [],
+        }
+
+        async def stream_events() -> AsyncIterator[dict[str, Any]]:
+            nonlocal sequence_number, next_output_index
+
+            round_items: list[tuple[int, str, dict[str, str]]] = []
+            for action in actions:
+                search_item = _external_web_search_call_item_for_action(action)
+                if search_item is None:
+                    continue
+                added_item = copy.deepcopy(search_item)
+                added_item["status"] = "in_progress"
+                output_index = next_output_index
+                next_output_index += 1
+                round_items.append((output_index, search_item["id"], action))
+                yield encode(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": added_item,
+                    }
+                )
+                for event_type in (
+                    "response.web_search_call.in_progress",
+                    "response.web_search_call.searching",
+                ):
+                    sequence_number += 1
+                    yield encode(
+                        {
+                            "type": event_type,
+                            "item_id": search_item.get("id"),
+                            "output_index": output_index,
+                            "sequence_number": sequence_number,
+                            "action": copy.deepcopy(added_item.get("action", {})),
+                        }
+                    )
+
+            async def run_round_action(
+                index: int,
+                action: dict[str, str],
+            ) -> tuple[int, str, list[str], dict[str, str]]:
+                section, urls, completed_action = await _external_web_search_run_action(
+                    action,
+                    page_cache,
+                    page_fetch_tasks,
+                )
+                return index, section, urls, completed_action
+
+            tasks = [
+                asyncio.create_task(run_round_action(index, action))
+                for index, (_output_index, _item_id, action) in enumerate(round_items)
+            ]
+            round_results: list[Optional[tuple[str, list[str], dict[str, str]]]] = [
+                None
+            ] * len(round_items)
+            round_completed_items: list[Optional[dict[str, Any]]] = [None] * len(round_items)
+            completed_all_tasks = False
+            try:
+                for task in asyncio.as_completed(tasks):
+                    index, section, urls, completed_action = await task
+                    round_results[index] = (section, urls, completed_action)
+                    output_index, item_id, _action = round_items[index]
+                    completed_item = _external_web_search_call_item_for_action(
+                        completed_action,
+                        urls,
+                    )
+                    if completed_item is None:
+                        continue
+                    completed_item["id"] = item_id
+                    round_completed_items[index] = completed_item
+                    sequence_number += 1
+                    yield encode(
+                        {
+                            "type": "response.web_search_call.completed",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "sequence_number": sequence_number,
+                            "action": copy.deepcopy(completed_item.get("action", {})),
+                        }
+                    )
+                    yield encode(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": output_index,
+                            "item": completed_item,
+                        }
+                    )
+                completed_all_tasks = True
+            finally:
+                if not completed_all_tasks:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            sections: list[str] = []
+            all_urls: list[str] = []
+            urls_by_action: list[list[str]] = []
+            completed: list[dict[str, str]] = []
+            visible_items: list[dict[str, Any]] = []
+            for index, _round_item in enumerate(round_items):
+                result = round_results[index]
+                completed_item = round_completed_items[index]
+                if result is None or completed_item is None:
+                    continue
+                section, urls, completed_action = result
+                sections.append(section)
+                urls_by_action.append(urls)
+                completed.append(completed_action)
+                visible_items.append(completed_item)
+                for url in urls:
+                    if url not in all_urls:
+                        all_urls.append(url)
+            collection["message"] = "\n\n".join(
+                section for section in sections if section.strip()
+            )
+            collection["source_urls"] = all_urls
+            collection["source_urls_by_action"] = urls_by_action
+            collection["completed_actions"] = completed
+            collection["completed_items"] = visible_items
+
+        return stream_events(), collection
+
+    for round_number in range(1, max_rounds + 1):
+        round_actions = _external_web_search_budgeted_actions(
+            _web_search_actions_for_request(current_response, request_kwargs),
+            completed_actions,
+        )
+        if not round_actions:
+            final_response = current_response
+            break
+
+        round_events, round_result = collect_action_events(round_actions)
+        async for event in round_events:
+            yield event
+        round_message = round_result["message"]
+        round_source_urls = round_result["source_urls"]
+        round_source_urls_by_action = round_result["source_urls_by_action"]
+        round_completed_actions = round_result["completed_actions"]
+        round_completed_items = round_result["completed_items"]
+        _trace_module._route_trace(
+            "external_web_search_bridge_actions_executed",
+            activity="local_pi_web_access",
+            request_id=_routing_module._trace_request_id(request_kwargs),
+            session=_routing_module._trace_session_context(request_kwargs),
+            model_group=_responses_execution_module._request_model_group(request_kwargs),
+            deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
+            route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
+            round=round_number,
+            actions=_external_web_search_trace_actions(round_completed_actions),
+            source_url_count=len(round_source_urls),
+            evidence_chars=len(round_message or ""),
+        )
+        search_sections.append(round_message)
+        completed_actions.extend(round_completed_actions)
+        source_urls_by_action.extend(round_source_urls_by_action)
+        completed_search_items.extend(round_completed_items)
+        for url in round_source_urls:
+            if url not in source_urls:
+                source_urls.append(url)
+
+        search_results = "\n\n".join(section for section in search_sections if section.strip())
+        completed_labels = _external_web_search_action_labels(completed_actions)
+        try:
+            # The round budget guards against an endless action loop; it must
+            # not replace the model's own final answer. On the last round the
+            # continuation directs the model itself to close the investigation
+            # and its answer is kept verbatim.
+            final_round = round_number >= max_rounds
+
+            _external_web_search_prepare_continuation_recovery_request(
+                request_kwargs=request_kwargs,
+                search_results=search_results,
+                queries=completed_labels,
+                completed_actions=completed_actions,
+                round_number=round_number,
+                final_round=final_round,
+            )
+
+            continuation_task = asyncio.create_task(
+                _external_web_search_continue_or_synthesize(
+                    request_kwargs=request_kwargs,
+                    search_results=search_results,
+                    queries=completed_labels,
+                    completed_actions=completed_actions,
+                    source_urls=source_urls,
+                    round_number=round_number,
+                    original_function=original_function,
+                    final_round=final_round,
+                )
+            )
+            try:
+                async for keepalive in _external_web_search_keepalives_until_done(
+                    continuation_task,
+                    request_kwargs=request_kwargs,
+                    phase="web_search_continuation",
+                ):
+                    yield keepalive
+                current_response = await continuation_task
+            finally:
+                if not continuation_task.done():
+                    continuation_task.cancel()
+        except Exception as exc:
+            route_recovery_attempted = True
+            recovery_task = asyncio.create_task(
+                _external_web_search_stream_route_recovery_or_fallback(
+                    exc,
+                    request_kwargs=request_kwargs,
+                    search_results=search_results,
+                    queries=completed_labels,
+                )
+            )
+            try:
+                async for keepalive in _external_web_search_keepalives_until_done(
+                    recovery_task,
+                    request_kwargs=request_kwargs,
+                    phase="web_search_route_recovery",
+                ):
+                    yield keepalive
+                final_response = await recovery_task
+            finally:
+                if not recovery_task.done():
+                    recovery_task.cancel()
+            if _has_web_search_actions_for_request(
+                final_response,
+                request_kwargs,
+            ):
+                current_response = final_response
+                continue
+            forced_synthesis = True
+            break
+        final_response = current_response
+
+    if not forced_synthesis:
+        search_results = "\n\n".join(section for section in search_sections if section.strip())
+        completed_labels = _external_web_search_action_labels(completed_actions)
+        try:
+            finalize_task = asyncio.create_task(
+                _external_web_search_finalize_response(
+                    final_response,
+                    request_kwargs=request_kwargs,
+                    search_results=search_results,
+                    queries=completed_labels,
+                    source_urls=source_urls,
+                    original_function=original_function,
+                )
+            )
+            try:
+                async for keepalive in _external_web_search_keepalives_until_done(
+                    finalize_task,
+                    request_kwargs=request_kwargs,
+                    phase="web_search_finalize",
+                ):
+                    yield keepalive
+                final_response = await finalize_task
+            finally:
+                if not finalize_task.done():
+                    finalize_task.cancel()
+        except Exception as exc:
+            if route_recovery_attempted:
+                # A bounded route-recovery poll already ran for this stream;
+                # polling again would only extend the client-visible silence.
+                # Surface the failure so Codex can reconnect and retry once
+                # the upstream route recovers.
+                yield _streaming_module._synthesized_failed_response_event(
+                    request_kwargs or {},
+                    exc,
+                )
+                return
+            route_recovery_attempted = True
+            recovery_task = asyncio.create_task(
+                _external_web_search_stream_route_recovery_or_fallback(
+                    exc,
+                    request_kwargs=request_kwargs,
+                    search_results=search_results,
+                    queries=completed_labels,
+                )
+            )
+            try:
+                async for keepalive in _external_web_search_keepalives_until_done(
+                    recovery_task,
+                    request_kwargs=request_kwargs,
+                    phase="web_search_route_recovery",
+                ):
+                    yield keepalive
+                final_response = await recovery_task
+            finally:
+                if not recovery_task.done():
+                    recovery_task.cancel()
+
+    synthesized_payload, output_items = _external_web_search_output_items_from_response(
+        final_response,
+        request_kwargs,
+    )
+
+    final_output = list(completed_search_items)
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "web_search_call":
+            continue
+        if _is_web_search_function_call_item(item):
+            continue
+        item = _final_answer_message_item(item)
+        final_output.append(item)
+        index = len(final_output) - 1
+        if item.get("type") == "message":
+            for event in _external_web_search_message_stream_events(item, index):
+                yield encode(event)
+            continue
+
+        added_tool_item = copy.deepcopy(item)
+        if added_tool_item.get("status") == "completed":
+            added_tool_item["status"] = "in_progress"
+        yield encode(
+            {
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": added_tool_item,
+            }
+        )
+        yield encode(
+            {
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            }
+        )
+
+    if not _external_web_search_visible_message_items(final_output):
+        exception = _external_web_search_missing_final_answer_exception(request_kwargs)
+        if route_recovery_attempted:
+            yield _streaming_module._synthesized_failed_response_event(
+                request_kwargs or {},
+                exception,
+            )
+            return
+        recovery_task = asyncio.create_task(
+            _external_web_search_stream_route_recovery_or_fallback(
+                exception,
+                request_kwargs=request_kwargs,
+                search_results=search_results,
+                queries=completed_labels,
+            )
+        )
+        try:
+            async for keepalive in _external_web_search_keepalives_until_done(
+                recovery_task,
+                request_kwargs=request_kwargs,
+                phase="web_search_route_recovery",
+            ):
+                yield keepalive
+            recovered_response = await recovery_task
+        finally:
+            if not recovery_task.done():
+                recovery_task.cancel()
+        recovered_payload, recovered_output = _external_web_search_output_items_from_response(
+            recovered_response,
+            request_kwargs,
+        )
+        if isinstance(recovered_output, list):
+            for item in recovered_output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "web_search_call":
+                    continue
+                if _is_web_search_function_call_item(item):
+                    continue
+                item = _final_answer_message_item(item)
+                final_output.append(item)
+                if item.get("type") == "message":
+                    index = len(final_output) - 1
+                    for event in _external_web_search_message_stream_events(item, index):
+                        yield encode(event)
+        synthesized_payload = recovered_payload
+        if not _external_web_search_visible_message_items(final_output):
+            yield _streaming_module._synthesized_failed_response_event(
+                request_kwargs or {},
+                exception,
+            )
+            return
+
+    final_response_payload = copy.deepcopy(synthesized_payload)
+    final_response_payload["status"] = "completed"
+    final_response_payload["output"] = final_output
+    yield encode({"type": "response.completed", "response": final_response_payload})
+
+

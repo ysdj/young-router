@@ -1014,6 +1014,10 @@ class CoreIPCServer:
                     tab,
                     known_revision if type(known_revision) is int else None,
                 )
+            elif request.method == "files":
+                # The external-settings listing is read-only: it names the
+                # registered client configuration files and never their text.
+                result = self.core.client_files()
             elif request.method == "editor":
                 if set(params) == {"domain", "document"}:
                     domain = params.get("domain")

@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+from ...browser_identity import browser_request_headers
 from ..persistence import AtomicJSONStore, PersistenceError, read_bytes
 from ..security import safe_exception_message
 
@@ -753,7 +754,7 @@ class RelayHTTPClient:
             raise RelayAccountsError("Relay request method is invalid")
         url = _relay_endpoint(origin, path)
         request_body = None
-        request_headers = {"Accept": "application/json", "User-Agent": "Young-Router-Core/1", **dict(headers)}
+        request_headers = {**browser_request_headers(), **dict(headers)}
         if body is not None:
             request_body = json.dumps(dict(body), ensure_ascii=False).encode("utf-8")
             request_headers.setdefault("Content-Type", "application/json")
@@ -825,9 +826,8 @@ class RelayHTTPClient:
             _relay_endpoint(origin, path),
             data=json.dumps(fields, ensure_ascii=False).encode("utf-8"),
             headers={
-                "Accept": "application/json",
+                **browser_request_headers(),
                 "Content-Type": "application/json",
-                "User-Agent": "Young-Router-Core/1",
             },
             method="POST",
         )
@@ -891,9 +891,8 @@ class RelayHTTPClient:
         request = urllib.request.Request(
             endpoint,
             headers={
-                "Accept": "application/json",
+                **browser_request_headers(),
                 "Cache-Control": "no-store",
-                "User-Agent": "Young-Router-Core/1",
             },
             method="GET",
         )
@@ -2215,7 +2214,11 @@ class RelayAccountsDomain:
                 issues.append(self._apply_issue("account_unavailable", account_id=account_id, resource_id=resource_id))
                 continue
             _, account = account_result
-            if account.get("login_status") != "signed_in":
+            # Remote work needs usable credentials, not a fresh browser
+            # sign-in: an in-memory or explicitly remembered session can still
+            # authenticate this Apply, and the login observation must not be
+            # what decides whether the journaled work may run.
+            if not self._has_session_credentials(account):
                 issues.append(self._apply_issue("login_required", account_id=account_id, resource_id=resource_id))
                 continue
             if operation.get("kind") != "api_key_create":
@@ -2839,14 +2842,18 @@ class RelayAccountsDomain:
         self.revision += 1
 
     def trusted_secret_value(self, field: str, target: str | None = None) -> str:
-        """Read one API key only for a native, one-time plaintext lease."""
+        """Read one API key only for a native, one-time plaintext lease.
+
+        A key that is already known locally is local data: the account's
+        login status only records what the last session check observed, so it
+        never blocks this read.  The read resolves the station credential on
+        its own and fails only when no key or no dashboard session exists.
+        """
 
         if field != "api_key" or target is None:
             raise RelayAccountsError("The requested relay credential is unavailable")
         account_id, resource_id = self._secret_target(target)
         account = self._accounts[self._index(account_id)]
-        if account["login_status"] != "signed_in":
-            raise RelayAccountsError("Relay login is unavailable")
         return self._read_key(account, self._selected_resource(account, resource_id))
 
     def add_account_for_login(
@@ -3063,6 +3070,11 @@ class RelayAccountsDomain:
         ``signed_in`` state must still pass through :meth:`accept_login_result`
         so the Core has the verified session in memory for a later relay
         import.
+
+        The result is one account observation, never a statement about the
+        station's API keys: the last verified key list and its resource state
+        stay exactly as they were, so locally known keys keep loading while
+        the account reads signed out or expired.
         """
 
         if status not in {"signed_out", "expired"}:
@@ -3071,10 +3083,12 @@ class RelayAccountsDomain:
         account = copy.deepcopy(self._accounts[index])
         account["login_status"] = status
         account["last_updated_at"] = _utc_now_iso()
-        account["resource_status"] = "idle"
-        account["resource_error"] = "none"
-        account["resources"] = []
-        account["groups"] = []
+        # A session check says nothing about the station's API keys.  The
+        # result is recorded as the account's login observation only: the last
+        # verified key list and its resource state stay exactly as they were,
+        # so locally known keys keep loading and stay usable while the account
+        # reads signed out or expired.  Only a real resource read may replace,
+        # empty, or downgrade that list.
         self._accounts[index] = _private_account(account)
         self._session_secrets.pop(account_id, None)
         if status == "expired":
@@ -3083,8 +3097,12 @@ class RelayAccountsDomain:
         self.revision += 1
         return _public_account(self._accounts[index])
 
-    def _headers(self, account: Mapping[str, Any]) -> dict[str, str]:
-        secrets = self._session_secrets.get(str(account.get("id", "")), {})
+    @staticmethod
+    def _session_headers(secrets: object) -> dict[str, str]:
+        """Return dashboard headers for one stored session, if it has one."""
+
+        if not isinstance(secrets, Mapping):
+            return {}
         cookie = secrets.get("cookie")
         token = secrets.get("access_token")
         headers: dict[str, str] = {}
@@ -3092,41 +3110,41 @@ class RelayAccountsDomain:
             headers["Cookie"] = cookie
         if isinstance(token, str) and token:
             headers["Authorization"] = f"Bearer {token}"
-        if not headers:
-            raise RelayAccountsError("Relay login is unavailable")
         return headers
 
-    def _read_key_headers(self, account: Mapping[str, Any]) -> dict[str, str]:
-        """Resolve dashboard headers for one key read.
+    def _has_session_credentials(self, account: Mapping[str, Any]) -> bool:
+        """Whether Core can still issue one station request for this account."""
 
-        The in-memory session is preferred.  After a Core restart it may be
-        empty even though the user explicitly saved the session; fall back to
-        those persisted secrets, matching the behavior of the relay resource
-        refresh path once the session has been restored.
+        account_id = str(account.get("id", ""))
+        if self._session_headers(self._session_secrets.get(account_id, {})):
+            return True
+        return bool(self._session_headers(account.get("session")))
+
+    def _headers(self, account: Mapping[str, Any]) -> dict[str, str]:
+        """Resolve dashboard headers for one station read or write.
+
+        The in-memory session is preferred.  After a Core restart it is
+        empty even though the user explicitly saved the session, and a failed
+        session check pops it as well; the remembered session is a local
+        credential, so it is reused here instead of gating every read on the
+        account's login status.
         """
 
-        try:
-            return self._headers(account)
-        except RelayAccountsError:
-            pass
-        if not account.get("remember_password"):
-            raise RelayAccountsError("Relay login is unavailable") from None
-        session = account.get("session")
-        if not isinstance(session, Mapping):
-            raise RelayAccountsError("Relay login is unavailable") from None
-        cookie = session.get("cookie")
-        token = session.get("access_token")
-        headers: dict[str, str] = {}
-        if isinstance(cookie, str) and cookie:
-            headers["Cookie"] = cookie
-        if isinstance(token, str) and token:
-            headers["Authorization"] = f"Bearer {token}"
-        if not headers:
-            raise RelayAccountsError("Relay login is unavailable") from None
         account_id = str(account.get("id", ""))
+        headers = self._session_headers(self._session_secrets.get(account_id, {}))
+        if headers:
+            return headers
+        session = account.get("session")
+        headers = self._session_headers(session)
+        if not headers:
+            raise RelayAccountsError("Relay login is unavailable")
         self._session_secrets[account_id] = {
             key: value
-            for key, value in (("cookie", cookie), ("access_token", token), ("refresh_token", session.get("refresh_token")))
+            for key, value in (
+                ("cookie", session.get("cookie")),
+                ("access_token", session.get("access_token")),
+                ("refresh_token", session.get("refresh_token")),
+            )
             if isinstance(value, str) and value
         }
         return headers
@@ -3433,8 +3451,10 @@ class RelayAccountsDomain:
         account = self._accounts[index]
         previous_resources = copy.deepcopy(account.get("resources", []))
         previous_groups = copy.deepcopy(account.get("groups", []))
-        if account["login_status"] != "signed_in":
-            raise RelayAccountsError("Relay login is unavailable")
+        # A refresh needs usable credentials, not a fresh browser sign-in: a
+        # remembered session still reads the station, and an account without
+        # any session fails in the first read below with the same unavailable
+        # result instead of refusing here on its login observation.
         try:
             self._clear_resource_cache(account_id)
             with ThreadPoolExecutor(max_workers=3) as executor:
@@ -4088,7 +4108,7 @@ class RelayAccountsDomain:
         if isinstance(cached, str) and cached:
             return cached
         if account["type"] == "sub2api":
-            keys = _json_data(self._http.json(account["origin"], "/api/v1/keys?page=1&page_size=100", headers=self._read_key_headers(account)))
+            keys = _json_data(self._http.json(account["origin"], "/api/v1/keys?page=1&page_size=100", headers=self._headers(account)))
             if isinstance(keys, Mapping):
                 keys = keys.get("items", [])
             if not isinstance(keys, Sequence) or isinstance(keys, (str, bytes, bytearray)):
@@ -4115,7 +4135,7 @@ class RelayAccountsDomain:
             token_id = int(token_id_text)
         except ValueError:
             raise RelayAccountsError("The selected relay API resource is unavailable")
-        payload = _json_data(self._http.post(account["origin"], f"/api/token/{token_id}/key", headers=self._read_key_headers(account)))
+        payload = _json_data(self._http.post(account["origin"], f"/api/token/{token_id}/key", headers=self._headers(account)))
         key = payload.get("key") if isinstance(payload, Mapping) else None
         if not isinstance(key, str) or not key.strip():
             raise RelayAccountsError("Relay API key is unavailable")

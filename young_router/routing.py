@@ -95,6 +95,11 @@ from .base import (
     _RECOVERY_POLICY_RECOVERY,
     _RECOVERY_MAX_DEFAULT_SECONDS,
     _RECOVERY_MAX_SECONDS_ENV,
+    _REASONING_PARAMETERS_COMPAT_RETRY_METADATA_KEY,
+    _REASONING_PARAMETERS_COMPAT,
+    _REASONING_PARAMETERS_COMPAT_DEFAULT_TTL_SECONDS,
+    _REASONING_PARAMETERS_COMPAT_LOCK,
+    _REASONING_PARAMETERS_COMPAT_TTL_SECONDS_ENV,
     _REQUEST_TIMEOUT_DEFAULT_SECONDS,
     _REQUEST_TIMEOUT_SECONDS_ENV,
     _REQUEST_BODY_SIZE_REJECTED_METADATA_KEY,
@@ -2647,6 +2652,290 @@ def _record_web_search_tool_unsupported(
         ttl_seconds=ttl,
         expires_at=expires_at,
         exception=_trace_exception(exception),
+    )
+    return True
+
+
+# OpenAI-chat gateways translate a client reasoning request through their own
+# per-model thinking table.  A model they cannot map (a relay alias such as a
+# prefixed spelling of a Gemini model) is refused while the completion request
+# is converted, and the reasoned parameters are exactly the refused part.
+_REASONING_CONFIGURATION_ERROR_MARKERS = (
+    "thinking configuration",
+    "thinking config",
+    "thinking_config",
+    "gemini thinking",
+    "reasoning configuration",
+    "reasoning config",
+)
+_REASONING_CONFIGURATION_REJECTION_MARKERS = (
+    "does not have a known",
+    "has no known",
+    "no known",
+    "unknown",
+    "not support",
+    "does not support",
+    "unsupported",
+    "not allowed",
+    "invalid",
+    "convert_request_failed",
+    "不支持",
+    "未知",
+    "无效",
+)
+
+
+def _is_reasoning_configuration_unsupported_error(exception: Exception) -> bool:
+    """Whether the upstream refused this model's reasoning configuration.
+
+    The failure is deterministic and route-scoped: the same request without the
+    optional reasoning fields is the compatible one, and the route itself
+    remains healthy.  Keep the match on an explicit configuration-rejection
+    phrase so an ordinary request/format 400 is never classified here.
+    """
+
+    status_code = _exception_status_code(exception)
+    if status_code is not None and status_code not in (400, 422):
+        return False
+    text = _exception_text(exception).lower()
+    if not text:
+        return False
+    if not any(marker in text for marker in _REASONING_CONFIGURATION_ERROR_MARKERS):
+        return False
+    return any(
+        marker in text for marker in _REASONING_CONFIGURATION_REJECTION_MARKERS
+    )
+
+
+def _request_attempted_reasoning_parameters_compat_retry(
+    request_kwargs: Optional[dict],
+) -> bool:
+    for metadata_key in ("litellm_metadata", "metadata"):
+        metadata = _request_context_module._request_metadata_dict(
+            request_kwargs, metadata_key
+        )
+        if (
+            metadata is not None
+            and metadata.get(_REASONING_PARAMETERS_COMPAT_RETRY_METADATA_KEY) is True
+        ):
+            return True
+    return False
+
+
+def _reasoning_parameters_compat_ttl_seconds() -> float:
+    value = os.getenv(_REASONING_PARAMETERS_COMPAT_TTL_SECONDS_ENV, "").strip()
+    if not value:
+        return _REASONING_PARAMETERS_COMPAT_DEFAULT_TTL_SECONDS
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _REASONING_PARAMETERS_COMPAT_DEFAULT_TTL_SECONDS
+    return max(0.0, parsed)
+
+
+def _reasoning_parameters_compat_state_map(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    payload.setdefault("schema_version", 1)
+    states = payload.setdefault("reasoning_parameters_compat", {})
+    if not isinstance(states, dict):
+        states = {}
+        payload["reasoning_parameters_compat"] = states
+    return states
+
+
+def _clean_reasoning_parameters_compat_state(
+    state: Any,
+    *,
+    now: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(state, dict):
+        return None
+    if state.get("status") not in {None, "compat"}:
+        return None
+    mode = state.get("mode")
+    if mode not in {"strip", "google_thinking_level"}:
+        return None
+    try:
+        expires_at = float(state.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    if expires_at <= 0 or (now is not None and expires_at <= now):
+        return None
+    cleaned = dict(state)
+    cleaned["status"] = "compat"
+    cleaned["expires_at"] = expires_at
+    try:
+        cleaned["detected_at"] = float(cleaned.get("detected_at") or 0.0)
+    except (TypeError, ValueError):
+        cleaned["detected_at"] = 0.0
+    return cleaned
+
+
+def _sync_reasoning_parameters_compat_from_shared_locked(
+    states: dict[str, Any],
+    now: float,
+) -> None:
+    shared: dict[str, dict[str, Any]] = {}
+    for cache_key, state in list(states.items()):
+        cleaned = _clean_reasoning_parameters_compat_state(state, now=now)
+        if cleaned is None:
+            states.pop(cache_key, None)
+            continue
+        shared[cache_key] = cleaned
+        if cleaned is not state:
+            states[cache_key] = cleaned
+    with _REASONING_PARAMETERS_COMPAT_LOCK:
+        _REASONING_PARAMETERS_COMPAT.clear()
+        _REASONING_PARAMETERS_COMPAT.update(
+            {key: value.copy() for key, value in shared.items()}
+        )
+
+
+def _reasoning_parameters_compat_update_shared(callback: Any) -> Any:
+    path = _deployment_cooldown_file_path()
+    if not path:
+        return None
+
+    def update(payload: dict[str, Any]) -> Any:
+        now = time.time()
+        states = _reasoning_parameters_compat_state_map(payload)
+        _sync_reasoning_parameters_compat_from_shared_locked(states, now)
+        result = callback(states, now)
+        _sync_reasoning_parameters_compat_from_shared_locked(states, now)
+        return result, now
+
+    try:
+        return _state_module._locked_json_state_update(path, update)
+    except OSError:
+        return None
+
+
+def _reasoning_parameters_compat_cache_key(
+    request_kwargs: Optional[dict],
+) -> Optional[str]:
+    deployment_id = _deployment_id_from_request(request_kwargs)
+    return f"id:{deployment_id}" if deployment_id else None
+
+
+def _reasoning_parameters_compat_cached(
+    request_kwargs: Optional[dict],
+) -> Optional[dict[str, Any]]:
+    if (
+        not isinstance(request_kwargs, dict)
+        or _reasoning_parameters_compat_ttl_seconds() <= 0
+    ):
+        return None
+    cache_key = _reasoning_parameters_compat_cache_key(request_kwargs)
+    if not cache_key:
+        return None
+
+    def read(states: dict[str, Any], now: float) -> Optional[dict[str, Any]]:
+        state = _clean_reasoning_parameters_compat_state(
+            states.get(cache_key),
+            now=now,
+        )
+        if state is None:
+            states.pop(cache_key, None)
+            return None
+        return state
+
+    result = _reasoning_parameters_compat_update_shared(read)
+    state = result[0] if isinstance(result, tuple) else None
+    if state is None:
+        with _REASONING_PARAMETERS_COMPAT_LOCK:
+            state = _clean_reasoning_parameters_compat_state(
+                _REASONING_PARAMETERS_COMPAT.get(cache_key),
+                now=time.time(),
+            )
+            if state is None:
+                _REASONING_PARAMETERS_COMPAT.pop(cache_key, None)
+    if not isinstance(state, dict):
+        return None
+    _trace_module._route_trace(
+        "reasoning_parameters_compat_cache_hit",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=_deployment_id_from_request(request_kwargs),
+        route_key=_deployment_route_key_from_request(request_kwargs),
+        cache_key=cache_key,
+        expires_at=state.get("expires_at"),
+        remaining_seconds=round(
+            max(0.0, float(state.get("expires_at") or 0.0) - time.time()),
+            3,
+        ),
+        request=_trace_module._trace_request_summary(request_kwargs),
+    )
+    return state
+
+
+def _trace_reasoning_parameters_compat_applied(
+    request_kwargs: Optional[dict],
+    *,
+    mode: Optional[str] = None,
+) -> None:
+    _trace_module._route_trace(
+        "reasoning_parameters_compat_applied",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=_deployment_id_from_request(request_kwargs),
+        route_key=_deployment_route_key_from_request(request_kwargs),
+        mode=mode,
+        request=_trace_module._trace_request_summary(request_kwargs),
+    )
+
+
+def _record_reasoning_parameters_compat(
+    request_kwargs: Optional[dict],
+    mode: str,
+) -> bool:
+    """Remember the wire shape this deployment accepts for client reasoning.
+
+    ``google_thinking_level`` keeps the client's requested level through the
+    native Google thinking configuration; ``strip`` sends the same completion
+    without reasoning fields so the model uses its provider default.  A later
+    request that the route accepts with reasoning parameters re-learns the
+    opposite once the entry expires.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    cache_key = _reasoning_parameters_compat_cache_key(request_kwargs)
+    if not cache_key:
+        return False
+    ttl = _reasoning_parameters_compat_ttl_seconds()
+    now = time.time()
+    model = request_kwargs.get("model")
+    state = {
+        "status": "compat",
+        "mode": mode,
+        "deployment_id": _deployment_id_from_request(request_kwargs),
+        "route_key": _deployment_route_key_from_request(request_kwargs),
+        "upstream_model": model.strip() if isinstance(model, str) else None,
+        "detected_at": now,
+        "expires_at": now + ttl if ttl > 0 else 0.0,
+    }
+
+    def record(states: dict[str, Any], _now: float) -> None:
+        states[cache_key] = state.copy()
+
+    result = _reasoning_parameters_compat_update_shared(record)
+    if result is None:
+        with _REASONING_PARAMETERS_COMPAT_LOCK:
+            _REASONING_PARAMETERS_COMPAT.setdefault(cache_key, state.copy())
+    _trace_module._route_trace(
+        "reasoning_parameters_compat_recorded",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=state.get("deployment_id"),
+        route_key=state.get("route_key"),
+        cache_key=cache_key,
+        mode=mode,
+        ttl_seconds=ttl,
+        expires_at=state.get("expires_at"),
     )
     return True
 

@@ -12,6 +12,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
+from . import browser_identity as _browser_identity
 from . import request_context as _request_context_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
@@ -735,10 +736,40 @@ def _header_key(headers: Dict[str, str], name: str) -> Optional[str]:
             return key
     return None
 
+def _with_owned_user_agent_header(request_kwargs: dict) -> Optional[dict]:
+    """Guarantee one outgoing User-Agent that never names this router.
+
+    A downstream client's own User-Agent is forwarded byte-for-byte by
+    ``_with_incoming_user_agent_header`` and stays untouched here.  Two cases
+    are repaired: a request that carries no User-Agent at all (the router's own
+    calls and helper workers build their own requests, and the SDK default
+    would name a Python client) and a User-Agent that names this app (only our
+    own components can send it, and a relay must never learn it).  Both present
+    the shared browser identity instead.
+    """
+
+    existing_headers = request_kwargs.get("extra_headers")
+    merged_headers: Dict[str, str] = (
+        existing_headers.copy() if isinstance(existing_headers, dict) else {}
+    )
+    user_agent_key = _header_key(merged_headers, "User-Agent")
+    if user_agent_key is not None and not _browser_identity.is_self_identifying_user_agent(
+        merged_headers[user_agent_key]
+    ):
+        return None
+
+    merged_headers[user_agent_key or "User-Agent"] = _browser_identity.browser_user_agent()
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["extra_headers"] = merged_headers
+    return modified_kwargs
+
 
 def _with_incoming_user_agent_header(request_kwargs: dict) -> Optional[dict]:
     incoming_user_agent = _incoming_request_user_agent(request_kwargs)
-    if not incoming_user_agent:
+    if not incoming_user_agent or _browser_identity.is_self_identifying_user_agent(incoming_user_agent):
+        # Our own components can be a "client" of this proxy; their identity is
+        # ours and must not be forwarded upstream.  ``_with_owned_user_agent_header``
+        # supplies the browser identity instead.
         return None
 
     existing_headers = request_kwargs.get("extra_headers")
