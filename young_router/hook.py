@@ -123,6 +123,7 @@ class YoungRouterHook(CustomLogger):
         for update_request in (
             _codex_fast_tier_module._with_codex_fast_default_service_tier,
             _reasoning_module._with_model_reasoning_mapping,
+            _reasoning_module._with_model_reasoning_parameter_support,
             _responses_request_module._with_plaintext_agent_message_content_restored,
             _responses_request_module._with_codex_function_call_arguments_repaired,
             _responses_request_module._with_neutral_attachment_paths,
@@ -142,6 +143,7 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_codex_compaction_headers,
             _responses_request_module._with_stream_request_timeout,
             _responses_request_module._with_incoming_user_agent_header,
+            _responses_request_module._with_owned_user_agent_header,
             _responses_request_module._with_browser_compatible_headers,
         ):
             image_budget_before = None

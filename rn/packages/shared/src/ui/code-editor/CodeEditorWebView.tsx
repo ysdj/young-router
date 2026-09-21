@@ -4,7 +4,32 @@ import AppKitCodeWebView from "../macos/NativeCodeWebViewNativeComponent";
 import WinUICodeWebView from "../windows/NativeCodeWebViewNativeComponent";
 import { CODE_EDITOR_WEB_BUNDLE } from "./CodeEditorWebBundle";
 
-export type CodeEditorLanguage = "json" | "toml" | "text";
+export type CodeEditorLanguage = "json" | "toml" | "yaml" | "text";
+
+/**
+ * Localized labels for the editor's in-page context menu. The WebView cannot
+ * read the app's translations, so the shared UI passes them in the page
+ * bootstrap; a missing label falls back to English inside the page.
+ */
+export type CodeEditorMenuLabels = {
+  cut: string;
+  copy: string;
+  paste: string;
+  selectAll: string;
+  undo: string;
+  redo: string;
+};
+
+export function editorMenuLabels(translate: (key: string) => string): CodeEditorMenuLabels {
+  return {
+    cut: translate("common.cut"),
+    copy: translate("common.copy"),
+    paste: translate("common.paste"),
+    selectAll: translate("common.selectAll"),
+    undo: translate("common.undo"),
+    redo: translate("common.redo"),
+  };
+}
 
 export type CodeEditorDiff = {
   added: number;
@@ -22,6 +47,15 @@ type InitialEditorCommand = {
   showDiff: boolean;
 };
 
+function inlineMenuLabels(labels: CodeEditorMenuLabels | undefined): string {
+  if (!labels) return "";
+  const serialized = JSON.stringify(labels)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026");
+  return `<script>window.LiteLLMCodeEditorMenuLabels = ${serialized};</script>`;
+}
+
 function inlineCommand(command: InitialEditorCommand | undefined): string {
   if (!command) return "";
   const serialized = JSON.stringify(command)
@@ -31,7 +65,7 @@ function inlineCommand(command: InitialEditorCommand | undefined): string {
   return `<script>window.LiteLLMCodeEditorInitialCommand = ${serialized};</script>`;
 }
 
-function codeEditorHtml(command?: InitialEditorCommand): string {
+function codeEditorHtml(command?: InitialEditorCommand, labels?: CodeEditorMenuLabels): string {
   return `<!doctype html>
 <html>
   <head>
@@ -55,6 +89,7 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
         --editor-scrollbar-track: #e2e8f0;
         --editor-scrollbar-thumb: #94a3b8;
         --editor-scrollbar-thumb-hover: #64748b;
+        --editor-menu-bg: #ffffff;
         --diff-sidebar-bg: #f8fafc;
         --diff-sidebar-header: #f1f5f9;
         --diff-sidebar-card: #ffffff;
@@ -83,6 +118,7 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
           --editor-scrollbar-track: #34343a;
           --editor-scrollbar-thumb: #737b88;
           --editor-scrollbar-thumb-hover: #9aa3b2;
+          --editor-menu-bg: #2d2d30;
           --diff-sidebar-bg: #252526;
           --diff-sidebar-header: #2d2d30;
           --diff-sidebar-card: #1e1e1e;
@@ -163,6 +199,38 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
         cursor: pointer;
       }
       #editor-scrollbar[hidden] { display: none; }
+      #editor-menu {
+        position: absolute;
+        z-index: 8;
+        min-width: 136px;
+        padding: 4px;
+        border: 1px solid var(--editor-border);
+        border-radius: 6px;
+        background: var(--editor-menu-bg);
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+        font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      #editor-menu[hidden] { display: none; }
+      .editor-menu-item {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        padding: 4px 10px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--editor-fg);
+        font: inherit;
+        text-align: left;
+        cursor: default;
+      }
+      .editor-menu-item:hover:not(:disabled) { background: var(--editor-match); }
+      .editor-menu-item:disabled { color: var(--editor-gutter-fg); }
+      .editor-menu-separator {
+        height: 1px;
+        margin: 4px 6px;
+        background: var(--editor-border);
+      }
       #editor-scrollbar-thumb {
         position: absolute;
         top: 0;
@@ -285,6 +353,7 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
       <div id="editor" tabindex="0" role="textbox" aria-multiline="true">
         <div id="ace-editor"></div>
         <div id="editor-scrollbar" aria-hidden="true" hidden><div id="editor-scrollbar-thumb"></div></div>
+        <div id="editor-menu" role="menu" hidden></div>
       </div>
       <aside id="diff-sidebar" aria-hidden="true">
         <div id="diff-sidebar-header"><span>Δ</span><span id="diff-sidebar-total"></span></div>
@@ -292,6 +361,7 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
       </aside>
     </div>
     ${inlineCommand(command)}
+    ${inlineMenuLabels(labels)}
     <script>${CODE_EDITOR_WEB_BUNDLE.replace(/<\/script/gi, "<\\/script")}</script>
   </body>
 </html>`;
@@ -302,6 +372,18 @@ function codeEditorHtml(command?: InitialEditorCommand): string {
 // blank-WebView/second-replace startup phase.
 export const CODE_EDITOR_HTML = codeEditorHtml();
 
+// Building the shell embeds the whole editor bundle, so the localized
+// read-only variant is cached per label set instead of per open.
+let readOnlyHtmlCache: { key: string; html: string } | undefined;
+
+export function readOnlyCodeEditorHtml(labels: CodeEditorMenuLabels): string {
+  const key = JSON.stringify(labels);
+  if (!readOnlyHtmlCache || readOnlyHtmlCache.key !== key) {
+    readOnlyHtmlCache = { key, html: codeEditorHtml(undefined, labels) };
+  }
+  return readOnlyHtmlCache.html;
+}
+
 export function CodeEditorWebView({
   documentKey,
   value,
@@ -310,6 +392,7 @@ export function CodeEditorWebView({
   readOnly = false,
   showDiff = false,
   style,
+  menuLabels,
   onChange,
   onError,
 }: {
@@ -320,6 +403,7 @@ export function CodeEditorWebView({
   readOnly?: boolean;
   showDiff?: boolean;
   style?: StyleProp<ViewStyle>;
+  menuLabels?: CodeEditorMenuLabels;
   onChange?: (text: string, diff?: CodeEditorDiff) => void;
   onError?: () => void;
 }): React.JSX.Element {
@@ -337,7 +421,7 @@ export function CodeEditorWebView({
     language,
     readOnly,
     showDiff,
-  }));
+  }, menuLabels));
   return <View style={[styles.frame, style]}>
     <NativeCodeWebView
       html={initialHtml}

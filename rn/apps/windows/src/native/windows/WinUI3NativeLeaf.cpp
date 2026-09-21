@@ -65,6 +65,7 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
     return {900, 560};
   }
   if (route == L"provider-wizard") return {540, 420};
+  if (route == L"file-editor") return {900, 560};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
   return {320, 160};
@@ -77,6 +78,7 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
     return {960, 640};
   }
   if (route == L"provider-wizard") return {620, 460};
+  if (route == L"file-editor") return {900, 560};
   return {320, 160};
 }
 
@@ -1858,6 +1860,43 @@ void WinUI3NativeLeaf::OpenExternalURL(std::wstring_view url) {
   ShellExecuteW(nullptr, L"open", command.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
+void WinUI3NativeLeaf::RevealFile(std::wstring_view path) {
+  if (path.empty() || path.size() > 4096) return;
+  std::wstring target(path);
+  if (target.find_first_of(L"\r\n") != std::wstring::npos) return;
+  // Only an absolute drive-letter or UNC path is revealable; the settings pane
+  // never hands over a relative path, and a relative one would resolve against
+  // the app's working directory.
+  const bool absolute =
+      (target.size() >= 3 && target[1] == L':' && (target[2] == L'\\' || target[2] == L'/')) ||
+      (target.size() >= 2 && target[0] == L'\\' && target[1] == L'\\');
+  if (!absolute) return;
+  try {
+    std::error_code error;
+    const bool exists = std::filesystem::exists(std::filesystem::path(target), error) && !error;
+    std::wstring arguments;
+    if (exists) {
+      arguments = L"/select,\"" + target + L"\"";
+    } else {
+      // The pane lists files the user may not have created yet; open the
+      // nearest existing parent directory instead of doing nothing.
+      std::filesystem::path directory = std::filesystem::path(target).parent_path();
+      while (!directory.empty()) {
+        error.clear();
+        if (std::filesystem::exists(directory, error) && !error) break;
+        if (error) return;
+        const std::filesystem::path parent = directory.parent_path();
+        if (parent == directory) return;
+        directory = parent;
+      }
+      if (directory.empty()) return;
+      arguments = L"\"" + directory.wstring() + L"\"";
+    }
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
+  } catch (...) {
+  }
+}
+
 void WinUI3NativeLeaf::Quit() {
   if (quit_in_progress_ || quitting_) return;
   quit_in_progress_ = true;
@@ -2015,6 +2054,7 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
     return Localized("appTitle", L"Young Router");
   }
   if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
+  if (route == L"file-editor") return Localized("routeFileEditor", L"Edit File");
   return Localized("appTitle", L"Young Router");
 }
 

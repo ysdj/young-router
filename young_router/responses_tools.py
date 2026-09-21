@@ -13,10 +13,7 @@ from .base import (
     Any,
     HostedToolPlan,
     Optional,
-    _COMPUTER_FACADE_BROWSER_BACKEND,
-    _COMPUTER_FACADE_CHROME_BACKEND,
-    _COMPUTER_FACADE_MCP_BACKEND,
-    _HOSTED_GA_COMPUTER_TOOL_TYPES,
+    _HOSTED_COMPUTER_TOOL_TYPES,
     _HOSTED_WEB_SEARCH_TOOL_TYPES,
     _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY,
@@ -696,14 +693,11 @@ def _responses_hosted_tool_plan(
     client_namespaces: list[str] = []
     client_functions: list[str] = []
     passthrough_tools: list[dict] = []
-    hosted_computer_tools: list[dict] = []
-    computer_environment: Optional[dict] = None
 
     def visit_tool(tool: Any) -> None:
         nonlocal hosted_web_search
         nonlocal hosted_web_search_preview
         nonlocal hosted_computer
-        nonlocal computer_environment
         if not isinstance(tool, dict):
             return
         tool_type = tool.get("type")
@@ -712,12 +706,8 @@ def _responses_hosted_tool_plan(
             if tool_type == "web_search_preview":
                 hosted_web_search_preview = True
             return
-        if tool_type in _HOSTED_GA_COMPUTER_TOOL_TYPES:
+        if tool_type in _HOSTED_COMPUTER_TOOL_TYPES:
             hosted_computer = True
-            hosted_computer_tools.append(copy.deepcopy(tool))
-            environment = tool.get("environment")
-            if isinstance(environment, dict):
-                computer_environment = copy.deepcopy(environment)
             return
         if tool_type == "namespace":
             _append_unique_string(client_namespaces, tool.get("name"))
@@ -771,24 +761,6 @@ def _responses_hosted_tool_plan(
         for additional_tool in _responses_input_additional_tools(request.get("input")):
             visit_tool(additional_tool)
 
-    facade_required = hosted_computer
-    unsupported_reason: Optional[str] = None
-    available_executor_hints: list[str] = []
-    for namespace in client_namespaces:
-        lowered = namespace.lower()
-        if lowered == "mcp__computer_use":
-            _append_unique_string(available_executor_hints, _COMPUTER_FACADE_MCP_BACKEND)
-        elif lowered in {"browser", "browser_use", "mcp__browser", "mcp__browser_use"}:
-            _append_unique_string(
-                available_executor_hints,
-                _COMPUTER_FACADE_BROWSER_BACKEND,
-            )
-        elif lowered in {"chrome", "chrome_browser", "mcp__chrome"}:
-            _append_unique_string(
-                available_executor_hints,
-                _COMPUTER_FACADE_CHROME_BACKEND,
-            )
-
     return HostedToolPlan(
         hosted_web_search=hosted_web_search,
         hosted_web_search_preview=hosted_web_search_preview,
@@ -796,11 +768,88 @@ def _responses_hosted_tool_plan(
         client_namespaces=client_namespaces,
         client_functions=client_functions,
         passthrough_tools=passthrough_tools,
-        facade_required=facade_required,
-        unsupported_reason=unsupported_reason,
-        hosted_computer_tools=hosted_computer_tools,
-        computer_environment=computer_environment,
-        available_executor_hints=available_executor_hints,
+    )
+
+
+def _request_hosted_computer_blocks_chat_bridge(
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    """Never bridge a request that asks the upstream for a hosted computer tool.
+
+    Bridging flattens the request into chat tools and drops the hosted
+    ``computer`` declaration, which would answer the turn as if the client had
+    never asked for computer use.  A client that brings its own computer or
+    browser tools may still be bridged, because those tools are what the client
+    executes and they survive the bridge.
+    """
+
+    plan = _responses_hosted_tool_plan(request_kwargs, outer_request_kwargs)
+    if not plan.hosted_computer:
+        return False
+    return not (
+        _tools_module._request_has_browser_computer_client_tool(request_kwargs)
+        or _tools_module._request_has_browser_computer_client_tool(outer_request_kwargs)
+    )
+
+
+def _native_hosted_computer_unsupported_error(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    outer_request_kwargs: Optional[dict] = None,
+) -> bool:
+    """Recognise an upstream refusal of the hosted ``computer`` tool."""
+
+    plan = _responses_hosted_tool_plan(
+        request_kwargs,
+        outer_request_kwargs,
+    )
+    if not plan.hosted_computer:
+        return False
+    status_code = _routing_module._exception_status_code(exception)
+    if status_code is not None and status_code not in {400, 404, 422}:
+        return False
+    if _routing_module._is_terminal_prompt_or_policy_error(exception):
+        return False
+    text = _routing_module._exception_text(exception)
+    if not text:
+        return False
+    tool_markers = (
+        "computer",
+        "computer_use",
+        "computer-use",
+        "hosted browser",
+        "hosted tool",
+        "tool type",
+        "invalid_prompt",
+        "invalid_union",
+        "invalid_type",
+    )
+    if not any(marker in text for marker in tool_markers):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "unsupported",
+            "not supported",
+            "does not support",
+            "not support",
+            "unsupported tool",
+            "invalid tool",
+            "unknown tool",
+            "unrecognized tool",
+            "invalid responses api request",
+            "invalid_prompt",
+            "invalid_union",
+            "invalid_type",
+            "expected string, received array",
+            "expected array, received undefined",
+            "tool type",
+            "invalid_request_error",
+            "not found",
+            "unrecognized",
+            "unknown",
+        )
     )
 
 

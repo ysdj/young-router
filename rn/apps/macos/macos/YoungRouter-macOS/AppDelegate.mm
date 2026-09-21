@@ -53,11 +53,14 @@
   self.reactHostStarted = YES;
   [self loadReactNativeWindow:nil];
   RCTRootViewFactory *rootViewFactory = self.rootViewFactory;
-  [AppKitNativeLeaf.shared setRouteWindowFactory:^NSWindow *(NSString *route, NSString *logTab, NSWindow *existingWindow) {
+  [AppKitNativeLeaf.shared setRouteWindowFactory:^NSWindow *(NSString *route, NSString *logTab, NSString *fileId, NSWindow *existingWindow) {
     NSMutableDictionary *props = [@{
       @"isPrimaryHost": @NO,
       @"initialRoute": route,
     } mutableCopy];
+    if (fileId != nil) {
+      props[@"initialFileTarget"] = fileId;
+    }
     if (logTab != nil) {
       props[@"initialLogTab"] = logTab;
     }
@@ -69,7 +72,7 @@
     // shell, so an explicit whitelist here silently gives a missed pane
     // (General) a plain titled window while the shell still reserves its
     // title-bar inset.
-    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard"]];
+    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];
     const BOOL settingsShell = ![standaloneRoutes containsObject:route];
     NSView *rootView = (NSView *)[rootViewFactory viewWithModuleName:@"YoungRouter" initialProperties:props];
     // RCTSurfaceHostingView defaults to an opaque white background on macOS.

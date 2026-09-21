@@ -29,10 +29,12 @@ struct LiteLLMWinUIButtonProps : winrt::implements<LiteLLMWinUIButtonProps, winr
        symbol = cloneFromProps->symbol;
        symbolWithTitle = cloneFromProps->symbolWithTitle;
        disabled = cloneFromProps->disabled;
+       busy = cloneFromProps->busy;
        primary = cloneFromProps->primary;
        destructive = cloneFromProps->destructive;
        compact = cloneFromProps->compact;
        link = cloneFromProps->link;
+       plainLink = cloneFromProps->plainLink;
        onPress = cloneFromProps->onPress;  
      }
   }
@@ -53,6 +55,9 @@ struct LiteLLMWinUIButtonProps : winrt::implements<LiteLLMWinUIButtonProps, winr
   REACT_FIELD(disabled)
   std::optional<bool> disabled{};
 
+  REACT_FIELD(busy)
+  std::optional<bool> busy{};
+
   REACT_FIELD(primary)
   std::optional<bool> primary{};
 
@@ -64,6 +69,9 @@ struct LiteLLMWinUIButtonProps : winrt::implements<LiteLLMWinUIButtonProps, winr
 
   REACT_FIELD(link)
   std::optional<bool> link{};
+
+  REACT_FIELD(plainLink)
+  std::optional<bool> plainLink{};
 
    // These fields can be used to determine if JS has registered for this event
   REACT_FIELD(onPress)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import importlib.util
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,12 +11,14 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from unittest import mock
 
 from young_router.core.domains import DomainError
 from young_router.core.domains.codex import CodexSettingsDomain
 from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router import traceone
 from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
@@ -51,6 +54,38 @@ litellm_settings:
 future_top_level:
   keep: true
 """
+
+
+DEEP_TEST_PROMPT = "Using only the current language model, produce 315 separate first-instinct choices of an integer from 1 through 355 inclusive."
+
+
+def deep_test_config(model_name: str = "gpt-6-astra", surface: str = "openai/responses", *, protocol_mode: str = "") -> str:
+    """The provider fixture renamed to a TraceOne route, on a chosen surface."""
+
+    config = textwrap.dedent(PROVIDER_CONFIG).lstrip().replace("default-chat", model_name)
+    if surface != "openai/responses":
+        config = config.replace("upstream_url_surface: openai/responses", f"upstream_url_surface: {surface}")
+    if protocol_mode:
+        config = config.replace(
+            f"upstream_url_surface: {surface}",
+            f"upstream_url_surface: {surface}\n      upstream_protocol_mode: {protocol_mode}",
+            1,
+        )
+    return config
+
+
+@contextlib.contextmanager
+def degradation_engine(*, answer: dict[str, object]):
+    """Patch the TraceOne adapter so a test never needs the staged engine."""
+
+    def identify(_text: str, **_kwargs: object) -> dict[str, object]:
+        return dict(answer)
+
+    with mock.patch.object(traceone, "engine", return_value={"name": "TraceOne", "source": "test", "revision": "test", "staged_at": "", "available": True}), mock.patch.object(
+        traceone, "prompt_text", return_value=DEEP_TEST_PROMPT
+    ), mock.patch.object(traceone, "identify", side_effect=identify):
+        yield
+
 
 
 class ProvidersModelsDomainTests(unittest.TestCase):
@@ -1381,6 +1416,414 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertFalse(core.snapshot()["drafts"]["providers_models"]["dirty"])
             self.assertEqual(saved_before_probe, path.read_text(encoding="utf-8"))
 
+    def test_model_deep_test_sends_the_frozen_prompt_to_a_responses_route(self) -> None:
+        deep_requests: list[dict[str, object]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                if self.path == "/v1/responses":
+                    if len(str(payload.get("input", ""))) > 100:
+                        deep_requests.append(payload)
+                        body = {
+                            "id": "resp-deep",
+                            "model": payload.get("model"),
+                            "output": [{"type": "message", "content": [{"type": "output_text", "text": "[[1]]"}]}],
+                        }
+                    else:
+                        body = {"id": "resp-probe", "output": []}
+                elif self.path == "/v1/messages":
+                    body = {"content": [{"type": "text", "text": "OK"}]}
+                else:
+                    body = {"choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+                encoded = json.dumps(body).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = deep_test_config(protocol_mode="fixed").replace(
+                "https://example.test/v1", f"http://127.0.0.1:{port}/v1"
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(config, encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                core = CoreStore(domains=[domain])
+                with degradation_engine(answer={"status": "identified", "label": "gpt-6-astra", "numbers": 315}):
+                    result = core.probe(
+                        {"provider_id": "primary", "model_id": "00000071"},
+                        domain="providers_models",
+                    )
+                model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(1, len(deep_requests))
+        self.assertEqual("gpt-6-astra", deep_requests[0]["model"])
+        self.assertEqual(DEEP_TEST_PROMPT, deep_requests[0]["input"])
+        self.assertEqual("matched", result["degradation"]["status"])
+        self.assertEqual("gpt-6-astra", result["degradation"]["target"])
+        self.assertEqual("gpt-6-astra", result["degradation"]["label"])
+        self.assertEqual("TraceOne", result["degradation"]["engine"]["name"])
+        self.assertTrue(result["degradation"]["engine"]["available"])
+        self.assertEqual("matched", model["probe"]["degradation"]["status"])
+        self.assertEqual(
+            {"includes_degradation": True, "target": "gpt-6-astra", "surface": "openai/responses"},
+            model["deep_probe"],
+        )
+        self.assertTrue(model["model_enabled"])
+        self.assertNotIn("replace-me-secret", json.dumps(result))
+
+    def test_model_deep_test_keeps_a_mismatched_model_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            core = CoreStore(domains=[domain])
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": True, "status": "ok"}
+
+            def deep_request(**_kwargs: object) -> tuple[str, str]:
+                return "[[1]]", "ok"
+
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
+                ProvidersModelsDomain, "_degradation_request", side_effect=deep_request
+            ), degradation_engine(answer={"status": "identified", "label": "gpt-5.6-luna", "numbers": 315}):
+                result = core.probe(
+                    {"provider_id": "primary", "model_id": "00000071"},
+                    domain="providers_models",
+                )
+            snapshot = core.snapshot()
+            model = snapshot["domains"]["providers_models"]["providers"][0]["models"][0]
+
+        self.assertEqual("mismatch", result["degradation"]["status"])
+        self.assertEqual("gpt-5.6-luna", result["degradation"]["label"])
+        self.assertIn("gpt-5.6-luna", result["degradation"]["detail"])
+        # A fingerprint mismatch is a finding, never a routing decision: the
+        # model keeps its enable checkbox and the draft stays clean.
+        self.assertTrue(model["model_enabled"])
+        self.assertTrue(model["enabled"])
+        self.assertEqual("mismatch", model["probe"]["degradation"]["status"])
+        self.assertFalse(snapshot["drafts"]["providers_models"]["dirty"])
+
+    def test_model_probe_does_not_retry_a_slow_surface(self) -> None:
+        """A read timeout is the verdict; only a dropped connection is retried."""
+        attempts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
+                attempts.append(self.path)
+                time.sleep(1.0)
+                body = b'{"id": "late", "output": []}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = PROVIDER_CONFIG.replace("https://example.test/v1", f"http://127.0.0.1:{port}/v1")
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(config).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                with mock.patch.dict(os.environ, {ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV: "0.4"}):
+                    result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+        self.assertEqual(3, len(attempts), attempts)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["unreachable"])
+        self.assertEqual(["timeout"] * 3, list(result["summary"]["statuses"].values()))
+
+    def test_probe_names_a_rejected_connection_as_rejected(self) -> None:
+        """A refusal is reported as a refusal; only silence is a timeout."""
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
+                self.close_connection = True
+                self.wfile.close()
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = PROVIDER_CONFIG.replace("https://example.test/v1", f"http://127.0.0.1:{port}/v1")
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(config).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                with mock.patch.object(ProvidersModelsDomain, "_degradation_request", return_value=("", "refused")):
+                    result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["unreachable"])
+        self.assertEqual("refused", result["summary"]["transport"])
+        self.assertEqual(
+            {"openai/responses", "openai/chat", "anthropic"},
+            set(result["summary"]["unreachable_surfaces"]),
+        )
+        self.assertEqual(["refused"] * 3, list(result["summary"]["statuses"].values()))
+        self.assertNotIn("network_error", json.dumps(result["summary"]["statuses"]))
+
+    def test_probe_budget_follows_the_runtime_first_event_setting(self) -> None:
+        """Unreachable means what the router means by it, not a private ceiling."""
+
+        self.assertEqual(
+            "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS",
+            ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_SETTING_KEY,
+        )
+        self.assertGreater(ProvidersModelsDomain._DEGRADATION_PROBE_TIMEOUT_SECONDS, 200.0)
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS=42\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": str(settings)},
+                clear=False,
+            ):
+                os.environ.pop(ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV, None)
+                self.assertEqual(42.0, ProvidersModelsDomain._model_probe_timeout_seconds())
+            # An explicit override still wins for a focused local run.
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": str(settings),
+                    ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV: "7",
+                },
+                clear=False,
+            ):
+                self.assertEqual(7.0, ProvidersModelsDomain._model_probe_timeout_seconds())
+            os.environ.pop(ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV, None)
+        with mock.patch.dict(
+            os.environ,
+            {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": "/nonexistent/runtime-settings.env"},
+            clear=False,
+        ):
+            os.environ.pop(ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV, None)
+            self.assertEqual(120.0, ProvidersModelsDomain._model_probe_timeout_seconds())
+
+    def test_model_probe_does_not_recommend_a_protocol_change_after_a_dropped_connection(self) -> None:
+        """A reset on the configured surface must not re-point a working route."""
+
+        def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+            return {
+                "surface": surface,
+                "available": surface == "openai/chat",
+                "status": "ok" if surface == "openai/chat" else "network_error",
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(protocol_mode="fixed"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        # The route is configured for Responses and that attempt was reset, so
+        # the pane reports reachability instead of offering a protocol switch.
+        self.assertIsNone(result["recommended_surface"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(["openai/chat"], result["summary"]["available_surfaces"])
+        self.assertIn("no protocol change is recommended", result["detail"])
+
+    def test_model_probe_recommends_the_answering_surface_after_a_real_rejection(self) -> None:
+        def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+            return {
+                "surface": surface,
+                "available": surface == "openai/chat",
+                "status": "ok" if surface == "openai/chat" else "unsupported",
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertEqual("openai/chat", result["recommended_surface"])
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["unreachable"])
+
+    def test_model_probe_retries_a_dropped_connection_once(self) -> None:
+        """A relay edge that drops the first connection must not read as unavailable."""
+        attempts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
+                attempts.append(self.path)
+                if len(attempts) == 1:
+                    # Drop the connection without an HTTP answer, the way a
+                    # challenging relay edge does for a fresh diagnostic client.
+                    self.close_connection = True
+                    self.wfile.close()
+                    return
+                body = json.dumps(
+                    {"id": "response-1", "output": []}
+                    if self.path == "/v1/responses"
+                    else {"content": [{"type": "text", "text": "OK"}]}
+                    if self.path == "/v1/messages"
+                    else {"choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            config = PROVIDER_CONFIG.replace("https://example.test/v1", f"http://127.0.0.1:{port}/v1")
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.yaml"
+                path.write_text(textwrap.dedent(config).lstrip(), encoding="utf-8")
+                domain = ProvidersModelsDomain(path)
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["unreachable"])
+        # Three surfaces plus exactly one transport retry, whichever surface
+        # happened to lose the first connection.
+        self.assertEqual(4, len(attempts))
+        self.assertEqual(
+            ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
+            sorted(set(attempts)),
+        )
+        self.assertEqual(1, len([path for path in set(attempts) if attempts.count(path) == 2]))
+
+    def test_model_deep_test_skips_the_fingerprint_when_responses_never_answered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            deep_calls: list[object] = []
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": False, "status": "network_error"}
+
+            def deep_request(**_kwargs: object) -> tuple[str, str]:
+                deep_calls.append(object())
+                return "[[1]]", "ok"
+
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
+                ProvidersModelsDomain, "_degradation_request", side_effect=deep_request
+            ):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual([], deep_calls)
+        # A transport failure is a reachability finding, never a fingerprint or
+        # availability verdict.
+        self.assertTrue(result["unreachable"])
+        self.assertEqual([], result["summary"]["available_surfaces"])
+        self.assertEqual(
+            ["anthropic", "openai/chat", "openai/responses"],
+            sorted(result["summary"]["unreachable_surfaces"]),
+        )
+        self.assertEqual("unreachable", result["degradation"]["status"])
+        # the guard reports the surface's own status, not a generic failure
+        self.assertEqual("network_error", result["degradation"]["cause"])
+        self.assertIn("did not answer", result["degradation"]["detail"])
+
+    def test_model_deep_test_skips_degradation_for_other_protocols_and_names(self) -> None:
+        for label, config in (
+            ("fixed chat route", deep_test_config(surface="openai/chat", protocol_mode="fixed")),
+            ("unmatched name", deep_test_config(model_name="default-chat")),
+        ):
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "config.yaml"
+                    path.write_text(config, encoding="utf-8")
+                    domain = ProvidersModelsDomain(path)
+                    core = CoreStore(domains=[domain])
+                    deep_calls: list[object] = []
+
+                    def deep_request(**_kwargs: object) -> tuple[str, str]:
+                        deep_calls.append(object())
+                        return "[[1]]", "ok"
+
+                    def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                        return {"surface": surface, "available": True, "status": "ok"}
+
+                    with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
+                        ProvidersModelsDomain, "_degradation_request", side_effect=deep_request
+                    ):
+                        result = core.probe(
+                            {"provider_id": "primary", "model_id": "00000071"},
+                            domain="providers_models",
+                        )
+                    model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
+
+                self.assertEqual([], deep_calls)
+                self.assertEqual("skipped", result["degradation"]["status"])
+                self.assertIsNone(result["degradation"]["target"])
+                self.assertEqual(
+                    {"includes_degradation": False, "target": None, "surface": ""},
+                    model["deep_probe"],
+                )
+                self.assertTrue(model["model_enabled"])
+
+    def test_model_deep_test_reports_an_unstaged_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": True, "status": "ok"}
+
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
+                traceone, "engine", return_value={"name": "TraceOne", "available": False, "revision": ""}
+            ):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("unavailable", result["degradation"]["status"])
+        self.assertEqual("gpt-6-astra", result["degradation"]["target"])
+
     def test_model_probes_are_independent_and_do_not_lock_provider_edits(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
@@ -1477,6 +1920,50 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
 
 class CodexSettingsDomainTests(unittest.TestCase):
+    def test_use_local_api_points_the_selected_provider_at_the_young_router_proxy(self) -> None:
+        """The pane's Codex action adopts this app's own proxy as the backend."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            from young_router.core.domains._shared import local_proxy_endpoint
+
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "default-chat"\n'
+                'model_provider = "custom"\n'
+                '\n'
+                '[model_providers.custom]\n'
+                'name = "custom"\n'
+                'base_url = "https://relay.example.test/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "replace-me-secret"}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+            self.assertFalse(domain.snapshot()["uses_local_api"])
+
+            domain.dispatch("use_local_api", {})
+
+            base_url, key = local_proxy_endpoint()
+            self.assertRegex(base_url, r"^http://127\.0\.0\.1:\d+/v1$")
+            structured = domain.snapshot()["structured"]
+            provider = next(item for item in structured["providers"] if item["id"] == "custom")
+            self.assertEqual(base_url, provider["base_url"])
+            documents = domain.export(include_sensitive=True)
+            self.assertIn(base_url, documents["config_text"])
+            self.assertNotIn("relay.example.test", documents["config_text"])
+            # The proxy's master key replaces the relay credential.
+            self.assertIn(key, documents["config_text"] + documents["auth_text"])
+            # The pane's button reports this state instead of offering a no-op.
+            self.assertTrue(domain.snapshot()["uses_local_api"])
+            domain.dispatch("use_local_api", {})
+            self.assertEqual(documents, domain.export(include_sensitive=True))
+            self.assertTrue(domain.snapshot()["uses_local_api"])
+
     def test_staged_edits_preserve_existing_codex_file_presence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2064,7 +2551,7 @@ class RuntimeSettingsDomainTests(unittest.TestCase):
 
             loaded = module.load_specs()
             self.assertGreater(len(loaded), 20)
-            self.assertEqual("12389", loaded["LITELLM_PORT"].default)
+            self.assertEqual("12390", loaded["LITELLM_PORT"].default)
             self.assertEqual("0", loaded["YOUNG_ROUTER_MCP_AUTO_APPROVE"].default)
 
     def test_bool_auto_uses_checkbox_projection_and_auto_off_storage(self) -> None:

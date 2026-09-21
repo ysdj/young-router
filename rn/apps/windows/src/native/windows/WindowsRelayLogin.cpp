@@ -107,6 +107,76 @@ constexpr wchar_t kImmediateWebPresentationScript[] = LR"JS((() => {
     subtree: true,
   });
 })())JS";
+
+// Station sign-in pages cover their own form with blocking announcements
+// (系统公告 and similar dialogs) and keep a sign-in action busy behind them.
+// Hide those overlays so the embedded browser shows the real sign-in form.
+constexpr wchar_t kRelayLoginBlockingOverlayScript[] = LR"JS((() => {
+  const state = { lastDismissal: 0 };
+  const visible = (node) => {
+    if (!(node instanceof Element)) return false;
+    const rect = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const coveredArea = (node) => {
+    const rect = node.getBoundingClientRect();
+    return rect.width * rect.height;
+  };
+  const whitespacePattern = new RegExp('[' + String.fromCharCode(9, 10, 11, 12, 13, 32) + ']+', 'g');
+  const elementText = (node) => `${node.innerText || node.textContent || ''} ${node.getAttribute?.('aria-label') || ''} ${node.getAttribute?.('title') || ''}`.replace(whitespacePattern, ' ').trim();
+  const dismissPattern = /^(?:今日关闭|关闭公告|关闭|我知道了|知道了|明白|确定|好的|暂不|稍后再说|close|dismiss|got it|ok|no thanks)$/iu;
+  const signInActionPattern = /登录|登陆|注册|继续|提交|进入|sign in|sign up|log in|login|submit|continue|register/iu;
+  const closeAffordancePattern = /(close|dismiss|icon-close)/i;
+  const containsSignInForm = (node) => Boolean(node.querySelector?.('input[type=password],input[autocomplete=current-password]'));
+  const dismissalControl = (root) => {
+    for (const node of root.querySelectorAll('button,[role="button"],a,[class*="close"],[class*="Close"]')) {
+      if (!visible(node) || node.disabled) continue;
+      if (String(node.getAttribute?.('type') || '').toLowerCase() === 'submit') continue;
+      const text = elementText(node);
+      if (!text || text.length > 24) continue;
+      if (signInActionPattern.test(text)) continue;
+      if (dismissPattern.test(text)) return node;
+      const signature = `${node.className || ''} ${node.getAttribute?.('aria-label') || ''} ${node.getAttribute?.('title') || ''}`;
+      if (closeAffordancePattern.test(signature)) return node;
+    }
+    return null;
+  };
+  const dismissBlockingOverlays = (force) => {
+    const now = Date.now();
+    if (!force && now - state.lastDismissal < 250) return false;
+    state.lastDismissal = now;
+    const viewportArea = Math.max(1, window.innerWidth * window.innerHeight);
+    const selectors = '[role="dialog"],[aria-modal="true"],[class*="backdrop"],[class*="Backdrop"],[class*="mask"],[class*="Mask"],[class*="modal"],[class*="Modal"],[class*="dialog"],[class*="Dialog"],[class*="overlay"],[class*="Overlay"],[class*="popup"],[class*="Popup"],[class*="notice"],[class*="Notice"]';
+    let changed = false;
+    for (const node of document.querySelectorAll(selectors)) {
+      if (!visible(node) || containsSignInForm(node)) continue;
+      const position = getComputedStyle(node).position;
+      if (position !== 'fixed' && position !== 'absolute') continue;
+      const covered = coveredArea(node);
+      if (covered < viewportArea * 0.12) continue;
+      const control = dismissalControl(node);
+      if (control) {
+        try { control.click(); } catch {}
+        changed = true;
+        continue;
+      }
+      if (covered >= viewportArea * 0.6) {
+        try { node.style.setProperty('display', 'none', 'important'); } catch {}
+        changed = true;
+      }
+    }
+    return changed;
+  };
+  const prepare = () => dismissBlockingOverlays(true);
+  prepare();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', prepare, { once: true });
+  }
+  new MutationObserver(() => dismissBlockingOverlays(false)).observe(document.documentElement, { childList: true, subtree: true });
+  window.setInterval(() => dismissBlockingOverlays(false), 1000);
+})())JS";
+
 constexpr double kUIFontSize = 13.0;
 
 std::wstring Utf8ToWide(std::string const& value) {
@@ -464,6 +534,18 @@ std::string CookieHeader(std::map<std::string, std::string> const& values) {
 
 std::map<std::string, std::string> ParseCookieHeader(std::string const& header);
 
+// The one browser identity every request of ours presents.  The literals are
+// mirrored by `young_router/browser_identity.py` (asserted by
+// `tests/test_browser_identity.py`): the app never exposes a User-Agent of its
+// own, and a relay that binds a browser session to its IP and User-Agent
+// fingerprint keeps one account on one fingerprint.  The embedded sign-in page
+// pins the same User-Agent so the sign-in, the session proof, and Core's
+// dashboard client share one fingerprint.
+constexpr wchar_t kRelayBrowserUserAgent[] =
+    L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    L"Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
+constexpr wchar_t kRelayBrowserAcceptLanguage[] = L"zh-CN,zh;q=0.9,en;q=0.8";
+
 std::optional<EndpointProbeResult> ProbeEndpoint(
     WindowsRelayLoginOptions const& options,
     ParsedOrigin const& origin,
@@ -475,7 +557,7 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
   if (cookie_header.find_first_of("\r\n") != std::string::npos ||
       (captured_access && captured_access->find_first_of("\r\n") != std::string::npos)) return std::nullopt;
   auto session = WinHttpHandle(WinHttpOpen(
-      L"Young-Router/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+      kRelayBrowserUserAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
       WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
   if (!session) return std::nullopt;
   WinHttpSetTimeouts(session.get(), 12000, 12000, 12000, 12000);
@@ -505,6 +587,9 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
     DWORD no_redirect = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     WinHttpSetOption(request.get(), WINHTTP_OPTION_REDIRECT_POLICY, &no_redirect, sizeof(no_redirect));
     std::wstring headers = L"Accept: application/json\r\nContent-Type: application/json\r\n";
+    // The session's agent string supplies User-Agent; naming it again on the
+    // request would send the header twice.
+    headers += L"Accept-Language: " + std::wstring(kRelayBrowserAcceptLanguage) + L"\r\n";
     std::wstring origin_header = origin.uri.SchemeName() + L"://" + origin.uri.Host();
     if (port != (_wcsicmp(origin.uri.SchemeName().c_str(), L"https") == 0 ? 443 : 80)) {
       origin_header += L":" + std::to_wstring(port);
@@ -994,8 +1079,10 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
     auto core = state->webview.CoreWebView2();
     core.Settings().AreDevToolsEnabled(false);
     core.Settings().IsPasswordAutosaveEnabled(false);
+    core.Settings().UserAgent(kRelayBrowserUserAgent);
     core.NewWindowRequested([](auto const&, web::CoreWebView2NewWindowRequestedEventArgs const& args) { args.Handled(true); });
     co_await core.AddScriptToExecuteOnDocumentCreatedAsync(kImmediateWebPresentationScript);
+    co_await core.AddScriptToExecuteOnDocumentCreatedAsync(kRelayLoginBlockingOverlayScript);
     // The capture always runs so the post-login prompt can offer to keep the
     // typed password; whether it is persisted is decided after sign-in.
     core.WebMessageReceived([weak = std::weak_ptr<LoginState>(state)](auto const&, web::CoreWebView2WebMessageReceivedEventArgs const& args) {

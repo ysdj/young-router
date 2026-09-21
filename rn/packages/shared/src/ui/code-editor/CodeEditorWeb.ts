@@ -10,9 +10,13 @@ import "ace-builds/src-noconflict/mode-json";
 // @ts-ignore see the note above.
 import "ace-builds/src-noconflict/mode-toml";
 // @ts-ignore see the note above.
+import "ace-builds/src-noconflict/mode-yaml";
+// @ts-ignore see the note above.
 import "ace-builds/src-noconflict/ext-searchbox";
 
-type EditorLanguage = "json" | "toml" | "text";
+type EditorLanguage = "json" | "toml" | "yaml" | "text";
+/** Localized labels for the editor's own context menu. */
+type EditorMenuLabels = { cut: string; copy: string; paste: string; selectAll: string; undo: string; redo: string };
 type EditorDiff = { added: number; changed: number; deleted: number };
 type EditorDiffPreview = { lines: string[]; truncated: boolean };
 type EditorDiffEntry = EditorDiff & {
@@ -32,7 +36,8 @@ type ReplaceDocumentCommand = {
   showDiff: boolean;
 };
 type SetBaselineCommand = { type: "setBaseline"; baseline: string };
-type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | { type: "focus" };
+type InsertTextCommand = { type: "insertText"; text: string };
+type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "focus" };
 
 type AceSession = {
   getValue: () => string;
@@ -70,6 +75,7 @@ type AceApi = { edit: (element: HTMLElement, options?: Record<string, unknown>) 
 declare global {
   interface Window {
     LiteLLMCodeEditorInitialCommand?: unknown;
+    LiteLLMCodeEditorMenuLabels?: unknown;
     LiteLLMCodeEditor?: { receive: (message: unknown) => void };
     ace?: AceApi;
     webkit?: { messageHandlers?: { litellmCodeEditor?: { postMessage: (message: string) => void } } };
@@ -84,9 +90,11 @@ const editorScrollbarThumb = document.getElementById("editor-scrollbar-thumb");
 const diffSidebar = document.getElementById("diff-sidebar");
 const diffSidebarTotal = document.getElementById("diff-sidebar-total");
 const diffSidebarList = document.getElementById("diff-sidebar-list");
-if (!editorFrame || !editorHost || !editorScrollbar || !editorScrollbarThumb || !diffSidebar || !diffSidebarTotal || !diffSidebarList) {
+const editorMenu = document.getElementById("editor-menu");
+if (!editorFrame || !editorHost || !editorScrollbar || !editorScrollbarThumb || !diffSidebar || !diffSidebarTotal || !diffSidebarList || !editorMenu) {
   throw new Error("Code editor shell is missing.");
 }
+const menu: HTMLElement = editorMenu;
 const frame: HTMLElement = editorFrame;
 const host: HTMLElement = editorHost;
 const scrollTrack: HTMLElement = editorScrollbar;
@@ -111,6 +119,51 @@ let scrollbarDrag: { pointerId: number; grabOffset: number } | undefined;
 let latestDiff: EditorDiff = { added: 0, changed: 0, deleted: 0 };
 let applyingHostUpdate = false;
 
+/**
+ * Copy text to the system pasteboard through the legacy editing command.
+ *
+ * The async clipboard API is unavailable to a page the host loads from a
+ * string, and its rejection used to swallow Cmd-C/Cmd-X entirely. A
+ * programmatic selection inside the caller's user gesture still reaches the
+ * pasteboard, so this is the deterministic path; false means the caller must
+ * leave the event to the browser's own copy/cut handling.
+ */
+function writeClipboardText(text: string): boolean {
+  if (!text) return false;
+  const scratch = document.createElement("textarea");
+  scratch.value = text;
+  scratch.setAttribute("readonly", "true");
+  scratch.setAttribute("aria-hidden", "true");
+  scratch.style.position = "fixed";
+  scratch.style.top = "-10000px";
+  scratch.style.left = "0";
+  scratch.style.opacity = "0";
+  document.body.appendChild(scratch);
+  const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  let copied = false;
+  try {
+    scratch.select();
+    scratch.setSelectionRange(0, text.length);
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  }
+  scratch.remove();
+  previous?.focus();
+  return copied;
+}
+
+/** Copy the current selection, reporting whether the pasteboard took it. */
+function copySelection(editor: AceEditor): boolean {
+  const text = editor.getCopyText();
+  return text ? writeClipboardText(text) : false;
+}
+
+/** Ask the host to inject the system pasteboard into the editor. */
+function requestHostPaste(): void {
+  post({ type: "paste" });
+}
+
 function handleEditorShortcut(event: KeyboardEvent): void {
   const editor = aceEditor;
   if (!editor || event.defaultPrevented || (!event.metaKey && !event.ctrlKey) || event.altKey) return;
@@ -130,27 +183,133 @@ function handleEditorShortcut(event: KeyboardEvent): void {
     return;
   }
   if (key === "c" || key === "x") {
-    const text = editor.getCopyText();
-    if (!text || !navigator.clipboard?.writeText) return;
+    // Copy first, then cut: the selection must never disappear without
+    // reaching the pasteboard. When the copy is refused, the event is left
+    // untouched so the browser's own copy/cut event still runs.
+    if (!copySelection(editor)) return;
     event.preventDefault();
     event.stopPropagation();
     editor.focus();
-    void navigator.clipboard.writeText(text).then(() => {
-      if (key === "x" && aceEditor === editor) editor.execCommand("cut");
-    }).catch(() => undefined);
-    return;
+    if (key === "x") editor.execCommand("cut");
   }
-  if (key === "v" && navigator.clipboard?.readText) {
-    event.preventDefault();
-    event.stopPropagation();
-    editor.focus();
-    void navigator.clipboard.readText().then((text) => {
-      if (aceEditor === editor) editor.execCommand("paste", text);
-    }).catch(() => undefined);
-  }
+  // Paste keeps the browser's own paste event: the WebView delivers the
+  // system pasteboard there, and the context menu asks the host for it.
 }
 
 document.addEventListener("keydown", handleEditorShortcut, true);
+
+const FALLBACK_MENU_LABELS: EditorMenuLabels = {
+  cut: "Cut",
+  copy: "Copy",
+  paste: "Paste",
+  selectAll: "Select All",
+  undo: "Undo",
+  redo: "Redo",
+};
+
+/** Labels come from the shared UI; English is only the last-resort fallback. */
+function readMenuLabels(): EditorMenuLabels {
+  const provided = window.LiteLLMCodeEditorMenuLabels;
+  const labels: EditorMenuLabels = { ...FALLBACK_MENU_LABELS };
+  if (!provided || typeof provided !== "object") return labels;
+  const source = provided as Record<string, unknown>;
+  for (const key of Object.keys(FALLBACK_MENU_LABELS) as Array<keyof EditorMenuLabels>) {
+    const value = source[key];
+    if (typeof value === "string" && value) labels[key] = value.slice(0, 64);
+  }
+  return labels;
+}
+
+const menuLabels = readMenuLabels();
+type MenuAction = "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll";
+const MENU_ENTRIES: ReadonlyArray<MenuAction | "separator"> = ["undo", "redo", "separator", "cut", "copy", "paste", "separator", "selectAll"];
+
+let documentReadOnly = false;
+let menuOpen = false;
+
+function menuActionDisabled(action: MenuAction): boolean {
+  const editor = aceEditor;
+  if (!editor) return true;
+  if (action === "paste") return documentReadOnly;
+  if (action === "cut" || action === "copy") return documentReadOnly || !editor.getCopyText();
+  return false;
+}
+
+function runMenuAction(action: MenuAction): void {
+  const editor = aceEditor;
+  if (!editor) return;
+  hideEditorMenu();
+  editor.focus();
+  if (action === "undo") editor.execCommand("undo");
+  else if (action === "redo") editor.execCommand("redo");
+  else if (action === "selectAll") editor.execCommand("selectall");
+  else if (action === "copy") copySelection(editor);
+  else if (action === "cut") {
+    // Only remove the selection once the pasteboard holds it.
+    if (copySelection(editor)) editor.execCommand("cut");
+  } else if (action === "paste") requestHostPaste();
+}
+
+function renderEditorMenu(): void {
+  menu.replaceChildren();
+  for (const entry of MENU_ENTRIES) {
+    if (entry === "separator") {
+      const separator = document.createElement("div");
+      separator.className = "editor-menu-separator";
+      menu.appendChild(separator);
+      continue;
+    }
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "editor-menu-item";
+    item.dataset.action = entry;
+    item.textContent = menuLabels[entry];
+    item.disabled = menuActionDisabled(entry);
+    item.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      runMenuAction(entry);
+    });
+    menu.appendChild(item);
+  }
+}
+
+function showEditorMenu(clientX: number, clientY: number): void {
+  if (!aceEditor) return;
+  renderEditorMenu();
+  menu.hidden = false;
+  menuOpen = true;
+  const frameBounds = frame.getBoundingClientRect();
+  const menuBounds = menu.getBoundingClientRect();
+  const left = Math.max(2, Math.min(clientX - frameBounds.left, frameBounds.width - menuBounds.width - 2));
+  const top = Math.max(2, Math.min(clientY - frameBounds.top, frameBounds.height - menuBounds.height - 2));
+  menu.style.left = `${Math.round(left)}px`;
+  menu.style.top = `${Math.round(top)}px`;
+}
+
+function hideEditorMenu(): void {
+  if (!menuOpen) return;
+  menuOpen = false;
+  menu.hidden = true;
+}
+
+// The in-page menu replaces WebKit's own context menu, which would otherwise
+// act on Ace's hidden staging textarea instead of the visible document.
+frame.addEventListener("contextmenu", (event) => {
+  if (!aceEditor) return;
+  event.preventDefault();
+  event.stopPropagation();
+  showEditorMenu(event.clientX, event.clientY);
+});
+document.addEventListener("pointerdown", (event) => {
+  if (menuOpen && event.target instanceof Node && !menu.contains(event.target)) hideEditorMenu();
+}, true);
+document.addEventListener("keydown", (event) => {
+  if (menuOpen && event.key === "Escape") hideEditorMenu();
+}, true);
+window.addEventListener("blur", hideEditorMenu);
+window.addEventListener("resize", hideEditorMenu);
+frame.addEventListener("wheel", hideEditorMenu, { passive: true } as AddEventListenerOptions);
 
 const DIFF_PREVIEW_LINE_LIMIT = 4;
 const DIFF_SIDEBAR_ENTRY_LIMIT = 24;
@@ -166,11 +325,17 @@ function aceViewport(): HTMLElement {
 }
 
 function aceContentHeight(viewport: HTMLElement): number {
-  if (!aceEditor) return viewport.scrollHeight;
-  const config = aceEditor.renderer.layerConfig;
+  const editor = aceEditor;
+  if (!editor) return viewport.scrollHeight;
+  const config = editor.renderer.layerConfig;
   const lineHeight = config?.lineHeight ?? 16;
-  const lineHeightTotal = aceEditor.session.getScreenLength() * lineHeight;
-  return Math.max(viewport.scrollHeight, config?.maxHeight ?? 0, lineHeightTotal);
+  // Ace keeps its content layer one line taller than the scroller
+  // (``minHeight = scrollerHeight + lineHeight``), so the scroller's own
+  // scrollHeight always claims a one-line overflow and must never be the
+  // overflow signal: a document that fits would still show a scroller. The
+  // document's own pixel height decides instead.
+  const lineHeightTotal = editor.session.getScreenLength() * lineHeight;
+  return Math.max(config?.maxHeight ?? 0, lineHeightTotal);
 }
 
 function renderEditorScrollbar(): void {
@@ -458,6 +623,7 @@ function reportChange(): void {
 function modeForLanguage(language: EditorLanguage): string {
   if (language === "json") return "ace/mode/json";
   if (language === "toml") return "ace/mode/toml";
+  if (language === "yaml") return "ace/mode/yaml";
   return "ace/mode/text";
 }
 function configureEditor(command: ReplaceDocumentCommand): void {
@@ -467,7 +633,13 @@ function configureEditor(command: ReplaceDocumentCommand): void {
   aceEditor.session.setUseWorker(false);
   aceEditor.session.setMode(modeForLanguage(command.language));
   aceEditor.setReadOnly(command.readOnly);
+  documentReadOnly = command.readOnly;
+  hideEditorMenu();
   aceEditor.setOption("wrap", "free");
+  // Copy and Cut act on the current line when nothing is selected, which is
+  // what every code editor does and what makes Cmd-X feel alive: without this
+  // an unselected Cmd-X has nothing to cut and silently does nothing.
+  aceEditor.setOption("copyWithEmptySelection", true);
   aceEditor.setOption("showPrintMargin", false);
   aceEditor.setOption("highlightActiveLine", true);
   aceEditor.setOption("highlightSelectedWord", true);
@@ -541,14 +713,26 @@ function receive(input: unknown): void {
   if (!command || typeof command !== "object") return;
   const message = command as Partial<HostCommand>;
   if (message.type === "replace" && typeof message.documentKey === "string" && typeof message.value === "string"
-    && typeof message.baseline === "string" && (message.language === "json" || message.language === "toml" || message.language === "text")
-    && typeof message.readOnly === "boolean" && typeof message.showDiff === "boolean") {
+    && typeof message.baseline === "string"
+    && typeof message.readOnly === "boolean" && typeof message.showDiff === "boolean"
+    && (message.language === "json" || message.language === "toml" || message.language === "yaml" || message.language === "text")) {
     replaceDocument(message as ReplaceDocumentCommand);
   } else if (message.type === "setBaseline" && typeof message.baseline === "string") {
     setBaseline(message.baseline);
+  } else if (message.type === "insertText" && typeof message.text === "string") {
+    // The host reads the system pasteboard for the context menu's Paste item
+    // and injects it here; the editor document itself stays capped at 2 MiB.
+    insertHostText(message.text);
   } else if (message.type === "focus") {
     aceEditor?.focus();
   }
+}
+
+function insertHostText(text: string): void {
+  const editor = aceEditor;
+  if (!editor || documentReadOnly || !text) return;
+  editor.focus();
+  editor.execCommand("paste", text.slice(0, 1024 * 1024));
 }
 
 window.LiteLLMCodeEditor = { receive };

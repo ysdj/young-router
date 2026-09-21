@@ -26,6 +26,7 @@
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Media.Imaging.h>
 #include <winrt/Microsoft.Web.WebView2.Core.h>
+#include <winrt/Windows.ApplicationModel.DataTransfer.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.System.h>
@@ -63,6 +64,7 @@ using winrt::Microsoft::UI::Xaml::Controls::ListView;
 using winrt::Microsoft::UI::Xaml::Controls::ListViewSelectionMode;
 using winrt::Microsoft::UI::Xaml::Controls::Orientation;
 using winrt::Microsoft::UI::Xaml::Controls::PasswordBox;
+using winrt::Microsoft::UI::Xaml::Controls::ProgressRing;
 using winrt::Microsoft::UI::Xaml::Controls::ScrollViewer;
 using winrt::Microsoft::UI::Xaml::Controls::StackPanel;
 using winrt::Microsoft::UI::Xaml::Controls::TextBox;
@@ -78,8 +80,9 @@ using winrt::Microsoft::UI::Xaml::Thickness;
 namespace web = winrt::Microsoft::Web::WebView2::Core;
 
 constexpr double kUIFontSize = 13.0;
-// The settings sidebar follows the native reference: a 13pt medium label.
-constexpr double kSourceListFontSize = 13.0;
+// The settings sidebar follows the native reference: a 13.5pt medium label, a
+// half step above the 13pt body text like the macOS source list.
+constexpr double kSourceListFontSize = 13.5;
 constexpr double kSourceListGlyphFontSize = 15.0;
 
 winrt::hstring ToHString(std::string const& value) {
@@ -273,9 +276,42 @@ struct ButtonComponentView final
     if (!button_ || !Props()) return;
     auto const& props = *Props();
     bool const link = props.link.value_or(false);
+    bool const busy = props.busy.value_or(false);
     const auto symbol = props.symbol.value_or("");
+    // The busy spinner is the button's own leading content, so the control
+    // centers the icon with the title and keeps the width its caller's
+    // reservation already gave it.
+    auto const busySpinner = []() {
+      auto ring = ProgressRing{};
+      ring.IsActive(true);
+      ring.Width(12.0);
+      ring.Height(12.0);
+      ring.MinWidth(12.0);
+      ring.MinHeight(12.0);
+      ring.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+      return ring;
+    };
+    auto const busySpinnerRow = [&](winrt::hstring const& label) {
+      // The spinner is the button's own leading content, so WinUI centers the
+      // icon and the title together as one group — exactly like a
+      // symbol-with-title button, and never a resized or renamed button.
+      auto row = StackPanel{};
+      row.Orientation(Orientation::Horizontal);
+      row.Spacing(3);
+      row.Children().Append(busySpinner());
+      auto text = TextBlock{};
+      text.FontSize(kUIFontSize);
+      text.Text(label);
+      text.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+      row.Children().Append(text);
+      return row;
+    };
     if (symbol.empty()) {
-      button_.Content(winrt::box_value(ToHString(props.title)));
+      if (busy) {
+        button_.Content(busySpinnerRow(ToHString(props.title)));
+      } else {
+        button_.Content(winrt::box_value(ToHString(props.title)));
+      }
     } else if (props.symbolWithTitle.value_or(false)) {
       // Keep the translated title next to a leading glyph instead of turning
       // the control into an icon-only button.
@@ -307,6 +343,10 @@ struct ButtonComponentView final
       label.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
       row.Children().Append(icon);
       row.Children().Append(label);
+      if (busy) {
+        // The spinner leads the glyph and the title as one centered group.
+        row.Children().InsertAt(0, busySpinner());
+      }
       button_.Content(row);
     } else {
       auto icon = FontIcon{};
@@ -327,9 +367,42 @@ struct ButtonComponentView final
       else if (symbol == "chevron-up") icon.Glyph(L"\xE70E");
       else if (symbol == "chevron-down") icon.Glyph(L"\xE70D");
       else icon.Glyph(L"\xE74D");
-      button_.Content(icon);
+      // An icon-only button has no room for a second glyph: while its action
+      // runs the spinner takes the icon's place instead of sitting beside it.
+      if (busy) {
+        auto ring = busySpinner();
+        ring.HorizontalAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Center);
+        button_.Content(ring);
+      } else {
+        button_.Content(icon);
+      }
     }
-    hyperlink_.Content(winrt::box_value(ToHString(props.title)));
+    if (busy && link) {
+      // A busy hyperlink carries the ring as its leading content, next to its
+      // label, and keeps the width its own reservation already gives it.
+      auto row = StackPanel{};
+      row.Orientation(Orientation::Horizontal);
+      row.Spacing(3);
+      row.Children().Append(busySpinner());
+      auto linkLabel = TextBlock{};
+      linkLabel.FontSize(kUIFontSize);
+      linkLabel.Text(ToHString(props.title));
+      linkLabel.VerticalAlignment(winrt::Microsoft::UI::Xaml::VerticalAlignment::Center);
+      row.Children().Append(linkLabel);
+      hyperlink_.Content(row);
+    } else if (link && props.plainLink.value_or(false)) {
+      // The quiet link owns both its ink and its resting underline on the text
+      // itself, so the hyperlink's pointer-over state cannot repaint either:
+      // only the pointer cursor and the underline say the label is a link.
+      auto linkLabel = TextBlock{};
+      linkLabel.FontSize(kUIFontSize);
+      linkLabel.Text(ToHString(props.title));
+      linkLabel.Foreground(SecondaryTextBrush());
+      linkLabel.TextDecorations(winrt::Windows::UI::Text::TextDecorations::Underline);
+      hyperlink_.Content(linkLabel);
+    } else {
+      hyperlink_.Content(winrt::box_value(ToHString(props.title)));
+    }
     button_.IsEnabled(Enabled(props.disabled));
     hyperlink_.IsEnabled(Enabled(props.disabled));
     button_.Visibility(link ? winrt::Microsoft::UI::Xaml::Visibility::Collapsed
@@ -337,8 +410,17 @@ struct ButtonComponentView final
     hyperlink_.Visibility(link ? winrt::Microsoft::UI::Xaml::Visibility::Visible
                                : winrt::Microsoft::UI::Xaml::Visibility::Collapsed);
     if (link) {
+      // A plain link owns its whole column: it drops the inline bezel and
+      // left-aligns its title, for a long value such as a file path. The WinUI
+      // hyperlink already has no bezel, so only the alignment needs stating.
+      // Its label carries the quiet ink and underline itself, so nothing about
+      // this variant follows the hyperlink's accent state.
       hyperlink_.Background(nullptr);
-      hyperlink_.Foreground(nullptr);
+      if (props.plainLink.value_or(false)) {
+        hyperlink_.HorizontalContentAlignment(winrt::Microsoft::UI::Xaml::HorizontalAlignment::Left);
+      } else {
+        hyperlink_.Foreground(nullptr);
+      }
       return;
     }
     if (props.compact.value_or(false)) {
@@ -850,9 +932,14 @@ struct TableComponentView final
 
     if (rows_changed) {
       list_.Items().Clear();
+      // A source list keeps the native sidebar rhythm; the pane's own rail is a
+      // compact source list one density step below it.
+      const bool compact_rows = props.compact.value_or(false);
       for (size_t row_index = 0; row_index < props.rowKeys.size(); ++row_index) {
         auto row = Grid{};
-        row.MinHeight(source_list ? 26.0 : (props.compact.value_or(false) ? 22.0 : 28.0));
+        row.MinHeight(source_list
+            ? (compact_rows ? 26.0 : 30.0)
+            : (compact_rows ? 22.0 : 28.0));
         if (source_list) row.Margin(winrt::Microsoft::UI::Xaml::Thickness{0, 1, 0, 1});
         const bool disabled = std::find(disabled_row_keys.begin(), disabled_row_keys.end(), props.rowKeys[row_index]) != disabled_row_keys.end();
         if (props.alternatingRows.value_or(false) && row_index % 2 == 1) {
@@ -951,10 +1038,17 @@ struct TableComponentView final
             Grid::SetColumnSpan(content, static_cast<int32_t>(std::max<size_t>(1, column_count)));
             row.Children().Append(content);
           } else {
+          // A source-list row without an icon tile is the settings window's
+          // subordinate rail, one level below the sidebar's pane list: it
+          // carries the sidebar's own source-list type step instead of the
+          // ordinary body cell.
+          const bool rail_row = source_list &&
+              (row_index >= row_symbols.size() || row_symbols[row_index].empty());
           for (size_t column_index = 0; column_index < column_count; ++column_index) {
             const auto cell_index = row_index * column_count + column_index;
             auto cell = TextBlock{};
-            cell.FontSize(kUIFontSize);
+            cell.FontSize(rail_row ? kSourceListFontSize : kUIFontSize);
+            if (rail_row) cell.FontWeight(winrt::Windows::UI::Text::FontWeights::Medium());
             cell.Text(ToHString(cell_index < props.cells.size() ? props.cells[cell_index] : ""));
             if (!cell.Text().empty()) ToolTipService::SetToolTip(cell, winrt::box_value(cell.Text()));
             const double vertical_margin = props.compact.value_or(false) ? 2.0 : 5.0;
@@ -1291,7 +1385,7 @@ struct CodeWebViewComponentView final
     if (disposed_ || !Props()) return;
     auto const& props = *Props();
     if (props.html.empty() || props.documentKey.empty() ||
-        (props.language != "json" && props.language != "toml" && props.language != "text") ||
+        (props.language != "json" && props.language != "toml" && props.language != "yaml" && props.language != "text") ||
         props.html.size() > 4 * 1024 * 1024 ||
         props.value.size() > 2 * 1024 * 1024 ||
         props.baseline.size() > 2 * 1024 * 1024) {
@@ -1384,6 +1478,33 @@ struct CodeWebViewComponentView final
     }
   }
 
+  void InsertClipboardText() noexcept {
+    auto weak = get_weak();
+    [weak]() -> winrt::fire_and_forget {
+      auto self = weak.get();
+      if (!self || self->disposed_) co_return;
+      try {
+        auto content = winrt::Windows::ApplicationModel::DataTransfer::Clipboard::GetContent();
+        if (!content.Contains(winrt::Windows::ApplicationModel::DataTransfer::StandardDataFormats::Text())) co_return;
+        auto clipboard_text = co_await content.GetTextAsync();
+        auto current = weak.get();
+        if (!current || current->disposed_) co_return;
+        std::wstring value = clipboard_text.c_str();
+        // Keep the injected payload bounded; the editor document itself is
+        // capped at 2 MiB in the shared UI.
+        constexpr size_t maximum_length = 262144;
+        if (value.size() > maximum_length) value.resize(maximum_length);
+        auto payload = winrt::Windows::Data::Json::JsonObject{};
+        payload.Insert(L"type", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"insertText"));
+        payload.Insert(L"text", winrt::Windows::Data::Json::JsonValue::CreateStringValue(winrt::hstring{value}));
+        auto script = winrt::hstring(L"window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(") +
+            payload.Stringify() + L");";
+        current->ExecuteEditorScript(std::move(script));
+      } catch (...) {
+      }
+    }();
+  }
+
   void ExecuteEditorScript(winrt::hstring script) noexcept {
     auto weak = get_weak();
     [weak, script = std::move(script)]() -> winrt::fire_and_forget {
@@ -1419,6 +1540,10 @@ struct CodeWebViewComponentView final
       }
       if (type == "error") {
         EmitEditorError(winrt::to_string(payload.GetNamedString(L"message", L"editor_error")));
+        return;
+      }
+      if (type == "paste") {
+        InsertClipboardText();
         return;
       }
       if (type != "change") {

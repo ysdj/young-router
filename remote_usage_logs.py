@@ -26,6 +26,7 @@ from typing import Any
 
 from config_editor_core.load import load_config
 from young_router.api_base import isolated_http_opener, service_root
+from young_router.browser_identity import browser_request_headers
 
 
 MAX_TARGETS = 4
@@ -195,9 +196,8 @@ def _fetch_json(
     request = urllib.request.Request(
         url,
         headers={
-            "Accept": "application/json",
+            **browser_request_headers(),
             "Authorization": authorization,
-            "User-Agent": "Young-Router-Usage/1",
         },
         method="GET",
     )

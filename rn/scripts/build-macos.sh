@@ -74,6 +74,12 @@ PI_WEB_ACCESS_NODE_WORK="$RUNTIME_WORK/node"
 "${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_pi_web_access.py" \
   --output "$PI_WEB_ACCESS_PACKAGE_WORK" \
   --node-output "$PI_WEB_ACCESS_NODE_WORK"
+# The degradation deep test runs the latest upstream TraceOne, so every
+# artifact build re-checks its default branch instead of packaging a stale
+# classifier copy.
+TRACEONE_WORK="$RUNTIME_WORK/traceone"
+"${PI_WEB_ACCESS_UPDATE_COMMAND[@]}" "$PROJECT_ROOT/scripts/update_traceone.py" \
+  --output "$TRACEONE_WORK"
 
 export RCT_USE_RN_DEP=0
 export RCT_USE_PREBUILT_RNCORE=0
@@ -171,6 +177,7 @@ for directory in young_router config_editor_core webdav; do
     "$PROJECT_ROOT/$directory/" "$CORE/$directory/"
 done
 copy_tree "$PI_WEB_ACCESS_PACKAGE_WORK" "$CORE/young_router/pi-web-access"
+copy_tree "$TRACEONE_WORK" "$CORE/young_router/traceone"
 
 if [[ -n "$RUNTIME_SOURCE" ]]; then
   if [[ ! -d "$RUNTIME_SOURCE/python" \
@@ -254,6 +261,14 @@ fi
   echo "The bundled pi-web-access package is missing." >&2
   exit 5
 }
+[[ -f "$CORE/young_router/traceone/traceone.js" ]] || {
+  echo "The bundled TraceOne degradation engine is missing." >&2
+  exit 5
+}
+[[ -f "$CORE/young_router/traceone/prompt.txt" ]] || {
+  echo "The bundled TraceOne identity prompt is missing." >&2
+  exit 5
+}
 [[ -f "$CORE/config_editor_core/api.py" ]] || {
   echo "Bundled Core dependencies are incomplete." >&2
   exit 5
@@ -276,6 +291,14 @@ if ! printf '' | "$CORE/runtime/bin/node" \
   --entry "$CORE/young_router/pi-web-access/index.ts" \
   --config-dir "$PI_WEB_ACCESS_SMOKE_CONFIG"; then
   echo "The bundled pi-web-access worker could not load its staged SDK." >&2
+  exit 5
+fi
+# A staged classifier that cannot load would turn every deep test into an
+# inconclusive result, so the bundle verifies one real attribution first.
+if ! printf '%s\n' '{"id":"bundle-smoke","text":"[[1]]"}' | "$CORE/runtime/bin/node" \
+  "$CORE/young_router/traceone_worker.mjs" --dir "$CORE/young_router/traceone" \
+  | grep -q '"id":"bundle-smoke"'; then
+  echo "The bundled TraceOne worker could not run the staged classifier." >&2
   exit 5
 fi
 [[ "$(tr -d '[:space:]' < "$CORE/runtime/LITELLM_VERSION")" == "$(tr -d '[:space:]' < "$PROJECT_ROOT/LITELLM_VERSION")" ]] || {

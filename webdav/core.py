@@ -16,6 +16,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from young_router.browser_identity import browser_request_headers
 from dataclasses import dataclass
 from typing import Any
 
@@ -942,7 +944,7 @@ class WebDAVClient:
         retryable_error: SyncError | None = None
         for attempt in range(1, attempts + 1):
             request_headers = {
-                "User-Agent": "Young Router WebDAV Sync",
+                **browser_request_headers(accept="*/*"),
                 **(headers or {}),
             }
             if self.settings.username or self.settings.password:
@@ -1001,7 +1003,7 @@ class WebDAVClient:
         if not curl:
             raise original_error
         request_headers = {
-            "User-Agent": "Young Router WebDAV Sync",
+            **browser_request_headers(accept="*/*"),
             **(headers or {}),
         }
         if self.settings.username or self.settings.password:

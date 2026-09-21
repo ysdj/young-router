@@ -431,9 +431,9 @@ class HookStreamingToolEventTests(HookTestCase):
         original_completed_payload = (
             streaming_module._ResponsesStreamCompletionState.completed_payload
         )
-        computer_facade_module = importlib.import_module("young_router.computer_facade")
+        web_search_bridge_module = importlib.import_module("young_router.responses_web_search_bridge")
         original_resolve = (
-            computer_facade_module._resolve_web_search_function_calls_stream_rounds
+            web_search_bridge_module._resolve_web_search_function_calls_stream_rounds
         )
         captured: dict[str, object] = {}
 
@@ -457,7 +457,7 @@ class HookStreamingToolEventTests(HookTestCase):
         streaming_module._ResponsesStreamCompletionState.completed_payload = (
             fake_completed_payload
         )
-        computer_facade_module._resolve_web_search_function_calls_stream_rounds = fake_resolve
+        web_search_bridge_module._resolve_web_search_function_calls_stream_rounds = fake_resolve
         self.addCleanup(
             setattr,
             streaming_module,
@@ -466,7 +466,7 @@ class HookStreamingToolEventTests(HookTestCase):
         )
         self.addCleanup(
             setattr,
-            computer_facade_module,
+            web_search_bridge_module,
             "_resolve_web_search_function_calls_stream_rounds",
             original_resolve,
         )

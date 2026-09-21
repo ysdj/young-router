@@ -1,5 +1,6 @@
 import React from "react";
 import {
+  ActivityIndicator,
   Platform,
   Pressable,
   StyleSheet,
@@ -46,10 +47,34 @@ type ButtonProps = {
   toolTip?: string;
   accessibilityLabel?: string;
   disabled?: boolean;
+  /**
+   * The button's own action is running. The control deliberately stays
+   * enabled: it keeps its title, width, and color and centers a small spinner
+   * with the title (the loading button early iOS used). Callers keep whatever
+   * guard their action needs, because the button stays live.
+   */
+  busy?: boolean;
   primary?: boolean;
   destructive?: boolean;
   compact?: boolean;
   link?: boolean;
+  /**
+   * ``plainLink`` keeps link behavior (pointer cursor, accessibility role) but
+   * is the quiet variant: it draws no inline bezel, left-aligns the title for
+   * a long value such as a file path that owns its whole column, reads in
+   * secondary ink at the row's own weight instead of the accent-colored,
+   * semibold navigation link, and stays underlined at rest — the underline is
+   * what says "link", and neither the ink nor the decoration reacts to hover.
+   */
+  plainLink?: boolean;
+  /**
+   * ``tight`` lets a caller that owns its own short label hug the native
+   * bezel; the default reservation stays for translated labels, which must
+   * never truncate. ``flex`` skips the reservation entirely and lets the
+   * caller's own container bound the control, so a long value such as a file
+   * path truncates inside its column instead of widening the row.
+   */
+  titleWidth?: "auto" | "tight" | "flex";
   onPress?: () => void;
   style?: StyleProp<ViewStyle>;
 };
@@ -90,7 +115,8 @@ type CheckboxProps = {
   style?: StyleProp<ViewStyle>;
 };
 
-function nativeControlTextWidth(label: string): number {
+/** Rough advance width of a native control label, in points. */
+export function nativeControlTextWidth(label: string): number {
   return Array.from(label).reduce((width, character) => {
     if (/\s/u.test(character)) return width + 4;
     return width + (/[^\u0000-\u024f]/u.test(character) ? 13 : 7.5);
@@ -107,6 +133,34 @@ function isCompactGlyphTitle(title: string): boolean {
 // buttons and checkboxes do not turn complete actions into truncated fragments.
 function nativeButtonMinimumWidth(title: string, compact = false): number {
   return Math.max(72, Math.ceil((compact ? 32 : 38) + nativeControlTextWidth(title) * 1.15));
+}
+
+// A native button draws its title inside a fixed bezel, so a reservation wider
+// than the text reads as empty padding around the label. Callers that keep
+// their own label short can ask for the bezel-hugging width instead; the
+// shared default above stays for translated labels.
+function nativeButtonTightWidth(title: string, plainLink = false): number {
+  // A plain link draws no inline bezel, so it needs no bezel padding: the caller
+  // that measures the leftover width gets that room back for its own text.
+  if (plainLink) return Math.ceil(nativeControlTextWidth(title)) + 2;
+  return Math.max(44, Math.ceil(nativeControlTextWidth(title) + 20));
+}
+
+// A busy button draws the spinner as its leading content, so the native
+// control centers the icon together with the title as one group — the loading
+// button early iOS showed. The shared reservation above already leaves room
+// for that leading 12 pt icon, so a busy button keeps the exact width of its
+// idle state; only a caller that reserves the bezel-hugging width has to add
+// the slot itself, and it does so whether or not its action is running so the
+// control never resizes mid-flight.
+const BUSY_SPINNER_SIZE = 12;
+const BUSY_SPINNER_GAP = 3;
+const BUSY_SPINNER_BEZEL_ROOM = 4;
+const BUSY_SPINNER_SLOT = 2 * (BUSY_SPINNER_SIZE + BUSY_SPINNER_GAP + BUSY_SPINNER_BEZEL_ROOM);
+
+function nativeButtonBusyMinimumWidth(title: string, reservation: number, plainLink: boolean): number {
+  if (plainLink) return reservation;
+  return Math.max(reservation, Math.ceil(nativeControlTextWidth(title)) + BUSY_SPINNER_SLOT);
 }
 
 function nativeCheckboxMinimumWidth(label: string): number {
@@ -144,6 +198,10 @@ type TableProps = {
   selectedKey?: string;
   striped?: boolean;
   alternatingRows?: boolean;
+  /**
+   * Compact density: 22 pt rows for a plain table, and 26 pt rows for a source
+   * list — the pane's own rail against the sidebar's regular 30 pt.
+   */
   compact?: boolean;
   followBottom?: boolean;
   framed?: boolean;
@@ -212,15 +270,17 @@ type SplitViewProps = {
   style?: StyleProp<ViewStyle>;
 };
 
-const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeButtonWithRef(props, ref): React.JSX.Element {
+const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeButtonWithRef({ titleWidth: titleWidthRequest, ...props }, ref): React.JSX.Element {
   const compact = props.compact ?? true;
   const buttonProps = {
     ...props,
     compact,
     disabled: props.disabled === true,
+    busy: props.busy === true,
     primary: props.primary === true,
     destructive: props.destructive === true,
     link: props.link === true,
+    plainLink: props.plainLink === true,
     symbolWithTitle: props.symbolWithTitle === true,
   };
   // A caller may enlarge a button, but must never reduce a translated title to
@@ -228,8 +288,16 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
   // caller/native icon size rather than the text-button minimum width. A
   // symbol-with-title button reserves room for the leading icon.
   const showsTitle = props.symbolWithTitle === true || !props.symbol;
+  const reservation = titleWidthRequest === "tight"
+    ? nativeButtonTightWidth(props.title, props.plainLink === true)
+    : nativeButtonMinimumWidth(props.title, compact);
   const titleWidth = showsTitle && !(compact && isCompactGlyphTitle(props.title))
-    ? { minWidth: nativeButtonMinimumWidth(props.title, compact) + (props.symbol ? 22 : 0), flexShrink: 0 }
+    ? titleWidthRequest === "flex"
+      ? { minWidth: 0, flexShrink: 1 }
+      : {
+          minWidth: (props.busy === undefined ? reservation : nativeButtonBusyMinimumWidth(props.title, reservation, props.plainLink === true)) + (props.symbol ? 22 : 0),
+          flexShrink: 0,
+        }
     : undefined;
   const style = [props.link ? styles.linkButton : styles.button, props.style, titleWidth];
   if (Platform.OS === "windows") {
@@ -238,7 +306,7 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
   if (Platform.OS === "macos") {
     return <AppKitButton {...buttonProps} ref={ref as never} style={[props.style, titleWidth]} />;
   }
-    return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={style} accessibilityRole={props.link ? "link" : "button"}><Text style={styles.controlText}>{props.title}</Text></Pressable>;
+    return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={[style, props.busy === true && styles.buttonBusy]} accessibilityRole={props.link ? "link" : "button"}>{props.busy === true ? <ActivityIndicator size="small" style={styles.buttonBusyIndicator} /> : null}<Text style={styles.controlText}>{props.title}</Text></Pressable>;
 });
 
 // Keep the long-standing function export while allowing desktop callers to
@@ -400,6 +468,8 @@ export function NativeSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpe
 
 const styles = StyleSheet.create({
   button: { minWidth: 28, height: 24 },
+  buttonBusy: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: BUSY_SPINNER_GAP },
+  buttonBusyIndicator: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
   controlText: { fontSize: UI_FONT_SIZE },
   linkButton: { minWidth: 72, minHeight: 22 },
   segmented: { minHeight: 24 },

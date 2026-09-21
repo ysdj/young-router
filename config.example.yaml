@@ -29,7 +29,7 @@ litellm_settings:
     - default-chat
 
 general_settings:
-  master_key: sk-local-litellm
+  master_key: sk-young-router
   ui: true
 
 router_settings:
